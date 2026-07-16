@@ -21,6 +21,9 @@ public:
 	void DetileImage(GraphicContext* ctx, DepthStencilVulkanImage* image,
 	                 const DepthTargetInfo& info, const BufferImageCopySource& source,
 	                 bool refresh) const;
+	void DetileStencil(GraphicContext* ctx, DepthStencilVulkanImage* image,
+	                   const DepthTargetInfo& info, const BufferImageCopySource& source,
+	                   bool refresh) const;
 	void TileImage(void* dst, const void* src, const RenderTargetInfo& info) const;
 	void TileImage(void* dst, const void* src, const DepthTargetInfo& info) const;
 };

@@ -14,11 +14,47 @@
 #include "libs/errno.h"
 
 #include <cstring>
+#include <limits>
 
 namespace Libs::Graphics {
 
 constexpr int GRAPHICS_EVENT_QUEUED_GRAPHICS_INTERRUPT = 0x00;
 constexpr int GRAPHICS_EVENT_EOP                       = 0x40;
+constexpr uint64_t GRAPHICS_REFERENCE_CLOCK_FREQUENCY  = 100000000;
+
+bool GraphicsScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency, uint64_t* value) {
+	if (host_frequency == 0 || value == nullptr) {
+		return false;
+	}
+
+	const auto whole_seconds = host_ticks / host_frequency;
+	const auto remainder     = host_ticks % host_frequency;
+	constexpr auto MAX_VALUE = std::numeric_limits<uint64_t>::max();
+	if (whole_seconds > MAX_VALUE / GRAPHICS_REFERENCE_CLOCK_FREQUENCY ||
+	    remainder > MAX_VALUE / GRAPHICS_REFERENCE_CLOCK_FREQUENCY) {
+		return false;
+	}
+
+	const auto whole_value = whole_seconds * GRAPHICS_REFERENCE_CLOCK_FREQUENCY;
+	const auto fractional_value =
+	    (remainder * GRAPHICS_REFERENCE_CLOCK_FREQUENCY) / host_frequency;
+	if (whole_value > MAX_VALUE - fractional_value) {
+		return false;
+	}
+	*value = whole_value + fractional_value;
+	return true;
+}
+
+uint64_t GraphicsRenderReadReferenceClock() {
+	const auto host_frequency = LibKernel::KernelGetTscFrequency();
+	const auto host_ticks     = LibKernel::KernelReadTsc();
+	uint64_t   value          = 0;
+	if (!GraphicsScaleReferenceClock(host_ticks, host_frequency, &value)) {
+		EXIT("cannot scale host clock, ticks=0x%016" PRIx64 " frequency=%" PRIu64 "\n",
+		     host_ticks, host_frequency);
+	}
+	return value;
+}
 
 static void SubmitLabel32(CommandBuffer* buffer, uint32_t* dst, uint32_t value,
                           LabelCallback callback_1 = nullptr, LabelCallback callback_2 = nullptr,
@@ -158,7 +194,7 @@ void GraphicsRenderWriteAtEndOfPipeClockCounter(uint64_t submit_id, CommandBuffe
 	buffer->SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopWrite), submit_id, 8, 0, 0,
 	                     0, reinterpret_cast<uint64_t>(dst_gpu_addr));
 
-	const auto value = LibKernel::KernelReadTsc();
+	const auto value = GraphicsRenderReadReferenceClock();
 	PublishImmediateFence(dst_gpu_addr, value);
 	LOGF_COLOR(Log::Color::BrightGreen,
 	           "EndOfPipe Signal!!! [0x%016" PRIx64 "] <- Clock: 0x%016" PRIx64 "\n",
@@ -176,7 +212,7 @@ void GraphicsRenderWriteAtEndOfPipeClockCounterWithWriteBack(uint64_t       subm
 	buffer->SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopWriteBack), submit_id, 8, 0,
 	                     0, 0, reinterpret_cast<uint64_t>(dst_gpu_addr));
 
-	const auto value = LibKernel::KernelReadTsc();
+	const auto value = GraphicsRenderReadReferenceClock();
 	PublishImmediateFence(dst_gpu_addr, value);
 	LOGF_COLOR(Log::Color::BrightGreen,
 	           "EndOfPipe Signal!!! [0x%016" PRIx64 "] <- Clock: 0x%016" PRIx64 "\n",

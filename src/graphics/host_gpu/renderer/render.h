@@ -127,6 +127,10 @@ void RenderDispatchDirect(uint64_t submit_id, CommandBuffer* buffer, HW::Context
 void GraphicsRenderInit();
 void GraphicsRenderCreateContext();
 
+[[nodiscard]] bool GraphicsScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency,
+                                               uint64_t* value);
+[[nodiscard]] uint64_t GraphicsRenderReadReferenceClock();
+
 [[nodiscard]] bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
                                             ShaderBufferResource* descriptor,

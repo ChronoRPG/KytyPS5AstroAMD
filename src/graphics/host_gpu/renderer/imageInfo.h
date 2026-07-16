@@ -86,6 +86,7 @@ struct DepthTargetInfo {
 	bool     depth_load_clear   = false;
 	bool     stencil_load_clear = false;
 	bool     stencil_access     = false;
+	bool     stencil_htile_compressed = false;
 };
 
 enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_64_64, Unsupported };
@@ -171,12 +172,26 @@ struct VideoOutPixelFormatInfo {
 }
 
 enum class DepthOverlap : uint8_t { None, RetireSampled, Unsupported };
+enum class DepthTransitionSource : uint8_t { None, Guest, Native };
 enum class RenderTargetOverlap : uint8_t { None, RetireSampled, RetireTarget, Unsupported };
 enum class SampledOverlap : uint8_t { None, ReadOnlyAlias, Unsupported };
 enum class StorageSampledOverlap : uint8_t { None, ExactImage, Unsupported };
 enum class HostWriteOverlap : uint8_t { None, InvalidateImage, Unsupported };
 enum class BufferImageAlias : uint8_t { None, VideoOutWrite, RenderTargetWrite, Unsupported };
 enum class MetaImageOverlap : uint8_t { RetainSampled, RetireTarget, Unsupported };
+
+[[nodiscard]] inline constexpr DepthTransitionSource
+SelectDepthTransitionSource(bool depth_load_clear, bool sampled_native_available,
+                            bool sampled_cpu_dirty, bool sampled_buffer_modified,
+                            bool buffer_overlap, bool buffer_cpu_dirty) noexcept {
+	if (depth_load_clear) {
+		return DepthTransitionSource::None;
+	}
+	return sampled_native_available && !sampled_cpu_dirty && !sampled_buffer_modified &&
+	               !(buffer_overlap && buffer_cpu_dirty)
+	           ? DepthTransitionSource::Native
+	           : DepthTransitionSource::Guest;
+}
 
 [[nodiscard]] inline MetaImageOverlap ClassifyMetaImageOverlap(bool sampled, bool render_target,
                                                                bool gpu_modified,
@@ -281,10 +296,15 @@ enum class MetaImageOverlap : uint8_t { RetainSampled, RetireTarget, Unsupported
 }
 
 [[nodiscard]] inline bool CanLoadStencilAttachment(const DepthTargetInfo& target,
-                                                   bool                   stencil_initialized) {
+                                                    bool                   stencil_initialized) {
 	const bool has_stencil = target.stencil_address != 0 || target.stencil_size != 0;
 	return !has_stencil || !target.stencil_access || target.stencil_load_clear ||
 	       stencil_initialized;
+}
+
+[[nodiscard]] inline bool CanLoadRawStencilPlane(const DepthTargetInfo& target) {
+	const bool has_stencil = target.stencil_address != 0 || target.stencil_size != 0;
+	return has_stencil && !target.stencil_htile_compressed;
 }
 
 [[nodiscard]] inline bool IsDepthTargetRangeCompatible(const DepthTargetInfo& target,
@@ -414,6 +434,22 @@ ClassifyBufferImageAlias(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 		return DepthOverlap::None;
 	}
 	const bool has_stencil = depth.stencil_address != 0 || depth.stencil_size != 0;
+	const bool exact_depth_format =
+	    sampled.format == depth.guest_format &&
+	    ((depth.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm) &&
+	      depth.format == VK_FORMAT_D16_UNORM && depth.bytes_per_element == 2) ||
+	     (depth.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) &&
+	      depth.format == VK_FORMAT_D32_SFLOAT && depth.bytes_per_element == 4));
+	const bool exact_depth_load =
+	    !has_stencil && !depth.depth_load_clear && sampled.address == depth.address &&
+	    sampled.size == depth.size && sampled.width == depth.width && sampled.height == depth.height &&
+	    sampled.pitch == depth.pitch && sampled.base_level == 0 && sampled.levels == 1 &&
+	    sampled.view_levels == 1 && sampled.tile == depth.tile_mode && sampled.depth == 1 &&
+	    sampled.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
+	    sampled.base_array == 0 && exact_depth_format;
+	if (!sampled_gpu_modified && exact_depth_load) {
+		return DepthOverlap::RetireSampled;
+	}
 	if (sampled.address == depth.address && !sampled_gpu_modified && depth.depth_load_clear &&
 	    (!has_stencil ||
 	     (depth.stencil_address != 0 && depth.stencil_size != 0 && depth.stencil_load_clear))) {

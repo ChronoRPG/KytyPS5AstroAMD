@@ -661,6 +661,22 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	memcpy(dst, src, static_cast<size_t>(dw_num) * 4);
 }
 
+void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
+	Common::LockGuard lock(m_mutex);
+	if (dst_address == 0 || (num_bytes != sizeof(uint32_t) && num_bytes != sizeof(uint64_t)) ||
+	    (dst_address & (num_bytes - 1u)) != 0) {
+		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
+		     num_bytes);
+	}
+	const auto value = GraphicsRenderReadReferenceClock();
+	CommandProcessorGuestAccessScope guest_access(CommandProcessorGuestAccess::DirectFence,
+	                                                dst_address, num_bytes);
+	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
+	     " size=%u\n",
+	     dst_address, value, num_bytes);
+}
+
 void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
                                uint64_t dst_address_or_offset, uint8_t src_sel,
                                uint8_t  src_cache_policy,

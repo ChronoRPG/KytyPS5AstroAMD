@@ -7777,9 +7777,9 @@ TestCase ImageStoreRgbOneUsesInverseSwizzle() {
   AppendVMovU32(&code, 21, 2);
   AppendVMovU32(&code, 22, 0);
   AppendVMovLiteral(&code, 0, 0x3f800000u);
-  AppendVMovLiteral(&code, 1, 0x3f000000u);
-  AppendVMovLiteral(&code, 2, 0x3e800000u);
-  AppendVMovLiteral(&code, 3, 0x3f400000u);
+  AppendVMovLiteral(&code, 1, 0x3f008081u);
+  AppendVMovLiteral(&code, 2, 0x3e808081u);
+  AppendVMovLiteral(&code, 3, 0x3f40c0c1u);
   code.push_back(EncodeMimg0(0x08, 0xf));
   code.push_back(EncodeMimg1(0, 20));
   AppendEnd(&code);
@@ -7809,9 +7809,9 @@ TestCase ImageStoreBgraUsesInverseSwizzle() {
   AppendVMovU32(&code, 21, 2);
   AppendVMovU32(&code, 22, 0);
   AppendVMovLiteral(&code, 0, 0x3f800000u);
-  AppendVMovLiteral(&code, 1, 0x3f000000u);
-  AppendVMovLiteral(&code, 2, 0x3e800000u);
-  AppendVMovLiteral(&code, 3, 0x3f400000u);
+  AppendVMovLiteral(&code, 1, 0x3f008081u); // 128/255
+  AppendVMovLiteral(&code, 2, 0x3e808081u); // 64/255
+  AppendVMovLiteral(&code, 3, 0x3f3fbfc0u); // 191/255
   code.push_back(EncodeMimg0(0x08, 0xf));
   code.push_back(EncodeMimg1(0, 20));
   AppendEnd(&code);
@@ -8788,6 +8788,12 @@ void CheckSampledColorViews() {
                                  DstSel(4, 0, 0, 0)) ==
               VulkanImage::VIEW_R000,
           "D16 depth target did not select its R000 depth-aspect view");
+  Require("SampledColorViews", "D32S8 R001 depth target",
+          SelectSampledDepthView(VK_FORMAT_D32_SFLOAT_S8_UINT,
+                                 VK_FORMAT_R32_SFLOAT,
+                                 DstSel(4, 0, 0, 1)) ==
+              VulkanImage::VIEW_R001,
+          "D32S8 depth target did not select its R001 depth-aspect view");
   Require("SampledColorViews", "storage identity",
           SelectStorageColorView(VK_FORMAT_R8G8B8A8_UNORM,
                                  VK_FORMAT_R8G8B8A8_UNORM,
@@ -9599,6 +9605,67 @@ void CheckDepthTargetTileRoundTrip() {
     }
   }
   std::printf("[host]    %-32s ok\n", "DepthTargetTileRoundTrip");
+}
+
+void CheckStencilTargetTileRoundTrip() {
+  struct Case {
+    uint32_t width;
+    uint32_t height;
+  };
+  constexpr std::array cases{Case{8, 8}, Case{257, 259}, Case{1920, 1080}};
+  constexpr auto format = Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt);
+  constexpr auto tile = Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
+  for (const auto test : cases) {
+    const auto pitch = TileGetTexturePitch(format, test.width, 1, tile);
+    TileSizeAlign stencil{};
+    TileSizeAlign htile{};
+    TileSizeAlign depth{};
+    Require("StencilTargetTileRoundTrip", "layout",
+            pitch >= test.width && pitch % 256 == 0 &&
+                TileGetDepthSize(test.width, test.height, 0,
+                                 Prospero::GpuEnumValue(Prospero::DepthFormat::kZ32F),
+                                 Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt), false,
+                                 &stencil, &htile, &depth) &&
+                stencil.size != 0 && stencil.align == 0x10000,
+            "Prospero stencil layout was rejected");
+    std::vector<uint8_t> linear(stencil.size, 0);
+    for (uint32_t y = 0; y < test.height; y++) {
+      for (uint32_t x = 0; x < test.width; x++) {
+        linear[static_cast<uint64_t>(y) * pitch + x] =
+            static_cast<uint8_t>((x * 43u + y * 71u + 19u) & 0xffu);
+      }
+    }
+    std::vector<uint8_t> tiled(stencil.size, 0xcd);
+    std::vector<uint8_t> restored(stencil.size, 0xa5);
+    TileConvertLinearToTiledDepth(tiled.data(), linear.data(), format, test.width,
+                                  test.height, pitch, stencil.size);
+    TileConvertTiledToLinearDepth(restored.data(), tiled.data(), format, test.width,
+                                  test.height, pitch, stencil.size);
+    for (uint32_t y = 0; y < test.height; y++) {
+      const auto row = static_cast<uint64_t>(y) * pitch;
+      Require("StencilTargetTileRoundTrip", "contents",
+              std::memcmp(linear.data() + row, restored.data() + row, test.width) == 0,
+              "linear-to-tiled PS5 stencil conversion did not round-trip");
+    }
+    if (test.width == 8 && test.height == 8) {
+      Require("StencilTargetTileRoundTrip", "Prospero S8 SW_64KB_Z_X anchors",
+              tiled[0] == linear[0] && tiled[1] == linear[1] &&
+                  tiled[4] == linear[2] && tiled[2] == linear[pitch] &&
+                  tiled[0x27] == linear[5 * pitch + 3],
+              "Prospero S8 stencil address anchors changed");
+    }
+    if (test.width == 257 && test.height == 259) {
+      Require("StencilTargetTileRoundTrip", "Prospero S8 block order",
+              tiled[0x10000] == linear[256] && tiled[0x20000] == linear[256 * pitch],
+              "Prospero S8 stencil block order changed");
+    }
+    if (test.width == 1920 && test.height == 1080) {
+      Require("StencilTargetTileRoundTrip", "PPSA01880 footprint",
+              pitch == 2048 && stencil.size == 0x280000,
+              "captured PPSA01880 stencil footprint changed");
+    }
+  }
+  std::printf("[host]    %-32s ok\n", "StencilTargetTileRoundTrip");
 }
 
 void CheckStorageTextureGpuOwnedRebindState() {
@@ -10625,10 +10692,83 @@ void CheckImageOverlapResolution() {
               DepthOverlap::Unsupported,
           "GPU-owned sampled image was admitted for retirement");
   depth.depth_load_clear = false;
-  Require("ImageOverlapResolution", "depth load",
+  Require("ImageOverlapResolution", "incompatible depth load",
           ClassifyDepthOverlap(sampled, false, depth) ==
               DepthOverlap::Unsupported,
-          "load-preserving depth use was admitted for retirement");
+          "layout-unknown depth load was admitted for retirement");
+
+  ImageInfo ppsa01880_sampled_depth{};
+  ppsa01880_sampled_depth.address = 0x1095200000ull;
+  ppsa01880_sampled_depth.size = 0x10000000ull;
+  ppsa01880_sampled_depth.format =
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
+  ppsa01880_sampled_depth.width = 8192;
+  ppsa01880_sampled_depth.height = 8192;
+  ppsa01880_sampled_depth.pitch = 8192;
+  ppsa01880_sampled_depth.tile =
+      Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
+  ppsa01880_sampled_depth.type =
+      Prospero::GpuEnumValue(Prospero::ImageType::kColor2D);
+  DepthTargetInfo ppsa01880_depth{};
+  ppsa01880_depth.address = ppsa01880_sampled_depth.address;
+  ppsa01880_depth.size = ppsa01880_sampled_depth.size;
+  ppsa01880_depth.format = VK_FORMAT_D32_SFLOAT;
+  ppsa01880_depth.guest_format = ppsa01880_sampled_depth.format;
+  ppsa01880_depth.width = ppsa01880_sampled_depth.width;
+  ppsa01880_depth.height = ppsa01880_sampled_depth.height;
+  ppsa01880_depth.pitch = ppsa01880_sampled_depth.pitch;
+  ppsa01880_depth.bytes_per_element = 4;
+  ppsa01880_depth.tile_mode = ppsa01880_sampled_depth.tile;
+  Require("ImageOverlapResolution", "PPSA01880 exact depth load",
+          ClassifyDepthOverlap(ppsa01880_sampled_depth, false,
+                               ppsa01880_depth) ==
+              DepthOverlap::RetireSampled,
+          "captured CPU-owned R32F/D32F depth layout was not retired");
+  Require("ImageOverlapResolution", "PPSA01880 GPU depth load",
+          ClassifyDepthOverlap(ppsa01880_sampled_depth, true,
+                               ppsa01880_depth) ==
+              DepthOverlap::Unsupported,
+          "captured GPU-owned sampled depth was admitted for retirement");
+  auto mismatched_sampled_depth = ppsa01880_sampled_depth;
+  mismatched_sampled_depth.pitch++;
+  auto mismatched_depth = ppsa01880_depth;
+  mismatched_depth.stencil_address = ppsa01880_depth.address + ppsa01880_depth.size;
+  mismatched_depth.stencil_size = 0x4000000;
+  Require("ImageOverlapResolution", "PPSA01880 depth layout guards",
+          ClassifyDepthOverlap(mismatched_sampled_depth, false,
+                               ppsa01880_depth) ==
+                  DepthOverlap::Unsupported &&
+              ClassifyDepthOverlap(ppsa01880_sampled_depth, false,
+                                   mismatched_depth) ==
+                  DepthOverlap::Unsupported,
+          "pitch-mismatched or stencil-bearing depth load was admitted");
+  mismatched_sampled_depth = ppsa01880_sampled_depth;
+  mismatched_sampled_depth.levels = 2;
+  mismatched_sampled_depth.view_levels = 2;
+  mismatched_depth = ppsa01880_depth;
+  mismatched_depth.format = VK_FORMAT_D16_UNORM;
+  Require("ImageOverlapResolution", "PPSA01880 depth topology guards",
+          ClassifyDepthOverlap(mismatched_sampled_depth, false,
+                               ppsa01880_depth) ==
+                  DepthOverlap::Unsupported &&
+              ClassifyDepthOverlap(ppsa01880_sampled_depth, false,
+                                   mismatched_depth) ==
+                  DepthOverlap::Unsupported,
+          "mipmapped or format-mismatched depth load was admitted");
+  Require("ImageOverlapResolution", "depth transition source",
+          SelectDepthTransitionSource(true, true, false, false, false, true) ==
+                  DepthTransitionSource::None &&
+              SelectDepthTransitionSource(false, true, false, false, false, true) ==
+                  DepthTransitionSource::Native &&
+              SelectDepthTransitionSource(false, false, false, false, false, false) ==
+                  DepthTransitionSource::Guest &&
+              SelectDepthTransitionSource(false, true, true, false, false, false) ==
+                  DepthTransitionSource::Guest &&
+              SelectDepthTransitionSource(false, true, false, true, false, false) ==
+                  DepthTransitionSource::Guest &&
+              SelectDepthTransitionSource(false, true, false, false, true, true) ==
+                  DepthTransitionSource::Guest,
+          "clear, clean-native, or overlapping dirty-buffer depth preservation policy regressed");
   depth.depth_load_clear = true;
   depth.stencil_address = sampled.address + 0x6000;
   depth.stencil_size = 0x2000;
@@ -10657,6 +10797,15 @@ void CheckImageOverlapResolution() {
   Require("ImageOverlapResolution", "stencil clear initializes",
           CanLoadStencilAttachment(depth, false),
           "stencil clear did not initialize the attachment");
+  depth.stencil_htile_compressed = false;
+  Require("ImageOverlapResolution", "raw stencil load",
+          CanLoadRawStencilPlane(depth),
+          "uncompressed guest stencil plane was rejected");
+  depth.stencil_htile_compressed = true;
+  Require("ImageOverlapResolution", "compressed stencil load",
+          !CanLoadRawStencilPlane(depth),
+          "HTile-compressed guest stencil plane was silently admitted");
+  depth.stencil_htile_compressed = false;
   depth.address = sampled.address;
   depth.size = 0xff0000;
   depth.stencil_address = sampled.address + 0x1000000;
@@ -11041,6 +11190,31 @@ void CheckEmbeddedFetchLaneSpill() {
   std::printf("[host]    %-32s ok\n", "EmbeddedFetchLaneSpill");
 }
 
+void CheckReferenceClockScale() {
+  uint64_t value = 0;
+  Require("ReferenceClockScale", "zero",
+          GraphicsScaleReferenceClock(0, 3000000000ull, &value) && value == 0,
+          "zero host tick did not produce a zero GPU clock");
+  Require("ReferenceClockScale", "fractional second",
+          GraphicsScaleReferenceClock(1500000000ull, 3000000000ull, &value) &&
+              value == 50000000ull,
+          "host half-second did not scale to 50,000,000 ticks");
+  Require("ReferenceClockScale", "whole and fractional",
+          GraphicsScaleReferenceClock(3750000000ull, 3000000000ull, &value) &&
+              value == 125000000ull,
+          "host 1.25 seconds did not scale to 125,000,000 ticks");
+  Require("ReferenceClockScale", "monotonic floor",
+          GraphicsScaleReferenceClock(3750000001ull, 3000000000ull, &value) &&
+              value == 125000000ull,
+          "sub-reference-tick increment did not use a monotonic floor");
+  Require("ReferenceClockScale", "guards",
+          !GraphicsScaleReferenceClock(1, 0, &value) &&
+              !GraphicsScaleReferenceClock(1, 1, nullptr) &&
+              !GraphicsScaleReferenceClock(UINT64_MAX, 1, &value),
+          "invalid frequency, destination, or overflow was accepted");
+  std::printf("[host]    %-32s ok\n", "ReferenceClockScale");
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -11049,6 +11223,10 @@ int main(int argc, char **argv) {
 
   EnsureConfigInitialized();
   TileInit();
+  if (argc == 2 && std::strcmp(argv[1], "--reference-clock-only") == 0) {
+    CheckReferenceClockScale();
+    return 0;
+  }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
     CheckImageOverlapResolution();
@@ -11096,6 +11274,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-readback-only") == 0) {
     CheckDepthTargetTileRoundTrip();
+    CheckStencilTargetTileRoundTrip();
     CheckDepthTargetFootprints();
     return 0;
   }
@@ -11126,6 +11305,7 @@ int main(int argc, char **argv) {
   CheckStorageImageSwizzleSpecializationId();
   CheckRenderTargetTileRoundTrip();
   CheckDepthTargetTileRoundTrip();
+  CheckStencilTargetTileRoundTrip();
   CheckStorageTextureVolumeUploadLayout();
   CheckStorageTextureGpuOwnedRebindState();
   CheckStorageTextureSampledReuse();
@@ -11145,6 +11325,7 @@ int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
 #endif
+  CheckReferenceClockScale();
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
   CheckPs5GameExampleImageClearRuntimeShape();

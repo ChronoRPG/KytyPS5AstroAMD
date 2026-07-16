@@ -26,6 +26,9 @@ struct BufferImageCopySource {
 	uint64_t      address     = 0;
 	uint64_t      size        = 0;
 	bool          cpu_current = false;
+	// True when the guest range was CPU-dirty before coherence resolution. ObtainBufferForImage
+	// may consume that tracker state while publishing the same bytes to a cached buffer.
+	bool cpu_dirty = false;
 };
 
 struct BufferCacheRange {

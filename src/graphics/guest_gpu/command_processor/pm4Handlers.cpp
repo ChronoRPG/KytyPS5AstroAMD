@@ -2224,6 +2224,15 @@ KYTY_CP_OP_PARSER(CpOpCopyData) {
 	const uint32_t num_bytes     = ((control >> 16u) & 0x1u) != 0 ? 8u : 4u;
 	const uint64_t src           = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
 	const uint64_t dst           = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
+	if (src_sel == (9u << 1u)) {
+		if (dst_sel != (2u << 1u) || dst == 0 || (dst & (num_bytes - 1u)) != 0) {
+			EXIT("unsupported reference-clock copyData, src_sel=0x%02" PRIx32
+			     " dst_sel=0x%02" PRIx32 " dst=0x%016" PRIx64 " size=%u\n",
+			     src_sel, dst_sel, dst, num_bytes);
+		}
+		cp->WriteReferenceClock(dst, num_bytes);
+		return 5;
+	}
 	const auto     dma_src       = CopyDataSrcToDma(src_sel);
 	if (dma_src == 2 && num_bytes == 8) {
 		EXIT("unsupported 64-bit immediate copyData\n");

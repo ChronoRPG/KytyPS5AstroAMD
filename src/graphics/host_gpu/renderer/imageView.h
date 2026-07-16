@@ -88,6 +88,7 @@ namespace Libs::Graphics {
 		switch (swizzle) {
 			case DstSel(4, 4, 4, 4): return VulkanImage::VIEW_DEPTH_TEXTURE;
 			case DstSel(4, 0, 0, 0): return VulkanImage::VIEW_R000;
+			case DstSel(4, 0, 0, 1): return VulkanImage::VIEW_R001;
 			default: break;
 		}
 	}

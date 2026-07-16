@@ -4,8 +4,8 @@
 #include "common/abi.h"
 #include "common/common.h"
 
+#include <span>
 #include <utility>
-#include <vector>
 #include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
@@ -47,7 +47,7 @@ struct ImageImageCopy {
 	int          dst_z = 0;
 };
 
-enum class StagingBufferType { Texture, Vertex, Index, ReadBack };
+enum class StagingBufferType { Texture, Vertex, ReadBack };
 
 class UtilScratchBuffer {
 public:
@@ -61,36 +61,30 @@ private:
 	void* m_data = nullptr;
 };
 
-void UtilBufferToImage(CommandBuffer* buffer, VulkanBuffer* src_buffer, uint32_t src_pitch,
-                       VulkanImage* dst_image, uint64_t dst_layout);
-void UtilBufferToImage(CommandBuffer* buffer, VulkanBuffer* src_buffer, VulkanImage* dst_image,
-                       const std::vector<BufferImageCopy>& regions, uint64_t dst_layout);
-void UtilImageToBuffer(CommandBuffer* buffer, VulkanImage* src_image, VulkanBuffer* dst_buffer,
-                       uint32_t dst_pitch, uint64_t src_layout,
-                       VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT);
-void UtilImageToImage(CommandBuffer* buffer, const std::vector<ImageImageCopy>& regions,
+void UtilImageToImage(CommandBuffer* buffer, std::span<const ImageImageCopy> regions,
                       VulkanImage* dst_image, uint64_t dst_layout);
+void UtilCopyImageWithBuffer(CommandBuffer* buffer, GraphicContext* ctx, VulkanImage* src_image,
+                             VkImageAspectFlags src_aspect, VulkanImage* dst_image,
+                             VkImageAspectFlags dst_aspect, uint32_t bytes_per_element,
+                             uint64_t dst_layout);
 void UtilBlitImage(CommandBuffer* buffer, VulkanImage* src_image, VulkanSwapchain* dst_swapchain);
 void UtilFillImage(GraphicContext* ctx, VulkanImage* dst_image, const void* src_data, uint64_t size,
                    uint32_t src_pitch, uint64_t dst_layout);
-void UtilFillDepthImage(GraphicContext* ctx, DepthStencilVulkanImage* dst_image,
-                        const void* src_data, uint64_t size, uint32_t src_pitch);
+void UtilFillImage(GraphicContext* ctx, DepthStencilVulkanImage* dst_image, const void* src_data,
+                   uint64_t size, uint32_t src_pitch, VkImageAspectFlags aspect);
 void UtilFillImage(GraphicContext* ctx, VulkanImage* dst_image, const void* src_data, uint64_t size,
-                   const std::vector<BufferImageCopy>& regions, uint64_t dst_layout);
-void UtilFillImage(GraphicContext* ctx, const std::vector<ImageImageCopy>& regions,
+                   std::span<const BufferImageCopy> regions, uint64_t dst_layout);
+void UtilFillImage(GraphicContext* ctx, std::span<const ImageImageCopy> regions,
                    VulkanImage* dst_image, uint64_t dst_layout);
 void UtilFillBuffer(GraphicContext* ctx, void* dst_data, uint64_t size, uint32_t dst_pitch,
                     VulkanImage* src_image, uint64_t src_layout,
                     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT);
-void UtilUploadBuffer(GraphicContext* ctx, StagingBufferType type, VulkanBuffer* dst_buffer,
-                      const void* src_data, uint64_t size);
 void UtilUploadBuffer(GraphicContext* ctx, StagingBufferType type, VulkanBuffer* dst_buffer,
                       uint64_t dst_offset, const void* src_data, uint64_t size);
 void UtilCopyBuffer(VulkanBuffer* src_buffer, VulkanBuffer* dst_buffer, uint64_t size);
 void UtilDownloadBuffer(GraphicContext* ctx, VulkanBuffer* src_buffer, uint64_t src_offset,
                         void* dst_data, uint64_t size);
 bool UtilBufferIsTiled(uint64_t vaddr, uint64_t size);
-void UtilSetDepthLayoutOptimal(DepthStencilVulkanImage* image);
 void UtilSetImageLayoutOptimal(VulkanImage* image);
 void UtilResetImageViews(VulkanImage* image);
 void UtilCreateImageView(GraphicContext* ctx, VulkanImage* image, int view_index,

@@ -1207,6 +1207,7 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 		     (vaddr & (TRACKER_PAGE_SIZE - 1)) == 0 && (size & (TRACKER_PAGE_SIZE - 1)) == 0);
 	}
 	FaultSafeCacheLock lock(this, m_mutex);
+	const bool         cpu_dirty = m_memory_tracker.IsRegionCpuModified(vaddr, size);
 	auto use_coherent_guest_backing = [&](const CachedBuffer& overlap) {
 		const bool gpu_modified = m_memory_tracker.IsRegionGpuModified(vaddr, size);
 		const auto dirty_ranges = m_gpu_modified_ranges.Intersections(vaddr, size);
@@ -1219,7 +1220,7 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 		// A clean/CPU-current image range may coexist with a partial cached-buffer view because
 		// guest backing is authoritative. The PS5 detiler consumes that backing at the existing
 		// Tiler seam.
-		return BufferImageCopySource {nullptr, 0, vaddr, size, true};
+		return BufferImageCopySource {nullptr, 0, vaddr, size, true, cpu_dirty};
 	};
 	auto               it = m_buffers.upper_bound(vaddr);
 	if (it == m_buffers.begin()) {
@@ -1227,7 +1228,7 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 		    PageOverlaps(vaddr, size, it->second->vaddr, it->second->size)) {
 			return use_coherent_guest_backing(*it->second);
 		}
-		return {nullptr, 0, vaddr, size, true};
+		return {nullptr, 0, vaddr, size, true, cpu_dirty};
 	}
 	--it;
 	auto&      cached = *it->second;
@@ -1241,7 +1242,7 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 		    PageOverlaps(vaddr, size, next->second->vaddr, next->second->size)) {
 			return use_coherent_guest_backing(*next->second);
 		}
-		return {nullptr, 0, vaddr, size, true};
+		return {nullptr, 0, vaddr, size, true, cpu_dirty};
 	}
 	if (cached.ctx == nullptr || cached.buffer == nullptr || cached.buffer->buffer == nullptr) {
 		EXIT("BufferCache: inconsistent image source, addr=0x%016" PRIx64 " size=0x%016" PRIx64
@@ -1250,7 +1251,7 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 		     static_cast<const void*>(cached.buffer.get()));
 	}
 	const bool gpu_modified = m_memory_tracker.IsRegionGpuModified(vaddr, size);
-	const bool cpu_modified = m_memory_tracker.IsRegionCpuModified(vaddr, size);
+	const bool cpu_modified = cpu_dirty;
 	if (gpu_modified && cpu_modified) {
 		EXIT("BufferCache: image source is both CPU- and GPU-modified, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 "\n",
@@ -1333,7 +1334,7 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	return {cached.buffer.get(), offset, vaddr, size, true};
+	return {cached.buffer.get(), offset, vaddr, size, true, cpu_dirty};
 }
 
 namespace {

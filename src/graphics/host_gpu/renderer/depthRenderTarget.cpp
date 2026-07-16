@@ -340,6 +340,8 @@ void ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	    (r->stencil_test_enable &&
 	     (stencil_face_accesses_attachment(r->stencil_static_front, r->stencil_dynamic_front) ||
 	      stencil_face_accesses_attachment(r->stencil_static_back, r->stencil_dynamic_back)));
+	info.stencil_htile_compressed =
+	    has_stencil && has_htile && !z.stencil_info.tile_stencil_disable;
 	r->vulkan_buffer = cache->FindDepthTarget(buffer, g_render_ctx->GetGraphicCtx(), info);
 	if (meta_clear && !cache->TouchMeta(z.htile_data_base_addr, z.depth_view.slice_start, false)) {
 		DepthFatal("failed to consume HTile clear state");

@@ -50,8 +50,8 @@ void Tiler::DetileImage(GraphicContext* ctx, GpuTextureVulkanImage* image,
 }
 
 void Tiler::DetileImage(GraphicContext* ctx, DepthStencilVulkanImage* image,
-                              const DepthTargetInfo& info, const BufferImageCopySource& source,
-                              bool refresh) const {
+                               const DepthTargetInfo& info, const BufferImageCopySource& source,
+                               bool refresh) const {
 	const bool d16 = info.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm) &&
 	                 info.format == VK_FORMAT_D16_UNORM && info.bytes_per_element == 2;
 	const bool d32 =
@@ -80,7 +80,54 @@ void Tiler::DetileImage(GraphicContext* ctx, DepthStencilVulkanImage* image,
 	TileConvertTiledToLinearDepth(linear.Data(), reinterpret_cast<const void*>(source.address),
 	                              info.guest_format, info.width, info.height, info.pitch,
 	                              info.size);
-	UtilFillDepthImage(ctx, image, linear.Data(), info.size, info.pitch);
+	UtilFillImage(ctx, image, linear.Data(), info.size, info.pitch, VK_IMAGE_ASPECT_DEPTH_BIT);
+}
+
+void Tiler::DetileStencil(GraphicContext* ctx, DepthStencilVulkanImage* image,
+                          const DepthTargetInfo& info, const BufferImageCopySource& source,
+                          bool refresh) const {
+	TileSizeAlign stencil_size {};
+	TileSizeAlign htile_size {};
+	TileSizeAlign depth_size {};
+	const auto stencil_format = Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt);
+	const auto stencil_pitch  = TileGetTexturePitch(
+	     stencil_format, info.width, 1, Prospero::GpuEnumValue(Prospero::TileMode::kDepth));
+	const bool    supported_layout =
+	    TileGetDepthSize(info.width, info.height, 0,
+	                     Prospero::GpuEnumValue(Prospero::DepthFormat::kZ32F),
+	                     Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt),
+	                     info.htile_address != 0, &stencil_size, &htile_size, &depth_size) &&
+	    stencil_size.size == info.stencil_size && stencil_size.align == 65536 &&
+	    stencil_pitch != 0;
+	if (ctx == nullptr || image == nullptr || info.address == 0 || info.size == 0 ||
+	    info.stencil_address == 0 || info.stencil_size == 0 || info.width == 0 ||
+	    info.height == 0 || info.format != VK_FORMAT_D32_SFLOAT_S8_UINT ||
+	    info.guest_format != Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) ||
+	    info.bytes_per_element != 4 ||
+	    info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kDepth) ||
+	    info.stencil_htile_compressed || !supported_layout || !source.cpu_current ||
+	    source.address != info.stencil_address ||
+	    source.size != info.stencil_size || (source.buffer == nullptr && source.offset != 0)) {
+		EXIT("Tiler: unsupported stencil detile, ctx=%p image=%p source_buffer=%p "
+		     "source=0x%016" PRIx64 "+0x%016" PRIx64 " offset=0x%016" PRIx64
+		     " current=%d stencil=0x%016" PRIx64 "+0x%016" PRIx64
+		     " extent=%ux%u depth_pitch=%u stencil_pitch=%u tile=%u format=%d guest_format=%u "
+		     "bpe=%u\n",
+		     static_cast<const void*>(ctx), static_cast<const void*>(image),
+		     static_cast<const void*>(source.buffer), source.address, source.size, source.offset,
+		     source.cpu_current, info.stencil_address, info.stencil_size, info.width, info.height,
+		     info.pitch, stencil_pitch, info.tile_mode, static_cast<int>(info.format),
+		     info.guest_format, info.bytes_per_element);
+	}
+	if (refresh) {
+		VulkanDeviceWaitIdle(ctx);
+	}
+	UtilScratchBuffer linear(info.stencil_size);
+	TileConvertTiledToLinearDepth(linear.Data(), reinterpret_cast<const void*>(source.address),
+	                              stencil_format, info.width, info.height, stencil_pitch,
+	                              info.stencil_size);
+	UtilFillImage(ctx, image, linear.Data(), info.stencil_size, stencil_pitch,
+	              VK_IMAGE_ASPECT_STENCIL_BIT);
 }
 
 void Tiler::TileImage(void* dst, const void* src, const RenderTargetInfo& info) const {

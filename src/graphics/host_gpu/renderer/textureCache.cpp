@@ -591,7 +591,8 @@ bool Equal(const DepthTargetInfo& left, const DepthTargetInfo& right) {
 	       left.htile_size == right.htile_size && left.format == right.format &&
 	       left.guest_format == right.guest_format && left.width == right.width &&
 	       left.height == right.height && left.pitch == right.pitch &&
-	       left.bytes_per_element == right.bytes_per_element && left.tile_mode == right.tile_mode;
+	       left.bytes_per_element == right.bytes_per_element && left.tile_mode == right.tile_mode &&
+	       left.stencil_htile_compressed == right.stencil_htile_compressed;
 }
 
 [[nodiscard]] bool IsCoherentGuestImageSource(const BufferImageCopySource& source,
@@ -862,6 +863,11 @@ void CreateDepthViews(GraphicContext* ctx, DepthStencilVulkanImage* image) {
 	                    VK_IMAGE_ASPECT_DEPTH_BIT,
 	                    {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ZERO,
 	                     VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO},
+	                    0, 0, 1, 1);
+	UtilCreateImageView(ctx, image, VulkanImage::VIEW_R001, VK_IMAGE_VIEW_TYPE_2D,
+	                    VK_IMAGE_ASPECT_DEPTH_BIT,
+	                    {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ZERO,
+	                     VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE},
 	                    0, 0, 1, 1);
 }
 
@@ -1840,6 +1846,7 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 	                   PageOverlaps(info.address, info.size, info.htile_address, info.htile_size) ||
 	                   (has_stencil && PageOverlaps(info.stencil_address, info.stencil_size,
 	                                                info.htile_address, info.htile_size)))) ||
+	    (info.stencil_htile_compressed && (!has_stencil || !has_htile)) ||
 	    !(info.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm)
 	          ? !has_stencil && info.format == VK_FORMAT_D16_UNORM && info.bytes_per_element == 2
 	          : info.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) &&
@@ -1871,14 +1878,23 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 		     " elements=0x%016" PRIx64 "\n",
 		     info.stencil_size, elements);
 	}
+	if (has_stencil && !info.stencil_load_clear && !CanLoadRawStencilPlane(info)) {
+		EXIT("TextureCache: HTile-compressed stencil load is unsupported, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " htile=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
+		     info.stencil_address, info.stencil_size, info.htile_address, info.htile_size);
+	}
 	if (has_htile) {
 		RegisterMeta(info.htile_address, info.htile_size);
 	}
 	std::lock_guard transaction(m_resource_mutex);
-	const auto      depth_source = m_buffer_cache.ObtainBufferForImage(info.address, info.size);
-	if (has_stencil) {
-		(void)m_buffer_cache.ObtainBufferForImage(info.stencil_address, info.stencil_size);
-	}
+	// BufferCache treats an untracked guest range as CPU-current. That is useful when
+	// uploading from guest memory, but it is not evidence that a clean native image is
+	// stale. Only a genuinely overlapping buffer participates in transition selection.
+	const bool depth_buffer_overlap = m_buffer_cache.HasPageOverlap(info.address, info.size);
+	const auto depth_source = m_buffer_cache.ObtainBufferForImage(info.address, info.size);
+	const auto stencil_source =
+	    has_stencil ? m_buffer_cache.ObtainBufferForImage(info.stencil_address, info.stencil_size)
+	                : BufferImageCopySource {};
 	FaultSafeTextureLock lock(this, m_lock);
 	RequireNoMetaOverlapLocked(info.address, info.size);
 	if (has_stencil) {
@@ -1900,37 +1916,32 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 		if (has_stencil && info.stencil_load_clear) {
 			match->stencil_initialized = true;
 		}
-		if (!match->gpu_modified && m_memory_tracker.IsRegionCpuModified(info.address, info.size)) {
-			if (has_stencil && match->stencil_initialized && !info.stencil_load_clear) {
-				EXIT("TextureCache: depth refresh would discard initialized stencil, "
-				     "addr=0x%016" PRIx64 "\n",
-				     info.address);
-			}
+		if (!match->gpu_modified && depth_source.cpu_dirty) {
 			m_memory_tracker.ForEachUploadRange(
 			    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
 			    [&]() noexcept {
 				    m_tiler.DetileImage(ctx,
-				                               static_cast<DepthStencilVulkanImage*>(match->image),
-				                               match->depth, depth_source, true);
+				                        static_cast<DepthStencilVulkanImage*>(match->image),
+				                        match->depth, depth_source, true);
 			    });
 		}
-		if (!match->gpu_modified && has_stencil &&
-		    m_memory_tracker.IsRegionCpuModified(info.stencil_address, info.stencil_size)) {
-			if (!info.stencil_load_clear) {
-				if (info.stencil_access) {
-					EXIT("TextureCache: stencil refresh from guest memory is unsupported, "
-					     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-					     info.stencil_address, info.stencil_size);
-				}
-			} else {
-				m_memory_tracker.ForEachUploadRange(
-				    info.stencil_address, info.stencil_size, false,
-				    [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
-			}
+		if (!match->gpu_modified && has_stencil && stencil_source.cpu_dirty) {
+			m_memory_tracker.ForEachUploadRange(
+			    info.stencil_address, info.stencil_size, false,
+			    [](uint64_t, uint64_t) noexcept {},
+			    [&]() noexcept {
+				    if (!info.stencil_load_clear) {
+					    m_tiler.DetileStencil(
+					        ctx, static_cast<DepthStencilVulkanImage*>(match->image), match->depth,
+					        stencil_source, true);
+					    match->stencil_initialized = true;
+				    }
+			    });
 		}
 		return static_cast<DepthStencilVulkanImage*>(match->image);
 	}
 	std::vector<CachedImage*> retire;
+	std::shared_ptr<CachedImage> sampled_depth_source;
 	for (const auto& entry: m_images) {
 		auto&      cached = *entry;
 		const bool overlaps =
@@ -1946,6 +1957,9 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 			     "+0x%016" PRIx64 " existing_kind=%u existing=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
 			     info.address, info.size, static_cast<uint32_t>(cached.kind), cached.Address(),
 			     cached.Size());
+		}
+		if (!info.depth_load_clear && sampled_depth_source == nullptr) {
+			sampled_depth_source = entry;
 		}
 		retire.push_back(&cached);
 	}
@@ -1979,19 +1993,64 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 	cached->ctx                 = ctx;
 	cached->stencil_initialized = !has_stencil || info.stencil_load_clear;
 	cached->image               = CreateDepthTarget(ctx, info, &cached->memory);
+	if (sampled_depth_source != nullptr &&
+	    (sampled_depth_source->image->type != VulkanImageType::Texture ||
+	     sampled_depth_source->image->format != Prospero::SurfaceFormat(info.guest_format) ||
+	     sampled_depth_source->image->extent.width != info.width ||
+	     sampled_depth_source->image->extent.height != info.height)) {
+		EXIT("TextureCache: sampled-depth native source is inconsistent, format=%d/%d "
+		     "extent=%ux%u/%ux%u type=%u\n",
+		     static_cast<int>(sampled_depth_source->image->format),
+		     static_cast<int>(Prospero::SurfaceFormat(info.guest_format)),
+		     sampled_depth_source->image->extent.width,
+		     sampled_depth_source->image->extent.height, info.width, info.height,
+		     static_cast<uint32_t>(sampled_depth_source->image->type));
+	}
+	const auto transition_source = SelectDepthTransitionSource(
+	    info.depth_load_clear, sampled_depth_source != nullptr,
+	    sampled_depth_source != nullptr && sampled_depth_source->info.IsCpuDirty(),
+	    sampled_depth_source != nullptr && sampled_depth_source->buffer_modified,
+	    depth_buffer_overlap, depth_source.cpu_dirty);
+	LOGF("TextureCache: depth transition source=%u sampled=%d sampled_cpu_dirty=%d "
+	     "sampled_buffer_dirty=%d buffer_overlap=%d buffer_cpu_dirty=%d addr=0x%016" PRIx64
+	     " size=0x%016" PRIx64 "\n",
+	     static_cast<uint32_t>(transition_source), sampled_depth_source != nullptr,
+	     sampled_depth_source != nullptr && sampled_depth_source->info.IsCpuDirty(),
+	     sampled_depth_source != nullptr && sampled_depth_source->buffer_modified,
+	     depth_buffer_overlap, depth_source.cpu_dirty, info.address, info.size);
 	m_memory_tracker.ForEachUploadRange(
 	    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
 	    [&]() noexcept {
-		    if (!info.depth_load_clear) {
-			    m_tiler.DetileImage(ctx,
-			                               static_cast<DepthStencilVulkanImage*>(cached->image),
-			                               info, depth_source, false);
+		    switch (transition_source) {
+			    case DepthTransitionSource::None: break;
+			    case DepthTransitionSource::Guest:
+				    m_tiler.DetileImage(ctx, static_cast<DepthStencilVulkanImage*>(cached->image),
+				                        info, depth_source, false);
+				    break;
+			    case DepthTransitionSource::Native:
+				    command->RetainResourceUntilFence(sampled_depth_source);
+				    UtilCopyImageWithBuffer(
+				        command, ctx, sampled_depth_source->image, VK_IMAGE_ASPECT_COLOR_BIT,
+				        cached->image, VK_IMAGE_ASPECT_DEPTH_BIT, info.bytes_per_element,
+				        static_cast<uint64_t>(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL));
+				    LOGF("TextureCache: preserved sampled depth through native buffer copy, "
+				         "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				         info.address, info.size);
+				    break;
 		    }
 	    });
 	if (has_stencil) {
 		m_memory_tracker.ForEachUploadRange(
-		    info.stencil_address, info.stencil_size, false, [](uint64_t, uint64_t) noexcept {},
-		    []() noexcept {});
+		    info.stencil_address, info.stencil_size, false,
+		    [](uint64_t, uint64_t) noexcept {},
+		    [&]() noexcept {
+			    if (!info.stencil_load_clear) {
+				    m_tiler.DetileStencil(
+				        ctx, static_cast<DepthStencilVulkanImage*>(cached->image), info,
+				        stencil_source, false);
+			    }
+		    });
+		cached->stencil_initialized = true;
 	}
 	auto* image = static_cast<DepthStencilVulkanImage*>(cached->image);
 	m_images.push_back(std::move(cached));
