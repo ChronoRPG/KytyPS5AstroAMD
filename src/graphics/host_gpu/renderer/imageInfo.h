@@ -173,7 +173,13 @@ struct VideoOutPixelFormatInfo {
 
 enum class DepthOverlap : uint8_t { None, RetireSampled, Unsupported };
 enum class DepthTransitionSource : uint8_t { None, Guest, Native };
-enum class RenderTargetOverlap : uint8_t { None, RetireSampled, RetireTarget, Unsupported };
+enum class RenderTargetOverlap : uint8_t {
+	None,
+	RetireSampled,
+	PreserveStorage,
+	RetireTarget,
+	Unsupported
+};
 enum class SampledOverlap : uint8_t { None, ReadOnlyAlias, Unsupported };
 enum class StorageSampledOverlap : uint8_t { None, ExactImage, Unsupported };
 enum class HostWriteOverlap : uint8_t { None, InvalidateImage, Unsupported };
@@ -471,6 +477,27 @@ ClassifyRenderTargetOverlap(const ImageInfo& sampled, bool sampled_gpu_modified,
 	    ImageRangeOverlaps(sampled.address, sampled.size, target.address, target.size);
 	return !sampled_gpu_modified && same_context && (exact || page_isolated_overlap)
 	           ? RenderTargetOverlap::RetireSampled
+	           : RenderTargetOverlap::Unsupported;
+}
+
+[[nodiscard]] inline RenderTargetOverlap ClassifyStorageRenderTargetOverlap(
+    const ImageInfo& storage, VkFormat storage_format, bool storage_gpu_modified,
+    bool storage_buffer_modified, bool storage_cpu_dirty, bool same_context,
+    const RenderTargetInfo& target) {
+	if (!ImagePageRangesOverlap(storage.address, storage.size, target.address, target.size)) {
+		return RenderTargetOverlap::None;
+	}
+	const bool exact_native_image =
+	    storage.address == target.address && storage.size == target.size &&
+	    storage_format == target.format && storage.width == target.width &&
+	    storage.height == target.height && storage.pitch == target.pitch &&
+	    storage.base_level == 0 && storage.levels == 1 && storage.view_levels == 1 &&
+	    storage.tile == target.tile_mode && storage.depth == 1 &&
+	    storage.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
+	    storage.base_array == 0 && target.levels == 1;
+	return exact_native_image && storage_gpu_modified && !storage_buffer_modified &&
+	               !storage_cpu_dirty && same_context
+	           ? RenderTargetOverlap::PreserveStorage
 	           : RenderTargetOverlap::Unsupported;
 }
 

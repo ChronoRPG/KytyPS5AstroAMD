@@ -115,7 +115,8 @@ private:
 	                                                              uint64_t size) const;
 	void                       RequireNoMetaOverlapLocked(uint64_t vaddr, uint64_t size) const;
 	void                       MarkSampledAliasesCpuDirtyLocked(uint64_t vaddr, uint64_t size);
-	void                       RetireImages(const std::vector<CachedImage*>& retire);
+	void RetireImages(const std::vector<CachedImage*>& retire,
+	                  const CachedImage* native_storage_source = nullptr);
 	void                       SynchronizeRenderTargetToBufferLocked(CachedImage& cached);
 
 	Common::Mutex                             m_dummy_mutex;

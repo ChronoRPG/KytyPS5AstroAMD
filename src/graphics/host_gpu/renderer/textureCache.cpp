@@ -527,13 +527,15 @@ struct TextureCache::ReadbackWorker {
 	std::thread          thread;
 };
 
-void TextureCache::RetireImages(const std::vector<CachedImage*>& retire) {
+void TextureCache::RetireImages(const std::vector<CachedImage*>& retire,
+                                const CachedImage* native_storage_source) {
 	if (retire.empty()) {
 		return;
 	}
 	// FindTexture and FindRenderTarget retain cache records on their recording commands. Erasing
 	// the lookup owner therefore defers Vulkan destruction until the last referencing fence.
-	size_t removed = 0;
+	size_t removed                = 0;
+	bool   native_storage_retired = false;
 	for (auto it = m_images.begin(); it != m_images.end();) {
 		if (std::find(retire.begin(), retire.end(), it->get()) == retire.end()) {
 			++it;
@@ -541,7 +543,22 @@ void TextureCache::RetireImages(const std::vector<CachedImage*>& retire) {
 		}
 		const bool sampled = (*it)->kind == CachedImage::Kind::Texture;
 		const bool target  = (*it)->kind == CachedImage::Kind::RenderTarget;
-		if ((!sampled && !target) || (*it)->gpu_modified || (target && (*it)->buffer_modified)) {
+		const bool native_storage = it->get() == native_storage_source;
+		if (native_storage) {
+			if ((*it)->kind != CachedImage::Kind::StorageTexture || !(*it)->gpu_modified ||
+			    (*it)->buffer_modified || (*it)->info.IsCpuDirty() ||
+			    !m_memory_tracker.IsRegionGpuModified((*it)->Address(), (*it)->Size())) {
+				EXIT("TextureCache: invalid native storage-image retirement, kind=%u "
+				     "gpu_modified=%d buffer_modified=%d cpu_dirty=%d tracker_gpu_modified=%d\n",
+				     static_cast<uint32_t>((*it)->kind), (*it)->gpu_modified,
+				     (*it)->buffer_modified, (*it)->info.IsCpuDirty(),
+				     m_memory_tracker.IsRegionGpuModified((*it)->Address(), (*it)->Size()));
+			}
+			(*it)->gpu_modified  = false;
+			native_storage_retired = true;
+		}
+		if ((!sampled && !target && !native_storage) || (*it)->gpu_modified ||
+		    (target && (*it)->buffer_modified)) {
 			EXIT("TextureCache: invalid image retirement, kind=%u gpu_modified=%d "
 			     "buffer_modified=%d\n",
 			     static_cast<uint32_t>((*it)->kind), (*it)->gpu_modified, (*it)->buffer_modified);
@@ -553,7 +570,11 @@ void TextureCache::RetireImages(const std::vector<CachedImage*>& retire) {
 				     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 				     (*it)->Address(range), (*it)->Size(range));
 			}
-			m_memory_tracker.UntrackMemory((*it)->Address(range), (*it)->Size(range));
+			// An exact storage-to-target transition transfers this registration to the new cache
+			// record. Keeping it GPU-owned also keeps guest page protection continuous.
+			if (!native_storage) {
+				m_memory_tracker.UntrackMemory((*it)->Address(range), (*it)->Size(range));
+			}
 		}
 		it = m_images.erase(it);
 		removed++;
@@ -561,6 +582,9 @@ void TextureCache::RetireImages(const std::vector<CachedImage*>& retire) {
 	if (removed != retire.size()) {
 		EXIT("TextureCache: image retirement set mismatch, requested=%zu removed=%zu\n",
 		     retire.size(), removed);
+	}
+	if (native_storage_source != nullptr && !native_storage_retired) {
+		EXIT("TextureCache: native storage-image retirement source was not retired\n");
 	}
 }
 
@@ -1759,25 +1783,53 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 		command->RetainResourceUntilFence(match);
 		return static_cast<RenderTextureVulkanImage*>(match->image);
 	}
-	std::vector<CachedImage*> retire;
+	std::vector<CachedImage*>       retire;
+	std::shared_ptr<CachedImage> native_storage_source;
 	for (const auto& entry: m_images) {
 		auto& cached = *entry;
 		if (!cached.OverlapsRange(info.address, info.size, true)) {
 			continue;
 		}
-		const auto overlap =
-		    cached.kind == CachedImage::Kind::Texture
-		        ? ClassifyRenderTargetOverlap(cached.info, cached.gpu_modified, cached.ctx == ctx,
-		                                      info)
-		    : cached.kind == CachedImage::Kind::RenderTarget
-		        ? ClassifyRenderTargetOverlap(cached.target, cached.gpu_modified,
-		                                      cached.buffer_modified, cached.ctx == ctx, info)
-		        : RenderTargetOverlap::Unsupported;
-		const bool retire_sampled = cached.kind == CachedImage::Kind::Texture &&
-		                            overlap == RenderTargetOverlap::RetireSampled;
-		const bool retire_target  = cached.kind == CachedImage::Kind::RenderTarget &&
-		                            overlap == RenderTargetOverlap::RetireTarget;
-		if (!retire_sampled && !retire_target) {
+		RenderTargetOverlap overlap = RenderTargetOverlap::Unsupported;
+		switch (cached.kind) {
+			case CachedImage::Kind::Texture:
+				overlap = ClassifyRenderTargetOverlap(cached.info, cached.gpu_modified,
+				                                      cached.ctx == ctx, info);
+				break;
+			case CachedImage::Kind::StorageTexture:
+				overlap = ClassifyStorageRenderTargetOverlap(
+				    cached.info, cached.image->format, cached.gpu_modified,
+				    cached.buffer_modified,
+				    cached.info.IsCpuDirty() ||
+				        m_memory_tracker.IsRegionCpuModified(cached.info.address, cached.info.size),
+				    cached.ctx == ctx, info);
+				break;
+			case CachedImage::Kind::RenderTarget:
+				overlap = ClassifyRenderTargetOverlap(cached.target, cached.gpu_modified,
+				                                      cached.buffer_modified, cached.ctx == ctx, info);
+				break;
+			case CachedImage::Kind::DepthTarget:
+			case CachedImage::Kind::VideoOut: break;
+		}
+		bool supported = false;
+		switch (overlap) {
+			case RenderTargetOverlap::RetireSampled:
+				supported = cached.kind == CachedImage::Kind::Texture;
+				break;
+			case RenderTargetOverlap::PreserveStorage:
+				supported = cached.kind == CachedImage::Kind::StorageTexture &&
+				            native_storage_source == nullptr;
+				if (supported) {
+					native_storage_source = entry;
+				}
+				break;
+			case RenderTargetOverlap::RetireTarget:
+				supported = cached.kind == CachedImage::Kind::RenderTarget;
+				break;
+			case RenderTargetOverlap::None:
+			case RenderTargetOverlap::Unsupported: break;
+		}
+		if (!supported) {
 			EXIT("TextureCache: unsupported render-target alias, requested=0x%016" PRIx64
 			     "+0x%016" PRIx64 " existing_kind=%u existing=0x%016" PRIx64 "+0x%016" PRIx64
 			     " gpu_modified=%d same_context=%d"
@@ -1809,18 +1861,37 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 		     info.address, info.size, retired.address, retired.size, retained.address,
 		     retained.size);
 	}
-	RetireImages(retire);
+	RetireImages(retire, native_storage_source.get());
 	auto cached    = std::make_shared<CachedImage>();
 	cached->kind   = CachedImage::Kind::RenderTarget;
 	cached->target = info;
 	cached->ctx    = ctx;
 	cached->image  = CreateRenderTarget(ctx, info, &cached->memory);
-	m_memory_tracker.ForEachUploadRange(
-	    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
-	    [&]() noexcept {
-		    UploadRenderTarget(ctx, static_cast<RenderTextureVulkanImage*>(cached->image), info,
-		                       false);
-	    });
+	const bool preserve_native = native_storage_source != nullptr;
+	if (preserve_native) {
+		command->RetainResourceUntilFence(native_storage_source);
+		ImageImageCopy region {};
+		region.src_image = native_storage_source->image;
+		region.src_level = 0;
+		region.dst_level = 0;
+		region.width     = info.width;
+		region.height    = info.height;
+		UtilImageToImage(command, std::span<const ImageImageCopy>(&region, 1), cached->image,
+		                 static_cast<uint64_t>(RENDER_COLOR_IMAGE_LAYOUT));
+	} else {
+		m_memory_tracker.ForEachUploadRange(
+		    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
+		    [&]() noexcept {
+			    UploadRenderTarget(ctx, static_cast<RenderTextureVulkanImage*>(cached->image), info,
+			                       false);
+		    });
+	}
+	cached->gpu_modified = preserve_native;
+	if (preserve_native) {
+		LOGF("TextureCache: preserved storage image through native render-target copy, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " format=%d extent=%ux%u\n",
+		     info.address, info.size, static_cast<int>(info.format), info.width, info.height);
+	}
 	auto* image = static_cast<RenderTextureVulkanImage*>(cached->image);
 	command->RetainResourceUntilFence(cached);
 	m_images.push_back(std::move(cached));

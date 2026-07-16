@@ -10539,6 +10539,52 @@ void CheckImageOverlapResolution() {
           ClassifyRenderTargetOverlap(sampled, true, true, target) ==
               RenderTargetOverlap::Unsupported,
           "GPU-owned sampled allocation was retired for a render target");
+
+  ImageInfo storage{};
+  storage.address = 0x112cd0000ull;
+  storage.size = 0xff0000;
+  storage.format = Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16_16_16Float);
+  storage.width = 1920;
+  storage.height = 1080;
+  storage.pitch = 1920;
+  storage.tile = Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+  storage.type = Prospero::GpuEnumValue(Prospero::ImageType::kColor2D);
+  RenderTargetInfo storage_target{};
+  storage_target.address = storage.address;
+  storage_target.size = storage.size;
+  storage_target.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+  storage_target.width = storage.width;
+  storage_target.height = storage.height;
+  storage_target.pitch = storage.pitch;
+  storage_target.bytes_per_element = 8;
+  storage_target.tile_mode = storage.tile;
+  Require("ImageOverlapResolution", "storage render-target native transition",
+          ClassifyStorageRenderTargetOverlap(storage, storage_target.format, true, false, false,
+                                             true, storage_target) ==
+              RenderTargetOverlap::PreserveStorage,
+          "exact GPU-owned RGBA16F storage image was not preserved for a render target");
+  auto mismatched_storage_target = storage_target;
+  mismatched_storage_target.width--;
+  Require("ImageOverlapResolution", "storage render-target guards",
+          ClassifyStorageRenderTargetOverlap(storage, storage_target.format, false, false, false,
+                                             true, storage_target) ==
+                  RenderTargetOverlap::Unsupported &&
+              ClassifyStorageRenderTargetOverlap(storage, storage_target.format, true, true, false,
+                                                 true, storage_target) ==
+                  RenderTargetOverlap::Unsupported &&
+              ClassifyStorageRenderTargetOverlap(storage, storage_target.format, true, false, true,
+                                                 true, storage_target) ==
+                  RenderTargetOverlap::Unsupported &&
+              ClassifyStorageRenderTargetOverlap(storage, storage_target.format, true, false, false,
+                                                 false, storage_target) ==
+                  RenderTargetOverlap::Unsupported &&
+              ClassifyStorageRenderTargetOverlap(storage, VK_FORMAT_R32G32B32A32_SFLOAT, true,
+                                                 false, false, true, storage_target) ==
+                  RenderTargetOverlap::Unsupported &&
+              ClassifyStorageRenderTargetOverlap(storage, storage_target.format, true, false, false,
+                                                 true, mismatched_storage_target) ==
+                  RenderTargetOverlap::Unsupported,
+          "unsupported storage-to-render-target transition was admitted");
   Require("ImageOverlapResolution", "render target context",
           ClassifyRenderTargetOverlap(sampled, false, false, target) ==
               RenderTargetOverlap::Unsupported,
