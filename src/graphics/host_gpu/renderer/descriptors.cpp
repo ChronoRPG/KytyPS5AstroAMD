@@ -310,7 +310,10 @@ static void ValidateDepthTargetBinding(const ShaderRecompiler::IR::ImageResource
 
 static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,
                                                 const ShaderTextureResource& descriptor) {
-	const auto tile  = descriptor.TileMode();
+	const auto tile   = descriptor.TileMode();
+	const auto width  = static_cast<uint32_t>(descriptor.Width5()) + 1u;
+	const auto height = static_cast<uint32_t>(descriptor.Height5()) + 1u;
+	const auto depth  = static_cast<uint32_t>(descriptor.Depth()) + 1u;
 	const bool is_2d = resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
 	                   descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
 	                   descriptor.Depth() == 0;
@@ -320,8 +323,13 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	    descriptor.BaseArray5() <= descriptor.Depth();
 	const bool is_3d = resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
 	                   descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor3D);
+	const bool supported_depth_tile =
+	    tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) && !resource.read &&
+	    resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint &&
+	    IsSupportedStorageDepthTile(descriptor.Format(), descriptor.Type(), width, height, depth);
 	const bool supported_tile = tile == Prospero::GpuEnumValue(Prospero::TileMode::kLinear) ||
-	                            tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+	                            tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
+	                            supported_depth_tile;
 	const bool supported_swizzle =
 	    IsSupportedStorageSwizzle(descriptor.Format(), descriptor.DstSelXYZW()) &&
 	    (descriptor.DstSelXYZW() == DstSel(4, 5, 6, 7) || !resource.read);

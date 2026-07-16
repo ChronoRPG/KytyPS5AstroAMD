@@ -21,6 +21,14 @@ namespace Libs::Graphics {
 	        swizzle == DstSel(5, 6, 7, 4));
 }
 
+[[nodiscard]] inline bool IsSupportedStorageDepthTile(uint32_t format, uint32_t type,
+                                                      uint32_t width, uint32_t height,
+                                                      uint32_t depth) noexcept {
+	return format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) &&
+	       type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) && width == 1 &&
+	       height == 1 && depth == 1;
+}
+
 [[noreturn]] inline void UnsupportedColorView(const char* usage, VkFormat image_format,
                                               VkFormat view_format, uint32_t swizzle) noexcept {
 	EXIT("unsupported %s color image view: image_format=%d view_format=%d swizzle=0x%03x\n", usage,

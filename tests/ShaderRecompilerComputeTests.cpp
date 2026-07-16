@@ -9064,6 +9064,15 @@ ShaderTextureResource BasicUintArrayStorageTextureDescriptor() {
            0x00000000u, 0x00700000u, 0x00000000u, 0x00000000u}};
 }
 
+ShaderRecompiler::IR::ImageResource Ppsa14053DepthTileStorageTextureResource() {
+  return BasicUintArrayStorageTextureResource();
+}
+
+ShaderTextureResource Ppsa14053DepthTileStorageTextureDescriptor() {
+  return {{0x20144c00u, 0x00500000u, 0x00000000u, 0xd1800204u,
+           0x00000000u, 0x00700000u, 0x00000000u, 0x00000000u}};
+}
+
 ShaderRecompiler::IR::ImageResource BasicUintVolumeStorageTextureResource() {
   auto resource = BasicStorageTextureResource();
   resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
@@ -9127,6 +9136,14 @@ ShaderTextureResource BasicUintVolumeStorageTextureDescriptor() {
   } else if (std::strcmp(kind, "uint-resource-float-format") == 0) {
     resource = BasicUintArrayStorageTextureResource();
     descriptor = BasicArrayStorageTextureDescriptor();
+  } else if (std::strcmp(kind, "depth-tile-read") == 0) {
+    resource = Ppsa14053DepthTileStorageTextureResource();
+    descriptor = Ppsa14053DepthTileStorageTextureDescriptor();
+    resource.read = true;
+  } else if (std::strcmp(kind, "depth-tile-extent") == 0) {
+    resource = Ppsa14053DepthTileStorageTextureResource();
+    descriptor = Ppsa14053DepthTileStorageTextureDescriptor();
+    descriptor.fields[2] |= 1u;
   } else {
     std::_Exit(0x7e);
   }
@@ -9207,6 +9224,21 @@ void CheckBasicStorageTextureDescriptor() {
           "PPSA21268 uint 3D storage descriptor fixture is malformed");
   ValidateStorageTexture(BasicUintVolumeStorageTextureResource(), uint_volume, 0x10000);
 
+  const auto depth_tile = Ppsa14053DepthTileStorageTextureDescriptor();
+  Require("BasicStorageTexture", "PPSA14053 depth-tile descriptor",
+          depth_tile.Base40() == 0x20144c0000ull && depth_tile.Width5() + 1u == 1 &&
+              depth_tile.Height5() + 1u == 1 && depth_tile.Depth() + 1u == 1 &&
+              depth_tile.BaseArray5() == 0 &&
+              depth_tile.Type() ==
+                  Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) &&
+              depth_tile.Format() ==
+                  Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) &&
+              depth_tile.TileMode() ==
+                  Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
+              depth_tile.DstSelXYZW() == DstSel(4, 0, 0, 1),
+          "PPSA14053 write-only depth-tile storage descriptor fixture is malformed");
+  ValidateStorageTexture(Ppsa14053DepthTileStorageTextureResource(), depth_tile, 0x10000);
+
   char path[MAX_PATH]{};
   Require("BasicStorageTexture", "host",
           GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
@@ -9214,7 +9246,8 @@ void CheckBasicStorageTextureDescriptor() {
   for (const char *kind : {"resource", "type", "tile", "mip", "swizzle",
                            "linear-rgb1-read", "bgra-read", "yzwx-read", "yzwx-format",
                            "array-base-view", "reserved", "metadata", "uint-format",
-                           "uint-resource-float-format"}) {
+                           "uint-resource-float-format", "depth-tile-read",
+                           "depth-tile-extent"}) {
     std::string command = std::string("\"") + path +
                           "\" --storage-texture-descriptor-death " + kind;
     std::vector<char> mutable_command(command.begin(), command.end());
@@ -9266,6 +9299,45 @@ void CheckStorageTextureLinearUploadLayout() {
                   total.size,
           "linear RGBA8 storage upload lost Prospero pitch or allocation size");
   std::printf("[host]    %-32s ok\n", "StorageTextureLinearUpload");
+}
+
+void CheckStorageTextureDepthTileUploadLayout() {
+  constexpr uint32_t format = Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt);
+  constexpr uint32_t width = 1;
+  constexpr uint32_t height = 1;
+  constexpr uint32_t depth = 1;
+  constexpr uint32_t tile = Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
+  const auto pitch = TileGetTexturePitch(format, width, 1, tile);
+  TileSizeAlign slice{};
+  TileSizeAlign total{};
+  TileSizeOffset level{};
+  TilePaddedSize padded{};
+  TileGetTextureSize(format, width, height, pitch, 1, tile, &slice, &level,
+                     &padded);
+  TileGetTextureTotalSize(format, width, height, depth, pitch, 1, tile, false,
+                          &total);
+  const auto layout = TextureCalcUploadLayout(
+      format, width, height, 1, depth, pitch, tile, total.size, true, false,
+      false, "StorageTextureDepthTileTest");
+  const auto regions = TextureBuildUploadRegions(
+      layout, VK_FORMAT_R8_UINT, width, height, depth, 1, true, false,
+      TextureUploadDestination::MipLevels,
+      TextureUploadSliceLayout::MipChainPerSlice);
+  Require("StorageTextureDepthTileUpload", "PPSA14053 layout",
+          pitch == 256 && padded.width == 256 && padded.height == 256 &&
+              slice.size == 0x10000 && slice.align == 0x10000 &&
+              level.size == slice.size && level.offset == 0 &&
+              total.size == slice.size && total.align == slice.align &&
+              layout.tile == tile && layout.fmt_tiled_depth &&
+              !layout.fmt_tiled_render_target && layout.pitch == pitch &&
+              layout.slice_stride == total.size && regions.size() == 1 &&
+              regions[0].offset == 0 && regions[0].width == width &&
+              regions[0].height == height && regions[0].pitch == pitch &&
+              TextureCalcUploadSize(layout, regions, 1, depth,
+                                    TextureUploadSliceLayout::MipChainPerSlice) ==
+                  total.size,
+          "1x1 R8_UINT depth tile lost its PS5 64 KiB block footprint");
+  std::printf("[host]    %-32s ok\n", "StorageTextureDepthTileUpload");
 }
 
 void CheckStorageTextureLinearReadbackLayout() {
@@ -11049,6 +11121,7 @@ int main(int argc, char **argv) {
   CheckBufferCacheRangeMerge();
   CheckBasicStorageTextureDescriptor();
   CheckStorageTextureLinearUploadLayout();
+  CheckStorageTextureDepthTileUploadLayout();
   CheckStorageTextureLinearReadbackLayout();
   CheckStorageImageSwizzleSpecializationId();
   CheckRenderTargetTileRoundTrip();

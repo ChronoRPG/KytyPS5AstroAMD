@@ -1549,12 +1549,16 @@ StorageTextureVulkanImage* TextureCache::FindStorageTexture(CommandBuffer*   com
 	const bool supported_type = info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) ||
 	                            info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) ||
 	                            info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor3D);
+	const bool supported_depth_tile =
+	    info.tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
+	    IsSupportedStorageDepthTile(info.format, info.type, info.width, info.height, info.depth);
 	if (command == nullptr || ctx == nullptr || info.address == 0 || info.size == 0 ||
 	    info.address >= TRACKER_ADDRESS_SIZE || info.size > TRACKER_ADDRESS_SIZE - info.address ||
 	    info.width == 0 || info.height == 0 || info.depth == 0 || info.levels != 1 ||
 	    info.base_level != 0 || info.view_levels != 1 || info.base_array != 0 || !supported_type ||
 	    (info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kLinear) &&
-	     info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget)) ||
+	     info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
+	     !supported_depth_tile) ||
 	    !IsSupportedStorageSwizzle(info.format, info.swizzle)) {
 		EXIT("TextureCache: unsupported storage-image request, command=%p ctx=%p "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64

@@ -299,10 +299,10 @@ static bool Gen5Standard64KBLayout(uint32_t format, uint32_t* bytes_per_element,
 	}
 }
 
-static bool Gen5RenderTargetBlockSizeFromElementBytes(uint32_t  bytes_per_element,
-                                                      uint32_t* block_width,
-                                                      uint32_t* block_height) {
-	// AGC render-target
+static bool Gen5Thin64KBBlockSizeFromElementBytes(uint32_t  bytes_per_element,
+                                                  uint32_t* block_width,
+                                                  uint32_t* block_height) {
+	// AGC thin 64 KiB block table, shared by depth and render-target tiles.
 	switch (bytes_per_element) {
 		case 1:
 			*block_width  = 256;
@@ -1182,7 +1182,7 @@ static void ConvertRenderTargetTyped(uint32_t width, uint32_t height, uint32_t p
 
 	uint32_t block_width  = 0;
 	uint32_t block_height = 0;
-	EXIT_NOT_IMPLEMENTED(!Gen5RenderTargetBlockSizeFromElementBytes(
+	EXIT_NOT_IMPLEMENTED(!Gen5Thin64KBBlockSizeFromElementBytes(
 	    static_cast<uint32_t>(sizeof(T)), &block_width, &block_height));
 
 	const uint64_t blocks_per_row = (static_cast<uint64_t>(pitch) + block_width - 1u) / block_width;
@@ -2448,8 +2448,8 @@ bool TileGetDepthSize(uint32_t width, uint32_t height, uint32_t pitch, uint32_t 
 uint32_t TileGetRenderTargetPitch(uint32_t width, uint32_t bytes_per_element) {
 	uint32_t block_width  = 0;
 	uint32_t block_height = 0;
-	if (width == 0 || !Gen5RenderTargetBlockSizeFromElementBytes(bytes_per_element, &block_width,
-	                                                             &block_height)) {
+	if (width == 0 || !Gen5Thin64KBBlockSizeFromElementBytes(bytes_per_element, &block_width,
+	                                                        &block_height)) {
 		return 0;
 	}
 	const uint64_t pitch = (static_cast<uint64_t>(width) + block_width - 1u) &
@@ -2463,8 +2463,8 @@ bool TileGetRenderTargetSize(uint32_t width, uint32_t height, uint32_t pitch,
 	uint32_t block_width  = 0;
 	uint32_t block_height = 0;
 	if (height == 0 || pitch == 0 ||
-	    !Gen5RenderTargetBlockSizeFromElementBytes(bytes_per_element, &block_width,
-	                                               &block_height) ||
+	    !Gen5Thin64KBBlockSizeFromElementBytes(bytes_per_element, &block_width,
+	                                           &block_height) ||
 	    pitch != TileGetRenderTargetPitch(width, bytes_per_element)) {
 		return false;
 	}
@@ -2590,7 +2590,7 @@ void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32
 	    bytes_per_element != 0 && tile == 27 && levels == 1) {
 		uint32_t block_width  = 0;
 		uint32_t block_height = 0;
-		EXIT_NOT_IMPLEMENTED(!Gen5RenderTargetBlockSizeFromElementBytes(
+		EXIT_NOT_IMPLEMENTED(!Gen5Thin64KBBlockSizeFromElementBytes(
 		    bytes_per_element, &block_width, &block_height));
 
 		const uint32_t padded_width  = AlignUp(pitch, block_width);
@@ -2619,7 +2619,7 @@ void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32
 	    bytes_per_element != 0 && tile == 27 && levels > 1) {
 		uint32_t block_width  = 0;
 		uint32_t block_height = 0;
-		EXIT_NOT_IMPLEMENTED(!Gen5RenderTargetBlockSizeFromElementBytes(
+		EXIT_NOT_IMPLEMENTED(!Gen5Thin64KBBlockSizeFromElementBytes(
 		    bytes_per_element, &block_width, &block_height));
 
 		const uint32_t     bytes_log2        = IntLog2(bytes_per_element);
@@ -2842,17 +2842,15 @@ void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32
 	if (tile == 24 && levels == 1) {
 		const uint32_t bytes_per_element = Prospero::NumBytesPerElement(format);
 		if (bytes_per_element != 0) {
-			uint32_t block_width = 0;
-			switch (bytes_per_element) {
-				case 1: block_width = 512; break;
-				case 2: block_width = 256; break;
-				case 4: block_width = 128; break;
-				default: break;
-			}
+			uint32_t block_width  = 0;
+			uint32_t block_height = 0;
+			const bool supported = bytes_per_element <= 4 &&
+			                       Gen5Thin64KBBlockSizeFromElementBytes(
+			                           bytes_per_element, &block_width, &block_height);
 
-			if (block_width != 0) {
+			if (supported) {
 				const uint32_t padded_width  = (pitch + block_width - 1u) & ~(block_width - 1u);
-				const uint32_t padded_height = (height + 127u) & ~127u;
+				const uint32_t padded_height = AlignUp(height, block_height);
 				const uint32_t size          = padded_width * padded_height * bytes_per_element;
 
 				if (total_size != nullptr) {
@@ -2878,15 +2876,13 @@ void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32
 	if (tile == 24 && levels > 1) {
 		const uint32_t bytes_per_element = Prospero::NumBytesPerElement(format);
 		if (bytes_per_element != 0) {
-			uint32_t block_width = 0;
-			switch (bytes_per_element) {
-				case 1: block_width = 512; break;
-				case 2: block_width = 256; break;
-				case 4: block_width = 128; break;
-				default: break;
-			}
+			uint32_t block_width  = 0;
+			uint32_t block_height = 0;
+			const bool supported = bytes_per_element <= 4 &&
+			                       Gen5Thin64KBBlockSizeFromElementBytes(
+			                           bytes_per_element, &block_width, &block_height);
 
-			if (block_width != 0) {
+			if (supported) {
 				static bool logged = false;
 				if (!logged) {
 					LOGF("\t temporary: sizing PS5 depth tiled texture with mips, format = %u, "
@@ -2902,7 +2898,7 @@ void TileGetTextureSize(uint32_t format, uint32_t width, uint32_t height, uint32
 					offset = AlignUp(offset, 65536u);
 
 					const uint32_t padded_width  = AlignUp(mip_pitch, block_width);
-					const uint32_t padded_height = AlignUp(mip_height, 128u);
+					const uint32_t padded_height = AlignUp(mip_height, block_height);
 					const uint32_t size          = padded_width * padded_height * bytes_per_element;
 
 					if (level_sizes != nullptr) {
@@ -3130,7 +3126,7 @@ uint32_t TileGetTexturePitch(uint32_t format, uint32_t width, uint32_t levels, u
 		if (const uint32_t bytes_per_element = Prospero::NumBytesPerElement(format); bytes_per_element != 0) {
 			uint32_t block_width  = 0;
 			uint32_t block_height = 0;
-			EXIT_NOT_IMPLEMENTED(!Gen5RenderTargetBlockSizeFromElementBytes(
+			EXIT_NOT_IMPLEMENTED(!Gen5Thin64KBBlockSizeFromElementBytes(
 			    bytes_per_element, &block_width, &block_height));
 			pitch = AlignUp(pitch, block_width);
 		}
@@ -3152,11 +3148,12 @@ uint32_t TileGetTexturePitch(uint32_t format, uint32_t width, uint32_t levels, u
 		pitch = AlignUp(pitch, (1u << block_width_log2) * texels_per_element_wide);
 	}
 	if (tile == 24) {
-		switch (Prospero::NumBytesPerElement(format)) {
-			case 1: pitch = (pitch + 511u) & ~511u; break;
-			case 2: pitch = (pitch + 255u) & ~255u; break;
-			case 4: pitch = (pitch + 127u) & ~127u; break;
-			default: break;
+		const uint32_t bytes_per_element = Prospero::NumBytesPerElement(format);
+		uint32_t       block_width      = 0;
+		uint32_t       block_height     = 0;
+		if (bytes_per_element <= 4 && Gen5Thin64KBBlockSizeFromElementBytes(
+		                                  bytes_per_element, &block_width, &block_height)) {
+			pitch = AlignUp(pitch, block_width);
 		}
 	}
 
