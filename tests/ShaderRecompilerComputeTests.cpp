@@ -8699,6 +8699,14 @@ bool CacheFault(void *opaque, PageFaultAccess access, uint64_t vaddr,
     (void)SelectSampledColorView(VK_FORMAT_R8G8B8A8_SNORM,
                                  VK_FORMAT_R8G8B8A8_UNORM,
                                  DstSel(4, 5, 6, 7));
+  } else if (std::strcmp(kind, "sampled-rgb10-swizzle") == 0) {
+    (void)SelectSampledColorView(VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+                                 VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+                                 DstSel(4, 5, 6, 7));
+  } else if (std::strcmp(kind, "sampled-rgb10-reverse") == 0) {
+    (void)SelectSampledColorView(VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+                                 VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+                                 DstSel(6, 5, 4, 7));
   } else if (std::strcmp(kind, "sampled-depth-format") == 0) {
     (void)SelectSampledDepthView(VK_FORMAT_D32_SFLOAT_S8_UINT,
                                  VK_FORMAT_R16_UNORM, DstSel(4, 4, 4, 4));
@@ -8762,12 +8770,12 @@ void CheckSampledColorViews() {
   Require("SampledColorViews", "mutable BGRA target",
           SelectSampledColorView(VK_FORMAT_B8G8R8A8_UNORM,
                                  VK_FORMAT_R8G8B8A8_UNORM,
-                                 DstSel(6, 5, 4, 7)) == VulkanImage::VIEW_RGBA8_BGRA,
+                                 DstSel(6, 5, 4, 7)) == VulkanImage::VIEW_BGRA_TO_RGBA,
           "BGRA target did not select the exact RGBA/BGRA mutable view");
   Require("SampledColorViews", "mutable sRGB view of UNORM BGRA target",
           SelectSampledColorView(VK_FORMAT_B8G8R8A8_UNORM,
                                  VK_FORMAT_R8G8B8A8_SRGB,
-                                 DstSel(6, 5, 4, 7)) == VulkanImage::VIEW_RGBA8_BGRA,
+                                 DstSel(6, 5, 4, 7)) == VulkanImage::VIEW_BGRA_TO_RGBA,
           "UNORM BGRA target did not select its compatible sRGB RGBA sampled view");
   Require("SampledColorViews", "mutable sRGB BGRA target",
           BgraToRgbaSampledViewFormat(VK_FORMAT_B8G8R8A8_SRGB) ==
@@ -8775,8 +8783,16 @@ void CheckSampledColorViews() {
               SelectSampledColorView(VK_FORMAT_B8G8R8A8_SRGB,
                                      VK_FORMAT_R8G8B8A8_SRGB,
                                      DstSel(6, 5, 4, 7)) ==
-                  VulkanImage::VIEW_RGBA8_BGRA,
+                  VulkanImage::VIEW_BGRA_TO_RGBA,
           "sRGB BGRA target did not select its matching mutable RGBA view");
+  Require("SampledColorViews", "mutable packed RGB10 view",
+          BgraToRgbaSampledViewFormat(VK_FORMAT_A2R10G10B10_UNORM_PACK32) ==
+                  VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
+              SelectSampledColorView(VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+                                     VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+                                     DstSel(6, 5, 4, 7)) ==
+                  VulkanImage::VIEW_BGRA_TO_RGBA,
+          "packed RGB10 target did not select its matching mutable channel-order view");
   Require("SampledColorViews", "D32 depth target",
           SelectSampledDepthView(VK_FORMAT_D32_SFLOAT_S8_UINT,
                                  VK_FORMAT_R32_SFLOAT,
@@ -8857,8 +8873,9 @@ void CheckSampledColorViews() {
   for (const char *kind :
        {"sampled", "sampled-compatible-swizzle", "sampled-compatible-reverse",
         "sampled-compatible-class", "sampled-compatible-colorspace",
-        "sampled-compatible-snorm", "sampled-depth-format",
-        "sampled-depth-swizzle", "storage", "storage-format",
+        "sampled-compatible-snorm", "sampled-rgb10-swizzle",
+        "sampled-rgb10-reverse", "sampled-depth-format", "sampled-depth-swizzle",
+        "storage", "storage-format",
         "storage-compatible-swizzle", "storage-kind", "storage-no-write",
         "storage-atomic", "storage-compare", "storage-mip",
         "storage-dimension"}) {

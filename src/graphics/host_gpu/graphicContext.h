@@ -89,7 +89,7 @@ struct VulkanImage {
 	static constexpr int VIEW_STENCIL_TEXTURE_ARRAY = 17;
 	static constexpr int VIEW_STORAGE               = 18;
 	static constexpr int VIEW_STORAGE_ARRAY         = 19;
-	static constexpr int VIEW_RGBA8_BGRA            = 20;
+	static constexpr int VIEW_BGRA_TO_RGBA          = 20;
 
 	explicit VulkanImage(VulkanImageType type): type(type) {}
 

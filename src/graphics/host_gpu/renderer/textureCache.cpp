@@ -654,7 +654,10 @@ bool RenderTargetSupportsStorage(GraphicContext* ctx, VkFormat format, VkImageCr
 }
 
 VkImageCreateFlags RenderTargetCreateFlags(VkFormat format) {
-	return IsRgba8SrgbViewFormat(format)
+	const bool compatible_format_view =
+	    IsRgba8SrgbViewFormat(format) ||
+	    BgraToRgbaSampledViewFormat(format) != VK_FORMAT_UNDEFINED;
+	return compatible_format_view
 	           ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT
 	           : VkImageCreateFlags {0};
 }
@@ -742,7 +745,7 @@ void CreateRenderTargetViews(GraphicContext* ctx, RenderTextureVulkanImage* imag
 	}
 	const auto rgba_view_format = BgraToRgbaSampledViewFormat(image->format);
 	if (rgba_view_format != VK_FORMAT_UNDEFINED) {
-		CreateRenderTargetView(ctx, image, VulkanImage::VIEW_RGBA8_BGRA, VK_COMPONENT_SWIZZLE_B,
+		CreateRenderTargetView(ctx, image, VulkanImage::VIEW_BGRA_TO_RGBA, VK_COMPONENT_SWIZZLE_B,
 		                       VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_R,
 		                       VK_COMPONENT_SWIZZLE_A, VK_IMAGE_VIEW_TYPE_2D, rgba_view_format,
 		                       VK_IMAGE_USAGE_SAMPLED_BIT);
@@ -1083,14 +1086,14 @@ VkImageView TextureCache::GetRenderTargetSampledView(GraphicContext*           c
 		     level_count, image != nullptr ? image->mip_levels : 0);
 	}
 	const bool compatible_variant_format =
-	    view_format == image->format || (variant == VulkanImage::VIEW_RGBA8_BGRA &&
-	                                     IsBgraToRgba8SampledView(image->format, view_format));
+	    view_format == image->format || (variant == VulkanImage::VIEW_BGRA_TO_RGBA &&
+	                                     IsBgraToRgbaSampledView(image->format, view_format));
 	if (!compatible_variant_format) {
 		EXIT("TextureCache: incompatible render-target sampled view format, image_format=%d"
 		     " view_format=%d variant=%d\n",
 		     static_cast<int>(image->format), static_cast<int>(view_format), variant);
 	}
-	const auto default_view_format = variant == VulkanImage::VIEW_RGBA8_BGRA
+	const auto default_view_format = variant == VulkanImage::VIEW_BGRA_TO_RGBA
 	                                     ? BgraToRgbaSampledViewFormat(image->format)
 	                                     : image->format;
 	if (view_format == default_view_format && base_level == 0 && level_count == image->mip_levels) {
@@ -1137,8 +1140,8 @@ VkImageView TextureCache::GetRenderTargetSampledView(GraphicContext*           c
 			components = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO,
 			              VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R};
 			break;
-		case VulkanImage::VIEW_RGBA8_BGRA:
-			if (!IsBgraToRgba8SampledView(image->format, view_format)) {
+		case VulkanImage::VIEW_BGRA_TO_RGBA:
+			if (!IsBgraToRgbaSampledView(image->format, view_format)) {
 				EXIT("TextureCache: incompatible mutable render-target sampled view\n");
 			}
 			components = {VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_R,

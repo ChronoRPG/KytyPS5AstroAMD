@@ -39,17 +39,25 @@ namespace Libs::Graphics {
 	switch (image_format) {
 		case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_R8G8B8A8_UNORM;
 		case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_R8G8B8A8_SRGB;
+		case VK_FORMAT_A2R10G10B10_UNORM_PACK32: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
 		default: return VK_FORMAT_UNDEFINED;
 	}
 }
 
-[[nodiscard]] inline bool IsBgraToRgba8SampledView(VkFormat image_format,
-                                                   VkFormat view_format) noexcept {
-	const bool bgra8 =
-	    image_format == VK_FORMAT_B8G8R8A8_UNORM || image_format == VK_FORMAT_B8G8R8A8_SRGB;
-	const bool rgba8 =
-	    view_format == VK_FORMAT_R8G8B8A8_UNORM || view_format == VK_FORMAT_R8G8B8A8_SRGB;
-	return bgra8 && rgba8;
+[[nodiscard]] inline bool IsBgraToRgbaSampledView(VkFormat image_format,
+                                                  VkFormat view_format) noexcept {
+	switch (image_format) {
+		case VK_FORMAT_B8G8R8A8_UNORM:
+		case VK_FORMAT_B8G8R8A8_SRGB:
+			switch (view_format) {
+				case VK_FORMAT_R8G8B8A8_UNORM:
+				case VK_FORMAT_R8G8B8A8_SRGB: return true;
+				default: return false;
+			}
+		case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+			return view_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+		default: return false;
+	}
 }
 
 [[nodiscard]] inline VkFormat BgraSrgbStorageViewFormat(VkFormat image_format) noexcept {
@@ -72,8 +80,8 @@ namespace Libs::Graphics {
 			default: break;
 		}
 	}
-	if (IsBgraToRgba8SampledView(image_format, view_format) && swizzle == DstSel(6, 5, 4, 7)) {
-		return VulkanImage::VIEW_RGBA8_BGRA;
+	if (IsBgraToRgbaSampledView(image_format, view_format) && swizzle == DstSel(6, 5, 4, 7)) {
+		return VulkanImage::VIEW_BGRA_TO_RGBA;
 	}
 	UnsupportedColorView("sampled", image_format, view_format, swizzle);
 }
