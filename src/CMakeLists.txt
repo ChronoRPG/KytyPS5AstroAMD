@@ -292,6 +292,8 @@ target_include_directories(resource_mutex_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(shader_recompiler_compute_tests ../tests/ShaderRecompilerComputeTests.cpp)
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests ../tests/VirtualMemoryAllocationTests.cpp)
+target_compile_definitions(virtual_memory_allocation_tests PRIVATE
+	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
 
 add_executable(kyty_emulator main.cpp ${kyty_emulator_src})
