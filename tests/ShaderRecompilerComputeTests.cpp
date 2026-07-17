@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image.h"
 #include "graphics/host_gpu/renderer/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/renderVertex.h"
@@ -11944,24 +11945,24 @@ void CheckEmbeddedFetchLaneSpill() {
 void CheckReferenceClockScale() {
   uint64_t value = 0;
   Require("ReferenceClockScale", "zero",
-          GraphicsScaleReferenceClock(0, 3000000000ull, &value) && value == 0,
+          Sync::ScaleReferenceClock(0, 3000000000ull, &value) && value == 0,
           "zero host tick did not produce a zero GPU clock");
   Require("ReferenceClockScale", "fractional second",
-          GraphicsScaleReferenceClock(1500000000ull, 3000000000ull, &value) &&
+          Sync::ScaleReferenceClock(1500000000ull, 3000000000ull, &value) &&
               value == 50000000ull,
           "host half-second did not scale to 50,000,000 ticks");
   Require("ReferenceClockScale", "whole and fractional",
-          GraphicsScaleReferenceClock(3750000000ull, 3000000000ull, &value) &&
+          Sync::ScaleReferenceClock(3750000000ull, 3000000000ull, &value) &&
               value == 125000000ull,
           "host 1.25 seconds did not scale to 125,000,000 ticks");
   Require("ReferenceClockScale", "monotonic floor",
-          GraphicsScaleReferenceClock(3750000001ull, 3000000000ull, &value) &&
+          Sync::ScaleReferenceClock(3750000001ull, 3000000000ull, &value) &&
               value == 125000000ull,
           "sub-reference-tick increment did not use a monotonic floor");
   Require("ReferenceClockScale", "guards",
-          !GraphicsScaleReferenceClock(1, 0, &value) &&
-              !GraphicsScaleReferenceClock(1, 1, nullptr) &&
-              !GraphicsScaleReferenceClock(UINT64_MAX, 1, &value),
+          !Sync::ScaleReferenceClock(1, 0, &value) &&
+              !Sync::ScaleReferenceClock(1, 1, nullptr) &&
+              !Sync::ScaleReferenceClock(UINT64_MAX, 1, &value),
           "invalid frequency, destination, or overflow was accepted");
   std::printf("[host]    %-32s ok\n", "ReferenceClockScale");
 }
