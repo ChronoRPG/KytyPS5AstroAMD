@@ -56,23 +56,15 @@ private:
 	TrackingSpinLock& m_mutex;
 };
 
-bool Overlaps(uint64_t left, uint64_t left_size, uint64_t right, uint64_t right_size) {
-	return left < right + right_size && right < left + left_size;
-}
-
-bool PageOverlaps(uint64_t left, uint64_t left_size, uint64_t right, uint64_t right_size) {
-	return ImagePageRangesOverlap(left, left_size, right, right_size);
-}
-
 enum class ImageRangeOverlap : uint8_t { None, PageOnly, Bytes };
 
 ImageRangeOverlap ClassifyImageRangeOverlap(uint64_t left, uint64_t left_size, uint64_t right,
                                             uint64_t right_size) {
-	if (Overlaps(left, left_size, right, right_size)) {
+	if (ImageRangeOverlaps(left, left_size, right, right_size)) {
 		return ImageRangeOverlap::Bytes;
 	}
-	return PageOverlaps(left, left_size, right, right_size) ? ImageRangeOverlap::PageOnly
-	                                                        : ImageRangeOverlap::None;
+	return ImagePageRangesOverlap(left, left_size, right, right_size) ? ImageRangeOverlap::PageOnly
+	                                                                  : ImageRangeOverlap::None;
 }
 
 } // namespace
@@ -176,8 +168,8 @@ struct TextureCache::CachedImage {
 	}
 	[[nodiscard]] bool OverlapsRange(uint64_t address, uint64_t size, bool page) const {
 		for (uint32_t i = 0; i < RangeCount(); i++) {
-			if (page ? PageOverlaps(address, size, Address(i), Size(i))
-			         : Overlaps(address, size, Address(i), Size(i))) {
+			if (page ? ImagePageRangesOverlap(address, size, Address(i), Size(i))
+			         : ImageRangeOverlaps(address, size, Address(i), Size(i))) {
 				return true;
 			}
 		}
@@ -417,8 +409,10 @@ struct TextureCache::ReadbackWorker {
 		                                   Prospero::NumBytesPerElement(cached.info.format))
 		                             : MakeColorImageTransferInfo(cached.target);
 		const bool linear  = info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-		const bool tiled   = target && IsTiledRenderTarget(cached.target);
-		bool       single_layer_storage = false;
+		const bool tiled_target = target && IsTiledRenderTarget(cached.target);
+		const bool tiled_storage =
+		    storage && info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+		bool single_layer_storage = false;
 		if (storage) {
 			switch (static_cast<Prospero::ImageType>(cached.info.type)) {
 				case Prospero::ImageType::kColor2D:
@@ -429,10 +423,12 @@ struct TextureCache::ReadbackWorker {
 			}
 		}
 		const bool basic_storage =
-		    !storage || (single_layer_storage && cached.info.base_level == 0 &&
-		                 cached.info.levels == 1 && cached.info.base_array == 0 && linear);
+		    !storage ||
+		    (single_layer_storage && cached.info.base_level == 0 && cached.info.levels == 1 &&
+		     cached.info.base_array == 0 && (linear || tiled_storage));
 		const auto layers = target ? cached.target.layers : 1u;
-		if ((!linear && !tiled) || !basic_storage || info.levels != 1 || info.size > UINT32_MAX) {
+		if ((!linear && !tiled_target && !tiled_storage) || !basic_storage || info.levels != 1 ||
+		    info.size > UINT32_MAX) {
 			EXIT("TextureCache: unsupported color-image readback layout, addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " extent=%ux%u pitch=%u bpe=%u levels=%u tile=%u kind=%u\n",
 			     info.address, info.size, info.width, info.height, info.pitch,
@@ -454,9 +450,20 @@ struct TextureCache::ReadbackWorker {
 		    MakeLayeredImageBufferCopies(layers, slice_size, info.pitch, info.width, info.height);
 		UtilFillBuffer(cached.ctx, download.data(), info.size, regions, cached.image,
 		               cached.image->layout);
-		if (tiled) {
+		if (tiled_target || tiled_storage) {
 			guest.resize(info.size);
-			cache.m_tiler.TileImage(guest.data(), download.data(), cached.target);
+			const RenderTargetInfo layout =
+			    target ? cached.target : RenderTargetInfo {info.address,
+			                                               info.size,
+			                                               info.format,
+			                                               info.width,
+			                                               info.height,
+			                                               info.pitch,
+			                                               info.bytes_per_element,
+			                                               info.tile_mode,
+			                                               info.levels,
+			                                               1};
+			cache.m_tiler.TileImage(guest.data(), download.data(), layout);
 			Libs::LibKernel::Memory::WriteBacking(info.address, guest.data(), info.size);
 		} else {
 			Libs::LibKernel::Memory::WriteBacking(info.address, download.data(), info.size);
@@ -602,7 +609,8 @@ void TextureCache::RetireImages(const std::vector<CachedImage*>& retire,
 		}
 		const bool sampled      = (*it)->kind == CachedImage::Kind::Texture;
 		const bool storage      = (*it)->kind == CachedImage::Kind::StorageTexture;
-		const bool target       = (*it)->kind == CachedImage::Kind::RenderTarget;
+		const bool target       = (*it)->kind == CachedImage::Kind::RenderTarget ||
+		                          (*it)->kind == CachedImage::Kind::DepthTarget;
 		const bool native_image = it->get() == native_image_source;
 		if (native_image) {
 			bool source_valid = (*it)->gpu_modified && !(*it)->buffer_modified;
@@ -1664,6 +1672,37 @@ void TextureCache::RetireSampledTargetAliases(GraphicContext* ctx, const ImageIn
 				     cached->ctx == ctx, cached->gpu_modified, cached->buffer_modified);
 		}
 	}
+	for (const auto& cached: m_images) {
+		if (cached->kind != CachedImage::Kind::DepthTarget) {
+			continue;
+		}
+		const auto overlap = ClassifyImageRangeOverlap(requested.address, requested.size,
+		                                               cached->depth.address, cached->depth.size);
+		if (overlap == ImageRangeOverlap::None) {
+			continue;
+		}
+		const auto delta = cached->depth.address >= requested.address
+		                       ? cached->depth.address - requested.address
+		                       : UINT64_MAX;
+		const bool contained =
+		    delta <= requested.size && cached->depth.size <= requested.size - delta;
+		const bool supported = cached->ctx == ctx && !cached->buffer_modified &&
+		                       cached->depth.stencil_address == 0 &&
+		                       cached->depth.stencil_size == 0 && cached->depth.layers == 1 &&
+		                       (overlap == ImageRangeOverlap::PageOnly || contained);
+		if (!supported) {
+			EXIT("TextureCache: unsupported sampled/depth-target alias, sampled=0x%016" PRIx64
+			     "+0x%016" PRIx64 " depth=0x%016" PRIx64 "+0x%016" PRIx64
+			     " overlap=%u contained=%d same_context=%d gpu=%d buffer=%d stencil=0x%016" PRIx64
+			     "+0x%016" PRIx64 " layers=%u\n",
+			     requested.address, requested.size, cached->depth.address, cached->depth.size,
+			     static_cast<uint32_t>(overlap), contained, cached->ctx == ctx,
+			     cached->gpu_modified, cached->buffer_modified, cached->depth.stencil_address,
+			     cached->depth.stencil_size, cached->depth.layers);
+		}
+		wait_idle |= cached->gpu_modified;
+		retire.push_back(cached.get());
+	}
 	if (retire.empty()) {
 		return;
 	}
@@ -1675,10 +1714,50 @@ void TextureCache::RetireSampledTargetAliases(GraphicContext* ctx, const ImageIn
 		if (!cached->gpu_modified) {
 			continue;
 		}
-		const auto transfer = m_readback->DownloadColorImage(*cached);
+		const auto transfer = cached->kind == CachedImage::Kind::DepthTarget
+		                          ? m_readback->DownloadDepthTarget(*cached)
+		                          : m_readback->DownloadColorImage(*cached);
 		m_memory_tracker.ForEachDownloadRange<true>(transfer.address, transfer.size,
 		                                            [](uint64_t, uint64_t) noexcept {});
 		cached->gpu_modified = false;
+	}
+	std::vector<uint64_t> retire_depth_metadata;
+	for (auto* cached: retire) {
+		if (cached->kind != CachedImage::Kind::DepthTarget || cached->depth.htile_address == 0) {
+			continue;
+		}
+		const bool retained_owner =
+		    std::any_of(m_images.begin(), m_images.end(), [&](const auto& other) {
+			    return std::find(retire.begin(), retire.end(), other.get()) == retire.end() &&
+			           other->kind == CachedImage::Kind::DepthTarget &&
+			           other->depth.htile_address == cached->depth.htile_address &&
+			           other->depth.htile_size == cached->depth.htile_size;
+		    });
+		if (!retained_owner &&
+		    std::find(retire_depth_metadata.begin(), retire_depth_metadata.end(),
+		              cached->depth.htile_address) == retire_depth_metadata.end()) {
+			retire_depth_metadata.push_back(cached->depth.htile_address);
+		}
+	}
+	for (const auto address: retire_depth_metadata) {
+		auto metadata = m_surface_metas.find(address);
+		auto owner    = std::find_if(retire.begin(), retire.end(), [&](const auto* cached) {
+			return cached->kind == CachedImage::Kind::DepthTarget &&
+			       cached->depth.htile_address == address;
+		});
+		if (metadata == m_surface_metas.end() || owner == retire.end() ||
+		    metadata->second.size != (*owner)->depth.htile_size) {
+			EXIT(
+			    "TextureCache: retiring depth target has invalid HTile metadata, addr=0x%016" PRIx64
+			    " size=0x%016" PRIx64 "\n",
+			    address, owner != retire.end() ? (*owner)->depth.htile_size : 0);
+		}
+		if (metadata->second.gpu_modified) {
+			m_metadata_tracker.ForEachDownloadRange<true>(metadata->first, metadata->second.size,
+			                                              [](uint64_t, uint64_t) noexcept {});
+		}
+		m_metadata_tracker.UntrackMemory(metadata->first, metadata->second.size);
+		m_surface_metas.erase(metadata);
 	}
 	RetireImages(retire);
 }
@@ -1895,9 +1974,13 @@ VulkanImage* TextureCache::FindTexture(CommandBuffer* command, GraphicContext* c
 			if (!cached->OverlapsRange(info.address, info.size, true)) {
 				continue;
 			}
-			EXIT("TextureCache: sampled image shares pages with GPU target, addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 " target_kind=%u\n",
-			     info.address, info.size, static_cast<uint32_t>(cached->kind));
+			EXIT("TextureCache: sampled image overlaps GPU target, requested=0x%016" PRIx64
+			     "+0x%016" PRIx64 " target=0x%016" PRIx64 "+0x%016" PRIx64
+			     " target_kind=%u requested_info={format=%u extent=%ux%ux%u pitch=%u levels=%u"
+			     " tile=%u type=%u}\n",
+			     info.address, info.size, cached->Address(), cached->Size(),
+			     static_cast<uint32_t>(cached->kind), info.format, info.width, info.height,
+			     info.depth, info.pitch, info.levels, info.tile, info.type);
 		}
 		const auto overlap =
 		    ClassifySampledOverlap(info, cached->info, cached->gpu_modified, cached->ctx == ctx);
@@ -2291,15 +2374,16 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 	      info.stencil_size % info.layers != 0 || info.stencil_address >= TRACKER_ADDRESS_SIZE ||
 	      info.stencil_size > TRACKER_ADDRESS_SIZE - info.stencil_address ||
 	      (info.stencil_address & 0xffffu) != 0 ||
-	      PageOverlaps(info.address, info.size, info.stencil_address, info.stencil_size))) ||
+	      ImagePageRangesOverlap(info.address, info.size, info.stencil_address,
+	                             info.stencil_size))) ||
 	    ((info.htile_address == 0) != (info.htile_size == 0)) ||
 	    (has_htile &&
 	     (info.htile_size % info.layers != 0 || info.htile_address >= TRACKER_ADDRESS_SIZE ||
 	      info.htile_size > TRACKER_ADDRESS_SIZE - info.htile_address ||
 	      (info.htile_address & 0x7fffu) != 0 ||
-	      PageOverlaps(info.address, info.size, info.htile_address, info.htile_size) ||
-	      (has_stencil && PageOverlaps(info.stencil_address, info.stencil_size, info.htile_address,
-	                                   info.htile_size)))) ||
+	      ImagePageRangesOverlap(info.address, info.size, info.htile_address, info.htile_size) ||
+	      (has_stencil && ImagePageRangesOverlap(info.stencil_address, info.stencil_size,
+	                                             info.htile_address, info.htile_size)))) ||
 	    (info.stencil_htile_compressed && (!has_stencil || !has_htile)) ||
 	    !IsSupportedDepthTargetFormat(info)) {
 		EXIT("TextureCache: unsupported depth target, command=%p ctx=%p depth=0x%016" PRIx64
@@ -2579,7 +2663,8 @@ TextureCache::RegisterVideoOutSurfaces(GraphicContext*                  ctx,
 	}
 	for (size_t i = 0; i < infos.size(); i++) {
 		for (size_t j = i + 1; j < infos.size(); j++) {
-			if (PageOverlaps(infos[i].address, infos[i].size, infos[j].address, infos[j].size)) {
+			if (ImagePageRangesOverlap(infos[i].address, infos[i].size, infos[j].address,
+			                           infos[j].size)) {
 				EXIT("TextureCache: video-out surfaces share pages, first=%zu second=%zu\n", i, j);
 			}
 		}
@@ -3277,7 +3362,7 @@ RenderTextureVulkanImage* TextureCache::FindRenderTargetByRange(CommandBuffer* c
 	std::shared_ptr<CachedImage> found;
 	for (auto& cached: m_images) {
 		if (cached->kind != CachedImage::Kind::RenderTarget ||
-		    !Overlaps(vaddr, size, cached->Address(), cached->Size())) {
+		    !ImageRangeOverlaps(vaddr, size, cached->Address(), cached->Size())) {
 			continue;
 		}
 		const auto slice_size =
@@ -3407,7 +3492,8 @@ void TextureCache::RegisterMeta(uint64_t vaddr, uint64_t size, uint32_t layers) 
 		range_size -= existing->second.size;
 	}
 	for (const auto& [address, meta]: m_surface_metas) {
-		if (address != vaddr && PageOverlaps(range_vaddr, range_size, address, meta.size)) {
+		if (address != vaddr &&
+		    ImagePageRangesOverlap(range_vaddr, range_size, address, meta.size)) {
 			LOGF("TextureCache: registering overlapping metadata views, requested=0x%016" PRIx64
 			     "+0x%016" PRIx64 " existing=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
 			     range_vaddr, range_size, address, meta.size);
@@ -3479,7 +3565,7 @@ bool TextureCache::HasMetaRangeOverlap(uint64_t vaddr, uint64_t size) {
 	}
 	FaultSafeTextureLock lock(this, m_lock);
 	return std::any_of(m_surface_metas.begin(), m_surface_metas.end(), [&](const auto& entry) {
-		return Overlaps(vaddr, size, entry.first, entry.second.size);
+		return ImageRangeOverlaps(vaddr, size, entry.first, entry.second.size);
 	});
 }
 
@@ -3492,7 +3578,7 @@ bool TextureCache::HasMetaOverlap(uint64_t vaddr, uint64_t size) {
 	}
 	FaultSafeTextureLock lock(this, m_lock);
 	for (const auto& [address, meta]: m_surface_metas) {
-		if (PageOverlaps(vaddr, size, address, meta.size)) {
+		if (ImagePageRangesOverlap(vaddr, size, address, meta.size)) {
 			return true;
 		}
 	}
@@ -3508,7 +3594,7 @@ bool TextureCache::IsMetaGpuModified(uint64_t vaddr, uint64_t size) {
 	}
 	FaultSafeTextureLock lock(this, m_lock);
 	for (const auto& [address, meta]: m_surface_metas) {
-		if (Overlaps(vaddr, size, address, meta.size) &&
+		if (ImageRangeOverlaps(vaddr, size, address, meta.size) &&
 		    m_metadata_tracker.IsRegionGpuModified(vaddr, size)) {
 			return true;
 		}
@@ -3518,7 +3604,7 @@ bool TextureCache::IsMetaGpuModified(uint64_t vaddr, uint64_t size) {
 
 bool TextureCache::HasMetaOverlapLocked(uint64_t vaddr, uint64_t size) const {
 	for (const auto& [address, meta]: m_surface_metas) {
-		if (PageOverlaps(vaddr, size, address, meta.size)) {
+		if (ImagePageRangesOverlap(vaddr, size, address, meta.size)) {
 			return true;
 		}
 	}
@@ -3686,7 +3772,7 @@ void TextureCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	FaultSafeTextureLock lock(this, m_lock);
 	const auto           end = vaddr + size;
 	for (const auto& [address, meta]: m_surface_metas) {
-		if (PageOverlaps(vaddr, size, address, meta.size) &&
+		if (ImagePageRangesOverlap(vaddr, size, address, meta.size) &&
 		    (vaddr > address || end < address + meta.size)) {
 			EXIT("TextureCache: partial metadata unmap is unsupported, unmap=0x%016" PRIx64
 			     "+0x%016" PRIx64 " metadata=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
@@ -3695,7 +3781,7 @@ void TextureCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	}
 	for (const auto& cached: m_images) {
 		for (uint32_t i = 0; i < cached->RangeCount(); i++) {
-			if (PageOverlaps(vaddr, size, cached->Address(i), cached->Size(i)) &&
+			if (ImagePageRangesOverlap(vaddr, size, cached->Address(i), cached->Size(i)) &&
 			    (vaddr > cached->Address(i) || end < cached->Address(i) + cached->Size(i))) {
 				EXIT("TextureCache: partial image unmap is unsupported, unmap=0x%016" PRIx64
 				     "+0x%016" PRIx64 " image=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
@@ -3749,7 +3835,7 @@ void TextureCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	std::vector<ImageRetirementRange> metadata_ranges;
 	metadata_ranges.reserve(m_surface_metas.size());
 	for (const auto& [address, meta]: m_surface_metas) {
-		const bool retiring = Overlaps(vaddr, size, address, meta.size) ||
+		const bool retiring = ImageRangeOverlaps(vaddr, size, address, meta.size) ||
 		                      std::find(retire_depth_metadata.begin(), retire_depth_metadata.end(),
 		                                address) != retire_depth_metadata.end();
 		metadata_ranges.push_back({address, meta.size, retiring});
@@ -3794,7 +3880,8 @@ void TextureCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	for (auto it = m_surface_metas.begin(); it != m_surface_metas.end();) {
-		const bool allocation_unmapped = Overlaps(vaddr, size, it->first, it->second.size);
+		const bool allocation_unmapped =
+		    ImageRangeOverlaps(vaddr, size, it->first, it->second.size);
 		const bool depth_owner_retired =
 		    std::find(retire_depth_metadata.begin(), retire_depth_metadata.end(), it->first) !=
 		    retire_depth_metadata.end();
