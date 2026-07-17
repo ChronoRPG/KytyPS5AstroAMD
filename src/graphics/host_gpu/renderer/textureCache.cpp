@@ -3098,11 +3098,26 @@ void TextureCache::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
 	MarkSampledAliasesCpuDirtyLocked(vaddr, size);
 }
 
-void TextureCache::SynchronizeRenderTargetToBufferLocked(CachedImage& cached) {
-	const auto& target = cached.target;
+void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached) {
+	const bool render_target = cached.kind == CachedImage::Kind::RenderTarget;
+	const bool video_out     = cached.kind == CachedImage::Kind::VideoOut;
+	RenderTargetInfo target {};
+	if (render_target) {
+		target = cached.target;
+	} else if (video_out) {
+		const auto& info         = cached.video_out;
+		target.address           = info.address;
+		target.size              = info.size;
+		target.format            = info.format;
+		target.width             = info.width;
+		target.height            = info.height;
+		target.pitch             = info.pitch;
+		target.bytes_per_element = info.bytes_per_element;
+		target.tile_mode         = info.tile_mode;
+	}
 	const bool  linear = target.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
 	const bool  tiled  = IsTiledRenderTarget(target);
-	const auto    rows = static_cast<uint64_t>(target.height - 1);
+	const auto  rows = static_cast<uint64_t>(target.height - 1);
 	TileSizeAlign exact {};
 	bool          single_slice = false;
 	if (IsSupportedStandard64RenderTarget(target)) {
@@ -3116,13 +3131,18 @@ void TextureCache::SynchronizeRenderTargetToBufferLocked(CachedImage& cached) {
 		single_slice = TileGetRenderTargetSize(target.width, target.height, target.pitch,
 		                                       target.bytes_per_element, &exact);
 	}
-	const bool    layered_size = target.layers != 0 && single_slice &&
-	                             exact.size <= UINT64_MAX / target.layers &&
-	                             exact.size * target.layers == target.size;
-	const bool    exact_tiled  = tiled && exact.align == 65536 && layered_size;
-	const bool    valid_cache  = cached.kind == CachedImage::Kind::RenderTarget &&
-	                             cached.gpu_modified && !cached.buffer_modified &&
-	                             cached.ctx != nullptr && cached.image != nullptr;
+	const bool layered_size = target.layers != 0 && single_slice &&
+	                          exact.size <= UINT64_MAX / target.layers &&
+	                          exact.size * target.layers == target.size;
+	const bool exact_tiled = tiled && exact.align == 65536 && layered_size;
+	const bool valid_video_out =
+	    video_out && cached.video_out.compression == VideoOutCompression::Uncompressed &&
+	    cached.video_out.metadata_address == 0 && cached.video_out.dcc_control == 0 &&
+	    target.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
+	    target.bytes_per_element == 4 && (target.address & 0xffffu) == 0;
+	const bool valid_cache = (render_target || valid_video_out) && cached.gpu_modified &&
+	                         !cached.buffer_modified && cached.ctx != nullptr &&
+	                         cached.image != nullptr;
 	const bool    valid_target =
 	    target.address != 0 && target.size != 0 && target.width != 0 && target.height != 0 &&
 	    target.pitch >= target.width && target.bytes_per_element != 0 && target.layers != 0 &&
@@ -3130,18 +3150,20 @@ void TextureCache::SynchronizeRenderTargetToBufferLocked(CachedImage& cached) {
 	    rows <= (UINT64_MAX - target.width) / target.pitch;
 	const bool valid_image = cached.image != nullptr && cached.image->layers == target.layers;
 	if (!valid_cache || !valid_target || (!linear && !exact_tiled) || !valid_image) {
-		EXIT("TextureCache: unsupported render-target buffer synchronization, "
+		EXIT("TextureCache: unsupported color-image buffer synchronization, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
 		     " extent=%ux%u pitch=%u bpe=%u levels=%u layers=%u/%u tile=%u"
-		     " gpu_modified=%d buffer_modified=%d\n",
+		     " kind=%u compression=%u gpu_modified=%d buffer_modified=%d\n",
 		     target.address, target.size, target.width, target.height, target.pitch,
 		     target.bytes_per_element, target.levels, target.layers,
 		     cached.image == nullptr ? 0 : cached.image->layers, target.tile_mode,
+		     static_cast<uint32_t>(cached.kind),
+		     video_out ? static_cast<uint32_t>(cached.video_out.compression) : 0,
 		     cached.gpu_modified, cached.buffer_modified);
 	}
 	const auto linear_elements = rows * target.pitch + target.width;
 	if (linear_elements > UINT64_MAX / target.bytes_per_element) {
-		EXIT("TextureCache: render-target buffer synchronization size overflow\n");
+		EXIT("TextureCache: color-image buffer synchronization size overflow\n");
 	}
 	const auto linear_size = linear_elements * target.bytes_per_element;
 	const auto slice_size  = target.size / target.layers;
@@ -3150,7 +3172,7 @@ void TextureCache::SynchronizeRenderTargetToBufferLocked(CachedImage& cached) {
 	    cached.image->extent.height != target.height ||
 	    (tiled && !IsSupportedRenderTargetElementSize(target.bytes_per_element)) ||
 	    HasMetaOverlapLocked(target.address, target.size)) {
-		EXIT("TextureCache: render-target buffer synchronization storage mismatch, "
+		EXIT("TextureCache: color-image buffer synchronization storage mismatch, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " linear=0x%016" PRIx64 "\n",
 		     target.address, target.size, linear_size);
 	}
@@ -3178,7 +3200,7 @@ void TextureCache::SynchronizeRenderTargetToBufferLocked(CachedImage& cached) {
 	m_memory_tracker.ForEachDownloadRange<true>(target.address, target.size,
 	                                            [](uint64_t, uint64_t) noexcept {});
 	if (m_memory_tracker.IsRegionGpuModified(target.address, target.size)) {
-		EXIT("TextureCache: render-target buffer synchronization retained GPU ownership\n");
+		EXIT("TextureCache: color-image buffer synchronization retained GPU ownership\n");
 	}
 	m_buffer_cache.PublishImageBacking(target.address, target.size);
 	cached.gpu_modified    = false;
@@ -3240,7 +3262,18 @@ bool TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
 		case BufferImageWrite::InvalidateTexture:
 		case BufferImageWrite::InvalidateVideoOut: cached.buffer_modified = true; return true;
 		case BufferImageWrite::SynchronizeRenderTarget:
-			SynchronizeRenderTargetToBufferLocked(cached);
+			if (cached.kind != CachedImage::Kind::RenderTarget) {
+				EXIT("TextureCache: render-target synchronization action has kind=%u\n",
+				     static_cast<uint32_t>(cached.kind));
+			}
+			SynchronizeColorImageToBufferLocked(cached);
+			return true;
+		case BufferImageWrite::SynchronizeVideoOut:
+			if (cached.kind != CachedImage::Kind::VideoOut) {
+				EXIT("TextureCache: video-out synchronization action has kind=%u\n",
+				     static_cast<uint32_t>(cached.kind));
+			}
+			SynchronizeColorImageToBufferLocked(cached);
 			return true;
 		case BufferImageWrite::None:
 		case BufferImageWrite::Unsupported:

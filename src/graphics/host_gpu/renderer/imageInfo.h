@@ -330,6 +330,7 @@ enum class BufferImageWrite : uint8_t {
 	InvalidateTexture,
 	InvalidateVideoOut,
 	SynchronizeRenderTarget,
+	SynchronizeVideoOut,
 	Unsupported
 };
 enum class MetaImageOverlap : uint8_t { RetainSampled, RetireTarget, Unsupported };
@@ -613,9 +614,11 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 			           ? BufferImageWrite::InvalidateTexture
 			           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::VideoOut:
-			return exact && buffer_formatted && !image_gpu_modified
-			           ? BufferImageWrite::InvalidateVideoOut
-			           : BufferImageWrite::Unsupported;
+			if (!exact || !buffer_page_aligned || !buffer_formatted) {
+				return BufferImageWrite::Unsupported;
+			}
+			return image_gpu_modified ? BufferImageWrite::SynchronizeVideoOut
+			                          : BufferImageWrite::InvalidateVideoOut;
 		case BufferImageBinding::RenderTarget:
 			return exact && buffer_page_aligned && buffer_formatted && image_gpu_modified
 			           ? BufferImageWrite::SynchronizeRenderTarget

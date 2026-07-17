@@ -10648,9 +10648,18 @@ void CheckBufferImageWrites() {
            BufferImageWrite::Unsupported},
       Case{"video GPU-owned", video, video_size, video, video_size,
            BufferImageBinding::VideoOut, true, true,
-           BufferImageWrite::Unsupported},
+           BufferImageWrite::SynchronizeVideoOut},
       Case{"video unformatted", video, video_size, video, video_size,
            BufferImageBinding::VideoOut, false, false,
+           BufferImageWrite::Unsupported},
+      Case{"video GPU-owned unformatted", video, video_size, video, video_size,
+           BufferImageBinding::VideoOut, true, false,
+           BufferImageWrite::Unsupported},
+      Case{"video GPU-owned partial", video, video_size - 4, video, video_size,
+           BufferImageBinding::VideoOut, true, true,
+           BufferImageWrite::Unsupported},
+      Case{"video unaligned", video + 0x100, video_size, video + 0x100,
+           video_size, BufferImageBinding::VideoOut, true, true,
            BufferImageWrite::Unsupported},
       Case{"target exact", target, target_size, target, target_size,
            BufferImageBinding::RenderTarget, true, true,
@@ -10682,6 +10691,11 @@ void CheckBufferImageWrites() {
               TileGetRenderTargetSize(1920, 1080, 1920, 4, &storage) &&
               storage.align == 0x10000 && storage.size == target_size,
           "render-target write fixture has an invalid tiled layout");
+  Require("BufferImageWrite", "PPSA02721 video layout",
+          TileGetRenderTargetPitch(3840, 4) == 3840 &&
+              TileGetRenderTargetSize(3840, 2160, 3840, 4, &storage) &&
+              storage.align == 0x10000 && storage.size == video_size,
+          "4K video-out ownership fixture lost its exact tiled layout");
   std::printf("[host]    %-32s ok\n", "BufferImageWrite");
 }
 
