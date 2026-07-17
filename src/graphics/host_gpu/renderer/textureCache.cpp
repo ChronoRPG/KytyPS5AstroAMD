@@ -3051,8 +3051,11 @@ void TextureCache::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
 	bool                 found            = false;
 	for (const auto& cached: m_images) {
 		for (uint32_t range = 0; range < cached->RangeCount(); range++) {
+			// CPU-current depth targets use the same tracked guest refresh path as sampled and
+			// color images. GPU-owned targets and metadata aliases remain unsupported below.
 			const bool host_refreshable = (cached->kind == CachedImage::Kind::Texture ||
-			                               cached->kind == CachedImage::Kind::RenderTarget) &&
+			                               cached->kind == CachedImage::Kind::RenderTarget ||
+			                               cached->kind == CachedImage::Kind::DepthTarget) &&
 			                              !cached->buffer_modified;
 			switch (ClassifyHostWriteOverlap(vaddr, size, cached->Address(range),
 			                                 cached->Size(range), host_refreshable,

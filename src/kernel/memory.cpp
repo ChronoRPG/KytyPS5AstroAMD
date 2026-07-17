@@ -3455,10 +3455,8 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 		if (old_gpu_mode == GpuAccessMode::NoAccess) {
 			continue;
 		}
-		if ((old_range.type != VirtualRangeType::Stack &&
-		     old_range.type != VirtualRangeType::Code) ||
-		    !GetGpuResources().IsMapped(old_range.start, old_range.size)) {
-			EXIT("GPU protection transition requires tracked stack/code memory: addr=0x%016" PRIx64
+		if (!GetGpuResources().IsMapped(old_range.start, old_range.size)) {
+			EXIT("GPU protection transition requires tracked memory: addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " type=%s\n",
 			     old_range.start, old_range.size, Common::EnumName(old_range.type).c_str());
 		}
