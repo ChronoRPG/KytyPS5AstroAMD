@@ -1426,8 +1426,10 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	infos.reserve(static_cast<size_t>(buffer_num));
 
 	for (int i = 0; i < buffer_num; i++) {
+		LOGF("\t buffers[%d]: data=%p metadata=%p\n", i, buffers[i].data, buffers[i].metadata);
 		if (buffers[i].reserved[0] != nullptr || buffers[i].reserved[1] != nullptr) {
-			EXIT("video-out buffer reserved fields are unsupported\n");
+			LOGF("\t buffers[%d]: ignoring reserved fields {%p, %p}\n", i,
+			     buffers[i].reserved[0], buffers[i].reserved[1]);
 		}
 		const auto data_address     = reinterpret_cast<uint64_t>(buffers[i].data);
 		const auto metadata_address = reinterpret_cast<uint64_t>(buffers[i].metadata);
