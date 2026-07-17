@@ -214,7 +214,7 @@ void Tiler::DetileStencil(GraphicContext* ctx, DepthStencilVulkanImage* image,
 void Tiler::TileImage(void* dst, const void* src, const RenderTargetInfo& info) const {
 	if (dst == nullptr || src == nullptr || info.address == 0 || info.size == 0 ||
 	    info.width == 0 || info.height == 0 || info.pitch < info.width ||
-	    info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
+	    !IsTiledRenderTarget(info) ||
 	    info.levels != 1 || info.layers == 0 || info.size % info.layers != 0 ||
 	    !IsSupportedRenderTargetElementSize(info.bytes_per_element)) {
 		EXIT("Tiler: unsupported render-target tile, dst=%p src=%p "
@@ -227,8 +227,13 @@ void Tiler::TileImage(void* dst, const void* src, const RenderTargetInfo& info) 
 	for (uint32_t layer = 0; layer < info.layers; layer++) {
 		auto* guest_slice  = static_cast<uint8_t*>(dst) + slice_size * layer;
 		auto* linear_slice = static_cast<const uint8_t*>(src) + slice_size * layer;
-		TileConvertLinearToTiledRenderTarget(guest_slice, linear_slice, info.width, info.height,
-		                                     info.pitch, info.bytes_per_element, slice_size);
+		if (IsSupportedStandard64RenderTarget(info)) {
+			TileConvertLinearToTiledStandard64KB32(guest_slice, linear_slice, info.width,
+			                                        info.height, info.pitch, slice_size);
+		} else {
+			TileConvertLinearToTiledRenderTarget(guest_slice, linear_slice, info.width, info.height,
+			                                     info.pitch, info.bytes_per_element, slice_size);
+		}
 	}
 }
 

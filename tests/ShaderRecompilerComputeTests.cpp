@@ -9649,6 +9649,180 @@ void CheckColorResolveLayers() {
   std::printf("[host]    %-32s ok\n", "ColorResolveLayers");
 }
 
+[[noreturn]] void RunStandard64RenderTargetDeathCase() {
+  RenderTargetInfo info{};
+  info.address = 0x10000;
+  info.size = 0x10000;
+  info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+  info.width = 128;
+  info.height = 64;
+  info.pitch = 128;
+  info.bytes_per_element = 8;
+  info.tile_mode =
+      Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB);
+  std::vector<uint8_t> linear(info.size, 0);
+  std::vector<uint8_t> tiled(info.size, 0);
+  Tiler tiler;
+  tiler.TileImage(tiled.data(), linear.data(), info);
+  std::_Exit(0x7f);
+}
+
+void CheckStandard64RenderTargetTileRoundTrip() {
+  constexpr uint32_t format =
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
+  constexpr uint32_t tile =
+      Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB);
+
+  constexpr uint32_t observed_width = 3840;
+  constexpr uint32_t observed_height = 2160;
+  const auto observed_pitch =
+      TileGetTexturePitch(format, observed_width, 1, tile);
+  TileSizeAlign observed{};
+  TileGetTextureSize(format, observed_width, observed_height, observed_pitch,
+                     1, tile, &observed, nullptr, nullptr);
+  Require("Standard64RenderTarget", "observed layout",
+          observed_pitch == 3840 && observed.size == 0x1fe0000 &&
+              observed.align == 0x10000,
+          "PPSA02721 Standard64KB render-target footprint changed");
+
+  constexpr uint32_t width = 257;
+  constexpr uint32_t height = 131;
+  const auto pitch = TileGetTexturePitch(format, width, 1, tile);
+  TileSizeAlign storage{};
+  TileGetTextureSize(format, width, height, pitch, 1, tile, &storage,
+                     nullptr, nullptr);
+  Require("Standard64RenderTarget", "partial layout",
+          pitch == 384 && storage.size == 0x60000 &&
+              storage.align == 0x10000,
+          "partial Standard64KB footprint was not padded in 128x128 blocks");
+
+  RenderTargetInfo info{};
+  info.address = 0x10000;
+  info.size = storage.size;
+  info.format = VK_FORMAT_R8G8B8A8_UNORM;
+  info.width = width;
+  info.height = height;
+  info.pitch = pitch;
+  info.bytes_per_element = 4;
+  info.tile_mode = tile;
+  Require("Standard64RenderTarget", "support boundary",
+          IsSupportedStandard64RenderTarget(info) &&
+              IsTiledRenderTarget(info),
+          "exact Standard64KB render target was not classified as tiled");
+  Require(
+      "Standard64RenderTarget", "display tile boundary",
+      IsSupportedDisplayRenderTargetTileMode(
+          Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget)) &&
+          !IsSupportedDisplayRenderTargetTileMode(tile),
+      "Standard64KB render target could alias a mode-27 display image");
+  auto unsupported = info;
+  unsupported.address += 4;
+  Require("Standard64RenderTarget", "address guard",
+          !IsSupportedStandard64RenderTarget(unsupported),
+          "unaligned Standard64KB backing was accepted");
+  unsupported = info;
+  unsupported.bytes_per_element = 8;
+  Require("Standard64RenderTarget", "element guard",
+          !IsSupportedStandard64RenderTarget(unsupported),
+          "unimplemented Standard64KB element size was accepted");
+  unsupported = info;
+  unsupported.pitch += 128;
+  Require("Standard64RenderTarget", "pitch guard",
+          !IsSupportedStandard64RenderTarget(unsupported),
+          "non-minimal Standard64KB pitch was accepted");
+  unsupported = info;
+  unsupported.size += 0x10000;
+  Require("Standard64RenderTarget", "size guard",
+          !IsSupportedStandard64RenderTarget(unsupported),
+          "non-exact Standard64KB allocation was accepted");
+  unsupported = info;
+  unsupported.levels = 2;
+  Require("Standard64RenderTarget", "mip guard",
+          !IsSupportedStandard64RenderTarget(unsupported),
+          "unimplemented Standard64KB mip chain was accepted");
+  unsupported = info;
+  unsupported.layers = 2;
+  Require("Standard64RenderTarget", "layer guard",
+          !IsSupportedStandard64RenderTarget(unsupported),
+          "unimplemented Standard64KB array was accepted");
+
+  std::vector<uint32_t> linear(storage.size / sizeof(uint32_t), 0);
+  for (uint32_t y = 0; y < height; y++) {
+    for (uint32_t x = 0; x < width; x++) {
+      linear[static_cast<uint64_t>(y) * pitch + x] =
+          (y * 0x1f123bb5u) ^ (x * 0x9e3779b9u) ^ 0xa55a3cc3u;
+    }
+  }
+  std::vector<uint32_t> tiled(linear.size(), 0xcdcdcdcdu);
+  std::vector<uint32_t> restored(linear.size(), 0xa5a5a5a5u);
+  Tiler tiler;
+  tiler.TileImage(tiled.data(), linear.data(), info);
+  TileConvertTiledToLinearStandard64KB32(
+      restored.data(), tiled.data(), width, height, pitch, storage.size);
+  for (uint32_t y = 0; y < height; y++) {
+    const auto row = static_cast<uint64_t>(y) * pitch;
+    Require("Standard64RenderTarget", "round trip",
+            std::memcmp(linear.data() + row, restored.data() + row,
+                        width * sizeof(uint32_t)) == 0,
+            "Standard64KB render-target conversion did not round-trip");
+  }
+  Require("Standard64RenderTarget", "padding",
+          tiled.back() == 0,
+          "Standard64KB render-target conversion retained stale padding");
+
+  constexpr uint32_t block_width = 128;
+  constexpr uint32_t block_height = 128;
+  constexpr uint64_t block_size = 0x10000;
+  std::vector<uint32_t> known(block_size / sizeof(uint32_t));
+  for (uint32_t i = 0; i < known.size(); i++) {
+    known[i] = i;
+  }
+  std::vector<uint32_t> standard(known.size(), 0);
+  std::vector<uint32_t> render_target(known.size(), 0);
+  TileConvertLinearToTiledStandard64KB32(
+      standard.data(), known.data(), block_width, block_height, block_width,
+      block_size);
+  Require("Standard64RenderTarget", "SDK byte mapping",
+          standard[0] == 0 && standard[1] == 1 && standard[2] == 2 &&
+              standard[4] == 128 && standard[8] == 256 &&
+              standard[16] == 512 && standard[32] == 4 &&
+              standard[16383] == 16383,
+          "Standard64KB reciprocal mapping disagreed with the PS5 SDK");
+  TileConvertLinearToTiledRenderTarget(
+      render_target.data(), known.data(), block_width, block_height,
+      block_width, sizeof(uint32_t), block_size);
+  Require("Standard64RenderTarget", "mode identity",
+          standard != render_target,
+          "Standard64KB was accidentally treated as RenderTarget/XOR tiling");
+
+  char path[MAX_PATH]{};
+  Require("Standard64RenderTarget", "host",
+          GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
+          "GetModuleFileName failed");
+  std::string command =
+      std::string("\"") + path + "\" --standard64-rt-death";
+  std::vector<char> mutable_command(command.begin(), command.end());
+  mutable_command.push_back('\0');
+  STARTUPINFOA startup{sizeof(startup)};
+  PROCESS_INFORMATION process{};
+  Require("Standard64RenderTarget", "host",
+          CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr,
+                         FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                         &process) != 0,
+          "CreateProcess failed");
+  Require("Standard64RenderTarget", "host",
+          WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0,
+          "unsupported Standard64KB render-target case timed out");
+  DWORD exit_code = 0;
+  const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  Require("Standard64RenderTarget", "hard failure",
+          exited && exit_code == 321,
+          "unsupported Standard64KB render-target shape lost its fatal guard");
+  std::printf("[host]    %-32s ok\n", "Standard64RenderTarget");
+}
+
 void CheckRenderTargetTileRoundTrip() {
   struct Case {
     uint32_t width;
@@ -11790,8 +11964,15 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-death") == 0) {
     RunReverseRenderTargetDeathCase();
   }
+  if (argc == 2 && std::strcmp(argv[1], "--standard64-rt-death") == 0) {
+    RunStandard64RenderTargetDeathCase();
+  }
   if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-only") == 0) {
     CheckReverseRenderTargetFormatContract();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--standard64-rt-only") == 0) {
+    CheckStandard64RenderTargetTileRoundTrip();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
@@ -11878,6 +12059,7 @@ int main(int argc, char **argv) {
   CheckStorageTextureLinearReadbackLayout();
   CheckStorageImageSwizzleSpecializationId();
   CheckColorResolveLayers();
+  CheckStandard64RenderTargetTileRoundTrip();
   CheckRenderTargetTileRoundTrip();
   CheckDepthTargetTileRoundTrip();
   CheckStencilTargetTileRoundTrip();

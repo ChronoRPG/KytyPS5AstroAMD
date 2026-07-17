@@ -415,9 +415,8 @@ struct TextureCache::ReadbackWorker {
 		                                   cached.info, Prospero::SurfaceFormat(cached.info.format),
 		                                   Prospero::NumBytesPerElement(cached.info.format))
 		                             : MakeColorImageTransferInfo(cached.target);
-		const bool linear  = info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-		const bool tiled =
-		    target && info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+		const bool linear = info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
+		const bool tiled  = target && IsTiledRenderTarget(cached.target);
 		bool single_layer_storage = false;
 		if (storage) {
 			switch (static_cast<Prospero::ImageType>(cached.info.type)) {
@@ -975,14 +974,16 @@ void UploadRenderTargetLayers(GraphicContext* ctx, RenderTextureVulkanImage* ima
 	}
 	const auto slice_size  = info.size / info.layers;
 	const auto upload_size = slice_size * layer_count;
-	if (info.levels > 1 || info.layers > 1) {
+	const bool standard64 = IsSupportedStandard64RenderTarget(info);
+	if (standard64 || info.levels > 1 || info.layers > 1) {
 		const auto format = RenderTargetTransferFormat(info.bytes_per_element);
 		auto layout = TextureCalcUploadLayout(format, info.width, info.height, info.levels,
 		                                      layer_count, info.pitch, info.tile_mode, upload_size,
 		                                      false, false, false, "TextureCache render target");
-		const bool tiled =
+		const bool render_target_tiled =
 		    info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
-		if ((tiled && !layout.fmt_tiled_render_target) || layout.pitch != info.pitch) {
+		if ((render_target_tiled && !layout.fmt_tiled_render_target) ||
+		    (standard64 && !layout.fmt_tiled_standard64kb) || layout.pitch != info.pitch) {
 			EXIT("TextureCache: unsupported render-target mip upload layout, pitch=%u/%u tile=%u\n",
 			     info.pitch, layout.pitch, info.tile_mode);
 		}
@@ -2074,13 +2075,15 @@ StorageTextureVulkanImage* TextureCache::FindStorageTexture(CommandBuffer*   com
 RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*          command,
                                                          GraphicContext*         ctx,
                                                          const RenderTargetInfo& info) {
+	const bool standard64 = IsSupportedStandard64RenderTarget(info);
 	if (command == nullptr || ctx == nullptr || info.address == 0 || info.size == 0 ||
 	    info.address >= TRACKER_ADDRESS_SIZE || info.size > TRACKER_ADDRESS_SIZE - info.address ||
 	    info.format == VK_FORMAT_UNDEFINED || info.width == 0 || info.height == 0 ||
 	    info.pitch < info.width || info.bytes_per_element == 0 || info.levels == 0 ||
 	    info.levels > 16 || info.layers == 0 || info.size % info.layers != 0 ||
 	    (info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kLinear) &&
-	     info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget))) {
+	     info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
+	     !standard64)) {
 		EXIT("TextureCache: invalid render-target request, ctx=%p addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 " extent=%ux%u pitch=%u bpe=%u tile=%u format=%d\n",
 		     static_cast<const void*>(ctx), info.address, info.size, info.width, info.height,
@@ -2098,6 +2101,19 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 			     " expected=0x%08x extent=%ux%u pitch=%u bpe=%u levels=%u tile=%u\n",
 			     info.size, layout.size, info.width, info.height, info.pitch,
 			     info.bytes_per_element, info.levels, info.tile_mode);
+		}
+	}
+	if (standard64) {
+		const auto format = RenderTargetTransferFormat(info.bytes_per_element);
+		const auto expected_pitch =
+		    TileGetTexturePitch(format, info.width, info.levels, info.tile_mode);
+		TileSizeAlign layout {};
+		TileGetTextureSize(format, info.width, info.height, expected_pitch, info.levels,
+		                   info.tile_mode, &layout, nullptr, nullptr);
+		if (expected_pitch != info.pitch || layout.align != 65536 || layout.size != info.size) {
+			EXIT("TextureCache: invalid Standard64KB render-target layout,"
+			     " size=0x%016" PRIx64 " expected=0x%08x align=0x%08x pitch=%u/%u\n",
+			     info.size, layout.size, layout.align, info.pitch, expected_pitch);
 		}
 	}
 	const auto rows = static_cast<uint64_t>(info.height - 1);
@@ -3085,12 +3101,21 @@ void TextureCache::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
 void TextureCache::SynchronizeRenderTargetToBufferLocked(CachedImage& cached) {
 	const auto& target = cached.target;
 	const bool  linear = target.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-	const bool  tiled =
-	    target.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+	const bool  tiled  = IsTiledRenderTarget(target);
 	const auto    rows = static_cast<uint64_t>(target.height - 1);
 	TileSizeAlign exact {};
-	const bool    single_slice = TileGetRenderTargetSize(target.width, target.height, target.pitch,
-	                                                     target.bytes_per_element, &exact);
+	bool          single_slice = false;
+	if (IsSupportedStandard64RenderTarget(target)) {
+		const auto format = RenderTargetTransferFormat(target.bytes_per_element);
+		const auto expected_pitch =
+		    TileGetTexturePitch(format, target.width, target.levels, target.tile_mode);
+		TileGetTextureSize(format, target.width, target.height, expected_pitch, target.levels,
+		                   target.tile_mode, &exact, nullptr, nullptr);
+		single_slice = target.pitch == expected_pitch && exact.align == 65536 && exact.size != 0;
+	} else {
+		single_slice = TileGetRenderTargetSize(target.width, target.height, target.pitch,
+		                                       target.bytes_per_element, &exact);
+	}
 	const bool    layered_size = target.layers != 0 && single_slice &&
 	                             exact.size <= UINT64_MAX / target.layers &&
 	                             exact.size * target.layers == target.size;

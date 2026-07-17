@@ -360,6 +360,30 @@ SelectStorageSampledViewShape(uint32_t type, uint32_t depth, uint32_t backing_la
 	}
 }
 
+[[nodiscard]] inline constexpr bool IsSupportedDisplayRenderTargetTileMode(
+    uint32_t tile_mode) noexcept {
+	return tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+}
+
+[[nodiscard]] inline constexpr bool
+IsSupportedStandard64RenderTarget(const RenderTargetInfo& info) noexcept {
+	if (info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB) ||
+	    info.address == 0 || (info.address & 0xffffu) != 0 || info.width == 0 || info.height == 0 ||
+	    info.bytes_per_element != 4 || info.levels != 1 || info.layers != 1) {
+		return false;
+	}
+	const auto expected_pitch = (static_cast<uint64_t>(info.width) + 127u) & ~uint64_t {127u};
+	const auto padded_height  = (static_cast<uint64_t>(info.height) + 127u) & ~uint64_t {127u};
+	return expected_pitch <= UINT32_MAX && info.pitch == expected_pitch &&
+	       expected_pitch <= UINT64_MAX / padded_height / info.bytes_per_element &&
+	       info.size == expected_pitch * padded_height * info.bytes_per_element;
+}
+
+[[nodiscard]] inline constexpr bool IsTiledRenderTarget(const RenderTargetInfo& info) noexcept {
+	return info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
+	       IsSupportedStandard64RenderTarget(info);
+}
+
 [[nodiscard]] inline constexpr DepthTransitionSource
 SelectDepthTransitionSource(bool depth_load_clear, bool sampled_native_available,
                             bool sampled_cpu_dirty, bool sampled_buffer_modified,
