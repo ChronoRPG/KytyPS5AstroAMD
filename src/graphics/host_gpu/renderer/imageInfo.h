@@ -442,11 +442,16 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 	if (!ImagePageRangesOverlap(buffer_address, buffer_size, image_address, image_size)) {
 		return BufferImageWrite::None;
 	}
-	const bool exact        = buffer_address == image_address && buffer_size == image_size;
-	const bool page_aligned = ((buffer_address | buffer_size) & (TRACKER_PAGE_SIZE - 1)) == 0;
+	const bool exact = buffer_address == image_address && buffer_size == image_size;
+	const auto offset = buffer_address >= image_address ? buffer_address - image_address : UINT64_MAX;
+	const bool contained = offset <= image_size && buffer_size <= image_size - offset;
+	const bool buffer_page_aligned =
+	    ((buffer_address | buffer_size) & (TRACKER_PAGE_SIZE - 1)) == 0;
+	const bool image_page_aligned =
+	    ((image_address | image_size) & (TRACKER_PAGE_SIZE - 1)) == 0;
 	switch (binding) {
 		case BufferImageBinding::Texture:
-			return exact && page_aligned && !image_gpu_modified
+			return contained && image_page_aligned && !image_gpu_modified
 			           ? BufferImageWrite::InvalidateTexture
 			           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::VideoOut:
@@ -454,7 +459,7 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 			           ? BufferImageWrite::InvalidateVideoOut
 			           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::RenderTarget:
-			return exact && page_aligned && buffer_formatted && image_gpu_modified
+			return exact && buffer_page_aligned && buffer_formatted && image_gpu_modified
 			           ? BufferImageWrite::SynchronizeRenderTarget
 			           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::Unsupported: return BufferImageWrite::Unsupported;
