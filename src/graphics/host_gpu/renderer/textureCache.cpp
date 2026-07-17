@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderTargetBarriers.h"
 #include "graphics/host_gpu/renderer/resourceMutex.h"
 #include "graphics/host_gpu/utils.h"
 #include "graphics/shader/shader.h"

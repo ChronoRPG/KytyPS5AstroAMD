@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/debug.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -6,7 +8,6 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/renderer/renderState.h"
 
 #include <atomic>
 #include <cmath>

@@ -7,7 +7,6 @@
 #include "graphics/host_gpu/renderer/bufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/renderState.h"
 #include "graphics/presentation/displayBuffer.h"
 #include "kernel/eventQueue.h"
 #include "kernel/pthread.h"

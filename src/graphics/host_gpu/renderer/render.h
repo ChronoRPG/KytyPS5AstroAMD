@@ -40,6 +40,19 @@ struct HtileClearTarget {
 	uint64_t size    = 0;
 };
 
+enum class CommandBufferDebugOp : uint32_t {
+	DispatchDirect,
+	DrawIndex,
+	DrawIndexAuto,
+	EopWrite,
+	EopInterrupt,
+	EopWriteBack,
+	EopFlip,
+	EopWriteBackFlip,
+	EopOnlyFlip,
+	Unknown,
+};
+
 class FenceResourceRetainer {
 public:
 	FenceResourceRetainer() = default;
