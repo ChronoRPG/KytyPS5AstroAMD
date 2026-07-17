@@ -285,7 +285,8 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 		mask = 0x0f;
 	}
 
-	r->target_slot = rt_slot;
+	r->target_slot    = rt_slot;
+	r->export_mapping = {};
 
 	if (rt.base.addr == 0 || mask == 0) {
 		if (graphics_debug_dump_enabled()) {
@@ -479,6 +480,7 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 		r->extent         = view_extent;
 		r->base_mip_level = rt.view.current_mip_level;
 		r->buffer_size    = backing_size;
+		r->export_mapping = rt_format.export_mapping;
 	} else {
 		const auto layout = static_cast<Prospero::ChannelLayout>(rt.info.format);
 		const auto type   = static_cast<Prospero::ChannelType>(rt.info.channel_type);

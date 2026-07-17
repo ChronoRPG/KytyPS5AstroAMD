@@ -748,6 +748,12 @@ static void RefreshShaders(HW::Context* ctx, HW::Shader* sh_ctx, const DrawCallI
 	state->vs_shader     = {};
 	state->ps_shader     = {};
 	state->ps_input_info = {};
+	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
+	    target_export_mapping {};
+	for (uint32_t i = 0; i < state->color_count; i++) {
+		target_export_mapping[state->color_info[i].target_slot] =
+		    state->color_info[i].export_mapping;
+	}
 	EXIT_IF(g_render_ctx == nullptr || g_render_ctx->GetGraphicCtx() == nullptr);
 	const auto lane_mask_mode = SelectGraphicsLaneMaskMode(*g_render_ctx->GetGraphicCtx(), 64u);
 
@@ -766,7 +772,8 @@ static void RefreshShaders(HW::Context* ctx, HW::Shader* sh_ctx, const DrawCallI
 		LogDrawPhase(draw.name, "ShaderCompileInfoPS");
 	}
 	if (!ShaderCompileInfoPS(&pixel_shader_info, &shader_regs, lane_mask_mode,
-	                         &state->vs_input_info, &state->ps_input_info, &state->ps_shader)) {
+	                         &state->vs_input_info, target_export_mapping, &state->ps_input_info,
+	                         &state->ps_shader)) {
 		EXIT("ShaderCompileInfoPS failed for draw %s\n", draw.name);
 	}
 }

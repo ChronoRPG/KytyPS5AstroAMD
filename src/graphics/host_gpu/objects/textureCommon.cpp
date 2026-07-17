@@ -92,6 +92,9 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(uint32_t raw_layout, uint32_
 	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16G16B16A16_SFLOAT, 8};
 	}
+	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kReversed)) {
+		return {VK_FORMAT_R16G16B16A16_SFLOAT, 8, Prospero::ColorMappingAbgr};
+	}
 	if (is(Prospero::ChannelLayout::k32, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R32_SFLOAT, 4};
 	}

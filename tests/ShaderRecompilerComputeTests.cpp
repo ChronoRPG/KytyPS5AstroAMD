@@ -8676,6 +8676,51 @@ bool CacheFault(void *opaque, PageFaultAccess access, uint64_t vaddr,
          context->texture->InvalidateMemory(access, vaddr, size, phase);
 }
 
+[[noreturn]] void RunReverseRenderTargetDeathCase() {
+  (void)TextureGetRenderTargetFormat(12u, 7u, 3u);
+  std::_Exit(0x7f);
+}
+
+void CheckReverseRenderTargetFormatContract() {
+  const auto format = TextureGetRenderTargetFormat(12u, 7u, 2u);
+  Require("ReverseRenderTarget", "exact format",
+          format.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+              format.bytes_per_element == 8u &&
+              format.export_mapping == Prospero::ColorMappingAbgr,
+          "exact reverse RGBA16F render-target tuple was rejected");
+  Require("ReverseRenderTarget", "write masks",
+          format.export_mapping.ApplyMask(0x1u) == 0x8u &&
+              format.export_mapping.ApplyMask(0x2u) == 0x4u &&
+              format.export_mapping.ApplyMask(0x4u) == 0x2u &&
+              format.export_mapping.ApplyMask(0x8u) == 0x1u &&
+              format.export_mapping.ApplyMask(0xfu) == 0xfu,
+          "reverse RGBA16F component mask was not mapped exactly once");
+
+  char path[MAX_PATH]{};
+  Require("ReverseRenderTarget", "host",
+          GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
+          "GetModuleFileName failed");
+  std::string command = std::string("\"") + path + "\" --reverse-rt-death";
+  std::vector<char> mutable_command(command.begin(), command.end());
+  mutable_command.push_back('\0');
+  STARTUPINFOA startup{sizeof(startup)};
+  PROCESS_INFORMATION process{};
+  Require("ReverseRenderTarget", "host",
+          CreateProcessA(nullptr, mutable_command.data(), nullptr, nullptr, FALSE,
+                         CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) != 0,
+          "CreateProcess failed");
+  Require("ReverseRenderTarget", "host",
+          WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0,
+          "unsupported adjacent render-target tuple timed out");
+  DWORD exit_code = 0;
+  const bool exited = GetExitCodeProcess(process.hProcess, &exit_code) != 0;
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  Require("ReverseRenderTarget", "hard failure", exited && exit_code == 321,
+          "adjacent unproven render-target tuple did not retain the fatal guard");
+  std::printf("[host]    %-32s ok\n", "ReverseRenderTargetFormat");
+}
+
 [[noreturn]] void RunImageViewDeathCase(const char *kind) {
   if (std::strcmp(kind, "sampled") == 0) {
     (void)SelectSampledColorView(VK_FORMAT_R8G8B8A8_UNORM,
@@ -11729,6 +11774,13 @@ int main(int argc, char **argv) {
     return 0;
   }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-death") == 0) {
+    RunReverseRenderTargetDeathCase();
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-only") == 0) {
+    CheckReverseRenderTargetFormatContract();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
     CheckImageOverlapResolution();
     return 0;
@@ -11802,6 +11854,7 @@ int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--metadata-descriptor-death") == 0) {
     RunMetadataDescriptorDeathCase(argv[2]);
   }
+  CheckReverseRenderTargetFormatContract();
   CheckSampledColorViews();
   CheckSampledDepthResource();
   CheckSampledDepthDescriptor();
