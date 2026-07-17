@@ -416,9 +416,9 @@ struct TextureCache::ReadbackWorker {
 		                                   cached.info, Prospero::SurfaceFormat(cached.info.format),
 		                                   Prospero::NumBytesPerElement(cached.info.format))
 		                             : MakeColorImageTransferInfo(cached.target);
-		const bool linear = info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-		const bool tiled  = target && IsTiledRenderTarget(cached.target);
-		bool single_layer_storage = false;
+		const bool linear  = info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
+		const bool tiled   = target && IsTiledRenderTarget(cached.target);
+		bool       single_layer_storage = false;
 		if (storage) {
 			switch (static_cast<Prospero::ImageType>(cached.info.type)) {
 				case Prospero::ImageType::kColor2D:
@@ -785,8 +785,7 @@ TextureImageCreateParams MakeImageParams(const ImageInfo& info, bool storage) {
 }
 
 bool FormatSupportsStorage(GraphicContext* ctx, VkFormat format) {
-	VkFormatProperties properties {};
-	vkGetPhysicalDeviceFormatProperties(ctx->physical_device, format, &properties);
+	const auto properties = ctx->GetFormatProperties(format);
 	return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
 }
 
@@ -818,9 +817,8 @@ VkImageUsageFlags RenderTargetUsage(GraphicContext* ctx, VkFormat format,
 		usage |= VK_IMAGE_USAGE_STORAGE_BIT;
 	}
 	VkImageFormatProperties properties {};
-	if (vkGetPhysicalDeviceImageFormatProperties(ctx->physical_device, format, VK_IMAGE_TYPE_2D,
-	                                             VK_IMAGE_TILING_OPTIMAL, usage, flags,
-	                                             &properties) != VK_SUCCESS) {
+	if (ctx->GetImageFormatProperties(format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage,
+	                                  flags, &properties) != VK_SUCCESS) {
 		EXIT("TextureCache: render-target format does not support required usage, format=%d "
 		     "usage=0x%x\n",
 		     static_cast<int>(format), usage);
@@ -958,7 +956,7 @@ void UploadRenderTargetLayers(GraphicContext* ctx, RenderTextureVulkanImage* ima
 	}
 	const auto slice_size  = info.size / info.layers;
 	const auto upload_size = slice_size * layer_count;
-	const bool standard64 = IsSupportedStandard64RenderTarget(info);
+	const bool standard64  = IsSupportedStandard64RenderTarget(info);
 	if (standard64 || info.levels > 1 || info.layers > 1) {
 		const auto format = RenderTargetTransferFormat(info.bytes_per_element);
 		auto layout = TextureCalcUploadLayout(format, info.width, info.height, info.levels,
@@ -966,9 +964,8 @@ void UploadRenderTargetLayers(GraphicContext* ctx, RenderTextureVulkanImage* ima
 		                                      false, false, false, "TextureCache render target");
 		const bool render_target_tiled =
 		    info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
-		if (!standard64 &&
-		    ((render_target_tiled && !layout.fmt_tiled_render_target) ||
-		     layout.pitch != info.pitch)) {
+		if (!standard64 && ((render_target_tiled && !layout.fmt_tiled_render_target) ||
+		                    layout.pitch != info.pitch)) {
 			EXIT("TextureCache: unsupported render-target mip upload layout, pitch=%u/%u tile=%u\n",
 			     info.pitch, layout.pitch, info.tile_mode);
 		}
@@ -1099,9 +1096,8 @@ DepthStencilVulkanImage* CreateDepthTarget(GraphicContext* ctx, const DepthTarge
 	create.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
 	create.samples       = VK_SAMPLE_COUNT_1_BIT;
 	VkImageFormatProperties properties {};
-	if (vkGetPhysicalDeviceImageFormatProperties(ctx->physical_device, info.format,
-	                                             VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
-	                                             create.usage, 0, &properties) != VK_SUCCESS) {
+	if (ctx->GetImageFormatProperties(info.format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+	                                  create.usage, 0, &properties) != VK_SUCCESS) {
 		EXIT("TextureCache: depth format does not support required usage, format=%d usage=0x%x\n",
 		     static_cast<int>(info.format), create.usage);
 	}
@@ -1770,8 +1766,8 @@ VulkanImage* TextureCache::FindTexture(CommandBuffer* command, GraphicContext* c
 	if (command == nullptr || ctx == nullptr || info.address == 0 || info.size == 0 ||
 	    info.address >= TRACKER_ADDRESS_SIZE || info.size > TRACKER_ADDRESS_SIZE - info.address ||
 	    info.width == 0 || info.height == 0 || info.depth == 0 || info.levels == 0 ||
-	    info.levels >= 16 ||
-	    info.view_levels == 0 || info.base_level + info.view_levels > info.levels) {
+	    info.levels >= 16 || info.view_levels == 0 ||
+	    info.base_level + info.view_levels > info.levels) {
 		EXIT("TextureCache: invalid sampled-image request, command=%p ctx=%p addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 " extent=%ux%ux%u levels=%u\n",
 		     static_cast<const void*>(command), static_cast<const void*>(ctx), info.address,
@@ -3086,9 +3082,9 @@ void TextureCache::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
 }
 
 void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached) {
-	const bool render_target = cached.kind == CachedImage::Kind::RenderTarget;
-	const bool video_out     = cached.kind == CachedImage::Kind::VideoOut;
-	RenderTargetInfo target = cached.target;
+	const bool       render_target = cached.kind == CachedImage::Kind::RenderTarget;
+	const bool       video_out     = cached.kind == CachedImage::Kind::VideoOut;
+	RenderTargetInfo target        = cached.target;
 	if (video_out) {
 		const auto& info         = cached.video_out;
 		target.address           = info.address;
@@ -3100,8 +3096,8 @@ void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached) {
 		target.bytes_per_element = info.bytes_per_element;
 		target.tile_mode         = info.tile_mode;
 	}
-	const bool  linear = target.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-	const bool  tiled  = IsTiledRenderTarget(target);
+	const bool    linear = target.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
+	const bool    tiled  = IsTiledRenderTarget(target);
 	TileSizeAlign exact {};
 	bool          single_slice = false;
 	if (IsSupportedStandard64RenderTarget(target)) {
@@ -3114,9 +3110,8 @@ void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached) {
 	const bool layered_size =
 	    single_slice && static_cast<uint64_t>(exact.size) * target.layers == target.size;
 	const bool exact_tiled = tiled && exact.align == 65536 && layered_size;
-	const bool valid_kind = render_target ||
-	                        (video_out && cached.video_out.compression ==
-	                                          VideoOutCompression::Uncompressed);
+	const bool valid_kind  = render_target || (video_out && cached.video_out.compression ==
+	                                                            VideoOutCompression::Uncompressed);
 	if (!valid_kind || !cached.gpu_modified || cached.buffer_modified || target.levels != 1 ||
 	    target.size > UINT32_MAX || (!linear && !exact_tiled) ||
 	    HasMetaOverlapLocked(target.address, target.size)) {
@@ -3130,9 +3125,8 @@ void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached) {
 		     video_out ? static_cast<uint32_t>(cached.video_out.compression) : 0,
 		     cached.gpu_modified, cached.buffer_modified);
 	}
-	const auto slice_size  = target.size / target.layers;
-	if (cached.image->format != target.format ||
-	    cached.image->extent.width != target.width ||
+	const auto slice_size = target.size / target.layers;
+	if (cached.image->format != target.format || cached.image->extent.width != target.width ||
 	    cached.image->extent.height != target.height ||
 	    (tiled && !IsSupportedRenderTargetElementSize(target.bytes_per_element)) ||
 	    HasMetaOverlapLocked(target.address, target.size)) {

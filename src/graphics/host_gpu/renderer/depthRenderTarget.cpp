@@ -11,8 +11,8 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/objects/textureCommon.h"
-#include "graphics/host_gpu/renderer/descriptorCache.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/descriptorCache.h"
 #include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -25,7 +25,6 @@
 #include <cstdarg>
 #include <cstdio>
 #include <limits>
-#include <mutex>
 #include <vulkan/vk_enum_string_helper.h>
 
 namespace Libs::Graphics {
@@ -74,21 +73,15 @@ static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
 			if (ctx == nullptr) {
 				return VK_FORMAT_UNDEFINED;
 			}
-			// Kyty selects one physical device. Query its optional D16S8-compatible formats once.
-			static std::once_flag once;
-			static VkFormat       selected = VK_FORMAT_UNDEFINED;
-			std::call_once(once, [&] {
-				for (const auto format: policy.stencil_attachment_formats) {
-					VkImageFormatProperties properties {};
-					if (vkGetPhysicalDeviceImageFormatProperties(
-					        ctx->physical_device, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
-					        DepthTargetImageUsage(), 0, &properties) == VK_SUCCESS) {
-						selected = format;
-						break;
-					}
+			for (const auto format: policy.stencil_attachment_formats) {
+				VkImageFormatProperties properties {};
+				if (ctx->GetImageFormatProperties(format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+				                                  DepthTargetImageUsage(), 0,
+				                                  &properties) == VK_SUCCESS) {
+					return format;
 				}
-			});
-			return selected;
+			}
+			return VK_FORMAT_UNDEFINED;
 		}
 		default: return VK_FORMAT_UNDEFINED;
 	}
