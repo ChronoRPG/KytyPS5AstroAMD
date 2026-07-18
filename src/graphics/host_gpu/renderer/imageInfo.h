@@ -225,7 +225,12 @@ FindGuestDepthFormatPolicy(uint32_t guest_format) noexcept {
 	                    : info.format == policy->depth_attachment_format);
 }
 
-enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_64_64, Unsupported };
+enum class VideoOutCompression : uint8_t {
+	Uncompressed,
+	Dcc256_256_0,
+	Dcc256_64_64,
+	Unsupported
+};
 
 struct VideoOutInfo {
 	uint64_t            address           = 0;
@@ -246,22 +251,28 @@ struct VideoOutInfo {
 [[nodiscard]] inline VideoOutCompression
 ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t dcc_control,
                             uint64_t dcc_clear_color) noexcept {
+	constexpr uint32_t VIDEO_OUT_DCC_CONTROL_256_256_0 = 0x00000048u;
 	constexpr uint32_t VIDEO_OUT_DCC_CONTROL_256_64_64 = 0x00000208u;
 	if (!compressed) {
 		return metadata_address == 0 && dcc_control == 0 && dcc_clear_color == 0
 		           ? VideoOutCompression::Uncompressed
 		           : VideoOutCompression::Unsupported;
 	}
-	return metadata_address != 0 && (metadata_address & 0xffu) == 0 &&
-	               dcc_control == VIDEO_OUT_DCC_CONTROL_256_64_64 && dcc_clear_color == 0
-	           ? VideoOutCompression::Dcc256_64_64
-	           : VideoOutCompression::Unsupported;
+	if (metadata_address == 0 || (metadata_address & 0xffu) != 0 || dcc_clear_color != 0) {
+		return VideoOutCompression::Unsupported;
+	}
+	switch (dcc_control) {
+		case VIDEO_OUT_DCC_CONTROL_256_256_0: return VideoOutCompression::Dcc256_256_0;
+		case VIDEO_OUT_DCC_CONTROL_256_64_64: return VideoOutCompression::Dcc256_64_64;
+		default: return VideoOutCompression::Unsupported;
+	}
 }
 
 [[nodiscard]] inline constexpr bool
 CanUseVideoOutNativeWithoutUpload(VideoOutCompression compression, bool render_target,
                                   bool gpu_modified, bool guest_modified) noexcept {
-	return compression == VideoOutCompression::Dcc256_64_64 && !guest_modified &&
+	return compression != VideoOutCompression::Uncompressed &&
+	       compression != VideoOutCompression::Unsupported && !guest_modified &&
 	       (render_target || gpu_modified);
 }
 

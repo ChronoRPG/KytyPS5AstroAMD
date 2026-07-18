@@ -11945,6 +11945,10 @@ void CheckImageOverlapResolution() {
           "host-backed fill aliased a sampled image on another page");
 
   constexpr uint64_t video_metadata = 0x1020c10000ull;
+  Require("ImageOverlapResolution", "video-out DCC 256/256/0",
+          ClassifyVideoOutCompression(true, video_metadata, 0x48u, 0) ==
+              VideoOutCompression::Dcc256_256_0,
+          "Prospero video-out DCC 256/256/0 mode was rejected");
   Require("ImageOverlapResolution", "video-out DCC 256/64/64",
           ClassifyVideoOutCompression(true, video_metadata, 0x208u, 0) ==
               VideoOutCompression::Dcc256_64_64,
@@ -11970,6 +11974,10 @@ void CheckImageOverlapResolution() {
                   VideoOutCompression::Dcc256_64_64, false, true, false) &&
               !CanUseVideoOutNativeWithoutUpload(
                   VideoOutCompression::Dcc256_64_64, false, false, false) &&
+              CanUseVideoOutNativeWithoutUpload(
+                  VideoOutCompression::Dcc256_256_0, true, false, false) &&
+              !CanUseVideoOutNativeWithoutUpload(
+                  VideoOutCompression::Dcc256_256_0, false, false, true) &&
               !CanUseVideoOutNativeWithoutUpload(
                   VideoOutCompression::Dcc256_64_64, true, false, true) &&
               !CanUseVideoOutNativeWithoutUpload(

@@ -300,7 +300,8 @@ void ValidateVideoOut(GraphicContext* ctx, const VideoOutInfo& info) {
 	const auto compression =
 	    ClassifyVideoOutCompression(info.compression != VideoOutCompression::Uncompressed,
 	                                info.metadata_address, info.dcc_control, 0);
-	const bool metadata_invalid = compression == VideoOutCompression::Dcc256_64_64 &&
+	const bool metadata_invalid = compression != VideoOutCompression::Uncompressed &&
+	                              compression != VideoOutCompression::Unsupported &&
 	                              (info.metadata_address >= TRACKER_ADDRESS_SIZE ||
 	                               (info.metadata_address >= info.address &&
 	                                info.metadata_address < info.address + info.size));
