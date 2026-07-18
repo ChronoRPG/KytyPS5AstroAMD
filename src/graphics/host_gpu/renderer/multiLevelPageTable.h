@@ -15,7 +15,8 @@ namespace Libs::Graphics {
 
 // Sparse two-level lookup for texture-cache page ownership.
 // Entries are selected by guest page number; queries never allocate L1 buckets.
-template <typename EntryT, size_t PageBits = 20, size_t AddressSpaceBits = 40, size_t FirstLevelBits = 10>
+template <typename EntryT, size_t PageBits = 20, size_t AddressSpaceBits = 40,
+          size_t FirstLevelBits = 10>
 class MultiLevelPageTable final {
 public:
 	using Entry = EntryT;
@@ -24,14 +25,14 @@ public:
 	static_assert(PageBits < AddressSpaceBits);
 	static_assert(FirstLevelBits > 0 && FirstLevelBits <= AddressSpaceBits - PageBits);
 
-	static constexpr size_t kPageBits          = PageBits;
-	static constexpr size_t kAddressSpaceBits  = AddressSpaceBits;
-	static constexpr size_t kFirstLevelBits    = FirstLevelBits;
-	static constexpr size_t kSecondLevelBits   = AddressSpaceBits - FirstLevelBits - PageBits;
-	static constexpr size_t kFirstLevelEntries = size_t{1} << FirstLevelBits;
-	static constexpr size_t kBucketEntries     = size_t{1} << kSecondLevelBits;
-	static constexpr size_t kPageCount         = size_t{1} << (AddressSpaceBits - PageBits);
-	static constexpr uint64_t kAddressSpaceSize = uint64_t{1} << AddressSpaceBits;
+	static constexpr size_t   kPageBits          = PageBits;
+	static constexpr size_t   kAddressSpaceBits  = AddressSpaceBits;
+	static constexpr size_t   kFirstLevelBits    = FirstLevelBits;
+	static constexpr size_t   kSecondLevelBits   = AddressSpaceBits - FirstLevelBits - PageBits;
+	static constexpr size_t   kFirstLevelEntries = size_t {1} << FirstLevelBits;
+	static constexpr size_t   kBucketEntries     = size_t {1} << kSecondLevelBits;
+	static constexpr size_t   kPageCount         = size_t {1} << (AddressSpaceBits - PageBits);
+	static constexpr uint64_t kAddressSpaceSize  = uint64_t {1} << AddressSpaceBits;
 
 	struct PageRange final {
 		size_t first          = 0;
@@ -74,12 +75,13 @@ public:
 
 	// Returns the half-open page interval touched by a non-empty byte range.
 	// An end exactly at 2^AddressSpaceBits is valid; wrapping or crossing it is not.
-	[[nodiscard]] static constexpr bool TryGetPageRange(uint64_t address, uint64_t size, PageRange& range) {
+	[[nodiscard]] static constexpr bool TryGetPageRange(uint64_t address, uint64_t size,
+	                                                    PageRange& range) {
 		if (size == 0 || address >= kAddressSpaceSize || size > kAddressSpaceSize - address) {
 			return false;
 		}
-		const uint64_t end = address + size;
-		range.first       = static_cast<size_t>(address >> PageBits);
+		const uint64_t end   = address + size;
+		range.first          = static_cast<size_t>(address >> PageBits);
 		range.last_exclusive = static_cast<size_t>(((end - 1) >> PageBits) + 1);
 		return true;
 	}
@@ -89,8 +91,12 @@ public:
 private:
 	using Bucket = std::array<Entry, kBucketEntries>;
 
-	[[nodiscard]] static constexpr size_t FirstLevelIndex(size_t page) { return page >> kSecondLevelBits; }
-	[[nodiscard]] static constexpr size_t SecondLevelIndex(size_t page) { return page & (kBucketEntries - 1); }
+	[[nodiscard]] static constexpr size_t FirstLevelIndex(size_t page) {
+		return page >> kSecondLevelBits;
+	}
+	[[nodiscard]] static constexpr size_t SecondLevelIndex(size_t page) {
+		return page & (kBucketEntries - 1);
+	}
 
 	std::vector<std::unique_ptr<Bucket>> m_first_level;
 	size_t                               m_allocated_buckets = 0;
@@ -151,8 +157,8 @@ public:
 		if (registration == m_registrations.end()) {
 			return false;
 		}
-		const auto coarse_pages   = CollectPages<20>(registration->ranges);
-		const auto tracking_pages = CollectPages<12>(registration->ranges);
+		const auto          coarse_pages     = CollectPages<20>(registration->ranges);
+		const auto          tracking_pages   = CollectPages<12>(registration->ranges);
 		const Registration* registration_ptr = &*registration;
 		if (!HasAllMemberships(m_coarse_pages, coarse_pages, registration_ptr) ||
 		    !HasAllMemberships(m_tracking_pages, tracking_pages, registration_ptr)) {
@@ -179,7 +185,8 @@ public:
 	}
 
 	template <typename Predicate>
-	[[nodiscard]] std::vector<OwnerT> Query(uint64_t address, uint64_t size, Predicate&& predicate) const {
+	[[nodiscard]] std::vector<OwnerT> Query(uint64_t address, uint64_t size,
+	                                        Predicate&& predicate) const {
 		return QueryImpl(address, size, true, std::forward<Predicate>(predicate));
 	}
 
@@ -190,7 +197,8 @@ public:
 	}
 
 	template <typename Predicate>
-	[[nodiscard]] std::vector<OwnerT> QueryCandidates(uint64_t address, uint64_t size, Predicate&& predicate) const {
+	[[nodiscard]] std::vector<OwnerT> QueryCandidates(uint64_t address, uint64_t size,
+	                                                  Predicate&& predicate) const {
 		return QueryImpl(address, size, false, std::forward<Predicate>(predicate));
 	}
 
@@ -206,9 +214,9 @@ public:
 private:
 	template <typename Predicate>
 	[[nodiscard]] std::vector<OwnerT> QueryImpl(uint64_t address, uint64_t size, bool strict_bytes,
-	                                           Predicate&& predicate) const {
-		typename CoarseTable::PageRange coarse_range{};
-		typename TrackingTable::PageRange tracking_range{};
+	                                            Predicate&& predicate) const {
+		typename CoarseTable::PageRange   coarse_range {};
+		typename TrackingTable::PageRange tracking_range {};
 		if (!CoarseTable::TryGetPageRange(address, size, coarse_range) ||
 		    !TrackingTable::TryGetPageRange(address, size, tracking_range)) {
 			return {};
@@ -222,7 +230,8 @@ private:
 		std::vector<OwnerT> result;
 		for (const Registration* registration: candidates) {
 			if ((!strict_bytes || Overlaps(registration->ranges, address, size)) &&
-			    HasTrackingMembership(registration, tracking_range) && predicate(registration->owner)) {
+			    HasTrackingMembership(registration, tracking_range) &&
+			    predicate(registration->owner)) {
 				result.push_back(registration->owner);
 			}
 		}
@@ -248,20 +257,22 @@ private:
 	[[nodiscard]] static std::vector<ByteRange> Normalize(const std::vector<ByteRange>& ranges) {
 		std::vector<ByteRange> sorted;
 		for (const auto& range: ranges) {
-			typename CoarseTable::PageRange ignored{};
+			typename CoarseTable::PageRange ignored {};
 			if (!CoarseTable::TryGetPageRange(range.address, range.size, ignored)) {
 				return {};
 			}
 			sorted.push_back(range);
 		}
-		std::sort(sorted.begin(), sorted.end(),
-		          [](const ByteRange& lhs, const ByteRange& rhs) { return lhs.address < rhs.address; });
+		std::sort(sorted.begin(), sorted.end(), [](const ByteRange& lhs, const ByteRange& rhs) {
+			return lhs.address < rhs.address;
+		});
 		std::vector<ByteRange> merged;
 		for (const auto& range: sorted) {
 			if (merged.empty() || range.address > merged.back().address + merged.back().size) {
 				merged.push_back(range);
 			} else {
-				const uint64_t end = std::max(merged.back().address + merged.back().size, range.address + range.size);
+				const uint64_t end = std::max(merged.back().address + merged.back().size,
+				                              range.address + range.size);
 				merged.back().size = end - merged.back().address;
 			}
 		}
@@ -284,29 +295,33 @@ private:
 	}
 
 	template <typename Table>
-	[[nodiscard]] static bool HasAllMemberships(const Table& table, const std::vector<size_t>& pages,
-	                                            const Registration* registration) {
+	[[nodiscard]] static bool HasAllMemberships(const Table&               table,
+	                                            const std::vector<size_t>& pages,
+	                                            const Registration*        registration) {
 		for (const size_t page: pages) {
 			const auto* owners = table.Find(page);
-			if (owners == nullptr || std::find(owners->begin(), owners->end(), registration) == owners->end()) {
+			if (owners == nullptr ||
+			    std::find(owners->begin(), owners->end(), registration) == owners->end()) {
 				return false;
 			}
 		}
 		return true;
 	}
 
-	[[nodiscard]] bool HasTrackingMembership(const Registration* registration,
+	[[nodiscard]] bool HasTrackingMembership(const Registration*                      registration,
 	                                         const typename TrackingTable::PageRange& range) const {
 		for (size_t page = range.first; page < range.last_exclusive; ++page) {
 			const auto* owners = m_tracking_pages.Find(page);
-			if (owners != nullptr && std::find(owners->begin(), owners->end(), registration) != owners->end()) {
+			if (owners != nullptr &&
+			    std::find(owners->begin(), owners->end(), registration) != owners->end()) {
 				return true;
 			}
 		}
 		return false;
 	}
 
-	[[nodiscard]] static bool Overlaps(const std::vector<ByteRange>& ranges, uint64_t address, uint64_t size) {
+	[[nodiscard]] static bool Overlaps(const std::vector<ByteRange>& ranges, uint64_t address,
+	                                   uint64_t size) {
 		const uint64_t end = address + size;
 		return std::any_of(ranges.begin(), ranges.end(), [&](const ByteRange& range) {
 			return range.address < end && address < range.address + range.size;
@@ -314,26 +329,28 @@ private:
 	}
 	static void AppendUnique(MembershipList& destination, const MembershipList& source) {
 		for (const Registration* registration: source) {
-			if (std::find(destination.begin(), destination.end(), registration) == destination.end()) {
+			if (std::find(destination.begin(), destination.end(), registration) ==
+			    destination.end()) {
 				destination.push_back(registration);
 			}
 		}
 	}
-	[[nodiscard]] static std::vector<ByteRange> CoalesceTrackingPages(const std::vector<size_t>& pages) {
+	[[nodiscard]] static std::vector<ByteRange>
+	CoalesceTrackingPages(const std::vector<size_t>& pages) {
 		std::vector<ByteRange> result;
 		for (const size_t page: pages) {
 			const uint64_t address = static_cast<uint64_t>(page) << 12;
 			if (!result.empty() && result.back().address + result.back().size == address) {
-				result.back().size += uint64_t{1} << 12;
+				result.back().size += uint64_t {1} << 12;
 			} else {
-				result.push_back({address, uint64_t{1} << 12});
+				result.push_back({address, uint64_t {1} << 12});
 			}
 		}
 		return result;
 	}
 
-	CoarseTable               m_coarse_pages;
-	TrackingTable             m_tracking_pages;
+	CoarseTable             m_coarse_pages;
+	TrackingTable           m_tracking_pages;
 	std::list<Registration> m_registrations;
 };
 

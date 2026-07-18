@@ -683,8 +683,8 @@ std::pair<VulkanBuffer*, uint64_t> BufferCache::ObtainBuffer(CommandBuffer*  com
 	// host page protection is irrelevant.
 	if (is_read && !is_written && size <= CACHING_PAGE_SIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size) &&
-	    !texture_region.gpu_image_bytes && !texture_region.gpu_metadata_bytes) {
+	    m_memory_tracker.IsRegionCpuModified(vaddr, size) && !texture_region.gpu_image_bytes &&
+	    !texture_region.gpu_metadata_bytes) {
 		std::array<uint8_t, CACHING_PAGE_SIZE> guest_data;
 		if (Libs::LibKernel::Memory::TryReadBacking(vaddr, guest_data.data(), size)) {
 			VulkanBuffer* stream_buffer    = nullptr;
@@ -1143,10 +1143,10 @@ void BufferCache::CopyBuffer(CommandBuffer* command, GraphicContext* ctx, uint64
 	bool dst_image_transition = false;
 	{
 		std::lock_guard transaction(m_resource_mutex);
-		const auto src_region    = m_texture_cache->QueryRegion(src_vaddr, size);
-		const auto dst_region    = m_texture_cache->QueryRegion(dst_vaddr, size);
-		const bool src_image_gpu = src_region.gpu_image_bytes;
-		const bool src_meta      = src_region.metadata_bytes;
+		const auto      src_region    = m_texture_cache->QueryRegion(src_vaddr, size);
+		const auto      dst_region    = m_texture_cache->QueryRegion(dst_vaddr, size);
+		const bool      src_image_gpu = src_region.gpu_image_bytes;
+		const bool      src_meta      = src_region.metadata_bytes;
 		if (src_region.non_sampled_pages) {
 			EXIT("BufferCache: GPU copy aliases target pages, src=0x%016" PRIx64
 			     " dst=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -1174,7 +1174,7 @@ void BufferCache::CopyBuffer(CommandBuffer* command, GraphicContext* ctx, uint64
 			     " dst=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 			     src_vaddr, dst_vaddr, size);
 		}
-		dst_image_transition = m_texture_cache->InvalidateMemoryFromGPU(dst_vaddr, size);
+		dst_image_transition        = m_texture_cache->InvalidateMemoryFromGPU(dst_vaddr, size);
 		const auto transitioned_dst = m_texture_cache->QueryRegion(dst_vaddr, size);
 		// A clean target destination is handled above like a protected host write. Target
 		// aliases that require an actual GPU buffer copy remain unsupported.

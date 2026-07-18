@@ -19,16 +19,16 @@ class CommandBuffer;
 struct VulkanSwapchain {
 	~VulkanSwapchain();
 
-	VkSwapchainKHR                              swapchain        = nullptr;
-	VkFormat                                    swapchain_format = VK_FORMAT_UNDEFINED;
-	VkExtent2D                                  swapchain_extent = {};
-	std::unique_ptr<VkImage[]>                  swapchain_images;
-	std::unique_ptr<VkImageView[]>              swapchain_image_views;
-	uint32_t                                    swapchain_images_count = 0;
-	std::unique_ptr<VkSemaphore[]>              image_acquired_semaphores;
-	std::unique_ptr<VkSemaphore[]>              render_complete_semaphores;
-	uint32_t                                    current_index = 0;
-	uint32_t                                    present_frame = 0;
+	VkSwapchainKHR                 swapchain        = nullptr;
+	VkFormat                       swapchain_format = VK_FORMAT_UNDEFINED;
+	VkExtent2D                     swapchain_extent = {};
+	std::unique_ptr<VkImage[]>     swapchain_images;
+	std::unique_ptr<VkImageView[]> swapchain_image_views;
+	uint32_t                       swapchain_images_count = 0;
+	std::unique_ptr<VkSemaphore[]> image_acquired_semaphores;
+	std::unique_ptr<VkSemaphore[]> render_complete_semaphores;
+	uint32_t                       current_index = 0;
+	uint32_t                       present_frame = 0;
 };
 
 struct VulkanCommandPool {

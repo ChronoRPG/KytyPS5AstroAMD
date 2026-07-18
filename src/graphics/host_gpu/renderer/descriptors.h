@@ -19,8 +19,7 @@ struct TargetTextureViewInfo {
 
 [[nodiscard]] TargetTextureViewInfo
 ResolveTargetTextureView(const ShaderRecompiler::IR::ImageResource& resource,
-                         Prospero::ImageType type, uint32_t base_layer,
-                         uint32_t image_layers);
+                         Prospero::ImageType type, uint32_t base_layer, uint32_t image_layers);
 
 [[nodiscard]] bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor,
                                                     const VulkanImage&           image);

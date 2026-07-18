@@ -268,7 +268,7 @@ static bool TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input, cons
 		}
 		if (resource.written || !resource.read || resource.atomic || descriptor.Base48() == 0 ||
 		    descriptor_size == 0 ||
-		        cache->QueryRegion(descriptor.Base48(), descriptor_size).metadata_pages) {
+		    cache->QueryRegion(descriptor.Base48(), descriptor_size).metadata_pages) {
 			EXIT("unsupported HTile clear side-buffer access\n");
 		}
 		g_render_ctx->GetBufferCache()->ValidateGpuAccess(descriptor.Base48(), descriptor_size,

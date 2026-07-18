@@ -34,7 +34,7 @@ DummyTextureCache::~DummyTextureCache() {
 }
 
 VulkanImage* DummyTextureCache::Get(GraphicContext* ctx, Usage usage, bool uint_format,
-	                                bool image_3d) {
+                                    bool image_3d) {
 	Common::LockGuard lock(m_mutex);
 	if (ctx == nullptr) {
 		EXIT("TextureCache: dummy texture requires a graphics context\n");

@@ -163,28 +163,28 @@ public:
 	virtual ~FlipQueue() { KYTY_NOT_IMPLEMENTED; }
 	KYTY_CLASS_NO_COPY(FlipQueue);
 
-	bool Reserve(VideoOutConfig* cfg, int index, int64_t flip_arg, bool gpu_eop,
-	             uint64_t* request_id);
-	void Prepare(uint64_t request_id, Graphics::CommandBuffer* buffer);
+	bool     Reserve(VideoOutConfig* cfg, int index, int64_t flip_arg, bool gpu_eop,
+	                 uint64_t* request_id);
+	void     Prepare(uint64_t request_id, Graphics::CommandBuffer* buffer);
 	uint64_t PrepareNextCpu(Graphics::CommandBuffer* buffer);
-	void Complete(uint64_t request_id);
-	void WaitForSubmitSlot();
-	bool Flip(uint32_t micros);
-	bool HasPending(VideoOutConfig* cfg, int start_index, int count);
-	void GetFlipStatus(VideoOutConfig* cfg, VideoOutFlipStatus* out);
-	void Wait(VideoOutConfig* cfg, int index);
+	void     Complete(uint64_t request_id);
+	void     WaitForSubmitSlot();
+	bool     Flip(uint32_t micros);
+	bool     HasPending(VideoOutConfig* cfg, int start_index, int count);
+	void     GetFlipStatus(VideoOutConfig* cfg, VideoOutFlipStatus* out);
+	void     Wait(VideoOutConfig* cfg, int index);
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
 
 	struct Request {
-		uint64_t        id;
-		VideoOutConfig* cfg;
-		int             index;
-		int64_t         flip_arg;
-		uint64_t        submit_ptc;
-		bool            gpu_eop;
-		RequestState    state;
+		uint64_t                 id;
+		VideoOutConfig*          cfg;
+		int                      index;
+		int64_t                  flip_arg;
+		uint64_t                 submit_ptc;
+		bool                     gpu_eop;
+		RequestState             state;
 		Graphics::PreparedFrame* frame;
 	};
 
@@ -194,7 +194,7 @@ private:
 	Common::CondVar    m_done_cond_var;
 	std::list<Request> m_requests;
 	std::list<Request> m_cpu_requests;
-	bool               m_processing = false;
+	bool               m_processing      = false;
 	uint64_t           m_next_request_id = 1;
 };
 

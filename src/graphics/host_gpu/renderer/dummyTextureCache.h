@@ -12,7 +12,7 @@ namespace Libs::Graphics {
 
 class DummyTextureCache final {
 public:
-	enum class Usage: uint8_t { Sampled, Storage };
+	enum class Usage : uint8_t { Sampled, Storage };
 
 	DummyTextureCache() = default;
 	~DummyTextureCache();

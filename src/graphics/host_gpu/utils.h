@@ -92,8 +92,7 @@ void UtilCopyImageWithBuffer(CommandBuffer* buffer, GraphicContext* ctx, VulkanI
                              uint64_t dst_layout);
 void UtilBlitPreparedImage(CommandBuffer* buffer, VulkanImage* src_image,
                            VulkanSwapchain* dst_swapchain);
-void UtilClearColorImage(CommandBuffer* buffer, VulkanImage* image,
-                         const VkClearColorValue& color);
+void UtilClearColorImage(CommandBuffer* buffer, VulkanImage* image, const VkClearColorValue& color);
 void UtilFillImage(GraphicContext* ctx, VulkanImage* dst_image, const void* src_data, uint64_t size,
                    uint32_t src_pitch, uint64_t dst_layout);
 void UtilFillImage(GraphicContext* ctx, DepthStencilVulkanImage* dst_image, const void* src_data,

@@ -125,11 +125,11 @@ VkImageView TextureCache::GetRenderTargetAttachmentView(GraphicContext*         
 		     static_cast<int>(image->format), static_cast<int>(format), level);
 	}
 
-	return GetImageView(
-	    ctx, image,
-	    {format, layer_count == 1 ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-	     VK_IMAGE_ASPECT_COLOR_BIT, level, 1, base_layer, layer_count, DstSel(4, 5, 6, 7),
-	     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT});
+	return GetImageView(ctx, image,
+	                    {format,
+	                     layer_count == 1 ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+	                     VK_IMAGE_ASPECT_COLOR_BIT, level, 1, base_layer, layer_count,
+	                     DstSel(4, 5, 6, 7), VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT});
 }
 
 VkImageView TextureCache::GetDepthTargetAttachmentView(GraphicContext*          ctx,
@@ -151,9 +151,9 @@ VkImageView TextureCache::GetDepthTargetAttachmentView(GraphicContext*          
 
 VkImageView TextureCache::GetImageView(GraphicContext* ctx, VulkanImage* image,
                                        const ImageViewInfo& info) {
-	const bool supported_type = info.type == VK_IMAGE_VIEW_TYPE_2D ||
-	                            info.type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ||
-	                            info.type == VK_IMAGE_VIEW_TYPE_3D;
+	const bool supported_type  = info.type == VK_IMAGE_VIEW_TYPE_2D ||
+	                             info.type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ||
+	                             info.type == VK_IMAGE_VIEW_TYPE_3D;
 	const bool supported_usage = info.usage == VK_IMAGE_USAGE_SAMPLED_BIT ||
 	                             info.usage == VK_IMAGE_USAGE_STORAGE_BIT ||
 	                             info.usage == VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT ||
@@ -189,14 +189,14 @@ VkImageView TextureCache::GetImageView(GraphicContext* ctx, VulkanImage* image,
 	usage.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
 	usage.usage = info.usage;
 	VkImageViewCreateInfo create {};
-	create.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-	create.pNext    = &usage;
-	create.image    = image->image;
-	create.viewType = info.type;
-	create.format   = info.format;
-	create.components = info.usage == VK_IMAGE_USAGE_SAMPLED_BIT
-	                        ? TextureGetComponentMapping(info.swizzle)
-	                        : VkComponentMapping {};
+	create.sType                           = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	create.pNext                           = &usage;
+	create.image                           = image->image;
+	create.viewType                        = info.type;
+	create.format                          = info.format;
+	create.components                      = info.usage == VK_IMAGE_USAGE_SAMPLED_BIT
+	                                             ? TextureGetComponentMapping(info.swizzle)
+	                                             : VkComponentMapping {};
 	create.subresourceRange.aspectMask     = info.aspect;
 	create.subresourceRange.baseMipLevel   = info.base_level;
 	create.subresourceRange.levelCount     = info.level_count;
@@ -239,10 +239,10 @@ VkImageView TextureCache::GetDepthTargetSampledView(GraphicContext*          ctx
 }
 
 VkImageView TextureCache::GetSampledColorView(GraphicContext* ctx, VulkanImage* image,
-	                                          VkFormat view_format, uint32_t swizzle,
-	                                          uint32_t base_level, uint32_t level_count,
-	                                          VkImageViewType type, uint32_t base_layer,
-	                                          uint32_t layer_count) {
+                                              VkFormat view_format, uint32_t swizzle,
+                                              uint32_t base_level, uint32_t level_count,
+                                              VkImageViewType type, uint32_t base_layer,
+                                              uint32_t layer_count) {
 	if (ctx == nullptr || image == nullptr || image->image == nullptr ||
 	    view_format == VK_FORMAT_UNDEFINED || base_level >= 16 ||
 	    (type != VK_IMAGE_VIEW_TYPE_2D && type != VK_IMAGE_VIEW_TYPE_2D_ARRAY) ||
@@ -309,8 +309,7 @@ VkImageView TextureCache::GetRenderTargetStorageView(GraphicContext*           c
 	}
 	return GetImageView(ctx, image,
 	                    {view_format, type, VK_IMAGE_ASPECT_COLOR_BIT, base_level, level_count,
-	                     base_layer, layer_count, DstSel(4, 5, 6, 7),
-	                     VK_IMAGE_USAGE_STORAGE_BIT});
+	                     base_layer, layer_count, DstSel(4, 5, 6, 7), VK_IMAGE_USAGE_STORAGE_BIT});
 }
 
 VkImageView TextureCache::GetStorageTextureSampledView(GraphicContext*            ctx,
@@ -362,8 +361,7 @@ VkImageView TextureCache::GetStorageTextureStorageView(GraphicContext*          
 	}
 	return GetImageView(ctx, image,
 	                    {image->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT,
-	                     base_level, 1, 0, 1, DstSel(4, 5, 6, 7),
-	                     VK_IMAGE_USAGE_STORAGE_BIT});
+	                     base_level, 1, 0, 1, DstSel(4, 5, 6, 7), VK_IMAGE_USAGE_STORAGE_BIT});
 }
 
 } // namespace Libs::Graphics

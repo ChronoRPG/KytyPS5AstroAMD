@@ -34,13 +34,13 @@ class ResourceMutex;
 class TextureCache {
 public:
 	struct RegionInfo {
-		bool image_pages          = false;
-		bool image_bytes          = false;
-		bool gpu_image_bytes      = false;
-		bool non_sampled_pages    = false;
-		bool metadata_pages       = false;
-		bool metadata_bytes       = false;
-		bool gpu_metadata_bytes   = false;
+		bool image_pages        = false;
+		bool image_bytes        = false;
+		bool gpu_image_bytes    = false;
+		bool non_sampled_pages  = false;
+		bool metadata_pages     = false;
+		bool metadata_bytes     = false;
+		bool gpu_metadata_bytes = false;
 	};
 
 	TextureCache(PageManager& page_manager, BufferCache& buffer_cache,
@@ -103,15 +103,15 @@ public:
 	FindDepthTargetByRange(CommandBuffer* command, uint64_t vaddr, uint64_t size,
 	                       bool allow_containing_sampled = false);
 	[[nodiscard]] RegionInfo QueryRegion(uint64_t vaddr, uint64_t size);
-	void               RegisterMeta(uint64_t vaddr, uint64_t size, uint32_t layers = 1);
-	[[nodiscard]] bool IsMeta(uint64_t vaddr);
-	[[nodiscard]] bool IsMetaRange(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool IsMetaCleared(uint64_t vaddr, uint32_t slice);
-	[[nodiscard]] bool ClearMeta(uint64_t vaddr);
-	[[nodiscard]] bool TouchMeta(uint64_t vaddr, uint32_t slice, bool is_clear);
-	[[nodiscard]] bool InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,
-	                                    PageFaultPhase phase) noexcept;
-	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	void                     RegisterMeta(uint64_t vaddr, uint64_t size, uint32_t layers = 1);
+	[[nodiscard]] bool       IsMeta(uint64_t vaddr);
+	[[nodiscard]] bool       IsMetaRange(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool       IsMetaCleared(uint64_t vaddr, uint32_t slice);
+	[[nodiscard]] bool       ClearMeta(uint64_t vaddr);
+	[[nodiscard]] bool       TouchMeta(uint64_t vaddr, uint32_t slice, bool is_clear);
+	[[nodiscard]] bool       InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,
+	                                          PageFaultPhase phase) noexcept;
+	void                     UnmapMemory(uint64_t vaddr, uint64_t size);
 
 	VulkanImage* GetDummySampledTexture(bool uint_format, bool image_3d);
 	VulkanImage* GetDummyStorageTexture(bool uint_format, bool image_3d);
@@ -137,10 +137,10 @@ private:
 	void RetireStorageDepthAliasLocked(GraphicContext* ctx, const ImageInfo& requested);
 	void RegisterImageLocked(CachedImage& image);
 	void UnregisterImageLocked(CachedImage& image, bool release_tracking);
-	[[nodiscard]] VulkanImage* PublishImage(CommandBuffer* command,
-	                                        std::shared_ptr<CachedImage> image);
-	[[nodiscard]] std::vector<CachedImage*>
-	FindImagesInRegionLocked(uint64_t vaddr, uint64_t size, bool page_overlap);
+	[[nodiscard]] VulkanImage*              PublishImage(CommandBuffer*               command,
+	                                                     std::shared_ptr<CachedImage> image);
+	[[nodiscard]] std::vector<CachedImage*> FindImagesInRegionLocked(uint64_t vaddr, uint64_t size,
+	                                                                 bool page_overlap);
 	void RequireRetirementIsolation(const std::vector<CachedImage*>& retire, const char* operation,
 	                                uint64_t address, uint64_t size) const;
 	void RetireImages(const std::vector<CachedImage*>& retire,
@@ -150,7 +150,7 @@ private:
 	void SynchronizeDepthImageToBufferLocked(CachedImage& cached, uint64_t write_address,
 	                                         uint64_t write_size);
 
-	std::unique_ptr<DummyTextureCache>         m_dummy_textures;
+	std::unique_ptr<DummyTextureCache>        m_dummy_textures;
 	TrackingSpinLock                          m_lock;
 	std::mutex                                m_fault_mutex;
 	MemoryTracker                             m_memory_tracker;

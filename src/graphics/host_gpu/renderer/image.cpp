@@ -40,10 +40,9 @@ TextureImageCreateParams MakeImageParams(const ImageInfo& info, bool storage) {
 	params.image_layout    = TextureUploadDestination::MipLevels;
 	params.allow_cube_view = !storage;
 	params.compatible_format_views =
-	    storage &&
-	    (IsRgba8SrgbViewFormat(TextureGetFormat(info.format, params.format_usage)) ||
-	     info.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) ||
-	     info.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float));
+	    storage && (IsRgba8SrgbViewFormat(TextureGetFormat(info.format, params.format_usage)) ||
+	                info.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) ||
+	                info.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float));
 	params.owner = storage ? "StorageTextureCache" : "TextureCache";
 	return params;
 }
@@ -60,7 +59,8 @@ bool RenderTargetSupportsStorage(GraphicContext* ctx, VkFormat format, VkImageCr
 
 VkImageCreateFlags RenderTargetCreateFlags(VkFormat format) {
 	const bool compatible_format_view =
-	    IsRgba8SrgbViewFormat(format) || BgraToRgbaSampledViewFormat(format) != VK_FORMAT_UNDEFINED ||
+	    IsRgba8SrgbViewFormat(format) ||
+	    BgraToRgbaSampledViewFormat(format) != VK_FORMAT_UNDEFINED ||
 	    format == VK_FORMAT_R8G8B8A8_UINT || format == VK_FORMAT_R16G16B16A16_SFLOAT ||
 	    format == VK_FORMAT_R16G16B16A16_UINT;
 	return compatible_format_view
@@ -69,7 +69,7 @@ VkImageCreateFlags RenderTargetCreateFlags(VkFormat format) {
 }
 
 VkImageUsageFlags RenderTargetUsage(GraphicContext* ctx, VkFormat format,
-	                                VkImageCreateFlags flags) {
+                                    VkImageCreateFlags flags) {
 	auto usage = static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
 	             static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_TRANSFER_SRC_BIT) |
 	             static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_TRANSFER_DST_BIT) |
@@ -107,8 +107,7 @@ static constexpr uint32_t DummyTextureSwizzle() {
 }
 
 TextureImageCreateParams MakeDummyTextureParams(bool uint_format, bool image_3d,
-	                                            TextureFormatUsage usage,
-	                                            const char*        owner) {
+                                                TextureFormatUsage usage, const char* owner) {
 	TextureImageCreateParams params {};
 	params.fmt = static_cast<uint32_t>(
 	    Prospero::GpuEnumValue(uint_format ? Prospero::BufferFormat::k8_8_8_8UInt
@@ -140,7 +139,7 @@ uint32_t RenderTargetTransferFormat(uint32_t bytes_per_element) {
 }
 
 GpuTextureVulkanImage* CreateTexture(GraphicContext* ctx, const ImageInfo& info, bool storage,
-	                                VulkanMemory* memory, VkComponentMapping* components) {
+                                     VulkanMemory* memory, VkComponentMapping* components) {
 	if (components == nullptr) {
 		EXIT("TextureCache: invalid texture component output\n");
 	}
@@ -151,7 +150,7 @@ GpuTextureVulkanImage* CreateTexture(GraphicContext* ctx, const ImageInfo& info,
 }
 
 void CreateTextureViews(GraphicContext* ctx, GpuTextureVulkanImage* image, const ImageInfo& info,
-	                    bool storage, VkComponentMapping components) {
+                        bool storage, VkComponentMapping components) {
 	if (storage) {
 		TextureCreateImageViews(ctx, image, components, info.type, 0, 0, 1, info.depth, false,
 		                        TextureFormatUsage::Sampled | TextureFormatUsage::Storage);
@@ -162,8 +161,8 @@ void CreateTextureViews(GraphicContext* ctx, GpuTextureVulkanImage* image, const
 }
 
 void UploadRenderTargetLayers(GraphicContext* ctx, RenderTextureVulkanImage* image,
-	                          const RenderTargetInfo& info, uint32_t base_layer,
-	                          uint32_t layer_count, bool refresh) {
+                              const RenderTargetInfo& info, uint32_t base_layer,
+                              uint32_t layer_count, bool refresh) {
 	if (info.layers == 0 || info.size % info.layers != 0 || layer_count == 0 ||
 	    base_layer >= info.layers || layer_count > info.layers - base_layer || image == nullptr ||
 	    base_layer >= image->layers || layer_count > image->layers - base_layer) {
@@ -218,12 +217,12 @@ void UploadRenderTargetLayers(GraphicContext* ctx, RenderTextureVulkanImage* ima
 }
 
 void UploadRenderTarget(GraphicContext* ctx, RenderTextureVulkanImage* image,
-	                    const RenderTargetInfo& info, bool refresh) {
+                        const RenderTargetInfo& info, bool refresh) {
 	UploadRenderTargetLayers(ctx, image, info, 0, info.layers, refresh);
 }
 
 RenderTextureVulkanImage* CreateRenderTarget(GraphicContext* ctx, const RenderTargetInfo& info,
-	                                        VulkanMemory* memory) {
+                                             VulkanMemory* memory) {
 	auto* image          = new RenderTextureVulkanImage;
 	image->extent.width  = info.width;
 	image->extent.height = info.height;
@@ -257,7 +256,7 @@ RenderTextureVulkanImage* CreateRenderTarget(GraphicContext* ctx, const RenderTa
 }
 
 DepthStencilVulkanImage* CreateDepthTarget(GraphicContext* ctx, const DepthTargetInfo& info,
-	                                      VulkanMemory* memory) {
+                                           VulkanMemory* memory) {
 	VkImageCreateInfo create {};
 	create.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	create.imageType     = VK_IMAGE_TYPE_2D;
@@ -333,7 +332,7 @@ void ValidateVideoOut(GraphicContext* ctx, const VideoOutInfo& info) {
 }
 
 VideoOutVulkanImage* CreateVideoOut(GraphicContext* ctx, const VideoOutInfo& info,
-	                               VulkanMemory* memory) {
+                                    VulkanMemory* memory) {
 	auto* image          = new VideoOutVulkanImage;
 	image->extent.width  = info.width;
 	image->extent.height = info.height;
@@ -365,7 +364,7 @@ VideoOutVulkanImage* CreateVideoOut(GraphicContext* ctx, const VideoOutInfo& inf
 }
 
 void UploadVideoOut(GraphicContext* ctx, VideoOutVulkanImage* image, const VideoOutInfo& info,
-	                bool refresh) {
+                    bool refresh) {
 	if (info.compression != VideoOutCompression::Uncompressed) {
 		EXIT("TextureCache: compressed video-out guest upload is unsupported, "
 		     "addr=0x%016" PRIx64 " metadata=0x%016" PRIx64 " dcc=0x%08" PRIx32 "\n",
@@ -390,17 +389,17 @@ void UploadVideoOut(GraphicContext* ctx, VideoOutVulkanImage* image, const Video
 }
 
 GpuTextureVulkanImage* CreateDummyTexture(GraphicContext* ctx, bool uint_format, bool image_3d,
-	                                     bool storage, VulkanMemory* memory) {
+                                          bool storage, VulkanMemory* memory) {
 	if (memory == nullptr || memory->allocation != nullptr) {
 		EXIT("TextureCache: invalid dummy texture memory slot, slot=%p allocation=%p storage=%d\n",
 		     static_cast<const void*>(memory),
 		     memory == nullptr ? nullptr : static_cast<const void*>(memory->allocation), storage);
 	}
-	auto* image = storage ? static_cast<GpuTextureVulkanImage*>(new StorageTextureVulkanImage)
-	                      : new TextureVulkanImage;
-	auto usage  = storage ? TextureFormatUsage::Storage : TextureFormatUsage::Sampled;
-	auto layout = storage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-	auto owner  = storage ? "DummyStorageTexture" : "DummySampledTexture";
+	auto* image  = storage ? static_cast<GpuTextureVulkanImage*>(new StorageTextureVulkanImage)
+	                       : new TextureVulkanImage;
+	auto  usage  = storage ? TextureFormatUsage::Storage : TextureFormatUsage::Sampled;
+	auto  layout = storage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	auto  owner  = storage ? "DummyStorageTexture" : "DummySampledTexture";
 
 	auto params     = MakeDummyTextureParams(uint_format, image_3d, usage, owner);
 	auto components = TextureCreateImage(ctx, image, memory, params);
