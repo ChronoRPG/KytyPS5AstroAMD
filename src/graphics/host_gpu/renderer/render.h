@@ -4,10 +4,10 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/streamBuffer.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include <memory>
 #include <vector>
-#include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
 
@@ -80,9 +80,9 @@ public:
 	void Begin() const;
 	void End() const;
 	void Execute();
-	void ExecuteWithSemaphore(VkSemaphore signal_semaphore = nullptr);
-	void ExecuteWithSemaphore(VkSemaphore wait_semaphore, VkPipelineStageFlags wait_stage,
-	                          VkSemaphore signal_semaphore);
+	void ExecuteWithSemaphore(vk::Semaphore signal_semaphore = nullptr);
+	void ExecuteWithSemaphore(vk::Semaphore wait_semaphore, vk::PipelineStageFlags wait_stage,
+	                          vk::Semaphore signal_semaphore);
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRenderPass(VulkanFramebuffer* framebuffer, RenderColorInfo* colors,

@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/utils.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/displayBuffer.h"
 
 #include <algorithm>
@@ -25,7 +26,6 @@
 #include <cstdarg>
 #include <cstdio>
 #include <limits>
-#include <vulkan/vk_enum_string_helper.h>
 
 namespace Libs::Graphics {
 
@@ -71,11 +71,11 @@ static float ColorClearF16(uint32_t value) {
 	       std::ldexp(static_cast<float>(0x400u | mantissa), static_cast<int>(exponent) - 25);
 }
 
-[[maybe_unused]] static VkClearColorValue ColorClearValue(const HW::RenderTarget& rt) {
+[[maybe_unused]] static vk::ClearColorValue ColorClearValue(const HW::RenderTarget& rt) {
 	const uint32_t c0 = rt.clear_word0.word0;
 	const uint32_t c1 = rt.clear_word1.word1;
 
-	VkClearColorValue color {};
+	vk::ClearColorValue color {};
 
 	switch (static_cast<Prospero::ChannelType>(rt.info.channel_type)) {
 		case Prospero::ChannelType::kUNorm:
@@ -312,7 +312,7 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 		r->base_addr          = 0;
 		r->vulkan_buffer      = nullptr;
 		r->vulkan_view        = nullptr;
-		r->format             = VK_FORMAT_UNDEFINED;
+		r->format             = vk::Format::eUndefined;
 		r->extent             = {};
 		r->base_mip_level     = 0;
 		r->buffer_size        = 0;
@@ -480,8 +480,8 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	if (!render_to_texture && (levels != 1 || rt.view.current_mip_level != 0)) {
 		EXIT("mipmapped display render targets are unsupported\n");
 	}
-	const VkExtent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
-	                                std::max(height >> rt.view.current_mip_level, 1u)};
+	const vk::Extent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
+	                                  std::max(height >> rt.view.current_mip_level, 1u)};
 
 	auto decision_log_id = g_render_color_log_count.fetch_add(1);
 	if (decision_log_id < 128 || !render_to_texture) {

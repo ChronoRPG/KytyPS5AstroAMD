@@ -102,9 +102,9 @@ namespace ImageOps {
 
 [[nodiscard]] GpuTextureVulkanImage* CreateTexture(GraphicContext* ctx, const ImageInfo& info,
                                                    bool storage, VulkanMemory* memory,
-                                                   VkComponentMapping* components);
+                                                   vk::ComponentMapping* components);
 void CreateTextureViews(GraphicContext* ctx, GpuTextureVulkanImage* image, const ImageInfo& info,
-                        bool storage, VkComponentMapping components);
+                        bool storage, vk::ComponentMapping components);
 
 [[nodiscard]] RenderTextureVulkanImage*
 CreateRenderTarget(GraphicContext* ctx, const RenderTargetInfo& info, VulkanMemory* memory);

@@ -6,12 +6,12 @@
 #include "common/common.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <map>
 #include <unordered_map>
 #include <vector>
-#include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
 
@@ -23,19 +23,19 @@ class CommandBuffer;
 struct ShaderStageRuntime;
 
 struct VulkanDescriptor {
-	VkDescriptorSet descriptor_set = nullptr;
+	vk::DescriptorSet descriptor_set = nullptr;
 };
 
 struct VulkanDescriptorSet {
-	VkDescriptorSet       set     = nullptr;
-	VkDescriptorSetLayout layout  = nullptr;
-	int                   pool_id = -1;
+	vk::DescriptorSet       set     = nullptr;
+	vk::DescriptorSetLayout layout  = nullptr;
+	int                     pool_id = -1;
 };
 
 struct BufferView {
-	VulkanBuffer* buffer = nullptr;
-	VkDeviceSize  offset = 0;
-	VkDeviceSize  range  = VK_WHOLE_SIZE;
+	VulkanBuffer*  buffer = nullptr;
+	vk::DeviceSize offset = 0;
+	vk::DeviceSize range  = VK_WHOLE_SIZE;
 };
 
 struct ShaderAddressWriteRange {
@@ -49,9 +49,9 @@ public:
 	enum class Stage { Unknown, Vertex, Pixel, Compute };
 
 	struct TextureBinding {
-		VulkanImage* image      = nullptr;
-		int          view       = VulkanImage::VIEW_DEFAULT;
-		VkImageView  image_view = nullptr;
+		VulkanImage*  image      = nullptr;
+		int           view       = VulkanImage::VIEW_DEFAULT;
+		vk::ImageView image_view = nullptr;
 	};
 
 	enum class TextureVariant : int {
@@ -66,7 +66,7 @@ public:
 	struct NativeDescriptors {
 		std::vector<BufferView>     buffers;
 		std::vector<TextureBinding> images;
-		std::vector<VkSampler>      samplers;
+		std::vector<vk::Sampler>    samplers;
 		std::vector<BufferView>     addresses;
 		BufferView                  gds;
 		BufferView                  flattened_srt;
@@ -77,41 +77,43 @@ public:
 	virtual ~DescriptorCache() { KYTY_NOT_IMPLEMENTED; }
 	KYTY_CLASS_NO_COPY(DescriptorCache);
 
-	VkDescriptorSetLayout GetDescriptorSetLayout(Stage                                stage,
-	                                             const ShaderRecompiler::IR::Program& program);
-	void                  Recycle(VulkanDescriptorSet* set);
-	VulkanDescriptorSet*  GetDescriptor(Stage stage, const ShaderRecompiler::IR::Program& program,
-	                                    const NativeDescriptors& descriptors);
+	vk::DescriptorSetLayout GetDescriptorSetLayout(Stage                                stage,
+	                                               const ShaderRecompiler::IR::Program& program);
+	void                    Recycle(VulkanDescriptorSet* set);
+	VulkanDescriptorSet*    GetDescriptor(Stage stage, const ShaderRecompiler::IR::Program& program,
+	                                      const NativeDescriptors& descriptors);
 
 private:
 	struct Pool {
-		VkDescriptorPool pool           = nullptr;
-		int              next_free_pool = -1;
-		bool             free           = true;
+		vk::DescriptorPool pool           = nullptr;
+		int                next_free_pool = -1;
+		bool               free           = true;
 	};
 
 	void                 Init();
 	void                 CreatePool(GraphicContext* gctx);
 	VulkanDescriptorSet* Allocate(Stage stage, const ShaderRecompiler::IR::Program& program);
-	VkDescriptorSetLayout
+	vk::DescriptorSetLayout
 	GetDescriptorSetLayoutInternal(GraphicContext* gctx, Stage stage,
 	                               const ShaderRecompiler::IR::Program& program);
 
 	Common::Mutex     m_mutex;
 	std::vector<Pool> m_pools;
 	int               m_first_free_pool = -1;
-	std::unordered_map<VkDescriptorSetLayout, std::vector<VulkanDescriptorSet*>>
-	                                                       m_free_sets_by_layout;
-	std::map<std::vector<uint32_t>, VkDescriptorSetLayout> m_descriptor_set_layouts;
-	bool                                                   m_initialized = false;
+	std::unordered_map<vk::DescriptorSetLayout, std::vector<VulkanDescriptorSet*>>
+	                                                         m_free_sets_by_layout;
+	std::map<std::vector<uint32_t>, vk::DescriptorSetLayout> m_descriptor_set_layouts;
+	bool                                                     m_initialized = false;
 };
 
-const char*        storage_usage_name(ShaderStorageUsage usage);
-VkImageAspectFlags DepthStencilAspectMask(VkFormat format);
-std::vector<ShaderAddressWriteRange>
-BindDescriptors(uint64_t submit_id, CommandBuffer* buffer, VkPipelineBindPoint pipeline_bind_point,
-                VkPipelineLayout layout, const ShaderStageRuntime& runtime,
-                VkShaderStageFlags vk_stage, DescriptorCache::Stage stage);
+const char*                          storage_usage_name(ShaderStorageUsage usage);
+vk::ImageAspectFlags                 DepthStencilAspectMask(vk::Format format);
+std::vector<ShaderAddressWriteRange> BindDescriptors(uint64_t submit_id, CommandBuffer* buffer,
+                                                     vk::PipelineBindPoint     pipeline_bind_point,
+                                                     vk::PipelineLayout        layout,
+                                                     const ShaderStageRuntime& runtime,
+                                                     vk::ShaderStageFlags      vk_stage,
+                                                     DescriptorCache::Stage    stage);
 
 } // namespace Libs::Graphics
 

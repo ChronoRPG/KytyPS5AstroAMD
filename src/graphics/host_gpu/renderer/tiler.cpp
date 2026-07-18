@@ -45,11 +45,11 @@ static void UploadPromotedD16Depth(GraphicContext* ctx, DepthStencilVulkanImage*
 		region.width     = info.width;
 		region.height    = info.height;
 		region.dst_layer = base_layer + layer;
-		region.aspect    = VK_IMAGE_ASPECT_DEPTH_BIT;
+		region.aspect    = vk::ImageAspectFlagBits::eDepth;
 		regions.push_back(region);
 	}
 	UtilFillImage(ctx, image, host_linear.Data(), host_upload_size, regions,
-	              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+	              vk::ImageLayout::eDepthStencilAttachmentOptimal);
 }
 
 void Tiler::DetileImage(GraphicContext* ctx, GpuTextureVulkanImage* image, const ImageInfo& info,
@@ -70,8 +70,7 @@ void Tiler::DetileImage(GraphicContext* ctx, GpuTextureVulkanImage* image, const
 	    ctx, image, reinterpret_cast<const void*>(source.address), info.size, regions, layout,
 	    info.format, info.width, info.height, info.depth, info.levels, slice_layout,
 	    storage ? "StorageTextureCache" : "TextureCache",
-	    static_cast<uint64_t>(storage ? VK_IMAGE_LAYOUT_GENERAL
-	                                  : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+	    storage ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal);
 }
 
 void Tiler::DetileImage(GraphicContext* ctx, DepthStencilVulkanImage* image,
@@ -82,10 +81,10 @@ void Tiler::DetileImage(GraphicContext* ctx, DepthStencilVulkanImage* image,
 	}
 	if (DepthAspectTransferBytes(info.format) != info.bytes_per_element) {
 		switch (info.format) {
-			case VK_FORMAT_D24_UNORM_S8_UINT:
+			case vk::Format::eD24UnormS8Uint:
 				UploadPromotedD16Depth<EncodeD16AsD24>(ctx, image, info, source, base_layer);
 				return;
-			case VK_FORMAT_D32_SFLOAT_S8_UINT:
+			case vk::Format::eD32SfloatS8Uint:
 				UploadPromotedD16Depth<EncodeD16AsD32>(ctx, image, info, source, base_layer);
 				return;
 			default:
@@ -108,11 +107,11 @@ void Tiler::DetileImage(GraphicContext* ctx, DepthStencilVulkanImage* image,
 		region.width     = info.width;
 		region.height    = info.height;
 		region.dst_layer = base_layer + layer;
-		region.aspect    = VK_IMAGE_ASPECT_DEPTH_BIT;
+		region.aspect    = vk::ImageAspectFlagBits::eDepth;
 		regions.push_back(region);
 	}
 	UtilFillImage(ctx, image, linear.Data(), info.size, regions,
-	              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+	              vk::ImageLayout::eDepthStencilAttachmentOptimal);
 }
 
 void Tiler::DetileStencil(GraphicContext* ctx, DepthStencilVulkanImage* image,
@@ -139,11 +138,11 @@ void Tiler::DetileStencil(GraphicContext* ctx, DepthStencilVulkanImage* image,
 		region.width     = info.width;
 		region.height    = info.height;
 		region.dst_layer = base_layer + layer;
-		region.aspect    = VK_IMAGE_ASPECT_STENCIL_BIT;
+		region.aspect    = vk::ImageAspectFlagBits::eStencil;
 		regions.push_back(region);
 	}
 	UtilFillImage(ctx, image, linear.Data(), info.stencil_size, regions,
-	              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+	              vk::ImageLayout::eDepthStencilAttachmentOptimal);
 }
 
 void Tiler::TileImage(void* dst, const void* src, const RenderTargetInfo& info) const {

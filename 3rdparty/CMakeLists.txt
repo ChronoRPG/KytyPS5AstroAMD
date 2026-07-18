@@ -5,30 +5,6 @@ add_subdirectory(cpuinfo)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 add_subdirectory(SDL2)
 
-add_library(vulkan-1 UNKNOWN IMPORTED GLOBAL)
-
-if(MINGW)
-	find_library(Vulkan_Lib NAMES libvulkan-1.dll.a vulkan-1
-	             PATHS "$ENV{VULKAN_SDK}/Lib" "$ENV{VULKAN_SDK}/Lib32" NO_DEFAULT_PATH)
-	if(NOT Vulkan_Lib)
-		find_library(Vulkan_Lib NAMES libvulkan-1.dll.a vulkan-1)
-	endif()
-elseif(WIN32)
-	find_library(Vulkan_Lib NAMES vulkan-1
-	             PATHS "$ENV{VULKAN_SDK}/Lib" "$ENV{VULKAN_SDK}/Lib32" NO_DEFAULT_PATH)
-	if(NOT Vulkan_Lib)
-		find_library(Vulkan_Lib NAMES vulkan-1)
-	endif()
-elseif(LINUX)
-	find_library(Vulkan_Lib vulkan)
-endif()
-
-if(NOT Vulkan_Lib OR Vulkan_Lib MATCHES "-NOTFOUND$")
-	message(FATAL_ERROR "Vulkan library was not found")
-endif()
-
-set_target_properties(vulkan-1 PROPERTIES IMPORTED_LOCATION "${Vulkan_Lib}")
-
 set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
 set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
 set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)

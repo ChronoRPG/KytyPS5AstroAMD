@@ -57,8 +57,8 @@ void PipelineCache::DeletePipelineInternal(Pipeline* p) {
 	EXIT_IF(gctx == nullptr);
 
 	VulkanDeviceWaitIdle(gctx);
-	vkDestroyPipeline(gctx->device, p->pipeline, nullptr);
-	vkDestroyPipelineLayout(gctx->device, p->pipeline_layout, nullptr);
+	gctx->device.destroyPipeline(p->pipeline, nullptr);
+	gctx->device.destroyPipelineLayout(p->pipeline_layout, nullptr);
 
 	p->pipeline        = nullptr;
 	p->pipeline_layout = nullptr;
@@ -67,7 +67,7 @@ void PipelineCache::DeletePipelineInternal(Pipeline* p) {
 PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
     VulkanFramebuffer* framebuffer, RenderColorInfo* colors, uint32_t color_count,
     RenderDepthInfo* depth, ShaderVertexInputInfo* vs_input_info, HW::Context* ctx,
-    HW::Shader* sh_ctx, ShaderPixelInputInfo* ps_input_info, VkPrimitiveTopology topology,
+    HW::Shader* sh_ctx, ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool ps_active, std::span<const uint32_t> vs_spirv, std::span<const uint32_t> ps_spirv) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
@@ -116,7 +116,7 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 	static_params.negative_one_to_one = !ctx->GetClipControl().dx_clip_space;
 	static_params.topology            = topology;
 	static_params.with_depth =
-	    (depth->format != VK_FORMAT_UNDEFINED && depth->vulkan_buffer != nullptr);
+	    (depth->format != vk::Format::eUndefined && depth->vulkan_buffer != nullptr);
 	static_params.depth_test_enable  = depth->depth_test_enable;
 	static_params.depth_write_enable = (depth->depth_write_enable && !depth->depth_clear_enable);
 	static_params.depth_compare_op   = depth->depth_compare_op;

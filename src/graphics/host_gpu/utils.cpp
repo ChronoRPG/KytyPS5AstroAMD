@@ -8,13 +8,13 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window.h"
 
 #include <atomic>
 #include <memory>
 #include <span>
 #include <vector>
-#include <vulkan/vk_enum_string_helper.h>
 
 namespace Libs::Graphics {
 
@@ -24,8 +24,8 @@ static uint64_t                   g_scratch_buffer_capacity = 0;
 
 std::vector<ImageBufferCopy> MakeLayeredImageBufferCopies(uint32_t layers, uint64_t slice_size,
                                                           uint32_t pitch, uint32_t width,
-                                                          uint32_t           height,
-                                                          VkImageAspectFlags aspect) {
+                                                          uint32_t             height,
+                                                          vk::ImageAspectFlags aspect) {
 	if (layers == 0 || slice_size == 0 || slice_size > UINT32_MAX / layers || pitch < width ||
 	    width == 0 || height == 0) {
 		EXIT("invalid layered image-buffer copy layout\n");
@@ -104,17 +104,17 @@ void VulkanDeviceWaitIdle(GraphicContext* ctx) {
 		}
 	}
 
-	auto result = vkDeviceWaitIdle(ctx->device);
+	auto result = ctx->device.waitIdle();
 
 	for (int i = locked_num - 1; i >= 0; i--) {
 		locked[i]->Unlock();
 	}
 
-	if (result != VK_SUCCESS) {
-		LOGF("vkDeviceWaitIdle failed: %s (%d)\n", string_VkResult(result),
+	if (result != vk::Result::eSuccess) {
+		LOGF("vkDeviceWaitIdle failed: %s (%d)\n", VulkanToString(result).c_str(),
 		     static_cast<int>(result));
 	}
-	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
 void UtilResetImageViews(VulkanImage* image) {
@@ -124,10 +124,10 @@ void UtilResetImageViews(VulkanImage* image) {
 }
 
 void UtilCreateImageView(GraphicContext* ctx, VulkanImage* image, int view_index,
-                         VkImageViewType view_type, VkImageAspectFlags aspect_mask,
-                         VkComponentMapping components, uint32_t base_array_layer,
+                         vk::ImageViewType view_type, vk::ImageAspectFlags aspect_mask,
+                         vk::ComponentMapping components, uint32_t base_array_layer,
                          uint32_t base_mip_level, uint32_t layer_count, uint32_t level_count,
-                         VkFormat view_format, VkImageUsageFlags view_usage) {
+                         vk::Format view_format, vk::ImageUsageFlags view_usage) {
 	if (view_index < 0 || view_index >= VulkanImage::VIEW_MAX || image->image == nullptr ||
 	    image->image_view[view_index] != nullptr) {
 		EXIT("invalid image-view creation target: image=%p index=%d current_view=%d\n",
@@ -136,18 +136,18 @@ void UtilCreateImageView(GraphicContext* ctx, VulkanImage* image, int view_index
 		         image->image_view[view_index] != nullptr);
 	}
 
-	VkImageViewUsageCreateInfo usage_info {};
-	usage_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
+	vk::ImageViewUsageCreateInfo usage_info {};
+	usage_info.sType = vk::StructureType::eImageViewUsageCreateInfo;
 	usage_info.pNext = nullptr;
 	usage_info.usage = view_usage;
 
-	VkImageViewCreateInfo create_info {};
-	create_info.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-	create_info.pNext      = (view_usage != 0 ? &usage_info : nullptr);
-	create_info.flags      = 0;
+	vk::ImageViewCreateInfo create_info {};
+	create_info.sType      = vk::StructureType::eImageViewCreateInfo;
+	create_info.pNext      = (view_usage ? &usage_info : nullptr);
+	create_info.flags      = {};
 	create_info.image      = image->image;
 	create_info.viewType   = view_type;
-	create_info.format     = (view_format != VK_FORMAT_UNDEFINED ? view_format : image->format);
+	create_info.format     = (view_format != vk::Format::eUndefined ? view_format : image->format);
 	create_info.components = components;
 	create_info.subresourceRange.aspectMask     = aspect_mask;
 	create_info.subresourceRange.baseArrayLayer = base_array_layer;
@@ -156,17 +156,17 @@ void UtilCreateImageView(GraphicContext* ctx, VulkanImage* image, int view_index
 	create_info.subresourceRange.levelCount     = level_count;
 
 	const auto result =
-	    vkCreateImageView(ctx->device, &create_info, nullptr, &image->image_view[view_index]);
-	if (result != VK_SUCCESS || image->image_view[view_index] == nullptr) {
+	    ctx->device.createImageView(&create_info, nullptr, &image->image_view[view_index]);
+	if (result != vk::Result::eSuccess || image->image_view[view_index] == nullptr) {
 		EXIT("failed to create image view: result=%d image_format=%d view_format=%d index=%d\n",
 		     static_cast<int>(result), static_cast<int>(image->format),
 		     static_cast<int>(create_info.format), view_index);
 	}
 }
 
-static void SetImageLayout(VkCommandBuffer buffer, VulkanImage* dst_image, uint32_t base_level,
-                           uint32_t levels, VkImageAspectFlags aspect_mask,
-                           VkImageLayout old_image_layout, VkImageLayout new_image_layout);
+static void SetImageLayout(vk::CommandBuffer buffer, VulkanImage* dst_image, uint32_t base_level,
+                           uint32_t levels, vk::ImageAspectFlags aspect_mask,
+                           vk::ImageLayout old_image_layout, vk::ImageLayout new_image_layout);
 
 template <typename Recorder>
 static void ExecuteImmediateUtilCommands(const Recorder& recorder) {
@@ -180,16 +180,16 @@ static void ExecuteImmediateUtilCommands(const Recorder& recorder) {
 	command.WaitForFence();
 }
 
-[[nodiscard]] static bool IsSingleImageAspect(VkImageAspectFlags aspect) {
-	return aspect == VK_IMAGE_ASPECT_COLOR_BIT || aspect == VK_IMAGE_ASPECT_DEPTH_BIT ||
-	       aspect == VK_IMAGE_ASPECT_STENCIL_BIT;
+[[nodiscard]] static bool IsSingleImageAspect(vk::ImageAspectFlags aspect) {
+	return aspect == vk::ImageAspectFlagBits::eColor || aspect == vk::ImageAspectFlagBits::eDepth ||
+	       aspect == vk::ImageAspectFlagBits::eStencil;
 }
 
-[[nodiscard]] static VkBufferImageCopy
-MakeBufferImageCopy(VkDeviceSize buffer_offset, uint32_t buffer_pitch, VkImageAspectFlags aspect,
-                    uint32_t mip_level, uint32_t array_layer, VkOffset3D image_offset,
-                    VkExtent3D image_extent) {
-	VkBufferImageCopy copy {};
+[[nodiscard]] static vk::BufferImageCopy
+MakeBufferImageCopy(vk::DeviceSize buffer_offset, uint32_t buffer_pitch,
+                    vk::ImageAspectFlags aspect, uint32_t mip_level, uint32_t array_layer,
+                    vk::Offset3D image_offset, vk::Extent3D image_extent) {
+	vk::BufferImageCopy copy {};
 	copy.bufferOffset                    = buffer_offset;
 	copy.bufferRowLength                 = buffer_pitch != image_extent.width ? buffer_pitch : 0;
 	copy.bufferImageHeight               = 0;
@@ -202,12 +202,13 @@ MakeBufferImageCopy(VkDeviceSize buffer_offset, uint32_t buffer_pitch, VkImageAs
 	return copy;
 }
 
-static void SetBufferMemoryBarrier(VkCommandBuffer command, VkBuffer buffer, VkDeviceSize offset,
-                                   VkDeviceSize size, VkAccessFlags src_access,
-                                   VkAccessFlags dst_access, VkPipelineStageFlags src_stage,
-                                   VkPipelineStageFlags dst_stage) {
-	VkBufferMemoryBarrier barrier {};
-	barrier.sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+static void SetBufferMemoryBarrier(vk::CommandBuffer command, vk::Buffer buffer,
+                                   vk::DeviceSize offset, vk::DeviceSize size,
+                                   vk::AccessFlags src_access, vk::AccessFlags dst_access,
+                                   vk::PipelineStageFlags src_stage,
+                                   vk::PipelineStageFlags dst_stage) {
+	vk::BufferMemoryBarrier barrier {};
+	barrier.sType               = vk::StructureType::eBufferMemoryBarrier;
 	barrier.srcAccessMask       = src_access;
 	barrier.dstAccessMask       = dst_access;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -215,59 +216,64 @@ static void SetBufferMemoryBarrier(VkCommandBuffer command, VkBuffer buffer, VkD
 	barrier.buffer              = buffer;
 	barrier.offset              = offset;
 	barrier.size                = size;
-	vkCmdPipelineBarrier(command, src_stage, dst_stage, 0, 0, nullptr, 1, &barrier, 0, nullptr);
+	command.pipelineBarrier(src_stage, dst_stage, vk::DependencyFlags {}, 0, nullptr, 1, &barrier,
+	                        0, nullptr);
 }
 
-[[nodiscard]] static VkImageAspectFlags GetDepthStencilAspects(VkFormat format) {
+[[nodiscard]] static vk::ImageAspectFlags GetDepthStencilAspects(vk::Format format) {
 	switch (format) {
-		case VK_FORMAT_D16_UNORM:
-		case VK_FORMAT_D32_SFLOAT: return VK_IMAGE_ASPECT_DEPTH_BIT;
-		case VK_FORMAT_D16_UNORM_S8_UINT:
-		case VK_FORMAT_D24_UNORM_S8_UINT:
-		case VK_FORMAT_D32_SFLOAT_S8_UINT:
-			return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+		case vk::Format::eD16Unorm:
+		case vk::Format::eD32Sfloat: return vk::ImageAspectFlagBits::eDepth;
+		case vk::Format::eD16UnormS8Uint:
+		case vk::Format::eD24UnormS8Uint:
+		case vk::Format::eD32SfloatS8Uint:
+			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
 		default: EXIT("unsupported depth/stencil image format: %d\n", static_cast<int>(format));
 	}
 }
 
-[[nodiscard]] static VkImageAspectFlags GetTransferAspects(const VulkanImage& image,
-                                                           VkImageAspectFlags copy_aspect) {
-	switch (copy_aspect) {
-		case VK_IMAGE_ASPECT_COLOR_BIT: return VK_IMAGE_ASPECT_COLOR_BIT;
-		case VK_IMAGE_ASPECT_DEPTH_BIT:
-		case VK_IMAGE_ASPECT_STENCIL_BIT: {
-			const auto aspects = GetDepthStencilAspects(image.format);
-			if ((copy_aspect & aspects) == 0) {
-				EXIT("image transfer aspect is unavailable: format=%d copy=0x%x available=0x%x\n",
-				     static_cast<int>(image.format), copy_aspect, aspects);
-			}
-			return aspects;
-		}
-		default: EXIT("unsupported image transfer aspect: 0x%x\n", copy_aspect);
+[[nodiscard]] static vk::ImageAspectFlags GetTransferAspects(const VulkanImage&   image,
+                                                             vk::ImageAspectFlags copy_aspect) {
+	if (copy_aspect == vk::ImageAspectFlagBits::eColor) {
+		return vk::ImageAspectFlagBits::eColor;
 	}
+	if (copy_aspect == vk::ImageAspectFlagBits::eDepth ||
+	    copy_aspect == vk::ImageAspectFlagBits::eStencil) {
+		const auto aspects = GetDepthStencilAspects(image.format);
+		if (!(copy_aspect & aspects)) {
+			EXIT("image transfer aspect is unavailable: format=%d copy=0x%x available=0x%x\n",
+			     static_cast<int>(image.format),
+			     static_cast<vk::ImageAspectFlags::MaskType>(copy_aspect),
+			     static_cast<vk::ImageAspectFlags::MaskType>(aspects));
+		}
+		return aspects;
+	}
+	EXIT("unsupported image transfer aspect: 0x%x\n",
+	     static_cast<vk::ImageAspectFlags::MaskType>(copy_aspect));
 }
 
 static void RecordBufferToImageCopy(CommandBuffer& command, VulkanBuffer& src_buffer,
-                                    VulkanImage&                       dst_image,
-                                    std::span<const VkBufferImageCopy> regions,
-                                    VkImageAspectFlags                 transition_aspects,
-                                    VkImageLayout initial_layout, VkImageLayout final_layout) {
-	auto* vk_command = command.GetPool()->buffers[command.GetIndex()];
+                                    VulkanImage&                         dst_image,
+                                    std::span<const vk::BufferImageCopy> regions,
+                                    vk::ImageAspectFlags                 transition_aspects,
+                                    vk::ImageLayout initial_layout, vk::ImageLayout final_layout) {
+	auto vk_command = command.GetPool()->buffers[command.GetIndex()];
 	SetBufferMemoryBarrier(vk_command, src_buffer.buffer, 0, VK_WHOLE_SIZE,
-	                       VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-	                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	                       vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eTransferRead,
+	                       vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer);
 	SetImageLayout(vk_command, &dst_image, 0, VK_REMAINING_MIP_LEVELS, transition_aspects,
-	               initial_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-	vkCmdCopyBufferToImage(vk_command, src_buffer.buffer, dst_image.image,
-	                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                       static_cast<uint32_t>(regions.size()), regions.data());
+	               initial_layout, vk::ImageLayout::eTransferDstOptimal);
+	vk_command.copyBufferToImage(src_buffer.buffer, dst_image.image,
+	                             vk::ImageLayout::eTransferDstOptimal,
+	                             static_cast<uint32_t>(regions.size()), regions.data());
 	SetImageLayout(vk_command, &dst_image, 0, VK_REMAINING_MIP_LEVELS, transition_aspects,
-	               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, final_layout);
+	               vk::ImageLayout::eTransferDstOptimal, final_layout);
 }
 
-[[nodiscard]] static std::span<const VkBufferImageCopy>
+[[nodiscard]] static std::span<const vk::BufferImageCopy>
 ConvertBufferImageCopies(std::span<const BufferImageCopy> regions) {
-	static thread_local std::vector<VkBufferImageCopy> vk_regions;
+	static thread_local std::vector<vk::BufferImageCopy> vk_regions;
 	vk_regions.resize(regions.size());
 
 	for (size_t i = 0; i < regions.size(); i++) {
@@ -279,9 +285,9 @@ ConvertBufferImageCopies(std::span<const BufferImageCopy> regions) {
 	return vk_regions;
 }
 
-[[nodiscard]] static std::span<const VkBufferImageCopy>
+[[nodiscard]] static std::span<const vk::BufferImageCopy>
 ConvertImageBufferCopies(std::span<const ImageBufferCopy> regions) {
-	static thread_local std::vector<VkBufferImageCopy> vk_regions;
+	static thread_local std::vector<vk::BufferImageCopy> vk_regions;
 	vk_regions.resize(regions.size());
 	for (size_t i = 0; i < regions.size(); i++) {
 		const auto& r = regions[i];
@@ -294,30 +300,32 @@ ConvertImageBufferCopies(std::span<const ImageBufferCopy> regions) {
 
 static void RecordImageToBuffer(CommandBuffer& command, VulkanImage& src_image,
                                 VulkanBuffer& dst_buffer, std::span<const ImageBufferCopy> regions,
-                                VkImageLayout final_layout) {
-	auto*              vk_command = command.GetPool()->buffers[command.GetIndex()];
-	VkImageAspectFlags aspects    = 0;
+                                vk::ImageLayout final_layout) {
+	auto                 vk_command = command.GetPool()->buffers[command.GetIndex()];
+	vk::ImageAspectFlags aspects    = {};
 	for (const auto& region: regions) {
 		aspects |= GetTransferAspects(src_image, region.aspect);
 	}
 	SetImageLayout(vk_command, &src_image, 0, VK_REMAINING_MIP_LEVELS, aspects, src_image.layout,
-	               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+	               vk::ImageLayout::eTransferSrcOptimal);
 	SetBufferMemoryBarrier(vk_command, dst_buffer.buffer, 0, VK_WHOLE_SIZE,
-	                       VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-	                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	                       vk::AccessFlagBits::eMemoryRead, vk::AccessFlagBits::eTransferWrite,
+	                       vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer);
 	const auto copies = ConvertImageBufferCopies(regions);
-	vkCmdCopyImageToBuffer(vk_command, src_image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                       dst_buffer.buffer, static_cast<uint32_t>(copies.size()), copies.data());
+	vk_command.copyImageToBuffer(src_image.image, vk::ImageLayout::eTransferSrcOptimal,
+	                             dst_buffer.buffer, static_cast<uint32_t>(copies.size()),
+	                             copies.data());
 	SetBufferMemoryBarrier(vk_command, dst_buffer.buffer, 0, VK_WHOLE_SIZE,
-	                       VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT,
-	                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT);
+	                       vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost);
 	SetImageLayout(vk_command, &src_image, 0, VK_REMAINING_MIP_LEVELS, aspects,
-	               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, final_layout);
+	               vk::ImageLayout::eTransferSrcOptimal, final_layout);
 }
 
 static void RecordImageToBuffer(CommandBuffer& command, VulkanImage& src_image,
                                 VulkanBuffer& dst_buffer, uint32_t dst_pitch,
-                                VkImageLayout final_layout, VkImageAspectFlags aspect) {
+                                vk::ImageLayout final_layout, vk::ImageAspectFlags aspect) {
 	const ImageBufferCopy region {
 	    0, dst_pitch, 0, src_image.extent.width, src_image.extent.height, 0, 0, 0, 0, 0, aspect};
 	RecordImageToBuffer(command, src_image, dst_buffer,
@@ -332,62 +340,67 @@ public:
 
 	void UploadToBuffer(GraphicContext* ctx, VulkanBuffer* dst_buffer, const void* src_data,
 	                    uint64_t size, uint64_t dst_offset) {
-		RecordUpload<true>(ctx, src_data, size, [&](CommandBuffer*, VkCommandBuffer vk_command) {
-			SetBufferMemoryBarrier(vk_command, m_buffer.buffer, 0, size, VK_ACCESS_MEMORY_WRITE_BIT,
-			                       VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-			                       VK_PIPELINE_STAGE_TRANSFER_BIT);
-			SetBufferMemoryBarrier(vk_command, dst_buffer->buffer, dst_offset, size,
-			                       VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-			                       VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-			                       VK_PIPELINE_STAGE_TRANSFER_BIT);
-			const VkBufferCopy copy_region {.srcOffset = 0, .dstOffset = dst_offset, .size = size};
-			vkCmdCopyBuffer(vk_command, m_buffer.buffer, dst_buffer->buffer, 1, &copy_region);
+		RecordUpload<true>(ctx, src_data, size, [&](CommandBuffer*, vk::CommandBuffer vk_command) {
 			SetBufferMemoryBarrier(
-			    vk_command, dst_buffer->buffer, dst_offset, size, VK_ACCESS_TRANSFER_WRITE_BIT,
-			    VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
-			        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-			    VK_PIPELINE_STAGE_TRANSFER_BIT,
-			    VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-			        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+			    vk_command, m_buffer.buffer, 0, size, vk::AccessFlagBits::eMemoryWrite,
+			    vk::AccessFlagBits::eTransferRead, vk::PipelineStageFlagBits::eAllCommands,
+			    vk::PipelineStageFlagBits::eTransfer);
+			SetBufferMemoryBarrier(
+			    vk_command, dst_buffer->buffer, dst_offset, size,
+			    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+			    vk::AccessFlagBits::eTransferWrite, vk::PipelineStageFlagBits::eAllCommands,
+			    vk::PipelineStageFlagBits::eTransfer);
+			const vk::BufferCopy copy_region {
+			    .srcOffset = 0, .dstOffset = dst_offset, .size = size};
+			vk_command.copyBuffer(m_buffer.buffer, dst_buffer->buffer, 1, &copy_region);
+			SetBufferMemoryBarrier(
+			    vk_command, dst_buffer->buffer, dst_offset, size,
+			    vk::AccessFlagBits::eTransferWrite,
+			    vk::AccessFlagBits::eVertexAttributeRead | vk::AccessFlagBits::eIndexRead |
+			        vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
+			    vk::PipelineStageFlagBits::eTransfer,
+			    vk::PipelineStageFlagBits::eVertexInput | vk::PipelineStageFlagBits::eVertexShader |
+			        vk::PipelineStageFlagBits::eFragmentShader |
+			        vk::PipelineStageFlagBits::eComputeShader);
 		});
 	}
 
 	void UploadToImage(GraphicContext* ctx, VulkanImage* image, const void* src_data, uint64_t size,
-	                   uint32_t src_pitch, VkImageAspectFlags copy_aspect,
-	                   VkImageLayout initial_layout, VkImageLayout final_layout) {
+	                   uint32_t src_pitch, vk::ImageAspectFlags copy_aspect,
+	                   vk::ImageLayout initial_layout, vk::ImageLayout final_layout) {
 		const auto transition_aspects = GetTransferAspects(*image, copy_aspect);
-		RecordUpload<false>(ctx, src_data, size, [&](CommandBuffer* command, VkCommandBuffer) {
+		RecordUpload<false>(ctx, src_data, size, [&](CommandBuffer* command, vk::CommandBuffer) {
 			const auto region = MakeBufferImageCopy(0, src_pitch, copy_aspect, 0, 0, {0, 0, 0},
 			                                        {image->extent.width, image->extent.height, 1});
 			RecordBufferToImageCopy(*command, m_buffer, *image,
-			                        std::span<const VkBufferImageCopy>(&region, 1),
+			                        std::span<const vk::BufferImageCopy>(&region, 1),
 			                        transition_aspects, initial_layout, final_layout);
 		});
 	}
 
 	void UploadToImage(GraphicContext* ctx, VulkanImage* dst_image, const void* src_data,
 	                   uint64_t size, std::span<const BufferImageCopy> regions,
-	                   uint64_t dst_layout) {
-		RecordUpload<false>(ctx, src_data, size, [&](CommandBuffer* command, VkCommandBuffer) {
-			VkImageAspectFlags transition_aspects = 0;
+	                   vk::ImageLayout dst_layout) {
+		RecordUpload<false>(ctx, src_data, size, [&](CommandBuffer* command, vk::CommandBuffer) {
+			vk::ImageAspectFlags transition_aspects = {};
 			for (const auto& region: regions) {
 				transition_aspects |= GetTransferAspects(*dst_image, region.aspect);
 			}
 			RecordBufferToImageCopy(*command, m_buffer, *dst_image,
 			                        ConvertBufferImageCopies(regions), transition_aspects,
-			                        dst_image->layout, static_cast<VkImageLayout>(dst_layout));
+			                        dst_image->layout, dst_layout);
 		});
 	}
 
 	void DownloadFromImage(GraphicContext* ctx, void* dst_data, uint64_t size, uint32_t dst_pitch,
-	                       VulkanImage* src_image, uint64_t src_layout, VkImageAspectFlags aspect) {
+	                       VulkanImage* src_image, vk::ImageLayout src_layout,
+	                       vk::ImageAspectFlags aspect) {
 		Common::LockGuard lock(m_mutex);
 
-		EnsureBuffer(ctx, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+		EnsureBuffer(ctx, size, vk::BufferUsageFlagBits::eTransferDst);
 
-		ExecuteImmediateUtilCommands([&](CommandBuffer* command, VkCommandBuffer) {
-			RecordImageToBuffer(*command, *src_image, m_buffer, dst_pitch,
-			                    static_cast<VkImageLayout>(src_layout), aspect);
+		ExecuteImmediateUtilCommands([&](CommandBuffer* command, vk::CommandBuffer) {
+			RecordImageToBuffer(*command, *src_image, m_buffer, dst_pitch, src_layout, aspect);
 		});
 
 		std::memcpy(dst_data, m_mapped_data, size);
@@ -395,12 +408,11 @@ public:
 
 	void DownloadFromImage(GraphicContext* ctx, void* dst_data, uint64_t size,
 	                       std::span<const ImageBufferCopy> regions, VulkanImage* src_image,
-	                       uint64_t src_layout) {
+	                       vk::ImageLayout src_layout) {
 		Common::LockGuard lock(m_mutex);
-		EnsureBuffer(ctx, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-		ExecuteImmediateUtilCommands([&](CommandBuffer* command, VkCommandBuffer) {
-			RecordImageToBuffer(*command, *src_image, m_buffer, regions,
-			                    static_cast<VkImageLayout>(src_layout));
+		EnsureBuffer(ctx, size, vk::BufferUsageFlagBits::eTransferDst);
+		ExecuteImmediateUtilCommands([&](CommandBuffer* command, vk::CommandBuffer) {
+			RecordImageToBuffer(*command, *src_image, m_buffer, regions, src_layout);
 		});
 		std::memcpy(dst_data, m_mapped_data, size);
 	}
@@ -421,7 +433,7 @@ private:
 	void RecordUpload(GraphicContext* ctx, const void* src_data, uint64_t size,
 	                  const Recorder& recorder) {
 		Common::LockGuard lock(m_mutex);
-		CopyFromHost(ctx, src_data, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+		CopyFromHost(ctx, src_data, size, vk::BufferUsageFlagBits::eTransferSrc);
 		if constexpr (WaitIdle) {
 			VulkanDeviceWaitIdle(ctx);
 		}
@@ -429,13 +441,13 @@ private:
 	}
 
 	void CopyFromHost(GraphicContext* ctx, const void* src_data, uint64_t size,
-	                  VkBufferUsageFlags usage) {
+	                  vk::BufferUsageFlags usage) {
 		EnsureBuffer(ctx, size, usage);
 
 		std::memcpy(m_mapped_data, src_data, size);
 	}
 
-	void EnsureBuffer(GraphicContext* ctx, uint64_t size, VkBufferUsageFlags usage) {
+	void EnsureBuffer(GraphicContext* ctx, uint64_t size, vk::BufferUsageFlags usage) {
 		if (m_capacity < size || m_buffer.usage != usage) {
 			if (m_buffer.buffer != nullptr) {
 				VulkanUnmapMemory(ctx, &m_buffer.memory);
@@ -443,9 +455,9 @@ private:
 				VulkanDeleteBuffer(ctx, &m_buffer);
 			}
 
-			m_buffer.usage = usage;
-			m_buffer.memory.property =
-			    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+			m_buffer.usage           = usage;
+			m_buffer.memory.property = vk::MemoryPropertyFlagBits::eHostVisible |
+			                           vk::MemoryPropertyFlagBits::eHostCoherent;
 			VulkanCreateBuffer(ctx, size, &m_buffer);
 			m_capacity = size;
 
@@ -467,45 +479,45 @@ static ReusableStagingBuffer g_readback_staging_buffer;
 static Common::Mutex g_compressed_image_copy_mutex;
 static VulkanBuffer  g_compressed_image_copy_buffer;
 
-bool UtilIsBcFormat(VkFormat format) {
-	return format == VK_FORMAT_BC1_RGB_UNORM_BLOCK || format == VK_FORMAT_BC1_RGB_SRGB_BLOCK ||
-	       format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || format == VK_FORMAT_BC1_RGBA_SRGB_BLOCK ||
-	       format == VK_FORMAT_BC2_UNORM_BLOCK || format == VK_FORMAT_BC2_SRGB_BLOCK ||
-	       format == VK_FORMAT_BC3_UNORM_BLOCK || format == VK_FORMAT_BC3_SRGB_BLOCK ||
-	       format == VK_FORMAT_BC4_UNORM_BLOCK || format == VK_FORMAT_BC4_SNORM_BLOCK ||
-	       format == VK_FORMAT_BC5_UNORM_BLOCK || format == VK_FORMAT_BC5_SNORM_BLOCK ||
-	       format == VK_FORMAT_BC6H_UFLOAT_BLOCK || format == VK_FORMAT_BC6H_SFLOAT_BLOCK ||
-	       format == VK_FORMAT_BC7_UNORM_BLOCK || format == VK_FORMAT_BC7_SRGB_BLOCK;
+bool UtilIsBcFormat(vk::Format format) {
+	return format == vk::Format::eBc1RgbUnormBlock || format == vk::Format::eBc1RgbSrgbBlock ||
+	       format == vk::Format::eBc1RgbaUnormBlock || format == vk::Format::eBc1RgbaSrgbBlock ||
+	       format == vk::Format::eBc2UnormBlock || format == vk::Format::eBc2SrgbBlock ||
+	       format == vk::Format::eBc3UnormBlock || format == vk::Format::eBc3SrgbBlock ||
+	       format == vk::Format::eBc4UnormBlock || format == vk::Format::eBc4SnormBlock ||
+	       format == vk::Format::eBc5UnormBlock || format == vk::Format::eBc5SnormBlock ||
+	       format == vk::Format::eBc6HUfloatBlock || format == vk::Format::eBc6HSfloatBlock ||
+	       format == vk::Format::eBc7UnormBlock || format == vk::Format::eBc7SrgbBlock;
 }
 
-uint32_t UtilGetBcBlockSize(VkFormat format) {
+uint32_t UtilGetBcBlockSize(vk::Format format) {
 	switch (format) {
-		case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
-		case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
-		case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
-		case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
-		case VK_FORMAT_BC4_UNORM_BLOCK:
-		case VK_FORMAT_BC4_SNORM_BLOCK: return 8;
-		case VK_FORMAT_BC2_UNORM_BLOCK:
-		case VK_FORMAT_BC2_SRGB_BLOCK:
-		case VK_FORMAT_BC3_UNORM_BLOCK:
-		case VK_FORMAT_BC3_SRGB_BLOCK:
-		case VK_FORMAT_BC5_UNORM_BLOCK:
-		case VK_FORMAT_BC5_SNORM_BLOCK:
-		case VK_FORMAT_BC6H_UFLOAT_BLOCK:
-		case VK_FORMAT_BC6H_SFLOAT_BLOCK:
-		case VK_FORMAT_BC7_UNORM_BLOCK:
-		case VK_FORMAT_BC7_SRGB_BLOCK: return 16;
+		case vk::Format::eBc1RgbUnormBlock:
+		case vk::Format::eBc1RgbSrgbBlock:
+		case vk::Format::eBc1RgbaUnormBlock:
+		case vk::Format::eBc1RgbaSrgbBlock:
+		case vk::Format::eBc4UnormBlock:
+		case vk::Format::eBc4SnormBlock: return 8;
+		case vk::Format::eBc2UnormBlock:
+		case vk::Format::eBc2SrgbBlock:
+		case vk::Format::eBc3UnormBlock:
+		case vk::Format::eBc3SrgbBlock:
+		case vk::Format::eBc5UnormBlock:
+		case vk::Format::eBc5SnormBlock:
+		case vk::Format::eBc6HUfloatBlock:
+		case vk::Format::eBc6HSfloatBlock:
+		case vk::Format::eBc7UnormBlock:
+		case vk::Format::eBc7SrgbBlock: return 16;
 		default: return 0;
 	}
 }
 
-static uint32_t GetFormatTexelSize(VkFormat format) {
+static uint32_t GetFormatTexelSize(vk::Format format) {
 	switch (format) {
-		case VK_FORMAT_R32G32_SFLOAT:
-		case VK_FORMAT_R32G32_UINT: return 8;
-		case VK_FORMAT_R32G32B32A32_SFLOAT:
-		case VK_FORMAT_R32G32B32A32_UINT: return 16;
+		case vk::Format::eR32G32Sfloat:
+		case vk::Format::eR32G32Uint: return 8;
+		case vk::Format::eR32G32B32A32Sfloat:
+		case vk::Format::eR32G32B32A32Uint: return 16;
 		default: return 0;
 	}
 }
@@ -520,8 +532,8 @@ static VulkanBuffer* GetCompressedImageCopyBuffer(GraphicContext* ctx, uint64_t 
 
 	if (g_compressed_image_copy_buffer.buffer == nullptr) {
 		g_compressed_image_copy_buffer.usage =
-		    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-		g_compressed_image_copy_buffer.memory.property = 0;
+		    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+		g_compressed_image_copy_buffer.memory.property = {};
 		VulkanCreateBuffer(ctx, buffer_size, &g_compressed_image_copy_buffer);
 	}
 
@@ -539,20 +551,20 @@ static ReusableStagingBuffer* GetStagingBuffer(StagingBufferType type) {
 	return nullptr;
 }
 
-static void SetImageLayout(VkCommandBuffer buffer, VulkanImage* dst_image, uint32_t base_level,
-                           uint32_t levels, VkImageAspectFlags aspect_mask,
-                           VkImageLayout old_image_layout, VkImageLayout new_image_layout) {
-	if ((old_image_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
-	     new_image_layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) ||
-	    (old_image_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
-	     new_image_layout == VK_IMAGE_LAYOUT_GENERAL) ||
-	    (old_image_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
-	     new_image_layout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)) {
+static void SetImageLayout(vk::CommandBuffer buffer, VulkanImage* dst_image, uint32_t base_level,
+                           uint32_t levels, vk::ImageAspectFlags aspect_mask,
+                           vk::ImageLayout old_image_layout, vk::ImageLayout new_image_layout) {
+	if ((old_image_layout == vk::ImageLayout::eTransferDstOptimal &&
+	     new_image_layout == vk::ImageLayout::eTransferSrcOptimal) ||
+	    (old_image_layout == vk::ImageLayout::eTransferDstOptimal &&
+	     new_image_layout == vk::ImageLayout::eGeneral) ||
+	    (old_image_layout == vk::ImageLayout::eTransferDstOptimal &&
+	     new_image_layout == vk::ImageLayout::ePresentSrcKHR)) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
 			LOGF("set_image_layout: image=%p type=%d tracked=%d requested=%d->%d base=%u "
 			     "levels=%u\n",
-			     reinterpret_cast<void*>(dst_image->image), static_cast<int>(dst_image->type),
+			     VulkanHandleToPointer(dst_image->image), static_cast<int>(dst_image->type),
 			     static_cast<int>(dst_image->layout), static_cast<int>(old_image_layout),
 			     static_cast<int>(new_image_layout), base_level, levels);
 		}
@@ -563,11 +575,11 @@ static void SetImageLayout(VkCommandBuffer buffer, VulkanImage* dst_image, uint3
 		return;
 	}
 
-	VkImageMemoryBarrier image_memory_barrier {};
-	image_memory_barrier.sType                           = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	vk::ImageMemoryBarrier image_memory_barrier {};
+	image_memory_barrier.sType                           = vk::StructureType::eImageMemoryBarrier;
 	image_memory_barrier.pNext                           = nullptr;
-	image_memory_barrier.srcAccessMask                   = 0;
-	image_memory_barrier.dstAccessMask                   = 0;
+	image_memory_barrier.srcAccessMask                   = {};
+	image_memory_barrier.dstAccessMask                   = {};
 	image_memory_barrier.oldLayout                       = old_image_layout;
 	image_memory_barrier.newLayout                       = new_image_layout;
 	image_memory_barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
@@ -580,78 +592,80 @@ static void SetImageLayout(VkCommandBuffer buffer, VulkanImage* dst_image, uint3
 	image_memory_barrier.subresourceRange.layerCount     = dst_image->layers;
 
 	switch (old_image_layout) {
-		case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-			image_memory_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		case vk::ImageLayout::eColorAttachmentOptimal:
+			image_memory_barrier.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
 			break;
-		case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
-			image_memory_barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-			                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+		case vk::ImageLayout::eDepthStencilAttachmentOptimal:
+			image_memory_barrier.srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentRead |
+			                                     vk::AccessFlagBits::eDepthStencilAttachmentWrite;
 			break;
-		case VK_IMAGE_LAYOUT_GENERAL:
+		case vk::ImageLayout::eGeneral:
 			image_memory_barrier.srcAccessMask =
-			    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-			    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-			    VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+			    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+			    vk::AccessFlagBits::eColorAttachmentRead |
+			    vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eTransferRead |
+			    vk::AccessFlagBits::eTransferWrite;
 			break;
-		case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-			image_memory_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		case vk::ImageLayout::eTransferDstOptimal:
+			image_memory_barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 			break;
-		case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-			image_memory_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		case vk::ImageLayout::eTransferSrcOptimal:
+			image_memory_barrier.srcAccessMask = vk::AccessFlagBits::eTransferRead;
 			break;
-		case VK_IMAGE_LAYOUT_PREINITIALIZED:
-			image_memory_barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+		case vk::ImageLayout::ePreinitialized:
+			image_memory_barrier.srcAccessMask = vk::AccessFlagBits::eHostWrite;
 			break;
 		default: break;
 	}
 
 	switch (new_image_layout) {
-		case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-			image_memory_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		case vk::ImageLayout::eTransferDstOptimal:
+			image_memory_barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
 			break;
-		case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-			image_memory_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		case vk::ImageLayout::eTransferSrcOptimal:
+			image_memory_barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
 			break;
-		case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+		case vk::ImageLayout::eShaderReadOnlyOptimal:
 			image_memory_barrier.srcAccessMask |=
-			    VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
-			image_memory_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+			    vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eHostWrite;
+			image_memory_barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead;
 			break;
-		case VK_IMAGE_LAYOUT_GENERAL:
+		case vk::ImageLayout::eGeneral:
 			image_memory_barrier.dstAccessMask =
-			    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+			    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
 			break;
-		case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-			image_memory_barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		case vk::ImageLayout::eColorAttachmentOptimal:
+			image_memory_barrier.dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
 			break;
-		case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
-			image_memory_barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-			                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+		case vk::ImageLayout::eDepthStencilAttachmentOptimal:
+			image_memory_barrier.dstAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentRead |
+			                                     vk::AccessFlagBits::eDepthStencilAttachmentWrite;
 			break;
 		default: break;
 	}
 
-	auto src_stages = static_cast<VkPipelineStageFlags>(
-	    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
-	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-	    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-	    VK_PIPELINE_STAGE_HOST_BIT);
-	auto dest_stages = static_cast<VkPipelineStageFlags>(
-	    VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-	    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT);
+	auto src_stages = static_cast<vk::PipelineStageFlags>(
+	    vk::PipelineStageFlagBits::eTopOfPipe | vk::PipelineStageFlagBits::eTransfer |
+	    vk::PipelineStageFlagBits::eColorAttachmentOutput |
+	    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eEarlyFragmentTests |
+	    vk::PipelineStageFlagBits::eLateFragmentTests | vk::PipelineStageFlagBits::eHost);
+	auto dest_stages = static_cast<vk::PipelineStageFlags>(
+	    vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eVertexShader |
+	    vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eComputeShader |
+	    vk::PipelineStageFlagBits::eColorAttachmentOutput |
+	    vk::PipelineStageFlagBits::eEarlyFragmentTests |
+	    vk::PipelineStageFlagBits::eLateFragmentTests);
 
-	vkCmdPipelineBarrier(buffer, src_stages, dest_stages, 0, 0, nullptr, 0, nullptr, 1,
-	                     &image_memory_barrier);
+	buffer.pipelineBarrier(src_stages, dest_stages, vk::DependencyFlags {}, 0, nullptr, 0, nullptr,
+	                       1, &image_memory_barrier);
 
 	dst_image->layout = new_image_layout;
 }
 
-static bool CopyBlockImageToCompressedImage(VkCommandBuffer vk_buffer, const ImageImageCopy& r,
+static bool CopyBlockImageToCompressedImage(vk::CommandBuffer vk_buffer, const ImageImageCopy& r,
                                             VulkanImage* dst_image) {
-	if (r.src_aspect != VK_IMAGE_ASPECT_COLOR_BIT || r.dst_aspect != VK_IMAGE_ASPECT_COLOR_BIT ||
-	    !UtilIsBcFormat(dst_image->format)) {
+	if (r.src_aspect != vk::ImageAspectFlagBits::eColor ||
+	    r.dst_aspect != vk::ImageAspectFlagBits::eColor || !UtilIsBcFormat(dst_image->format)) {
 		return false;
 	}
 
@@ -672,41 +686,43 @@ static bool CopyBlockImageToCompressedImage(VkCommandBuffer vk_buffer, const Ima
 	                                                          block_height * dst_block_size);
 
 	const auto src_region =
-	    MakeBufferImageCopy(0, 0, VK_IMAGE_ASPECT_COLOR_BIT, r.src_level, r.src_layer,
+	    MakeBufferImageCopy(0, 0, vk::ImageAspectFlagBits::eColor, r.src_level, r.src_layer,
 	                        {r.src_x, r.src_y, 0}, {block_width, block_height, 1});
 
 	auto src_layout = r.src_image->layout;
-	SetImageLayout(vk_buffer, r.src_image, r.src_level, 1, VK_IMAGE_ASPECT_COLOR_BIT, src_layout,
-	               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+	SetImageLayout(vk_buffer, r.src_image, r.src_level, 1, vk::ImageAspectFlagBits::eColor,
+	               src_layout, vk::ImageLayout::eTransferSrcOptimal);
 
 	SetBufferMemoryBarrier(vk_buffer, copy_buffer->buffer, 0, VK_WHOLE_SIZE,
-	                       VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-	                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-	vkCmdCopyImageToBuffer(vk_buffer, r.src_image->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                       copy_buffer->buffer, 1, &src_region);
+	                       vk::AccessFlagBits::eTransferRead, vk::AccessFlagBits::eTransferWrite,
+	                       vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eTransfer);
+	vk_buffer.copyImageToBuffer(r.src_image->image, vk::ImageLayout::eTransferSrcOptimal,
+	                            copy_buffer->buffer, 1, &src_region);
 	SetBufferMemoryBarrier(vk_buffer, copy_buffer->buffer, 0, VK_WHOLE_SIZE,
-	                       VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-	                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	                       vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eTransferRead,
+	                       vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eTransfer);
 
 	const auto dst_region =
-	    MakeBufferImageCopy(0, 0, VK_IMAGE_ASPECT_COLOR_BIT, r.dst_level, r.dst_layer,
+	    MakeBufferImageCopy(0, 0, vk::ImageAspectFlagBits::eColor, r.dst_level, r.dst_layer,
 	                        {r.dst_x, r.dst_y, 0}, {r.width, r.height, 1});
 
-	vkCmdCopyBufferToImage(vk_buffer, copy_buffer->buffer, dst_image->image,
-	                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &dst_region);
+	vk_buffer.copyBufferToImage(copy_buffer->buffer, dst_image->image,
+	                            vk::ImageLayout::eTransferDstOptimal, 1, &dst_region);
 
-	SetImageLayout(vk_buffer, r.src_image, r.src_level, 1, VK_IMAGE_ASPECT_COLOR_BIT,
-	               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, src_layout);
+	SetImageLayout(vk_buffer, r.src_image, r.src_level, 1, vk::ImageAspectFlagBits::eColor,
+	               vk::ImageLayout::eTransferSrcOptimal, src_layout);
 
 	return true;
 }
 
 void UtilImageToImage(CommandBuffer* buffer, std::span<const ImageImageCopy> regions,
-                      VulkanImage* dst_image, uint64_t dst_layout) {
-	auto* vk_buffer = buffer->GetPool()->buffers[buffer->GetIndex()];
+                      VulkanImage* dst_image, vk::ImageLayout dst_layout) {
+	auto vk_buffer = buffer->GetPool()->buffers[buffer->GetIndex()];
 
-	bool               same_image_copy        = false;
-	VkImageAspectFlags dst_transition_aspects = 0;
+	bool                 same_image_copy        = false;
+	vk::ImageAspectFlags dst_transition_aspects = {};
 	for (const auto& r: regions) {
 		dst_transition_aspects |= GetTransferAspects(*dst_image, r.dst_aspect);
 		if (r.src_image == dst_image) {
@@ -717,10 +733,10 @@ void UtilImageToImage(CommandBuffer* buffer, std::span<const ImageImageCopy> reg
 
 	if (same_image_copy) {
 		SetImageLayout(vk_buffer, dst_image, 0, VK_REMAINING_MIP_LEVELS, dst_transition_aspects,
-		               dst_image->layout, VK_IMAGE_LAYOUT_GENERAL);
+		               dst_image->layout, vk::ImageLayout::eGeneral);
 
 		for (const auto& r: regions) {
-			VkImageCopy region;
+			vk::ImageCopy region;
 
 			region.srcSubresource.aspectMask     = r.src_aspect;
 			region.srcSubresource.mipLevel       = r.src_level;
@@ -734,41 +750,41 @@ void UtilImageToImage(CommandBuffer* buffer, std::span<const ImageImageCopy> reg
 			region.dstOffset                     = {r.dst_x, r.dst_y, r.dst_z};
 			region.extent                        = {r.width, r.height, 1};
 
-			auto src_layout     = VK_IMAGE_LAYOUT_GENERAL;
-			auto restore_layout = VK_IMAGE_LAYOUT_GENERAL;
+			auto src_layout     = vk::ImageLayout::eGeneral;
+			auto restore_layout = vk::ImageLayout::eGeneral;
 			if (r.src_image != dst_image) {
 				restore_layout = r.src_image->layout;
 				SetImageLayout(vk_buffer, r.src_image, r.src_level, 1,
 				               GetTransferAspects(*r.src_image, r.src_aspect), restore_layout,
-				               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-				src_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+				               vk::ImageLayout::eTransferSrcOptimal);
+				src_layout = vk::ImageLayout::eTransferSrcOptimal;
 			}
 
-			vkCmdCopyImage(vk_buffer, r.src_image->image, src_layout, dst_image->image,
-			               VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+			vk_buffer.copyImage(r.src_image->image, src_layout, dst_image->image,
+			                    vk::ImageLayout::eGeneral, 1, &region);
 
 			if (r.src_image != dst_image) {
 				SetImageLayout(vk_buffer, r.src_image, r.src_level, 1,
 				               GetTransferAspects(*r.src_image, r.src_aspect),
-				               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, restore_layout);
+				               vk::ImageLayout::eTransferSrcOptimal, restore_layout);
 			}
 		}
 
 		SetImageLayout(vk_buffer, dst_image, 0, VK_REMAINING_MIP_LEVELS, dst_transition_aspects,
-		               VK_IMAGE_LAYOUT_GENERAL, static_cast<VkImageLayout>(dst_layout));
+		               vk::ImageLayout::eGeneral, dst_layout);
 		return;
 	}
 
 	SetImageLayout(vk_buffer, dst_image, 0, VK_REMAINING_MIP_LEVELS, dst_transition_aspects,
-	               dst_image->layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+	               dst_image->layout, vk::ImageLayout::eTransferDstOptimal);
 
 	for (const auto& r: regions) {
-		VkImageCopy region;
+		vk::ImageCopy region;
 
 		auto src_layout = r.src_image->layout;
 
-		if (r.src_aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
-		    r.dst_aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
+		if (r.src_aspect == vk::ImageAspectFlagBits::eColor &&
+		    r.dst_aspect == vk::ImageAspectFlagBits::eColor &&
 		    CopyBlockImageToCompressedImage(vk_buffer, r, dst_image)) {
 			continue;
 		}
@@ -787,24 +803,24 @@ void UtilImageToImage(CommandBuffer* buffer, std::span<const ImageImageCopy> reg
 
 		SetImageLayout(vk_buffer, r.src_image, r.src_level, 1,
 		               GetTransferAspects(*r.src_image, r.src_aspect), src_layout,
-		               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		               vk::ImageLayout::eTransferSrcOptimal);
 
-		vkCmdCopyImage(vk_buffer, r.src_image->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		               dst_image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+		vk_buffer.copyImage(r.src_image->image, vk::ImageLayout::eTransferSrcOptimal,
+		                    dst_image->image, vk::ImageLayout::eTransferDstOptimal, 1, &region);
 
 		SetImageLayout(vk_buffer, r.src_image, r.src_level, 1,
 		               GetTransferAspects(*r.src_image, r.src_aspect),
-		               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, src_layout);
+		               vk::ImageLayout::eTransferSrcOptimal, src_layout);
 	}
 
 	SetImageLayout(vk_buffer, dst_image, 0, VK_REMAINING_MIP_LEVELS, dst_transition_aspects,
-	               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<VkImageLayout>(dst_layout));
+	               vk::ImageLayout::eTransferDstOptimal, dst_layout);
 }
 
 void UtilCopyImageWithBuffer(CommandBuffer* buffer, GraphicContext* ctx, VulkanImage* src_image,
-                             VkImageAspectFlags src_aspect, VulkanImage* dst_image,
-                             VkImageAspectFlags dst_aspect, uint32_t bytes_per_element,
-                             uint64_t dst_layout) {
+                             vk::ImageAspectFlags src_aspect, VulkanImage* dst_image,
+                             vk::ImageAspectFlags dst_aspect, uint32_t bytes_per_element,
+                             vk::ImageLayout dst_layout) {
 	if (!IsSingleImageAspect(src_aspect) || !IsSingleImageAspect(dst_aspect) ||
 	    (bytes_per_element != 2 && bytes_per_element != 4) || src_image->layers != 1 ||
 	    dst_image->layers != 1 || src_image->mip_levels != 1 || dst_image->mip_levels != 1 ||
@@ -813,10 +829,11 @@ void UtilCopyImageWithBuffer(CommandBuffer* buffer, GraphicContext* ctx, VulkanI
 	    src_image->extent.height != dst_image->extent.height) {
 		EXIT("unsupported image-buffer-image copy, src_aspect=0x%x dst_aspect=0x%x bpe=%u "
 		     "src=%ux%u/%u/%u dst=%ux%u/%u/%u\n",
-		     src_aspect, dst_aspect, bytes_per_element, src_image->extent.width,
-		     src_image->extent.height, src_image->layers, src_image->mip_levels,
-		     dst_image->extent.width, dst_image->extent.height, dst_image->layers,
-		     dst_image->mip_levels);
+		     static_cast<vk::ImageAspectFlags::MaskType>(src_aspect),
+		     static_cast<vk::ImageAspectFlags::MaskType>(dst_aspect), bytes_per_element,
+		     src_image->extent.width, src_image->extent.height, src_image->layers,
+		     src_image->mip_levels, dst_image->extent.width, dst_image->extent.height,
+		     dst_image->layers, dst_image->mip_levels);
 	}
 
 	const uint64_t row_bytes = static_cast<uint64_t>(src_image->extent.width) * bytes_per_element;
@@ -833,51 +850,54 @@ void UtilCopyImageWithBuffer(CommandBuffer* buffer, GraphicContext* ctx, VulkanI
 	// barriers below. The preservation policy stays isolated here so a future scheduler can replace
 	// this synchronization without changing texture-cache ownership logic.
 	VulkanDeviceWaitIdle(ctx);
-	auto* copy_buffer  = new VulkanBuffer;
-	copy_buffer->usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-	copy_buffer->memory.property = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	auto* copy_buffer = new VulkanBuffer;
+	copy_buffer->usage =
+	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+	copy_buffer->memory.property = vk::MemoryPropertyFlagBits::eDeviceLocal;
 	VulkanCreateBuffer(ctx, copy_buffer_size, copy_buffer);
 	buffer->DeleteAfterFence(copy_buffer);
 
-	auto*      vk_buffer    = buffer->GetPool()->buffers[buffer->GetIndex()];
+	auto       vk_buffer    = buffer->GetPool()->buffers[buffer->GetIndex()];
 	const auto src_layout   = src_image->layout;
-	const auto final_layout = static_cast<VkImageLayout>(dst_layout);
+	const auto final_layout = dst_layout;
 	SetImageLayout(vk_buffer, src_image, 0, 1, src_aspect, src_layout,
-	               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+	               vk::ImageLayout::eTransferSrcOptimal);
 	SetImageLayout(vk_buffer, dst_image, 0, 1, dst_aspect, dst_image->layout,
-	               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+	               vk::ImageLayout::eTransferDstOptimal);
 
 	for (uint32_t row = 0; row < src_image->extent.height; row += rows_per_chunk) {
 		const auto rows = std::min(rows_per_chunk, src_image->extent.height - row);
 		auto copy = MakeBufferImageCopy(0, 0, src_aspect, 0, 0, {0, static_cast<int32_t>(row), 0},
 		                                {src_image->extent.width, rows, 1});
-		vkCmdCopyImageToBuffer(vk_buffer, src_image->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		                       copy_buffer->buffer, 1, &copy);
+		vk_buffer.copyImageToBuffer(src_image->image, vk::ImageLayout::eTransferSrcOptimal,
+		                            copy_buffer->buffer, 1, &copy);
 
-		SetBufferMemoryBarrier(vk_buffer, copy_buffer->buffer, 0, copy_buffer_size,
-		                       VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-		                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		SetBufferMemoryBarrier(
+		    vk_buffer, copy_buffer->buffer, 0, copy_buffer_size, vk::AccessFlagBits::eTransferWrite,
+		    vk::AccessFlagBits::eTransferRead, vk::PipelineStageFlagBits::eTransfer,
+		    vk::PipelineStageFlagBits::eTransfer);
 
 		copy.imageSubresource.aspectMask = dst_aspect;
-		vkCmdCopyBufferToImage(vk_buffer, copy_buffer->buffer, dst_image->image,
-		                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+		vk_buffer.copyBufferToImage(copy_buffer->buffer, dst_image->image,
+		                            vk::ImageLayout::eTransferDstOptimal, 1, &copy);
 		if (row + rows < src_image->extent.height) {
-			SetBufferMemoryBarrier(vk_buffer, copy_buffer->buffer, 0, copy_buffer_size,
-			                       VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-			                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+			SetBufferMemoryBarrier(
+			    vk_buffer, copy_buffer->buffer, 0, copy_buffer_size,
+			    vk::AccessFlagBits::eTransferRead, vk::AccessFlagBits::eTransferWrite,
+			    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer);
 		}
 	}
 
-	SetImageLayout(vk_buffer, src_image, 0, 1, src_aspect, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	SetImageLayout(vk_buffer, src_image, 0, 1, src_aspect, vk::ImageLayout::eTransferSrcOptimal,
 	               src_layout);
-	SetImageLayout(vk_buffer, dst_image, 0, 1, dst_aspect, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	SetImageLayout(vk_buffer, dst_image, 0, 1, dst_aspect, vk::ImageLayout::eTransferDstOptimal,
 	               final_layout);
 }
 
 void UtilBlitPreparedImage(CommandBuffer* buffer, VulkanImage* src_image,
                            VulkanSwapchain* dst_swapchain) {
-	auto* vk_buffer = buffer->GetPool()->buffers[buffer->GetIndex()];
-	if (src_image->layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+	auto vk_buffer = buffer->GetPool()->buffers[buffer->GetIndex()];
+	if (src_image->layout != vk::ImageLayout::eTransferSrcOptimal) {
 		EXIT("invalid prepared presentation image, image=%p vk_image=%p layout=%d\n",
 		     static_cast<const void*>(src_image),
 		     src_image != nullptr ? static_cast<void*>(src_image->image) : nullptr,
@@ -887,13 +907,13 @@ void UtilBlitPreparedImage(CommandBuffer* buffer, VulkanImage* src_image,
 	VulkanImage swapchain_image(VulkanImageType::Unknown);
 
 	swapchain_image.image  = dst_swapchain->swapchain_images[dst_swapchain->current_index];
-	swapchain_image.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+	swapchain_image.layout = vk::ImageLayout::eUndefined;
 
-	SetImageLayout(vk_buffer, &swapchain_image, 0, 1, VK_IMAGE_ASPECT_COLOR_BIT,
-	               VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+	SetImageLayout(vk_buffer, &swapchain_image, 0, 1, vk::ImageAspectFlagBits::eColor,
+	               vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal);
 
-	VkImageBlit region {};
-	region.srcSubresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+	vk::ImageBlit region {};
+	region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
 	region.srcSubresource.mipLevel       = 0;
 	region.srcSubresource.baseArrayLayer = 0;
 	region.srcSubresource.layerCount     = 1;
@@ -903,7 +923,7 @@ void UtilBlitPreparedImage(CommandBuffer* buffer, VulkanImage* src_image,
 	region.srcOffsets[1].x               = static_cast<int>(src_image->extent.width);
 	region.srcOffsets[1].y               = static_cast<int>(src_image->extent.height);
 	region.srcOffsets[1].z               = 1;
-	region.dstSubresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+	region.dstSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
 	region.dstSubresource.mipLevel       = 0;
 	region.dstSubresource.baseArrayLayer = 0;
 	region.dstSubresource.layerCount     = 1;
@@ -914,21 +934,21 @@ void UtilBlitPreparedImage(CommandBuffer* buffer, VulkanImage* src_image,
 	region.dstOffsets[1].y               = static_cast<int>(dst_swapchain->swapchain_extent.height);
 	region.dstOffsets[1].z               = 1;
 
-	vkCmdBlitImage(vk_buffer, src_image->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	               swapchain_image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
-	               VK_FILTER_LINEAR);
+	vk_buffer.blitImage(src_image->image, vk::ImageLayout::eTransferSrcOptimal,
+	                    swapchain_image.image, vk::ImageLayout::eTransferDstOptimal, 1, &region,
+	                    vk::Filter::eLinear);
 }
 
 void UtilClearColorImage(CommandBuffer* buffer, VulkanImage* image,
-                         const VkClearColorValue& color) {
-	auto* vk_buffer = buffer->GetPool()->buffers[buffer->GetIndex()];
-	SetImageLayout(vk_buffer, image, 0, 1, VK_IMAGE_ASPECT_COLOR_BIT, image->layout,
-	               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-	const VkImageSubresourceRange range {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-	vkCmdClearColorImage(vk_buffer, image->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1,
-	                     &range);
-	SetImageLayout(vk_buffer, image, 0, 1, VK_IMAGE_ASPECT_COLOR_BIT,
-	               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                         const vk::ClearColorValue& color) {
+	auto vk_buffer = buffer->GetPool()->buffers[buffer->GetIndex()];
+	SetImageLayout(vk_buffer, image, 0, 1, vk::ImageAspectFlagBits::eColor, image->layout,
+	               vk::ImageLayout::eTransferDstOptimal);
+	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	vk_buffer.clearColorImage(image->image, vk::ImageLayout::eTransferDstOptimal, &color, 1,
+	                          &range);
+	SetImageLayout(vk_buffer, image, 0, 1, vk::ImageAspectFlagBits::eColor,
+	               vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferSrcOptimal);
 }
 
 void VulkanCreateBuffer(GraphicContext* gctx, uint64_t size, VulkanBuffer* buffer) {
@@ -936,24 +956,27 @@ void VulkanCreateBuffer(GraphicContext* gctx, uint64_t size, VulkanBuffer* buffe
 
 	EXIT_IF(buffer->buffer != nullptr);
 
-	VkBufferCreateInfo buffer_info {};
-	buffer_info.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.sType       = vk::StructureType::eBufferCreateInfo;
 	buffer_info.size        = size;
 	buffer_info.usage       = buffer->usage;
-	buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	buffer_info.sharingMode = vk::SharingMode::eExclusive;
 
 	VmaAllocationCreateInfo alloc_info {};
-	alloc_info.requiredFlags = buffer->memory.property;
+	alloc_info.requiredFlags =
+	    static_cast<vk::MemoryPropertyFlags::MaskType>(buffer->memory.property);
 
-	const auto result =
-	    vmaCreateBuffer(gctx->allocator, &buffer_info, &alloc_info, &buffer->buffer,
-	                    &buffer->memory.allocation, &buffer->memory.allocation_info);
-	if (result != VK_SUCCESS) {
+	vk::Buffer::CType native_buffer = VK_NULL_HANDLE;
+	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
+	    gctx->allocator, static_cast<const vk::BufferCreateInfo::NativeType*>(buffer_info),
+	    &alloc_info, &native_buffer, &buffer->memory.allocation, &buffer->memory.allocation_info));
+	buffer->buffer                  = native_buffer;
+	if (result != vk::Result::eSuccess) {
 		VulkanLogMemoryBudget(gctx);
 	}
-	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
-	vkGetBufferMemoryRequirements(gctx->device, buffer->buffer, &buffer->memory.requirements);
+	gctx->device.getBufferMemoryRequirements(buffer->buffer, &buffer->memory.requirements);
 
 	buffer->memory.type      = buffer->memory.allocation_info.memoryType;
 	buffer->memory.memory    = buffer->memory.allocation_info.deviceMemory;
@@ -978,7 +1001,7 @@ void VulkanDeleteBuffer(GraphicContext* gctx, VulkanBuffer* buffer) {
 	buffer->memory.offset          = 0;
 }
 
-bool VulkanCreateImage(GraphicContext* gctx, const VkImageCreateInfo* image_info,
+bool VulkanCreateImage(GraphicContext* gctx, const vk::ImageCreateInfo* image_info,
                        VulkanImage* image, VulkanMemory* memory) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -986,17 +1009,20 @@ bool VulkanCreateImage(GraphicContext* gctx, const VkImageCreateInfo* image_info
 	EXIT_IF(memory->allocation != nullptr);
 
 	VmaAllocationCreateInfo alloc_info {};
-	alloc_info.requiredFlags = memory->property;
+	alloc_info.requiredFlags = static_cast<vk::MemoryPropertyFlags::MaskType>(memory->property);
 
-	const auto result = vmaCreateImage(gctx->allocator, image_info, &alloc_info, &image->image,
-	                                   &memory->allocation, &memory->allocation_info);
+	vk::Image::CType native_image = VK_NULL_HANDLE;
+	const auto       result       = static_cast<vk::Result>(vmaCreateImage(
+	    gctx->allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(*image_info),
+	    &alloc_info, &native_image, &memory->allocation, &memory->allocation_info));
+	image->image                  = native_image;
 
-	if (result != VK_SUCCESS) {
+	if (result != vk::Result::eSuccess) {
 		VulkanLogMemoryBudget(gctx);
 		return false;
 	}
 
-	vkGetImageMemoryRequirements(gctx->device, image->image, &memory->requirements);
+	gctx->device.getImageMemoryRequirements(image->image, &memory->requirements);
 
 	memory->type      = memory->allocation_info.memoryType;
 	memory->memory    = memory->allocation_info.deviceMemory;
@@ -1023,18 +1049,19 @@ void VulkanDeleteImage(GraphicContext* gctx, VulkanImage* image, VulkanMemory* m
 }
 
 void UtilFillImage(GraphicContext* ctx, VulkanImage* dst_image, const void* src_data, uint64_t size,
-                   uint32_t src_pitch, uint64_t dst_layout) {
+                   uint32_t src_pitch, vk::ImageLayout dst_layout) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(size == 0);
 
 	GetStagingBuffer(StagingBufferType::Texture)
-	    ->UploadToImage(ctx, dst_image, src_data, size, src_pitch, VK_IMAGE_ASPECT_COLOR_BIT,
-	                    VK_IMAGE_LAYOUT_UNDEFINED, static_cast<VkImageLayout>(dst_layout));
+	    ->UploadToImage(ctx, dst_image, src_data, size, src_pitch, vk::ImageAspectFlagBits::eColor,
+	                    vk::ImageLayout::eUndefined, dst_layout);
 }
 
 void UtilFillBuffer(GraphicContext* ctx, void* dst_data, uint64_t size, uint32_t dst_pitch,
-                    VulkanImage* src_image, uint64_t src_layout, VkImageAspectFlags aspect) {
+                    VulkanImage* src_image, vk::ImageLayout src_layout,
+                    vk::ImageAspectFlags aspect) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(size == 0);
@@ -1045,7 +1072,7 @@ void UtilFillBuffer(GraphicContext* ctx, void* dst_data, uint64_t size, uint32_t
 
 void UtilFillBuffer(GraphicContext* ctx, void* dst_data, uint64_t size,
                     std::span<const ImageBufferCopy> regions, VulkanImage* src_image,
-                    uint64_t src_layout) {
+                    vk::ImageLayout src_layout) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(size == 0 || regions.empty());
 	GetStagingBuffer(StagingBufferType::ReadBack)
@@ -1053,14 +1080,14 @@ void UtilFillBuffer(GraphicContext* ctx, void* dst_data, uint64_t size,
 }
 
 void UtilSetImageLayoutOptimal(VulkanImage* image) {
-	ExecuteImmediateUtilCommands([&](CommandBuffer*, VkCommandBuffer vk_command) {
-		SetImageLayout(vk_command, image, 0, VK_REMAINING_MIP_LEVELS, VK_IMAGE_ASPECT_COLOR_BIT,
-		               image->layout, VK_IMAGE_LAYOUT_GENERAL);
+	ExecuteImmediateUtilCommands([&](CommandBuffer*, vk::CommandBuffer vk_command) {
+		SetImageLayout(vk_command, image, 0, VK_REMAINING_MIP_LEVELS,
+		               vk::ImageAspectFlagBits::eColor, image->layout, vk::ImageLayout::eGeneral);
 	});
 }
 
 void UtilFillImage(GraphicContext* ctx, VulkanImage* image, const void* src_data, uint64_t size,
-                   std::span<const BufferImageCopy> regions, uint64_t dst_layout) {
+                   std::span<const BufferImageCopy> regions, vk::ImageLayout dst_layout) {
 	EXIT_IF(size == 0 || regions.empty());
 
 	GetStagingBuffer(StagingBufferType::Texture)
@@ -1068,18 +1095,18 @@ void UtilFillImage(GraphicContext* ctx, VulkanImage* image, const void* src_data
 }
 
 void UtilFillImage(GraphicContext* ctx, std::span<const ImageImageCopy> regions,
-                   VulkanImage* dst_image, uint64_t dst_layout) {
-	ExecuteImmediateUtilCommands([&](CommandBuffer* command, VkCommandBuffer) {
+                   VulkanImage* dst_image, vk::ImageLayout dst_layout) {
+	ExecuteImmediateUtilCommands([&](CommandBuffer* command, vk::CommandBuffer) {
 		UtilImageToImage(command, regions, dst_image, dst_layout);
 	});
 }
 
 void UtilFillImage(GraphicContext* ctx, DepthStencilVulkanImage* image, const void* src_data,
-                   uint64_t size, uint32_t src_pitch, VkImageAspectFlags aspect) {
+                   uint64_t size, uint32_t src_pitch, vk::ImageAspectFlags aspect) {
 	EXIT_IF(size == 0);
 	GetStagingBuffer(StagingBufferType::Texture)
 	    ->UploadToImage(ctx, image, src_data, size, src_pitch, aspect, image->layout,
-	                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+	                    vk::ImageLayout::eDepthStencilAttachmentOptimal);
 }
 
 void UtilUploadBuffer(GraphicContext* ctx, StagingBufferType type, VulkanBuffer* dst_buffer,
@@ -1103,20 +1130,22 @@ void UtilReleaseCachedResources(GraphicContext* ctx) {
 void UtilCopyBuffer(VulkanBuffer* src_buffer, VulkanBuffer* dst_buffer, uint64_t size) {
 	EXIT_IF(size == 0 || size > src_buffer->buffer_size || size > dst_buffer->buffer_size);
 
-	ExecuteImmediateUtilCommands([&](CommandBuffer*, VkCommandBuffer vk_command) {
-		SetBufferMemoryBarrier(vk_command, src_buffer->buffer, 0, size, VK_ACCESS_MEMORY_WRITE_BIT,
-		                       VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-		                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+	ExecuteImmediateUtilCommands([&](CommandBuffer*, vk::CommandBuffer vk_command) {
+		SetBufferMemoryBarrier(vk_command, src_buffer->buffer, 0, size,
+		                       vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eTransferRead,
+		                       vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer);
 		SetBufferMemoryBarrier(vk_command, dst_buffer->buffer, 0, size,
-		                       VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-		                       VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-		                       VK_PIPELINE_STAGE_TRANSFER_BIT);
-		const VkBufferCopy copy_region {.srcOffset = 0, .dstOffset = 0, .size = size};
-		vkCmdCopyBuffer(vk_command, src_buffer->buffer, dst_buffer->buffer, 1, &copy_region);
-		SetBufferMemoryBarrier(vk_command, dst_buffer->buffer, 0, size,
-		                       VK_ACCESS_TRANSFER_WRITE_BIT,
-		                       VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-		                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+		                       vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                       vk::AccessFlagBits::eTransferWrite,
+		                       vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer);
+		const vk::BufferCopy copy_region {.srcOffset = 0, .dstOffset = 0, .size = size};
+		vk_command.copyBuffer(src_buffer->buffer, dst_buffer->buffer, 1, &copy_region);
+		SetBufferMemoryBarrier(
+		    vk_command, dst_buffer->buffer, 0, size, vk::AccessFlagBits::eTransferWrite,
+		    vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands);
 	});
 }
 
@@ -1132,7 +1161,7 @@ void UtilDownloadBuffer(GraphicContext* ctx, VulkanBuffer* src_buffer, uint64_t 
 	}
 	EXIT_IF(ctx->queues[GraphicContext::QUEUE_GFX].family != family);
 
-	if ((src_buffer->memory.property & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+	if (src_buffer->memory.property & vk::MemoryPropertyFlagBits::eHostVisible) {
 		void* mapped = nullptr;
 		VulkanMapMemory(ctx, &src_buffer->memory, &mapped);
 		std::memcpy(dst_data, static_cast<const uint8_t*>(mapped) + src_offset, size);
@@ -1141,21 +1170,23 @@ void UtilDownloadBuffer(GraphicContext* ctx, VulkanBuffer* src_buffer, uint64_t 
 	}
 
 	VulkanBuffer readback {};
-	readback.usage           = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-	readback.memory.property = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-	                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-	                           VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+	readback.usage           = vk::BufferUsageFlagBits::eTransferDst;
+	readback.memory.property = vk::MemoryPropertyFlagBits::eHostVisible |
+	                           vk::MemoryPropertyFlagBits::eHostCoherent |
+	                           vk::MemoryPropertyFlagBits::eHostCached;
 	VulkanCreateBuffer(ctx, size, &readback);
 
-	ExecuteImmediateUtilCommands([&](CommandBuffer*, VkCommandBuffer vk_command) {
+	ExecuteImmediateUtilCommands([&](CommandBuffer*, vk::CommandBuffer vk_command) {
 		SetBufferMemoryBarrier(vk_command, src_buffer->buffer, src_offset, size,
-		                       VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-		                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-		const VkBufferCopy copy {.srcOffset = src_offset, .dstOffset = 0, .size = size};
-		vkCmdCopyBuffer(vk_command, src_buffer->buffer, readback.buffer, 1, &copy);
-		SetBufferMemoryBarrier(vk_command, readback.buffer, 0, size, VK_ACCESS_TRANSFER_WRITE_BIT,
-		                       VK_ACCESS_HOST_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                       VK_PIPELINE_STAGE_HOST_BIT);
+		                       vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eTransferRead,
+		                       vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer);
+		const vk::BufferCopy copy {.srcOffset = src_offset, .dstOffset = 0, .size = size};
+		vk_command.copyBuffer(src_buffer->buffer, readback.buffer, 1, &copy);
+		SetBufferMemoryBarrier(vk_command, readback.buffer, 0, size,
+		                       vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead,
+		                       vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eHost);
 	});
 
 	void* mapped = nullptr;

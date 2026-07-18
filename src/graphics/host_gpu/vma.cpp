@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/vulkanCommon.h"
+
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wnullability-completeness"
@@ -24,7 +26,6 @@
 #include <fmt/format.h>
 #include <string>
 #include <vector>
-#include <vulkan/vk_enum_string_helper.h>
 
 namespace Libs::Graphics {
 
@@ -66,16 +67,21 @@ bool VulkanCreateAllocator(GraphicContext* ctx) {
 	EXIT_IF(ctx == nullptr || ctx->instance == nullptr || ctx->physical_device == nullptr ||
 	        ctx->device == nullptr || ctx->allocator != nullptr);
 
+	VmaVulkanFunctions functions {};
+	functions.vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr;
+	functions.vkGetDeviceProcAddr   = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+
 	VmaAllocatorCreateInfo info {};
 	info.instance         = ctx->instance;
 	info.physicalDevice   = ctx->physical_device;
 	info.device           = ctx->device;
+	info.pVulkanFunctions = &functions;
 	info.vulkanApiVersion = VULKAN_TARGET_API_VERSION;
 	info.flags = ctx->memory_budget_ext_enabled ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0;
 
-	const auto result = vmaCreateAllocator(&info, &ctx->allocator);
-	if (result != VK_SUCCESS) {
-		LOGF("vmaCreateAllocator failed: %s\n", string_VkResult(result));
+	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &ctx->allocator));
+	if (result != vk::Result::eSuccess) {
+		LOGF("vmaCreateAllocator failed: %s\n", VulkanToString(result).c_str());
 		return false;
 	}
 	return true;
@@ -127,11 +133,13 @@ bool VulkanAllocate(GraphicContext* ctx, VulkanMemory* memory) {
 	}
 
 	VmaAllocationCreateInfo info {};
-	info.requiredFlags = memory->property;
+	info.requiredFlags = static_cast<vk::MemoryPropertyFlags::MaskType>(memory->property);
 	memory->unique_id  = VulkanNextMemoryUniqueId();
-	const auto result  = vmaAllocateMemory(ctx->allocator, &memory->requirements, &info,
-	                                       &memory->allocation, &memory->allocation_info);
-	if (result == VK_SUCCESS) {
+	const auto result  = static_cast<vk::Result>(vmaAllocateMemory(
+	    ctx->allocator,
+	    static_cast<const vk::MemoryRequirements::NativeType*>(memory->requirements), &info,
+	    &memory->allocation, &memory->allocation_info));
+	if (result == vk::Result::eSuccess) {
 		memory->type   = memory->allocation_info.memoryType;
 		memory->memory = memory->allocation_info.deviceMemory;
 		memory->offset = memory->allocation_info.offset;
@@ -146,7 +154,7 @@ bool VulkanAllocate(GraphicContext* ctx, VulkanMemory* memory) {
 		                            g_memory_stats.allocated[i].load()));
 	}
 	EXIT("size = %" PRIu64 ", index = %u, error: %s:%s\n", memory->requirements.size, index,
-	     string_VkResult(result), Common::Concat(stats, '\n').c_str());
+	     VulkanToString(result).c_str(), Common::Concat(stats, '\n').c_str());
 	return false;
 }
 
@@ -166,7 +174,8 @@ void VulkanMapMemory(GraphicContext* ctx, VulkanMemory* memory, void** data) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(ctx == nullptr || memory == nullptr || data == nullptr || ctx->allocator == nullptr ||
 	        memory->allocation == nullptr);
-	EXIT_NOT_IMPLEMENTED(vmaMapMemory(ctx->allocator, memory->allocation, data) != VK_SUCCESS);
+	EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(vmaMapMemory(ctx->allocator, memory->allocation,
+	                                                          data)) != vk::Result::eSuccess);
 }
 
 void VulkanUnmapMemory(GraphicContext* ctx, VulkanMemory* memory) {
@@ -180,16 +189,18 @@ void VulkanBindImageMemory(GraphicContext* ctx, VulkanImage* image, VulkanMemory
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(ctx == nullptr || image == nullptr || memory == nullptr || ctx->allocator == nullptr ||
 	        memory->allocation == nullptr);
-	EXIT_NOT_IMPLEMENTED(vmaBindImageMemory(ctx->allocator, memory->allocation, image->image) !=
-	                     VK_SUCCESS);
+	EXIT_NOT_IMPLEMENTED(
+	    static_cast<vk::Result>(vmaBindImageMemory(ctx->allocator, memory->allocation,
+	                                               image->image)) != vk::Result::eSuccess);
 }
 
 void VulkanBindBufferMemory(GraphicContext* ctx, VulkanBuffer* buffer, VulkanMemory* memory) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(ctx == nullptr || buffer == nullptr || memory == nullptr || ctx->allocator == nullptr ||
 	        memory->allocation == nullptr);
-	EXIT_NOT_IMPLEMENTED(vmaBindBufferMemory(ctx->allocator, memory->allocation, buffer->buffer) !=
-	                     VK_SUCCESS);
+	EXIT_NOT_IMPLEMENTED(
+	    static_cast<vk::Result>(vmaBindBufferMemory(ctx->allocator, memory->allocation,
+	                                                buffer->buffer)) != vk::Result::eSuccess);
 }
 
 } // namespace Libs::Graphics

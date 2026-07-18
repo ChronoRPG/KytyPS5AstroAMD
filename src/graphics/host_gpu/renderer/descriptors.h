@@ -1,20 +1,20 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DESCRIPTORS_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DESCRIPTORS_H_
 
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <cstdint>
-#include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
 
 struct VulkanImage;
 
 struct TargetTextureViewInfo {
-	VkImageViewType type        = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
-	uint32_t        base_layer  = 0;
-	uint32_t        layer_count = 0;
+	vk::ImageViewType type        = static_cast<vk::ImageViewType>(VK_IMAGE_VIEW_TYPE_MAX_ENUM);
+	uint32_t          base_layer  = 0;
+	uint32_t          layer_count = 0;
 };
 
 [[nodiscard]] TargetTextureViewInfo

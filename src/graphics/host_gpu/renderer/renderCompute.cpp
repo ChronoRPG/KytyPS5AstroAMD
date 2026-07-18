@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/shaderSubgroup.h"
 #include "graphics/host_gpu/utils.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ShaderIR.h"
 #include "graphics/shader/shader.h"
@@ -38,9 +39,6 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
-#include <vulkan/vk_enum_string_helper.h>
-
-// IWYU pragma: no_forward_declare VkImageView_T
 
 namespace Libs::Graphics {
 static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
@@ -530,20 +528,20 @@ void RenderDispatchDirect(uint64_t submit_id, CommandBuffer* buffer, HW::Context
 
 	for (;;) {
 		const auto recording_generation = buffer->GetRecordingGeneration();
-		auto*      vk_buffer            = buffer->GetPool()->buffers[buffer->GetIndex()];
+		auto       vk_buffer            = buffer->GetPool()->buffers[buffer->GetIndex()];
 		auto*      pipeline             = g_render_ctx->GetPipelineCache()->CreateComputePipeline(
 		    &input_info, &sh_ctx->GetCs(), cs_shader);
 
-		vkCmdBindPipeline(vk_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
 
 		const auto address_writes = BindDescriptors(
-		    submit_id, buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline_layout,
-		    input_info.stage, VK_SHADER_STAGE_COMPUTE_BIT, DescriptorCache::Stage::Compute);
+		    submit_id, buffer, vk::PipelineBindPoint::eCompute, pipeline->pipeline_layout,
+		    input_info.stage, vk::ShaderStageFlagBits::eCompute, DescriptorCache::Stage::Compute);
 		if (buffer->GetRecordingGeneration() != recording_generation) {
 			continue;
 		}
 
-		vkCmdDispatch(vk_buffer, thread_group_x, thread_group_y, thread_group_z);
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
 		bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 		has_storage_writes      = MarkShaderAddressWrites(address_writes) || has_storage_writes;
@@ -557,7 +555,7 @@ void RenderDispatchDirect(uint64_t submit_id, CommandBuffer* buffer, HW::Context
 		        }) ||
 		    has_storage_writes;
 		if (has_storage_writes) {
-			ShaderWriteBarrier(vk_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+			ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
 		break;
 	}
