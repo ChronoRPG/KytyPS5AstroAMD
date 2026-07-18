@@ -567,8 +567,8 @@ NativeTexture(uint64_t submit_id, CommandBuffer* command_buffer,
 	                          descriptor.MsaaDepth();
 	if (image == nullptr) {
 		if (check_depth) {
-			image =
-			    g_render_ctx->GetTextureCache()->FindDepthTargetByRange(address, size.size, true);
+			image = g_render_ctx->GetTextureCache()->FindDepthTargetByRange(
+			    command_buffer, address, size.size, true);
 		} else {
 			image = g_render_ctx->GetTextureCache()->FindRenderTargetByRange(command_buffer,
 			                                                                 address, size.size);
@@ -699,7 +699,7 @@ NativeTexture(uint64_t submit_id, CommandBuffer* command_buffer,
 	}
 	if (image == nullptr) {
 		auto*      texture_cache = g_render_ctx->GetTextureCache();
-		const bool metadata_read = texture_cache->HasMetaOverlap(address, size.size);
+		const bool metadata_read = texture_cache->QueryRegion(address, size.size).metadata_pages;
 		if (storage && metadata_read) {
 			EXIT("storage texture overlaps surface metadata\n");
 		}

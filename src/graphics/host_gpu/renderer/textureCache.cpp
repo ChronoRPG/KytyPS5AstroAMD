@@ -11,7 +11,7 @@
 #include "graphics/host_gpu/objects/label.h"
 #include "graphics/host_gpu/objects/textureCommon.h"
 #include "graphics/host_gpu/renderer/bufferCache.h"
-#include "graphics/host_gpu/renderer/framebufferCache.h"
+#include "graphics/host_gpu/renderer/dummyTextureCache.h"
 #include "graphics/host_gpu/renderer/image.h"
 #include "graphics/host_gpu/renderer/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -19,7 +19,6 @@
 #include "graphics/host_gpu/renderer/renderTargetBarriers.h"
 #include "graphics/host_gpu/renderer/resourceMutex.h"
 #include "graphics/host_gpu/utils.h"
-#include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 
 #include <xxhash.h>
@@ -124,20 +123,16 @@ struct TextureCache::CachedImage {
 		switch (kind) {
 			case Kind::Texture:
 			case Kind::StorageTexture:
-				TextureCache::DeleteGpuTexture(ctx, static_cast<GpuTextureVulkanImage*>(image),
-				                               &memory);
+				ImageOps::Destroy(ctx, static_cast<GpuTextureVulkanImage*>(image), &memory);
 				break;
 			case Kind::RenderTarget:
-				TextureCache::DeleteRenderTexture(
-				    ctx, static_cast<RenderTextureVulkanImage*>(image), &memory);
+				ImageOps::Destroy(ctx, static_cast<RenderTextureVulkanImage*>(image), &memory);
 				break;
 			case Kind::DepthTarget:
-				TextureCache::DeleteDepthStencil(ctx, static_cast<DepthStencilVulkanImage*>(image),
-				                                 &memory);
+				ImageOps::Destroy(ctx, static_cast<DepthStencilVulkanImage*>(image), &memory);
 				break;
 			case Kind::VideoOut:
-				TextureCache::DeleteVideoOut(ctx, static_cast<VideoOutVulkanImage*>(image),
-				                             &memory);
+				ImageOps::Destroy(ctx, static_cast<VideoOutVulkanImage*>(image), &memory);
 				break;
 		}
 		image = nullptr;
@@ -246,6 +241,21 @@ void TextureCache::UnregisterImageLocked(CachedImage& image, bool release_tracki
 		}
 	}
 	image.registered = false;
+}
+
+VulkanImage* TextureCache::PublishImage(CommandBuffer* command,
+                                        std::shared_ptr<CachedImage> image) {
+	if (command == nullptr || image == nullptr || image->image == nullptr || image->registered) {
+		EXIT("TextureCache: invalid image publication, command=%p record=%p image=%p registered=%d\n",
+		     static_cast<const void*>(command), static_cast<const void*>(image.get()),
+		     image != nullptr ? static_cast<const void*>(image->image) : nullptr,
+		     image != nullptr && image->registered);
+	}
+	auto* result = image->image;
+	command->RetainResourceUntilFence(image);
+	m_images.push_back(std::move(image));
+	RegisterImageLocked(*m_images.back());
+	return result;
 }
 
 std::vector<TextureCache::CachedImage*>
@@ -829,406 +839,6 @@ void AppendLayerCopies(std::vector<ImageImageCopy>& regions, VulkanImage* source
 	}
 }
 
-VkImageAspectFlags DepthAspectMask(VkFormat format) {
-	return VK_IMAGE_ASPECT_DEPTH_BIT |
-	       (format == VK_FORMAT_D16_UNORM_S8_UINT || format == VK_FORMAT_D24_UNORM_S8_UINT ||
-	                format == VK_FORMAT_D32_SFLOAT_S8_UINT
-	            ? VK_IMAGE_ASPECT_STENCIL_BIT
-	            : 0u);
-}
-
-TextureImageCreateParams MakeImageParams(const ImageInfo& info, bool storage) {
-	TextureImageCreateParams params {};
-	params.fmt        = info.format;
-	params.width      = info.width;
-	params.height     = info.height;
-	params.base_level = SelectImageBackingBaseLevel(storage, info.base_level);
-	params.levels     = info.levels;
-	params.depth      = info.depth;
-	params.type       = info.type;
-	// Storage image views use identity component mapping. The guest storage write mapping is
-	// validated before this point and intentionally does not become a Vulkan view swizzle.
-	params.swizzle               = storage ? DstSel(4, 5, 6, 7) : info.swizzle;
-	params.format_usage          = TextureFormatUsage::Sampled | TextureFormatUsage::Storage;
-	params.required_format_usage = storage
-	                                   ? TextureFormatUsage::Sampled | TextureFormatUsage::Storage
-	                                   : TextureFormatUsage::Sampled;
-	params.view_usage      = storage ? TextureFormatUsage::Sampled | TextureFormatUsage::Storage
-	                                 : TextureFormatUsage::Sampled;
-	params.image_layout    = TextureUploadDestination::MipLevels;
-	params.allow_cube_view = !storage;
-	params.compatible_format_views =
-	    storage &&
-	    (IsRgba8SrgbViewFormat(TextureGetFormat(info.format, params.format_usage)) ||
-	     info.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) ||
-	     info.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float));
-	params.owner = storage ? "StorageTextureCache" : "TextureCache";
-	return params;
-}
-
-bool FormatSupportsStorage(GraphicContext* ctx, VkFormat format) {
-	const auto properties = ctx->GetFormatProperties(format);
-	return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
-}
-
-bool RenderTargetSupportsStorage(GraphicContext* ctx, VkFormat format, VkImageCreateFlags flags) {
-	const auto compatible = SrgbStorageViewFormat(format);
-	const auto required_flags =
-	    VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-	const bool compatible_views = (flags & required_flags) == required_flags;
-	return FormatSupportsStorage(ctx, format) ||
-	       (compatible_views && compatible != VK_FORMAT_UNDEFINED &&
-	        FormatSupportsStorage(ctx, compatible));
-}
-
-VkImageCreateFlags RenderTargetCreateFlags(VkFormat format) {
-	const bool compatible_format_view =
-	    IsRgba8SrgbViewFormat(format) || BgraToRgbaSampledViewFormat(format) != VK_FORMAT_UNDEFINED ||
-	    format == VK_FORMAT_R8G8B8A8_UINT || format == VK_FORMAT_R16G16B16A16_SFLOAT ||
-	    format == VK_FORMAT_R16G16B16A16_UINT;
-	return compatible_format_view
-	           ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT
-	           : VkImageCreateFlags {0};
-}
-
-VkImageUsageFlags RenderTargetUsage(GraphicContext* ctx, VkFormat format,
-                                    VkImageCreateFlags flags) {
-	auto usage = static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
-	             static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_TRANSFER_SRC_BIT) |
-	             static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_TRANSFER_DST_BIT) |
-	             static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_SAMPLED_BIT);
-	if (RenderTargetSupportsStorage(ctx, format, flags)) {
-		usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-	}
-	VkImageFormatProperties properties {};
-	if (ctx->GetImageFormatProperties(format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage,
-	                                  flags, &properties) != VK_SUCCESS) {
-		EXIT("TextureCache: render-target format does not support required usage, format=%d "
-		     "usage=0x%x\n",
-		     static_cast<int>(format), usage);
-	}
-	return usage;
-}
-
-void CreateRenderTargetView(GraphicContext* ctx, VulkanImage* image, int index,
-                            VkComponentSwizzle r, VkComponentSwizzle g, VkComponentSwizzle b,
-                            VkComponentSwizzle a, VkImageViewType type = VK_IMAGE_VIEW_TYPE_2D,
-                            VkFormat          view_format = VK_FORMAT_UNDEFINED,
-                            VkImageUsageFlags view_usage = 0, uint32_t level_count = 0) {
-	const auto layer_count = type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? image->layers : 1u;
-	UtilCreateImageView(ctx, image, index, type, VK_IMAGE_ASPECT_COLOR_BIT, {r, g, b, a}, 0, 0,
-	                    layer_count, level_count == 0 ? image->mip_levels : level_count,
-	                    view_format, view_usage);
-}
-
-void CreateRenderAttachmentViews(GraphicContext* ctx, RenderTextureVulkanImage* image) {
-	for (uint32_t level = 0; level < image->mip_levels; level++) {
-		VkImageViewCreateInfo create {};
-		create.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-		create.image      = image->image;
-		create.viewType   = VK_IMAGE_VIEW_TYPE_2D;
-		create.format     = image->format;
-		create.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-		                     VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-		create.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
-		create.subresourceRange.baseMipLevel   = level;
-		create.subresourceRange.levelCount     = 1;
-		create.subresourceRange.baseArrayLayer = 0;
-		create.subresourceRange.layerCount     = 1;
-		const auto result =
-		    vkCreateImageView(ctx->device, &create, nullptr, &image->render_view[level]);
-		if (result != VK_SUCCESS || image->render_view[level] == nullptr) {
-			EXIT("TextureCache: failed to create render-target mip view, result=%d level=%u\n",
-			     static_cast<int>(result), level);
-		}
-	}
-}
-
-void CreateRenderTargetViews(GraphicContext* ctx, RenderTextureVulkanImage* image) {
-	CreateRenderTargetView(ctx, image, VulkanImage::VIEW_DEFAULT, VK_COMPONENT_SWIZZLE_IDENTITY,
-	                       VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-	                       VK_COMPONENT_SWIZZLE_IDENTITY);
-	if (image->layers > 1) {
-		CreateRenderTargetView(ctx, image, VulkanImage::VIEW_DEFAULT_ARRAY,
-		                       VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-		                       VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-		                       VK_IMAGE_VIEW_TYPE_2D_ARRAY);
-	}
-	if (FormatSupportsStorage(ctx, image->format)) {
-		CreateRenderTargetView(ctx, image, VulkanImage::VIEW_STORAGE, VK_COMPONENT_SWIZZLE_IDENTITY,
-		                       VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-		                       VK_COMPONENT_SWIZZLE_IDENTITY, VK_IMAGE_VIEW_TYPE_2D,
-		                       VK_FORMAT_UNDEFINED, 0, 1);
-		if (image->layers > 1) {
-			CreateRenderTargetView(ctx, image, VulkanImage::VIEW_STORAGE_ARRAY,
-			                       VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-			                       VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-			                       VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_FORMAT_UNDEFINED, 0, 1);
-		}
-	}
-	CreateRenderAttachmentViews(ctx, image);
-}
-
-void CreateVideoOutViews(GraphicContext* ctx, VideoOutVulkanImage* image) {
-	CreateRenderTargetView(ctx, image, VulkanImage::VIEW_DEFAULT, VK_COMPONENT_SWIZZLE_IDENTITY,
-	                       VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-	                       VK_COMPONENT_SWIZZLE_IDENTITY);
-	if ((image->format == VK_FORMAT_R8G8B8A8_SRGB || image->format == VK_FORMAT_B8G8R8A8_SRGB) &&
-	    FormatSupportsStorage(ctx, VK_FORMAT_R8G8B8A8_UINT)) {
-		CreateRenderTargetView(ctx, image, VulkanImage::VIEW_STORAGE, VK_COMPONENT_SWIZZLE_IDENTITY,
-		                       VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-		                       VK_COMPONENT_SWIZZLE_IDENTITY, VK_IMAGE_VIEW_TYPE_2D,
-		                       VK_FORMAT_R8G8B8A8_UINT, VK_IMAGE_USAGE_STORAGE_BIT, 1);
-	}
-}
-
-[[nodiscard]] uint32_t RenderTargetTransferFormat(uint32_t bytes_per_element) {
-	switch (bytes_per_element) {
-		case 1: return Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm);
-		case 2: return Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm);
-		case 4: return Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
-		case 8: return Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16_16_16Float);
-		case 16: return Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32Float);
-		default:
-			EXIT("TextureCache: unsupported render-target element size: %u\n", bytes_per_element);
-	}
-}
-
-void UploadRenderTargetLayers(GraphicContext* ctx, RenderTextureVulkanImage* image,
-                              const RenderTargetInfo& info, uint32_t base_layer,
-                              uint32_t layer_count, bool refresh) {
-	if (info.layers == 0 || info.size % info.layers != 0 || layer_count == 0 ||
-	    base_layer >= info.layers || layer_count > info.layers - base_layer || image == nullptr ||
-	    base_layer >= image->layers || layer_count > image->layers - base_layer) {
-		EXIT("TextureCache: invalid render-target layer upload, base=%u count=%u "
-		     "info_layers=%u image_layers=%u size=0x%016" PRIx64 "\n",
-		     base_layer, layer_count, info.layers, image != nullptr ? image->layers : 0, info.size);
-	}
-	if (refresh) {
-		VulkanDeviceWaitIdle(ctx);
-	}
-	const auto slice_size  = info.size / info.layers;
-	const auto upload_size = slice_size * layer_count;
-	const bool standard64  = IsSupportedStandard64RenderTarget(info);
-	if (standard64 || info.levels > 1 || info.layers > 1) {
-		const auto format = RenderTargetTransferFormat(info.bytes_per_element);
-		auto layout = TextureCalcUploadLayout(format, info.width, info.height, info.levels,
-		                                      layer_count, info.pitch, info.tile_mode, upload_size,
-		                                      false, false, false, "TextureCache render target");
-		const bool render_target_tiled =
-		    info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
-		if (!standard64 && ((render_target_tiled && !layout.fmt_tiled_render_target) ||
-		                    layout.pitch != info.pitch)) {
-			EXIT("TextureCache: unsupported render-target mip upload layout, pitch=%u/%u tile=%u\n",
-			     info.pitch, layout.pitch, info.tile_mode);
-		}
-		auto regions = TextureBuildUploadRegions(
-		    layout, info.format, info.width, info.height, layer_count, info.levels, true, false,
-		    TextureUploadDestination::MipLevels, TextureUploadSliceLayout::MipChainPerSlice);
-		for (auto& region: regions) {
-			region.dst_layer += base_layer;
-		}
-		const auto source_address = info.address + slice_size * base_layer;
-		TextureUploadGuestImage(
-		    ctx, image, reinterpret_cast<const void*>(source_address), upload_size, regions, layout,
-		    format, info.width, info.height, layer_count, info.levels,
-		    TextureUploadSliceLayout::MipChainPerSlice, "TextureCache render target",
-		    static_cast<uint64_t>(VK_IMAGE_LAYOUT_GENERAL));
-		return;
-	}
-	if (info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
-	    UtilBufferIsTiled(info.address, slice_size)) {
-		UtilScratchBuffer scratch(slice_size);
-		TileConvertTiledToLinearRenderTarget(
-		    scratch.Data(), reinterpret_cast<const void*>(info.address), info.width, info.height,
-		    info.pitch, info.bytes_per_element, slice_size);
-		UtilFillImage(ctx, image, scratch.Data(), slice_size, info.pitch,
-		              static_cast<uint64_t>(VK_IMAGE_LAYOUT_GENERAL));
-	} else {
-		UtilFillImage(ctx, image, reinterpret_cast<const void*>(info.address), slice_size,
-		              info.pitch, static_cast<uint64_t>(VK_IMAGE_LAYOUT_GENERAL));
-	}
-}
-
-void UploadRenderTarget(GraphicContext* ctx, RenderTextureVulkanImage* image,
-                        const RenderTargetInfo& info, bool refresh) {
-	UploadRenderTargetLayers(ctx, image, info, 0, info.layers, refresh);
-}
-
-RenderTextureVulkanImage* CreateRenderTarget(GraphicContext* ctx, const RenderTargetInfo& info,
-                                             VulkanMemory* memory) {
-	auto* image          = new RenderTextureVulkanImage;
-	image->extent.width  = info.width;
-	image->extent.height = info.height;
-	image->format        = info.format;
-	image->mip_levels    = info.levels;
-	image->layers        = info.layers;
-	image->layout        = VK_IMAGE_LAYOUT_UNDEFINED;
-	UtilResetImageViews(image);
-	VkImageCreateInfo create {};
-	create.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-	create.flags         = RenderTargetCreateFlags(info.format);
-	create.imageType     = VK_IMAGE_TYPE_2D;
-	create.extent        = {info.width, info.height, 1};
-	create.mipLevels     = info.levels;
-	create.arrayLayers   = info.layers;
-	create.format        = info.format;
-	create.tiling        = VK_IMAGE_TILING_OPTIMAL;
-	create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	create.usage         = RenderTargetUsage(ctx, info.format, create.flags);
-	create.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
-	create.samples       = VK_SAMPLE_COUNT_1_BIT;
-	memory->property     = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-	if (!VulkanCreateImage(ctx, &create, image, memory)) {
-		EXIT("TextureCache: failed to create render target, addr=0x%016" PRIx64
-		     " extent=%ux%u format=%d\n",
-		     info.address, info.width, info.height, static_cast<int>(info.format));
-	}
-	image->memory = *memory;
-	CreateRenderTargetViews(ctx, image);
-	return image;
-}
-
-void CreateDepthViews(GraphicContext* ctx, DepthStencilVulkanImage* image) {
-	UtilCreateImageView(ctx, image, VulkanImage::VIEW_DEFAULT, VK_IMAGE_VIEW_TYPE_2D,
-	                    DepthAspectMask(image->format),
-	                    {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-	                     VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
-	                    0, 0, 1, 1);
-}
-
-DepthStencilVulkanImage* CreateDepthTarget(GraphicContext* ctx, const DepthTargetInfo& info,
-                                           VulkanMemory* memory) {
-	VkImageCreateInfo create {};
-	create.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-	create.imageType     = VK_IMAGE_TYPE_2D;
-	create.extent        = {info.width, info.height, 1};
-	create.mipLevels     = 1;
-	create.arrayLayers   = info.layers;
-	create.format        = info.format;
-	create.tiling        = VK_IMAGE_TILING_OPTIMAL;
-	create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	create.usage         = DepthTargetImageUsage();
-	create.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
-	create.samples       = VK_SAMPLE_COUNT_1_BIT;
-	VkImageFormatProperties properties {};
-	if (ctx->GetImageFormatProperties(info.format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
-	                                  create.usage, 0, &properties) != VK_SUCCESS) {
-		EXIT("TextureCache: depth format does not support required usage, format=%d usage=0x%x\n",
-		     static_cast<int>(info.format), create.usage);
-	}
-	auto* image          = new DepthStencilVulkanImage;
-	image->extent.width  = info.width;
-	image->extent.height = info.height;
-	image->guest_pitch   = info.pitch;
-	image->layers        = info.layers;
-	image->format        = info.format;
-	image->layout        = VK_IMAGE_LAYOUT_UNDEFINED;
-	image->compressed    = false;
-	UtilResetImageViews(image);
-	memory->property = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-	if (!VulkanCreateImage(ctx, &create, image, memory)) {
-		EXIT("TextureCache: failed to create depth target, addr=0x%016" PRIx64
-		     " extent=%ux%u format=%d\n",
-		     info.address, info.width, info.height, static_cast<int>(info.format));
-	}
-	image->memory = *memory;
-	CreateDepthViews(ctx, image);
-	return image;
-}
-
-void ValidateVideoOutInfo(GraphicContext* ctx, const VideoOutInfo& info) {
-	const auto compression =
-	    ClassifyVideoOutCompression(info.compression != VideoOutCompression::Uncompressed,
-	                                info.metadata_address, info.dcc_control, 0);
-	const bool metadata_invalid = compression == VideoOutCompression::Dcc256_64_64 &&
-	                              (info.metadata_address >= TRACKER_ADDRESS_SIZE ||
-	                               (info.metadata_address >= info.address &&
-	                                info.metadata_address < info.address + info.size));
-	if (ctx == nullptr || info.address == 0 || info.size == 0 ||
-	    info.address >= TRACKER_ADDRESS_SIZE || info.size > TRACKER_ADDRESS_SIZE - info.address ||
-	    (info.address & 0xffffu) != 0 || info.width == 0 || info.height == 0 ||
-	    info.width > 16384 || info.height > 16384 || info.pitch < info.width ||
-	    info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
-	    compression == VideoOutCompression::Unsupported || compression != info.compression ||
-	    metadata_invalid || !IsSupportedVideoOutFormat(info)) {
-		EXIT("TextureCache: unsupported video-out surface, ctx=%p addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 " metadata=0x%016" PRIx64 " dcc=0x%08" PRIx32
-		     " extent=%ux%u pitch=%u tile=%u guest_format=%u bpe=%u vk_format=%d\n",
-		     static_cast<const void*>(ctx), info.address, info.size, info.metadata_address,
-		     info.dcc_control, info.width, info.height, info.pitch, info.tile_mode,
-		     info.guest_format, info.bytes_per_element, static_cast<int>(info.format));
-	}
-	TileSizeAlign exact {};
-	TileGetTextureTotalSize(info.guest_format, info.width, info.height, 1, info.pitch, 1,
-	                        info.tile_mode, false, &exact);
-	if (exact.align != 65536 || exact.size != info.size ||
-	    TileGetTexturePitch(info.guest_format, info.width, 1, info.tile_mode) != info.pitch) {
-		EXIT("TextureCache: video-out tile layout mismatch, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 " expected_size=0x%016" PRIx64 " align=0x%016" PRIx64
-		     " pitch=%u\n",
-		     info.address, info.size, exact.size, exact.align, info.pitch);
-	}
-	(void)RenderTargetUsage(ctx, info.format, 0);
-}
-
-VideoOutVulkanImage* CreateVideoOut(GraphicContext* ctx, const VideoOutInfo& info,
-                                    VulkanMemory* memory) {
-	auto* image          = new VideoOutVulkanImage;
-	image->extent.width  = info.width;
-	image->extent.height = info.height;
-	image->format        = info.format;
-	image->layout        = VK_IMAGE_LAYOUT_UNDEFINED;
-	UtilResetImageViews(image);
-	VkImageCreateInfo create {};
-	create.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-	create.imageType     = VK_IMAGE_TYPE_2D;
-	create.extent        = {info.width, info.height, 1};
-	create.mipLevels     = 1;
-	create.arrayLayers   = 1;
-	create.format        = info.format;
-	create.tiling        = VK_IMAGE_TILING_OPTIMAL;
-	create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	create.flags         = RenderTargetCreateFlags(info.format);
-	create.usage         = RenderTargetUsage(ctx, info.format, create.flags);
-	create.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
-	create.samples       = VK_SAMPLE_COUNT_1_BIT;
-	memory->property     = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-	if (!VulkanCreateImage(ctx, &create, image, memory)) {
-		EXIT("TextureCache: failed to create video-out image, addr=0x%016" PRIx64
-		     " extent=%ux%u format=%d\n",
-		     info.address, info.width, info.height, static_cast<int>(info.format));
-	}
-	image->memory = *memory;
-	CreateVideoOutViews(ctx, image);
-	return image;
-}
-
-void UploadVideoOut(GraphicContext* ctx, VideoOutVulkanImage* image, const VideoOutInfo& info,
-                    bool refresh) {
-	if (info.compression != VideoOutCompression::Uncompressed) {
-		EXIT("TextureCache: compressed video-out guest upload is unsupported, "
-		     "addr=0x%016" PRIx64 " metadata=0x%016" PRIx64 " dcc=0x%08" PRIx32 "\n",
-		     info.address, info.metadata_address, info.dcc_control);
-	}
-	if (refresh) {
-		VulkanDeviceWaitIdle(ctx);
-	}
-	image->layout = VK_IMAGE_LAYOUT_UNDEFINED;
-	UtilScratchBuffer scratch(info.size);
-	TileConvertTiledToLinearRenderTarget(
-	    scratch.Data(), reinterpret_cast<const void*>(info.address), info.width, info.height,
-	    info.pitch, info.bytes_per_element, info.size);
-	if (info.bgra16) {
-		auto* pixels = static_cast<uint16_t*>(scratch.Data());
-		for (uint64_t i = 0; i < info.size / sizeof(uint16_t); i += 4) {
-			std::swap(pixels[i], pixels[i + 2]);
-		}
-	}
-	UtilFillImage(ctx, image, scratch.Data(), info.size, info.pitch,
-	              static_cast<uint64_t>(VK_IMAGE_LAYOUT_GENERAL));
-}
-
 } // namespace
 
 TextureCache::TextureCache(PageManager& page_manager, BufferCache& buffer_cache,
@@ -1238,326 +848,8 @@ TextureCache::TextureCache(PageManager& page_manager, BufferCache& buffer_cache,
 	if (!Common::Thread::IsMainThread()) {
 		EXIT("TextureCache: construction is restricted to the main thread\n");
 	}
+	m_dummy_textures = std::make_unique<DummyTextureCache>();
 	m_readback = std::make_unique<ReadbackWorker>(*this);
-}
-
-VkImageView TextureCache::GetRenderTargetAttachmentView(GraphicContext*           ctx,
-                                                        RenderTextureVulkanImage* image,
-                                                        VkFormat format, uint32_t level,
-                                                        uint32_t base_layer, uint32_t layer_count) {
-	if (ctx == nullptr || image == nullptr || image->image == nullptr ||
-	    format == VK_FORMAT_UNDEFINED || level >= image->mip_levels || level >= 16 ||
-	    layer_count == 0 || base_layer >= image->layers ||
-	    layer_count > image->layers - base_layer) {
-		EXIT("TextureCache: invalid render-target attachment view, image=%p format=%d"
-		     " level=%u image_levels=%u base_layer=%u layer_count=%u image_layers=%u\n",
-		     static_cast<const void*>(image), static_cast<int>(format), level,
-		     image != nullptr ? image->mip_levels : 0, base_layer, layer_count,
-		     image != nullptr ? image->layers : 0);
-	}
-	if (format == image->format && base_layer == 0 && layer_count == 1) {
-		if (image->render_view[level] == nullptr) {
-			EXIT("TextureCache: base render-target attachment view is missing, level=%u\n", level);
-		}
-		return image->render_view[level];
-	}
-	if (format != image->format && !IsRgba8SrgbReinterpretation(image->format, format)) {
-		EXIT("TextureCache: incompatible render-target attachment view, image_format=%d"
-		     " view_format=%d level=%u\n",
-		     static_cast<int>(image->format), static_cast<int>(format), level);
-	}
-
-	std::lock_guard lock(image->attachment_view_mutex);
-	for (const auto& cached: image->attachment_views) {
-		if (cached.format == format && cached.level == level && cached.base_layer == base_layer &&
-		    cached.layer_count == layer_count) {
-			return cached.view;
-		}
-	}
-
-	VkImageViewUsageCreateInfo usage {};
-	usage.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
-	usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-	VkImageViewCreateInfo create {};
-	create.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-	create.pNext      = &usage;
-	create.image      = image->image;
-	create.viewType   = layer_count == 1 ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-	create.format     = format;
-	create.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-	                     VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-	create.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
-	create.subresourceRange.baseMipLevel   = level;
-	create.subresourceRange.levelCount     = 1;
-	create.subresourceRange.baseArrayLayer = base_layer;
-	create.subresourceRange.layerCount     = layer_count;
-	VkImageView view                       = nullptr;
-	const auto  result = vkCreateImageView(ctx->device, &create, nullptr, &view);
-	if (result != VK_SUCCESS || view == nullptr) {
-		EXIT("TextureCache: failed to create render-target attachment view,"
-		     " result=%d image_format=%d view_format=%d level=%u base_layer=%u"
-		     " layer_count=%u\n",
-		     static_cast<int>(result), static_cast<int>(image->format), static_cast<int>(format),
-		     level, base_layer, layer_count);
-	}
-	image->attachment_views.push_back({format, level, base_layer, layer_count, view});
-	LOGF("TextureCache: created render-target attachment view:"
-	     " image_format=%d view_format=%d level=%u layer=%u+%u extent=%ux%u\n",
-	     static_cast<int>(image->format), static_cast<int>(format), level, base_layer, layer_count,
-	     image->extent.width, image->extent.height);
-	return view;
-}
-
-VkImageView TextureCache::GetDepthTargetAttachmentView(GraphicContext*          ctx,
-                                                       DepthStencilVulkanImage* image,
-                                                       uint32_t base_layer, uint32_t layer_count) {
-	if (ctx == nullptr || image == nullptr || image->image == nullptr || layer_count == 0 ||
-	    base_layer >= image->layers || layer_count > image->layers - base_layer) {
-		EXIT("TextureCache: invalid depth-target attachment view, image=%p base_layer=%u "
-		     "layer_count=%u image_layers=%u\n",
-		     static_cast<const void*>(image), base_layer, layer_count,
-		     image != nullptr ? image->layers : 0);
-	}
-	if (base_layer == 0 && layer_count == 1) {
-		return image->image_view[VulkanImage::VIEW_DEFAULT];
-	}
-	std::lock_guard lock(image->attachment_view_mutex);
-	for (const auto& cached: image->attachment_views) {
-		if (cached.base_layer == base_layer && cached.layer_count == layer_count) {
-			return cached.view;
-		}
-	}
-	VkImageViewCreateInfo create {};
-	create.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-	create.image      = image->image;
-	create.viewType   = layer_count == 1 ? VK_IMAGE_VIEW_TYPE_2D : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-	create.format     = image->format;
-	create.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-	                     VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-	create.subresourceRange.aspectMask     = DepthAspectMask(image->format);
-	create.subresourceRange.baseMipLevel   = 0;
-	create.subresourceRange.levelCount     = 1;
-	create.subresourceRange.baseArrayLayer = base_layer;
-	create.subresourceRange.layerCount     = layer_count;
-	VkImageView view                       = nullptr;
-	const auto  result = vkCreateImageView(ctx->device, &create, nullptr, &view);
-	if (result != VK_SUCCESS || view == nullptr) {
-		EXIT("TextureCache: failed to create depth-target attachment view, result=%d "
-		     "format=%d base_layer=%u layer_count=%u\n",
-		     static_cast<int>(result), static_cast<int>(image->format), base_layer, layer_count);
-	}
-	image->attachment_views.push_back({base_layer, layer_count, view});
-	return view;
-}
-
-VkImageView TextureCache::GetImageView(GraphicContext* ctx, VulkanImage* image,
-                                       const ImageViewInfo& info) {
-	const bool supported_type = info.type == VK_IMAGE_VIEW_TYPE_2D ||
-	                            info.type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ||
-	                            info.type == VK_IMAGE_VIEW_TYPE_3D;
-	const bool valid_shape =
-	    (info.type == VK_IMAGE_VIEW_TYPE_2D && info.layer_count == 1) ||
-	    info.type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ||
-	    (info.type == VK_IMAGE_VIEW_TYPE_3D && info.base_layer == 0 && info.layer_count == 1);
-	if (ctx == nullptr || image == nullptr || image->image == nullptr ||
-	    info.format == VK_FORMAT_UNDEFINED || info.aspect == 0 || info.level_count == 0 ||
-	    info.base_level >= (image != nullptr ? image->mip_levels : 0) ||
-	    info.level_count > image->mip_levels - info.base_level || info.layer_count == 0 ||
-	    info.base_layer >= image->layers || info.layer_count > image->layers - info.base_layer ||
-	    !supported_type || !valid_shape) {
-		EXIT("TextureCache: invalid dynamic image view, image=%p format=%d aspect=0x%x"
-		     " swizzle=0x%03x mip=%u+%u layer=%u+%u type=%d storage=%d"
-		     " image_levels=%u image_layers=%u\n",
-		     static_cast<const void*>(image), static_cast<int>(info.format), info.aspect,
-		     info.swizzle, info.base_level, info.level_count, info.base_layer, info.layer_count,
-		     static_cast<int>(info.type), info.is_storage, image != nullptr ? image->mip_levels : 0,
-		     image != nullptr ? image->layers : 0);
-	}
-
-	auto&           cache = image->view_cache;
-	std::lock_guard lock(cache.mutex);
-	for (const auto& cached: cache.views) {
-		if (cached.info == info) {
-			return cached.view;
-		}
-	}
-
-	VkImageViewUsageCreateInfo usage {};
-	usage.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
-	usage.usage = info.is_storage ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT;
-	VkImageViewCreateInfo create {};
-	create.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-	create.pNext    = &usage;
-	create.image    = image->image;
-	create.viewType = info.type;
-	create.format   = info.format;
-	create.components =
-	    info.is_storage ? VkComponentMapping {} : TextureGetComponentMapping(info.swizzle);
-	create.subresourceRange.aspectMask     = info.aspect;
-	create.subresourceRange.baseMipLevel   = info.base_level;
-	create.subresourceRange.levelCount     = info.level_count;
-	create.subresourceRange.baseArrayLayer = info.base_layer;
-	create.subresourceRange.layerCount     = info.layer_count;
-	VkImageView view                       = nullptr;
-	const auto  result = vkCreateImageView(ctx->device, &create, nullptr, &view);
-	if (result != VK_SUCCESS || view == nullptr) {
-		EXIT("TextureCache: failed to create dynamic image view, result=%d format=%d"
-		     " aspect=0x%x swizzle=0x%03x mip=%u+%u layer=%u+%u type=%d storage=%d\n",
-		     static_cast<int>(result), static_cast<int>(info.format), info.aspect, info.swizzle,
-		     info.base_level, info.level_count, info.base_layer, info.layer_count,
-		     static_cast<int>(info.type), info.is_storage);
-	}
-	cache.views.push_back({info, view});
-	return view;
-}
-
-VkImageView TextureCache::GetDepthTargetSampledView(GraphicContext*          ctx,
-                                                    DepthStencilVulkanImage* image,
-                                                    VkFormat view_format, uint32_t swizzle,
-                                                    uint32_t base_level, uint32_t level_count,
-                                                    VkImageViewType type, uint32_t base_layer,
-                                                    uint32_t layer_count) {
-	if (ctx == nullptr || image == nullptr || image->image == nullptr ||
-	    view_format == VK_FORMAT_UNDEFINED ||
-	    !IsSupportedSampledDepthView(image->format, view_format, swizzle)) {
-		EXIT("TextureCache: invalid sampled depth-target view, image=%p image_format=%d"
-		     " view_format=%d swizzle=0x%03x mip=%u+%u layer=%u+%u type=%d"
-		     " image_levels=%u image_layers=%u\n",
-		     static_cast<const void*>(image),
-		     image != nullptr ? static_cast<int>(image->format) : VK_FORMAT_UNDEFINED,
-		     static_cast<int>(view_format), swizzle, base_level, level_count, base_layer,
-		     layer_count, static_cast<int>(type), image != nullptr ? image->mip_levels : 0,
-		     image != nullptr ? image->layers : 0);
-	}
-	return GetImageView(ctx, image,
-	                    {image->format, type, VK_IMAGE_ASPECT_DEPTH_BIT, base_level, level_count,
-	                     base_layer, layer_count, swizzle});
-}
-
-VkImageView TextureCache::GetSampledColorView(GraphicContext* ctx, VulkanImage* image,
-	                                          VkFormat view_format, uint32_t swizzle,
-	                                          uint32_t base_level, uint32_t level_count,
-	                                          VkImageViewType type, uint32_t base_layer,
-	                                          uint32_t layer_count) {
-	if (ctx == nullptr || image == nullptr || image->image == nullptr ||
-	    view_format == VK_FORMAT_UNDEFINED || base_level >= 16 ||
-	    (type != VK_IMAGE_VIEW_TYPE_2D && type != VK_IMAGE_VIEW_TYPE_2D_ARRAY) ||
-	    !IsSupportedSampledColorView(image->format, view_format, swizzle)) {
-		EXIT("TextureCache: invalid sampled color view, image=%p swizzle=0x%03x"
-		     " view_format=%d mip=%u+%u layer=%u+%u type=%d image_levels=%u image_layers=%u\n",
-		     static_cast<const void*>(image), swizzle, static_cast<int>(view_format), base_level,
-		     level_count, base_layer, layer_count, static_cast<int>(type),
-		     image != nullptr ? image->mip_levels : 0, image != nullptr ? image->layers : 0);
-	}
-	const auto precreated_view = type == VK_IMAGE_VIEW_TYPE_2D_ARRAY
-	                                 ? VulkanImage::VIEW_DEFAULT_ARRAY
-	                                 : VulkanImage::VIEW_DEFAULT;
-	const bool full_view =
-	    base_level == 0 && level_count == image->mip_levels && base_layer == 0 &&
-	    layer_count == (type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? image->layers : 1u);
-	if (view_format == image->format && swizzle == DstSel(4, 5, 6, 7) && full_view &&
-	    image->image_view[precreated_view] != nullptr) {
-		return image->image_view[precreated_view];
-	}
-	return GetImageView(ctx, image,
-	                    {view_format, type, VK_IMAGE_ASPECT_COLOR_BIT, base_level, level_count,
-	                     base_layer, layer_count, swizzle});
-}
-
-VkImageView TextureCache::GetRenderTargetStorageView(GraphicContext*           ctx,
-                                                     RenderTextureVulkanImage* image,
-                                                     VkFormat view_format, uint32_t base_level,
-                                                     uint32_t level_count, VkImageViewType type,
-                                                     uint32_t base_layer, uint32_t layer_count) {
-	if (ctx == nullptr || image == nullptr || image->image == nullptr ||
-	    view_format == VK_FORMAT_UNDEFINED ||
-	    (type != VK_IMAGE_VIEW_TYPE_2D && type != VK_IMAGE_VIEW_TYPE_2D_ARRAY)) {
-		EXIT("TextureCache: invalid render-target storage view, image=%p view_format=%d"
-		     " mip=%u+%u layer=%u+%u type=%d image_levels=%u image_layers=%u\n",
-		     static_cast<const void*>(image), static_cast<int>(view_format), base_level,
-		     level_count, base_layer, layer_count, static_cast<int>(type),
-		     image != nullptr ? image->mip_levels : 0, image != nullptr ? image->layers : 0);
-	}
-	const bool exact      = view_format == image->format;
-	const bool compatible = view_format == BgraSrgbStorageViewFormat(image->format);
-	if (!exact && !compatible) {
-		EXIT("TextureCache: incompatible render-target storage view, image_format=%d"
-		     " view_format=%d base=%u count=%u\n",
-		     static_cast<int>(image->format), static_cast<int>(view_format), base_level,
-		     level_count);
-	}
-	if (exact) {
-		const auto index = type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? VulkanImage::VIEW_STORAGE_ARRAY
-		                                                       : VulkanImage::VIEW_STORAGE;
-		const bool full_view =
-		    base_level == 0 && level_count == 1 && base_layer == 0 &&
-		    layer_count == (type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? image->layers : 1u);
-		if (full_view && image->image_view[index] != nullptr) {
-			return image->image_view[index];
-		}
-	}
-
-	if (compatible && !FormatSupportsStorage(ctx, view_format)) {
-		EXIT("TextureCache: compatible render-target storage format lacks storage support,"
-		     " image_format=%d view_format=%d base=%u count=%u\n",
-		     static_cast<int>(image->format), static_cast<int>(view_format), base_level,
-		     level_count);
-	}
-	return GetImageView(ctx, image,
-	                    {view_format, type, VK_IMAGE_ASPECT_COLOR_BIT, base_level, level_count,
-	                     base_layer, layer_count, DstSel(4, 5, 6, 7), true});
-}
-
-VkImageView TextureCache::GetStorageTextureSampledView(GraphicContext*            ctx,
-                                                       StorageTextureVulkanImage* image,
-                                                       const ImageInfo&           info) {
-	const auto shape =
-	    SelectStorageSampledViewShape(info.type, info.depth, image != nullptr ? image->layers : 0);
-	if (ctx == nullptr || image == nullptr || image->image == nullptr ||
-	    shape == StorageSampledViewShape::Unsupported || info.base_array != 0 ||
-	    info.levels != image->mip_levels || info.base_level >= info.levels ||
-	    info.view_levels == 0 || info.base_level + info.view_levels > info.levels) {
-		EXIT("TextureCache: invalid sampled view of storage texture, image=%p type=%u depth=%u"
-		     " base=%u levels=%u view_levels=%u image_levels=%u base_array=%u\n",
-		     static_cast<const void*>(image), info.type, info.depth, info.base_level, info.levels,
-		     info.view_levels, image != nullptr ? image->mip_levels : 0, info.base_array);
-	}
-	const auto view_format = TextureGetFormat(info.format, TextureFormatUsage::Sampled);
-	if (view_format != image->format && !IsRgba8SrgbReinterpretation(image->format, view_format) &&
-	    !IsR32UintFloatReinterpretation(image->format, view_format)) {
-		EXIT("TextureCache: incompatible sampled view of storage texture, image_format=%d"
-		     " view_format=%d swizzle=0x%03x\n",
-		     static_cast<int>(image->format), static_cast<int>(view_format), info.swizzle);
-	}
-
-	VkImageViewType type = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
-	switch (shape) {
-		case StorageSampledViewShape::Image2D: type = VK_IMAGE_VIEW_TYPE_2D; break;
-		case StorageSampledViewShape::Image2DArray: type = VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
-		case StorageSampledViewShape::Image3D: type = VK_IMAGE_VIEW_TYPE_3D; break;
-		case StorageSampledViewShape::Unsupported:
-			EXIT("TextureCache: unsupported sampled storage-image view shape\n");
-	}
-	const auto layer_count = shape == StorageSampledViewShape::Image2DArray ? info.depth : 1u;
-	return GetImageView(ctx, image,
-	                    {view_format, type, VK_IMAGE_ASPECT_COLOR_BIT, info.base_level,
-	                     info.view_levels, 0, layer_count, info.swizzle});
-}
-
-VkImageView TextureCache::GetStorageTextureStorageView(GraphicContext*            ctx,
-                                                       StorageTextureVulkanImage* image,
-                                                       uint32_t                   base_level) {
-	if (ctx == nullptr || image == nullptr || image->image == nullptr ||
-	    base_level >= (image != nullptr ? image->mip_levels : 0)) {
-		EXIT("TextureCache: invalid storage-texture mip view, image=%p level=%u levels=%u\n",
-		     static_cast<const void*>(image), base_level, image != nullptr ? image->mip_levels : 0);
-	}
-	if (base_level == 0) {
-		return image->image_view[VulkanImage::VIEW_DEFAULT];
-	}
-	return GetImageView(ctx, image,
-	                    {image->format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT,
-	                     base_level, 1, 0, 1, DstSel(4, 5, 6, 7), true});
 }
 
 TextureCache::CachedImage* TextureCache::FindGpuReadbackPageCandidateLocked(uint64_t vaddr,
@@ -1801,31 +1093,14 @@ void TextureCache::RetireStorageDepthAliasLocked(GraphicContext* ctx,
 
 TextureCache::~TextureCache() {
 	m_readback.reset();
-	GraphicContext* ctx = nullptr;
 	if (!m_images.empty()) {
-		ctx = m_images.front()->ctx;
-	} else {
-		ctx = m_dummy_ctx;
-	}
-	if (ctx != nullptr) {
-		VulkanDeviceWaitIdle(ctx);
+		VulkanDeviceWaitIdle(m_images.front()->ctx);
 	}
 	for (const auto& image: m_images) {
 		UnregisterImageLocked(*image, false);
 	}
 	m_images.clear();
-	for (size_t i = 0; i < m_dummy_sampled_textures.size(); i++) {
-		if (m_dummy_sampled_textures[i] != nullptr) {
-			DeleteGpuTexture(ctx, static_cast<GpuTextureVulkanImage*>(m_dummy_sampled_textures[i]),
-			                 m_dummy_sampled_memory[i]);
-			delete m_dummy_sampled_memory[i];
-		}
-		if (m_dummy_storage_textures[i] != nullptr) {
-			DeleteGpuTexture(ctx, static_cast<GpuTextureVulkanImage*>(m_dummy_storage_textures[i]),
-			                 m_dummy_storage_memory[i]);
-			delete m_dummy_storage_memory[i];
-		}
-	}
+	m_dummy_textures.reset();
 }
 
 VulkanImage* TextureCache::FindTexture(CommandBuffer* command, GraphicContext* ctx,
@@ -1990,27 +1265,21 @@ VulkanImage* TextureCache::FindTexture(CommandBuffer* command, GraphicContext* c
 		}
 	}
 	m_images.reserve(m_images.size() + 1);
-	auto cached   = std::make_shared<CachedImage>();
-	cached->kind  = CachedImage::Kind::Texture;
-	cached->info  = info;
-	cached->ctx   = ctx;
-	cached->image = new TextureVulkanImage;
-	const auto components =
-	    TextureCreateImage(ctx, cached->image, &cached->memory, MakeImageParams(info, false));
+	auto cached                = std::make_shared<CachedImage>();
+	cached->kind               = CachedImage::Kind::Texture;
+	cached->info               = info;
+	cached->ctx                = ctx;
+	VkComponentMapping components {};
+	cached->image = ImageOps::CreateTexture(ctx, info, false, &cached->memory, &components);
 	m_memory_tracker.ForEachUploadRange(
 	    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
 	    [&]() noexcept {
 		    m_tiler.DetileImage(cached->ctx, static_cast<GpuTextureVulkanImage*>(cached->image),
 		                        cached->info, source, false, false);
 	    });
-	TextureCreateImageViews(ctx, cached->image, components, info.type, info.base_array,
-	                        info.base_level, info.view_levels, info.depth, true,
-	                        TextureFormatUsage::Sampled);
-	auto* image = cached->image;
-	command->RetainResourceUntilFence(cached);
-	m_images.push_back(std::move(cached));
-	RegisterImageLocked(*m_images.back());
-	return image;
+	ImageOps::CreateTextureViews(ctx, static_cast<GpuTextureVulkanImage*>(cached->image), info,
+	                             false, components);
+	return PublishImage(command, std::move(cached));
 }
 
 StorageTextureVulkanImage* TextureCache::FindStorageTexture(CommandBuffer*   command,
@@ -2133,13 +1402,12 @@ StorageTextureVulkanImage* TextureCache::FindStorageTexture(CommandBuffer*   com
 
 	ResolveStorageImageOverlaps(ctx, info);
 	m_images.reserve(m_images.size() + 1);
-	auto cached   = std::make_shared<CachedImage>();
-	cached->kind  = CachedImage::Kind::StorageTexture;
-	cached->info  = info;
-	cached->ctx   = ctx;
-	cached->image = new StorageTextureVulkanImage;
-	const auto components =
-	    TextureCreateImage(ctx, cached->image, &cached->memory, MakeImageParams(info, true));
+	auto cached                = std::make_shared<CachedImage>();
+	cached->kind               = CachedImage::Kind::StorageTexture;
+	cached->info               = info;
+	cached->ctx                = ctx;
+	VkComponentMapping components {};
+	cached->image = ImageOps::CreateTexture(ctx, info, true, &cached->memory, &components);
 	m_memory_tracker.ForEachUploadRange(
 	    info.address, info.size, true, [](uint64_t, uint64_t) noexcept {},
 	    [&]() noexcept {
@@ -2147,13 +1415,9 @@ StorageTextureVulkanImage* TextureCache::FindStorageTexture(CommandBuffer*   com
 		                        cached->info, source, false, true);
 	    });
 	cached->gpu_modified = true;
-	TextureCreateImageViews(ctx, cached->image, components, info.type, 0, 0, 1, info.depth, false,
-	                        TextureFormatUsage::Sampled | TextureFormatUsage::Storage);
-	auto* image = static_cast<StorageTextureVulkanImage*>(cached->image);
-	command->RetainResourceUntilFence(cached);
-	m_images.push_back(std::move(cached));
-	RegisterImageLocked(*m_images.back());
-	return image;
+	ImageOps::CreateTextureViews(ctx, static_cast<GpuTextureVulkanImage*>(cached->image), info, true,
+	                             components);
+	return static_cast<StorageTextureVulkanImage*>(PublishImage(command, std::move(cached)));
 }
 
 RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*          command,
@@ -2188,7 +1452,7 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 		}
 	}
 	if (standard64) {
-		const auto format = RenderTargetTransferFormat(info.bytes_per_element);
+		const auto format = ImageOps::RenderTargetTransferFormat(info.bytes_per_element);
 		const auto expected_pitch =
 		    TileGetTexturePitch(format, info.width, info.levels, info.tile_mode);
 		TileSizeAlign layout {};
@@ -2249,8 +1513,8 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 			m_memory_tracker.ForEachUploadRange(
 			    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
 			    [&]() noexcept {
-				    UploadRenderTarget(ctx, static_cast<RenderTextureVulkanImage*>(match->image),
-				                       info, true);
+				    ImageOps::UploadRenderTarget(
+				        ctx, static_cast<RenderTextureVulkanImage*>(match->image), info, true);
 			    });
 			match->buffer_modified = false;
 		}
@@ -2350,7 +1614,7 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 	cached->kind               = CachedImage::Kind::RenderTarget;
 	cached->target             = info;
 	cached->ctx                = ctx;
-	cached->image              = CreateRenderTarget(ctx, info, &cached->memory);
+	cached->image              = ImageOps::CreateRenderTarget(ctx, info, &cached->memory);
 	const bool preserve_native = native_image_source != nullptr;
 	if (preserve_native) {
 		command->RetainResourceUntilFence(native_image_source);
@@ -2367,9 +1631,9 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 			m_memory_tracker.ForEachUploadRange(
 			    tail_address, tail_size, true, [](uint64_t, uint64_t) noexcept {},
 			    [&]() noexcept {
-				    UploadRenderTargetLayers(ctx,
-				                             static_cast<RenderTextureVulkanImage*>(cached->image),
-				                             info, old.layers, info.layers - old.layers, false);
+				    ImageOps::UploadRenderTargetLayers(
+				        ctx, static_cast<RenderTextureVulkanImage*>(cached->image), info, old.layers,
+				        info.layers - old.layers, false);
 			    });
 		}
 		std::vector<ImageImageCopy> regions;
@@ -2382,16 +1646,12 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 		m_memory_tracker.ForEachUploadRange(
 		    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
 		    [&]() noexcept {
-			    UploadRenderTarget(ctx, static_cast<RenderTextureVulkanImage*>(cached->image), info,
-			                       false);
+			    ImageOps::UploadRenderTarget(
+			        ctx, static_cast<RenderTextureVulkanImage*>(cached->image), info, false);
 		    });
 	}
 	cached->gpu_modified = preserve_native;
-	auto* image = static_cast<RenderTextureVulkanImage*>(cached->image);
-	command->RetainResourceUntilFence(cached);
-	m_images.push_back(std::move(cached));
-	RegisterImageLocked(*m_images.back());
-	return image;
+	return static_cast<RenderTextureVulkanImage*>(PublishImage(command, std::move(cached)));
 }
 
 DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, GraphicContext* ctx,
@@ -2635,7 +1895,7 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 	cached->depth               = info;
 	cached->ctx                 = ctx;
 	cached->stencil_initialized = !has_stencil;
-	cached->image               = CreateDepthTarget(ctx, info, &cached->memory);
+	cached->image               = ImageOps::CreateDepthTarget(ctx, info, &cached->memory);
 	if (discarded_depth_source != nullptr) {
 		command->RetainResourceUntilFence(discarded_depth_source);
 	}
@@ -2737,11 +1997,7 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 			cached->stencil_initialized = true;
 		}
 	}
-	auto* image = static_cast<DepthStencilVulkanImage*>(cached->image);
-	command->RetainResourceUntilFence(cached);
-	m_images.push_back(std::move(cached));
-	RegisterImageLocked(*m_images.back());
-	return image;
+	return static_cast<DepthStencilVulkanImage*>(PublishImage(command, std::move(cached)));
 }
 
 std::vector<VideoOutVulkanImage*>
@@ -2751,7 +2007,7 @@ TextureCache::RegisterVideoOutSurfaces(GraphicContext*                  ctx,
 		EXIT("TextureCache: video-out registration requires surfaces\n");
 	}
 	for (const auto& info: infos) {
-		ValidateVideoOutInfo(ctx, info);
+		ImageOps::ValidateVideoOut(ctx, info);
 	}
 	for (size_t i = 0; i < infos.size(); i++) {
 		for (size_t j = i + 1; j < infos.size(); j++) {
@@ -2789,13 +2045,13 @@ TextureCache::RegisterVideoOutSurfaces(GraphicContext*                  ctx,
 		cached->kind      = CachedImage::Kind::VideoOut;
 		cached->video_out = info;
 		cached->ctx       = ctx;
-		cached->image     = CreateVideoOut(ctx, info, &cached->memory);
+		cached->image     = ImageOps::CreateVideoOut(ctx, info, &cached->memory);
 		if (info.compression == VideoOutCompression::Uncompressed) {
 			m_memory_tracker.ForEachUploadRange(
 			    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
 			    [&]() noexcept {
-				    UploadVideoOut(ctx, static_cast<VideoOutVulkanImage*>(cached->image), info,
-				                   false);
+				    ImageOps::UploadVideoOut(
+				        ctx, static_cast<VideoOutVulkanImage*>(cached->image), info, false);
 			    });
 		} else {
 			// A compressed guest surface cannot be decoded without its DCC metadata. Establish the
@@ -2862,7 +2118,7 @@ void TextureCache::RefreshVideoOut(VideoOutVulkanImage* image, bool render_targe
 	}
 	m_memory_tracker.ForEachUploadRange(
 	    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
-	    [&]() noexcept { UploadVideoOut(cached.ctx, image, info, true); });
+	    [&]() noexcept { ImageOps::UploadVideoOut(cached.ctx, image, info, true); });
 }
 
 void TextureCache::UnregisterVideoOutSurfaces(const std::vector<VideoOutVulkanImage*>& images) {
@@ -2915,8 +2171,8 @@ void TextureCache::UnregisterVideoOutSurfaces(const std::vector<VideoOutVulkanIm
 	}
 }
 
-bool TextureCache::ClearColorImageFromBuffer(CommandBuffer* command, uint64_t vaddr, uint64_t size,
-                                             uint32_t packed_clear) {
+bool TextureCache::ClearImageFromBuffer(CommandBuffer* command, uint64_t vaddr, uint64_t size,
+                                        uint32_t packed_clear) {
 	if (command == nullptr || command->IsInvalid() || vaddr == 0 || size == 0 ||
 	    vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
 		EXIT("TextureCache: invalid compute image clear, command=%p addr=0x%016" PRIx64
@@ -2926,28 +2182,67 @@ bool TextureCache::ClearColorImageFromBuffer(CommandBuffer* command, uint64_t va
 	m_buffer_cache.ValidateGpuAccess(vaddr, size, false, true);
 	std::lock_guard              transaction(m_resource_mutex);
 	FaultSafeTextureLock         lock(this, m_lock);
+	enum class ClearAspect : uint8_t { None, Color, Depth, Stencil };
+	auto classify = [vaddr, size](const CachedImage& cached) {
+		const bool color = cached.kind == CachedImage::Kind::VideoOut ||
+		                   cached.kind == CachedImage::Kind::RenderTarget;
+		if (color && cached.Address() == vaddr && cached.Size() == size) {
+			return ClearAspect::Color;
+		}
+		if (cached.kind != CachedImage::Kind::DepthTarget) {
+			return ClearAspect::None;
+		}
+		if (CanNativeClearDepthFromBuffer(cached.depth, vaddr, size)) {
+			return ClearAspect::Depth;
+		}
+		if (cached.RangeCount() == 2 && cached.Address(1) == vaddr && cached.Size(1) == size) {
+			return ClearAspect::Stencil;
+		}
+		return ClearAspect::None;
+	};
+
 	std::shared_ptr<CachedImage> match;
+	ClearAspect                  aspect       = ClearAspect::None;
+	bool                         incompatible = false;
+	uint32_t                     matches      = 0;
 	for (const auto& cached: m_images) {
 		if (!cached->OverlapsRange(vaddr, size, true)) {
 			continue;
 		}
-		const bool color = cached->kind == CachedImage::Kind::VideoOut ||
-		                   cached->kind == CachedImage::Kind::RenderTarget;
-		const bool exact = cached->Address() == vaddr && cached->Size() == size;
-		if (!color || !exact) {
-			return false;
+		const auto candidate = classify(*cached);
+		if (candidate == ClearAspect::None) {
+			incompatible = true;
+			continue;
 		}
-		if (match != nullptr) {
-			EXIT("TextureCache: compute image clear has ambiguous exact aliases, "
-			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " first=%p second=%p\n",
-			     vaddr, size, static_cast<const void*>(match->image),
-			     static_cast<const void*>(cached->image));
+		if (aspect == ClearAspect::None) {
+			aspect = candidate;
+			match  = cached;
+		} else if (candidate != aspect) {
+			incompatible = true;
+			continue;
 		}
-		match = cached;
+		matches++;
 	}
-	if (match == nullptr) {
+	if (matches > 1) {
+		EXIT("TextureCache: compute image clear has ambiguous exact aliases, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " aspect=%u matches=%u\n",
+		     vaddr, size, static_cast<uint32_t>(aspect), matches);
+	}
+	if (incompatible || match == nullptr) {
 		return false;
 	}
+
+	float depth_clear = 0.0f;
+	if (aspect == ClearAspect::Depth &&
+	    !DecodePackedDepthClear(match->image->format, packed_clear, &depth_clear)) {
+		return false;
+	}
+	uint8_t stencil_clear = 0;
+	if (aspect == ClearAspect::Stencil &&
+	    !DecodePackedStencilClear(packed_clear, &stencil_clear)) {
+		return false;
+	}
+
 	RequireNoMetaOverlapLocked(vaddr, size);
 	const bool buffer_overlap = m_buffer_cache.HasPageOverlap(vaddr, size);
 	const bool buffer_cpu_modified =
@@ -2956,16 +2251,15 @@ bool TextureCache::ClearColorImageFromBuffer(CommandBuffer* command, uint64_t va
 	    buffer_overlap && m_buffer_cache.IsRegionGpuModified(vaddr, size);
 	BufferImageCopySource source {nullptr, 0, vaddr, size, true};
 	if (buffer_overlap && !buffer_cpu_modified && !buffer_gpu_modified) {
-		// A prior buffer clear can leave one clean cached buffer after this range becomes a native
-		// color target. Allow coexisting cache views only after the shared ownership
-		// helper proves the stale source is coherent native-buffer or guest backing.
 		source = m_buffer_cache.ObtainBufferForImage(vaddr, size);
 	}
 	const bool buffer_source_valid =
 	    !buffer_overlap || IsCoherentGuestImageSource(source, vaddr, size);
 	const bool image_cpu_modified = m_memory_tracker.IsRegionCpuModified(vaddr, size);
-	if (!buffer_source_valid || buffer_cpu_modified || buffer_gpu_modified ||
-	    match->buffer_modified || image_cpu_modified) {
+	const bool invalid_common = !buffer_source_valid || buffer_cpu_modified ||
+	                            buffer_gpu_modified || match->buffer_modified ||
+	                            image_cpu_modified;
+	if (aspect == ClearAspect::Color && invalid_common) {
 		EXIT("TextureCache: compute image clear requires exclusive GPU image ownership, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
 		     " buffer_overlap=%d source_valid=%d buffer_cpu_modified=%d"
@@ -2973,176 +2267,61 @@ bool TextureCache::ClearColorImageFromBuffer(CommandBuffer* command, uint64_t va
 		     vaddr, size, buffer_overlap, buffer_source_valid, buffer_cpu_modified,
 		     buffer_gpu_modified, match->buffer_modified, image_cpu_modified);
 	}
-	VkClearColorValue clear {};
-	if (!DecodePackedColorClear(match->image->format, packed_clear, &clear)) {
-		return false;
+	if (aspect != ClearAspect::Color && (!match->gpu_modified || invalid_common)) {
+		const bool  depth       = aspect == ClearAspect::Depth;
+		const char* plane       = depth ? "depth" : "stencil";
+		const char* source_name = depth ? "buffer" : "stencil";
+		EXIT("TextureCache: compute %s clear requires a GPU-owned depth image and a clean "
+		     "%s source, addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " gpu_modified=%d buffer_overlap=%d source_valid=%d buffer_cpu_modified=%d"
+		     " buffer_gpu_modified=%d buffer_modified=%d image_cpu_modified=%d\n",
+		     plane, source_name, vaddr, size, match->gpu_modified, buffer_overlap,
+		     buffer_source_valid, buffer_cpu_modified, buffer_gpu_modified,
+		     match->buffer_modified, image_cpu_modified);
 	}
+
 	auto* vk_buffer = command->GetPool()->buffers[command->GetIndex()];
-	GraphicsRenderColorImageBarrier(vk_buffer, match->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-	const VkImageSubresourceRange range {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0,
-	                                     match->image->layers};
-	vkCmdClearColorImage(vk_buffer, match->image->image, match->image->layout, &clear, 1, &range);
-	GraphicsRenderColorImageBarrier(vk_buffer, match->image, RENDER_COLOR_IMAGE_LAYOUT);
-	if (!match->gpu_modified) {
-		m_memory_tracker.MarkRegionAsGpuModified(vaddr, size);
-		match->gpu_modified = true;
-	}
-	command->RetainResourceUntilFence(match);
-	return true;
-}
-
-bool TextureCache::ClearDepthImageFromBuffer(CommandBuffer* command, uint64_t vaddr, uint64_t size,
-                                             uint32_t packed_clear) {
-	if (command == nullptr || command->IsInvalid() || vaddr == 0 || size == 0 ||
-	    vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
-		EXIT("TextureCache: invalid compute depth clear, command=%p addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     static_cast<const void*>(command), vaddr, size);
-	}
-	m_buffer_cache.ValidateGpuAccess(vaddr, size, false, true);
-	std::lock_guard              transaction(m_resource_mutex);
-	FaultSafeTextureLock         lock(this, m_lock);
-	std::shared_ptr<CachedImage> match;
-	for (const auto& cached: m_images) {
-		if (!cached->OverlapsRange(vaddr, size, true)) {
-			continue;
-		}
-		const bool exact_depth = cached->kind == CachedImage::Kind::DepthTarget &&
-		                         CanNativeClearDepthFromBuffer(cached->depth, vaddr, size);
-		if (!exact_depth) {
+	if (aspect == ClearAspect::Color) {
+		VkClearColorValue clear {};
+		if (!DecodePackedColorClear(match->image->format, packed_clear, &clear)) {
 			return false;
 		}
-		if (match != nullptr) {
-			EXIT("TextureCache: compute depth clear has ambiguous exact aliases, "
-			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " first=%p second=%p\n",
-			     vaddr, size, static_cast<const void*>(match->image),
-			     static_cast<const void*>(cached->image));
+		GraphicsRenderColorImageBarrier(vk_buffer, match->image,
+		                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+		const VkImageSubresourceRange range {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+		                                     VK_REMAINING_MIP_LEVELS, 0,
+		                                     match->image->layers};
+		vkCmdClearColorImage(vk_buffer, match->image->image, match->image->layout, &clear, 1,
+		                     &range);
+		GraphicsRenderColorImageBarrier(vk_buffer, match->image, RENDER_COLOR_IMAGE_LAYOUT);
+		if (!match->gpu_modified) {
+			m_memory_tracker.MarkRegionAsGpuModified(vaddr, size);
+			match->gpu_modified = true;
 		}
-		match = cached;
+		command->RetainResourceUntilFence(match);
+		return true;
 	}
-	if (match == nullptr) {
-		return false;
-	}
-	float depth_clear = 0.0f;
-	if (!DecodePackedDepthClear(match->image->format, packed_clear, &depth_clear)) {
-		return false;
-	}
-	RequireNoMetaOverlapLocked(vaddr, size);
-	const bool buffer_overlap = m_buffer_cache.HasPageOverlap(vaddr, size);
-	const bool buffer_cpu_modified =
-	    buffer_overlap && m_buffer_cache.IsRegionCpuModified(vaddr, size);
-	const bool buffer_gpu_modified =
-	    buffer_overlap && m_buffer_cache.IsRegionGpuModified(vaddr, size);
-	BufferImageCopySource source {nullptr, 0, vaddr, size, true};
-	if (buffer_overlap && !buffer_cpu_modified && !buffer_gpu_modified) {
-		source = m_buffer_cache.ObtainBufferForImage(vaddr, size);
-	}
-	const bool buffer_source_valid =
-	    !buffer_overlap || IsCoherentGuestImageSource(source, vaddr, size);
-	const bool image_cpu_modified = m_memory_tracker.IsRegionCpuModified(vaddr, size);
-	if (!match->gpu_modified || !buffer_source_valid || buffer_cpu_modified ||
-	    buffer_gpu_modified || match->buffer_modified || image_cpu_modified) {
-		EXIT("TextureCache: compute depth clear requires a GPU-owned depth image and a clean "
-		     "buffer source, addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " gpu_modified=%d buffer_overlap=%d source_valid=%d buffer_cpu_modified=%d"
-		     " buffer_gpu_modified=%d buffer_modified=%d image_cpu_modified=%d\n",
-		     vaddr, size, match->gpu_modified, buffer_overlap, buffer_source_valid,
-		     buffer_cpu_modified, buffer_gpu_modified, match->buffer_modified, image_cpu_modified);
-	}
+
 	if (match->image->layout == VK_IMAGE_LAYOUT_UNDEFINED ||
 	    match->image->layout == VK_IMAGE_LAYOUT_PREINITIALIZED) {
-		EXIT("TextureCache: compute depth clear has invalid source layout %u\n",
+		EXIT("TextureCache: compute %s clear has invalid source layout %u\n",
+		     aspect == ClearAspect::Depth ? "depth" : "stencil",
 		     static_cast<uint32_t>(match->image->layout));
 	}
-	auto*      vk_buffer  = command->GetPool()->buffers[command->GetIndex()];
 	const auto old_layout = match->image->layout;
 	GraphicsRenderDepthStencilImageBarrier(vk_buffer, match->image,
 	                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-	const VkClearDepthStencilValue clear {depth_clear, 0};
-	const VkImageSubresourceRange  range {VK_IMAGE_ASPECT_DEPTH_BIT, 0, VK_REMAINING_MIP_LEVELS, 0,
-	                                      match->image->layers};
-	vkCmdClearDepthStencilImage(vk_buffer, match->image->image, match->image->layout, &clear, 1,
-	                            &range);
-	GraphicsRenderDepthStencilImageBarrier(vk_buffer, match->image, old_layout);
-	command->RetainResourceUntilFence(match);
-	return true;
-}
-
-bool TextureCache::ClearStencilImageFromBuffer(CommandBuffer* command, uint64_t vaddr,
-                                               uint64_t size, uint32_t packed_clear) {
-	if (command == nullptr || command->IsInvalid() || vaddr == 0 || size == 0 ||
-	    vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
-		EXIT("TextureCache: invalid compute stencil clear, command=%p addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     static_cast<const void*>(command), vaddr, size);
-	}
-	uint8_t stencil_clear = 0;
-	if (!DecodePackedStencilClear(packed_clear, &stencil_clear)) {
-		return false;
-	}
-	m_buffer_cache.ValidateGpuAccess(vaddr, size, false, true);
-	std::lock_guard              transaction(m_resource_mutex);
-	FaultSafeTextureLock         lock(this, m_lock);
-	std::shared_ptr<CachedImage> match;
-	for (const auto& cached: m_images) {
-		if (!cached->OverlapsRange(vaddr, size, true)) {
-			continue;
-		}
-		const bool exact_stencil = cached->kind == CachedImage::Kind::DepthTarget &&
-		                           cached->RangeCount() == 2 && cached->Address(1) == vaddr &&
-		                           cached->Size(1) == size;
-		if (!exact_stencil) {
-			return false;
-		}
-		if (match != nullptr) {
-			EXIT("TextureCache: compute stencil clear has ambiguous exact aliases, "
-			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " first=%p second=%p\n",
-			     vaddr, size, static_cast<const void*>(match->image),
-			     static_cast<const void*>(cached->image));
-		}
-		match = cached;
-	}
-	if (match == nullptr) {
-		return false;
-	}
-	RequireNoMetaOverlapLocked(vaddr, size);
-	const bool buffer_overlap = m_buffer_cache.HasPageOverlap(vaddr, size);
-	const bool buffer_cpu_modified =
-	    buffer_overlap && m_buffer_cache.IsRegionCpuModified(vaddr, size);
-	const bool buffer_gpu_modified =
-	    buffer_overlap && m_buffer_cache.IsRegionGpuModified(vaddr, size);
-	BufferImageCopySource source {nullptr, 0, vaddr, size, true};
-	if (buffer_overlap && !buffer_cpu_modified && !buffer_gpu_modified) {
-		source = m_buffer_cache.ObtainBufferForImage(vaddr, size);
-	}
-	const bool buffer_source_valid =
-	    !buffer_overlap || IsCoherentGuestImageSource(source, vaddr, size);
-	const bool image_cpu_modified = m_memory_tracker.IsRegionCpuModified(vaddr, size);
-	if (!match->gpu_modified || !buffer_source_valid || buffer_cpu_modified ||
-	    buffer_gpu_modified || match->buffer_modified || image_cpu_modified) {
-		EXIT("TextureCache: compute stencil clear requires a GPU-owned depth image and a clean "
-		     "stencil source, addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " gpu_modified=%d buffer_overlap=%d source_valid=%d buffer_cpu_modified=%d"
-		     " buffer_gpu_modified=%d buffer_modified=%d image_cpu_modified=%d\n",
-		     vaddr, size, match->gpu_modified, buffer_overlap, buffer_source_valid,
-		     buffer_cpu_modified, buffer_gpu_modified, match->buffer_modified, image_cpu_modified);
-	}
-	if (match->image->layout == VK_IMAGE_LAYOUT_UNDEFINED ||
-	    match->image->layout == VK_IMAGE_LAYOUT_PREINITIALIZED) {
-		EXIT("TextureCache: compute stencil clear has invalid source layout %u\n",
-		     static_cast<uint32_t>(match->image->layout));
-	}
-	auto*      vk_buffer  = command->GetPool()->buffers[command->GetIndex()];
-	const auto old_layout = match->image->layout;
-	GraphicsRenderDepthStencilImageBarrier(vk_buffer, match->image,
-	                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-	const VkClearDepthStencilValue clear {0.0f, stencil_clear};
-	const VkImageSubresourceRange range {VK_IMAGE_ASPECT_STENCIL_BIT, 0, VK_REMAINING_MIP_LEVELS, 0,
+	const VkClearDepthStencilValue clear {depth_clear, stencil_clear};
+	const auto clear_aspect = static_cast<VkImageAspectFlags>(
+	    aspect == ClearAspect::Depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_STENCIL_BIT);
+	const VkImageSubresourceRange range {clear_aspect, 0, VK_REMAINING_MIP_LEVELS, 0,
 	                                     match->image->layers};
 	vkCmdClearDepthStencilImage(vk_buffer, match->image->image, match->image->layout, &clear, 1,
 	                            &range);
 	GraphicsRenderDepthStencilImageBarrier(vk_buffer, match->image, old_layout);
-	match->stencil_initialized = true;
+	if (aspect == ClearAspect::Stencil) {
+		match->stencil_initialized = true;
+	}
 	command->RetainResourceUntilFence(match);
 	return true;
 }
@@ -3529,17 +2708,18 @@ bool TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
 	return false;
 }
 
-DepthStencilVulkanImage* TextureCache::FindDepthTargetByRange(uint64_t vaddr, uint64_t size,
+DepthStencilVulkanImage* TextureCache::FindDepthTargetByRange(CommandBuffer* command,
+	                                                          uint64_t vaddr, uint64_t size,
 	                                                          bool allow_containing_sampled) {
-	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	if (command == nullptr || vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
 		EXIT("TextureCache: invalid depth-target range query, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	FaultSafeTextureLock     lock(this, m_lock);
-	DepthStencilVulkanImage* found = nullptr;
-	for (auto& cached: m_images) {
+	FaultSafeTextureLock lock(this, m_lock);
+	CachedImage*         found = nullptr;
+	for (auto* cached: FindImagesInRegionLocked(vaddr, size, false)) {
 		if (cached->kind != CachedImage::Kind::DepthTarget ||
 		    !cached->OverlapsRange(vaddr, size, false)) {
 			continue;
@@ -3564,9 +2744,18 @@ DepthStencilVulkanImage* TextureCache::FindDepthTargetByRange(uint64_t vaddr, ui
 			     " size=0x%016" PRIx64 "\n",
 			     vaddr, size);
 		}
-		found = static_cast<DepthStencilVulkanImage*>(cached->image);
+		found = cached;
 	}
-	return found;
+	if (found == nullptr) {
+		return nullptr;
+	}
+	const auto owner = std::find_if(m_images.begin(), m_images.end(),
+	                                [found](const auto& image) { return image.get() == found; });
+	if (owner == m_images.end()) {
+		EXIT("TextureCache: page-table depth target has no cache owner\n");
+	}
+	command->RetainResourceUntilFence(*owner);
+	return static_cast<DepthStencilVulkanImage*>(found->image);
 }
 
 RenderTextureVulkanImage* TextureCache::FindRenderTargetByRange(CommandBuffer* command,
@@ -3612,59 +2801,30 @@ RenderTextureVulkanImage* TextureCache::FindRenderTargetByRange(CommandBuffer* c
 	return static_cast<RenderTextureVulkanImage*>(found->image);
 }
 
-bool TextureCache::HasGpuTargetPageOverlap(uint64_t vaddr, uint64_t size) {
+TextureCache::RegionInfo TextureCache::QueryRegion(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
-		EXIT("TextureCache: invalid GPU-target overlap query, addr=0x%016" PRIx64
+		EXIT("TextureCache: invalid region query, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
 	FaultSafeTextureLock lock(this, m_lock);
-	for (const auto* cached: FindImagesInRegionLocked(vaddr, size, true)) {
-		if (cached->kind != CachedImage::Kind::Texture &&
-		    cached->OverlapsRange(vaddr, size, true)) {
-			return true;
-		}
+	RegionInfo result;
+	const auto candidates = FindImagesInRegionLocked(vaddr, size, true);
+	result.image_pages    = !candidates.empty();
+	for (const auto* cached: candidates) {
+		const bool bytes = cached->OverlapsRange(vaddr, size, false);
+		result.image_bytes |= bytes;
+		result.gpu_image_bytes |= bytes && cached->gpu_modified;
+		result.non_sampled_pages |= cached->kind != CachedImage::Kind::Texture;
 	}
-	return false;
-}
-
-bool TextureCache::HasPageOverlap(uint64_t vaddr, uint64_t size) {
-	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
-	    size > TRACKER_ADDRESS_SIZE - vaddr) {
-		EXIT("TextureCache: invalid image page-overlap query, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
+	for (const auto& [address, metadata]: m_surface_metas) {
+		result.metadata_pages |= ImagePageRangesOverlap(vaddr, size, address, metadata.size);
+		result.metadata_bytes |= ImageRangeOverlaps(vaddr, size, address, metadata.size);
 	}
-	FaultSafeTextureLock lock(this, m_lock);
-	return !FindImagesInRegionLocked(vaddr, size, true).empty();
-}
-
-bool TextureCache::HasRangeOverlap(uint64_t vaddr, uint64_t size) {
-	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
-	    size > TRACKER_ADDRESS_SIZE - vaddr) {
-		EXIT("TextureCache: invalid image-range-overlap query, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
-	}
-	FaultSafeTextureLock lock(this, m_lock);
-	return !FindImagesInRegionLocked(vaddr, size, false).empty();
-}
-
-bool TextureCache::HasGpuModifiedRangeOverlap(uint64_t vaddr, uint64_t size) {
-	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
-	    size > TRACKER_ADDRESS_SIZE - vaddr) {
-		EXIT("TextureCache: invalid GPU-modified image-overlap query, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
-	}
-	FaultSafeTextureLock lock(this, m_lock);
-	for (const auto* cached: FindImagesInRegionLocked(vaddr, size, false)) {
-		if (cached->gpu_modified && cached->OverlapsRange(vaddr, size, false)) {
-			return true;
-		}
-	}
-	return false;
+	result.gpu_metadata_bytes =
+	    result.metadata_bytes && m_metadata_tracker.IsRegionGpuModified(vaddr, size);
+	return result;
 }
 
 void TextureCache::RegisterMeta(uint64_t vaddr, uint64_t size, uint32_t layers) {
@@ -3768,52 +2928,6 @@ bool TextureCache::IsMetaRange(uint64_t vaddr, uint64_t size) {
 	FaultSafeTextureLock lock(this, m_lock);
 	const auto           it = m_surface_metas.find(vaddr);
 	return it != m_surface_metas.end() && it->second.size == size;
-}
-
-bool TextureCache::HasMetaRangeOverlap(uint64_t vaddr, uint64_t size) {
-	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
-	    size > TRACKER_ADDRESS_SIZE - vaddr) {
-		EXIT("TextureCache: invalid metadata-range query, addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     "\n",
-		     vaddr, size);
-	}
-	FaultSafeTextureLock lock(this, m_lock);
-	return std::any_of(m_surface_metas.begin(), m_surface_metas.end(), [&](const auto& entry) {
-		return ImageRangeOverlaps(vaddr, size, entry.first, entry.second.size);
-	});
-}
-
-bool TextureCache::HasMetaOverlap(uint64_t vaddr, uint64_t size) {
-	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
-	    size > TRACKER_ADDRESS_SIZE - vaddr) {
-		EXIT("TextureCache: invalid metadata-overlap query, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
-	}
-	FaultSafeTextureLock lock(this, m_lock);
-	for (const auto& [address, meta]: m_surface_metas) {
-		if (ImagePageRangesOverlap(vaddr, size, address, meta.size)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-bool TextureCache::IsMetaGpuModified(uint64_t vaddr, uint64_t size) {
-	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
-	    size > TRACKER_ADDRESS_SIZE - vaddr) {
-		EXIT("TextureCache: invalid metadata ownership query, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
-	}
-	FaultSafeTextureLock lock(this, m_lock);
-	for (const auto& [address, meta]: m_surface_metas) {
-		if (ImageRangeOverlaps(vaddr, size, address, meta.size) &&
-		    m_metadata_tracker.IsRegionGpuModified(vaddr, size)) {
-			return true;
-		}
-	}
-	return false;
 }
 
 bool TextureCache::HasMetaOverlapLocked(uint64_t vaddr, uint64_t size) const {
@@ -4119,199 +3233,16 @@ void TextureCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	}
 }
 
-static constexpr int DummyTextureIndex(bool uint_format, bool image_3d) {
-	return (image_3d ? 2 : 0) + (uint_format ? 1 : 0);
-}
-
-static constexpr uint32_t DummyTextureSwizzle() {
-	return Prospero::GpuEnumValue(Prospero::CompSwizzle::kRed) |
-	       (Prospero::GpuEnumValue(Prospero::CompSwizzle::kGreen) << 3u) |
-	       (Prospero::GpuEnumValue(Prospero::CompSwizzle::kBlue) << 6u) |
-	       (Prospero::GpuEnumValue(Prospero::CompSwizzle::kAlpha) << 9u);
-}
-
-static TextureImageCreateParams MakeDummyTextureParams(bool uint_format, bool image_3d,
-                                                       TextureFormatUsage usage,
-                                                       const char*        owner) {
-	TextureImageCreateParams params {};
-	params.fmt = static_cast<uint32_t>(
-	    Prospero::GpuEnumValue(uint_format ? Prospero::BufferFormat::k8_8_8_8UInt
-	                                       : Prospero::BufferFormat::k8_8_8_8UNorm));
-	params.width                 = 1;
-	params.height                = 1;
-	params.base_level            = 0;
-	params.levels                = 1;
-	params.depth                 = 1;
-	params.type                  = Prospero::GpuEnumValue(image_3d ? Prospero::ImageType::kColor3D
-	                                                               : Prospero::ImageType::kColor2D);
-	params.swizzle               = DummyTextureSwizzle();
-	params.format_usage          = usage;
-	params.required_format_usage = usage;
-	params.view_usage            = usage;
-	params.image_layout          = TextureUploadDestination::MipLevels;
-	params.allow_cube_view       = true;
-	params.storage_swizzle_fallback = TextureHasFormatUsage(usage, TextureFormatUsage::Storage);
-	params.owner                    = owner;
-	return params;
-}
-
-static VulkanImage* CreateDummyTexture(GraphicContext* ctx, bool uint_format, bool image_3d,
-                                       bool storage, VulkanMemory** memory) {
-	if (memory == nullptr || *memory != nullptr) {
-		EXIT("TextureCache: invalid dummy texture memory slot, slot=%p current=%p storage=%d\n",
-		     static_cast<const void*>(memory),
-		     memory == nullptr ? nullptr : static_cast<const void*>(*memory), storage);
-	}
-	auto* image  = (storage ? static_cast<VulkanImage*>(new StorageTextureVulkanImage)
-	                        : new TextureVulkanImage);
-	auto  usage  = (storage ? TextureFormatUsage::Storage : TextureFormatUsage::Sampled);
-	auto  layout = (storage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-	auto  owner  = (storage ? "DummyStorageTexture" : "DummySampledTexture");
-
-	*memory         = new VulkanMemory {};
-	auto params     = MakeDummyTextureParams(uint_format, image_3d, usage, owner);
-	auto components = TextureCreateImage(ctx, image, *memory, params);
-
-	static constexpr uint32_t zero = 0;
-	UtilFillImage(ctx, image, &zero, sizeof(zero), 1, static_cast<uint64_t>(layout));
-	TextureCreateImageViews(ctx, image, components, params.type, 0, params.base_level,
-	                        params.levels, params.depth, params.allow_cube_view, params.view_usage);
-	return image;
-}
-
-void TextureCache::DeleteImageViews(GraphicContext* ctx, VulkanImage* image) {
-	EXIT_IF(ctx == nullptr);
-	EXIT_IF(image == nullptr);
-
-	for (auto& cached: image->view_cache.views) {
-		if (cached.view != nullptr) {
-			vkDestroyImageView(ctx->device, cached.view, nullptr);
-			cached.view = nullptr;
-		}
-	}
-	image->view_cache.views.clear();
-	for (auto& view: image->image_view) {
-		if (view != nullptr) {
-			vkDestroyImageView(ctx->device, view, nullptr);
-			view = nullptr;
-		}
-	}
-}
-
-void TextureCache::DeleteGpuTexture(GraphicContext* ctx, GpuTextureVulkanImage* image,
-                                    VulkanMemory* mem) {
-	KYTY_PROFILER_BLOCK("TextureCache::DeleteGpuTexture");
-
-	EXIT_IF(ctx == nullptr);
-	EXIT_IF(image == nullptr);
-
-	DeleteImageViews(ctx, image);
-	VulkanDeleteImage(ctx, image, mem);
-
-	switch (image->type) {
-		case VulkanImageType::Texture: delete static_cast<TextureVulkanImage*>(image); break;
-		case VulkanImageType::StorageTexture:
-			delete static_cast<StorageTextureVulkanImage*>(image);
-			break;
-		default: EXIT("unsupported gpu texture image type: %d\n", static_cast<int>(image->type));
-	}
-}
-
-void TextureCache::DeleteRenderTexture(GraphicContext* ctx, RenderTextureVulkanImage* image,
-                                       VulkanMemory* mem) {
-	KYTY_PROFILER_BLOCK("TextureCache::DeleteRenderTexture");
-
-	EXIT_IF(ctx == nullptr);
-	EXIT_IF(image == nullptr);
-
-	g_render_ctx->GetFramebufferCache()->FreeFramebufferByColor(image);
-	for (auto& view: image->render_view) {
-		if (view != nullptr) {
-			vkDestroyImageView(ctx->device, view, nullptr);
-			view = nullptr;
-		}
-	}
-	for (auto& cached: image->attachment_views) {
-		if (cached.view != nullptr) {
-			vkDestroyImageView(ctx->device, cached.view, nullptr);
-			cached.view = nullptr;
-		}
-	}
-	image->attachment_views.clear();
-	DeleteImageViews(ctx, image);
-	VulkanDeleteImage(ctx, image, mem);
-	delete image;
-}
-
-void TextureCache::DeleteDepthStencil(GraphicContext* ctx, DepthStencilVulkanImage* image,
-                                      VulkanMemory* mem) {
-	KYTY_PROFILER_BLOCK("TextureCache::DeleteDepthStencil");
-
-	EXIT_IF(ctx == nullptr);
-	EXIT_IF(image == nullptr);
-
-	g_render_ctx->GetFramebufferCache()->FreeFramebufferByDepth(image);
-	for (auto& cached: image->attachment_views) {
-		if (cached.view != nullptr) {
-			vkDestroyImageView(ctx->device, cached.view, nullptr);
-			cached.view = nullptr;
-		}
-	}
-	image->attachment_views.clear();
-	DeleteImageViews(ctx, image);
-	VulkanDeleteImage(ctx, image, mem);
-	delete image;
-}
-
-void TextureCache::DeleteVideoOut(GraphicContext* ctx, VideoOutVulkanImage* image,
-                                  VulkanMemory* mem) {
-	KYTY_PROFILER_BLOCK("TextureCache::DeleteVideoOut");
-
-	EXIT_IF(ctx == nullptr);
-	EXIT_IF(image == nullptr);
-
-	g_render_ctx->GetFramebufferCache()->FreeFramebufferByColor(image);
-	DeleteImageViews(ctx, image);
-	VulkanDeleteImage(ctx, image, mem);
-	delete image;
-}
-
 VulkanImage* TextureCache::GetDummySampledTexture(bool uint_format, bool image_3d) {
 	KYTY_PROFILER_BLOCK("TextureCache::GetDummySampledTexture");
-
-	Common::LockGuard lock(m_dummy_mutex);
-	auto*             ctx = g_render_ctx->GetGraphicCtx();
-	if (m_dummy_ctx != nullptr && m_dummy_ctx != ctx) {
-		EXIT("TextureCache: sampled dummy texture context changed, previous=%p current=%p\n",
-		     static_cast<const void*>(m_dummy_ctx), static_cast<const void*>(ctx));
-	}
-	m_dummy_ctx      = ctx;
-	const auto index = DummyTextureIndex(uint_format, image_3d);
-	auto*&     image = m_dummy_sampled_textures[index];
-	if (image == nullptr) {
-		image =
-		    CreateDummyTexture(ctx, uint_format, image_3d, false, &m_dummy_sampled_memory[index]);
-	}
-	return image;
+	return m_dummy_textures->Get(g_render_ctx->GetGraphicCtx(), DummyTextureCache::Usage::Sampled,
+	                             uint_format, image_3d);
 }
 
 VulkanImage* TextureCache::GetDummyStorageTexture(bool uint_format, bool image_3d) {
 	KYTY_PROFILER_BLOCK("TextureCache::GetDummyStorageTexture");
-
-	Common::LockGuard lock(m_dummy_mutex);
-	auto*             ctx = g_render_ctx->GetGraphicCtx();
-	if (m_dummy_ctx != nullptr && m_dummy_ctx != ctx) {
-		EXIT("TextureCache: storage dummy texture context changed, previous=%p current=%p\n",
-		     static_cast<const void*>(m_dummy_ctx), static_cast<const void*>(ctx));
-	}
-	m_dummy_ctx      = ctx;
-	const auto index = DummyTextureIndex(uint_format, image_3d);
-	auto*&     image = m_dummy_storage_textures[index];
-	if (image == nullptr) {
-		image =
-		    CreateDummyTexture(ctx, uint_format, image_3d, true, &m_dummy_storage_memory[index]);
-	}
-	return image;
+	return m_dummy_textures->Get(g_render_ctx->GetGraphicCtx(), DummyTextureCache::Usage::Storage,
+	                             uint_format, image_3d);
 }
 
 } // namespace Libs::Graphics

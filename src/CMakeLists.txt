@@ -137,7 +137,7 @@ config_compiler_and_linker()
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory(common)
 
-file(GLOB kyty_emulator_src
+file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	libs/*.cpp
 	libs/*.h
 	graphics/*.cpp

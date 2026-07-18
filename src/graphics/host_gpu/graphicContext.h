@@ -75,7 +75,7 @@ struct ImageViewInfo {
 	uint32_t           base_layer  = 0;
 	uint32_t           layer_count = 1;
 	uint32_t           swizzle     = 0;
-	bool               is_storage  = false;
+	VkImageUsageFlags  usage       = VK_IMAGE_USAGE_SAMPLED_BIT;
 
 	bool operator==(const ImageViewInfo&) const = default;
 };
@@ -121,15 +121,8 @@ struct VideoOutVulkanImage: public VulkanImage {
 };
 
 struct DepthStencilVulkanImage: public VulkanImage {
-	struct AttachmentView {
-		uint32_t    base_layer  = 0;
-		uint32_t    layer_count = 1;
-		VkImageView view        = nullptr;
-	};
 	DepthStencilVulkanImage(): VulkanImage(VulkanImageType::DepthStencil) {}
-	bool                        compressed = false;
-	std::mutex                  attachment_view_mutex;
-	std::vector<AttachmentView> attachment_views;
+	bool compressed = false;
 };
 
 struct GpuTextureVulkanImage: public VulkanImage {
@@ -145,17 +138,7 @@ struct StorageTextureVulkanImage: public GpuTextureVulkanImage {
 };
 
 struct RenderTextureVulkanImage: public VulkanImage {
-	struct AttachmentView {
-		VkFormat    format      = VK_FORMAT_UNDEFINED;
-		uint32_t    level       = 0;
-		uint32_t    base_layer  = 0;
-		uint32_t    layer_count = 1;
-		VkImageView view        = nullptr;
-	};
 	RenderTextureVulkanImage(): VulkanImage(VulkanImageType::RenderTexture) {}
-	VkImageView                 render_view[16] = {};
-	std::mutex                  attachment_view_mutex;
-	std::vector<AttachmentView> attachment_views;
 };
 
 struct VulkanBuffer {

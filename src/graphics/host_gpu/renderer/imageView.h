@@ -214,6 +214,18 @@ ValidateStorageImageResource(const ShaderRecompiler::IR::ImageResource& resource
 	}
 }
 
+namespace ImageViewOps {
+
+[[nodiscard]] VkImageAspectFlags DepthAspectMask(VkFormat format) noexcept;
+[[nodiscard]] bool FormatSupportsStorage(GraphicContext* ctx, VkFormat format);
+
+void CreateRenderTargetViews(GraphicContext* ctx, RenderTextureVulkanImage* image);
+void CreateDepthViews(GraphicContext* ctx, DepthStencilVulkanImage* image);
+void CreateVideoOutViews(GraphicContext* ctx, VideoOutVulkanImage* image);
+void DestroyViews(GraphicContext* ctx, VulkanImage* image);
+
+} // namespace ImageViewOps
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGEVIEW_H_

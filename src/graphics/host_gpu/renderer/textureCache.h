@@ -9,7 +9,6 @@
 #include "graphics/host_gpu/renderer/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/tiler.h"
 
-#include <array>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -29,10 +28,21 @@ struct VulkanImage;
 struct VulkanMemory;
 class BufferCache;
 class CommandBuffer;
+class DummyTextureCache;
 class ResourceMutex;
 
 class TextureCache {
 public:
+	struct RegionInfo {
+		bool image_pages          = false;
+		bool image_bytes          = false;
+		bool gpu_image_bytes      = false;
+		bool non_sampled_pages    = false;
+		bool metadata_pages       = false;
+		bool metadata_bytes       = false;
+		bool gpu_metadata_bytes   = false;
+	};
+
 	TextureCache(PageManager& page_manager, BufferCache& buffer_cache,
 	             ResourceMutex& resource_mutex);
 	~TextureCache();
@@ -50,12 +60,8 @@ public:
 	     RegisterVideoOutSurfaces(GraphicContext* ctx, const std::vector<VideoOutInfo>& infos);
 	void RefreshVideoOut(VideoOutVulkanImage* image, bool render_target = false);
 	void UnregisterVideoOutSurfaces(const std::vector<VideoOutVulkanImage*>& images);
-	[[nodiscard]] bool ClearColorImageFromBuffer(CommandBuffer* command, uint64_t vaddr,
-	                                             uint64_t size, uint32_t packed_clear);
-	[[nodiscard]] bool ClearDepthImageFromBuffer(CommandBuffer* command, uint64_t vaddr,
-	                                             uint64_t size, uint32_t packed_clear);
-	[[nodiscard]] bool ClearStencilImageFromBuffer(CommandBuffer* command, uint64_t vaddr,
-	                                               uint64_t size, uint32_t packed_clear);
+	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer* command, uint64_t vaddr, uint64_t size,
+	                                        uint32_t packed_clear);
 	void               MarkGpuWritten(VulkanImage* image);
 	void               PrepareHostWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
@@ -94,31 +100,18 @@ public:
 	                                                       StorageTextureVulkanImage* image,
 	                                                       uint32_t                   base_level);
 	[[nodiscard]] DepthStencilVulkanImage*
-	FindDepthTargetByRange(uint64_t vaddr, uint64_t size, bool allow_containing_sampled = false);
-	[[nodiscard]] bool HasPageOverlap(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool HasRangeOverlap(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool HasGpuModifiedRangeOverlap(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool HasGpuTargetPageOverlap(uint64_t vaddr, uint64_t size);
+	FindDepthTargetByRange(CommandBuffer* command, uint64_t vaddr, uint64_t size,
+	                       bool allow_containing_sampled = false);
+	[[nodiscard]] RegionInfo QueryRegion(uint64_t vaddr, uint64_t size);
 	void               RegisterMeta(uint64_t vaddr, uint64_t size, uint32_t layers = 1);
 	[[nodiscard]] bool IsMeta(uint64_t vaddr);
 	[[nodiscard]] bool IsMetaRange(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool HasMetaRangeOverlap(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool HasMetaOverlap(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool IsMetaGpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMetaCleared(uint64_t vaddr, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t vaddr);
 	[[nodiscard]] bool TouchMeta(uint64_t vaddr, uint32_t slice, bool is_clear);
 	[[nodiscard]] bool InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,
 	                                    PageFaultPhase phase) noexcept;
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
-
-	static void DeleteGpuTexture(GraphicContext* ctx, GpuTextureVulkanImage* image,
-	                             VulkanMemory* mem);
-	static void DeleteRenderTexture(GraphicContext* ctx, RenderTextureVulkanImage* image,
-	                                VulkanMemory* mem);
-	static void DeleteDepthStencil(GraphicContext* ctx, DepthStencilVulkanImage* image,
-	                               VulkanMemory* mem);
-	static void DeleteVideoOut(GraphicContext* ctx, VideoOutVulkanImage* image, VulkanMemory* mem);
 
 	VulkanImage* GetDummySampledTexture(bool uint_format, bool image_3d);
 	VulkanImage* GetDummyStorageTexture(bool uint_format, bool image_3d);
@@ -133,7 +126,6 @@ private:
 		uint32_t clear_mask   = 0;
 		bool     gpu_modified = false;
 	};
-	static void                DeleteImageViews(GraphicContext* ctx, VulkanImage* image);
 	[[nodiscard]] VkImageView  GetImageView(GraphicContext* ctx, VulkanImage* image,
 	                                        const ImageViewInfo& info);
 	[[nodiscard]] bool         HasMetaOverlapLocked(uint64_t vaddr, uint64_t size) const;
@@ -145,6 +137,8 @@ private:
 	void RetireStorageDepthAliasLocked(GraphicContext* ctx, const ImageInfo& requested);
 	void RegisterImageLocked(CachedImage& image);
 	void UnregisterImageLocked(CachedImage& image, bool release_tracking);
+	[[nodiscard]] VulkanImage* PublishImage(CommandBuffer* command,
+	                                        std::shared_ptr<CachedImage> image);
 	[[nodiscard]] std::vector<CachedImage*>
 	FindImagesInRegionLocked(uint64_t vaddr, uint64_t size, bool page_overlap);
 	void RequireRetirementIsolation(const std::vector<CachedImage*>& retire, const char* operation,
@@ -156,12 +150,7 @@ private:
 	void SynchronizeDepthImageToBufferLocked(CachedImage& cached, uint64_t write_address,
 	                                         uint64_t write_size);
 
-	Common::Mutex                             m_dummy_mutex;
-	std::array<VulkanImage*, 4>               m_dummy_sampled_textures {};
-	std::array<VulkanImage*, 4>               m_dummy_storage_textures {};
-	std::array<VulkanMemory*, 4>              m_dummy_sampled_memory {};
-	std::array<VulkanMemory*, 4>              m_dummy_storage_memory {};
-	GraphicContext*                           m_dummy_ctx = nullptr;
+	std::unique_ptr<DummyTextureCache>         m_dummy_textures;
 	TrackingSpinLock                          m_lock;
 	std::mutex                                m_fault_mutex;
 	MemoryTracker                             m_memory_tracker;

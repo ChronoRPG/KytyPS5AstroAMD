@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image.h"
 #include "graphics/host_gpu/renderer/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -1138,6 +1139,14 @@ public:
         &context, &image, image.format, 0, 1, VK_IMAGE_VIEW_TYPE_2D, 0, 1);
     const auto storage_again = texture_cache.GetRenderTargetStorageView(
         &context, &image, image.format, 0, 1, VK_IMAGE_VIEW_TYPE_2D, 0, 1);
+    const auto attachment = texture_cache.GetRenderTargetAttachmentView(
+        &context, &image, image.format, 0, 0, 1);
+    const auto attachment_again = texture_cache.GetRenderTargetAttachmentView(
+        &context, &image, image.format, 0, 0, 1);
+    const auto attachment_mip = texture_cache.GetRenderTargetAttachmentView(
+        &context, &image, image.format, 1, 0, 1);
+    const auto attachment_array = texture_cache.GetRenderTargetAttachmentView(
+        &context, &image, image.format, 0, 0, 2);
     Require(name, "cache identity",
             first != VK_NULL_HANDLE && first_again == first &&
                 second != VK_NULL_HANDLE && second != first &&
@@ -1148,14 +1157,17 @@ public:
                 reinterpreted_format != VK_NULL_HANDLE &&
                 reinterpreted_format != native_format &&
                 storage != VK_NULL_HANDLE && storage != native_format &&
-                storage_again == storage && image.view_cache.views.size() == 8,
-            "view cache omitted usage, swizzle, format, type, mip, or layer "
-            "identity");
+                storage_again == storage && attachment != VK_NULL_HANDLE &&
+                attachment_again == attachment && attachment != native_format &&
+                attachment != storage && attachment_mip != VK_NULL_HANDLE &&
+                attachment_mip != attachment && attachment_array != VK_NULL_HANDLE &&
+                attachment_array != attachment && image.view_cache.views.size() == 11,
+            "view cache omitted attachment usage, swizzle, format, type, mip, "
+            "or layer identity");
 
-    for (const auto &view : image.view_cache.views) {
-      vkDestroyImageView(m_device, view.view, nullptr);
-    }
-    image.view_cache.views.clear();
+    ImageViewOps::DestroyViews(&context, &image);
+    Require(name, "view teardown", image.view_cache.views.empty(),
+            "dynamic render-target views survived DestroyViews");
     vkDestroyImage(m_device, image_handle, nullptr);
     vkFreeMemory(m_device, memory, nullptr);
     std::printf("[host]    %-32s ok\n", name);
@@ -1232,19 +1244,30 @@ public:
     const auto array_view = texture_cache.GetDepthTargetSampledView(
         &context, &image, VK_FORMAT_R32_SFLOAT, replicated, 0, 1,
         VK_IMAGE_VIEW_TYPE_2D_ARRAY, 0, 2);
+    const auto attachment = texture_cache.GetDepthTargetAttachmentView(
+        &context, &image, 0, 1);
+    const auto attachment_again = texture_cache.GetDepthTargetAttachmentView(
+        &context, &image, 0, 1);
+    const auto attachment_layer = texture_cache.GetDepthTargetAttachmentView(
+        &context, &image, 1, 1);
+    const auto attachment_array = texture_cache.GetDepthTargetAttachmentView(
+        &context, &image, 0, 2);
     Require(name, "cache identity",
             first != VK_NULL_HANDLE && first_again == first &&
                 different_swizzle != VK_NULL_HANDLE &&
                 different_swizzle != first &&
                 different_layer != VK_NULL_HANDLE && different_layer != first &&
                 array_view != VK_NULL_HANDLE && array_view != first &&
-                image.view_cache.views.size() == 4,
-            "sampled depth cache omitted swizzle, type, or layer identity");
+                attachment != VK_NULL_HANDLE && attachment_again == attachment &&
+                attachment != first && attachment_layer != VK_NULL_HANDLE &&
+                attachment_layer != attachment && attachment_array != VK_NULL_HANDLE &&
+                attachment_array != attachment && image.view_cache.views.size() == 7,
+            "depth view cache omitted attachment usage, swizzle, type, or layer "
+            "identity");
 
-    for (const auto &view : image.view_cache.views) {
-      vkDestroyImageView(m_device, view.view, nullptr);
-    }
-    image.view_cache.views.clear();
+    ImageViewOps::DestroyViews(&context, &image);
+    Require(name, "view teardown", image.view_cache.views.empty(),
+            "dynamic depth-target views survived DestroyViews");
     vkDestroyImage(m_device, image_handle, nullptr);
     vkFreeMemory(m_device, memory, nullptr);
     std::printf("[host]    %-32s ok\n", name);
@@ -1255,7 +1278,7 @@ public:
     auto backing = CreateImage2D(name, 8, 8, VK_FORMAT_R8G8B8A8_UNORM,
                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                                      VK_IMAGE_USAGE_SAMPLED_BIT,
-                                 {}, 1, VK_IMAGE_LAYOUT_UNDEFINED);
+                                 {}, 1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
     GraphicContext context{};
     context.physical_device = m_physical_device;
@@ -1296,13 +1319,122 @@ public:
             "video-out sampled views did not use identity fast path and lazy "
             "mappings");
 
-    for (const auto &view : image.view_cache.views) {
-      vkDestroyImageView(m_device, view.view, nullptr);
-    }
-    image.view_cache.views.clear();
+    ImageViewOps::DestroyViews(&context, &image);
+    Require(name, "view teardown",
+            image.view_cache.views.empty() &&
+                std::all_of(std::begin(image.image_view),
+                            std::end(image.image_view),
+                            [](VkImageView view) { return view == VK_NULL_HANDLE; }),
+            "dynamic or fixed video-out views survived DestroyViews");
+    backing.view = VK_NULL_HANDLE;
     DestroyImage(&backing);
     std::printf("[host]    %-32s ok\n", name);
   }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  void CheckQueryRegionImageClassification() {
+    constexpr const char *name = "QueryRegionImageClassification";
+    constexpr uintptr_t base = 0x0000000200100000ull;
+    constexpr uint64_t allocation_size = 0x4000;
+    auto *memory = static_cast<uint8_t *>(VirtualAlloc(
+        reinterpret_cast<void *>(base), allocation_size,
+        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    Require(name, "allocation", memory == reinterpret_cast<void *>(base),
+            "fixed VirtualAlloc failed");
+    std::memset(memory, 0, allocation_size);
+
+    EnsureRuntimeContext();
+    ResourceMutex resource_mutex;
+    PageManager page_manager(RejectUnexpectedPageFault, nullptr);
+    BufferCache buffer_cache(page_manager, resource_mutex);
+    TextureCache texture_cache(page_manager, buffer_cache, resource_mutex);
+    buffer_cache.SetTextureCache(texture_cache);
+    page_manager.OnGpuMap(base, allocation_size);
+
+    constexpr auto format =
+        Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm);
+    constexpr auto linear =
+        Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
+    ImageInfo sampled_info{};
+    sampled_info.address = base + 0x100;
+    sampled_info.format = format;
+    sampled_info.width = 4;
+    sampled_info.height = 4;
+    sampled_info.pitch = TileGetTexturePitch(format, sampled_info.width, 1, linear);
+    sampled_info.tile = linear;
+    sampled_info.type = Prospero::GpuEnumValue(Prospero::ImageType::kColor2D);
+    TileSizeAlign sampled_size{};
+    TileGetTextureTotalSize(format, sampled_info.width, sampled_info.height,
+                            sampled_info.depth, sampled_info.pitch,
+                            sampled_info.levels, linear, false, &sampled_size);
+    sampled_info.size = sampled_size.size;
+    Require(name, "sampled fixture",
+            sampled_info.size != 0 && sampled_size.align != 0 &&
+                sampled_info.size <= 0x600 &&
+                sampled_info.address % sampled_size.align == 0,
+            "sampled image does not fit the intended sub-page fixture");
+
+    RenderTargetInfo target_info{};
+    target_info.address = base + 0x1100;
+    target_info.size = 0x100;
+    target_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    target_info.width = 4;
+    target_info.height = 4;
+    target_info.pitch = 4;
+    target_info.bytes_per_element = 4;
+    target_info.tile_mode = linear;
+
+    {
+      CommandBuffer command(GraphicContext::QUEUE_GFX);
+      auto *sampled =
+          texture_cache.FindTexture(&command, &m_runtime_context, sampled_info, false);
+      auto *target =
+          texture_cache.FindRenderTarget(&command, &m_runtime_context, target_info);
+      Require(name, "registration", sampled != nullptr && target != nullptr,
+              "sampled or non-sampled image registration failed");
+
+      const auto sampled_bytes =
+          texture_cache.QueryRegion(sampled_info.address + 0x20, 0x20);
+      const auto sampled_page = texture_cache.QueryRegion(base + 0x800, 0x20);
+      Require(name, "sampled classification",
+              sampled_bytes.image_pages && sampled_bytes.image_bytes &&
+                  !sampled_bytes.gpu_image_bytes &&
+                  !sampled_bytes.non_sampled_pages && sampled_page.image_pages &&
+                  !sampled_page.image_bytes && !sampled_page.gpu_image_bytes &&
+                  !sampled_page.non_sampled_pages,
+              "sampled image page and byte ownership were not separated");
+
+      const auto target_bytes =
+          texture_cache.QueryRegion(target_info.address + 0x20, 0x20);
+      const auto target_page =
+          texture_cache.QueryRegion(target_info.address + 0x400, 0x20);
+      Require(name, "non-sampled classification",
+              target_bytes.image_pages && target_bytes.image_bytes &&
+                  !target_bytes.gpu_image_bytes && target_bytes.non_sampled_pages &&
+                  target_page.image_pages && !target_page.image_bytes &&
+                  !target_page.gpu_image_bytes && target_page.non_sampled_pages,
+              "non-sampled image page and byte ownership were not separated");
+
+      texture_cache.MarkGpuWritten(target);
+      const auto gpu_bytes =
+          texture_cache.QueryRegion(target_info.address + 0x20, 0x20);
+      const auto gpu_page =
+          texture_cache.QueryRegion(target_info.address + 0x400, 0x20);
+      Require(name, "GPU ownership",
+              gpu_bytes.image_pages && gpu_bytes.image_bytes &&
+                  gpu_bytes.gpu_image_bytes && gpu_bytes.non_sampled_pages &&
+                  gpu_page.image_pages && !gpu_page.image_bytes &&
+                  !gpu_page.gpu_image_bytes && gpu_page.non_sampled_pages,
+              "GPU ownership escaped the target's exact byte range");
+
+      texture_cache.UnmapMemory(base, allocation_size);
+      page_manager.OnGpuUnmap(base, allocation_size);
+    }
+    Require(name, "free", VirtualFree(memory, 0, MEM_RELEASE) != 0,
+            "VirtualFree failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+#endif
 
   Buffer CreateStorageBuffer(const char *shader_name,
                              const std::vector<u32> &initial,
@@ -2238,6 +2370,37 @@ public:
   }
 
 private:
+  void EnsureRuntimeContext() {
+    if (m_runtime_context.allocator != VK_NULL_HANDLE) {
+      return;
+    }
+    m_runtime_context.instance = m_instance;
+    m_runtime_context.physical_device = m_physical_device;
+    m_runtime_context.device = m_device;
+    vkGetPhysicalDeviceProperties(m_physical_device,
+                                  &m_runtime_context.physical_device_properties);
+    m_runtime_context.physical_device_memory_properties = m_memory_properties;
+    for (auto &queue : m_runtime_context.queues) {
+      queue.mutex = &m_runtime_queue_mutex;
+      queue.family = m_queue_family;
+      queue.index = 0;
+      queue.vk_queue = m_queue;
+    }
+
+    VmaAllocatorCreateInfo allocator_info{};
+    allocator_info.instance = m_instance;
+    allocator_info.physicalDevice = m_physical_device;
+    allocator_info.device = m_device;
+    allocator_info.vulkanApiVersion = VK_API_VERSION_1_2;
+    RequireVk("VulkanHarness", "runtime context",
+              vmaCreateAllocator(&allocator_info, &m_runtime_context.allocator),
+              "vmaCreateAllocator");
+    if (g_render_ctx == nullptr) {
+      GraphicsRenderInit();
+    }
+    g_render_ctx->SetGraphicCtx(&m_runtime_context);
+  }
+
   void Init() {
     VkApplicationInfo app{};
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -2330,6 +2493,12 @@ private:
   void Destroy() {
     if (m_device != VK_NULL_HANDLE) {
       vkDeviceWaitIdle(m_device);
+      if (m_runtime_context.allocator != VK_NULL_HANDLE) {
+        GraphicsRenderReleaseThreadCommandPools();
+        UtilReleaseCachedResources(&m_runtime_context);
+        vmaDestroyAllocator(m_runtime_context.allocator);
+        m_runtime_context.allocator = VK_NULL_HANDLE;
+      }
       if (m_command_pool != VK_NULL_HANDLE) {
         vkDestroyCommandPool(m_device, m_command_pool, nullptr);
       }
@@ -2565,6 +2734,8 @@ private:
   VkCommandPool m_command_pool = VK_NULL_HANDLE;
   u32 m_queue_family = 0;
   VkPhysicalDeviceMemoryProperties m_memory_properties{};
+  Common::Mutex m_runtime_queue_mutex;
+  GraphicContext m_runtime_context{};
 };
 
 void CompareWords(const TestCase &test, const char *stage,
@@ -11135,7 +11306,7 @@ void CheckOverlappingMetadataViews() {
           page_manager.HandleFault(PageFaultAccess::Write, second),
           "shared metadata page did not transfer to CPU ownership");
   Require("OverlappingMetadataViews", "ownership",
-          !texture_cache.IsMetaGpuModified(second, 0x1000),
+          !texture_cache.QueryRegion(second, 0x1000).gpu_metadata_bytes,
           "shared metadata page retained GPU ownership after a CPU fault");
 
   texture_cache.UnmapMemory(base, allocation_size);
@@ -11143,6 +11314,62 @@ void CheckOverlappingMetadataViews() {
   Require("OverlappingMetadataViews", "free",
           VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
   std::printf("[host]    %-32s ok\n", "OverlappingMetadataViews");
+}
+
+void CheckQueryRegionAggregation() {
+  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uint64_t allocation_size = 0x10000;
+  constexpr uint64_t metadata_size = 0x180;
+  auto *memory = static_cast<uint8_t *>(VirtualAlloc(
+      reinterpret_cast<void *>(base), allocation_size,
+      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  Require("QueryRegionAggregation", "allocation",
+          memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
+
+  ResourceMutex resource_mutex;
+  CacheFaultContext fault_context;
+  PageManager page_manager(CacheFault, &fault_context);
+  BufferCache buffer_cache(page_manager, resource_mutex);
+  TextureCache texture_cache(page_manager, buffer_cache, resource_mutex);
+  fault_context.texture = &texture_cache;
+  buffer_cache.SetTextureCache(texture_cache);
+  page_manager.OnGpuMap(base, allocation_size);
+
+  const auto empty = texture_cache.QueryRegion(base + 0x20, 0x40);
+  Require("QueryRegionAggregation", "empty",
+          !empty.image_pages && !empty.image_bytes && !empty.gpu_image_bytes &&
+              !empty.non_sampled_pages && !empty.metadata_pages &&
+              !empty.metadata_bytes && !empty.gpu_metadata_bytes,
+          "empty region reported cached ownership");
+
+  texture_cache.RegisterMeta(base, metadata_size);
+  const auto bytes = texture_cache.QueryRegion(base + 0x20, 0x40);
+  const auto page_only = texture_cache.QueryRegion(base + 0x400, 0x40);
+  const auto disjoint = texture_cache.QueryRegion(base + 0x1000, 0x40);
+  Require("QueryRegionAggregation", "page and byte overlap",
+          bytes.metadata_pages && bytes.metadata_bytes &&
+              !bytes.gpu_metadata_bytes && page_only.metadata_pages &&
+              !page_only.metadata_bytes && !page_only.gpu_metadata_bytes &&
+              !disjoint.metadata_pages && !disjoint.metadata_bytes &&
+              !bytes.image_pages && !bytes.image_bytes &&
+              !bytes.gpu_image_bytes && !bytes.non_sampled_pages,
+          "metadata page candidates were not separated from exact byte overlap");
+
+  Require("QueryRegionAggregation", "clear", texture_cache.ClearMeta(base),
+          "metadata clear setup failed");
+  const auto gpu_bytes = texture_cache.QueryRegion(base + 0x20, 0x40);
+  const auto gpu_page_only = texture_cache.QueryRegion(base + 0x400, 0x40);
+  Require("QueryRegionAggregation", "GPU ownership",
+          gpu_bytes.metadata_pages && gpu_bytes.metadata_bytes &&
+              gpu_bytes.gpu_metadata_bytes && gpu_page_only.metadata_pages &&
+              !gpu_page_only.metadata_bytes && !gpu_page_only.gpu_metadata_bytes,
+          "GPU metadata ownership escaped its exact registered byte range");
+
+  texture_cache.UnmapMemory(base, allocation_size);
+  page_manager.OnGpuUnmap(base, allocation_size);
+  Require("QueryRegionAggregation", "free", VirtualFree(memory, 0, MEM_RELEASE) != 0,
+          "VirtualFree failed");
+  std::printf("[host]    %-32s ok\n", "QueryRegionAggregation");
 }
 
 void CheckGpuMetadataReuse() {
@@ -11173,7 +11400,7 @@ void CheckGpuMetadataReuse() {
       texture_cache.InvalidateMemoryFromGPU(base, allocation_size);
   Require("GpuMetadataReuse", "discard",
           !full_image_transition && !texture_cache.IsMeta(base) &&
-              !texture_cache.HasMetaRangeOverlap(base, allocation_size),
+              !texture_cache.QueryRegion(base, allocation_size).metadata_bytes,
           "metadata-only overwrite retained identity or claimed an image transition");
   texture_cache.RegisterMeta(base, metadata_size, layers);
   Require("GpuMetadataReuse", "re-register",
@@ -12721,8 +12948,8 @@ void CheckHostDmaMetadataReuse() {
               reinterpret_cast<uint32_t *>(memory + 0x1ffc)[0] == 0x11223344,
           "post-clear CPU DMA fill did not publish backing");
   Require("HostDmaMetadataReuse", "identity",
-          texture_cache.HasMetaOverlap(base, metadata_size) &&
-              !texture_cache.IsMetaGpuModified(base, 0x2000) &&
+          texture_cache.QueryRegion(base, metadata_size).metadata_pages &&
+              !texture_cache.QueryRegion(base, 0x2000).gpu_metadata_bytes &&
               VirtualQuery(memory, &protection, sizeof(protection)) != 0 &&
               protection.Protect == PAGE_READWRITE,
           "CPU writes erased metadata identity or retained virtual ownership");
@@ -12827,6 +13054,9 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
     CheckImageOverlapResolution();
+    CheckQueryRegionAggregation();
+    VulkanHarness vulkan;
+    vulkan.CheckQueryRegionImageClassification();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
@@ -12935,6 +13165,7 @@ int main(int argc, char **argv) {
   CheckGpuMetadataReuse();
   CheckMetadataReuseDescriptors();
   CheckImageOverlapResolution();
+  CheckQueryRegionAggregation();
   CheckMsaaCompatibility();
   CheckDepthHtileStencilCompatibility();
   CheckStencilAttachmentAccess();
@@ -12951,6 +13182,7 @@ int main(int argc, char **argv) {
   CheckEmbeddedFetchLaneSpill();
   CheckPs5GameExampleImageClearRuntimeShape();
   VulkanHarness vulkan;
+  vulkan.CheckQueryRegionImageClassification();
   vulkan.CheckMutableStorageSrgbView();
   vulkan.CheckMutableRenderTargetBgraStorageView();
   vulkan.CheckRenderTargetViewCache();

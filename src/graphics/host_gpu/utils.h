@@ -110,6 +110,7 @@ void UtilFillBuffer(GraphicContext* ctx, void* dst_data, uint64_t size,
                     uint64_t src_layout);
 void UtilUploadBuffer(GraphicContext* ctx, StagingBufferType type, VulkanBuffer* dst_buffer,
                       uint64_t dst_offset, const void* src_data, uint64_t size);
+void UtilReleaseCachedResources(GraphicContext* ctx);
 void UtilCopyBuffer(VulkanBuffer* src_buffer, VulkanBuffer* dst_buffer, uint64_t size);
 void UtilDownloadBuffer(GraphicContext* ctx, VulkanBuffer* src_buffer, uint64_t src_offset,
                         void* dst_data, uint64_t size);
