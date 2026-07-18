@@ -326,6 +326,7 @@ inline constexpr std::array<VideoOutFormatPolicy, 6> VIDEO_OUT_FORMAT_POLICIES {
 enum class DepthOverlap : uint8_t {
 	None,
 	RetireSampled,
+	RetireStorage,
 	ExpandTarget,
 	DiscardTarget,
 	Unsupported
@@ -813,6 +814,23 @@ ClassifyStorageBufferRebind(bool buffer_overlap, bool cached_gpu_modified,
 		return DepthOverlap::RetireSampled;
 	}
 	return DepthOverlap::Unsupported;
+}
+
+// Mirrors storage -> depth-target binding transition. An inaccessible stencil aspect
+// does not require the otherwise necessary image content copy.
+[[nodiscard]] inline DepthOverlap ClassifyStorageDepthOverlap(const ImageInfo& storage,
+                                                              const DepthTargetInfo& depth) {
+	const bool overlaps_depth = ImageRangeOverlaps(storage.address, storage.size, depth.address,
+	                                              depth.size);
+	const bool overlaps_stencil = depth.stencil_address != 0 &&
+	                              ImageRangeOverlaps(storage.address, storage.size,
+	                                                 depth.stencil_address, depth.stencil_size);
+	if (!overlaps_depth && !overlaps_stencil) {
+		return DepthOverlap::None;
+	}
+	return !overlaps_depth && overlaps_stencil && !depth.stencil_access
+	           ? DepthOverlap::RetireStorage
+	           : DepthOverlap::Unsupported;
 }
 
 [[nodiscard]] inline RenderTargetOverlap

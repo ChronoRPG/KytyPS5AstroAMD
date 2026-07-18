@@ -9747,7 +9747,7 @@ ShaderTextureResource BasicUintVolumeStorageTextureDescriptor() {
   } else if (std::strcmp(kind, "depth-tile-extent") == 0) {
     resource = Ppsa14053DepthTileStorageTextureResource();
     descriptor = Ppsa14053DepthTileStorageTextureDescriptor();
-    descriptor.fields[2] |= 1u;
+	    descriptor.fields[4] |= 1u;
   } else {
     std::_Exit(0x7e);
   }
@@ -10872,6 +10872,34 @@ void CheckStorageTextureSampledReuse() {
                   (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT),
           "shared storage image or view is missing sampled/storage usage");
   std::printf("[host]    %-32s ok\n", "StorageTextureSampledReuse");
+}
+
+void CheckStorageTextureDepthAlias() {
+  ImageInfo storage{};
+  storage.address = 0x201ae60000ull;
+  storage.size = 0x870000;
+  DepthTargetInfo depth{};
+  depth.address = 0x2046ca0000ull;
+  depth.size = 0x1fe0000;
+  depth.stencil_address = storage.address;
+  depth.stencil_size = storage.size;
+  Require("StorageTextureDepthAlias", "inactive stencil",
+          ClassifyStorageDepthOverlap(storage, depth) == DepthOverlap::RetireStorage,
+          "inactive stencil storage ownership was not retired");
+  depth.stencil_access = true;
+  Require("StorageTextureDepthAlias", "active stencil",
+          ClassifyStorageDepthOverlap(storage, depth) == DepthOverlap::Unsupported,
+          "active stencil storage contents were discarded");
+  depth.stencil_access = false;
+  storage.address = depth.address;
+  Require("StorageTextureDepthAlias", "depth aspect",
+          ClassifyStorageDepthOverlap(storage, depth) == DepthOverlap::Unsupported,
+          "depth-aspect storage contents were discarded");
+  storage.address = 0x2000000000ull;
+  Require("StorageTextureDepthAlias", "disjoint",
+          ClassifyStorageDepthOverlap(storage, depth) == DepthOverlap::None,
+          "disjoint storage image was classified as an alias");
+  std::printf("[host]    %-32s ok\n", "StorageTextureDepthAlias");
 }
 
 [[noreturn]] void RunStorageTextureAccessDeathCase(const char *kind) {
@@ -12900,6 +12928,7 @@ int main(int argc, char **argv) {
   CheckStorageTextureVolumeUploadLayout();
   CheckStorageTextureGpuOwnedRebindState();
   CheckStorageTextureSampledReuse();
+  CheckStorageTextureDepthAlias();
   CheckStorageTextureAccessPermissions();
   CheckMetaOverlapDeaths();
   CheckOverlappingMetadataViews();

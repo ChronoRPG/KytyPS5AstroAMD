@@ -2533,6 +2533,7 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 	std::shared_ptr<CachedImage> sampled_depth_source;
 	std::shared_ptr<CachedImage> native_depth_source;
 	std::shared_ptr<CachedImage> discarded_depth_source;
+	std::shared_ptr<CachedImage> retired_storage_source;
 	for (const auto& entry: m_images) {
 		auto&      cached = *entry;
 		const bool overlaps =
@@ -2554,6 +2555,9 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 				                               cached.buffer_modified, cached.ctx == ctx, info);
 				break;
 			case CachedImage::Kind::StorageTexture:
+				overlap = cached.ctx == ctx ? ClassifyStorageDepthOverlap(cached.info, info)
+				                            : DepthOverlap::Unsupported;
+				break;
 			case CachedImage::Kind::RenderTarget:
 			case CachedImage::Kind::VideoOut: break;
 		}
@@ -2565,9 +2569,20 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 					sampled_depth_source = entry;
 				}
 				break;
+			case DepthOverlap::RetireStorage:
+				supported = cached.kind == CachedImage::Kind::StorageTexture &&
+				            cached.gpu_modified && !cached.buffer_modified &&
+				            !cached.info.IsCpuDirty() &&
+				            retired_storage_source == nullptr && native_depth_source == nullptr &&
+				            discarded_depth_source == nullptr;
+				if (supported) {
+					retired_storage_source = entry;
+				}
+				break;
 			case DepthOverlap::ExpandTarget:
 				supported =
-				    cached.kind == CachedImage::Kind::DepthTarget && native_depth_source == nullptr;
+				    cached.kind == CachedImage::Kind::DepthTarget && native_depth_source == nullptr &&
+				    retired_storage_source == nullptr;
 				if (supported) {
 					native_depth_source = entry;
 				}
@@ -2575,6 +2590,7 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 			case DepthOverlap::DiscardTarget:
 				supported = cached.kind == CachedImage::Kind::DepthTarget &&
 				            discarded_depth_source == nullptr && native_depth_source == nullptr;
+				supported = supported && retired_storage_source == nullptr;
 				if (supported) {
 					discarded_depth_source = entry;
 				}
@@ -2591,8 +2607,17 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 		retire.push_back(&cached);
 	}
 	RequireRetirementIsolation(retire, "depth target", info.address, info.size);
-	RetireImages(retire, native_depth_source != nullptr ? native_depth_source.get()
-	                                                   : discarded_depth_source.get());
+	if (retired_storage_source != nullptr) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(retired_storage_source->info.address,
+		                                           retired_storage_source->info.size);
+		retired_storage_source->gpu_modified = false;
+	}
+	const auto* transition_source = native_depth_source != nullptr
+	                                    ? native_depth_source.get()
+	                                    : (discarded_depth_source != nullptr
+	                                           ? discarded_depth_source.get()
+	                                           : nullptr);
+	RetireImages(retire, transition_source);
 	const bool coherent_guest_stencil =
 	    has_stencil &&
 	    IsCoherentGuestImageSource(stencil_source, info.stencil_address, info.stencil_size);
@@ -2613,6 +2638,9 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 	cached->image               = CreateDepthTarget(ctx, info, &cached->memory);
 	if (discarded_depth_source != nullptr) {
 		command->RetainResourceUntilFence(discarded_depth_source);
+	}
+	if (retired_storage_source != nullptr) {
+		command->RetainResourceUntilFence(retired_storage_source);
 	}
 	if (native_depth_source != nullptr) {
 		const auto& old = native_depth_source->depth;

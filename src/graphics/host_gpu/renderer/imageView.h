@@ -34,8 +34,8 @@ namespace Libs::Graphics {
                                                       uint32_t width, uint32_t height,
                                                       uint32_t depth) noexcept {
 	return (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) &&
-	        type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) && width == 1 &&
-	        height == 1 && depth == 1) ||
+	        type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) && width != 0 &&
+	        height != 0 && depth == 1) ||
 	       (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) &&
 	        type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) && width != 0 &&
 	        height != 0 && depth == 1);
