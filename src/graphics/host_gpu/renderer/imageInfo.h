@@ -801,15 +801,18 @@ ClassifyStorageBufferRebind(bool buffer_overlap, bool cached_gpu_modified,
 	if (!depth_overlap && !stencil_overlap) {
 		return DepthOverlap::None;
 	}
-	const bool has_stencil = depth.stencil_address != 0 || depth.stencil_size != 0;
-	const bool exact_depth_format =
-	    sampled.format == depth.guest_format &&
-	    ((depth.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm) &&
-	      depth.format == VK_FORMAT_D16_UNORM && depth.bytes_per_element == 2) ||
-	     (depth.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) &&
-	      depth.format == VK_FORMAT_D32_SFLOAT && depth.bytes_per_element == 4));
+	const bool  has_stencil  = depth.stencil_address != 0 || depth.stencil_size != 0;
+	const auto* depth_policy = FindGuestDepthFormatPolicy(depth.guest_format);
+	const bool  exact_depth_format =
+	    sampled.format == depth.guest_format && depth_policy != nullptr &&
+	    depth.bytes_per_element == depth_policy->bytes_per_element &&
+	    DepthAspectTransferBytes(depth.format) == depth.bytes_per_element &&
+	    (has_stencil ? IsStencilAttachmentFormat(*depth_policy, depth.format)
+	                 : depth.format == depth_policy->depth_attachment_format);
+	// Keep this equivalent to ResolveDepthOverlap: recreate the sampled color image as
+	// depth and preserve its depth aspect. A disjoint stencil component is initialized separately.
 	const bool exact_depth_load =
-	    !has_stencil && !depth.depth_load_clear && sampled.address == depth.address &&
+	    !stencil_overlap && !depth.depth_load_clear && sampled.address == depth.address &&
 	    sampled.size == depth.size && sampled.width == depth.width &&
 	    sampled.height == depth.height && sampled.pitch == depth.pitch && sampled.base_level == 0 &&
 	    sampled.levels == 1 && sampled.view_levels == 1 && sampled.tile == depth.tile_mode &&
