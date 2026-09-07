@@ -282,7 +282,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				}
 			}
 			switch (inst.GetOpcode()) {
-				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
+				case IR::ValueOpcode::Ballot:
+				case IR::ValueOpcode::AnyLane: requirements.subgroup_ballot = true; break;
 				case IR::ValueOpcode::IsHelperInvocation:
 					if (program.stage != ShaderType::Pixel) {
 						Fail(program, "helper-invocation query outside a pixel shader");
