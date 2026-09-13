@@ -14,6 +14,7 @@
 #endif
 #else
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -1296,7 +1297,6 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 		return OK;
 	}
 
-#if defined(_WIN32)
 	if (!EnsureSocketBackend()) {
 		return NET_ERROR_ENETDOWN;
 	}
@@ -1311,7 +1311,13 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 		if (result != nullptr) {
 			freeaddrinfo(result);
 		}
-		return ret == EAI_NONAME ? NET_ERROR_RESOLVER_ENOHOST : NET_ERROR_RESOLVER_EINTERNAL;
+		if (ret == EAI_NONAME) {
+			return NET_ERROR_RESOLVER_ENOHOST;
+		}
+		if (ret == EAI_NODATA) {
+			return NET_ERROR_RESOLVER_ENORECORD;
+		}
+		return NET_ERROR_RESOLVER_EINTERNAL;
 	}
 
 	for (auto* ai = result; ai != nullptr; ai = ai->ai_next) {
@@ -1326,9 +1332,6 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 
 	freeaddrinfo(result);
 	return NET_ERROR_RESOLVER_ENORECORD;
-#else
-	return NET_ERROR_RESOLVER_ENOTIMPLEMENTED;
-#endif
 }
 
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst) {
