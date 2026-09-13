@@ -3654,12 +3654,13 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
-	g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		HwShIgnoreShaderRegister(cmd_offset, value);
-	};
+	for (uint32_t offset = Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS;
+	     offset <= Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS; offset++) {
+		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+			cp.GetShCtx().SetHsUserDataAddress(cmd_offset - Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS,
+			                                   value);
+		};
+	}
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		auto base = cp.GetShCtx().GetVs().hs_regs.data_addr;
 		base &= 0xFFFFFF00000000FFull;
