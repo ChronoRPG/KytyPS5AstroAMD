@@ -43,6 +43,9 @@ void AddOutput(ShaderInfo& info, StageOutputKind kind, uint32_t index, uint32_t 
 void ValidateOptions(const Program& program, ShaderStageInputInfo input_info) {
 	switch (program.stage) {
 		case ShaderType::Vertex:
+		case ShaderType::Local:
+		case ShaderType::TessellationControl:
+		case ShaderType::TessellationEvaluation:
 		case ShaderType::Mesh:
 			if (input_info.vertex == nullptr) {
 				return Fail("vertex shader has no input metadata");
@@ -81,7 +84,8 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 					    !inst.Arg(1).IsImmediate() || inst.Arg(1).GetType() != Type::U32) {
 						return Fail("typed attribute reference is not constant");
 					}
-					if (program.stage == ShaderType::Vertex &&
+					if ((program.stage == ShaderType::Vertex ||
+					     program.stage == ShaderType::Local) &&
 					    (inst.Arg(1).U32() >= 4u ||
 					     inst.Arg(0).U32() >=
 					         static_cast<uint32_t>(input_info.vertex->resources_num))) {
@@ -124,6 +128,8 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 							}
 							break;
 						case StageInputKind::VertexIndex:
+						case StageInputKind::InvocationId:
+						case StageInputKind::PrimitiveId:
 						case StageInputKind::InstanceIndex:
 						case StageInputKind::FrontFacing:
 						case StageInputKind::LocalInvocationIndex:
@@ -142,6 +148,7 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 								return Fail("typed barycentric component is out of range");
 							}
 							break;
+						case StageInputKind::TessCoord:
 						case StageInputKind::WorkgroupId:
 						case StageInputKind::LocalInvocationId:
 						case StageInputKind::GlobalInvocationId:
@@ -161,8 +168,10 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 					}
 					const auto& exp = program.export_info[index];
 					if (exp.kind == ExportTargetKind::Position && exp.index != 0 && exp.en != 0 &&
-					    program.stage != ShaderType::Vertex && program.stage != ShaderType::Mesh) {
-						return Fail("auxiliary position export requires the vertex or mesh stage");
+					    program.stage != ShaderType::Vertex && program.stage != ShaderType::Mesh &&
+					    program.stage != ShaderType::TessellationEvaluation) {
+						return Fail("auxiliary position export requires a vertex, mesh, or "
+						            "tessellation evaluation shader");
 					}
 					break;
 				}
@@ -249,6 +258,10 @@ void CollectComputeInputs(const ShaderComputeInputInfo* compute, ShaderInfo& inf
 void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
+			if (program.stage == ShaderType::TessellationControl &&
+			    inst.GetOpcode() == ValueOpcode::LaneId) {
+				AddInput(info, StageInputKind::InvocationId, 0, 1, "gl_InvocationID");
+			}
 			if (inst.GetOpcode() != ValueOpcode::GetBuiltin) {
 				continue;
 			}
@@ -260,6 +273,13 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 				case StageInputKind::InstanceIndex:
 					AddInput(info, kind, 0, 1, "gl_InstanceIndex");
 					break;
+				case StageInputKind::InvocationId:
+					AddInput(info, kind, 0, 1, "gl_InvocationID");
+					break;
+				case StageInputKind::PrimitiveId:
+					AddInput(info, kind, 0, 1, "gl_PrimitiveID");
+					break;
+				case StageInputKind::TessCoord: AddInput(info, kind, 0, 3, "gl_TessCoord"); break;
 				case StageInputKind::FragCoord: AddInput(info, kind, 0, 4, "gl_FragCoord"); break;
 				case StageInputKind::FrontFacing:
 					AddInput(info, kind, 0, 1, "gl_FrontFacing");
@@ -380,7 +400,10 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		    });
 	    });
 	switch (program.stage) {
-		case ShaderType::Vertex: CollectVertexInputs(program, input_info.vertex, next); break;
+		case ShaderType::Vertex:
+		case ShaderType::Local: CollectVertexInputs(program, input_info.vertex, next); break;
+		case ShaderType::TessellationControl:
+		case ShaderType::TessellationEvaluation:
 		case ShaderType::Mesh: break;
 		case ShaderType::Pixel: CollectPixelInputs(program, input_info.pixel, next); break;
 		case ShaderType::Compute: CollectComputeInputs(input_info.compute, next); break;

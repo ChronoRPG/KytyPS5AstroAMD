@@ -236,6 +236,9 @@ struct PipelineCache::ProgramCache {
 		switch (options.stage) {
 			case ShaderType::Vertex: stage_name = "vs"; break;
 			case ShaderType::Mesh: stage_name = "ms"; break;
+			case ShaderType::Local: stage_name = "ls"; break;
+			case ShaderType::TessellationControl: stage_name = "hs"; break;
+			case ShaderType::TessellationEvaluation: stage_name = "ds"; break;
 			case ShaderType::Pixel: stage_name = "ps"; break;
 			case ShaderType::Compute: stage_name = "cs"; break;
 			default: EXIT("invalid pipeline shader stage\n");
@@ -273,7 +276,7 @@ struct PipelineCache::ProgramCache {
 	                  uint32_t& push_data_cursor) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			stage = input_info.mesh.threads_num[0] != 0 ? ShaderType::Mesh : ShaderType::Vertex;
+			stage = input_info.logical_stage;
 		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 			stage = ShaderType::Pixel;
 		} else {
@@ -325,6 +328,9 @@ struct PipelineCache::ProgramCache {
 		switch (stage) {
 			case ShaderType::Vertex: label = "ShaderRecompiler VS"; break;
 			case ShaderType::Mesh: label = "ShaderRecompiler MS"; break;
+			case ShaderType::Local: label = "ShaderRecompiler LS"; break;
+			case ShaderType::TessellationControl: label = "ShaderRecompiler HS"; break;
+			case ShaderType::TessellationEvaluation: label = "ShaderRecompiler DS"; break;
 			case ShaderType::Pixel: label = "ShaderRecompiler PS"; break;
 			case ShaderType::Compute: label = "ShaderRecompiler CS"; break;
 			default: EXIT("invalid pipeline shader stage\n");
@@ -341,9 +347,9 @@ struct PipelineCache::ProgramCache {
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
-			if (stage == ShaderType::Mesh) {
+			if (stage == ShaderType::Mesh || stage == ShaderType::TessellationControl) {
 				options.user_data_base = 0;
-				options.wave_size      = input_info.mesh.wave_size;
+				options.wave_size = stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
 			}
 		} else if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			options.wave_size = input_info.wave_size;
@@ -361,16 +367,19 @@ struct PipelineCache::ProgramCache {
 		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
-		std::array<size_t, static_cast<size_t>(ShaderType::Mesh) + 1> counts {};
+		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
 		for (const auto& [key, source]: programs) {
 			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
 		}
 		// Guest geometry shaders are compiled through the host mesh stage.
-		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu\n",
+		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
 		            counts[static_cast<size_t>(ShaderType::Vertex)],
 		            counts[static_cast<size_t>(ShaderType::Pixel)],
 		            counts[static_cast<size_t>(ShaderType::Compute)],
-		            counts[static_cast<size_t>(ShaderType::Mesh)]);
+		            counts[static_cast<size_t>(ShaderType::Mesh)],
+		            counts[static_cast<size_t>(ShaderType::Local)],
+		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
+		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 		return permutation.handle;
 	}
 
@@ -564,12 +573,18 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info) {
-	const auto vertex_params = PrepareProgram(vertex_regs, context, user_config, vertex_info);
-	const bool mesh_active   = vertex_info.mesh.threads_num[0] != 0;
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
+	std::array<ShaderParams, 3> vertex_params;
+	if (tess_active) {
+		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
+	} else {
+		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+	}
+	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
-		auto& mesh              = vertex_info.mesh;
+		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;
 		const auto  logical_threads =
@@ -592,7 +607,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
 		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
-		auto&       clip     = vertex_info.clip_space;
+		auto&       clip     = vertex_info[tess_active ? 2u : 0u].clip_space;
 		clip.scale[0]        = viewport.xscale;
 		clip.scale[1]        = viewport.yscale;
 		clip.offset[0]       = viewport.xoffset;
@@ -610,7 +625,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
-	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor);
+	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
+		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+	}
 	return result;
 }
 
@@ -630,10 +647,12 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
-    const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+    std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const ShaderProgram& vertex_program,
-    const ShaderProgram& pixel_program) {
+    bool primitive_restart_enable, const GraphicsPrograms& programs) {
+	const auto& vs_input_info  = vertex_info.front();
+	const auto& vertex_program = programs.vertex[0];
+	const auto& pixel_program  = programs.pixel;
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
@@ -651,7 +670,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	const auto ps_id = ps_active ? pixel_program.id : 0;
 
 	GraphicsPipelineKey key {};
-	key.vs_shader_id            = vs_id;
+	for (uint32_t i = 0; i < programs.vertex.size(); i++) {
+		key.vertex_shader_ids[i] = programs.vertex[i].id;
+	}
 	key.ps_shader_id            = ps_id;
 	auto& static_params         = key.static_params;
 	auto& rendering             = key.rendering;
@@ -729,7 +750,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	static_params.stencil_test_enable      = depth.stencil_test_enable;
 	static_params.stencil_front            = depth.stencil_static_front;
 	static_params.stencil_back             = depth.stencil_static_back;
-	const bool rect_list     = topology == vk::PrimitiveTopology::ePatchList;
+	const bool rect_list =
+	    command.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kRectList;
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;
 	static_params.face       = mc.face;
@@ -780,9 +802,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vs_input_info,
-	                       vertex_program, ps_input_info, pixel_program, static_params,
-	                       m_driver_cache);
+	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
+	                       ps_input_info, programs, static_params, m_driver_cache);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);

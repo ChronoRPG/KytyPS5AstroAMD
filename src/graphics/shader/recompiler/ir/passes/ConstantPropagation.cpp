@@ -228,6 +228,15 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			const auto offset = Arg(inst, 1);
 			const auto count  = Arg(inst, 2);
 			auto* source = value.TryInstruction();
+			if (source != nullptr && source->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32)) {
+				const auto shift = Arg(*source, 1);
+				if (IsImmediate(shift, Type::U32) && shift.U32() < 32u &&
+				    offset.U32() <= shift.U32() && count.U32() <= shift.U32() - offset.U32()) {
+					Replace(inst, Value(0u));
+					return;
+				}
+			}
 			if (source != nullptr && source->GetOpcode() == ValueOpcode::GetBuiltin &&
 			    source->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::PackedAncillary)) &&
 			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32) && count.U32() != 0u) {

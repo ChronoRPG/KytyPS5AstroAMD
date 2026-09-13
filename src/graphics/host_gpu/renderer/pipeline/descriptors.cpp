@@ -93,19 +93,12 @@ static const char* ShaderStageResourceName(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Vertex: return "Vertex";
 		case ShaderType::Mesh: return "Mesh";
+		case ShaderType::Local: return "Local";
+		case ShaderType::TessellationControl: return "Hull";
+		case ShaderType::TessellationEvaluation: return "Domain";
 		case ShaderType::Pixel: return "Pixel";
 		case ShaderType::Compute: return "Compute";
 		default: return "Unknown";
-	}
-}
-
-static vk::ShaderStageFlags NativeShaderStage(ShaderType stage) {
-	switch (stage) {
-		case ShaderType::Vertex: return vk::ShaderStageFlagBits::eVertex;
-		case ShaderType::Mesh: return vk::ShaderStageFlagBits::eMeshEXT;
-		case ShaderType::Pixel: return vk::ShaderStageFlagBits::eFragment;
-		case ShaderType::Compute: return vk::ShaderStageFlagBits::eCompute;
-		default: EXIT("unknown native shader stage\n");
 	}
 }
 
@@ -884,9 +877,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	size_t write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
-	constexpr auto                 GraphicsStages = vk::ShaderStageFlagBits::eVertex |
-	                                                vk::ShaderStageFlagBits::eMeshEXT |
-	                                                vk::ShaderStageFlagBits::eFragment;
+	constexpr auto                 GraphicsStages =
+	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eMeshEXT |
+	    vk::ShaderStageFlagBits::eTessellationControl |
+	    vk::ShaderStageFlagBits::eTessellationEvaluation | vk::ShaderStageFlagBits::eFragment;
 	vk::ShaderStageFlags push_stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
 	                                       ? vk::ShaderStageFlagBits::eFragment
 	                                       : vk::ShaderStageFlags {};

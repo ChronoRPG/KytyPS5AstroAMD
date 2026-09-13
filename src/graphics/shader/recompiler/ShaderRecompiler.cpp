@@ -47,6 +47,9 @@ const char* StageName(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Compute: return "CS";
 		case ShaderType::Vertex: return "VS";
+		case ShaderType::Local: return "LS";
+		case ShaderType::TessellationControl: return "HS";
+		case ShaderType::TessellationEvaluation: return "TES";
 		case ShaderType::Mesh: return "MS";
 		case ShaderType::Pixel: return "PS";
 		default: return "unknown";
@@ -211,6 +214,8 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
                                             const ShaderVertexInputInfo* input_info,
                                             uint32_t user_data_base, uint32_t user_data_count,
                                             uint32_t wave_size) {
+	const uint32_t    vertex_index_reg   = input_info->logical_stage == ShaderType::Local ? 2u : 5u;
+	const uint32_t    instance_index_reg = input_info->logical_stage == ShaderType::Local ? 5u : 8u;
 	EmbeddedFetchData data;
 	data.loads.reserve(input_info->resources_num);
 	int32_t vertex_offset_candidate   = -1;
@@ -251,16 +256,17 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 		// corresponding direct-draw offsets before fetching.
 		const bool vertex_index_accumulator =
 		    IsDecodedVgpr(inst.dst) &&
-		    (inst.dst.reg == 0 || (user_data_base == 8 && inst.dst.reg == 5));
+		    (inst.dst.reg == 0 || (user_data_base == 8 && inst.dst.reg == vertex_index_reg));
 		const bool instance_index_accumulator =
-		    IsDecodedVgpr(inst.dst) && (inst.dst.reg == (user_data_base == 8 ? 8u : 3u));
+		    IsDecodedVgpr(inst.dst) &&
+		    (inst.dst.reg == (user_data_base == 8 ? instance_index_reg : 3u));
 		uint32_t   sad_zero = 0;
 		const bool index_offset_add =
-		    (vertex_index_accumulator || instance_index_accumulator) &&
-		    IsDecodedSgpr(inst.src0) &&
+		    (vertex_index_accumulator || instance_index_accumulator) && IsDecodedSgpr(inst.src0) &&
 		    ((inst.opcode == Decoder::Opcode::V_ADD_I32 && IsDecodedVgpr(inst.src1) &&
 		      inst.src1.reg == inst.dst.reg) ||
-		     (user_data_base == 8 && (inst.dst.reg == 5 || inst.dst.reg == 8) &&
+		     (user_data_base == 8 &&
+		      (inst.dst.reg == vertex_index_reg || inst.dst.reg == instance_index_reg) &&
 		      inst.opcode == Decoder::Opcode::V_SAD_U32 && IsDecodedVgpr(inst.src2) &&
 		      inst.src2.reg == inst.dst.reg &&
 		      TryDecodedOperandConstant(sgprs, inst.src1, sad_zero) && sad_zero == 0));
@@ -391,8 +397,8 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 						ClearEmbeddedFetchVectorLanes(&vector_lanes, inst.dst.reg);
 					}
 					if (IsDecodedVgpr(inst.dst) && inst.dst.reg < vgpr_is_index.size() &&
-					    IsDecodedVgpr(inst.src0) && inst.src0.reg == 8 &&
-					    IsDecodedVgpr(inst.src1) && inst.src1.reg == 5) {
+					    IsDecodedVgpr(inst.src0) && inst.src0.reg == instance_index_reg &&
+					    IsDecodedVgpr(inst.src1) && inst.src1.reg == vertex_index_reg) {
 						vgpr_is_index[inst.dst.reg] = true;
 					}
 				} else if (IsEmbeddedFetchAttribPropagationAlu(inst)) {
@@ -459,9 +465,7 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 	return data;
 }
 
-Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<const uint32_t> back,
-                                    std::vector<uint32_t>& joined_code) {
-	EXIT_IF(back.empty());
+Decoder::Program DecodeFrontProgram(std::span<const uint32_t> front) {
 	Decoder::Program result;
 	uint32_t         front_words = 0;
 	while (front_words < front.size()) {
@@ -477,7 +481,16 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	}
 	EXIT_IF(result.instructions.empty() ||
 	        result.instructions.back().opcode != Decoder::Opcode::S_SETPC_B64);
-	joined_code.assign(front.begin(), front.begin() + front_words);
+	result.code = front.first(front_words);
+	return result;
+}
+
+Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<const uint32_t> back,
+                                    std::vector<uint32_t>& joined_code) {
+	EXIT_IF(back.empty());
+	auto       result      = DecodeFrontProgram(front);
+	const auto front_words = static_cast<uint32_t>(result.code.size());
+	joined_code.assign(result.code.begin(), result.code.end());
 	joined_code.insert(joined_code.end(), back.begin(), back.end());
 	// The merged-stage ABI passes the back shader in s[6:7]. Give that handoff an
 	// ordinary CFG edge, retaining both bodies in one register and LDS lifetime.
@@ -500,12 +513,224 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 
 } // namespace
 
+void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
+                                 ShaderTessellationInputInfo& info) {
+	using namespace Decoder;
+	const auto constant = [](const Operand& operand, uint32_t value) {
+		return (operand.kind == OperandKind::IntegerInlineConstant ||
+		        operand.kind == OperandKind::LiteralConstant) &&
+		       operand.value == value;
+	};
+	auto     decoded       = DecodeFrontProgram(local);
+	uint32_t local_address = UINT32_MAX;
+	for (const auto& inst: decoded.instructions) {
+		if (inst.opcode == Opcode::V_MUL_U32_U24 && inst.src1.kind == OperandKind::Vgpr &&
+		    inst.src1.reg == 3u &&
+		    (inst.src0.kind == OperandKind::IntegerInlineConstant ||
+		     inst.src0.kind == OperandKind::LiteralConstant)) {
+			EXIT_IF(info.ls_stride != 0u && info.ls_stride != inst.src0.value);
+			info.ls_stride = inst.src0.value;
+			local_address  = inst.dst.reg;
+		}
+		if (inst.family == Family::DS) {
+			EXIT_NOT_IMPLEMENTED(inst.src0.kind != OperandKind::Vgpr ||
+			                     inst.src0.reg != local_address);
+		}
+	}
+	decoded = {};
+	DecodeProgram(control, decoded);
+	uint32_t control_point   = UINT32_MAX;
+	uint32_t control_address = UINT32_MAX;
+	for (const auto& inst: decoded.instructions) {
+		if (inst.opcode == Opcode::V_BFE_U32 && inst.src0.kind == OperandKind::Vgpr &&
+		    inst.src0.reg == 1u && constant(inst.src1, 8u) && constant(inst.src2, 5u)) {
+			control_point = inst.dst.reg;
+		}
+		if (inst.opcode == Opcode::V_LSHL_ADD_U32 && inst.src0.kind == OperandKind::Vgpr &&
+		    inst.src0.reg == control_point &&
+		    (inst.src1.kind == OperandKind::IntegerInlineConstant ||
+		     inst.src1.kind == OperandKind::LiteralConstant) &&
+		    inst.src1.value < 32u) {
+			info.hs_stride  = 1u << inst.src1.value;
+			control_address = inst.dst.reg;
+		}
+	}
+	EXIT_NOT_IMPLEMENTED(local_address == UINT32_MAX || control_address == UINT32_MAX ||
+	                     info.ls_stride == 0u || info.hs_stride == 0u ||
+	                     (info.ls_stride & 3u) != 0u || (info.hs_stride & 3u) != 0u);
+	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u\n",
+	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride);
+}
+
+namespace {
+
+const IR::Inst* TessellationBufferBase(const IR::Inst& inst) {
+	if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::None || inst.NumArgs() <= 3u)
+		return nullptr;
+	const auto* base = inst.Arg(3).Resolve().TryInstruction();
+	return base != nullptr && base->GetOpcode() == IR::ValueOpcode::TessellationBase ? base
+	                                                                                 : nullptr;
+}
+
+IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value value,
+                        IR::Value predicate, std::unordered_map<IR::Inst*, IR::Value>& resolved) {
+	using namespace IR;
+	value        = value.Resolve();
+	auto* source = value.TryInstruction();
+	if (source == nullptr) return value;
+	if (const auto found = resolved.find(source); found != resolved.end()) return found->second;
+	if (source->GetOpcode() == ValueOpcode::SelectU32) {
+		return source->Arg(0).Resolve() == predicate.Resolve()
+		           ? ActiveAddress(block, before, source->Arg(1), predicate, resolved)
+		           : value;
+	}
+	if (source->GetOpcode() != ValueOpcode::IAdd32 && source->GetOpcode() != ValueOpcode::ISub32)
+		return value;
+	const auto lhs = ActiveAddress(block, before, source->Arg(0), predicate, resolved);
+	const auto rhs = ActiveAddress(block, before, source->Arg(1), predicate, resolved);
+	if (lhs != source->Arg(0).Resolve() || rhs != source->Arg(1).Resolve()) {
+		auto copy = block.PrependNewInst(before, source->GetOpcode(), {lhs, rhs},
+		                                 source->Flags<uint64_t>());
+		value     = Value(&*copy);
+	}
+	resolved.emplace(source, value);
+	return value;
+}
+
+void LowerTessellationMemory(IR::Program& program, const CompileOptions& options) {
+	using namespace IR;
+	if (options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
+	    options.stage != ShaderType::TessellationEvaluation) {
+		return;
+	}
+	const auto& tess = options.input_info.vertex->tess;
+	// Ring addresses can reuse data VGPRs. Their inactive values are irrelevant to
+	// a store guarded by the same EXEC predicate, but must remain intact elsewhere.
+	for (auto* block: program.blocks) {
+		for (auto it = block->begin(); it != block->end(); ++it) {
+			if (TessellationBufferBase(*it) == nullptr) continue;
+			std::unordered_map<Inst*, Value> resolved;
+			it->SetArg(
+			    2, ActiveAddress(*block, it, it->Arg(2), it->Arg(it->NumArgs() - 1u), resolved));
+		}
+	}
+	ConstantPropagationPass(program.blocks);
+	uint32_t reads = 0, writes = 0, factors = 0;
+	for (auto* block: program.blocks) {
+		for (auto it = block->begin(); it != block->end(); ++it) {
+			auto&      inst   = *it;
+			const auto shared = SharedAccessOf(inst.GetOpcode());
+			const auto buffer = BufferAccessOf(inst.GetOpcode());
+			if (shared == SharedAccess::None && buffer == BufferAccess::None) {
+				continue;
+			}
+			const auto&           memory = program.memory_info.at(inst.Flags<MemoryFlags>().index);
+			bool                  write  = false;
+			uint32_t              components = 0;
+			TessellationAttribute kind;
+			Value                 address, predicate;
+			if (shared != SharedAccess::None && memory.kind == ResourceKind::Lds) {
+				write = shared == SharedAccess::Write;
+				EXIT_NOT_IMPLEMENTED(memory.data_bits != 32u ||
+				                     (options.stage == ShaderType::Local
+				                          ? !write
+				                          : options.stage != ShaderType::TessellationControl ||
+				                                shared != SharedAccess::Read));
+				kind       = write ? TessellationAttribute::LocalOutput
+				                   : TessellationAttribute::ControlInput;
+				components = SharedComponentCount(inst.GetOpcode());
+				address    = inst.Arg(0);
+				predicate  = inst.Arg(inst.NumArgs() - 1u);
+			} else if (buffer != BufferAccess::None && memory.kind == ResourceKind::Buffer) {
+				const auto* base = TessellationBufferBase(inst);
+				if (base == nullptr) {
+					continue;
+				}
+				EXIT_NOT_IMPLEMENTED(memory.data_bits != 32u || memory.formatted || memory.idxen ||
+				                     !memory.offen || buffer == BufferAccess::Atomic);
+				write      = buffer == BufferAccess::Write;
+				components = BufferComponentCount(inst.GetOpcode());
+				address    = inst.Arg(2).Resolve();
+				predicate  = inst.Arg(inst.NumArgs() - 1u);
+				if (base->Arg(0).U32() == 1u) {
+					EXIT_NOT_IMPLEMENTED(!write ||
+					                     options.stage != ShaderType::TessellationControl);
+					kind = TessellationAttribute::Factor;
+					factors += components;
+				} else {
+					kind = write ? TessellationAttribute::ControlOutput
+					             : TessellationAttribute::EvaluationInput;
+					EXIT_NOT_IMPLEMENTED(write
+					                         ? options.stage != ShaderType::TessellationControl
+					                         : options.stage != ShaderType::TessellationEvaluation);
+					if (address.IsImmediate() &&
+					    address.U32() >= tess.hs_stride * tess.output_control_points) {
+						EXIT_NOT_IMPLEMENTED(!write);
+						kind = TessellationAttribute::PatchOutput;
+					}
+				}
+			} else {
+				continue;
+			}
+			const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+				return Value(&*block->PrependNewInst(it, opcode, args));
+			};
+			std::array<Value, 4> values;
+			for (uint32_t component = 0; component < components; component++) {
+				const auto offset = memory.offset + 4u * component;
+				const auto byte_address =
+				    offset == 0u ? address : emit(ValueOpcode::IAdd32, {address, Value(offset)});
+				if (write) {
+					Value data = shared != SharedAccess::None ? inst.Arg(component + 1u)
+					             : components == 1u
+					                 ? inst.Arg(4)
+					                 : emit(components == 2u   ? ValueOpcode::CompositeExtractU32x2
+					                        : components == 3u ? ValueOpcode::CompositeExtractU32x3
+					                                           : ValueOpcode::CompositeExtractU32x4,
+					                        {inst.Arg(4), Value(component)});
+					emit(ValueOpcode::SetTessellationAttribute,
+					     {Value(static_cast<uint32_t>(kind)), byte_address, data, predicate});
+					writes++;
+				} else {
+					values[component] =
+					    emit(ValueOpcode::GetTessellationAttribute,
+					         {Value(static_cast<uint32_t>(kind)), byte_address, predicate});
+					reads++;
+				}
+			}
+			if (!write) {
+				Value replacement = values[0];
+				if (components == 2u)
+					replacement =
+					    emit(ValueOpcode::CompositeConstructU32x2, {values[0], values[1]});
+				if (components == 3u)
+					replacement = emit(ValueOpcode::CompositeConstructU32x3,
+					                   {values[0], values[1], values[2]});
+				if (components == 4u)
+					replacement = emit(ValueOpcode::CompositeConstructU32x4,
+					                   {values[0], values[1], values[2], values[3]});
+				inst.ReplaceUsesWith(replacement);
+			}
+			inst.Invalidate();
+		}
+	}
+	ConstantPropagationPass(program.blocks);
+	RemoveIdentities(program.blocks);
+	EliminateDeadCode(program.blocks);
+	LOGF("%s tessellation lowering: reads=%u writes=%u factors=%u\n", StageName(options.stage),
+	     reads, writes, factors);
+}
+
+} // namespace
+
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
 	}
 	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
-	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh) {
+	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh &&
+	    options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
+	    options.stage != ShaderType::TessellationEvaluation) {
 		EXIT("shader recompiler received unsupported stage %u\n",
 		     static_cast<unsigned>(options.stage));
 	}
@@ -525,6 +750,12 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	std::vector<uint32_t> joined_code;
 	if (!options.back_code.empty()) {
 		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
+	} else if (options.stage == ShaderType::Local) {
+		decoded = DecodeFrontProgram(code);
+		// The separately compiled hull half runs in the next Vulkan stage.
+		auto& handoff     = decoded.instructions.back();
+		handoff.opcode    = Decoder::Opcode::S_ENDPGM;
+		handoff.src_count = 0;
 	} else {
 		Decoder::DecodeProgram(code, decoded);
 	}
@@ -568,8 +799,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	}
 
 	EmbeddedFetchData embedded_fetch;
-	if (options.stage == ShaderType::Vertex && options.input_info.vertex != nullptr &&
-	    options.input_info.vertex->fetch_embedded) {
+	if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
+	    options.input_info.vertex != nullptr && options.input_info.vertex->fetch_embedded) {
 		embedded_fetch = DetectEmbeddedVertexFetch(
 		    decoded, options.input_info.vertex, options.user_data_base,
 		    static_cast<uint32_t>(options.user_data.size()), options.wave_size);
@@ -608,6 +839,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
+	LowerTessellationMemory(ir, options);
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
 	IR::TrackResources(ir);

@@ -453,7 +453,7 @@ struct DrawRenderState {
 	RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	uint32_t              color_count                              = 0;
 	bool                  ps_active                                = true;
-	ShaderVertexInputInfo vs_input_info;
+	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo  ps_input_info;
 	PipelineCache::GraphicsPrograms programs;
 };
@@ -831,6 +831,7 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
 		case Prospero::PrimitiveType::kTriStrip:
 			topology = vk::PrimitiveTopology::eTriangleStrip;
 			break;
+		case Prospero::PrimitiveType::kPatch:
 		case Prospero::PrimitiveType::kRectList:
 			topology = vk::PrimitiveTopology::ePatchList;
 			break;
@@ -953,7 +954,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vs_input_info, state.ps_input_info);
+	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
 }
 
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
@@ -1016,7 +1017,7 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 		LogDrawTargetState(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   state.ps_input_info, draw.index_count, 0);
 	}
-	LogDrawInputState(buffer, state.color_info[0], state.vs_input_info, index_type_and_size,
+	LogDrawInputState(buffer, state.color_info[0], state.vertex_info[0], index_type_and_size,
 	                  draw.index_count, index_addr);
 }
 
@@ -1031,6 +1032,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kTriFan:
 		case Prospero::PrimitiveType::kTriStrip:
 		case Prospero::PrimitiveType::kRectList:
+		case Prospero::PrimitiveType::kPatch:
 			if (draw.IsIndexed()) {
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
 				                      emit.first_instance);
@@ -1069,10 +1071,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
 	auto& ucfg = buffer.GetUserConfig();
-	const bool mesh_active = state.vs_input_info.stage.program->stage == ShaderType::Mesh;
+	const auto vertex_stages =
+	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
+	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
-		const auto& mesh = state.vs_input_info.mesh;
+		const auto& mesh = state.vertex_info[0].mesh;
 		if (primitive_restart_enable || mesh.primitives_per_group == 0) {
 			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
 			     static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed(), primitive_restart_enable);
@@ -1100,19 +1104,24 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
-	GraphicsBindings bindings {.vertex = PrepareBindings(state.vs_input_info.stage)};
-	std::array<PreparedBindings*, 2> descriptor_stages {&bindings.vertex, nullptr};
+	GraphicsBindings                 bindings;
+	std::array<PreparedBindings*, 4> descriptor_stages {};
+	uint32_t                         stage_count = 0;
+	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+		bindings.vertex[i]               = PrepareBindings(state.vertex_info[i].stage);
+		descriptor_stages[stage_count++] = &bindings.vertex[i];
+	}
 	if (state.ps_active) {
 		bindings.pixel.emplace(PrepareBindings(state.ps_input_info.stage));
-		descriptor_stages[1] = &*bindings.pixel;
+		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
-	const auto stages = std::span {descriptor_stages.data(), state.ps_active ? 2u : 1u};
+	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages);
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
-		vertex_bindings = AcquireVertexBuffers(buffer, state.vs_input_info);
+		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
 	const auto rendering =
@@ -1123,9 +1132,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
+	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs.vertex, state.programs.pixel);
+	    state.programs);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1155,7 +1164,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 
-	SetGraphicsDynamicParams(buffer, vk_buffer, state.vs_input_info, state.color_info,
+	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.color_info,
 	                         state.color_count, state.depth_info);
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(
@@ -1177,16 +1186,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
-		EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+		EmitDrawPrimitives(ucfg, vk_buffer, state.vertex_info[0], draw, emit);
 	}
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
 	}
 	vk::PipelineStageFlags shader_write_stages = {};
-	if (HasShaderBufferWrites(state.vs_input_info.stage)) {
-		shader_write_stages |= mesh_active ? vk::PipelineStageFlagBits::eMeshShaderEXT
-		                                   : vk::PipelineStageFlagBits::eVertexShader;
+	for (const auto& stage: vertex_stages) {
+		if (HasShaderBufferWrites(stage.stage)) {
+			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
+		}
 	}
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
@@ -1302,7 +1312,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	const bool indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
 	const auto [vertex_offset, instance_offset] =
 	    indirect ? std::pair<int32_t, uint32_t> {0, args.first_instance}
-	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vs_input_info);
+	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
 
 	DrawEmitInfo emit {};
 	emit.vertex_offset  = vertex_offset + args.base_vertex;
@@ -1374,9 +1384,9 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	}
 	RefreshShaders(buffer, draw, state);
 
-	const bool rect_list = topology == vk::PrimitiveTopology::ePatchList;
-	if (rect_list && state.vs_input_info.buffers_num == 0 &&
-	    state.vs_input_info.stage.program->param_export_mask == 0 &&
+	const bool rect_list = ucfg.GetPrimType() == Prospero::PrimitiveType::kRectList;
+	if (rect_list && state.vertex_info[0].buffers_num == 0 &&
+	    state.vertex_info[0].stage.program->param_export_mask == 0 &&
 	    state.ps_input_info.input_num != 0) {
 		if (graphics_debug_dump_enabled()) {
 			LOGF("DrawIndexAuto: skipping rect-list draw with no VS param exports and PS inputs: "
@@ -1393,7 +1403,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	const bool indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
 	const auto [vertex_offset, instance_offset] =
 	    indirect ? std::pair<int32_t, uint32_t> {0, args.first_instance}
-	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vs_input_info);
+	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
 	DrawEmitInfo emit {};
 	emit.first_vertex = static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
 	emit.first_instance = instance_offset;

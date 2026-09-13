@@ -170,7 +170,7 @@ private:
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {
-		PreparedBindings                vertex;
+		std::array<PreparedBindings, 3> vertex;
 		std::optional<PreparedBindings> pixel;
 	};
 

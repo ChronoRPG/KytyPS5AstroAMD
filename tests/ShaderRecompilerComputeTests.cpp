@@ -401,7 +401,16 @@ struct RenderExecutorTestAccess {
                                       const ShaderStageRuntime &vertex,
                                       const ShaderStageRuntime &pixel,
                                       bool pixel_active) {
-    return executor.PrepareGraphicsBindings(vertex, pixel, pixel_active);
+    RenderExecutor::GraphicsBindings result;
+    result.vertex[0] = executor.PrepareBindings(vertex);
+    std::array<PreparedBindings *, 2> stages{&result.vertex[0], nullptr};
+    if (pixel_active) {
+      result.pixel.emplace(executor.PrepareBindings(pixel));
+      stages[1] = &*result.pixel;
+    }
+    executor.PrepareGraphicsBindings(
+        std::span{stages.data(), pixel_active ? 2u : 1u});
+    return result;
   }
 
   static PipelineCache::Pipeline
@@ -9741,7 +9750,7 @@ public:
           ordered_bindings.pixel->images[0].image_id;
       Require(
           name, "VS-before-PS retained-owner order",
-          ordered_bindings.vertex.images[0].image_id == storage_id &&
+          ordered_bindings.vertex[0].images[0].image_id == storage_id &&
               ordered_sampled_id != storage_id &&
               RenderExecutorTestAccess::BoundImagesInOrder(executor, storage_id,
                                                            ordered_sampled_id),
@@ -9753,7 +9762,7 @@ public:
           RenderExecutorTestAccess::PrepareGraphicsBindings(
               executor, storage_runtime, sampled_runtime, true);
       const auto &storage_binding =
-          graphics_bindings.vertex.images[0];
+          graphics_bindings.vertex[0].images[0];
       const auto &sampled_binding =
           graphics_bindings.pixel->images[0];
       Require(name, "storage final acquisition",
@@ -9775,7 +9784,7 @@ public:
               "the production graphics binding path did not complete vertex "
               "storage acquisition before pixel sampling");
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
-          executor, scheduler.Current(), graphics_bindings.vertex,
+          executor, scheduler.Current(), graphics_bindings.vertex[0],
           *graphics_bindings.pixel));
       Require(name, "early writable alias retention",
               texture_cache.GetImage(storage_id).backing.state.access_mask ==
@@ -9815,15 +9824,15 @@ public:
               "an already sampled image was not promoted when a later "
               "storage alias bound the same backing");
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
-          executor, scheduler.Current(), writable_alias_bindings.vertex,
+          executor, scheduler.Current(), writable_alias_bindings.vertex[0],
           *writable_alias_bindings.pixel));
       Require(
           name, "forced-general descriptor capture",
-          writable_alias_bindings.vertex.images[0].layout ==
+          writable_alias_bindings.vertex[0].images[0].layout ==
                   vk::ImageLayout::eGeneral &&
               writable_alias_bindings.pixel->images[0].layout ==
                   vk::ImageLayout::eGeneral &&
-              MakeImageInfo(writable_alias_bindings.vertex.images[0])
+              MakeImageInfo(writable_alias_bindings.vertex[0].images[0])
                       .imageLayout == vk::ImageLayout::eGeneral &&
               MakeImageInfo(writable_alias_bindings.pixel->images[0])
                       .imageLayout == vk::ImageLayout::eGeneral &&
@@ -10240,8 +10249,8 @@ public:
         const auto bounds_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
             executor, scheduler.Current(), &no_color, 0, bounds_depth, bounds_bindings.pixel);
         descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
-            executor, scheduler.Current(), bounds_bindings.vertex, *bounds_bindings.pixel));
-        const auto &vertex_depth = bounds_bindings.vertex.images[0];
+            executor, scheduler.Current(), bounds_bindings.vertex[0], *bounds_bindings.pixel));
+        const auto &vertex_depth = bounds_bindings.vertex[0].images[0];
         const auto &pixel_depth = bounds_bindings.pixel->images[0];
         constexpr auto readonly_layout = vk::ImageLayout::eDepthReadOnlyOptimal;
         Require(name, "deferred clear with sampled read-only depth bounds",
@@ -10581,7 +10590,7 @@ public:
             RenderExecutorTestAccess::AcquireRenderTargets(
                 executor, scheduler.Current(), &no_color, 0, shared_depth, shared_bindings.pixel);
         descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
-            executor, scheduler.Current(), shared_bindings.vertex,
+            executor, scheduler.Current(), shared_bindings.vertex[0],
             *shared_bindings.pixel));
         const auto expected_layout =
             stencil_write
@@ -10592,7 +10601,7 @@ public:
             vk::AccessFlagBits2::eDepthStencilAttachmentRead |
             vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
         const auto &shared_image = texture_cache.GetImage(shared_depth.image_id);
-        const auto &vertex_image = shared_bindings.vertex.images[0];
+        const auto &vertex_image = shared_bindings.vertex[0].images[0];
         const auto &pixel_image = shared_bindings.pixel->images[0];
         Require(name, "sampled depth and stencil attachment layout",
                 shared_depth.image_id == phased_depth.image_id &&
@@ -12173,8 +12182,9 @@ public:
       mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
       return context.GetPipelineCache().GetGraphicsPipeline(
-          std::span{&color, 1u}, depth, vertex, scheduler.Current(), &pixel,
-          vk::PrimitiveTopology::eTriangleList, false, vertex_shader, pixel_shader);
+          std::span{&color, 1u}, depth, std::span{&vertex, 1u}, scheduler.Current(), &pixel,
+          vk::PrimitiveTopology::eTriangleList, false,
+          PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader});
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected) {
@@ -12196,7 +12206,7 @@ public:
               feedback_enabled == (depth_feedback && depth.depth_write_enable),
               "feedback was not selected only for an overlapping fragment depth read/write");
       RenderExecutorTestAccess::CommitBindings(
-          executor, command, selected, bindings.vertex, *bindings.pixel);
+          executor, command, selected, bindings.vertex[0], *bindings.pixel);
       rendering.color_attachments[0].is_clear = true;
       command.BeginRendering(rendering);
       auto cmd = command.Handle();
@@ -25504,10 +25514,160 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
 }
 
+void CheckTessellationPrograms() {
+  using namespace ShaderRecompiler;
+  const char *name = "TessellationPrograms";
+  std::array<std::vector<u32>, 3> code;
+  auto &local = code[0];
+  // The fused LS addresses one 124-byte control point using its v3 ordinal.
+  local.push_back(EncodeVop2(0x0b, 21, 255u, 3));
+  local.push_back(124);
+  local.push_back(EncodeDs0(0x0e, (3u << 8u) | 1u));
+  local.push_back(EncodeDs1Ex(0, 5, 2, 21));
+  local.push_back(EncodeSop1(0x20, 0, 6));
+  local.push_back(0xffffffffu); // Shader footer is not executable after LS handoff.
+
+  auto &control = code[1];
+  AppendVop3(&control, 0x365, 0, 193u, InlineU32(0));
+  AppendVop3(&control, 0x366, 0, 193u, Vgpr(0));
+  control.push_back(EncodeSopp(0x0a));
+  control.push_back(EncodeVopc(0xd1, 249u, 3));
+  control.push_back(EncodeVopcSdwa(0, 0, 0, 6, 1, 0, 0, 0, 0, 0, 0, 0, 1));
+  AppendVop3(&control, 0x148, 32, Vgpr(1), InlineU32(0), InlineU32(8));
+  AppendVop3(&control, 0x148, 34, Vgpr(1), InlineU32(8), InlineU32(5));
+  AppendVop3(&control, 0x346, 35, Vgpr(34), InlineU32(7), InlineU32(0));
+  control.push_back(EncodeVop2(0x0b, 29, 255u, 34));
+  control.push_back(124);
+  control.push_back(EncodeDs0(0x37, (3u << 8u) | 1u));
+  control.push_back(EncodeDs1Ex(10, 0, 0, 29));
+  control.push_back(EncodeMubuf0(0x1d, 28));
+  control.push_back(EncodeMubuf1(10, 2, 35, 2));
+  // The HS prologue's wave lane computation must refer to its control point.
+  control.push_back(EncodeMubuf0(0x1c, 120));
+  control.push_back(EncodeMubuf1(0, 2, 35, 2));
+  // The game reuses previously written data VGPRs for CP0-only ring addresses.
+  AppendVMovLiteral(&control, 4, 0x42280000u);
+  AppendVMovLiteral(&control, 5, 0x422c0000u);
+  control.push_back(EncodeVopc(0xd4, InlineU32(1), 34));
+  control.push_back(EncodeVop2(0x1a, 4, InlineU32(4), 32));
+  control.push_back(EncodeVop2(0x1a, 6, InlineU32(6), 32));
+  control.push_back(EncodeVop2(0x26, 5, 255u, 6));
+  control.push_back(0x7fc0);
+  for (u32 i = 0; i < 4; i++) {
+    AppendVMovLiteral(&control, i, std::bit_cast<u32>(static_cast<float>(i + 1)));
+  }
+  control.push_back(EncodeMubuf0(0x1e));
+  control.push_back(EncodeMubuf1(0, 2, 4, 4));
+  for (u32 i = 0; i < 4; i++) {
+    control.push_back(EncodeMubuf0(0x1c, i * 16));
+    control.push_back(EncodeMubuf1(i, 2, 5, 2));
+  }
+  AppendEnd(&control);
+
+  auto &evaluation = code[2];
+  evaluation.push_back(EncodeMubuf0(0x0d, 28));
+  evaluation.push_back(EncodeMubuf1(10, 2, 7, 4));
+  evaluation.push_back(EncodeMubuf0(0x0d, 256 + 28));
+  evaluation.push_back(EncodeMubuf1(12, 2, 7, 4));
+  evaluation.push_back(EncodeExp0(0x0c, 0xf));
+  evaluation.push_back(EncodeExp1(5, 6, 10, 12));
+  AppendEnd(&evaluation);
+
+  ShaderTessellationInputInfo tess{.input_control_points = 3,
+                                  .output_control_points = 3,
+                                  .domain = 1,
+                                  .partitioning = 2,
+                                  .output_topology = 2};
+  AnalyzeTessellationPrograms(local, control, tess);
+  Require(name, "decoded interface", tess.ls_stride == 124 && tess.hs_stride == 128,
+          "captured LS and HS address arithmetic must produce distinct strides");
+
+  constexpr std::array stages{ShaderType::Local, ShaderType::TessellationControl,
+                              ShaderType::TessellationEvaluation};
+  for (u32 stage = 0; stage < stages.size(); stage++) {
+    ShaderVertexInputInfo vertex;
+    vertex.logical_stage = stages[stage];
+    vertex.tess = tess;
+    CompileOptions options;
+    options.stage = stages[stage];
+    options.input_info.vertex = &vertex;
+    auto translated = TranslateProgram(code[stage], options);
+    std::set<u32> local_offsets, evaluation_offsets, factor_offsets, patch_offsets;
+    for (const auto *block : translated.program.blocks) {
+      for (const auto &inst : *block) {
+        if (inst.GetOpcode() != IR::ValueOpcode::GetTessellationAttribute &&
+            inst.GetOpcode() != IR::ValueOpcode::SetTessellationAttribute) {
+          continue;
+        }
+        if (!inst.Arg(1).IsImmediate()) {
+          continue;
+        }
+        switch (static_cast<IR::TessellationAttribute>(inst.Arg(0).U32())) {
+        case IR::TessellationAttribute::LocalOutput:
+          local_offsets.insert(inst.Arg(1).U32());
+          break;
+        case IR::TessellationAttribute::EvaluationInput:
+          evaluation_offsets.insert(inst.Arg(1).U32());
+          break;
+        case IR::TessellationAttribute::Factor:
+          factor_offsets.insert(inst.Arg(1).U32());
+          break;
+        case IR::TessellationAttribute::PatchOutput:
+          patch_offsets.insert(inst.Arg(1).U32());
+          break;
+        default:
+          break;
+        }
+      }
+    }
+    Require(name, "separate DS offsets", stage != 0 || local_offsets == std::set<u32>{4, 12},
+            "DS_WRITE2 must preserve both independently encoded offsets");
+    Require(name, "offchip component addressing",
+            stage != 2 || evaluation_offsets == std::set<u32>{28, 284},
+            "TES control point and component offsets must survive lowering");
+    Require(name, "triangle factor layout",
+            stage != 1 || factor_offsets == std::set<u32>{0, 4, 8, 12},
+            "the four packed guest factors must retain their order");
+    Require(name, "predicated patch addresses",
+            stage != 1 || patch_offsets == std::set<u32>{0x7fc0, 0x7fd0, 0x7fe0, 0x7ff0},
+            "CP0 patch stores must use the address assigned on their active predicate");
+    auto result = CompileProgram(std::move(translated), options, {});
+    ValidateSpirv(name, result.spirv);
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string assembly;
+    Require(name, "disassembly", tools.Disassemble(result.spirv, &assembly),
+            "failed to disassemble tessellation shader");
+    Require(name, "native local inputs",
+            stage != 0 || (assembly.find("VertexIndex") != std::string::npos &&
+                           assembly.find("InstanceIndex") != std::string::npos),
+            "LS v2/v5 must read native vertex/instance indices");
+    Require(name, "control point lane",
+            stage != 1 || (assembly.find("InvocationId") != std::string::npos &&
+                           assembly.find("SubgroupLocalInvocationId") == std::string::npos),
+            "HS lane masks must use control point invocation IDs");
+    Require(name, "control point barrier",
+            stage != 1 || (assembly.find("OpMemoryModel Logical GLSL450") != std::string::npos &&
+                           assembly.find("OpControlBarrier %uint_2 %uint_4 %uint_0") != std::string::npos),
+            "HS barriers must match GLSL450 control point synchronization semantics");
+    Require(name, "factor builtins",
+            stage != 1 || (assembly.find("TessLevelOuter") != std::string::npos &&
+                           assembly.find("TessLevelInner") != std::string::npos),
+            "triangle factors require outer[4] and inner[2] Vulkan builtins");
+    Require(name, "native domain and winding",
+            stage != 2 || (assembly.find("TessCoord") != std::string::npos &&
+                           assembly.find("Triangles") != std::string::npos &&
+                           assembly.find("SpacingFractionalOdd") != std::string::npos &&
+                           assembly.find("VertexOrderCw") != std::string::npos),
+            "TES must preserve guest triangle domain, partitioning, and winding");
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckEmbeddedFetchVertexOffset() {
   const auto MakeFetch = [](std::initializer_list<std::pair<u32, u32>> adds,
                             std::optional<std::pair<u32, u32>> late_add = {},
-                            u32 accumulator_vgpr = 0, bool ngg_sad = false) {
+                            u32 accumulator_vgpr = 0, bool ngg_sad = false,
+                            bool local = false) {
     std::vector<u32> code;
     code.push_back(EncodeSMovB32(0, InlineU32(0)));
     code.push_back(EncodeSmem0(0x02u, 20, 4));
@@ -25526,7 +25686,7 @@ void CheckEmbeddedFetchVertexOffset() {
     if (ngg_sad) {
       AppendOffsets();
     }
-    code.push_back(EncodeVop2(0x01u, 0, Vgpr(8), 5));
+    code.push_back(EncodeVop2(0x01u, 0, Vgpr(local ? 5 : 8), local ? 2 : 5));
     if (!ngg_sad) {
       AppendOffsets();
     }
@@ -25535,26 +25695,41 @@ void CheckEmbeddedFetchVertexOffset() {
     if (late_add.has_value()) {
       AppendVop3B(&code, 0x30fu, 0, 0, late_add->first, Vgpr(late_add->second));
     }
-    AppendEnd(&code);
+    if (local) {
+      AppendVMovU32(&code, 20, 0);
+      code.push_back(EncodeDs0(0x0e, 1u << 8u));
+      code.push_back(EncodeDs1Ex(0, 10, 9, 20));
+      code.push_back(EncodeDs0(0x0e, (3u << 8u) | 2u));
+      code.push_back(EncodeDs1Ex(0, 12, 11, 20));
+      code.push_back(EncodeSop1(0x20, 0, 6));
+      code.push_back(0xffffffffu);
+    } else {
+      AppendEnd(&code);
+    }
     return code;
   };
 
   const auto Compile = [&](const char *name, const std::vector<u32> &code,
-                           u32 slot10) {
+                           u32 slot10, ShaderType stage = ShaderType::Vertex,
+                           Prospero::BufferFormat format = Prospero::BufferFormat::k32_32_32_32Float) {
     std::array<u32, 11> user_data{};
     user_data[10] = slot10;
     ShaderVertexInputInfo vertex;
+    vertex.logical_stage = stage;
+    vertex.tess = {.input_control_points = 3, .output_control_points = 3,
+                   .ls_stride = 124, .hs_stride = 128, .domain = 1,
+                   .partitioning = 2, .output_topology = 2};
     vertex.fetch_embedded = true;
     vertex.fetch_buffer_reg = 0;
     vertex.fetch_attrib_reg = 2;
     vertex.resources_num = 1;
     vertex.resources[0].fields[3] =
-        BufferFormat(Prospero::BufferFormat::k32_32_32_32Float) << 12u | DstSel(4, 5, 6, 7);
+        BufferFormat(format) << 12u | DstSel(4, 5, 6, 7);
     vertex.resources_dst[0].attr_id = 0;
     vertex.resources_dst[0].registers_num = 4;
 
     ShaderRecompiler::CompileOptions options;
-    options.stage = ShaderType::Vertex;
+    options.stage = stage;
     options.user_data_base = 8;
     options.user_data = user_data;
     options.input_info.vertex = &vertex;
@@ -25604,6 +25779,28 @@ void CheckEmbeddedFetchVertexOffset() {
     vertex.stage.resources = result.resources;
     return ResolveDrawOffsets(0, vertex).second;
   };
+
+  for (const auto format : {Prospero::BufferFormat::k32_32_32_32Float,
+                            Prospero::BufferFormat::k32_32_32_32UInt}) {
+    const auto local = Compile("LocalEmbeddedFetch", MakeFetch({}, {}, 0, false, true),
+                               0, ShaderType::Local, format);
+    ValidateSpirv("LocalEmbeddedFetch", local.spirv);
+    Require("LocalEmbeddedFetch", "live vertex attributes",
+            std::ranges::any_of(local.program.info.inputs, [](const auto &input) {
+              return input.kind == ShaderRecompiler::IR::StageInputKind::Parameter &&
+                     input.location == 0;
+            }), "LS indexed fetch must consume native vertex attributes");
+    if (format == Prospero::BufferFormat::k32_32_32_32UInt) {
+      spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+      std::string assembly;
+      Require("LocalEmbeddedFetch", "disassembly", tools.Disassemble(local.spirv, &assembly),
+              "failed to disassemble unsigned LS fetch");
+      Require("LocalEmbeddedFetch", "unsigned input type",
+              assembly.find("OpTypePointer Input %v4uint") != std::string::npos &&
+                  assembly.find("OpConvertUToF") == std::string::npos,
+              "unsigned LS attributes must preserve their native integer bits");
+    }
+  }
 
   const auto valid =
       Compile("EmbeddedFetchVertexOffset", MakeFetch({{18, 0}}), 7);
@@ -29355,6 +29552,11 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--tessellation-only") == 0) {
+    CheckTessellationPrograms();
+    CheckEmbeddedFetchVertexOffset();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-lt-u16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorVopcCmpxLtU16CapturedSdwaExecMask());
@@ -29777,6 +29979,7 @@ int main(int argc, char **argv) {
   CheckPm4CeCompletion(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
+  CheckTessellationPrograms();
   CheckRectListShaders();
   CheckIndirectImageKeySwitch();
   CheckPs5GameExampleImageClearRuntimeShape();

@@ -277,7 +277,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					break;
 				}
 				case IR::ValueOpcode::LaneId:
-					requirements.subgroup_local_invocation_id = true;
+					requirements.subgroup_local_invocation_id |=
+					    program.stage != ShaderType::TessellationControl;
 					break;
 				case IR::ValueOpcode::ImageQueryLod: requirements.compute_derivatives = true; break;
 				case IR::ValueOpcode::ImageGatherRaw:
@@ -306,8 +307,10 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
-	    program.stage != ShaderType::Pixel && program.stage != ShaderType::Mesh) {
-		Fail(program, "binary SPIR-V emitter supports compute, vertex, and pixel shaders");
+	    program.stage != ShaderType::Pixel && program.stage != ShaderType::Mesh &&
+	    program.stage != ShaderType::Local && program.stage != ShaderType::TessellationControl &&
+	    program.stage != ShaderType::TessellationEvaluation) {
+		Fail(program, "binary SPIR-V emitter received an unsupported shader stage");
 	}
 	if (!program.srt_plan_complete || !program.resource_tracking_complete ||
 	    !program.shader_info_complete || !program.binding_layout_complete) {

@@ -8,6 +8,7 @@ namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
 
+vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage);
 vk::PipelineStageFlags  ShaderPipelineStages(vk::ShaderStageFlags stages);
 VulkanMemoryBarrier     MakeShaderAccessDependency();
 VulkanMemoryBarrier     MakeShaderWriteHazardDependency();

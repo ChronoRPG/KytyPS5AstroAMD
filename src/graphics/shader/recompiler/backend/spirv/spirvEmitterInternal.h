@@ -80,6 +80,10 @@ struct EmitterState {
 	Builder                                          builder;
 	const IR::Program&                               program;
 	ShaderStageInputInfo                             input_info;
+	std::array<uint32_t, 6>                          tess_variables {};
+	uint32_t                                         tess_inner_variable = 0;
+	uint32_t                                         tess_patch_base     = 0;
+
 	const SpirvRequirements                          requirements;
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;

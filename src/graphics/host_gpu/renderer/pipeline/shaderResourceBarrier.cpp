@@ -8,6 +8,20 @@
 
 namespace Libs::Graphics {
 
+vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage) {
+	switch (stage) {
+		case ShaderType::Local:
+		case ShaderType::Vertex: return vk::ShaderStageFlagBits::eVertex;
+		case ShaderType::Mesh: return vk::ShaderStageFlagBits::eMeshEXT;
+		case ShaderType::TessellationControl: return vk::ShaderStageFlagBits::eTessellationControl;
+		case ShaderType::TessellationEvaluation:
+			return vk::ShaderStageFlagBits::eTessellationEvaluation;
+		case ShaderType::Pixel: return vk::ShaderStageFlagBits::eFragment;
+		case ShaderType::Compute: return vk::ShaderStageFlagBits::eCompute;
+		default: EXIT("unknown native shader stage\n");
+	}
+}
+
 vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
 	vk::PipelineStageFlags result = {};
 	if (stages & vk::ShaderStageFlagBits::eVertex) {
@@ -15,6 +29,12 @@ vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
 	}
 	if (stages & vk::ShaderStageFlagBits::eMeshEXT) {
 		result |= vk::PipelineStageFlagBits::eMeshShaderEXT;
+	}
+	if (stages & vk::ShaderStageFlagBits::eTessellationControl) {
+		result |= vk::PipelineStageFlagBits::eTessellationControlShader;
+	}
+	if (stages & vk::ShaderStageFlagBits::eTessellationEvaluation) {
+		result |= vk::PipelineStageFlagBits::eTessellationEvaluationShader;
 	}
 	if (stages & vk::ShaderStageFlagBits::eFragment) {
 		result |= vk::PipelineStageFlagBits::eFragmentShader;

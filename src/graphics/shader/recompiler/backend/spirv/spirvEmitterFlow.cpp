@@ -51,6 +51,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		return bits;
 	}
 	if (kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||
+	    kind == IR::StageInputKind::InvocationId || kind == IR::StageInputKind::PrimitiveId ||
 	    kind == IR::StageInputKind::Layer || kind == IR::StageInputKind::SampleId) {
 		const auto value = state.builder.AllocateId();
 		const auto bits  = state.builder.AllocateId();
@@ -58,7 +59,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
 		return bits;
 	}
-	if (kind == IR::StageInputKind::FragCoord) {
+	if (kind == IR::StageInputKind::FragCoord || kind == IR::StageInputKind::TessCoord) {
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
 		const auto bits    = state.builder.AllocateId();
@@ -138,7 +139,7 @@ uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
 	if (input == nullptr || input->variable_id == 0) {
 		return ConstantU32(state, 0);
 	}
-	if (state.program.stage == ShaderType::Vertex) {
+	if (state.program.stage == ShaderType::Vertex || state.program.stage == ShaderType::Local) {
 		return EmitVertexParameterComponentU32(state, *input, chan & 3u);
 	}
 	const auto load_per_vertex = [&](uint32_t vertex) {
@@ -517,11 +518,95 @@ uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
 void EmitVoid(ValueEmitContext&) {}
 
 void EmitBarrier(EmitterState& state) {
-	const auto semantics =
-	    spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask;
+	const auto tessellation = state.program.stage == ShaderType::TessellationControl;
+	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
+	const auto semantics    = tessellation ? spv::MemorySemanticsMaskNone
+	                                       : spv::MemorySemanticsAcquireReleaseMask |
+	                                             spv::MemorySemanticsWorkgroupMemoryMask;
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
-	                          ConstantU32(state, spv::ScopeWorkgroup),
-	                          ConstantU32(state, semantics));
+	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
+}
+
+uint32_t EmitLaneId(EmitterState& state) {
+	return state.program.stage == ShaderType::TessellationControl
+	           ? EmitBuiltinU32(state, IR::StageInputKind::InvocationId, 0)
+	           : EmitSubgroupLocalInvocationId(state);
+}
+
+namespace {
+
+uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state          = ctx.state;
+	using Attribute      = IR::TessellationAttribute;
+	const auto  kind     = static_cast<Attribute>(inst.Arg(0).U32());
+	const auto& tess     = state.input_info.vertex->tess;
+	const auto  variable = state.tess_variables.at(static_cast<uint32_t>(kind));
+	EXIT_IF(variable == 0);
+	const auto input   = kind == Attribute::ControlInput || kind == Attribute::EvaluationInput;
+	const auto storage = input ? spv::StorageClassInput : spv::StorageClassOutput;
+	const auto pointer = state.builder.AllocateId();
+	if (kind == Attribute::Factor) {
+		EXIT_NOT_IMPLEMENTED(!inst.Arg(1).IsImmediate());
+		const auto index = inst.Arg(1).U32() / 4u;
+		const auto outer = index < 3u;
+		EXIT_NOT_IMPLEMENTED(index >= 4u);
+		state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)),
+		                          pointer, outer ? variable : state.tess_inner_variable,
+		                          ConstantU32(state, outer ? index : index - 3u));
+		return pointer;
+	}
+	auto address = ctx.Arg(inst, 1);
+	if (kind == Attribute::PatchOutput) {
+		address =
+		    EmitBinaryU32(state, spv::OpISub, address, ConstantU32(state, state.tess_patch_base));
+	}
+	const bool local  = kind == Attribute::LocalOutput || kind == Attribute::ControlInput;
+	const auto stride = local ? tess.ls_stride : tess.hs_stride;
+	const auto offset = kind == Attribute::PatchOutput ? address
+	                                                   : EmitBinaryU32(state, spv::OpUMod, address,
+	                                                                   ConstantU32(state, stride));
+	const auto attribute =
+	    EmitBinaryU32(state, spv::OpShiftRightLogical, offset, ConstantU32(state, 4));
+	const auto component =
+	    EmitBinaryU32(state, spv::OpBitwiseAnd,
+	                  EmitBinaryU32(state, spv::OpShiftRightLogical, offset, ConstantU32(state, 2)),
+	                  ConstantU32(state, 3));
+	const auto type = TypePointer(state, storage, TypeU32(state));
+	if (kind == Attribute::LocalOutput || kind == Attribute::PatchOutput) {
+		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, attribute,
+		                          component);
+	} else {
+		const auto vertex =
+		    kind == Attribute::ControlOutput
+		        ? EmitBuiltinU32(state, IR::StageInputKind::InvocationId, 0)
+		        : EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
+		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, vertex, attribute,
+		                          component);
+	}
+	return pointer;
+}
+
+} // namespace
+
+uint32_t EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, 2), [&] {
+		const auto value = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value,
+		                              TessellationPointer(ctx, inst));
+		return value;
+	});
+}
+
+void EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
+	EmitIfCondition(ctx.state, ctx.Arg(inst, 3), [&] {
+		auto value = ctx.Arg(inst, 2);
+		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::Factor)) {
+			const auto floating = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(spv::OpBitcast, TypeF32(ctx.state), floating, value);
+			value = floating;
+		}
+		ctx.state.builder.AddFunction(spv::OpStore, TessellationPointer(ctx, inst), value);
+	});
 }
 
 uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {

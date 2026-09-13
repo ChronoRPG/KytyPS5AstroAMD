@@ -33,7 +33,17 @@ struct ComputeShaderInfo;
 struct ShaderRegisters;
 } // namespace HW
 
-enum class ShaderType { Unknown, Vertex, Pixel, Fetch, Compute, Mesh };
+enum class ShaderType {
+	Unknown,
+	Vertex,
+	Pixel,
+	Fetch,
+	Compute,
+	Mesh,
+	Local,
+	TessellationControl,
+	TessellationEvaluation
+};
 
 namespace ShaderRecompiler::IR {
 struct CompiledShaderInfo;
@@ -99,6 +109,16 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	}
 };
 
+struct ShaderTessellationInputInfo {
+	uint32_t input_control_points  = 0;
+	uint32_t output_control_points = 0;
+	uint32_t ls_stride             = 0;
+	uint32_t hs_stride             = 0;
+	uint32_t domain                = 0;
+	uint32_t partitioning          = 0;
+	uint32_t output_topology       = 0;
+};
+
 struct ShaderVertexInputInfo {
 	static constexpr int RES_MAX = 32;
 
@@ -106,6 +126,7 @@ struct ShaderVertexInputInfo {
 	ShaderVertexDestination resources_dst[RES_MAX];
 	ShaderVertexInputBuffer buffers[RES_MAX];
 	ShaderStageRuntime      stage;
+	ShaderType                  logical_stage        = ShaderType::Vertex;
 	int                     resources_num       = 0;
 	int                     fetch_attrib_reg    = 0;
 	int                     fetch_buffer_reg    = 0;
@@ -114,6 +135,7 @@ struct ShaderVertexInputInfo {
 	uint32_t                pa_cl_vs_out_cntl    = 0;
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
+	ShaderTessellationInputInfo tess;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
 };

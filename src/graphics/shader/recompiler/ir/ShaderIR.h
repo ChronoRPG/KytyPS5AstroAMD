@@ -150,8 +150,20 @@ struct SampledResourcePair {
 	bool operator==(const SampledResourcePair& other) const = default;
 };
 
+enum class TessellationAttribute {
+	LocalOutput,
+	ControlInput,
+	ControlOutput,
+	EvaluationInput,
+	PatchOutput,
+	Factor
+};
+
 enum class StageInputKind {
 	VertexIndex,
+	InvocationId,
+	PrimitiveId,
+	TessCoord,
 	InstanceIndex,
 	FragCoord,
 	FrontFacing,
@@ -287,8 +299,12 @@ static_assert(sizeof(PushData) == 128);
 constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 
 [[nodiscard]] constexpr uint32_t NativeBinding(ShaderType stage, DescriptorBindingKind kind) {
+	const uint32_t group = stage == ShaderType::Pixel                    ? 1u
+	                       : stage == ShaderType::TessellationControl    ? 2u
+	                       : stage == ShaderType::TessellationEvaluation ? 3u
+	                                                                     : 0u;
 	return static_cast<uint32_t>(kind) +
-	       (stage == ShaderType::Pixel ? static_cast<uint32_t>(DescriptorBindingKind::Count) : 0u);
+	       group * static_cast<uint32_t>(DescriptorBindingKind::Count);
 }
 
 [[nodiscard]] constexpr ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind) {
