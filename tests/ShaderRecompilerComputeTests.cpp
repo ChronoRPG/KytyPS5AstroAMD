@@ -4738,24 +4738,27 @@ public:
               "instead of being discarded and recreated");
 
       ImageInfo chain = sampled.info;
-      chain.data = {0x10000, 0x8000};
-      chain.extent = {8, 8, 1};
-      chain.resources = {2, 4};
-      chain.pitch = 8;
-      chain.mip_layout[0] = {0, 0x4000, 8, 8};
-      chain.mip_layout[1] = {0x4000, 0x4000, 4, 4};
+      chain.data = {0x2394c1000, 0x384000};
+      chain.extent = {64, 64, 1};
+      chain.resources = {7, 150};
+      chain.pitch = 64;
+      chain.tile_mode = Prospero::TileMode::kStandard4KB;
+      chain.mip_layout[0] = {0x2000, 0x258000, 64, 64};
+      chain.mip_layout[1] = {0x1000, 0x96000, 32, 32};
+      for (uint32_t level = 2; level < chain.resources.levels; ++level) {
+        chain.mip_layout[level] = {0, 0x96000, 32, 32};
+      }
       ImageInfo subresource = chain;
-      subresource.data = {0x16000, 0x1000};
-      subresource.extent = {4, 4, 1};
+      subresource.data = {0x2394c3000, 0x4000};
       subresource.resources = {1, 1};
-      subresource.pitch = 4;
-      subresource.mip_layout[0] = {0, 0x1000, 4, 4};
+      subresource.mip_layout = {};
+      subresource.mip_layout[0] = {0, 0x4000, 64, 64};
       const auto mip = subresource.MipOf(chain);
       Require(name, "overlap resolution",
-              mip == 1 && subresource.SliceOf(chain, mip) == 2 &&
+              mip == 0 && subresource.SliceOf(chain, mip) == 0 &&
                   ImageRangeOverlaps(chain.data, subresource.data) &&
                   ImagePageRangesOverlap(chain.data, subresource.data),
-              "normalized mip/slice overlap did not resolve");
+              "captured PS5 atlas mip/slice overlap did not resolve");
 
       auto exact_desc = compatible_desc;
       const auto exact = texture_cache.FindImage(exact_desc, true);
@@ -10933,20 +10936,23 @@ public:
                                                     stencil_layout.size, false),
               "depth prefetch performed final target acquisition");
 
-      auto target_parent =
-          make_target_desc(base, target_mip_size * 2, {4, 4, 1});
+      auto target_parent = make_target_desc(base, 1536, {4, 4, 1});
       target_parent.type = BindingType::RenderTarget;
       target_parent.info.resources.levels = 2;
-      target_parent.info.mip_layout[0] = {0, target_mip_size, 4, 4};
-      target_parent.info.mip_layout[1] = {target_mip_size, target_mip_size, 2,
-                                          2};
+      // PS5 linear rows align to 256 bytes; smaller mips precede larger ones.
+      target_parent.info.pitch = 64;
+      target_parent.info.mip_layout[0] = {512, 1024, 64, 4};
+      target_parent.info.mip_layout[1] = {0, 512, 64, 2};
       target_parent.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
       auto target_base_subresource =
-          make_target_desc(base, target_mip_size, {4, 4, 1});
+          make_target_desc(base + 512, 1024, {4, 4, 1});
+      target_base_subresource.info.pitch = 64;
+      target_base_subresource.info.mip_layout[0] = {0, 1024, 64, 4};
       const auto target_base_subresource_id =
           texture_cache.FindImage(target_base_subresource);
-      auto target_subresource =
-          make_target_desc(base + target_mip_size, target_mip_size, {2, 2, 1});
+      auto target_subresource = make_target_desc(base, 512, {2, 2, 1});
+      target_subresource.info.pitch = 64;
+      target_subresource.info.mip_layout[0] = {0, 512, 64, 2};
       const auto target_subresource_id =
           texture_cache.FindImage(target_subresource);
       const auto *target_subresource_owner =
@@ -10961,6 +10967,15 @@ public:
                   !TextureCacheTestAccess::PendingDownload(
                       texture_cache, target_subresource_id),
               "FindImage claimed RenderExecutor-owned render-target state");
+      vk::ClearValue target_clear{};
+      target_clear.color.uint32[0] = 0x12345678;
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), target_base_subresource_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, target_clear);
+      target_clear.color.uint32[0] = 0x89abcdef;
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), target_subresource_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, target_clear);
       RenderExecutorTestAccess::BindRenderTarget(executor,
                                                  target_subresource_id);
       Require(name, "target prefetch purity",
@@ -10982,6 +10997,34 @@ public:
                                                            target_parent_id),
               "target overlap did not transfer target state to the merged "
               "owner");
+      auto target_readback = CreateHostBuffer(
+          name, 2 * sizeof(u32), vk::BufferUsageFlagBits::eTransferDst,
+          {0xaaaaaaaa, 0xaaaaaaaa});
+      const std::array target_probes{
+          vk::BufferImageCopy{0,
+                              0,
+                              0,
+                              {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                              {},
+                              {1, 1, 1}},
+          vk::BufferImageCopy{sizeof(u32),
+                              0,
+                              0,
+                              {vk::ImageAspectFlagBits::eColor, 1, 0, 1},
+                              {},
+                              {1, 1, 1}}};
+      texture_cache.GetImage(target_parent_id)
+          .Download(target_probes, target_readback.buffer, 0,
+                    target_readback.size);
+      const vk::MemoryBarrier2 target_host_barrier{
+          .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+          .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+          .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+          .dstAccessMask = vk::AccessFlagBits2::eHostRead};
+      vk::DependencyInfo target_dependency{};
+      target_dependency.memoryBarrierCount = 1;
+      target_dependency.pMemoryBarriers = &target_host_barrier;
+      scheduler.Current().Handle().pipelineBarrier2(target_dependency);
       RenderColorInfo rebound_color{};
       rebound_color.desc = target_subresource;
       rebound_color.image_id = target_subresource_id;
@@ -10989,6 +11032,11 @@ public:
       rebound_depth.desc = depth;
       rebound_depth.image_id = depth_id;
       scheduler.Finish();
+      Require(name, "promoted target mip contents",
+              ReadBuffer(name, target_readback, 2) ==
+                  std::vector<u32>{0x12345678, 0x89abcdef},
+              "promotion discarded GPU contents from a child mip");
+      DestroyBuffer(&target_readback);
       Require(name, "deferred target slot erasure",
               TextureCacheTestAccess::Owner(texture_cache,
                                             target_subresource_id) == nullptr,

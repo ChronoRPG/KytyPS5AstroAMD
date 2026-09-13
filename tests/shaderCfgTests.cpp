@@ -1183,37 +1183,90 @@ void TestNativeShaderResourceDependencies() {
 }
 
 void TestNormalizedImageContracts() {
+  // Captured PS5 256x256 atlas: each layer is a 0x56000-byte mip chain.
   ImageInfo container{};
-  container.data = {0x10000, 0x15000};
+  container.data = {0x241741000, 0x2198000};
   container.pixel_format = vk::Format::eR8G8B8A8Unorm;
   container.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
   container.type = Prospero::ImageType::kColor2D;
-  container.extent = {64, 64, 1};
-  container.resources = {3, 4};
-  container.pitch = 64;
+  container.extent = {256, 256, 1};
+  container.resources = {9, 100};
+  container.pitch = 256;
   container.bytes_per_block = 4;
   container.samples = 1;
-  container.tile_mode = Prospero::TileMode::kStandard64KB;
-  container.mip_layout[0] = {0, 0x10000, 64, 64};
-  container.mip_layout[1] = {0x10000, 0x4000, 32, 32};
-  container.mip_layout[2] = {0x14000, 0x1000, 16, 16};
+  container.tile_mode = Prospero::TileMode::kStandard4KB;
+  container.mip_layout[0] = {0x16000, 0x1900000, 256, 256};
+  container.mip_layout[1] = {0x6000, 0x640000, 128, 128};
+  container.mip_layout[2] = {0x2000, 0x190000, 64, 64};
+  container.mip_layout[3] = {0x1000, 0x64000, 32, 32};
+  for (uint32_t level = 4; level < container.resources.levels; ++level) {
+    container.mip_layout[level] = {0, 0x64000, 32, 32};
+  }
 
   ImageInfo subresource = container;
-  subresource.data = {0x22000, 0x1000};
-  subresource.extent = {32, 32, 1};
+  subresource.data = {0x2417ad000, 0x40000};
   subresource.resources = {1, 1};
-  subresource.pitch = 32;
   subresource.mip_layout = {};
-  subresource.mip_layout[0] = {0, 0x1000, 32, 32};
+  subresource.mip_layout[0] = {0, 0x40000, 256, 256};
 
-  Check(container.BlockExtent() == vk::Extent2D{64, 64},
+  Check(container.BlockExtent() == vk::Extent2D{256, 256},
         "normalized image block extent changed");
   Check(subresource.IsCompatible(container),
         "normalized compatible image was rejected");
-  Check(subresource.MipOf(container) == 1,
-        "normalized mip lookup missed a subresource");
-  Check(subresource.SliceOf(container, 1) == 2,
-        "normalized slice lookup missed a subresource");
+  Check(subresource.MipOf(container) == 0 &&
+            subresource.SliceOf(container, 0) == 1,
+        "PS5 mip-chain stride did not resolve the captured second array layer");
+
+  auto smaller = subresource;
+  smaller.data = {0x241747000, 0x10000};
+  smaller.extent = {128, 128, 1};
+  smaller.pitch = 128;
+  smaller.mip_layout[0] = {0, 0x10000, 128, 128};
+  Check(smaller.MipOf(container) == 1 && smaller.SliceOf(container, 1) == 0,
+        "PS5 reversed mip ordering did not resolve the captured smaller mip");
+
+  auto boundary = subresource;
+  boundary.data.address = container.data.address + 99 * 0x56000 + 0x16000;
+  Check(boundary.SliceOf(container, 0) == 99,
+        "PS5 array lookup rejected the final complete layer");
+  boundary.data.address += 0x56000;
+  Check(boundary.MipOf(container) == -1,
+        "PS5 array lookup accepted a layer beyond the parent range");
+  boundary = subresource;
+  boundary.data.address += 0x1000;
+  Check(boundary.MipOf(container) == -1,
+        "PS5 array lookup accepted a misaligned layer address");
+  boundary = subresource;
+  boundary.resources.layers = 2;
+  boundary.data.size *= 2;
+  boundary.mip_layout[0].size *= 2;
+  Check(boundary.MipOf(container) == -1,
+        "PS5 array lookup accepted contiguous child layers with a different stride");
+  boundary = subresource;
+  boundary.mip_layout[0].pitch *= 2;
+  Check(boundary.MipOf(container) == -1,
+        "PS5 array lookup accepted a different storage pitch");
+
+  auto small_atlas = container;
+  small_atlas.data = {0x239001000, 0x64000};
+  small_atlas.extent = {32, 32, 1};
+  small_atlas.pitch = 32;
+  small_atlas.resources = {6, 50};
+  small_atlas.mip_layout[0] = {0x1000, 0x32000, 32, 32};
+  for (uint32_t level = 1; level < small_atlas.resources.levels; ++level) {
+    small_atlas.mip_layout[level] = {0, 0x32000, 32, 32};
+  }
+  auto small_child = subresource;
+  small_child.data = {0x23900e000, 0x1000};
+  small_child.extent = {32, 32, 1};
+  small_child.pitch = 32;
+  small_child.mip_layout[0] = {0, 0x1000, 32, 32};
+  Check(small_child.MipOf(small_atlas) == 0 &&
+            small_child.SliceOf(small_atlas, 0) == 6,
+        "PS5 array lookup doubled the captured small-atlas layer index");
+  small_child.data.address = 0x23900d000;
+  Check(small_child.MipOf(small_atlas) == -1,
+        "PS5 array lookup treated a packed tail block as the full-size mip");
 
   auto incompatible = subresource;
   incompatible.samples = 2;

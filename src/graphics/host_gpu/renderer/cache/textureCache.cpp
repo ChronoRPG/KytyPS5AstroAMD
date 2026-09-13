@@ -810,17 +810,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const bool safe_to_delete =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
 
-	if (requested.data.address == cached.info.data.address) {
-		const uint32_t requested_block = requested.bytes_per_block * requested.samples;
-		const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
-		if (requested.BlockExtent() != cached.info.BlockExtent() ||
-		    requested_block != cached_block) {
-			if (safe_to_delete) {
-				FreeImage(cached_id);
-			}
-			return {merged_id};
-		}
-
+	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
+	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
+	if (requested.data.address == cached.info.data.address &&
+	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
 			return {depth_id};
 		}
@@ -873,38 +866,27 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		     static_cast<uint32_t>(cached.info.tile_mode));
 	}
 
-	if (requested.data.address > cached.info.data.address) {
-		const int32_t mip = requested.MipOf(cached.info);
-		if (mip >= 0) {
-			const int32_t layer = requested.SliceOf(cached.info, mip);
-			if (layer >= 0) {
-				return {cached_id, mip, layer};
-			}
-		}
-		if (safe_to_delete) {
-			FreeImage(cached_id);
-		}
-		return {};
+	const int32_t requested_mip = requested.MipOf(cached.info);
+	if (requested_mip >= 0) {
+		const int32_t layer = requested.SliceOf(cached.info, requested_mip);
+		return {cached_id, requested_mip, layer};
 	}
 
 	const int32_t mip = cached.info.MipOf(requested);
 	if (mip >= 0) {
 		const int32_t layer = cached.info.SliceOf(requested, mip);
-		if (layer >= 0) {
-			if (cached.binding.is_target) {
-				cached.binding.needs_rebind = true;
-				if (merged_id) {
-					m_slot_images[merged_id].binding.is_target = true;
-				}
-				FreeImage(cached_id);
-				return {merged_id};
-			}
-			if (merged_id) {
-				CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
-				             static_cast<uint32_t>(layer));
-				FreeImage(cached_id);
-			}
+		if (!merged_id) {
+			return {ExpandImage(requested, cached_id)};
 		}
+		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
+		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
+		             static_cast<uint32_t>(layer));
+		FreeImage(cached_id);
+		return {merged_id};
+	}
+	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
+		FreeImage(cached_id);
 	}
 	return {merged_id};
 }
@@ -919,7 +901,14 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 		source.binding.needs_rebind = true;
 	}
 	InitializeImage(expanded_id);
-	CopyImage(expanded_id, source_id);
+	const int32_t mip = source.info.MipOf(info);
+	const int32_t layer = source.info.SliceOf(info, mip);
+	if (layer >= 0) {
+		CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(mip),
+		             static_cast<uint32_t>(layer));
+	} else {
+		CopyImage(expanded_id, source_id);
+	}
 	FreeImage(source_id);
 	return expanded_id;
 }
