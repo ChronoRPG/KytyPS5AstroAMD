@@ -20,6 +20,11 @@
 #include <string>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -1162,6 +1167,43 @@ void TestDirectPartialProtectUnmapPreservesNeighbors() {
 
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+#if defined(__linux__)
+void TestPartialUnmapPreservesHostPermissions() {
+	const char* test = "PartialUnmapPreservesHostPermissions";
+	const auto base = MapNamedFlexible(test, SceKernelPageSize * 3, SceKernelProtCpuRw,
+	                                   "unmap_host_permissions");
+	using Common::VirtualMemory::Mode;
+	Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize, Mode::Read),
+	      "could not protect the left survivor from writes");
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base + SceKernelPageSize * 2,
+	                                                      SceKernelPageSize, Mode::NoAccess),
+	      "could not protect the right survivor from reads");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(middle)");
+
+	// Probe actual host access without taking a signal or changing the page protections.
+	uint64_t value = 0;
+	iovec local {&value, sizeof(value)};
+	iovec left {reinterpret_cast<void*>(base), sizeof(value)};
+	iovec right {reinterpret_cast<void*>(base + SceKernelPageSize * 2), sizeof(value)};
+	Check(test, process_vm_readv(getpid(), &local, 1, &left, 1, 0) == sizeof(value),
+	      "partial unmap removed read access to the left survivor");
+	Check(test, process_vm_writev(getpid(), &local, 1, &left, 1, 0) == -1,
+	      "partial unmap removed the left survivor's write protection");
+	Check(test, process_vm_readv(getpid(), &local, 1, &right, 1, 0) == -1,
+	      "partial unmap removed the right survivor's read protection");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap(left cleanup)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize * 2, SceKernelPageSize),
+	        "KernelMunmap(right cleanup)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
 
 void TestDirectMapValidationBeforeOwnerMutation() {
 	const char* test    = "DirectMapValidationBeforeOwnerMutation";
@@ -2529,6 +2571,9 @@ int main(int argc, char** argv) {
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+#if defined(__linux__)
+	RunTest(TestPartialUnmapPreservesHostPermissions);
+#endif
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
 	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
 	RunTest(TestDirectReleaseContracts);
