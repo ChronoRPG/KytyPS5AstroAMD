@@ -334,8 +334,6 @@ uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind ki
 	}
 }
 
-namespace {
-
 uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::StorageClass storage,
                                  const char* name) {
 	const auto variable =
@@ -344,6 +342,8 @@ uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::Storag
 	state.builder.AddName(variable, name);
 	return variable;
 }
+
+namespace {
 
 uint32_t BuiltInForInput(IR::StageInputKind kind) {
 	switch (kind) {
@@ -544,70 +544,6 @@ void DefineOutputs(EmitterState& state) {
 	}
 }
 
-void DefineTessellationInterfaces(EmitterState& state) {
-	using Attribute = IR::TessellationAttribute;
-	std::array<bool, 6> used {};
-	uint32_t            patch_begin = UINT32_MAX, patch_end = 0;
-	for (const auto* block: state.program.blocks) {
-		for (const auto& inst: *block) {
-			if (inst.GetOpcode() != IR::ValueOpcode::GetTessellationAttribute &&
-			    inst.GetOpcode() != IR::ValueOpcode::SetTessellationAttribute)
-				continue;
-			const auto kind = inst.Arg(0).U32();
-			used.at(kind)   = true;
-			if (kind == static_cast<uint32_t>(Attribute::PatchOutput)) {
-				EXIT_NOT_IMPLEMENTED(!inst.Arg(1).IsImmediate());
-				patch_begin = std::min(patch_begin, inst.Arg(1).U32());
-				patch_end   = std::max(patch_end, inst.Arg(1).U32() + 4u);
-			}
-		}
-	}
-	if (std::ranges::none_of(used, [](bool value) { return value; })) return;
-	const auto& tess  = state.input_info.vertex->tess;
-	const auto  array = [&](uint32_t type, uint32_t count) {
-		return state.builder.Type(spv::OpTypeArray, type, ConstantU32(state, count));
-	};
-	for (uint32_t index = 0; index < used.size(); index++) {
-		if (!used[index]) continue;
-		const auto kind    = static_cast<Attribute>(index);
-		const bool input   = kind == Attribute::ControlInput || kind == Attribute::EvaluationInput;
-		const auto storage = input ? spv::StorageClassInput : spv::StorageClassOutput;
-		uint32_t   type;
-		if (kind == Attribute::Factor) {
-			type = array(TypeF32(state), 4u);
-		} else if (kind == Attribute::PatchOutput) {
-			state.tess_patch_base = patch_begin;
-			type = array(TypeU32Vector(state, 4), (patch_end - patch_begin + 15u) / 16u);
-		} else {
-			const bool local  = kind == Attribute::LocalOutput || kind == Attribute::ControlInput;
-			const auto stride = local ? tess.ls_stride : tess.hs_stride;
-			type              = array(TypeU32Vector(state, 4), (stride + 15u) / 16u);
-			if (kind != Attribute::LocalOutput) {
-				type = array(type, local ? tess.input_control_points : tess.output_control_points);
-			}
-		}
-		auto& variable = state.tess_variables[index];
-		variable       = DefineInterfaceVariable(state, type, storage, "tess_attributes");
-		if (kind == Attribute::Factor) {
-			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn,
-			                            spv::BuiltInTessLevelOuter);
-			state.tess_inner_variable =
-			    DefineInterfaceVariable(state, array(TypeF32(state), 2u), storage, "tess_inner");
-			state.builder.AddAnnotation(spv::OpDecorate, state.tess_inner_variable,
-			                            spv::DecorationBuiltIn, spv::BuiltInTessLevelInner);
-			state.builder.AddAnnotation(spv::OpDecorate, state.tess_inner_variable,
-			                            spv::DecorationPatch);
-		} else {
-			state.builder.AddAnnotation(
-			    spv::OpDecorate, variable, spv::DecorationLocation,
-			    kind == Attribute::PatchOutput ? (tess.hs_stride + 15u) / 16u : 0u);
-		}
-		if (kind == Attribute::Factor || kind == Attribute::PatchOutput) {
-			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationPatch);
-		}
-	}
-}
-
 } // namespace
 
 void DefineModule(EmitterState& state) {
@@ -639,18 +575,7 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.program.stage == ShaderType::TessellationControl ||
 	    state.program.stage == ShaderType::TessellationEvaluation) {
-		const auto& tess = state.input_info.vertex->tess;
-		EXIT_NOT_IMPLEMENTED(tess.domain != 1u || tess.partitioning != 2u ||
-		                     tess.output_topology != 2u);
-		state.builder.RequireCapability(spv::CapabilityTessellation);
-		if (state.program.stage == ShaderType::TessellationControl) {
-			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
-			                               tess.output_control_points);
-		} else {
-			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeTriangles);
-			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSpacingFractionalOdd);
-			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeVertexOrderCw);
-		}
+		DefineTessellationExecutionModes(state);
 	}
 	state.entry_label = state.builder.AllocateId();
 

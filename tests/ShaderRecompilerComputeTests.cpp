@@ -36,6 +36,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"

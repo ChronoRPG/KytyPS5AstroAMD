@@ -37,9 +37,6 @@ struct CompileResult {
 	IR::Program            program;
 };
 
-void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
-                                 ShaderTessellationInputInfo& info);
-
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);
 [[nodiscard]] CompileResult CompileProgram(TranslateResult translated,
