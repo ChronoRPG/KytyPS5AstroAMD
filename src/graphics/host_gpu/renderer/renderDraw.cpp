@@ -1100,8 +1100,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
-	auto bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
-	                                        state.ps_active);
+	GraphicsBindings bindings {.vertex = PrepareBindings(state.vs_input_info.stage)};
+	std::array<PreparedBindings*, 2> descriptor_stages {&bindings.vertex, nullptr};
+	if (state.ps_active) {
+		bindings.pixel.emplace(PrepareBindings(state.ps_input_info.stage));
+		descriptor_stages[1] = &*bindings.pixel;
+	}
+	const auto stages = std::span {descriptor_stages.data(), state.ps_active ? 2u : 1u};
+	PrepareGraphicsBindings(stages);
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1132,13 +1138,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (bindings.pixel && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
-	std::array<PreparedBindings*, 2> descriptor_stages {&bindings.vertex, nullptr};
-	const size_t                     descriptor_stage_count = bindings.pixel.has_value() ? 2u : 1u;
-	if (bindings.pixel) {
-		descriptor_stages[1] = &*bindings.pixel;
-	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
-	               std::span {descriptor_stages.data(), descriptor_stage_count});
+	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (mesh_active) {
 		const uint32_t draw_data[] {
 		    draw.index_count,

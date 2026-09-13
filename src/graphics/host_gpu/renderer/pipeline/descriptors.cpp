@@ -857,32 +857,21 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 }
 
-RenderExecutor::GraphicsBindings
-RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
-                                        const ShaderStageRuntime& pixel, bool pixel_active) {
-	GraphicsBindings bindings {
-	    .vertex = PrepareBindings(vertex),
-	};
-	if (pixel_active) {
-		bindings.pixel.emplace(PrepareBindings(pixel));
+void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages) {
+	bool uses_dma = false;
+	for (auto* stage: stages) {
+		FindBuffers(*stage);
+		uses_dma |= stage->runtime->program->info.uses_dma;
 	}
-	FindBuffers(bindings.vertex);
-	if (bindings.pixel) {
-		FindBuffers(*bindings.pixel);
-	}
-	if (bindings.vertex.runtime->program->info.uses_dma ||
-	    (bindings.pixel && bindings.pixel->runtime->program->info.uses_dma)) {
+	if (uses_dma) {
 		m_context.PrepareBda();
 	}
-	RebindBuffers(bindings.vertex);
-	if (bindings.pixel) {
-		RebindBuffers(*bindings.pixel);
+	for (auto* stage: stages) {
+		RebindBuffers(*stage);
 	}
-	RebindImages(bindings.vertex);
-	if (bindings.pixel) {
-		RebindImages(*bindings.pixel);
+	for (auto* stage: stages) {
+		RebindImages(*stage);
 	}
-	return bindings;
 }
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
