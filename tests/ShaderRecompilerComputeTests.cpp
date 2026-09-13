@@ -25514,16 +25514,21 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
 }
 
-void CheckTessellationPrograms() {
+void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   using namespace ShaderRecompiler;
-  const char *name = "TessellationPrograms";
+  const bool multiplied_stride = hs_stride == 112;
+  const u32 local_address = multiplied_stride ? 18 : 21;
+  const u32 control_point = multiplied_stride ? 30 : 34;
+  const u32 relative_patch = multiplied_stride ? 28 : 32;
+  const u32 output_address = multiplied_stride ? 31 : 35;
+  const u32 input_address = multiplied_stride ? 25 : 29;
   std::array<std::vector<u32>, 3> code;
   auto &local = code[0];
-  // The fused LS addresses one 124-byte control point using its v3 ordinal.
-  local.push_back(EncodeVop2(0x0b, 21, 255u, 3));
-  local.push_back(124);
+  // The fused LS addresses one control point using its v3 ordinal.
+  local.push_back(EncodeVop2(0x0b, local_address, 255u, 3));
+  local.push_back(ls_stride);
   local.push_back(EncodeDs0(0x0e, (3u << 8u) | 1u));
-  local.push_back(EncodeDs1Ex(0, 5, 2, 21));
+  local.push_back(EncodeDs1Ex(0, 5, 2, local_address));
   local.push_back(EncodeSop1(0x20, 0, 6));
   local.push_back(0xffffffffu); // Shader footer is not executable after LS handoff.
 
@@ -25533,24 +25538,46 @@ void CheckTessellationPrograms() {
   control.push_back(EncodeSopp(0x0a));
   control.push_back(EncodeVopc(0xd1, 249u, 3));
   control.push_back(EncodeVopcSdwa(0, 0, 0, 6, 1, 0, 0, 0, 0, 0, 0, 0, 1));
-  AppendVop3(&control, 0x148, 32, Vgpr(1), InlineU32(0), InlineU32(8));
-  AppendVop3(&control, 0x148, 34, Vgpr(1), InlineU32(8), InlineU32(5));
-  AppendVop3(&control, 0x346, 35, Vgpr(34), InlineU32(7), InlineU32(0));
-  control.push_back(EncodeVop2(0x0b, 29, 255u, 34));
-  control.push_back(124);
+  AppendVop3(&control, 0x148, control_point, Vgpr(1), InlineU32(8),
+             InlineU32(5));
+  AppendVop3(&control, 0x148, relative_patch, Vgpr(1), InlineU32(0),
+             InlineU32(8));
+  if (multiplied_stride) {
+    // The later patch writes 112-byte outputs but reads 108-byte LS records.
+    // The second multiply overwrites packed v1; only memory consumers identify
+    // which of the two independently computed addresses supplies each stride.
+    control.push_back(EncodeVop2(0x0b, 0, 255u, control_point));
+    control.push_back(hs_stride);
+    control.push_back(EncodeVop2(0x0b, 1, 255u, control_point));
+    control.push_back(ls_stride);
+    AppendVop3(&control, 0x143, output_address, 255u, Vgpr(relative_patch),
+               Vgpr(0));
+    control.push_back(3 * hs_stride);
+    AppendVop3(&control, 0x143, input_address, 255u, Vgpr(relative_patch),
+               Vgpr(1));
+    control.push_back(3 * ls_stride);
+  } else {
+    control.push_back(EncodeSopk(0x00, 106, 3 * hs_stride));
+    control.push_back(EncodeVop2(0x0b, 2, 249u, 1));
+    control.push_back(EncodeVop2Sdwa(106, 6, 0, 6, 0, 0, 0, 0, 0, 0, 0, 1));
+    AppendVop3(&control, 0x346, output_address, Vgpr(control_point), InlineU32(7),
+               Vgpr(2));
+    control.push_back(EncodeVop2(0x0b, input_address, 255u, control_point));
+    control.push_back(ls_stride);
+  }
   control.push_back(EncodeDs0(0x37, (3u << 8u) | 1u));
-  control.push_back(EncodeDs1Ex(10, 0, 0, 29));
+  control.push_back(EncodeDs1Ex(10, 0, 0, input_address));
   control.push_back(EncodeMubuf0(0x1d, 28));
-  control.push_back(EncodeMubuf1(10, 2, 35, 2));
-  // The HS prologue's wave lane computation must refer to its control point.
-  control.push_back(EncodeMubuf0(0x1c, 120));
-  control.push_back(EncodeMubuf1(0, 2, 35, 2));
+  control.push_back(EncodeMubuf1(10, 2, output_address, 2));
+  // Keep the control-point-dependent value and the last written dword live.
+  control.push_back(EncodeMubuf0(0x1c, hs_stride - 8));
+  control.push_back(EncodeMubuf1(0, 2, output_address, 2));
   // The game reuses previously written data VGPRs for CP0-only ring addresses.
   AppendVMovLiteral(&control, 4, 0x42280000u);
   AppendVMovLiteral(&control, 5, 0x422c0000u);
-  control.push_back(EncodeVopc(0xd4, InlineU32(1), 34));
-  control.push_back(EncodeVop2(0x1a, 4, InlineU32(4), 32));
-  control.push_back(EncodeVop2(0x1a, 6, InlineU32(6), 32));
+  control.push_back(EncodeVopc(0xd4, InlineU32(1), control_point));
+  control.push_back(EncodeVop2(0x1a, 4, InlineU32(4), relative_patch));
+  control.push_back(EncodeVop2(0x1a, 6, InlineU32(6), relative_patch));
   control.push_back(EncodeVop2(0x26, 5, 255u, 6));
   control.push_back(0x7fc0);
   for (u32 i = 0; i < 4; i++) {
@@ -25565,10 +25592,12 @@ void CheckTessellationPrograms() {
   AppendEnd(&control);
 
   auto &evaluation = code[2];
+  AppendVop3(&evaluation, 0x169, 24, 255u, Vgpr(7));
+  evaluation.push_back(3 * hs_stride);
   evaluation.push_back(EncodeMubuf0(0x0d, 28));
-  evaluation.push_back(EncodeMubuf1(10, 2, 7, 4));
-  evaluation.push_back(EncodeMubuf0(0x0d, 256 + 28));
-  evaluation.push_back(EncodeMubuf1(12, 2, 7, 4));
+  evaluation.push_back(EncodeMubuf1(10, 2, 24, 4));
+  evaluation.push_back(EncodeMubuf0(0x0d, 2 * hs_stride + 28));
+  evaluation.push_back(EncodeMubuf1(12, 2, 24, 4));
   evaluation.push_back(EncodeExp0(0x0c, 0xf));
   evaluation.push_back(EncodeExp1(5, 6, 10, 12));
   AppendEnd(&evaluation);
@@ -25579,7 +25608,8 @@ void CheckTessellationPrograms() {
                                   .partitioning = 2,
                                   .output_topology = 2};
   AnalyzeTessellationPrograms(local, control, tess);
-  Require(name, "decoded interface", tess.ls_stride == 124 && tess.hs_stride == 128,
+  Require(name, "decoded interface",
+          tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
           "captured LS and HS address arithmetic must produce distinct strides");
 
   constexpr std::array stages{ShaderType::Local, ShaderType::TessellationControl,
@@ -25623,7 +25653,8 @@ void CheckTessellationPrograms() {
     Require(name, "separate DS offsets", stage != 0 || local_offsets == std::set<u32>{4, 12},
             "DS_WRITE2 must preserve both independently encoded offsets");
     Require(name, "offchip component addressing",
-            stage != 2 || evaluation_offsets == std::set<u32>{28, 284},
+            stage != 2 ||
+                evaluation_offsets == std::set<u32>{28, 2 * hs_stride + 28},
             "TES control point and component offsets must survive lowering");
     Require(name, "triangle factor layout",
             stage != 1 || factor_offsets == std::set<u32>{0, 4, 8, 12},
@@ -25661,6 +25692,11 @@ void CheckTessellationPrograms() {
             "TES must preserve guest triangle domain, partitioning, and winding");
   }
   std::printf("[host]    %-32s ok\n", name);
+}
+
+void CheckTessellationPrograms() {
+  CheckTessellationProgram("TessellationShiftedStride", 124, 128);
+  CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
 }
 
 void CheckEmbeddedFetchVertexOffset() {
