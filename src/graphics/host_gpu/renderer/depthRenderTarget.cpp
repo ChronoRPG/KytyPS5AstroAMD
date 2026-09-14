@@ -48,7 +48,10 @@ static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t
 		case Prospero::StencilOp::kZero: return vk::StencilOp::eZero;
 		case Prospero::StencilOp::kReplaceTest: return vk::StencilOp::eReplace;
 		case Prospero::StencilOp::kReplaceOp:
-			if (op_value != test_value) {
+			if ((op_value & write_mask) == 0) {
+				return vk::StencilOp::eZero;
+			}
+			if (((op_value ^ test_value) & write_mask) != 0) {
 				DepthFatal("unsupported stencil replacement: write mask=0x%02" PRIx8
 				           ", operation value=0x%02" PRIx8 ", test value=0x%02" PRIx8,
 				           write_mask, op_value, test_value);

@@ -12072,7 +12072,7 @@ public:
                                        : "PolygonModeRasterization";
     const uint32_t extent = depth_feedback ? 8 : 32;
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
-    constexpr uint64_t allocation_size = 0x20000;
+    constexpr uint64_t allocation_size = 0x40000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -12223,8 +12223,10 @@ public:
     auto buffer = CreateHostBuffer(name, sizeof(vertices), vk::BufferUsageFlagBits::eVertexBuffer,
                                    vertex_words);
     const auto pipeline = [&](bool enabled, uint8_t front, uint8_t back,
-                              bool provoking_last = false) -> PipelineCache::Pipeline & {
+                              bool provoking_last = false,
+                              bool clockwise = false) -> PipelineCache::Pipeline & {
       HW::ModeControl mode{};
+      mode.face = clockwise;
       mode.poly_mode = enabled;
       mode.polymode_front_ptype = front;
       mode.polymode_back_ptype = back;
@@ -12270,6 +12272,16 @@ public:
       cmd.setDepthWriteEnable(depth.depth_write_enable);
       cmd.setDepthCompareOp(vk::CompareOp::eAlways);
       cmd.setDepthBiasEnable(false);
+      if (depth.stencil_test_enable) {
+        const auto set_stencil = [&](vk::StencilFaceFlagBits face,
+                                     const PipelineStencilDynamicState &state) {
+          cmd.setStencilCompareMask(face, state.compareMask);
+          cmd.setStencilWriteMask(face, state.writeMask);
+          cmd.setStencilReference(face, state.reference);
+        };
+        set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_dynamic_front);
+        set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_dynamic_back);
+      }
       const vk::Bool32 write = true;
       cmd.setColorWriteEnableEXT(1, &write);
       cmd.setAttachmentFeedbackLoopEnableEXT(
@@ -12371,6 +12383,61 @@ public:
       draw(blend_pipeline(true, true));
       Require(name, "bypassed blend output", read_color() == solid_pixels,
               "blend bypass did not restore the unblended fragment color and coverage");
+
+      HW::DepthRenderTarget stencil_target{};
+      stencil_target.z_info.format = Prospero::DepthFormat::kZ32F;
+      stencil_target.stencil_info.format = Prospero::StencilFormat::k8UInt;
+      stencil_target.stencil_info.htile_stencil_disabled = true;
+      stencil_target.z_read_base_addr = stencil_target.z_write_base_addr = depth_address;
+      stencil_target.stencil_read_base_addr = stencil_target.stencil_write_base_addr =
+          depth_address + 0x20000;
+      stencil_target.size = {static_cast<uint16_t>(extent - 1),
+                             static_cast<uint16_t>(extent - 1), true};
+      registers.SetDepthRenderTarget(stencil_target);
+      HW::DepthControl stencil_control{};
+      stencil_control.stencil_enable = stencil_control.backface_enable = true;
+      stencil_control.stencilfunc = stencil_control.stencilfunc_bf =
+          static_cast<uint8_t>(vk::CompareOp::eAlways);
+      registers.SetDepthControl(stencil_control);
+      // PPSA01325 sets bit 7 on front faces and clears it on back faces.
+      registers.SetStencilControl({3, 3, 3, 4, 4, 4});
+      registers.SetStencilMask({0x80, 0, 0x80, 1, 0x80, 0, 0x80, 1});
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      auto stencil_readback = CreateHostBuffer(name, extent * extent,
+          vk::BufferUsageFlagBits::eTransferDst, {});
+      for (const bool back_face : {false, true}) {
+        const uint8_t initial = back_face ? 0xb5 : 0x35;
+        const uint8_t written = back_face ? 0x35 : 0xb5;
+        vk::ClearValue clear{};
+        clear.depthStencil = vk::ClearDepthStencilValue{0.625f, initial};
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth.image_id,
+            {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
+             0, 1, 0, 1}, clear);
+        draw(pipeline(true, 2, 2, false, !back_face));
+        const vk::BufferImageCopy copy{0, 0, 0,
+            {vk::ImageAspectFlagBits::eStencil, 0, 0, 1}, {}, {extent, extent, 1}};
+        cache.GetImage(depth.image_id).Download(std::span{&copy, 1},
+            stencil_readback.buffer, 0, stencil_readback.size);
+        const vk::MemoryBarrier2 barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead};
+        vk::DependencyInfo dependency{};
+        dependency.memoryBarrierCount = 1;
+        dependency.pMemoryBarriers = &barrier;
+        scheduler.Current().Handle().pipelineBarrier2(dependency);
+        scheduler.Finish();
+        const auto result = ReadBuffer(name, stencil_readback, extent * extent / 4);
+        const auto *stencil_bytes = reinterpret_cast<const uint8_t *>(result.data());
+        for (uint32_t texel = 0; texel < extent * extent; ++texel) {
+          const uint8_t expected = solid_pixels[texel * 4] != 0 ? written : initial;
+          Require(name, back_face ? "back-face masked ReplaceOp" : "front-face ReplaceTest",
+                  stencil_bytes[texel] == expected,
+                  "captured stencil operations changed masked bits or triangle coverage");
+        }
+      }
+      DestroyBuffer(&stencil_readback);
     }
     resources.UnmapMemory(depth_address, allocation_size);
     scheduler.Finish();
