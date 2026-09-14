@@ -147,7 +147,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
-	if (resource.formatted && resource.written) {
+	if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
 	const char* access = "Read";

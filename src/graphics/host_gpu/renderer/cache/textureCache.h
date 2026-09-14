@@ -67,8 +67,6 @@ public:
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
 	                                 uint32_t* fill_value = nullptr);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
-	// Record deferred DCC state while the original guest dispatch writes the metadata.
-	void               TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -81,17 +79,16 @@ private:
 	struct ImageDownload;
 
 	struct MetaDataInfo {
-		// A guest metadata-fill dispatch may initialize DCC before its render target is bound.
-		// PendingDcc retains that exact fill until an image binding classifies the address,
-		// without exposing an unconfirmed buffer address to the normal metadata heuristics.
-		// Keep all surface metadata in one entry so CMask/FMask can be
-		// registered beside HTile and DCC without introducing parallel tracking paths.
-		enum class Type : uint8_t { PendingDcc, CMask, FMask, HTile, Dcc };
+		enum class Type : uint8_t { CMask, FMask, HTile, Dcc };
 
-		Type     type       = Type::PendingDcc;
+		Type     type       = Type::Dcc;
 		uint32_t clear_mask = 0;
 		uint32_t fill_value = 0xffffffffu;
-		uint64_t fill_size  = 0;
+		// PS5 DCC bytes and layer consumption belong to the metadata allocation, not an image.
+		uint64_t size       = 0;
+		uint64_t revision   = 0;
+		bool     dirty      = true;
+		bool     tracked    = false;
 	};
 
 	struct OverlapResult {
@@ -149,7 +146,11 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
-	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);
+	void                        RefreshDccMetadata(const ImageDesc& desc);
+	void                        PrepareDccClear(ImageId id, const ImageDesc& desc,
+	                                            uint32_t metadata_base_layer);
+	void                        UntrackMetadata(uint64_t address, MetaDataInfo& metadata);
+	void                        InvalidateDccMetadata(uint64_t address, uint64_t size);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
@@ -186,6 +187,7 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	uint64_t                                          m_metadata_revision = 0;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

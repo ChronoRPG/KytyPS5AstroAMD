@@ -33,21 +33,29 @@ namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 
+[[nodiscard]] bool IsDccClearCode(uint32_t fill) {
+	switch (fill) {
+		case 0x00000000u:
+		case 0x20202020u:
+		case 0x40404040u:
+		case 0x80808080u:
+		case 0xc0c0c0c0u: return true;
+		default: return false;
+	}
+}
+
 [[nodiscard]] bool DecodeDccClear(const TextureCache::ImageDesc& desc, vk::Format format,
                                   uint32_t fill, vk::ClearColorValue& clear) {
-	const auto code = static_cast<uint8_t>(fill);
-	if (fill != static_cast<uint32_t>(code) * 0x01010101u) {
+	if (!IsDccClearCode(fill)) {
 		return false;
 	}
+	const auto code = static_cast<uint8_t>(fill);
 	const auto& metadata = desc.info.metadata;
 	if (code == 0x20) {
 		// Clear-to-register is a color-buffer operation; the texture pipe cannot decode it.
 		return desc.type == TextureCache::BindingType::RenderTarget &&
 		       metadata.dcc_clear_register_valid &&
 		       DecodePackedColorClear(format, metadata.dcc_clear_word, clear);
-	}
-	if (code != 0x00 && code != 0x40 && code != 0x80 && code != 0xc0) {
-		return false;
 	}
 	clear = {};
 	if (code == 0x00) {
@@ -188,6 +196,9 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 }
 
 TextureCache::~TextureCache() {
+	for (auto& [address, metadata]: m_surface_metas) {
+		UntrackMetadata(address, metadata);
+	}
 	m_slot_images.ForEach([&](ImageId id, const Image& image) {
 		if (image.registered) {
 			UnregisterImage(id);
@@ -323,10 +334,8 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image->info.HasMetadata()) {
 		const auto metadata = m_surface_metas.find(image->info.metadata.range.address);
 		if (metadata != m_surface_metas.end() &&
-		    ((image->info.metadata.kind == ImageMetadataKind::Dcc &&
-		      metadata->second.type == MetaDataInfo::Type::Dcc) ||
-		     (image->info.metadata.kind == ImageMetadataKind::Htile &&
-		      metadata->second.type == MetaDataInfo::Type::HTile))) {
+		    image->info.metadata.kind == ImageMetadataKind::Htile &&
+		    metadata->second.type == MetaDataInfo::Type::HTile) {
 			// A later binding may have reused this address for another metadata type.
 			m_surface_metas.erase(metadata);
 		}
@@ -1124,22 +1133,99 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 }
 
-void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
+void TextureCache::UntrackMetadata(uint64_t address, MetaDataInfo& metadata) {
+	if (metadata.tracked) {
+		m_page_manager.UpdatePageWatchers<false>(address, metadata.size);
+		metadata.tracked = false;
+	}
+}
+
+void TextureCache::InvalidateDccMetadata(uint64_t address, uint64_t size) {
+	for (auto& [base, metadata]: m_surface_metas) {
+		if (metadata.type != MetaDataInfo::Type::Dcc ||
+		    metadata.size == 0 || base >= address + size || address >= base + metadata.size) {
+			continue;
+		}
+		UntrackMetadata(base, metadata);
+		metadata.dirty      = true;
+		metadata.clear_mask = UINT32_MAX;
+		metadata.revision   = ++m_metadata_revision;
+	}
+}
+
+void TextureCache::RefreshDccMetadata(const ImageDesc& desc) {
+	const auto range = desc.info.metadata.range;
+	if (desc.info.metadata.kind != ImageMetadataKind::Dcc || range.size == 0 ||
+	    desc.info.resources.levels != 1) {
+		return;
+	}
+	// DCC allocations use complete 4 KiB metadata blocks. Besides validating
+	// the descriptor, this ensures that a CPU page fault identifies the metadata it modifies.
+	if (!range.Valid() || range.address % TRACKER_PAGE_SIZE != 0 ||
+	    range.size % TRACKER_PAGE_SIZE != 0) {
+		EXIT("TextureCache: DCC allocation must contain aligned 4 KiB blocks\n");
+	}
+	for (;;) {
+		uint64_t revision = 0;
+		{
+			std::scoped_lock lock {m_lock};
+			auto [entry, inserted] = m_surface_metas.try_emplace(range.address);
+			auto& metadata = entry->second;
+			if (inserted || metadata.type != MetaDataInfo::Type::Dcc) {
+				UntrackMetadata(range.address, metadata);
+				metadata = {.type = MetaDataInfo::Type::Dcc, .clear_mask = UINT32_MAX};
+			}
+			if (metadata.size != range.size) {
+				UntrackMetadata(range.address, metadata);
+				metadata.size     = range.size;
+				metadata.dirty    = true;
+				metadata.revision = ++m_metadata_revision;
+			}
+			if (!metadata.dirty) {
+				return;
+			}
+			if (!metadata.tracked) {
+				m_page_manager.UpdatePageWatchers<true>(range.address, range.size);
+				metadata.tracked = true;
+			}
+			revision = metadata.revision;
+		}
+		// Discovery precedes descriptor/vertex uploads. Drain metadata writes before taking
+		// the texture lock; completion can retire buffers and run memory-tracking callbacks.
+		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		std::vector<uint8_t> bytes(range.size);
+		std::scoped_lock lock {m_lock};
+		const auto entry = m_surface_metas.find(range.address);
+		if (entry == m_surface_metas.end() || entry->second.revision != revision) {
+			continue;
+		}
+		if (!LibKernel::Memory::TryReadBacking(range.address, bytes.data(), range.size)) {
+			EXIT("TextureCache: failed to read DCC metadata backing\n");
+		}
+		auto& metadata = entry->second;
+		metadata.fill_value = UINT32_MAX;
+		if (std::all_of(bytes.begin(), bytes.end(), [&](uint8_t byte) { return byte == bytes[0]; })) {
+			metadata.fill_value = static_cast<uint32_t>(bytes[0]) * 0x01010101u;
+		}
+		metadata.dirty = false;
+		return;
+	}
+}
+
+void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc,
+                                  uint32_t metadata_base_layer) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc) {
 		return;
 	}
 	auto& image            = m_slot_images[id];
 	image.info.metadata    = desc.info.metadata;
-	auto [entry, inserted] = m_surface_metas.try_emplace(
-	    desc.info.metadata.range.address, MetaDataInfo {.type = MetaDataInfo::Type::Dcc});
-	auto& metadata = entry->second;
-	if (!inserted && metadata.type == MetaDataInfo::Type::PendingDcc) {
-		metadata.type = MetaDataInfo::Type::Dcc;
-	} else if (metadata.type != MetaDataInfo::Type::Dcc) {
-		EXIT("TextureCache: image reuses non-DCC metadata\n");
+	const auto entry = m_surface_metas.find(desc.info.metadata.range.address);
+	if (entry == m_surface_metas.end() || entry->second.type != MetaDataInfo::Type::Dcc) {
+		return;
 	}
-	if (metadata.clear_mask == 0 || image.info.resources.levels != 1 ||
-	    desc.info.metadata.range.size == 0 || metadata.fill_size < desc.info.metadata.range.size) {
+	auto& metadata = entry->second;
+	if (metadata.dirty || metadata.clear_mask == 0 || image.info.resources.levels != 1 ||
+	    metadata.size != desc.info.metadata.range.size) {
 		return;
 	}
 	vk::ClearValue clear {};
@@ -1148,12 +1234,14 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 	}
 	const auto& view           = desc.view_info;
 	const bool  volume_texture = image.info.IsVolume() && view.type == vk::ImageViewType::e3D;
-	const auto  first          = volume_texture ? 0u : view.base_layer;
-	const auto  count = volume_texture ? std::max(image.info.extent.depth >> view.base_level, 1u)
+	const auto  first          = volume_texture ? 0u : metadata_base_layer;
+	const auto  image_first    = volume_texture ? 0u : view.base_layer;
+	const auto  count = volume_texture ? std::max(desc.info.extent.depth >> view.base_level, 1u)
 	                                   : view.layer_count;
 	if (first >= 32 || count > 32 - first) {
 		return;
 	}
+	const auto metadata_slice_size = metadata.size / desc.info.TransferLayers();
 	// The metadata fill covers the complete allocation. Consume each layer only after its
 	// native image contents exist; already materialized layers may have been rendered since.
 	for (uint32_t layer = first; layer < first + count;) {
@@ -1167,9 +1255,16 @@ void TextureCache::PrepareDccClear(ImageId id, const ImageDesc& desc) {
 			mask |= 1u << layer++;
 		} while (layer < first + count && (metadata.clear_mask & (1u << layer)) != 0);
 		ClearImage(m_scheduler.Current(), id,
-		           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count, start,
+		           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
+		            image_first + start - first,
 		            layer - start},
 		           clear);
+		// The host now owns expanded color data. Publish uncompressed (0xff)
+		// keys for these slices, so a later partial write cannot reuse stale clear codes.
+		const auto address = desc.info.metadata.range.address + metadata_slice_size * start;
+		const auto size    = metadata_slice_size * (layer - start);
+		auto [buffer, offset] = m_buffer_cache.ObtainBuffer(address, size, true, false);
+		buffer->Fill(offset, size, UINT32_MAX);
 		metadata.clear_mask &= ~mask;
 	}
 }
@@ -1235,6 +1330,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		std::scoped_lock lock {m_lock};
 		return GetNullImage(desc);
 	}
+	RefreshDccMetadata(desc);
+	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
 	{
@@ -1299,6 +1396,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		if (view_layer >= 0) {
 			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
 		}
+		PrepareDccClear(result, desc, metadata_base_layer);
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
 	}
@@ -1365,7 +1463,6 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		image.MarkGpuModified();
 	}
 	if (!image.info.data.Empty()) {
-		PrepareDccClear(id, desc);
 		RefreshImage(id);
 	}
 	switch (desc.type) {
@@ -1395,7 +1492,6 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.render_target = true;
-	PrepareDccClear(id, desc);
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
@@ -1426,6 +1522,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		if (!inserted && metadata->second.type != MetaDataInfo::Type::HTile) {
 			// PS5 allocations can reuse DCC storage as HTile while the old color image is cached.
 			// The depth binding defines the new type; incompatible fill state cannot carry over.
+			UntrackMetadata(metadata->first, metadata->second);
 			metadata->second = {.type       = MetaDataInfo::Type::HTile,
 			                    .clear_mask = image.info.htile_clear_mask};
 		}
@@ -1599,6 +1696,7 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	InvalidateDccMetadata(address, size);
 	InvalidateCpuAliases(address, size);
 }
 
@@ -1807,6 +1905,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
+	InvalidateDccMetadata(address, size);
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
 		if (image.depth_id || !image.Overlaps(address, size)) {
@@ -1861,18 +1960,21 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 bool TextureCache::IsMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	return found != m_surface_metas.end() && found->second.type != MetaDataInfo::Type::PendingDcc;
+	return found != m_surface_metas.end();
 }
 
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fill_value) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
-	    slice >= 32) {
+	if (found == m_surface_metas.end() || slice >= 32) {
 		return false;
 	}
 	if (fill_value != nullptr) {
 		*fill_value = found->second.fill_value;
+	}
+	if (found->second.type == MetaDataInfo::Type::Dcc &&
+	    (found->second.dirty || !IsDccClearCode(found->second.fill_value))) {
+		return false;
 	}
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
@@ -1880,8 +1982,7 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 bool TextureCache::ClearMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
-	    found->second.type == MetaDataInfo::Type::Dcc) {
+	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::Dcc) {
 		// Preserve the broad metadata-clear operation for CMask/FMask/HTile. DCC requires a
 		// validated fill value, so an arbitrary compute write must not clear it.
 		return false;
@@ -1890,43 +1991,10 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	return true;
 }
 
-void TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value) {
-	if (!GuestRange {address, size}.Valid()) {
-		EXIT("TextureCache: invalid DCC fill range\n");
-	}
-	// DCC fills use a repeated byte code. Require all four bytes of the detected dword to agree,
-	// and mark only recognized deferred-clear encodings as logically clear.
-	const auto dcc_clear_mask = [fill_value] {
-		const auto code = static_cast<uint8_t>(fill_value);
-		if (fill_value != static_cast<uint32_t>(code) * 0x01010101u) {
-			return 0u;
-		}
-		switch (code) {
-			case 0x00:
-			case 0x20:
-			case 0x40:
-			case 0x80:
-			case 0xc0: return UINT32_MAX;
-			default: return 0u;
-		}
-	}();
-	std::scoped_lock lock {m_lock};
-	// The guest dispatch still writes metadata. An unknown address remains PendingDcc until an
-	// image descriptor confirms its role; never reinterpret CMask/FMask/HTile as DCC.
-	const auto found = m_surface_metas.try_emplace(address).first;
-	if (found->second.type == MetaDataInfo::Type::PendingDcc ||
-	    found->second.type == MetaDataInfo::Type::Dcc) {
-		found->second.clear_mask = dcc_clear_mask;
-		found->second.fill_value = fill_value;
-		found->second.fill_size  = size;
-	}
-}
-
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
-	    slice >= 32) {
+	if (found == m_surface_metas.end() || slice >= 32) {
 		return false;
 	}
 	if (is_clear) {
@@ -1942,10 +2010,16 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
 	std::scoped_lock lock {m_lock};
-	const auto       end = address + size;
-	for (auto metadata = m_surface_metas.lower_bound(address);
-	     metadata != m_surface_metas.end() && metadata->first < end;) {
-		metadata = m_surface_metas.erase(metadata);
+	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
+		const auto base = metadata->first;
+		if ((base >= address && base < address + size) ||
+		    (metadata->second.size != 0 && base < address + size &&
+		     address < base + metadata->second.size)) {
+			UntrackMetadata(base, metadata->second);
+			metadata = m_surface_metas.erase(metadata);
+		} else {
+			++metadata;
+		}
 	}
 	auto images = FindImagesInRegion(address, size, false);
 	for (const auto id: images) {

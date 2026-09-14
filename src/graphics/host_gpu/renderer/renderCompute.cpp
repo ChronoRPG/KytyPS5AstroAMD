@@ -183,14 +183,6 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		return false;
 	}
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
-		// Track deferred DCC state while the original dispatch writes the metadata allocation.
-		cache.TrackDccFill(descriptor.Base48(), size, packed_clear);
-		static std::atomic<uint32_t> logged_metadata_clears {0};
-		if (logged_metadata_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
-			LOGF("GraphicsRenderDispatchDirect: metadata fill shader=0x%016" PRIx64
-			     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
-			     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
-		}
 		return false;
 	}
 	static std::atomic<uint32_t> logged_clears {0};
