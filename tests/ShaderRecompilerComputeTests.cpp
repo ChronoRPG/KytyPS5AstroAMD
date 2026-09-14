@@ -10275,9 +10275,9 @@ public:
               !read_only_depth.depth_write_enable &&
               !read_only_depth.stencil_clear_enable &&
               read_only_depth.stencil_test_enable &&
-              read_only_depth.stencil_dynamic_front.writeMask == 0 &&
-              read_only_depth.stencil_dynamic_back.writeMask == 0 &&
-              read_only_depth.stencil_static_front.passOp ==
+              read_only_depth.stencil_front.writeMask == 0 &&
+              read_only_depth.stencil_back.writeMask == 0 &&
+              read_only_depth.stencil_front.passOp ==
                   vk::StencilOp::eKeep &&
               !read_only_depth.AttachmentWriteAspects() &&
               depth_attachment_layout(read_only_depth) ==
@@ -12501,15 +12501,18 @@ public:
       cmd.setDepthWriteEnable(depth.depth_write_enable);
       cmd.setDepthCompareOp(depth.depth_compare_op);
       cmd.setDepthBiasEnable(false);
+      cmd.setStencilTestEnable(depth.stencil_test_enable);
       if (depth.stencil_test_enable) {
         const auto set_stencil = [&](vk::StencilFaceFlagBits face,
-                                     const PipelineStencilDynamicState &state) {
+                                     const vk::StencilOpState &state) {
+          cmd.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp,
+                           state.compareOp);
           cmd.setStencilCompareMask(face, state.compareMask);
           cmd.setStencilWriteMask(face, state.writeMask);
           cmd.setStencilReference(face, state.reference);
         };
-        set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_dynamic_front);
-        set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_dynamic_back);
+        set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
+        set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
       }
       const vk::Bool32 write = true;
       cmd.setColorWriteEnableEXT(1, &write);
@@ -12624,6 +12627,9 @@ public:
                              static_cast<uint16_t>(extent - 1), true};
       registers.SetDepthRenderTarget(stencil_target);
       HW::DepthControl stencil_control{};
+      // Keep the same depth/stencil attachment active when stencil testing is disabled.
+      stencil_control.z_enable = true;
+      stencil_control.zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways);
       stencil_control.stencil_enable = stencil_control.backface_enable = true;
       stencil_control.stencilfunc = stencil_control.stencilfunc_bf =
           static_cast<uint8_t>(vk::CompareOp::eAlways);
@@ -12651,6 +12657,9 @@ public:
         scheduler.Finish();
         return ReadBuffer(name, stencil_readback, extent * extent / 4);
       };
+      const std::array stencil_pipelines{
+          pipeline(true, 2, 2, false, true).pipeline,
+          pipeline(true, 2, 2, false, false).pipeline};
       const auto check_stencil = [&](const char *label, bool back_face,
                                      uint8_t initial, uint8_t written) {
         vk::ClearValue clear{};
@@ -12658,7 +12667,11 @@ public:
         TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth.image_id,
             {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
              0, 1, 0, 1}, clear);
-        draw(pipeline(true, 2, 2, false, !back_face));
+        const auto &selected = pipeline(true, 2, 2, false, !back_face);
+        Require(name, "dynamic stencil pipeline reuse",
+                selected.pipeline == stencil_pipelines[back_face],
+                "stencil enable, operations or references changed the graphics pipeline");
+        draw(selected);
         const auto result = read_stencil();
         const auto *stencil_bytes = reinterpret_cast<const uint8_t *>(result.data());
         for (uint32_t texel = 0; texel < extent * extent; ++texel) {
@@ -12671,6 +12684,17 @@ public:
       check_stencil("front-face ReplaceTest", false, 0x35, 0xb5);
       check_stencil("back-face masked ReplaceOp", true, 0xb5, 0x35);
 
+      stencil_control.stencil_enable = false;
+      registers.SetDepthControl(stencil_control);
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      check_stencil("disabled front stencil", false, 0x35, 0x35);
+      check_stencil("disabled back stencil", true, 0xb5, 0xb5);
+      stencil_control.stencil_enable = true;
+      registers.SetDepthControl(stencil_control);
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      check_stencil("re-enabled front stencil", false, 0x35, 0xb5);
+      check_stencil("re-enabled back stencil", true, 0xb5, 0x35);
+
       // Frame 6115 uses separate test/op replacement values with Always comparisons.
       stencil_control.z_enable = stencil_control.z_write_enable = true;
       stencil_control.zfunc = static_cast<uint8_t>(vk::CompareOp::eLessOrEqual);
@@ -12679,8 +12703,8 @@ public:
       registers.SetStencilMask({8, 0xff, 0xff, 1, 8, 0xff, 0xff, 1});
       RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
       Require(name, "independent stencil references",
-              depth.stencil_dynamic_front.reference == 8 &&
-                  depth.stencil_dynamic_back.reference == 1,
+              depth.stencil_front.reference == 8 &&
+                  depth.stencil_back.reference == 1,
               "always-pass faces must preserve their distinct replacement values");
       check_stencil("front test-value replacement", false, 0x35, 8);
       check_stencil("back operation-value replacement", true, 0x35, 1);
@@ -12700,8 +12724,8 @@ public:
       registers.SetStencilMask({8, 8, 1, 1, 8, 8, 1, 1});
       RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
       Require(name, "masked compare and replace reference",
-              depth.stencil_dynamic_front.reference == 9 &&
-                  depth.stencil_dynamic_back.reference == 9,
+              depth.stencil_front.reference == 9 &&
+                  depth.stencil_back.reference == 9,
               "disjoint comparison and replacement bits must combine into one reference");
       check_stencil("masked compare passes", false, 0xb8, 0xb9);
       check_stencil("masked compare fails", false, 0xb0, 0xb0);
@@ -28499,27 +28523,25 @@ void CheckDepthAttachmentWrites() {
 
   target.depth_load_clear_enable = false;
   target.stencil_test_enable = true;
-  target.stencil_dynamic_front = {0xff, 0xff, 0};
-  target.stencil_dynamic_back = target.stencil_dynamic_front;
-  target.stencil_static_front = {vk::StencilOp::eKeep, vk::StencilOp::eKeep,
-                                 vk::StencilOp::eKeep, vk::CompareOp::eAlways};
-  target.stencil_static_back = target.stencil_static_front;
+  target.stencil_front = {vk::StencilOp::eKeep, vk::StencilOp::eKeep,
+                          vk::StencilOp::eKeep, vk::CompareOp::eAlways, 0xff, 0xff, 0};
+  target.stencil_back = target.stencil_front;
   Require("DepthAttachmentWrites", "stencil keep",
           !target.AttachmentWriteAspects(),
           "KEEP-only stencil state claimed a stencil write");
 
-  target.stencil_static_front.failOp = vk::StencilOp::eZero;
+  target.stencil_front.failOp = vk::StencilOp::eZero;
   Require("DepthAttachmentWrites", "unreachable stencil fail",
           !target.AttachmentWriteAspects(),
           "ALWAYS comparison claimed an unreachable fail operation");
 
-  target.stencil_static_front.failOp = vk::StencilOp::eKeep;
-  target.stencil_static_front.passOp = vk::StencilOp::eReplace;
+  target.stencil_front.failOp = vk::StencilOp::eKeep;
+  target.stencil_front.passOp = vk::StencilOp::eReplace;
   Require("DepthAttachmentWrites", "stencil pass write",
           target.AttachmentWriteAspects() == vk::ImageAspectFlagBits::eStencil,
           "write-capable stencil pass did not claim stencil");
 
-  target.stencil_dynamic_front.writeMask = 0;
+  target.stencil_front.writeMask = 0;
   Require("DepthAttachmentWrites", "back-face keep",
           !target.AttachmentWriteAspects(),
           "masked front write or KEEP-only back face claimed stencil");

@@ -477,15 +477,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 #else
 	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
 #endif
-	depth_stencil_info.stencilTestEnable = (static_params.stencil_test_enable ? VK_TRUE : VK_FALSE);
-	depth_stencil_info.front.failOp      = static_params.stencil_front.failOp;
-	depth_stencil_info.front.passOp      = static_params.stencil_front.passOp;
-	depth_stencil_info.front.depthFailOp = static_params.stencil_front.depthFailOp;
-	depth_stencil_info.front.compareOp   = static_params.stencil_front.compareOp;
-	depth_stencil_info.back.failOp       = static_params.stencil_back.failOp;
-	depth_stencil_info.back.passOp       = static_params.stencil_back.passOp;
-	depth_stencil_info.back.depthFailOp  = static_params.stencil_back.depthFailOp;
-	depth_stencil_info.back.compareOp    = static_params.stencil_back.compareOp;
 	depth_stencil_info.minDepthBounds    = static_params.depth_min_bounds;
 	depth_stencil_info.maxDepthBounds    = static_params.depth_max_bounds;
 
@@ -498,6 +489,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    vk::DynamicState::eDepthCompareOp,
 	    vk::DynamicState::eDepthBiasEnable,
 	    vk::DynamicState::eDepthBias,
+	    vk::DynamicState::eStencilTestEnable,
+	    vk::DynamicState::eStencilOp,
 	    vk::DynamicState::eStencilCompareMask,
 	    vk::DynamicState::eStencilReference,
 	    vk::DynamicState::eStencilWriteMask,

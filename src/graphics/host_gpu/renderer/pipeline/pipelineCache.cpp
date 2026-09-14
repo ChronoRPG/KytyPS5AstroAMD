@@ -742,9 +742,6 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
 	static_params.depth_min_bounds         = depth.depth_min_bounds;
 	static_params.depth_max_bounds         = depth.depth_max_bounds;
-	static_params.stencil_test_enable      = depth.stencil_test_enable;
-	static_params.stencil_front            = depth.stencil_static_front;
-	static_params.stencil_back             = depth.stencil_static_back;
 	const bool rect_list =
 	    command.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kRectList;
 	static_params.cull_back  = !rect_list && mc.cull_back;
