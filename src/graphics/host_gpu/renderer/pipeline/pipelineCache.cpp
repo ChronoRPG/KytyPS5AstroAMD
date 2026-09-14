@@ -253,12 +253,7 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
-		vk::ShaderModuleCreateInfo create_info {};
-		create_info.codeSize    = result.spirv.size() * sizeof(uint32_t);
-		create_info.pCode       = result.spirv.data();
-		vk::ShaderModule module = nullptr;
-		RequireVulkanSuccess(device.createShaderModule(&create_info, nullptr, &module),
-		                     "create recompiled shader module");
+		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
