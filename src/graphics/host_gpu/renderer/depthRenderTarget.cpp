@@ -39,8 +39,7 @@ namespace Libs::Graphics {
 	EXIT("unsupported render state; details were printed above\n");
 }
 
-static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t op_value,
-                                     uint8_t test_value) {
+static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t op_value) {
 	if (write_mask == 0) {
 		return vk::StencilOp::eKeep;
 	}
@@ -51,11 +50,6 @@ static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t
 		case Prospero::StencilOp::kReplaceOp:
 			if ((op_value & write_mask) == 0) {
 				return vk::StencilOp::eZero;
-			}
-			if (((op_value ^ test_value) & write_mask) != 0) {
-				DepthFatal("unsupported stencil replacement: write mask=0x%02" PRIx8
-				           ", operation value=0x%02" PRIx8 ", test value=0x%02" PRIx8,
-				           write_mask, op_value, test_value);
 			}
 			return vk::StencilOp::eReplace;
 		case Prospero::StencilOp::kAddClamp: return vk::StencilOp::eIncrementAndClamp;
@@ -80,11 +74,35 @@ static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t
 static PipelineStencilStaticState ConvertStencilState(
     uint8_t compare, const std::array<uint8_t, 3>& operations, uint8_t op_value,
     PipelineStencilDynamicState& dynamic) {
-	return {
-	    ConvertStencilOp(operations[0], dynamic.writeMask, op_value, dynamic.reference),
-	    ConvertStencilOp(operations[1], dynamic.writeMask, op_value, dynamic.reference),
-	    ConvertStencilOp(operations[2], dynamic.writeMask, op_value, dynamic.reference),
-	    static_cast<vk::CompareOp>(compare)};
+	const auto test_value = dynamic.reference;
+	auto reference       = test_value;
+	auto required_bits   = dynamic.compareMask;
+	if (compare == static_cast<uint8_t>(vk::CompareOp::eAlways) ||
+	    compare == static_cast<uint8_t>(vk::CompareOp::eNever)) {
+		required_bits = 0;
+	}
+	std::array<vk::StencilOp, 3> converted {};
+	for (size_t i = 0; i < operations.size(); i++) {
+		converted[i] = ConvertStencilOp(operations[i], dynamic.writeMask, op_value);
+		if (converted[i] != vk::StencilOp::eReplace) {
+			continue;
+		}
+		auto replacement = test_value;
+		if (static_cast<Prospero::StencilOp>(operations[i]) == Prospero::StencilOp::kReplaceOp) {
+			replacement = op_value;
+		}
+		if (((reference ^ replacement) & required_bits & dynamic.writeMask) != 0) {
+			DepthFatal("unsupported stencil replacement: compare=%u, compare mask=0x%02" PRIx32
+			           ", write mask=0x%02" PRIx32 ", operation value=0x%02" PRIx8
+			           ", test value=0x%02" PRIx32,
+			           compare, dynamic.compareMask, dynamic.writeMask, op_value, test_value);
+		}
+		// Vulkan shares one reference between comparison and every replacement on this face.
+		reference = (reference & ~dynamic.writeMask) | (replacement & dynamic.writeMask);
+		required_bits |= dynamic.writeMask;
+	}
+	dynamic.reference = reference;
+	return {converted[0], converted[1], converted[2], static_cast<vk::CompareOp>(compare)};
 }
 
 [[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(const CommandBuffer&     buffer,

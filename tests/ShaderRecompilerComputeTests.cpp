@@ -12289,7 +12289,7 @@ public:
       cmd.setLineWidth(1);
       cmd.setDepthTestEnable(depth.depth_test_enable);
       cmd.setDepthWriteEnable(depth.depth_write_enable);
-      cmd.setDepthCompareOp(vk::CompareOp::eAlways);
+      cmd.setDepthCompareOp(depth.depth_compare_op);
       cmd.setDepthBiasEnable(false);
       if (depth.stencil_test_enable) {
         const auto set_stencil = [&](vk::StencilFaceFlagBits face,
@@ -12424,15 +12424,7 @@ public:
       RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
       auto stencil_readback = CreateHostBuffer(name, extent * extent,
           vk::BufferUsageFlagBits::eTransferDst, {});
-      for (const bool back_face : {false, true}) {
-        const uint8_t initial = back_face ? 0xb5 : 0x35;
-        const uint8_t written = back_face ? 0x35 : 0xb5;
-        vk::ClearValue clear{};
-        clear.depthStencil = vk::ClearDepthStencilValue{0.625f, initial};
-        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth.image_id,
-            {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
-             0, 1, 0, 1}, clear);
-        draw(pipeline(true, 2, 2, false, !back_face));
+      const auto read_stencil = [&] {
         const vk::BufferImageCopy copy{0, 0, 0,
             {vk::ImageAspectFlagBits::eStencil, 0, 0, 1}, {}, {extent, extent, 1}};
         cache.GetImage(depth.image_id).Download(std::span{&copy, 1},
@@ -12447,15 +12439,63 @@ public:
         dependency.pMemoryBarriers = &barrier;
         scheduler.Current().Handle().pipelineBarrier2(dependency);
         scheduler.Finish();
-        const auto result = ReadBuffer(name, stencil_readback, extent * extent / 4);
+        return ReadBuffer(name, stencil_readback, extent * extent / 4);
+      };
+      const auto check_stencil = [&](const char *label, bool back_face,
+                                     uint8_t initial, uint8_t written) {
+        vk::ClearValue clear{};
+        clear.depthStencil = vk::ClearDepthStencilValue{0.625f, initial};
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth.image_id,
+            {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
+             0, 1, 0, 1}, clear);
+        draw(pipeline(true, 2, 2, false, !back_face));
+        const auto result = read_stencil();
         const auto *stencil_bytes = reinterpret_cast<const uint8_t *>(result.data());
         for (uint32_t texel = 0; texel < extent * extent; ++texel) {
           const uint8_t expected = solid_pixels[texel * 4] != 0 ? written : initial;
-          Require(name, back_face ? "back-face masked ReplaceOp" : "front-face ReplaceTest",
+          Require(name, label,
                   stencil_bytes[texel] == expected,
                   "captured stencil operations changed masked bits or triangle coverage");
         }
-      }
+      };
+      check_stencil("front-face ReplaceTest", false, 0x35, 0xb5);
+      check_stencil("back-face masked ReplaceOp", true, 0xb5, 0x35);
+
+      // Frame 6115 uses separate test/op replacement values with Always comparisons.
+      stencil_control.z_enable = stencil_control.z_write_enable = true;
+      stencil_control.zfunc = static_cast<uint8_t>(vk::CompareOp::eLessOrEqual);
+      registers.SetDepthControl(stencil_control);
+      registers.SetStencilControl({0, 3, 9, 0, 4, 8});
+      registers.SetStencilMask({8, 0xff, 0xff, 1, 8, 0xff, 0xff, 1});
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      Require(name, "independent stencil references",
+              depth.stencil_dynamic_front.reference == 8 &&
+                  depth.stencil_dynamic_back.reference == 1,
+              "always-pass faces must preserve their distinct replacement values");
+      check_stencil("front test-value replacement", false, 0x35, 8);
+      check_stencil("back operation-value replacement", true, 0x35, 1);
+      stencil_control.zfunc = static_cast<uint8_t>(vk::CompareOp::eNever);
+      registers.SetDepthControl(stencil_control);
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      check_stencil("front depth-fail subtract wrap", false, 0, 0xff);
+      check_stencil("back depth-fail add wrap", true, 0xff, 0);
+
+      // A compare on bit 3 and replacement on bit 0 share one Vulkan reference
+      // without changing either native operation or the untouched stencil bits.
+      stencil_control.z_enable = stencil_control.z_write_enable = false;
+      stencil_control.stencilfunc = stencil_control.stencilfunc_bf =
+          static_cast<uint8_t>(vk::CompareOp::eEqual);
+      registers.SetDepthControl(stencil_control);
+      registers.SetStencilControl({0, 4, 0, 0, 4, 0});
+      registers.SetStencilMask({8, 8, 1, 1, 8, 8, 1, 1});
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      Require(name, "masked compare and replace reference",
+              depth.stencil_dynamic_front.reference == 9 &&
+                  depth.stencil_dynamic_back.reference == 9,
+              "disjoint comparison and replacement bits must combine into one reference");
+      check_stencil("masked compare passes", false, 0xb8, 0xb9);
+      check_stencil("masked compare fails", false, 0xb0, 0xb0);
+
       DestroyBuffer(&stencil_readback);
     }
     resources.UnmapMemory(depth_address, allocation_size);
