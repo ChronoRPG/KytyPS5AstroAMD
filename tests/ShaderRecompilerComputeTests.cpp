@@ -940,6 +940,7 @@ void EnsureConfigInitialized() {
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+    ShaderInit();
     config_initialized = true;
   }
 }
@@ -12182,8 +12183,8 @@ public:
     AppendEnd(&test.fragment_code);
     auto fragment = CompileFragmentCase(test);
     const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(false);
-    const ShaderProgram vertex_shader{1, CreateShaderModule(name, vertex_spirv)};
-    const ShaderProgram pixel_shader{2, CreateShaderModule(name, fragment.spirv)};
+    ShaderProgram vertex_shader{1, CreateShaderModule(name, vertex_spirv)};
+    ShaderProgram pixel_shader{2, CreateShaderModule(name, fragment.spirv)};
     ShaderRecompiler::IR::CompiledShaderInfo vertex_program{};
     vertex_program.stage = ShaderType::Vertex;
     vertex_program.info.vertex_fetch_components[0] = 2;
@@ -12497,6 +12498,100 @@ public:
       check_stencil("masked compare fails", false, 0xb0, 0xb0);
 
       DestroyBuffer(&stencil_readback);
+
+      // SPI_PS_IN_CONTROL must select the native wave width through the actual
+      // program cache. In wave32 a low-word compare preserves scalar VCC_HI.
+      static const auto native_vertex = [] {
+        std::vector<u32> code;
+        AppendVMovLiteral(&code, 1, 0xbf800000u);
+        AppendVMovLiteral(&code, 2, 0x40400000u);
+        code.push_back(EncodeVopc(0xc2, InlineU32(1), 5));
+        code.push_back(EncodeVop2(0x01, 3, Vgpr(1), 2));
+        code.push_back(EncodeVopc(0xc2, InlineU32(2), 5));
+        code.push_back(EncodeVop2(0x01, 4, Vgpr(1), 2));
+        AppendVMovU32(&code, 0, 0);
+        AppendVMovLiteral(&code, 6, 0x3f800000u);
+        code.push_back(EncodeExp0(0x0c, 0xf));
+        code.push_back(EncodeExp1(3, 4, 0, 6));
+        for (u32 parameter = 0; parameter < 8; parameter++) {
+          code.push_back(EncodeExp0(0x20 + parameter, 0xf));
+          code.push_back(EncodeExp1(0, 0, 0, 0));
+        }
+        AppendEnd(&code);
+        return code;
+      }();
+      static const auto native_pixel = [] {
+        std::vector<u32> code;
+        AppendVMovU32(&code, 0, 0);
+        AppendSMovLiteral(&code, 107, 0x3e800000u);
+        code.push_back(EncodeVopc(0xc2, InlineU32(1), 0));
+        code.push_back(EncodeVop1(0x01, 1, 107));
+        AppendVMovLiteral(&code, 2, 0x3f800000u);
+        code.push_back(EncodeExp0(0x00, 0xf));
+        code.push_back(EncodeExp1(1, 1, 1, 2));
+        AppendEnd(&code);
+        return code;
+      }();
+      static ShaderUserData native_user_data{};
+      const auto vertex_address = reinterpret_cast<uint64_t>(native_vertex.data());
+      const auto pixel_address = reinterpret_cast<uint64_t>(native_pixel.data());
+      ShaderMapUserData(vertex_address,
+          {.type = Prospero::ShaderBinaryType::kGs,
+           .user_data = &native_user_data,
+           .code_size_bytes = static_cast<uint32_t>(native_vertex.size() * sizeof(u32))});
+      ShaderMapUserData(pixel_address,
+          {.type = Prospero::ShaderBinaryType::kPs,
+           .code_size_bytes = static_cast<uint32_t>(native_pixel.size() * sizeof(u32))});
+      HW::VertexShaderInfo native_vertex_regs{};
+      native_vertex_regs.es_regs.data_addr = vertex_address;
+      HW::PixelShaderInfo native_pixel_regs{};
+      native_pixel_regs.ps_regs.data_addr = pixel_address;
+      const auto owned_vertex_shader = vertex_shader;
+      const auto owned_pixel_shader = pixel_shader;
+      depth.stencil_test_enable = false;
+      registers.SetViewportTransformControl(0x300);
+      user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      std::array<Prospero::ColorComponentMapping, 8> export_mapping{};
+      std::array<ShaderVertexInputInfo, 3> native_vertex_info{};
+      std::array<uint64_t, 2> wave_ids{};
+      std::array<std::vector<u32>, 2> wave_keys;
+      struct PixelWaveCase { uint32_t control, width, color; };
+      for (const auto wave : {PixelWaveCase{0x0008, 64, 0},
+                              PixelWaveCase{0x8008, 32, 0x3e800000},
+                              PixelWaveCase{0x0008, 64, 0}}) {
+        registers.SetPsInControl(wave.control);
+        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
+            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
+            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+        Require(name, "pixel wave metadata propagation",
+                pixel.input_num == 8 && pixel.stage.program->wave_size == wave.width,
+                "SPI_PS_IN_CONTROL width did not reach the compiled pixel program");
+        const auto index = static_cast<uint32_t>(wave.width == 32);
+        std::vector<u32> key;
+        BuildStageStaticKey(pixel, key);
+        if (wave_ids[index] != 0) {
+          Require(name, "pixel wave cache reuse",
+                  programs.pixel.id == wave_ids[index] && key == wave_keys[index],
+                  "restoring wave64 did not reuse its original program");
+        }
+        wave_ids[index] = programs.pixel.id;
+        wave_keys[index] = std::move(key);
+        vertex_shader = programs.vertex[0];
+        pixel_shader = programs.pixel;
+        vertex = native_vertex_info[0];
+        draw(pipeline(true, 2, 2));
+        const auto wave_pixels = read_color();
+        for (size_t component = 0; component < wave_pixels.size(); component++) {
+          const auto expected = component % 4 == 3 ? 0x3f800000u : wave.color;
+          Require(name, "pixel wave VCC_HI readback", wave_pixels[component] == expected,
+                  "pixel comparison clobbered VCC_HI in wave32 or retained it in wave64");
+        }
+      }
+      Require(name, "pixel wave cache distinction",
+              wave_ids[0] != wave_ids[1] && wave_keys[0] != wave_keys[1],
+              "wave32 and wave64 pixel programs shared a cache key");
+      vertex_shader = owned_vertex_shader;
+      pixel_shader = owned_pixel_shader;
     }
     resources.UnmapMemory(depth_address, allocation_size);
     scheduler.Finish();
