@@ -64,8 +64,7 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
-	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
-	                                 uint32_t* fill_value = nullptr);
+	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
@@ -79,16 +78,10 @@ private:
 	struct ImageDownload;
 
 	struct MetaDataInfo {
-		enum class Type : uint8_t { CMask, FMask, HTile, Dcc };
+		enum class Type : uint8_t { CMask, FMask, HTile };
 
-		Type     type       = Type::Dcc;
-		uint32_t clear_mask = 0;
-		uint32_t fill_value = 0xffffffffu;
-		// PS5 DCC bytes and layer consumption belong to the metadata allocation, not an image.
-		uint64_t size       = 0;
-		uint64_t revision   = 0;
-		bool     dirty      = true;
-		bool     tracked    = false;
+		Type     type;
+		uint32_t clear_mask = UINT32_MAX;
 	};
 
 	struct OverlapResult {
@@ -146,11 +139,8 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
-	void                        RefreshDccMetadata(const ImageDesc& desc);
-	void                        PrepareDccClear(ImageId id, const ImageDesc& desc,
-	                                            uint32_t metadata_base_layer);
-	void                        UntrackMetadata(uint64_t address, MetaDataInfo& metadata);
-	void                        InvalidateDccMetadata(uint64_t address, uint64_t size);
+	void                        MaterializeDccClear(ImageId id, const ImageDesc& desc,
+	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
@@ -187,7 +177,6 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
-	uint64_t                                          m_metadata_revision = 0;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

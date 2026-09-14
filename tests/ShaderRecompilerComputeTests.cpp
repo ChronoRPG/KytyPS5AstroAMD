@@ -4521,20 +4521,6 @@ public:
 
     {
       auto &resources = context;
-      namespace Exception = Common::HostException;
-      Require(name, "guest fault handler",
-              Exception::InstallHandler([](const Exception::ExceptionInfo &info) {
-                if (info.type != Exception::ExceptionType::AccessViolation ||
-                    (info.access_violation_type != Exception::AccessViolationType::Read &&
-                     info.access_violation_type != Exception::AccessViolationType::Write)) {
-                  return false;
-                }
-                const auto access =
-                    info.access_violation_type == Exception::AccessViolationType::Write
-                        ? PageFaultAccess::Write : PageFaultAccess::Read;
-                return LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
-              }),
-              "failed to install the production guest-memory fault route");
       LibKernel::Memory::InstallGpuResources(&resources);
       auto &texture_cache = resources.GetTextureCache();
       const auto [narrow_download, narrow_download_offset] =
@@ -6186,6 +6172,39 @@ public:
                               [](uint8_t value) { return value == 0x5a; }),
               "remapped host layer changed metadata outside the guest alias allocation");
 
+      RenderColorInfo retired_alias{};
+      retired_alias.desc = dcc_alias;
+      retired_alias.image_id = dcc_array_id;
+      retired_alias.guest_mip_level = 0;
+      retired_alias.guest_array_layer = 0;
+      texture_cache.UnmapMemory(dcc_array.info.data.address, dcc_array.info.data.size);
+      WriteMetadata(context, dcc_alias.info.metadata.range.address, 0x1000, 0x40404040u);
+      RenderExecutorTestAccess::PrepareGraphicsBindings(
+          context.GetRenderExecutor(), std::span<PreparedBindings *const>{},
+          std::span{&retired_alias, 1u});
+      RenderDepthInfo alias_depth{};
+      const auto alias_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          context.GetRenderExecutor(), scheduler.Current(), &retired_alias, 1, alias_depth);
+      Require(name, "retired DCC alias native coordinates",
+              retired_alias.image_id != dcc_array_id &&
+                  retired_alias.desc.view_info.base_level == 0 &&
+                  retired_alias.desc.view_info.base_layer == 0 &&
+                  retired_alias.desc.info.resources.layers == 1 &&
+                  alias_rendering.color_attachments[0].image_view != nullptr &&
+                  ReadCachedTexel(name, context, retired_alias.image_id) ==
+                      std::vector<u32>{0, 0x3c000000u},
+              "rediscovery treated a retired host layer as the native DCC slice");
+      resources.GetBufferCache().ReadMemory(alias_dcc_address, 0x3000);
+      Require(name, "retired DCC alias metadata bounds",
+              LibKernel::Memory::TryReadBacking(alias_dcc_address, alias_metadata.data(),
+                                               alias_metadata.size()) &&
+                  std::all_of(alias_metadata.begin(), alias_metadata.begin() + 0x2000,
+                              [](uint8_t byte) { return byte == 0xff; }) &&
+                  std::all_of(alias_metadata.begin() + 0x2000, alias_metadata.end(),
+                              [](uint8_t byte) { return byte == 0x5a; }),
+              "retired alias rediscovery overwrote metadata outside its native slice");
+      RenderExecutorTestAccess::ResetBindings(context.GetRenderExecutor());
+
       constexpr uint64_t metadata_data_a = 0x12000;
       constexpr uint64_t metadata_data_b = 0x12100;
       constexpr uint64_t metadata_a = 0x13000;
@@ -6284,7 +6303,7 @@ public:
       reused_color.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
       const auto reused_color_id = texture_cache.FindImage(reused_color);
       (void)texture_cache.FindRenderTarget(reused_color_id, reused_color);
-      // Exact repeated CPU stores must re-arm DCC metadata write protection.
+      // Repeated CPU stores must remain visible through ordinary buffer ownership.
       for (uint32_t repeat = 0; repeat < 2; repeat++) {
         vk::ClearValue painted{};
         painted.color.float32 = std::array{1.0f, 0.0f, 1.0f, 1.0f};
@@ -6305,14 +6324,12 @@ public:
                                            reused_depth.info.stencil.size);
       const auto reused_depth_id = texture_cache.FindImage(reused_depth);
       (void)texture_cache.FindDepthTarget(reused_depth_id, reused_depth);
-      uint32_t reused_fill = 0;
       Require(
           name, "DCC allocation reused as HTile",
           TextureCacheTestAccess::Contains(texture_cache, reused_color_id) &&
               texture_cache.GetImage(reused_color_id).IsBufferModified() &&
               !texture_cache.GetImage(reused_color_id).IsGpuModified() &&
-              !texture_cache.IsMetaCleared(base + 0x28000, 0, &reused_fill) &&
-              reused_fill == UINT32_MAX &&
+              !texture_cache.IsMetaCleared(base + 0x28000, 0) &&
               texture_cache.ClearMeta(base + 0x28000) &&
               texture_cache.TouchMeta(base + 0x28000, 0, false),
           "depth binding retained incompatible DCC clear state");
@@ -8250,14 +8267,13 @@ public:
                 allocation_alignment) == 0 &&
                 mapped == reinterpret_cast<void *>(base),
             "color-volume fixed mapping failed");
-    std::memset(mapped, 0, allocation_size);
+    std::memset(mapped, 0x5a, allocation_size);
     constexpr uint64_t slice_size = 0x10000;
-    std::memset(static_cast<uint8_t *>(mapped) + 31 * slice_size, 0x5a,
-                slice_size);
 
     {
       RenderContext context(m_runtime_context);
       context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -8296,7 +8312,6 @@ public:
       const auto attachment =
           texture_cache.FindRenderTarget(color.image_id, color.desc);
       const auto &image = texture_cache.GetImage(color.image_id);
-      uint32_t dcc_clear_value = 0xffffffffu;
       Require(
           name, "captured 3D target",
           color.image_id && attachment != nullptr &&
@@ -8308,8 +8323,7 @@ public:
               color.desc.info.mip_layout[0].size == 0x10000 &&
               color.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
               color.desc.info.metadata.range.address == dcc_address &&
-              texture_cache.IsMetaCleared(dcc_address, 7, &dcc_clear_value) &&
-              dcc_clear_value == 0 && !texture_cache.ClearMeta(dcc_address) &&
+              !texture_cache.IsMeta(dcc_address) && !texture_cache.ClearMeta(dcc_address) &&
               color.desc.view_info.type == vk::ImageViewType::e2D &&
               color.desc.view_info.layer_count == 1 &&
               image.backing.image_type == vk::ImageType::e3D &&
@@ -8319,6 +8333,18 @@ public:
           "dimension=2/depth=31 did not create the expected 32x32x32 "
           "backing and 2D "
           "attachment slice");
+      constexpr uint64_t metadata_slice_size = metadata_size / 32;
+      std::vector<uint8_t> metadata_bytes(metadata_size);
+      resources.GetBufferCache().ReadMemory(dcc_address, metadata_size);
+      Require(name, "first volume slice expanded metadata",
+              LibKernel::Memory::TryReadBacking(dcc_address, metadata_bytes.data(),
+                                               metadata_bytes.size()) &&
+                  std::all_of(metadata_bytes.begin(),
+                              metadata_bytes.begin() + metadata_slice_size,
+                              [](uint8_t byte) { return byte == 0xff; }) &&
+                  std::all_of(metadata_bytes.begin() + metadata_slice_size,
+                              metadata_bytes.end(), [](uint8_t byte) { return byte == 0; }),
+              "consuming volume slice 0 changed unrequested native metadata slices");
 
       RenderExecutorTestAccess::ResetBindings(executor);
       registers.SetColorView(
@@ -8336,9 +8362,21 @@ public:
               sliced_rendering.color_attachments[0].image_view != nullptr &&
               sliced_color.desc.view_info.base_layer == 7 &&
               sliced_rendering.num_color_attachments == 1 &&
-              sliced_rendering.num_layers == 1 &&
-              !texture_cache.IsMetaCleared(dcc_address, 7),
+              sliced_rendering.num_layers == 1,
           "a nonzero 3D attachment slice was treated as a Vulkan array layer");
+      resources.GetBufferCache().ReadMemory(dcc_address, metadata_size);
+      Require(name, "mixed volume metadata readback",
+              LibKernel::Memory::TryReadBacking(dcc_address, metadata_bytes.data(),
+                                               metadata_bytes.size()),
+              "mixed volume metadata is unavailable");
+      for (uint32_t slice = 0; slice < 32; slice++) {
+        const uint8_t expected = slice == 0 || slice == 7 ? 0xff : 0;
+        const auto first = metadata_bytes.begin() + slice * metadata_slice_size;
+        Require(name, "independent volume metadata consumption",
+                std::all_of(first, first + metadata_slice_size,
+                            [expected](uint8_t byte) { return byte == expected; }),
+                "mixed DCC metadata lost a pending slice or consumed an unrequested slice");
+      }
       Require(name, "3D slice clear and preservation",
               ReadCachedTexel(name, context, color.image_id, {0, 0, 7}) ==
                   std::vector<u32>{0} &&
@@ -8394,20 +8432,37 @@ public:
               "render-target upload/readback lost the final Z slice");
       DestroyBuffer(&slice_probe);
 
-      dcc_clear_value = 0;
+      vk::ClearValue painted{};
+      painted.color.float32 = std::array{1.0f, 1.0f, 1.0f, 0.0f};
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), color.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
       WriteMetadata(context, dcc_address, metadata_size, 0xffffffffu);
       color.image_id = texture_cache.FindImage(color.desc);
       (void)texture_cache.FindRenderTarget(color.image_id, color.desc);
-      const bool uncompressed =
-          !texture_cache.IsMetaCleared(dcc_address, 7, &dcc_clear_value) &&
-          dcc_clear_value == 0xffffffffu;
+      resources.GetBufferCache().ReadMemory(dcc_address, metadata_size);
+      Require(name, "expanded volume metadata preserves rendering",
+              ReadCachedTexel(name, context, color.image_id) ==
+                  std::vector<u32>{0x3fffffffu} &&
+                  LibKernel::Memory::TryReadBacking(dcc_address, metadata_bytes.data(),
+                                                   metadata_bytes.size()) &&
+                  std::all_of(metadata_bytes.begin(), metadata_bytes.end(),
+                              [](uint8_t byte) { return byte == 0xff; }),
+              "uncompressed native keys reapplied an old volume clear");
       WriteMetadata(context, dcc_address, metadata_size, 0);
       color.image_id = texture_cache.FindImage(color.desc);
       (void)texture_cache.FindRenderTarget(color.image_id, color.desc);
-      Require(
-          name, "registered DCC code state",
-          uncompressed && texture_cache.IsMetaCleared(dcc_address, 7),
-          "DCC fill codes were not classified as clear or uncompressed");
+      resources.GetBufferCache().ReadMemory(dcc_address, metadata_size);
+      Require(name, "native volume re-clear",
+              ReadCachedTexel(name, context, color.image_id) == std::vector<u32>{0} &&
+                  LibKernel::Memory::TryReadBacking(dcc_address, metadata_bytes.data(),
+                                                   metadata_bytes.size()) &&
+                  std::all_of(metadata_bytes.begin(),
+                              metadata_bytes.begin() + metadata_slice_size,
+                              [](uint8_t byte) { return byte == 0xff; }) &&
+                  std::all_of(metadata_bytes.begin() + metadata_slice_size,
+                              metadata_bytes.end(), [](uint8_t byte) { return byte == 0; }),
+              "a native metadata overwrite did not clear only its requested volume slice");
 
       for (const uint32_t base_slice : {0u, 7u}) {
         RenderExecutorTestAccess::ResetBindings(executor);
@@ -8432,10 +8487,19 @@ public:
         scheduler.Current().BeginRendering(volume_rendering);
         scheduler.Current().EndRendering();
       }
+      resources.GetBufferCache().ReadMemory(dcc_address, metadata_size);
+      Require(name, "complete volume expansion",
+              LibKernel::Memory::TryReadBacking(dcc_address, metadata_bytes.data(),
+                                               metadata_bytes.size()) &&
+                  std::all_of(metadata_bytes.begin(), metadata_bytes.end(),
+                              [](uint8_t byte) { return byte == 0xff; }),
+              "full volume acquisition left an unconsumed native clear slice");
 
       RenderExecutorTestAccess::ResetBindings(executor);
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
     }
 
     Require(name, "unmap direct backing",
@@ -8570,6 +8634,7 @@ public:
       HW::UserConfig user_config{};
       HW::Shader shaders{};
       context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
       context.GetGpu().SendCommandSync([&] {
         auto &scheduler = context.GetCommandScheduler();
         registers.SetColorBase(0, {.addr = base});
@@ -8627,7 +8692,7 @@ public:
                     color.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
                     color.desc.info.metadata.range.address == dcc_address &&
                     rendering.num_color_attachments == 1 &&
-                    !texture_cache.IsMetaCleared(dcc_address, 0),
+                    !texture_cache.IsMeta(dcc_address),
                 "a DCC fixed clear code was not materialised on an RGBA16F "
                 "target");
         Require(name, "GPU float clear value",
@@ -8694,11 +8759,55 @@ public:
                 ReadCachedTexel(name, context, color.image_id) ==
                     std::vector<u32>(fill_case.texel.begin(), fill_case.texel.end()),
                 "completing the metadata overwrite did not restore its clear");
+
+        ImageDesc previous_depth{};
+        previous_depth.type = BindingType::DepthTarget;
+        previous_depth.info.data = {base + 0x180000, 0x10000};
+        previous_depth.info.pixel_format = vk::Format::eD32Sfloat;
+        previous_depth.info.guest_format = Prospero::BufferFormat::k32Float;
+        previous_depth.info.type = Prospero::ImageType::kColor2D;
+        previous_depth.info.extent = {128, 128, 1};
+        previous_depth.info.resources = {1, 1};
+        previous_depth.info.pitch = 128;
+        previous_depth.info.bytes_per_block = 4;
+        previous_depth.info.samples = 1;
+        previous_depth.info.tile_mode = Prospero::TileMode::kLinear;
+        previous_depth.info.mip_layout[0] = {0, 0x10000, 128, 128};
+        previous_depth.info.metadata.kind = ImageMetadataKind::Htile;
+        previous_depth.info.metadata.range = {dcc_address, metadata_size.size};
+        previous_depth.info.htile_clear_mask = 0;
+        previous_depth.view_info.format = vk::Format::eD32Sfloat;
+        previous_depth.view_info.type = vk::ImageViewType::e2D;
+        previous_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+        previous_depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        const auto previous_depth_id = texture_cache.FindImage(previous_depth);
+        Require(name, "old HTile interpretation",
+                texture_cache.FindDepthTarget(previous_depth_id, previous_depth) != nullptr &&
+                    texture_cache.IsMeta(dcc_address),
+                "the old depth target did not register its metadata allocation");
+        paint();
+        bind();
+        Require(name, "HTile allocation reused as expanded DCC",
+                !texture_cache.IsMeta(dcc_address) && !texture_cache.ClearMeta(dcc_address) &&
+                    ReadCachedTexel(name, context, color.image_id) == painted,
+                "DCC discovery retained the old HTile classification or erased rendered color");
+        fill_metadata(metadata_words);
+        bind();
+        context.GetBufferCache().ReadMemory(dcc_address, metadata_size.size);
+        Require(name, "native DCC dispatch after HTile reuse",
+                ReadCachedTexel(name, context, color.image_id) ==
+                    std::vector<u32>(fill_case.texel.begin(), fill_case.texel.end()) &&
+                    LibKernel::Memory::TryReadBacking(dcc_address, expanded_metadata.data(),
+                                                     expanded_metadata.size()) &&
+                    std::all_of(expanded_metadata.begin(), expanded_metadata.end(),
+                                [](uint8_t byte) { return byte == 0xff; }),
+                "the former HTile entry swallowed the native DCC fill dispatch");
         RenderExecutorTestAccess::ResetBindings(executor);
         resources.UnmapMemory(base, allocation_size);
         scheduler.Finish();
       });
       context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
     }
 
     Require(name, "unmap direct backing",
@@ -8737,6 +8846,7 @@ public:
       std::memset(reinterpret_cast<void *>(dcc_address), 0xff, metadata_size);
       RenderContext context(m_runtime_context);
       context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -8785,9 +8895,16 @@ public:
       }
       Require(name, "opaque black before first sample",
               ReadCachedTexel(name, context, binding.image_id, {3839, 2159, 0}) ==
-                  std::vector<u32>{0, 0x3c000000u} &&
-                  !cache.IsMetaCleared(dcc_address, 0),
+                  std::vector<u32>{0, 0x3c000000u},
               "sampling read stale color bytes instead of the DCC opaque black clear");
+      context.GetBufferCache().ReadMemory(dcc_address, metadata_size);
+      std::vector<uint8_t> expanded_metadata(metadata_size);
+      Require(name, "sampled clear expands native metadata",
+              LibKernel::Memory::TryReadBacking(dcc_address, expanded_metadata.data(),
+                                               expanded_metadata.size()) &&
+                  std::all_of(expanded_metadata.begin(), expanded_metadata.end(),
+                              [](uint8_t byte) { return byte == 0xff; }),
+              "the sampled clear retained native clear keys after materialization");
       WriteMetadata(context, dcc_address, metadata_size, 0x80808080u);
       binding.image_id = cache.FindImage(binding.desc);
       (void)cache.FindTexture(binding.image_id, binding.desc);
@@ -8797,6 +8914,8 @@ public:
               "an existing sampled image retained the previous DCC clear");
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
     }
     Require(name, "unmap",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
@@ -14243,6 +14362,20 @@ private:
     if (m_runtime_context.allocator != nullptr) {
       return;
     }
+    namespace Exception = Common::HostException;
+    Require("VulkanHarness", "guest fault handler",
+            Exception::InstallHandler([](const Exception::ExceptionInfo &info) {
+              if (info.type != Exception::ExceptionType::AccessViolation ||
+                  (info.access_violation_type != Exception::AccessViolationType::Read &&
+                   info.access_violation_type != Exception::AccessViolationType::Write)) {
+                return false;
+              }
+              const auto access =
+                  info.access_violation_type == Exception::AccessViolationType::Write
+                      ? PageFaultAccess::Write : PageFaultAccess::Read;
+              return LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+            }),
+            "failed to install the production guest-memory fault route");
     m_runtime_context.instance = m_instance;
     m_runtime_context.physical_device = m_physical_device;
     m_runtime_context.device = m_device;
