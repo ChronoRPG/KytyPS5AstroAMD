@@ -410,8 +410,14 @@ struct RenderExecutorTestAccess {
       stages[1] = &*result.pixel;
     }
     executor.PrepareGraphicsBindings(
-        std::span{stages.data(), pixel_active ? 2u : 1u});
+        std::span{stages.data(), pixel_active ? 2u : 1u}, {});
     return result;
+  }
+
+  static void PrepareGraphicsBindings(RenderExecutor &executor,
+                                      std::span<PreparedBindings *const> stages,
+                                      std::span<RenderColorInfo> colors) {
+    executor.PrepareGraphicsBindings(stages, colors);
   }
 
   static PipelineCache::Pipeline
@@ -10971,11 +10977,17 @@ public:
       rebound_array_target.desc = array_target;
       rebound_array_target.image_id = array_target_id;
       RenderDepthInfo no_array_depth{};
+      const auto acquired_array_view = array_binding.images[0].image_view;
+      RenderExecutorTestAccess::PrepareGraphicsBindings(
+          executor, std::span<PreparedBindings *const>{},
+          std::span{&rebound_array_target, 1u});
       auto array_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
           executor, scheduler.Current(), &rebound_array_target, 1,
           no_array_depth);
       Require(name, "expanded array target rebind",
               rebound_array_target.image_id == expanded_array_id &&
+                  array_binding.images[0].image_id == expanded_array_id &&
+                  array_binding.images[0].image_view == acquired_array_view &&
                   array_rendering.color_attachments[0].image_view != nullptr &&
                   array_rendering.num_color_attachments == 1 &&
                   array_rendering.width == 128 &&
@@ -10986,6 +10998,106 @@ public:
               "the retained single-layer target did not rebind to the expanded "
               "backing");
       RenderExecutorTestAccess::ResetBindings(executor);
+
+      {
+        constexpr uint32_t before = 0x13579bdfu;
+        constexpr uint32_t guard = 0x2468ace0u;
+        constexpr uint32_t after = 0xa1b2c3d4u;
+        vk::ClearValue clear{};
+        clear.color.uint32[0] = before;
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), expanded_array_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 2}, clear);
+        clear.color.uint32[0] = guard;
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), expanded_array_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 1, 1}, clear);
+
+        ShaderRecompiler::IR::Program buffer_ir{};
+        buffer_ir.stage = ShaderType::Vertex;
+        buffer_ir.resource_tracking_complete = true;
+        buffer_ir.info.buffers.resize(1);
+        buffer_ir.info.buffers[0].read = true;
+        buffer_ir.info.buffers[0].formatted = true;
+        allocate_bindings(buffer_ir);
+        ShaderRecompiler::IR::CompiledShaderInfo buffer_program{};
+        buffer_program.stage = buffer_ir.stage;
+        buffer_program.info = std::move(buffer_ir.info);
+        buffer_program.bindings = std::move(buffer_ir.bindings);
+
+        constexpr uint64_t buffer_size = 2 * target_mip_size;
+        static_assert(buffer_size > BufferCache::CACHING_PAGESIZE);
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(array_target_address);
+        descriptor.fields[1] |= 4u << 16u;
+        descriptor.fields[2] = buffer_size / sizeof(uint32_t);
+        descriptor.fields[3] = 0x00014004u;
+        ShaderStageRuntime buffer_runtime{.program = &buffer_program};
+        auto &value = buffer_runtime.resources.buffers.emplace_back();
+        std::memcpy(value.dwords.data(), descriptor.fields, sizeof(descriptor.fields));
+        value.dword_count = 4;
+        auto buffer_bindings = executor.PrepareBindings(buffer_runtime);
+        std::array stages{&buffer_bindings};
+        RenderColorInfo target{};
+        target.desc = array_target;
+        target.image_id = array_target_id;
+        RenderExecutorTestAccess::PrepareGraphicsBindings(
+            executor, stages, std::span{&target, 1u});
+        const auto &buffer = buffer_bindings.buffers[0];
+        Require(name, "rediscovered target formatted-buffer read",
+                target.image_id == expanded_array_id &&
+                    buffer.range == buffer_size &&
+                    buffer_bindings.images.empty() &&
+                    texture_cache.GetImage(target.image_id).backing.state.layout ==
+                        vk::ImageLayout::eTransferSrcOptimal,
+                "target discovery did not precede the formatted image-to-buffer copy");
+        auto readback = CreateHostBuffer(name, 2 * sizeof(uint32_t),
+                                        vk::BufferUsageFlagBits::eTransferDst, {0, 0});
+        const std::array copies{
+            vk::BufferCopy{buffer.offset, 0, sizeof(uint32_t)},
+            vk::BufferCopy{buffer.offset + target_mip_size, sizeof(uint32_t),
+                           sizeof(uint32_t)}};
+        scheduler.Current().Handle().copyBuffer(buffer.buffer, readback.buffer,
+                                                copies.size(), copies.data());
+        vk::BufferMemoryBarrier readback_barrier{};
+        readback_barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        readback_barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        readback_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        readback_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        readback_barrier.buffer = readback.buffer;
+        readback_barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+            {}, 0, nullptr, 1, &readback_barrier, 0, nullptr);
+
+        const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &target, 1, no_array_depth);
+        Require(name, "attachment layout after formatted-buffer read",
+                rendering.color_attachments[0].image_layout ==
+                    vk::ImageLayout::eColorAttachmentOptimal &&
+                    texture_cache.GetImage(target.image_id).backing.state.layout ==
+                        vk::ImageLayout::eColorAttachmentOptimal,
+                "the formatted buffer copy left the render attachment in its transfer layout");
+        vk::ClearAttachment clear_attachment{};
+        clear_attachment.aspectMask = vk::ImageAspectFlagBits::eColor;
+        clear_attachment.colorAttachment = 0;
+        clear_attachment.clearValue.color.uint32[0] = after;
+        const vk::ClearRect clear_rect{{{0, 0}, {128, 128}}, 0, 1};
+        scheduler.BeginRendering(rendering);
+        scheduler.Current().Handle().clearAttachments(1, &clear_attachment, 1, &clear_rect);
+        scheduler.EndRendering();
+        scheduler.Finish();
+        Require(name, "formatted alias observes prior GPU contents",
+                ReadBuffer(name, readback, 2) == std::vector<u32>{before, guard},
+                "formatted buffer acquisition copied stale guest bytes instead of the image");
+        DestroyBuffer(&readback);
+        Require(name, "rendering after formatted-buffer acquisition",
+                ReadCachedTexel(name, context, target.image_id) == std::vector<u32>{after} &&
+                    ReadCachedTexel(name, context, target.image_id, {}, {1, 1, 1}, 1) ==
+                        std::vector<u32>{guard},
+                "attachment rendering lost its new color or changed the untouched array layer");
+        RenderExecutorTestAccess::ResetBindings(executor);
+      }
 
       auto colliding_msaa_texture = array_texture;
       colliding_msaa_texture.fields[3] =
@@ -11269,6 +11381,8 @@ public:
               TextureCacheTestAccess::Owner(texture_cache,
                                             target_subresource_id) == nullptr,
               "the displaced target slot was not erased after GPU completion");
+      RenderExecutorTestAccess::PrepareGraphicsBindings(
+          executor, std::span<PreparedBindings *const>{}, std::span{&rebound_color, 1u});
       auto rebound_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
           executor, scheduler.Current(), &rebound_color, 1, rebound_depth);
       Require(name, "guest target extent after host mip remap",
@@ -11327,6 +11441,8 @@ public:
       RenderDepthInfo ordered_depth{};
       ordered_depth.desc = ordered_depth_desc;
       ordered_depth.image_id = ordered_depth_id;
+      RenderExecutorTestAccess::PrepareGraphicsBindings(
+          executor, std::span<PreparedBindings *const>{}, std::span{&ordered_color, 1u});
       auto ordered_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
           executor, scheduler.Current(), &ordered_color, 1, ordered_depth);
       Require(name, "color-before-depth acquisition order",
