@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
@@ -74,6 +75,16 @@ static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t
 			return vk::StencilOp::eInvert;
 		default: DepthFatal("unsupported stencil operation: 0x%02" PRIx8, value);
 	}
+}
+
+static PipelineStencilStaticState ConvertStencilState(
+    uint8_t compare, const std::array<uint8_t, 3>& operations, uint8_t op_value,
+    PipelineStencilDynamicState& dynamic) {
+	return {
+	    ConvertStencilOp(operations[0], dynamic.writeMask, op_value, dynamic.reference),
+	    ConvertStencilOp(operations[1], dynamic.writeMask, op_value, dynamic.reference),
+	    ConvertStencilOp(operations[2], dynamic.writeMask, op_value, dynamic.reference),
+	    static_cast<vk::CompareOp>(compare)};
 }
 
 [[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(const CommandBuffer&     buffer,
@@ -304,22 +315,15 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		     dc.stencilfunc_bf > static_cast<uint8_t>(vk::CompareOp::eAlways))) {
 			DepthFatal("unsupported stencil compare state");
 		}
-		r.stencil_static_front = {
-		    ConvertStencilOp(sc.stencil_fail, front_write_mask, sm.stencil_opval, sm.stencil_testval),
-		    ConvertStencilOp(sc.stencil_zpass, front_write_mask, sm.stencil_opval, sm.stencil_testval),
-		    ConvertStencilOp(sc.stencil_zfail, front_write_mask, sm.stencil_opval, sm.stencil_testval),
-		    static_cast<vk::CompareOp>(dc.stencilfunc)};
 		r.stencil_dynamic_front = {sm.stencil_mask, front_write_mask, sm.stencil_testval};
+		r.stencil_static_front = ConvertStencilState(
+		    dc.stencilfunc, {sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail},
+		    sm.stencil_opval, r.stencil_dynamic_front);
 		if (dc.backface_enable) {
-			r.stencil_static_back = {
-			    ConvertStencilOp(sc.stencil_fail_bf, back_write_mask, sm.stencil_opval_bf,
-			                     sm.stencil_testval_bf),
-			    ConvertStencilOp(sc.stencil_zpass_bf, back_write_mask, sm.stencil_opval_bf,
-			                     sm.stencil_testval_bf),
-			    ConvertStencilOp(sc.stencil_zfail_bf, back_write_mask, sm.stencil_opval_bf,
-			                     sm.stencil_testval_bf),
-			    static_cast<vk::CompareOp>(dc.stencilfunc_bf)};
 			r.stencil_dynamic_back = {sm.stencil_mask_bf, back_write_mask, sm.stencil_testval_bf};
+			r.stencil_static_back = ConvertStencilState(
+			    dc.stencilfunc_bf, {sc.stencil_fail_bf, sc.stencil_zpass_bf, sc.stencil_zfail_bf},
+			    sm.stencil_opval_bf, r.stencil_dynamic_back);
 		} else {
 			r.stencil_static_back  = r.stencil_static_front;
 			r.stencil_dynamic_back = r.stencil_dynamic_front;
