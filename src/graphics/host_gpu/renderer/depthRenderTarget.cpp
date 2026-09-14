@@ -38,15 +38,22 @@ namespace Libs::Graphics {
 	EXIT("unsupported render state; details were printed above\n");
 }
 
-static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t op_value) {
+static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t op_value,
+                                     uint8_t test_value) {
 	if (write_mask == 0) {
 		return vk::StencilOp::eKeep;
 	}
 	switch (static_cast<Prospero::StencilOp>(value)) {
 		case Prospero::StencilOp::kKeep: return vk::StencilOp::eKeep;
 		case Prospero::StencilOp::kZero: return vk::StencilOp::eZero;
-		case Prospero::StencilOp::kReplaceTest:
-		case Prospero::StencilOp::kReplaceOp: return vk::StencilOp::eReplace;
+		case Prospero::StencilOp::kReplaceTest: return vk::StencilOp::eReplace;
+		case Prospero::StencilOp::kReplaceOp:
+			if (op_value != test_value) {
+				DepthFatal("unsupported stencil replacement: write mask=0x%02" PRIx8
+				           ", operation value=0x%02" PRIx8 ", test value=0x%02" PRIx8,
+				           write_mask, op_value, test_value);
+			}
+			return vk::StencilOp::eReplace;
 		case Prospero::StencilOp::kAddClamp: return vk::StencilOp::eIncrementAndClamp;
 		case Prospero::StencilOp::kSubClamp: return vk::StencilOp::eDecrementAndClamp;
 		case Prospero::StencilOp::kInvert: return vk::StencilOp::eInvert;
@@ -64,11 +71,6 @@ static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t
 			return vk::StencilOp::eInvert;
 		default: DepthFatal("unsupported stencil operation: 0x%02" PRIx8, value);
 	}
-}
-
-static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
-	constexpr auto replace_op = static_cast<uint8_t>(Prospero::StencilOp::kReplaceOp);
-	return fail == replace_op || pass == replace_op || depth_fail == replace_op;
 }
 
 [[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(const CommandBuffer&     buffer,
@@ -296,26 +298,23 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		const uint8_t back_write_mask  = stencil_ops_disabled ? 0 : sm.stencil_writemask_bf;
 		if (dc.stencilfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
 		    (dc.backface_enable &&
-		     dc.stencilfunc_bf > static_cast<uint8_t>(vk::CompareOp::eAlways)) ||
-		    (front_write_mask != 0 &&
-		     UsesStencilOpValue(sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail) &&
-		     sm.stencil_opval != sm.stencil_testval) ||
-		    (dc.backface_enable && back_write_mask != 0 &&
-		     UsesStencilOpValue(sc.stencil_fail_bf, sc.stencil_zpass_bf, sc.stencil_zfail_bf) &&
-		     sm.stencil_opval_bf != sm.stencil_testval_bf)) {
-			DepthFatal("unsupported stencil compare or replacement state");
+		     dc.stencilfunc_bf > static_cast<uint8_t>(vk::CompareOp::eAlways))) {
+			DepthFatal("unsupported stencil compare state");
 		}
 		r.stencil_static_front = {
-		    ConvertStencilOp(sc.stencil_fail, front_write_mask, sm.stencil_opval),
-		    ConvertStencilOp(sc.stencil_zpass, front_write_mask, sm.stencil_opval),
-		    ConvertStencilOp(sc.stencil_zfail, front_write_mask, sm.stencil_opval),
+		    ConvertStencilOp(sc.stencil_fail, front_write_mask, sm.stencil_opval, sm.stencil_testval),
+		    ConvertStencilOp(sc.stencil_zpass, front_write_mask, sm.stencil_opval, sm.stencil_testval),
+		    ConvertStencilOp(sc.stencil_zfail, front_write_mask, sm.stencil_opval, sm.stencil_testval),
 		    static_cast<vk::CompareOp>(dc.stencilfunc)};
 		r.stencil_dynamic_front = {sm.stencil_mask, front_write_mask, sm.stencil_testval};
 		if (dc.backface_enable) {
 			r.stencil_static_back = {
-			    ConvertStencilOp(sc.stencil_fail_bf, back_write_mask, sm.stencil_opval_bf),
-			    ConvertStencilOp(sc.stencil_zpass_bf, back_write_mask, sm.stencil_opval_bf),
-			    ConvertStencilOp(sc.stencil_zfail_bf, back_write_mask, sm.stencil_opval_bf),
+			    ConvertStencilOp(sc.stencil_fail_bf, back_write_mask, sm.stencil_opval_bf,
+			                     sm.stencil_testval_bf),
+			    ConvertStencilOp(sc.stencil_zpass_bf, back_write_mask, sm.stencil_opval_bf,
+			                     sm.stencil_testval_bf),
+			    ConvertStencilOp(sc.stencil_zfail_bf, back_write_mask, sm.stencil_opval_bf,
+			                     sm.stencil_testval_bf),
 			    static_cast<vk::CompareOp>(dc.stencilfunc_bf)};
 			r.stencil_dynamic_back = {sm.stencil_mask_bf, back_write_mask, sm.stencil_testval_bf};
 		} else {
