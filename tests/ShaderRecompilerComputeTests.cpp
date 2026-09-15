@@ -17352,6 +17352,45 @@ TestCase Vop1SdwaNotCapturedByte0Source() {
   return test;
 }
 
+TestCase Vop1SdwaMovByteDestinations() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 3, 30);
+  AppendVMovU32(&code, 30, 4);
+  AppendBufferLoadDword(&code, 2, 30);
+  code.push_back(EncodeVop1(0x01, 1, Vgpr(3)));
+  code.push_back(0x7e0202f9u);
+  code.push_back(0x00861280u); // Captured v_mov_b32 v1.byte2, 0, preserve.
+  AppendStoreVgpr(&code, 1, 2);
+
+  // RDNA2 table 88: select any byte, then pad, sign extend, or preserve.
+  for (u32 dst_u = 0; dst_u < 3; dst_u++) {
+    for (u32 dst_sel = 0; dst_sel < 4; dst_sel++) {
+      code.push_back(EncodeVop1(0x01, 1, Vgpr(3)));
+      code.push_back(EncodeVop1(0x01, 1, 249));
+      code.push_back(EncodeVop1Sdwa(2, dst_sel, dst_u));
+      AppendStoreVgpr(&code, 1, 3 + dst_u * 4 + dst_sel);
+    }
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaMovByteDestinations";
+  test.code = std::move(code);
+  test.initial = {0xa1b2c3d4u, 0x12345680u};
+  test.expected = {0xa1b2c3d4u, 0x12345680u, 0xa100c3d4u,
+                   0x00000080u, 0x00008000u, 0x00800000u, 0x80000000u,
+                   0xffffff80u, 0xffff8000u, 0xff800000u, 0x80000000u,
+                   0xa1b2c380u, 0xa1b280d4u, 0xa180c3d4u, 0x80b2c3d4u};
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"V_MOV_B32 v1.sdwa(sel=2,sext=0), 0", 1}};
+  test.required_spirv = {"OpBitFieldInsert", "OpBitFieldSExtract", "OpBitwiseOr"};
+  return test;
+}
+
 TestCase Vop2SdwaSubNcExactByte2Destination() {
   using O = ShaderOpcode;
 
@@ -25891,6 +25930,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorFfbhI32NativeAndVop3OnGpu);
   AddCase(Vop1SdwaFfblCapturedHighWordSource);
   AddCase(Vop1SdwaNotCapturedByte0Source);
+  AddCase(Vop1SdwaMovByteDestinations);
   AddCase(Vop2SdwaSubNcExactByte2Destination);
   AddCase(Vop2SdwaAddNcCapturedHighWordDestination);
   AddCase(Vop2SdwaAshrrevCapturedWord0SignExtends);
@@ -30705,6 +30745,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorAlignByteUsesFiveBitByteOffset());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sdwa-mov-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop1SdwaMovByteDestinations());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-ashr-only") == 0) {
