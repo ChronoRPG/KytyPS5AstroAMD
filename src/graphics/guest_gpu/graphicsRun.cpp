@@ -672,20 +672,16 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 		Pm4Execution*     previous_execution;
 	} execution_scope(*this, execution);
 
-	ProcessPm4(execution, 0);
+	ProcessPm4(execution);
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
 
-void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands) {
+void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
-	if (commands.empty()) {
-		return;
-	}
-	auto&      execution  = *g_current_execution;
-	const auto stop_depth = execution.m_buffer_stack.size();
-	execution.m_buffer_stack.push_back({commands});
-	ProcessPm4(execution, stop_depth);
+	EXIT_IF(!g_current_execution->m_next_buffer.empty());
+	g_current_execution->m_next_buffer = commands;
+	g_current_execution->m_chain       = chain;
 }
 
 void CommandProcessor::SuspendPm4() {
@@ -693,21 +689,13 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
-void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
-	while (execution.m_buffer_stack.size() > stop_depth) {
+void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
 		}
-		const auto buffer_index = execution.m_buffer_stack.size() - 1;
-		auto&      cursor       = execution.m_buffer_stack[buffer_index];
+		auto& cursor = execution.m_buffer_stack.back();
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());
-		if (cursor.deferred_advance_dw != 0) {
-			EXIT_IF(cursor.deferred_advance_dw > cursor.commands.size() - cursor.offset_dw);
-			cursor.offset_dw += cursor.deferred_advance_dw;
-			cursor.deferred_advance_dw = 0;
-			execution.m_made_progress  = true;
-			continue;
-		}
 		if (cursor.offset_dw == cursor.commands.size()) {
 			execution.m_buffer_stack.pop_back();
 			continue;
@@ -783,14 +771,19 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
-			if (execution.m_buffer_stack.size() > buffer_index + 1) {
-				execution.m_buffer_stack[buffer_index].deferred_advance_dw = packet_dw;
-			}
 			return;
 		}
-		EXIT_IF(execution.m_buffer_stack.size() != buffer_index + 1);
-		execution.m_buffer_stack[buffer_index].offset_dw += packet_dw;
+		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
+		if (!execution.m_next_buffer.empty()) {
+			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
+			if (execution.m_chain) {
+				cursor = {execution.m_next_buffer};
+			} else {
+				execution.m_buffer_stack.push_back({execution.m_next_buffer});
+			}
+			execution.m_next_buffer = {};
+		}
 	}
 }
 

@@ -30295,6 +30295,89 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4ContextState");
 }
 
+void CheckPm4IndirectControlFlow(RenderContext &renderer) {
+  constexpr const char *name = "Pm4IndirectControlFlow";
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  uint32_t selected = 0;
+  uint32_t returned = 0;
+  const auto address = [](const void *value) {
+    return reinterpret_cast<uint64_t>(value);
+  };
+  const auto write = [&](uint32_t *destination, uint32_t value) {
+    return std::array<uint32_t, 5>{
+        KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0,
+        static_cast<uint32_t>(address(destination)),
+        static_cast<uint32_t>(address(destination) >> 32u), value};
+  };
+  const auto indirect = [&](std::span<const uint32_t> target, bool chain) {
+    uint32_t control = 0x0f200000u | static_cast<uint32_t>(target.size());
+    if (chain) {
+      control |= 1u << 20u;
+    }
+    return std::array<uint32_t, 4>{
+        KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0),
+        static_cast<uint32_t>(address(target.data())),
+        static_cast<uint32_t>(address(target.data()) >> 32u), control};
+  };
+  const auto then_commands = write(&selected, 11);
+  const auto else_commands = write(&selected, 33);
+  const auto branch_suffix = write(&selected, 44);
+  const auto caller_suffix = write(&returned, 22);
+  alignas(8) uint64_t condition = 0;
+  std::array<uint32_t, 19> branch{
+      KYTY_PM4(14, Pm4::IT_INDIRECT_BUFFER, 0), 0,
+      static_cast<uint32_t>(address(&condition)),
+      static_cast<uint32_t>(address(&condition) >> 32u), UINT32_MAX,
+      UINT32_MAX, 1, 0,
+      static_cast<uint32_t>(address(then_commands.data())),
+      static_cast<uint32_t>(address(then_commands.data()) >> 32u),
+      static_cast<uint32_t>(then_commands.size()),
+      static_cast<uint32_t>(address(else_commands.data())),
+      static_cast<uint32_t>(address(else_commands.data()) >> 32u),
+      static_cast<uint32_t>(else_commands.size())};
+  std::copy(branch_suffix.begin(), branch_suffix.end(), branch.begin() + 14);
+  std::array<uint32_t, 9> caller{};
+  const auto call_branch = indirect(branch, false);
+  std::copy(call_branch.begin(), call_branch.end(), caller.begin());
+  std::copy(caller_suffix.begin(), caller_suffix.end(), caller.begin() + 4);
+  for (uint32_t mode : {1u, 2u}) {
+    branch[1] = mode | (3u << 8u);
+    for (uint64_t value : {0ull, 1ull}) {
+      condition = value;
+      selected = returned = 0;
+      uint32_t expected = 44;
+      if (value == 1) {
+        expected = 11;
+      } else if (mode == 2) {
+        expected = 33;
+      }
+      Pm4Execution execution;
+      Require(name, "conditional fetcher replacement",
+              processor.Process(execution, caller) == Pm4ProcessResult::Complete &&
+                  selected == expected && returned == 22,
+              "taken branch resumed its discarded suffix or lost the caller's return");
+    }
+  }
+
+  // This stream exceeds native recursion capacity, while chains need one fetcher cursor.
+  std::vector<std::array<uint32_t, 4>> links(65536);
+  std::span<const uint32_t> target = then_commands;
+  for (auto &link : links) {
+    link = indirect(target, true);
+    target = link;
+  }
+  const auto call_chain = indirect(target, false);
+  std::copy(call_chain.begin(), call_chain.end(), caller.begin());
+  selected = returned = 0;
+  Pm4Execution execution;
+  Require(name, "long chain and call return",
+          processor.Process(execution, caller) == Pm4ProcessResult::Complete &&
+              selected == 11 && returned == 22,
+          "long chain did not complete and return to the original caller");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4WaitResume(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -30324,7 +30407,7 @@ void CheckPm4WaitResume(RenderContext &renderer) {
   nested[0] = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0);
   nested[1] = static_cast<uint32_t>(address(child.data()));
   nested[2] = static_cast<uint32_t>(address(child.data()) >> 32u);
-  nested[3] = 0x0f200000u | static_cast<uint32_t>(child.size());
+  nested[3] = 0x0f300000u | static_cast<uint32_t>(child.size());
 
   std::array<uint32_t, 14> commands{};
   commands[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
@@ -30347,6 +30430,10 @@ void CheckPm4WaitResume(RenderContext &renderer) {
           processor.Process(execution, commands) == Pm4ProcessResult::Blocked &&
               prefix == 11 && child_observation == 0 && suffix == 0,
           "blocked indirect wait did not preserve its command position");
+  Require("Pm4WaitResume", "still blocked",
+          processor.Process(execution, commands) == Pm4ProcessResult::Blocked &&
+              !execution.MadeProgress() && suffix == 0,
+          "blocked wait advanced or replayed its caller");
 
   label = 1;
   child[4] = 1;
@@ -30609,6 +30696,10 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
+    CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
+    CheckPm4WaitResume(vulkan.RuntimeRenderer());
+    CheckPm4RewindResume(vulkan.RuntimeRenderer());
+    CheckPm4CeCompletion(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
@@ -30878,6 +30969,7 @@ int main(int argc, char **argv) {
   CheckAgcWaitPackets(vulkan.RuntimeRenderer());
   CheckAgcDrawIndirectMultiPacket(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
+  CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckPm4CeCompletion(vulkan.RuntimeRenderer());
