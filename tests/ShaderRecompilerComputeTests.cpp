@@ -219,7 +219,7 @@ struct TextureCacheTestAccess {
                          const vk::ImageSubresourceRange &range,
                          const vk::ClearValue &clear) {
     auto lock = Lock(cache);
-    cache.ClearImage(command, id, range, clear);
+    cache.ClearImage(command, id, cache.GetImage(id).backing.format, range, clear);
   }
 
   static void ConfigureGarbageCollection(TextureCache &cache,
@@ -8568,10 +8568,12 @@ public:
     struct FillCase {
       uint32_t fill;
       std::array<uint32_t, 2> texel;
+      bool reuse_unorm = false;
     };
     constexpr std::array cases{
         FillCase{0x40404040u, {0, 0x3c000000u}},
         FillCase{0x80808080u, {0x3c003c00u, 0x00003c00u}},
+        FillCase{0x40404040u, {0, 0x3c000000u}, true},
     };
     EnsureRuntimeContext();
     // Astro's generic metadata fill, through S_ENDPGM; trailing debug data is omitted.
@@ -8658,6 +8660,21 @@ public:
         auto &texture_cache = resources.GetTextureCache();
         auto &executor = context.GetRenderExecutor();
         resources.MapMemory(base, allocation_size);
+        ImageId unorm_id{};
+        if (fill_case.reuse_unorm) {
+          const auto float_info = registers.GetRenderTarget(0).info;
+          auto unorm_info = float_info;
+          unorm_info.dcc_compression_enable = false;
+          unorm_info.channel_type = Prospero::ChannelType::kUNorm;
+          registers.SetColorInfo(0, unorm_info);
+          RenderColorInfo unorm{};
+          RenderExecutorTestAccess::ResolveRenderColorTarget(
+              executor, scheduler.Current(), unorm, 0);
+          unorm_id = unorm.image_id;
+          (void)texture_cache.FindRenderTarget(unorm_id, unorm.desc);
+          RenderExecutorTestAccess::ResetBindings(executor);
+          registers.SetColorInfo(0, float_info);
+        }
         const auto fill_metadata = [&](uint32_t count, bool raw = false) {
           const auto *shader = &native_fill;
           if (raw) {
@@ -8687,6 +8704,13 @@ public:
         RenderDepthInfo no_depth{};
         const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
             executor, scheduler.Current(), &color, 1, no_depth);
+        if (fill_case.reuse_unorm) {
+          Require(name, "FLOAT clear reuses UNORM image",
+                  color.image_id == unorm_id &&
+                      texture_cache.GetImage(unorm_id).backing.format ==
+                          vk::Format::eR16G16B16A16Unorm,
+                  "the aliased clear did not reuse its existing UNORM allocation");
+        }
         Require(name, "fixed clear on a float target",
                 color.image_id &&
                     color.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
@@ -8695,10 +8719,12 @@ public:
                     !texture_cache.IsMeta(dcc_address),
                 "a DCC fixed clear code was not materialised on an RGBA16F "
                 "target");
+        const auto cleared = ReadCachedTexel(name, context, color.image_id);
         Require(name, "GPU float clear value",
-                ReadCachedTexel(name, context, color.image_id) ==
+                cleared ==
                     std::vector<u32>(fill_case.texel.begin(), fill_case.texel.end()),
-                "RGBA16F native image did not receive the fixed clear value");
+                "expected " + Hex(fill_case.texel[0]) + ", " + Hex(fill_case.texel[1]) +
+                    "; got " + Hex(cleared[0]) + ", " + Hex(cleared[1]));
         context.GetBufferCache().ReadMemory(dcc_address, metadata_size.size, false);
         std::vector<uint8_t> expanded_metadata(metadata_size.size);
         Require(name, "expanded native metadata",
@@ -8720,7 +8746,10 @@ public:
               texture_cache, scheduler.Current(), color.image_id,
               {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
         };
-        const std::vector<u32> painted{0x00003c00u, 0x3c003c00u};
+        std::vector<u32> painted{0x00003c00u, 0x3c003c00u};
+        if (fill_case.reuse_unorm) {
+          painted = {0x0000ffffu, 0xffffffffu};
+        }
         const auto retains_painted_texel = [&] {
           const auto texels = ReadCachedTexel(name, context, color.image_id, {}, {512, 256, 1});
           for (size_t i = 0; i < texels.size(); i += 2) {
