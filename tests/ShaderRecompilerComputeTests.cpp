@@ -1219,6 +1219,8 @@ struct GraphicsCase {
   bool pixel_position_w = false;
   float vertex_clip_w = 1.0f;
   bool pixel_depth_export = false;
+  u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
+  u32 pixel_custom_interpolation_mask = 0;
 };
 
 struct CompiledShader {
@@ -1565,6 +1567,8 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_pos_w = test.pixel_position_w;
   pixel_info.ps_depth_export_enable = test.pixel_depth_export;
   pixel_info.ps_system_input_base = 2;
+  pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
+  pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -25553,6 +25557,37 @@ GraphicsCase GraphicsPositionWExport() {
   return test;
 }
 
+GraphicsCase GraphicsPackedHalfCentroid() {
+  GraphicsCase test;
+  test.name = "GraphicsPackedHalfCentroid";
+  test.pixel_perspective_centroid_vgpr = 0;
+  test.pixel_custom_interpolation_mask = 1;
+  test.pixel_interpolator_settings = {0x420u};
+  // Captured ab810715011baef3 interpolation, with attr3.x remapped to attr0.x.
+  test.fragment_code = {
+      0xc8120002u, 0xc80e0000u,             // raw vertex0/vertex1 packed halves
+      0xcc204007u, 0x9c1206f2u,             // low(vertex1) - low(vertex0)
+      0xcc207005u, 0x9c1206f2u,             // high(vertex1) - high(vertex0)
+      0xc80a0001u,                         // raw vertex2
+      0xcc204006u, 0x9c1204f2u,
+      0xcc207003u, 0x9c1204f2u,
+      0xcc20400eu, 0x04120f00u,             // low = I * delta10 + vertex0
+      0xcc20600fu, 0x04120b00u,             // high = I * delta10 + vertex0
+      0x3e1c0306u, 0x3e1e0303u,             // += J * delta20
+      EncodeExp0(0x00, 0xf), EncodeExp1(14, 15, 14, 15)};
+  AppendEnd(&test.fragment_code);
+  // At the pixel center the vertex weights are (5/8, 1/8, 1/4).
+  // Packed values are (0,1), (1,2), (3,3): expected result (0.875, 1.625).
+  test.vertices = {
+      0xbf800000u, 0xbf800000u, 0x3c000000u, 0, 0, 0,
+      0x40e00000u, 0xbf800000u, 0x40003c00u, 0, 0, 0,
+      0xbf800000u, 0x40400000u, 0x42004200u, 0, 0, 0};
+  test.expected_pixel = {0x3f600000u, 0x3fd00000u, 0x3f600000u, 0x3fd00000u};
+  test.opcodes = {ShaderOpcode::V_INTERP_MOV_F32, ShaderOpcode::V_FMA_F32, ShaderOpcode::V_MAC_F32,
+                  ShaderOpcode::EXP, ShaderOpcode::S_ENDPGM};
+  return test;
+}
+
 GraphicsCase GraphicsAncillaryLayer(bool front_face) {
   GraphicsCase test;
   test.name = front_face ? "GraphicsAncillaryAfterFrontFace" : "GraphicsAncillaryLayer";
@@ -26196,6 +26231,7 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
   return {
       GraphicsInterpolationExport(),
       GraphicsPositionWExport(),
+      GraphicsPackedHalfCentroid(),
       GraphicsAncillaryLayer(false),
       GraphicsAncillaryLayer(true),
       GraphicsAncillarySampleId(),
@@ -30663,6 +30699,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--position-w-only") == 0) {
     VulkanHarness vulkan;
     RunGraphicsCase(&vulkan, GraphicsPositionWExport());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--centroid-only") == 0) {
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, GraphicsPackedHalfCentroid());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {

@@ -143,6 +143,7 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 							}
 							break;
 						case StageInputKind::BaryCoordSmooth:
+						case StageInputKind::BaryCoordSmoothCentroid:
 						case StageInputKind::BaryCoordNoPerspective:
 							if (component >= 2u) {
 								return Fail("typed barycentric component is out of range");
@@ -287,7 +288,8 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 				case StageInputKind::Layer: AddInput(info, kind, 0, 1, "gl_Layer"); break;
 				case StageInputKind::SampleId: AddInput(info, kind, 0, 1, "gl_SampleID"); break;
 				case StageInputKind::BaryCoordSmooth:
-					AddInput(info, kind, 0, 3, "gl_BaryCoordKHR");
+				case StageInputKind::BaryCoordSmoothCentroid:
+					AddInput(info, StageInputKind::BaryCoordSmooth, 0, 3, "gl_BaryCoordKHR");
 					break;
 				case StageInputKind::BaryCoordNoPerspective:
 					AddInput(info, kind, 0, 3, "gl_BaryCoordNoPerspKHR");
