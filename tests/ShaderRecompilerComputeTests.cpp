@@ -29450,6 +29450,106 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4SyntheticOcclusionCounterDump");
 }
 
+void CheckPm4Predication(RenderContext &renderer) {
+  constexpr const char *name = "Pm4Predication";
+  constexpr uint64_t ready = 1ull << 63u;
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  processor.BufferInit();
+  alignas(16) std::array<uint64_t, 32> query{};
+  alignas(16) uint64_t boolean = 0;
+  uint32_t predicated = 0;
+  uint32_t unconditional = 0;
+  const auto commands = [&](uint32_t op, uint32_t condition, uint32_t wait,
+                            const void *source) {
+    const auto address = reinterpret_cast<uint64_t>(source);
+    const auto predicated_address = reinterpret_cast<uint64_t>(&predicated);
+    const auto unconditional_address = reinterpret_cast<uint64_t>(&unconditional);
+    return std::array<uint32_t, 14>{
+        // Captured AGC form: c0022000 00010100 <query low> <query high>.
+        0xc0022000u, (op << 16u) | (wait << 12u) | (condition << 8u),
+        static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
+        KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0) | 1u, 0,
+        static_cast<uint32_t>(predicated_address),
+        static_cast<uint32_t>(predicated_address >> 32u), 11,
+        KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0,
+        static_cast<uint32_t>(unconditional_address),
+        static_cast<uint32_t>(unconditional_address >> 32u), 22};
+  };
+  const auto check = [&](const char *stage, uint32_t op, uint32_t condition,
+                         uint32_t wait, const void *source, bool skip) {
+    predicated = unconditional = 0;
+    const auto packet = commands(op, condition, wait, source);
+    Pm4Execution execution;
+    Require(name, stage,
+            processor.Process(execution, packet) == Pm4ProcessResult::Complete &&
+                processor.ShouldSkipPredicatedPackets() == skip &&
+                predicated == (skip ? 0u : 11u) && unconditional == 22,
+            "predicate polarity, tagged packet execution, or packet consumption is wrong");
+  };
+  struct Case {
+    uint64_t delta;
+    uint32_t condition;
+    bool skip;
+  };
+  constexpr Case cases[]{{1, 1, false}, {1, 0, true},
+                         {0, 1, true}, {0, 0, false}};
+  for (const auto &test : cases) {
+    query.fill(ready | 0x344u);
+    for (size_t db = 0; db < 16; db++) {
+      query[db * 2 + 1] += test.delta;
+    }
+    boolean = test.delta;
+    for (uint32_t wait : {0u, 1u}) {
+      check("ready Z-pass", 1, test.condition, wait, query.data(), test.skip);
+      check("bool preservation", 3, test.condition, wait, &boolean, test.skip);
+    }
+  }
+  query.fill(ready | 0x344u);
+  query[31]++;
+  check("only last DB visible", 1, 1, 0, query.data(), false);
+  check("inverse last DB visibility", 1, 0, 0, query.data(), true);
+  check("clear", 0, 0, 0, nullptr, false);
+
+  // Every begin AND end counter must be ready; no-wait must discard old skip state.
+  for (size_t missing = 0; missing < query.size(); missing++) {
+    query.fill(ready | 0x344u);
+    query[missing] &= ~ready;
+    for (uint32_t condition : {0u, 1u}) {
+      boolean = 0;
+      processor.SetPredication(1, 3, 0, &boolean, 0);
+      check("unavailable no-wait", 1, condition, 1, query.data(), false);
+    }
+  }
+
+  // Retry the same packet when its last DB's begin or end arrives later.
+  for (size_t missing : {30u, 31u}) {
+    query.fill(ready | 0x344u);
+    query[31]++;
+    query[missing] &= ~ready;
+    boolean = 0;
+    processor.SetPredication(1, 3, 0, &boolean, 0);
+    predicated = unconditional = 0;
+    const auto packet = commands(1, 1, 0, query.data());
+    Pm4Execution execution;
+    for (int retry = 0; retry < 2; retry++) {
+      Require(name, "pending wait suspends",
+              processor.Process(execution, packet) == Pm4ProcessResult::Blocked &&
+                  !execution.MadeProgress() && predicated == 0 && unconditional == 0 &&
+                  processor.ShouldSkipPredicatedPackets(),
+              "pending query advanced its packet or changed the prior predicate");
+    }
+    query[missing] |= ready;
+    Require(name, "ready wait resumes",
+            processor.Process(execution, packet) == Pm4ProcessResult::Complete &&
+                execution.MadeProgress() && predicated == 11 && unconditional == 22 &&
+                !processor.ShouldSkipPredicatedPackets(),
+            "ready query did not reevaluate and execute the suspended packet's suffix");
+  }
+  processor.BufferWait();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4StencilInfoValueLane(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
   constexpr std::array<uint32_t, 2> payload{0x00100801u, 0x28000000u};
@@ -30729,6 +30829,11 @@ int main(int argc, char **argv) {
     CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--predication-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4Predication(vulkan.RuntimeRenderer());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--descriptor-heap-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDescriptorHeapLargeSet();
@@ -31041,6 +31146,7 @@ int main(int argc, char **argv) {
   CheckVulkan13FeatureRequirements();
   CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
   CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
+  CheckPm4Predication(vulkan.RuntimeRenderer());
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
   CheckPm4NativeTargetGeometryRegisters(vulkan.RuntimeRenderer());
   CheckPm4PrivateAgcShaderRegisters(vulkan.RuntimeRenderer());

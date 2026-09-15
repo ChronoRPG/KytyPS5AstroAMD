@@ -818,35 +818,54 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
                                       const volatile void* address, uint32_t count_in_dwords) {
-	if (wait_op != 0) {
-		BufferFlushAndWait();
-	}
-
 	(void)count_in_dwords;
+	uint64_t value = 0;
 
 	switch (op) {
-		case 0x00: {
+		case 0x00:
 			m_predicate_skip = false;
-		} break;
-		case 0x03: {
+			return;
+		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
-
-			auto value = *reinterpret_cast<const volatile uint64_t*>(address);
-
-			switch (condition) {
-				case 0x00: m_predicate_skip = (value != 0); break;
-				case 0x01: m_predicate_skip = (value == 0); break;
-				default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
-			}
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1) < 128) {
-				LOGF("\t bool predication: addr=0x%016" PRIx64 ", value=0x%016" PRIx64
-				     ", condition=%" PRIu32 ", skip=%u, wait_op=%" PRIu32 "\n",
-				     reinterpret_cast<uint64_t>(address), value, condition,
-				     m_predicate_skip ? 1u : 0u, wait_op);
+			// One begin/end pair per DB; bit 63 marks each counter ready.
+			constexpr uint64_t ready_bit = 1ull << 63u;
+			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
+			for (uint32_t db = 0; db < 16u; db++) {
+				const auto begin = results[db * 2u];
+				const auto end   = results[db * 2u + 1u];
+				if ((begin & end & ready_bit) == 0) {
+					if (wait_op == 0) {
+						SuspendPm4();
+					} else {
+						m_predicate_skip = false;
+					}
+					return;
+				}
+				value += end - begin;
 			}
 		} break;
+		case 0x03:
+			if (wait_op != 0) {
+				BufferFlushAndWait();
+			}
+			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			value = *reinterpret_cast<const volatile uint64_t*>(address);
+			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
+	}
+	switch (condition) {
+		case 0x00: m_predicate_skip = (value != 0); break;
+		case 0x01: m_predicate_skip = (value == 0); break;
+		default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
+	}
+	if (op == 0x03) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 128) {
+			LOGF("\t bool predication: addr=0x%016" PRIx64 ", value=0x%016" PRIx64
+			     ", condition=%" PRIu32 ", skip=%u, wait_op=%" PRIu32 "\n",
+			     reinterpret_cast<uint64_t>(address), value, condition,
+			     m_predicate_skip ? 1u : 0u, wait_op);
+		}
 	}
 }
 
