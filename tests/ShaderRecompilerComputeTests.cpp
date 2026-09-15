@@ -1276,6 +1276,43 @@ size_t CountText(const std::string &text, const std::string &needle) {
   return count;
 }
 
+void CheckPixelParameterAliases() {
+  constexpr const char *name = "PixelParameterAliases";
+  ShaderPixelInputInfo pixel{};
+  pixel.input_num = 2;
+  const std::array<uint32_t, 2> pair = {0, 1};
+  for (const auto flat : {0u, 0x400u}) {
+    pixel.interpolator_settings[0] = flat | 3u;
+    pixel.interpolator_settings[1] = flat | 3u;
+    Require(name, "same-mode nonidentity alias",
+            ShaderPixelParameterLocation(pixel, pair, 0) == 3u &&
+                ShaderPixelParameterLocation(pixel, pair, 1) == 3u,
+            "aliases of one export with the same interpolation mode must "
+            "share that physical location");
+  }
+  pixel.interpolator_settings[0] = 3u;
+  pixel.interpolator_settings[1] = 0x423u;
+  pixel.custom_interpolation_mask = 2u;
+  Require(name, "smooth/custom alias",
+          ShaderPixelParameterLocation(pixel, pair, 0) == 3u &&
+              ShaderPixelParameterLocation(pixel, pair, 1) == 3u,
+          "custom interpolation must retain its shared vertex export");
+
+  pixel.input_num = 3;
+  pixel.custom_interpolation_mask = 0;
+  pixel.interpolator_settings[0] = 0x400u;
+  pixel.interpolator_settings[1] = 0u;
+  pixel.interpolator_settings[2] = 1u;
+  const std::array<uint32_t, 3> active = {0, 1, 2};
+  Require(name, "reserved physical locations",
+          ShaderPixelParameterLocation(pixel, active, 0) == 0u &&
+              ShaderPixelParameterLocation(pixel, active, 1) == 2u &&
+              ShaderPixelParameterLocation(pixel, active, 2) == 1u,
+          "a synthesized opposite-mode alias must not occupy another "
+          "vertex export's physical location");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckRectListShaders() {
   constexpr const char *name = "RectListShaders";
 
@@ -1356,6 +1393,25 @@ void CheckRectListShaders() {
               CountText(evaluation_text, " Location 1") == 2,
           "duplicate pixel mappings must share one vertex input and keep "
           "distinct patch outputs");
+
+  for (const auto flat : {0u, 0x400u}) {
+    pixel.interpolator_settings[0] = flat;
+    pixel.interpolator_settings[1] = flat;
+    const auto shared = BuildRectListShaders(vertex, &pixel);
+    ValidateSpirv(name, shared.control);
+    ValidateSpirv(name, shared.evaluation);
+    Require(name, "same-mode alias disassembly",
+            tools.Disassemble(shared.control, &control_text) &&
+                tools.Disassemble(shared.evaluation, &evaluation_text),
+            "failed to disassemble shared rectangle-list parameters");
+    Require(name, "same-mode interface deduplication",
+            CountText(control_text, " Location 0") == 2 &&
+                CountText(evaluation_text, " Location 0") == 2 &&
+                control_text.find(" Location 1") == std::string::npos &&
+                evaluation_text.find(" Location 1") == std::string::npos,
+            "same-mode aliases must produce one input and one output at "
+            "the shared location in each rectangle-list stage");
+  }
 
   const auto position_only = BuildRectListShaders(vertex, nullptr);
   ValidateSpirv(name, position_only.control);
@@ -25588,6 +25644,60 @@ GraphicsCase GraphicsPackedHalfCentroid() {
   return test;
 }
 
+GraphicsCase GraphicsPackedHalfInputAlias(bool second_weights) {
+  auto test = GraphicsPackedHalfCentroid();
+  test.name = second_weights ? "GraphicsPackedHalfAliasSecondWeights"
+                            : "GraphicsPackedHalfInputAlias";
+  test.pixel_custom_interpolation_mask = 2u;
+  test.pixel_interpolator_settings = {0u, 0x420u};
+  // The head shader reads one exported vec4 through two logical inputs:
+  // ordinary interpolation and raw per-vertex packed-half interpolation.
+  // Move the captured raw attr0.x loads to logical attr1.x, still mapped to 0.
+  for (const auto word : {0u, 1u, 6u}) {
+    test.fragment_code[word] |= 1u << 10u;
+  }
+  test.fragment_code.resize(test.fragment_code.size() - 3u);
+  test.fragment_code.push_back(EncodeVintrp(0x00, 16, 0, 1, 0));
+  test.fragment_code.push_back(EncodeVintrp(0x01, 16, 0, 1, 1));
+  AppendVMovLiteral(&test.fragment_code, 17, 0x3f800000u);
+  test.fragment_code.push_back(EncodeExp0(0x00, 0xf));
+  test.fragment_code.push_back(EncodeExp1(14, 15, 16, 17));
+  AppendEnd(&test.fragment_code);
+  // The smooth component (2,4,8) must vary independently of packed UVs.
+  test.vertices[3] = 0x40000000u;
+  test.vertices[9] = 0x40800000u;
+  test.vertices[15] = 0x41000000u;
+  if (second_weights) {
+    // Change the right vertex from x=7 to x=3: weights become (1/2,1/4,1/4).
+    test.vertices[6] = 0x40400000u;
+    test.expected_pixel = {0x3f800000u, 0x3fe00000u, 0x40800000u, 0x3f800000u};
+  } else {
+    test.expected_pixel = {0x3f600000u, 0x3fd00000u, 0x40700000u, 0x3f800000u};
+  }
+  test.opcodes.insert(test.opcodes.end(),
+                      {ShaderOpcode::V_INTERP_P1_F32, ShaderOpcode::V_INTERP_P2_F32,
+                       ShaderOpcode::V_MOV_B32});
+  return test;
+}
+
+GraphicsCase GraphicsSmoothRawInputAlias() {
+  auto test = GraphicsPackedHalfInputAlias(false);
+  test.name = "GraphicsSmoothRawInputAlias";
+  test.pixel_perspective_centroid_vgpr = UINT32_MAX;
+  // No explicit barycentric builtin: alias promotion must discover that the
+  // ordinary input needs weights while the raw alias returns vertex zero.
+  test.fragment_code = {EncodeVintrp(0x00, 0, 0, 1, 0),
+                        EncodeVintrp(0x01, 0, 0, 1, 1),
+                        EncodeVintrp(0x02, 1, 1, 1, 2),
+                        EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 0, 1)};
+  AppendEnd(&test.fragment_code);
+  test.expected_pixel = {0x40700000u, 0x40000000u, 0x40700000u, 0x40000000u};
+  test.opcodes = {ShaderOpcode::V_INTERP_P1_F32, ShaderOpcode::V_INTERP_P2_F32,
+                  ShaderOpcode::V_INTERP_MOV_F32, ShaderOpcode::EXP,
+                  ShaderOpcode::S_ENDPGM};
+  return test;
+}
+
 GraphicsCase GraphicsAncillaryLayer(bool front_face) {
   GraphicsCase test;
   test.name = front_face ? "GraphicsAncillaryAfterFrontFace" : "GraphicsAncillaryLayer";
@@ -26232,6 +26342,9 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsInterpolationExport(),
       GraphicsPositionWExport(),
       GraphicsPackedHalfCentroid(),
+      GraphicsPackedHalfInputAlias(false),
+      GraphicsPackedHalfInputAlias(true),
+      GraphicsSmoothRawInputAlias(),
       GraphicsAncillaryLayer(false),
       GraphicsAncillaryLayer(true),
       GraphicsAncillarySampleId(),
@@ -30806,6 +30919,16 @@ int main(int argc, char **argv) {
     RunGraphicsCase(&vulkan, GraphicsPackedHalfCentroid());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--pixel-alias-only") == 0) {
+    CheckPixelParameterAliases();
+    CheckRectListShaders();
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, GraphicsPackedHalfCentroid());
+    RunGraphicsCase(&vulkan, GraphicsPackedHalfInputAlias(false));
+    RunGraphicsCase(&vulkan, GraphicsPackedHalfInputAlias(true));
+    RunGraphicsCase(&vulkan, GraphicsSmoothRawInputAlias());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {
     CheckClipControlDepthClipState();
     return 0;
@@ -31168,6 +31291,7 @@ int main(int argc, char **argv) {
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
+  CheckPixelParameterAliases();
   CheckRectListShaders();
   CheckIndirectImageKeySwitch();
   CheckPs5GameExampleImageClearRuntimeShape();

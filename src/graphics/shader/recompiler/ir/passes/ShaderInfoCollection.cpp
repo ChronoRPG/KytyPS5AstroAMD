@@ -226,6 +226,18 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 			}
 		}
 	}
+	// Aliases of a vertex output share one SPIR-V interface variable. If any
+	// alias reads raw vertices, interpolate the other aliases from those too.
+	for (uint32_t input = 0; input < pixel->input_num; input++) {
+		for (uint32_t alias = 0; alias < pixel->input_num; alias++) {
+			if (ShaderPixelParameterMappedLocation(*pixel, input) ==
+			        ShaderPixelParameterMappedLocation(*pixel, alias) &&
+			    ShaderPixelParameterIsFlat(*pixel, input) ==
+			        ShaderPixelParameterIsFlat(*pixel, alias)) {
+				per_vertex[input] = per_vertex[input] || per_vertex[alias];
+			}
+		}
+	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
 		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input),
 		         per_vertex[input]);
