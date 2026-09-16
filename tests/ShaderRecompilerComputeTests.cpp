@@ -10044,6 +10044,113 @@ public:
                   sampled_overwide_binding.mip_views.empty() &&
                   sampled_overwide_binding.image_view != nullptr,
               "sampled view lost addressable mips in the allocated tail");
+      // Streaming T# clamps apply after S# max LOD, without changing the view
+      // base.
+      {
+        constexpr uint64_t lod_address = base + 0x170000;
+        auto lod_descriptor = mipped_storage_descriptor;
+        lod_descriptor.dwords[0] = static_cast<uint32_t>(lod_address >> 8u);
+        lod_descriptor.dwords[1] =
+            static_cast<uint32_t>(lod_address >> 40u) |
+            (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+            (3u << 30u);
+        lod_descriptor.dwords[3] &= ~(0xfu << 12u);
+        ShaderSamplerResource lod_sampler{
+            {0, 0,
+             static_cast<uint32_t>(Prospero::SamplerMipFilter::kLinear) << 26u,
+             0}};
+        TestCase lod_test;
+        lod_test.name = "TextureMinLodAfterSamplerClamp";
+        lod_test.has_user_data = true;
+        lod_test.image_descriptor_swizzle = mipped_storage.DstSelXYZW();
+        std::copy_n(lod_descriptor.dwords.begin(), 8,
+                    lod_test.user_data.begin());
+        std::copy_n(lod_sampler.fields, 4, lod_test.user_data.begin() + 8);
+        lod_test.user_data[50] = sizeof(uint32_t);
+        lod_test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                            ShaderOpcode::BUFFER_STORE_DWORD,
+                            ShaderOpcode::S_ENDPGM};
+        lod_test.required_spirv = {"OpImageSampleExplicitLod"};
+        AppendVMovLiteral(&lod_test.code, 20, std::bit_cast<uint32_t>(0.5f));
+        AppendVMovLiteral(&lod_test.code, 21, std::bit_cast<uint32_t>(0.5f));
+        lod_test.code.push_back(EncodeMimg0(0x27, 1));
+        lod_test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+        AppendStoreVgpr(&lod_test.code, 0, 0);
+        AppendEnd(&lod_test.code);
+        const auto lod_program = CompileCase(lod_test, SubgroupSize());
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+        ExpectFatal("TextureMinLodBeyondView", [&] {
+          auto invalid_lod = lod_descriptor;
+          invalid_lod.dwords[1] |= 1024u << 8u;
+          (void)RenderExecutorTestAccess::ResolveTexture(
+              executor, lod_program.program.info.images[0], invalid_lod);
+        });
+#endif
+        const auto lod_binding = RenderExecutorTestAccess::ResolveTexture(
+            executor, lod_program.program.info.images[0], lod_descriptor);
+        for (uint32_t mip = 0; mip < 4; ++mip) {
+          vk::ClearValue clear{};
+          clear.color.float32[0] = static_cast<float>(1u << mip);
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), lod_binding.image_id,
+              {vk::ImageAspectFlagBits::eColor, mip, 1, 0, 1}, clear);
+        }
+        const auto sampler = context.GetSamplerCache().GetSampler(lod_sampler);
+        auto output = CreateStorageBuffer(lod_test.name, {}, 1);
+        struct LodCase {
+          uint32_t base_level;
+          uint32_t min_lod;
+          float expected;
+          float integer_min_lod_expected;
+        };
+        constexpr std::array lod_cases{
+            LodCase{0, 0, 1.0f, 1.0f},   LodCase{0, 256, 2.0f, 2.0f},
+            LodCase{0, 384, 3.0f, 2.0f}, LodCase{1, 384, 3.0f, 2.0f},
+            LodCase{1, 512, 4.0f, 4.0f}, LodCase{1, 0, 2.0f, 2.0f},
+            LodCase{0, 256, 2.0f, 2.0f}};
+        std::array<vk::ImageView, lod_cases.size()> views{};
+        for (size_t index = 0; index < lod_cases.size(); ++index) {
+          const auto &test = lod_cases[index];
+          lod_descriptor.dwords[1] =
+              (lod_descriptor.dwords[1] & ~0xfff00u) | (test.min_lod << 8u);
+          lod_descriptor.dwords[3] =
+              (lod_descriptor.dwords[3] & ~(0xfu << 12u)) |
+              (test.base_level << 12u);
+          std::copy_n(lod_descriptor.dwords.begin(), 8,
+                      lod_test.user_data.begin());
+          const auto binding = RenderExecutorTestAccess::ResolveTexture(
+              executor, lod_program.program.info.images[0], lod_descriptor);
+          views[index] =
+              texture_cache.FindTexture(binding.image_id, binding.desc);
+          auto &image = texture_cache.GetImage(binding.image_id);
+          image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::AccessFlagBits2::eShaderRead, {},
+                        scheduler.Current().Handle());
+          Image sampled;
+          sampled.view = views[index];
+          sampled.layout = image.backing.state.layout;
+          scheduler.Finish();
+          Dispatch(lod_test, lod_program, output, nullptr, &sampled, nullptr,
+                   nullptr, sampler);
+          const auto result = ReadBuffer(lod_test.name, output, 1)[0];
+          // Vulkan permits flooring imageViewMinLod instead of retaining its
+          // fraction.
+          Require(lod_test.name, "sampled mip",
+                  result == std::bit_cast<uint32_t>(test.expected) ||
+                      result == std::bit_cast<uint32_t>(
+                                    test.integer_min_lod_expected),
+                  "texture clamp was lost, applied before sampler max LOD, or "
+                  "rebased incorrectly");
+        }
+        Require(lod_test.name, "view identity",
+                views[0] != views[1] && views[1] != views[2] &&
+                    views[2] != views[3] && views[1] == views.back(),
+                "different texture clamps aliased or identical clamped views "
+                "were not reused");
+        DestroyBuffer(&output);
+        RenderExecutorTestAccess::ResetBindings(executor);
+      }
+
       auto srgb_storage = storage;
       constexpr auto srgb_format =
           static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8Srgb);
@@ -14815,9 +14922,11 @@ private:
     available_feedback_dynamic.pNext = &available_feedback_layout;
     vk::PhysicalDeviceProvokingVertexFeaturesEXT available_provoking_vertex{};
     available_provoking_vertex.pNext = &available_feedback_dynamic;
+    vk::PhysicalDeviceImageViewMinLodFeaturesEXT available_min_lod{};
+    available_min_lod.pNext = &available_provoking_vertex;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-    available_features2.pNext = &available_provoking_vertex;
+    available_features2.pNext = &available_min_lod;
     m_physical_device.getFeatures2(&available_features2);
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
@@ -14843,6 +14952,8 @@ private:
     Require("VulkanHarness", "dispatch",
             available_features12.bufferDeviceAddress == true,
             "bufferDeviceAddress is not supported");
+    Require("VulkanHarness", "dispatch", available_min_lod.minLod == true,
+            "image view minimum LOD is not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
     Require("VulkanHarness", "graphics", available_features.fillModeNonSolid &&
@@ -14901,7 +15012,10 @@ private:
     vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex{};
     provoking_vertex.pNext = &feedback_dynamic;
     provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
-    device_info.pNext = &provoking_vertex;
+    vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
+    min_lod.pNext = &provoking_vertex;
+    min_lod.minLod = true;
+    device_info.pNext = &min_lod;
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
@@ -14918,7 +15032,8 @@ private:
         VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME,
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME,
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
-        VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME};
+        VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
+        VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
     device_info.enabledExtensionCount = std::size(device_extensions);
     device_info.ppEnabledExtensionNames = device_extensions;
     RequireVk("VulkanHarness", "dispatch",

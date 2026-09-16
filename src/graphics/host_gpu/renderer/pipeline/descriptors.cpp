@@ -452,6 +452,14 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
 	view.base_level  = descriptor.BaseLevel();
 	view.level_count = view_levels;
+	if (descriptor.MinLod() > descriptor.LastLevel() * 256u) {
+		EXIT("texture minimum LOD exceeds last mip level: min_lod=%u last_level=%u\n",
+		     descriptor.MinLod(), descriptor.LastLevel());
+	}
+	const auto base_lod = view.base_level * 256u;
+	if (descriptor.MinLod() > base_lod) {
+		view.min_lod = descriptor.MinLod() - base_lod;
+	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
 	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
