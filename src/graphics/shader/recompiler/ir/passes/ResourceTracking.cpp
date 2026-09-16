@@ -88,6 +88,7 @@ public:
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma = false;
+		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
 	void Run() {
@@ -168,15 +169,71 @@ private:
 		std::abort();
 	}
 
+	Value LowerDescriptorPhi(Value value) {
+		value           = value.Resolve();
+		const auto* phi = value.TryInstruction();
+		if (m_shader_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
+		    phi->NumArgs() != 2u || phi->NumPhiBlocks() != 2u || phi->GetType() != Type::U32 ||
+		    m_program.blocks.size() != m_program.block_info.size()) {
+			return value;
+		}
+		for (const auto& [original, selected]: m_descriptor_selections) {
+			if (original == phi) {
+				return selected;
+			}
+		}
+		const auto* merge = phi->Parent();
+		for (uint32_t first = 0; first < 2; first++) {
+			const auto* branch    = phi->PhiBlock(first);
+			const auto* alternate = phi->PhiBlock(first ^ 1u);
+			if (branch == nullptr || alternate == nullptr || merge == nullptr || branch == merge ||
+			    alternate == merge || branch == alternate || branch->ImmSuccessors().size() != 2u ||
+			    alternate->ImmPredecessors().size() != 1u ||
+			    alternate->ImmPredecessors()[0] != branch ||
+			    alternate->ImmSuccessors().size() != 1u || alternate->ImmSuccessors()[0] != merge) {
+				continue;
+			}
+			const auto branch_it    = std::ranges::find(m_program.blocks, branch);
+			const auto alternate_it = std::ranges::find(m_program.blocks, alternate);
+			const auto merge_it     = std::ranges::find(m_program.blocks, merge);
+			if (branch_it == m_program.blocks.end() || alternate_it == m_program.blocks.end() ||
+			    merge_it == m_program.blocks.end()) {
+				continue;
+			}
+			const auto& info = m_program.block_info[branch_it - m_program.blocks.begin()];
+			const auto  alternate_id =
+			    m_program.block_info[alternate_it - m_program.blocks.begin()].id;
+			const auto  merge_id = m_program.block_info[merge_it - m_program.blocks.begin()].id;
+			const auto& term     = info.terminator;
+			if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
+			    !((term.true_block == merge_id && term.false_block == alternate_id) ||
+			      (term.false_block == merge_id && term.true_block == alternate_id)) ||
+			    !ValidateRuntimeValue(m_program, info.condition, RuntimeValueType::Integer) ||
+			    !ValidateRuntimeValue(m_program, phi->Arg(0)) ||
+			    !ValidateRuntimeValue(m_program, phi->Arg(1))) {
+				continue;
+			}
+			// Retain a host expression; replacing the GPU Phi would break SSA dominance.
+			const auto true_arg = term.true_block == merge_id ? first : first ^ 1u;
+			auto&      selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
+			selected.SetArg(0, info.condition);
+			selected.SetArg(1, phi->Arg(true_arg));
+			selected.SetArg(2, phi->Arg(true_arg ^ 1u));
+			m_descriptor_selections.emplace_back(phi, Value(&selected));
+			return Value(&selected);
+		}
+		return value;
+	}
+
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
-	                DescriptorSource& descriptor, uint32_t pc) const {
+	                DescriptorSource& descriptor, uint32_t pc) {
 		if (handle.NumArgs() != width) {
 			Fail(pc, fmt::format("{} has {} descriptor dwords, expected {}",
 			                     ValueOpcodeName(handle.GetOpcode()), handle.NumArgs(), width));
 		}
 		descriptor.dword_count = width;
 		for (uint32_t i = 0; i < width; i++) {
-			descriptor.dwords[i] = handle.Arg(i).Resolve();
+			descriptor.dwords[i] = LowerDescriptorPhi(handle.Arg(i));
 		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
@@ -744,12 +801,14 @@ private:
 		}
 	}
 
-	Program&                       m_program;
-	ShaderInfo                     m_info;
-	std::vector<DescriptorSource>  m_sources;
-	std::vector<HandlePatch>       m_handle_patches;
-	std::vector<MemoryPatch>       m_memory_patches;
-	std::vector<IndirectImagePlan> m_indirect_images;
+	Program&                                   m_program;
+	ShaderInfo                                 m_info;
+	std::vector<DescriptorSource>              m_sources;
+	std::vector<HandlePatch>                   m_handle_patches;
+	std::vector<MemoryPatch>                   m_memory_patches;
+	std::vector<IndirectImagePlan>             m_indirect_images;
+	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
+	bool                                       m_shader_writes = false;
 };
 
 } // namespace
