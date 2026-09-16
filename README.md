@@ -165,14 +165,13 @@ The finished application and its runtime dependencies will be placed in
 
 ### Building on Linux
 
-Install the toolchain, system FFmpeg, and the libraries the bundled SDL2 needs. Without the audio, Wayland and
+Install the toolchain and the libraries the bundled SDL2 needs. Without the audio, Wayland and
 udev development packages SDL2 quietly configures itself without those backends, and the resulting
 build has no working sound and no gamepad hotplug:
 
 ```bash
 sudo apt-get install --no-install-recommends \
   clang lld ninja-build cmake git glslang-tools pkg-config \
-  libavformat-dev libavcodec-dev libswscale-dev libavutil-dev libavfilter-dev libswresample-dev \
   libgl1-mesa-dev libx11-dev libxcursor-dev libxext-dev libxfixes-dev \
   libxi-dev libxrandr-dev libxss-dev libxkbcommon-dev \
   libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
@@ -193,8 +192,9 @@ cmake --install _Build/linux --prefix _Build/linux/install
 ```
 
 The install step copies the Qt libraries and plugins next to the binaries, so
-`_Build/linux/install` runs without a matching system Qt. The emulator still requires
-the system FFmpeg runtime libraries matching those used to build it.
+`_Build/linux/install` runs without a matching system Qt. FFmpeg is linked statically
+from the pinned [KytyPS5 FFmpeg core](https://github.com/KytyPS5/ext-ffmpeg-core)
+release, including VP9 and WebM support. System FFmpeg packages are not required.
 
 As on Windows, the MSVC compiler is not used; Clang is required. `cl.exe` is rejected at configure
 time.
