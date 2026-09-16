@@ -4476,6 +4476,17 @@ public:
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_only_meta);
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, read_write_meta);
     TextureCacheTestAccess::RegisterHtileMeta(texture_cache, write_only_meta);
+
+    // An empty dispatch must not inspect even an unreadable shader address.
+    shaders.SetCsShader({.data_addr = 1});
+    constexpr std::array<std::array<uint32_t, 3>, 3> empty_dispatches{{
+        {0, 1, 1}, {1, 0, 1}, {1, 1, 0}}};
+    for (const auto mode : {0x41u, 0x61u}) {
+      for (const auto &groups : empty_dispatches) {
+        context.GetRenderExecutor().DispatchDirect(
+            0, scheduler.Current(), groups[0], groups[1], groups[2], mode);
+      }
+    }
     Require(name, "HTile fixture",
             texture_cache.IsMeta(read_only_meta) &&
                 texture_cache.IsMeta(read_write_meta) &&
