@@ -379,6 +379,11 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  static void DrawAuto(RenderExecutor &executor, CommandBuffer &command,
+                       const DrawAutoArgs &args) {
+    executor.DrawAuto(0, command, args);
+  }
+
   static bool TryConsumeComputeImageClear(RenderExecutor &executor,
       const ShaderComputeInputInfo &input, CommandBuffer &command,
       uint32_t x, uint32_t y, uint32_t z, uint32_t mode) {
@@ -13095,8 +13100,6 @@ public:
       check_stencil("masked compare passes", false, 0xb8, 0xb9);
       check_stencil("masked compare fails", false, 0xb0, 0xb0);
 
-      DestroyBuffer(&stencil_readback);
-
       // SPI_PS_IN_CONTROL must select the native wave width through the actual
       // program cache. In wave32 a low-word compare preserves scalar VCC_HI.
       static const auto native_vertex = [] {
@@ -13247,6 +13250,117 @@ public:
         Require(name, "zero homogeneous position culling", second_triangle == (i >= 2),
                 "zero positions drew an extra triangle, or a valid position was culled");
       }
+
+      // A NULL-export stencil pass must ignore smaller stale color targets,
+      // materialize the whole pending HTile clear, and still execute pixel discard.
+      static const auto null_pixels = [] {
+        std::array<std::vector<u32>, 2> result;
+        for (uint32_t discard = 0; discard < result.size(); discard++) {
+          auto &code = result[discard];
+          if (discard != 0) {
+            code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+          }
+          code.push_back(EncodeExp0(0x09, 0, true, false, true));
+          code.push_back(EncodeExp1(0, 0, 0, 0));
+          AppendEnd(&code);
+        }
+        return result;
+      }();
+      registers.Reset();
+      registers.SetViewportTransformControl(0x300);
+      registers.SetViewportScaleOffset(0, extent / 2, extent / 2,
+                                       extent / 2, extent / 2, 1, 0);
+      registers.SetViewportZMax(0, 1);
+      registers.SetScreenScissor(0, 0, extent, extent);
+      registers.SetWindowScissor(0, 0, extent, extent, false);
+      registers.SetGenericScissor(0, 0, extent, extent, false);
+      registers.SetViewportScissor(0, 0, 0, extent, extent, false);
+      registers.SetRenderTargetMask(0xf00f);
+      registers.SetShaderMask(0xf00f);
+      registers.SetPsInControl(0x8000);
+      registers.SetDepthShaderControl({.shader_kill_enable = true});
+      for (const auto slot : {0u, 3u}) {
+        registers.SetColorBase(slot,
+            {.addr = depth_address + (slot == 0 ? 0x38000 : 0x10000)});
+        registers.SetColorInfo(slot,
+            {.format = Prospero::ChannelLayout::k32_32_32_32,
+             .channel_type = Prospero::ChannelType::kFloat,
+             .channel_order = Prospero::ChannelOrder::kStandard});
+        const auto side = slot == 0 ? extent / 4 : extent;
+        registers.SetColorAttrib2(slot, {.height = side - 1, .width = side - 1});
+        registers.SetColorAttrib3(slot,
+            {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+        registers.SetTargetOutputMode(slot, 4);
+      }
+      stencil_target.z_info.htile_acceleration = true;
+      stencil_target.htile_data_base_addr = depth_address + 0x30000;
+      registers.SetDepthRenderTarget(stencil_target);
+      registers.SetDepthClearValue(1);
+      stencil_control = {};
+      stencil_control.stencil_enable = true;
+      stencil_control.stencilfunc = static_cast<uint8_t>(vk::CompareOp::eAlways);
+      registers.SetDepthControl(stencil_control);
+      registers.SetStencilControl({3, 3, 3, 3, 3, 3});
+      registers.SetStencilMask({0x80, 0, 0x80, 1, 0x80, 0, 0x80, 1});
+      user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      shaders.SetEsShaderBase(vertex_address);
+      for (uint32_t discard = 0; discard < null_pixels.size(); discard++) {
+        const auto &code = null_pixels[discard];
+        const auto address = reinterpret_cast<uint64_t>(code.data());
+        ShaderMapUserData(address,
+            {.type = Prospero::ShaderBinaryType::kPs,
+             .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+        shaders.SetPsShaderBase(address);
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+        (void)cache.FindDepthTarget(depth.image_id, depth.desc);
+        vk::ClearValue zero{};
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth.image_id,
+            {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
+             0, 1, 0, 1}, zero);
+        Require(name, "pending stencil-pass HTile clear",
+                cache.ClearMeta(stencil_target.htile_data_base_addr),
+                "the stencil pass did not retain its HTile metadata");
+        RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+        const auto depth_pixels = ReadCachedTexel(name, context, depth.image_id,
+                                                  {}, {extent, extent, 1});
+        Require(name, "NULL-export full depth clear",
+                std::ranges::all_of(depth_pixels, [](u32 v) { return v == 0x3f800000u; }),
+                "an unexported color target clipped the pending depth clear");
+        const auto stencil = read_stencil();
+        const auto expected = discard == 0 ? 0x80808080u : 0u;
+        Require(name, "NULL-export stencil coverage and discard",
+                std::ranges::all_of(stencil, [=](u32 v) { return v == expected; }),
+                "a stale color target clipped stencil coverage or the NULL-export shader was skipped");
+      }
+
+      // With MRT0 still bound, an MRT3-only export must retain location3 in
+      // rendering attachments, pipeline formats, blend masks and dynamic write enables.
+      static const auto sparse_pixel = [] {
+        auto code = native_pixel;
+        *std::ranges::find(code, EncodeExp0(0x00, 0xf)) = EncodeExp0(0x03, 0xf);
+        return code;
+      }();
+      const auto sparse_address = reinterpret_cast<uint64_t>(sparse_pixel.data());
+      ShaderMapUserData(sparse_address,
+          {.type = Prospero::ShaderBinaryType::kPs,
+           .code_size_bytes = static_cast<uint32_t>(sparse_pixel.size() * sizeof(u32))});
+      shaders.SetPsShaderBase(sparse_address);
+      registers.SetDepthControl({});
+      registers.SetDepthShaderControl({});
+      RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+      RenderColorInfo sparse_color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), sparse_color, 3);
+      const auto sparse_pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                                {}, {extent, extent, 1});
+      for (size_t component = 0; component < sparse_pixels.size(); component++) {
+        const auto expected = component % 4 == 3 ? 0x3f800000u : 0x3e800000u;
+        Require(name, "sparse MRT3 output", sparse_pixels[component] == expected,
+                "MRT3 was compacted to a different slot or clipped by unused MRT0");
+      }
+      DestroyBuffer(&stencil_readback);
 
       vertex_shader = owned_vertex_shader;
       pixel_shader = owned_pixel_shader;
