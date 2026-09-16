@@ -8594,7 +8594,8 @@ public:
 
   std::vector<u32> ReadCachedTexel(const char *name, RenderContext &context,
                                  ImageId id, vk::Offset3D offset = {},
-                                 vk::Extent3D extent = {1, 1, 1}, uint32_t layer = 0) {
+                                 vk::Extent3D extent = {1, 1, 1}, uint32_t layer = 0,
+                                 uint32_t mip = 0) {
     auto &scheduler = context.GetCommandScheduler();
     auto &image = context.GetTextureCache().GetImage(id);
     const auto bytes = image.info.bytes_per_block * extent.width *
@@ -8607,7 +8608,7 @@ public:
                   scheduler.Current().Handle());
     vk::BufferImageCopy copy{};
     copy.imageSubresource = {image.info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
-                                                : vk::ImageAspectFlagBits::eColor, 0, layer, 1};
+                                                : vk::ImageAspectFlagBits::eColor, mip, layer, 1};
     copy.imageOffset = offset;
     copy.imageExtent = extent;
     scheduler.Current().Handle().copyImageToBuffer(
@@ -9602,6 +9603,9 @@ public:
     constexpr uint64_t allocation_alignment = 0x10000;
     constexpr uint64_t depth_address = base + 0x40000;
     constexpr uint64_t stencil_address = base + 0x70000;
+    constexpr uint64_t mipped_storage_address = base + 0x100000;
+    constexpr uint32_t tail_backing_value = 0x2468ace0u;
+    constexpr uint32_t tail_gpu_value = 0x13579bdfu;
     EnsureRuntimeContext();
 
     int64_t direct_offset = -1;
@@ -9618,6 +9622,8 @@ public:
                 mapped == reinterpret_cast<void *>(base),
             "descriptor discovery fixed mapping failed");
     std::memset(mapped, 0, allocation_size);
+    std::fill_n(reinterpret_cast<uint32_t *>(mipped_storage_address),
+                0x10000 / 4, tail_backing_value);
 
     {
       RenderContext context(m_runtime_context);
@@ -9884,17 +9890,17 @@ public:
                 storage_descriptor.dwords.begin());
       storage_descriptor.dword_count = 8;
       auto mipped_storage = storage;
-      constexpr uint64_t mipped_storage_address = base + 0x100000;
       const auto encoded_mipped_storage_address = mipped_storage_address >> 8u;
       mipped_storage.fields[0] =
           static_cast<uint32_t>(encoded_mipped_storage_address);
       mipped_storage.fields[1] =
           static_cast<uint32_t>(encoded_mipped_storage_address >> 32u) |
-          (static_cast<uint32_t>(stencil_format) << 20u) | (3u << 30u);
-      mipped_storage.fields[2] = 1u | (7u << 14u);
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 20u) |
+          (3u << 30u);
+      mipped_storage.fields[2] = 15u | (63u << 14u);
       mipped_storage.fields[3] =
           DstSel(4, 5, 6, 7) | (1u << 12u) | (3u << 16u) |
-          (static_cast<uint32_t>(linear) << 20u) |
+          (static_cast<uint32_t>(Prospero::TileMode::kStandard64KB) << 20u) |
           (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
       mipped_storage.fields[5] = 0x00700000u | (3u << 4u);
       ShaderRecompiler::IR::DescriptorValue mipped_storage_descriptor{};
@@ -9911,6 +9917,14 @@ public:
                 std::end(overwide_mipped_storage.fields),
                 overwide_mipped_storage_descriptor.dwords.begin());
       overwide_mipped_storage_descriptor.dword_count = 8;
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+      ExpectFatal("MipViewPhysicalLayoutChange", [&] {
+        auto linear_view = overwide_mipped_storage_descriptor;
+        linear_view.dwords[3] &= ~(0x1fu << 20u);
+        (void)RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
+                                                       linear_view);
+      });
+#endif
       auto mipped_storage_resource = storage_resource;
       mipped_storage_resource.mip_mode =
           ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
@@ -9925,6 +9939,11 @@ public:
       auto plain_mipped_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
                                                    mipped_storage_descriptor);
+      vk::ClearValue tail_clear{};
+      tail_clear.color.uint32[0] = tail_gpu_value;
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), plain_mipped_storage_binding.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 4, 0, 1}, tail_clear);
       auto mipped_storage_binding = RenderExecutorTestAccess::ResolveTexture(
           executor, mipped_storage_resource, mipped_storage_descriptor);
       auto overwide_mipped_storage_binding =
@@ -9933,6 +9952,16 @@ public:
       auto sampled_overwide_resolved = RenderExecutorTestAccess::ResolveTexture(
           executor, sampled_overwide_resource,
           overwide_mipped_storage_descriptor);
+      const auto tail0 = ReadCachedTexel(name, context, overwide_mipped_storage_binding.image_id);
+      const auto tail3 = ReadCachedTexel(name, context, overwide_mipped_storage_binding.image_id,
+                                        {}, {1, 1, 1}, 0, 3);
+      const auto tail4 = ReadCachedTexel(name, context, overwide_mipped_storage_binding.image_id,
+                                        {}, {1, 1, 1}, 0, 4);
+      Require(name, "expanded tail preserves GPU and backing data",
+              tail0 == std::vector<u32>{tail_gpu_value} &&
+                  tail3 == std::vector<u32>{tail_gpu_value} &&
+                  tail4 == std::vector<u32>{tail_backing_value},
+              "expanding a shared mip tail lost GPU writes or the added mip's backing bytes");
       PreparedBindings mipped_prepared{};
       ShaderRecompiler::IR::CompiledShaderInfo mipped_program{};
       mipped_program.info.images.push_back(storage_resource);
@@ -9994,23 +10023,22 @@ public:
                   overwide_mipped_storage.MaxMip() == 3 &&
                   overwide_mipped_binding.image_id ==
                       plain_mipped_binding.image_id &&
-                  overwide_mipped_binding.desc.info.resources.levels == 4 &&
+                  overwide_mipped_binding.desc.info.resources.levels == 5 &&
                   overwide_mipped_binding.desc.view_info.base_level == 1 &&
-                  overwide_mipped_binding.desc.view_info.level_count == 3 &&
+                  overwide_mipped_binding.desc.view_info.level_count == 4 &&
                   overwide_mipped_binding.mip_views.empty() &&
                   overwide_mipped_binding.image_view ==
                       plain_mipped_binding.image_view,
-              "fixed storage view was not intersected with its physical mip "
-              "range before Vulkan acquisition");
+              "fixed storage view lost addressable mips in the allocated tail");
       Require(name, "over-wide sampled mip view",
               sampled_overwide_binding.image_id ==
                       plain_mipped_binding.image_id &&
-                  sampled_overwide_binding.desc.info.resources.levels == 4 &&
+                  sampled_overwide_binding.desc.info.resources.levels == 5 &&
                   sampled_overwide_binding.desc.view_info.base_level == 1 &&
-                  sampled_overwide_binding.desc.view_info.level_count == 3 &&
+                  sampled_overwide_binding.desc.view_info.level_count == 4 &&
                   sampled_overwide_binding.mip_views.empty() &&
                   sampled_overwide_binding.image_view != nullptr,
-              "sampled view was not intersected with its physical mip range");
+              "sampled view lost addressable mips in the allocated tail");
       auto srgb_storage = storage;
       constexpr auto srgb_format =
           static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8Srgb);
@@ -27983,12 +28011,6 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
     descriptor.fields[3] =
         (descriptor.fields[3] & ~(0x1fu << 20u)) |
         (static_cast<uint32_t>(Prospero::TileMode::kStandard256B) << 20u);
-  } else if (std::strcmp(kind, "base-mip-out-of-resource") == 0) {
-    descriptor.fields[3] |= (1u << 12u) | (1u << 16u);
-  } else if (std::strcmp(kind, "dynamic-mip-out-of-resource") == 0) {
-    resource.mip_mode = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
-    resource.mip_count = 2;
-    descriptor.fields[3] |= 1u << 16u;
   } else if (std::strcmp(kind, "inverted-mip-range") == 0) {
     descriptor.fields[3] |= 1u << 12u;
     descriptor.fields[5] |= 1u << 4u;
@@ -28460,8 +28482,6 @@ void CheckBasicStorageTextureDescriptor() {
   for (const char *kind : {"resource",
                            "type",
                            "standard256b-volume",
-                           "base-mip-out-of-resource",
-                           "dynamic-mip-out-of-resource",
                            "inverted-mip-range",
                            "swizzle",
                            "linear-rgb1-read",
