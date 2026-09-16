@@ -182,47 +182,61 @@ private:
 				return selected;
 			}
 		}
-		const auto* merge = phi->Parent();
-		for (uint32_t first = 0; first < 2; first++) {
-			const auto* branch    = phi->PhiBlock(first);
-			const auto* alternate = phi->PhiBlock(first ^ 1u);
-			if (branch == nullptr || alternate == nullptr || merge == nullptr || branch == merge ||
-			    alternate == merge || branch == alternate || branch->ImmSuccessors().size() != 2u ||
-			    alternate->ImmPredecessors().size() != 1u ||
-			    alternate->ImmPredecessors()[0] != branch ||
-			    alternate->ImmSuccessors().size() != 1u || alternate->ImmSuccessors()[0] != merge) {
-				continue;
-			}
-			const auto branch_it    = std::ranges::find(m_program.blocks, branch);
-			const auto alternate_it = std::ranges::find(m_program.blocks, alternate);
-			const auto merge_it     = std::ranges::find(m_program.blocks, merge);
-			if (branch_it == m_program.blocks.end() || alternate_it == m_program.blocks.end() ||
-			    merge_it == m_program.blocks.end()) {
-				continue;
-			}
-			const auto& info = m_program.block_info[branch_it - m_program.blocks.begin()];
-			const auto  alternate_id =
-			    m_program.block_info[alternate_it - m_program.blocks.begin()].id;
-			const auto  merge_id = m_program.block_info[merge_it - m_program.blocks.begin()].id;
-			const auto& term     = info.terminator;
-			if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
-			    !((term.true_block == merge_id && term.false_block == alternate_id) ||
-			      (term.false_block == merge_id && term.true_block == alternate_id)) ||
-			    !ValidateRuntimeValue(m_program, info.condition, RuntimeValueType::Integer) ||
-			    !ValidateRuntimeValue(m_program, phi->Arg(0)) ||
-			    !ValidateRuntimeValue(m_program, phi->Arg(1))) {
-				continue;
-			}
-			// Retain a host expression; replacing the GPU Phi would break SSA dominance.
-			const auto true_arg = term.true_block == merge_id ? first : first ^ 1u;
-			auto&      selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
-			selected.SetArg(0, info.condition);
-			selected.SetArg(1, phi->Arg(true_arg));
-			selected.SetArg(2, phi->Arg(true_arg ^ 1u));
-			m_descriptor_selections.emplace_back(phi, Value(&selected));
-			return Value(&selected);
+		const auto* merge  = phi->Parent();
+		const auto* branch = phi->PhiBlock(0);
+		if (merge == nullptr || branch == nullptr || phi->PhiBlock(1) == nullptr ||
+		    branch == phi->PhiBlock(1)) {
+			return value;
 		}
-		return value;
+		if (branch->ImmSuccessors().size() != 2u) {
+			if (branch->ImmPredecessors().size() != 1u) {
+				return value;
+			}
+			branch = branch->ImmPredecessors()[0];
+		}
+		if (branch == merge || branch->ImmSuccessors().size() != 2u) {
+			return value;
+		}
+		std::array<uint32_t, 2> target_ids;
+		for (uint32_t arm = 0; arm < 2; arm++) {
+			const auto* incoming = phi->PhiBlock(arm);
+			if (incoming == merge ||
+			    (incoming != branch &&
+			     (incoming->ImmPredecessors().size() != 1u ||
+			      incoming->ImmPredecessors()[0] != branch ||
+			      incoming->ImmSuccessors().size() != 1u ||
+			      incoming->ImmSuccessors()[0] != merge))) {
+				return value;
+			}
+			const auto* target = incoming == branch ? merge : incoming;
+			const auto  it     = std::ranges::find(m_program.blocks, target);
+			if (it == m_program.blocks.end()) {
+				return value;
+			}
+			target_ids[arm] = m_program.block_info[it - m_program.blocks.begin()].id;
+		}
+		const auto branch_it = std::ranges::find(m_program.blocks, branch);
+		if (branch_it == m_program.blocks.end()) {
+			return value;
+		}
+		const auto& info = m_program.block_info[branch_it - m_program.blocks.begin()];
+		const auto& term = info.terminator;
+		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
+		    !((term.true_block == target_ids[0] && term.false_block == target_ids[1]) ||
+		      (term.false_block == target_ids[0] && term.true_block == target_ids[1])) ||
+		    !ValidateRuntimeValue(m_program, info.condition, RuntimeValueType::Integer) ||
+		    !ValidateRuntimeValue(m_program, phi->Arg(0)) ||
+		    !ValidateRuntimeValue(m_program, phi->Arg(1))) {
+			return value;
+		}
+		// Retain a host expression; replacing the GPU Phi would break SSA dominance.
+		const auto true_arg = term.true_block == target_ids[0] ? 0u : 1u;
+		auto&      selected = m_program.value_storage.emplace_back(ValueOpcode::SelectU32);
+		selected.SetArg(0, info.condition);
+		selected.SetArg(1, phi->Arg(true_arg));
+		selected.SetArg(2, phi->Arg(true_arg ^ 1u));
+		m_descriptor_selections.emplace_back(phi, Value(&selected));
+		return Value(&selected);
 	}
 
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
