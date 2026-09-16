@@ -14,7 +14,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cinttypes>
 #include <cstdint>
@@ -22,6 +24,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -45,6 +48,19 @@
 #undef DeleteFile
 #endif
 #endif
+
+namespace Libs::Fiber {
+struct FiberObject;
+struct FiberOptParam;
+using FiberEntry = KYTY_SYSV_ABI void (*)(uint64_t, uint64_t);
+int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject*, const char*, FiberEntry, uint64_t, void*,
+                                     uint64_t, const FiberOptParam*, uint32_t);
+int32_t KYTY_SYSV_ABI FiberFinalize(FiberObject*);
+int32_t KYTY_SYSV_ABI FiberRun(FiberObject*, uint64_t, uint64_t*);
+int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject*, uint64_t, uint64_t*);
+int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject**);
+int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t, uint64_t*);
+} // namespace Libs::Fiber
 
 namespace {
 
@@ -2800,10 +2816,160 @@ void TestPackedReciprocalSquareRoot() {
 }
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64)
+constexpr int32_t FiberErrorState = -2141650938; // SCE_FIBER_ERROR_STATE
+
+struct FiberRoundTrip {
+	Libs::Fiber::FiberObject* first;
+	Libs::Fiber::FiberObject* second;
+	std::atomic<bool> running {false};
+	std::atomic<bool> release {false};
+	int first_errors = 0;
+	int second_errors = 0;
+	uint32_t first_visits = 0;
+	uint32_t second_visits = 0;
+	uint64_t first_arg = 0;
+	uint64_t second_arg = 0;
+};
+
+[[noreturn]] void KYTY_SYSV_ABI FirstFiberEntry(uint64_t initial, uint64_t arg) {
+	auto& data = *reinterpret_cast<FiberRoundTrip*>(initial);
+	for (;;) {
+		Libs::Fiber::FiberObject* self = nullptr;
+		data.first_errors |= Libs::Fiber::FiberGetSelf(&self);
+		data.first_errors |= self != data.first;
+		data.first_errors |= Libs::Fiber::FiberSwitch(self, 0, nullptr) != FiberErrorState;
+		if (data.first_errors != 0) {
+			__builtin_trap();
+		}
+		++data.first_visits;
+		data.first_arg = arg;
+		if (arg == 20) {
+			data.running.store(true, std::memory_order_release);
+			while (!data.release.load(std::memory_order_acquire)) {
+				asm volatile("pause");
+			}
+		}
+		data.first_errors |= Libs::Fiber::FiberSwitch(data.second, arg + 1, &arg);
+		if (data.first_errors != 0) {
+			__builtin_trap();
+		}
+		data.first_errors |= Libs::Fiber::FiberReturnToThread(arg + 1, &arg);
+	}
+}
+
+[[noreturn]] void KYTY_SYSV_ABI SecondFiberEntry(uint64_t initial, uint64_t arg) {
+	auto& data = *reinterpret_cast<FiberRoundTrip*>(initial);
+	for (;;) {
+		Libs::Fiber::FiberObject* self = nullptr;
+		data.second_errors |= Libs::Fiber::FiberGetSelf(&self);
+		data.second_errors |= self != data.second;
+		if (data.second_errors != 0) {
+			__builtin_trap();
+		}
+		++data.second_visits;
+		data.second_arg = arg;
+		data.second_errors |= Libs::Fiber::FiberSwitch(data.first, arg + 1, &arg);
+		if (data.second_errors != 0) {
+			__builtin_trap();
+		}
+	}
+}
+
+void TestSmallFiberStacksAndMigration() {
+	const char* test = "SmallFiberStacksAndMigration";
+	// 256-byte objects, 8-byte object alignment, 16-byte context
+	// alignment, and a 512-byte minimum context. The game supplies 2048 bytes.
+	for (const size_t stack_size: {512u, 2048u}) {
+		alignas(8) std::array<uint8_t, 256> first_object {};
+		alignas(8) std::array<uint8_t, 256> second_object {};
+		constexpr size_t GuardSize = 4096;
+		alignas(16) std::array<uint8_t, GuardSize + 2048 + 64> first_stack;
+		alignas(16) std::array<uint8_t, GuardSize + 2048 + 64> second_stack;
+		first_stack.fill(0xa5);
+		second_stack.fill(0xa5);
+		FiberRoundTrip data {reinterpret_cast<Libs::Fiber::FiberObject*>(first_object.data()),
+		                     reinterpret_cast<Libs::Fiber::FiberObject*>(second_object.data())};
+		CheckOk(test, Libs::Fiber::FiberInitialize(data.first, "first", FirstFiberEntry,
+		    reinterpret_cast<uint64_t>(&data), first_stack.data() + GuardSize, stack_size,
+		    nullptr, 0x0a000000), "initialize first fiber");
+		CheckOk(test, Libs::Fiber::FiberInitialize(data.second, "second", SecondFiberEntry,
+		    reinterpret_cast<uint64_t>(&data), second_stack.data() + GuardSize, stack_size,
+		    nullptr, 0x0a000000), "initialize second fiber");
+		uint64_t first_base = 0;
+		uint64_t second_base = 0;
+		std::memcpy(&first_base, first_stack.data() + GuardSize, sizeof(first_base));
+		std::memcpy(&second_base, second_stack.data() + GuardSize, sizeof(second_base));
+		const auto check_stacks = [&] {
+			for (const auto* stack: {&first_stack, &second_stack}) {
+				const auto is_guard = [](uint8_t byte) { return byte == 0xa5; };
+				Check(test, std::all_of(stack->begin(), stack->begin() + GuardSize, is_guard) &&
+				                std::all_of(stack->begin() + GuardSize + stack_size, stack->end(), is_guard),
+				      "fiber wrote outside its supplied stack");
+			}
+			Check(test, std::memcmp(&first_base, first_stack.data() + GuardSize, sizeof(first_base)) == 0 &&
+			                std::memcmp(&second_base, second_stack.data() + GuardSize, sizeof(second_base)) == 0,
+			      "fiber overwrote the bottom of its stack");
+		};
+		uint64_t returned = 0;
+		CheckOk(test, Libs::Fiber::FiberRun(data.first, 10, &returned), "run first fiber");
+		Check(test, returned == 13 && data.first_visits == 1 && data.second_visits == 1 &&
+		                data.first_arg == 10 && data.second_arg == 11,
+		      "switch/return arguments were not preserved");
+		check_stacks();
+
+		std::atomic<bool> done {false};
+		int worker_result = -1;
+		int worker_self_result = -1;
+		Libs::Fiber::FiberObject* worker_self = data.first;
+		std::thread worker([&] {
+			worker_result = Libs::Fiber::FiberRun(data.first, 20, &returned);
+			worker_self_result = Libs::Fiber::FiberGetSelf(&worker_self);
+			done.store(true, std::memory_order_release);
+		});
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (!data.running.load(std::memory_order_acquire) &&
+		       !done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::yield();
+		}
+		const bool running = data.running.load(std::memory_order_acquire);
+		Libs::Fiber::FiberObject* main_self = data.first;
+		const int main_self_result = Libs::Fiber::FiberGetSelf(&main_self);
+		const int busy_run = running ? Libs::Fiber::FiberRun(data.first, 30, nullptr) : 0;
+		const int busy_finalize = running ? Libs::Fiber::FiberFinalize(data.first) : 0;
+		data.release.store(true, std::memory_order_release);
+		worker.join();
+		Libs::Fiber::FiberObject* main_self_after = data.first;
+		Check(test, Libs::Fiber::FiberGetSelf(&main_self_after) == OK && main_self_after == nullptr &&
+		                main_self_result == OK && main_self == nullptr,
+		      "migrated fiber changed the original thread's current fiber");
+		Check(test, running && busy_run == FiberErrorState && busy_finalize == FiberErrorState,
+		      "running fiber was not exclusively owned");
+		CheckOk(test, worker_result, "resume fiber on another thread");
+		Check(test, worker_self_result == OK && worker_self == nullptr,
+		      "return to thread retained a current fiber");
+		Check(test, returned == 23 && data.first_visits == 2 && data.second_visits == 2 &&
+		                data.first_arg == 20 && data.second_arg == 21 &&
+		                data.first_errors == 0 && data.second_errors == 0,
+		      "migration lost fiber identity, arguments, or resumable contexts");
+		check_stacks();
+		CheckOk(test, Libs::Fiber::FiberFinalize(data.first), "finalize first suspended fiber");
+		CheckOk(test, Libs::Fiber::FiberFinalize(data.second), "finalize second suspended fiber");
+		std::printf("[host]    %s stack=%zu ok\n", test, stack_size);
+	}
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+#if defined(__x86_64__) || defined(_M_X64)
+	if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
+		RunTest(TestSmallFiberStacksAndMigration);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
 		RunTest(TestPackedReciprocalSquareRoot);
@@ -2815,6 +2981,9 @@ int main(int argc, char** argv) {
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 
+#if defined(__x86_64__) || defined(_M_X64)
+	RunTest(TestSmallFiberStacksAndMigration);
+#endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPackedReciprocalSquareRoot);
 #endif
