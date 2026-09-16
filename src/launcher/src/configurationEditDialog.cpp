@@ -240,7 +240,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_vulkan_validation->setChecked(info.vulkan_validation_enabled);
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
 	m_ui->checkBox_amd_cpu->setChecked(info.amd_cpu_enabled);
-#if !defined(__linux__)
+#if defined(__APPLE__)
 	m_ui->checkBox_amd_cpu->setVisible(false);
 #endif
 #if defined(_WIN32)

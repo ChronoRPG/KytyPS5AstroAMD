@@ -5,7 +5,7 @@
 #include <Zydis/Zydis.h>
 #include <bit>
 #include <cstring>
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+#if !defined(__APPLE__)
 #include <emmintrin.h>
 #include <xmmintrin.h>
 #endif
@@ -424,6 +424,21 @@ struct Context {
 		                              native->R12, native->R13, native->R14, native->R15};
 		std::memcpy(gpr, registers, sizeof(gpr));
 	}
+
+	void ClearUpperYmm(uint8_t index) const {
+		if ((native->ContextFlags & CONTEXT_XSTATE) != CONTEXT_XSTATE) {
+			return;
+		}
+		DWORD64 features = 0;
+		if (!GetXStateFeaturesMask(native, &features) || (features & XSTATE_MASK_AVX) == 0) {
+			return; // An absent AVX component restores zeroes.
+		}
+		DWORD size = 0;
+		auto* ymm = static_cast<M128A*>(LocateXStateFeature(native, XSTATE_AVX, &size));
+		if (ymm != nullptr && size >= (index + 1u) * sizeof(M128A)) {
+			ymm[index] = {};
+		}
+	}
 #else
 	ucontext_t* native;
 
@@ -588,8 +603,6 @@ static bool TryEmulateMonitorxMwaitx(Context& context) {
 	return true;
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-
 static uint32_t ReciprocalSquareRoot(uint32_t bits) {
 	const uint32_t magnitude = bits & 0x7fffffffu;
 	const uint32_t exponent  = magnitude & 0x7f800000u;
@@ -658,11 +671,18 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 }
 
 #endif
-#endif
+
+bool IsReciprocalSquareRoot(const ZydisDecodedInstruction& instruction,
+                            const ZydisDecodedOperand* operands) {
+	return instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
+	       instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
+	       instruction.raw.vex.offset == 0 && operands[0].size == 128 &&
+	       operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER;
+}
 
 uint64_t PatchReciprocalSquareRoots(uint64_t address, uint64_t size) {
 	uint64_t patched = 0;
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+#if !defined(__APPLE__)
 	ZydisDecoder decoder {};
 	if (!ZYAN_SUCCESS(
 	        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
@@ -677,12 +697,9 @@ uint64_t PatchReciprocalSquareRoots(uint64_t address, uint64_t size) {
 			++offset;
 			continue;
 		}
-		if (instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
-		    instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
-		    instruction.raw.vex.offset == 0 && operands[0].size == 128 &&
-		    operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+		if (IsReciprocalSquareRoot(instruction, operands)) {
 			// vvvv is reserved (must be 1111b). Clear one bit to route this
-			// otherwise intact instruction through the existing SIGILL emulator.
+			// otherwise intact instruction through the illegal-instruction emulator.
 			code[instruction.raw.vex.size - 1] &= ~0x08u;
 			++patched;
 		}
@@ -704,10 +721,10 @@ bool TryEmulate(void* native_context) {
 	Context context {static_cast<PCONTEXT>(native_context)};
 #else
 	Context context {static_cast<ucontext_t*>(native_context)};
+#endif
 	if (TryEmulateReciprocalSquareRoot(context)) {
 		return true;
 	}
-#endif
 	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context) ||
 	       TryEmulateShaNi(context);
 #else

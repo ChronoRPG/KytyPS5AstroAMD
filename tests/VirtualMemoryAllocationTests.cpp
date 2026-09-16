@@ -24,13 +24,16 @@
 #include <string>
 #include <vector>
 
-#if defined(__linux__)
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <csignal>
 #include <immintrin.h>
+#include <xbyak/xbyak.h>
+#endif
+
+#if defined(__linux__)
 #include <sys/uio.h>
 #include <ucontext.h>
 #include <unistd.h>
-#include <xbyak/xbyak.h>
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -217,10 +220,8 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	                                   reinterpret_cast<void*>(mapping + CODE_SIZE),
 	                                   TRAMPOLINE_SIZE);
 	const std::array<uintptr_t, 1> function_starts = {static_cast<uintptr_t>(mapping)};
-	const auto result = Loader::PatchRedZoneMemoryInstructions(
-	    mapping, code.size(), function_starts);
-	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, CODE_SIZE + TRAMPOLINE_SIZE),
-	      "failed to flush patched test code");
+	const auto result = Loader::PatchGuestInstructions(
+	    mapping, code.size(), function_starts, true, false);
 	const bool patched_preserved = function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 1;
 
 	Loader::UnregisterRedZonePatchModule(reinterpret_cast<void*>(mapping));
@@ -2546,55 +2547,93 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-#if defined(__linux__)
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 volatile sig_atomic_t g_rsqrt_traps = 0;
 
-void ReciprocalSquareRootHandler(int, siginfo_t*, void* context) {
+bool EmulateReciprocalSquareRootContext(void* context) {
 	const auto host_mxcsr = _mm_getcsr();
 	_mm_setcsr(0x7fe1); // Exercise the handler under a distinct rounding mode and raised flags.
-	if (!Loader::X64InstructionEmulator::TryEmulate(context)) {
+	const bool emulated        = Loader::X64InstructionEmulator::TryEmulate(context);
+	const bool preserved_mxcsr = _mm_getcsr() == 0x7fe1;
+	_mm_setcsr(host_mxcsr);
+	if (!emulated || !preserved_mxcsr) {
+		return false;
+	}
+	g_rsqrt_traps = g_rsqrt_traps + 1;
+	return true;
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+LONG CALLBACK ReciprocalSquareRootHandler(EXCEPTION_POINTERS* exception) {
+	if (exception->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION ||
+	    !EmulateReciprocalSquareRootContext(exception->ContextRecord)) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+#else
+void ReciprocalSquareRootHandler(int, siginfo_t*, void* context) {
+	if (!EmulateReciprocalSquareRootContext(context)) {
 		_exit(190);
 	}
-	if (_mm_getcsr() != 0x7fe1) {
-		_exit(191);
-	}
-	_mm_setcsr(host_mxcsr);
-	g_rsqrt_traps = g_rsqrt_traps + 1;
 }
+#endif
 
 void TestPackedReciprocalSquareRoot() {
 	const char* test = "PackedReciprocalSquareRoot";
 	constexpr uint64_t code_size = 0x4000;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	constexpr uint64_t allocation_size = code_size * 2;
+#else
+	constexpr uint64_t allocation_size = code_size;
+#endif
 	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
-	    0x902000000, code_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "rsqrt_test");
+	    0x902000000, allocation_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "rsqrt_test");
 	Check(test, mapping != 0, "failed to allocate instruction test code");
 	struct RestoreState {
 		uint64_t mapping;
 		uint64_t size;
 		uint32_t mxcsr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		void* handler = nullptr;
+#else
 		struct sigaction previous {};
 		bool installed = false;
+#endif
 		~RestoreState() {
 			_mm_setcsr(mxcsr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			if (handler != nullptr) {
+				RemoveVectoredExceptionHandler(handler);
+			}
+			Loader::UnregisterRedZonePatchModule(reinterpret_cast<void*>(mapping));
+#else
 			if (installed) {
 				sigaction(SIGILL, &previous, nullptr);
 			}
+#endif
 			Libs::LibKernel::Memory::FreeGuestMemory(mapping, size);
 		}
-	} restore {mapping, code_size, _mm_getcsr()};
+	} restore {mapping, allocation_size, _mm_getcsr()};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	restore.handler = AddVectoredExceptionHandler(1, ReciprocalSquareRootHandler);
+	Check(test, restore.handler != nullptr, "failed to install instruction handler");
+#else
 	struct sigaction action {};
 	action.sa_sigaction = ReciprocalSquareRootHandler;
 	action.sa_flags = SA_SIGINFO;
 	sigemptyset(&action.sa_mask);
 	restore.installed = sigaction(SIGILL, &action, &restore.previous) == 0;
 	Check(test, restore.installed, "failed to install instruction handler");
+#endif
 	using GuestFunction = void(KYTY_SYSV_ABI*)(const uint32_t*, uint32_t*);
 	const auto function = reinterpret_cast<GuestFunction>(mapping);
 	const auto refine = [](float estimate) {
 		return (estimate * 0.5f) * std::fma(-estimate, estimate, 3.0f);
 	};
+	constexpr uint64_t red_zone_sentinel = 0x1122334455667788ull;
 	std::array<uint32_t, 16> input {};
-	std::array<uint32_t, 16> output {};
+	std::array<uint32_t, 48> output {};
 	input.fill(0x3f800000);
 	for (const auto registers: {std::array {2, 1}, std::array {10, 9}, std::array {1, 1}}) {
 		const auto destination = registers[0];
@@ -2613,16 +2652,55 @@ void TestPackedReciprocalSquareRoot() {
 		if (destination != source) {
 			code.vmovups(Xbyak::Ymm(destination), code.ptr[code.rdi + 32]);
 		}
+		for (uint32_t offset = 8; offset <= 128; offset += 8) {
+			code.mov(code.rax, red_zone_sentinel ^ offset);
+			code.mov(code.qword[code.rsp - offset], code.rax);
+		}
 		code.vrsqrtps(Xbyak::Xmm(destination), Xbyak::Xmm(source));
+		for (uint32_t offset = 8; offset <= 128; offset += 8) {
+			code.mov(code.rax, code.qword[code.rsp - offset]);
+			code.mov(code.qword[code.rsi + 64 + offset - 8], code.rax);
+		}
 		code.vmovups(code.ptr[code.rsi], Xbyak::Ymm(destination));
 		code.vmovups(code.ptr[code.rsi + 32], Xbyak::Ymm(source));
 		code.vzeroupper();
 		code.ret();
+#if defined(__linux__)
 		const std::vector<uint8_t> original(code.getCode(), code.getCurr());
+#endif
+		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
+		      "failed to flush generated instruction test code");
 		function(input.data(), output.data());
 		const float native = std::bit_cast<float>(output[0]);
+		const auto red_zone_intact = [&] {
+			for (uint32_t offset = 8; offset <= 128; offset += 8) {
+				const auto index = 16 + (offset - 8) / sizeof(uint32_t);
+				const auto value = static_cast<uint64_t>(output[index]) |
+				                   (static_cast<uint64_t>(output[index + 1]) << 32);
+				if (value != (red_zone_sentinel ^ offset)) {
+					return false;
+				}
+			}
+			return true;
+		};
+		Check(test, red_zone_intact(), "native instruction corrupted the guest red zone");
 		Check(test, std::isfinite(native) && std::abs(native - std::bit_cast<float>(expected)) < 0.001f,
 		      "native reciprocal root is outside its error bound");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		Loader::RegisterRedZonePatchModule(reinterpret_cast<void*>(mapping), code_size,
+		                                   reinterpret_cast<void*>(mapping + code_size), code_size);
+		const std::array<uintptr_t, 1> function_starts {mapping};
+		// The extended-register case also relocates ordinary memory accesses while
+		// red-zone data is live, exercising both enabled patchers in one function.
+		const bool protect_memory = source == 9;
+		const auto patched = Loader::PatchGuestInstructions(
+		    mapping, code.getSize(), function_starts, protect_memory, true);
+		Check(test, patched.reciprocal_sqrt_instruction_count == 1 &&
+		                patched.unrelocatable_memory_instruction_count == 0 &&
+		                (protect_memory ? patched.patched_memory_instruction_count > 0
+		                                : patched.patched_memory_instruction_count == 0),
+		      "instruction pass lost reciprocal root or memory patch coverage");
+#else
 		Check(test, Loader::X64InstructionEmulator::PatchReciprocalSquareRoots(mapping, code.getSize()) == 1,
 		      "instruction pass did not patch exactly one packed reciprocal root");
 		const auto* patched = reinterpret_cast<const uint8_t*>(mapping);
@@ -2631,11 +2709,18 @@ void TestPackedReciprocalSquareRoot() {
 			changed += original[i] != patched[i];
 		}
 		Check(test, changed == 1, "instruction pass changed unrelated code bytes");
-		Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize());
+		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
+		      "failed to flush patched instruction test code");
+#endif
 		const auto before = g_rsqrt_traps;
 		function(input.data(), output.data());
 		Check(test, g_rsqrt_traps == before + 1, "patched instruction did not execute its handler");
+		Check(test, red_zone_intact(), "patched instruction corrupted the guest red zone");
 		Check(test, output[0] == expected, "patched instruction read or wrote the wrong register");
+		if (destination != source) {
+			Check(test, std::equal(input.begin(), input.begin() + 4, output.begin() + 8),
+			      "source lower XMM lanes were corrupted");
+		}
 		if (source != 9) {
 			Check(test, refine(refine(std::bit_cast<float>(output[0]))) == 1.0f,
 			      "identity quaternion normalization drifted below one");
@@ -2668,6 +2753,7 @@ void TestPackedReciprocalSquareRoot() {
 				function(input.data(), output.data());
 				const auto result_mxcsr = _mm_getcsr();
 				_mm_setcsr(restore.mxcsr);
+				Check(test, red_zone_intact(), "special-value trap corrupted the guest red zone");
 				Check(test, result_mxcsr == mxcsr, "instruction changed MXCSR controls or exception flags");
 				Check(test, std::equal(output.begin(), output.begin() + 4, values.begin() + 4),
 				      "special values or round-independent reciprocal roots differ from ISA semantics");
@@ -2675,6 +2761,7 @@ void TestPackedReciprocalSquareRoot() {
 		}
 		input.fill(0x3f800000);
 	}
+#if defined(__linux__)
 	std::array<uint8_t, 16> unknown {0x0f, 0x0b};
 	ucontext_t context {};
 	context.uc_mcontext.gregs[REG_RIP] = reinterpret_cast<greg_t>(unknown.data());
@@ -2708,6 +2795,7 @@ void TestPackedReciprocalSquareRoot() {
 	Check(test, std::equal(sha_expected.begin(), sha_expected.end(), fpstate._xmm[8].element),
 	      "SHA emulation lost its memory operand or extended destination register");
 	emulate({0x0f, 0x01, 0xfa}, 3); // monitorx
+#endif
 	std::printf("[host]    %-48s ok\n", test);
 }
 #endif
@@ -2716,7 +2804,7 @@ void TestPackedReciprocalSquareRoot() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
-#if defined(__linux__)
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
 		RunTest(TestPackedReciprocalSquareRoot);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -2727,7 +2815,7 @@ int main(int argc, char** argv) {
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 
-#if defined(__linux__)
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPackedReciprocalSquareRoot);
 #endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
