@@ -1068,7 +1068,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
-		if (primitive_restart_enable || mesh.primitives_per_group == 0) {
+		static std::atomic_bool restart_warned = false;
+		if (primitive_restart_enable && !restart_warned.exchange(true, std::memory_order_relaxed)) {
+			std::printf("Warning: primitive restart is not implemented for mesh shaders; "
+			            "continuing draw (primitive=%u indexed=%u)\n",
+			            static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed());
+		}
+		if (mesh.primitives_per_group == 0) {
 			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
 			     static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed(), primitive_restart_enable);
 		}
