@@ -10,8 +10,12 @@
 #include "loader/redZonePatcher.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
+#include "loader/x64InstructionEmulator.h"
 
+#include <algorithm>
 #include <array>
+#include <bit>
+#include <cmath>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -21,8 +25,12 @@
 #include <vector>
 
 #if defined(__linux__)
+#include <csignal>
+#include <immintrin.h>
 #include <sys/uio.h>
+#include <ucontext.h>
 #include <unistd.h>
+#include <xbyak/xbyak.h>
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2538,15 +2546,190 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+#if defined(__linux__)
+volatile sig_atomic_t g_rsqrt_traps = 0;
+
+void ReciprocalSquareRootHandler(int, siginfo_t*, void* context) {
+	const auto host_mxcsr = _mm_getcsr();
+	_mm_setcsr(0x7fe1); // Exercise the handler under a distinct rounding mode and raised flags.
+	if (!Loader::X64InstructionEmulator::TryEmulate(context)) {
+		_exit(190);
+	}
+	if (_mm_getcsr() != 0x7fe1) {
+		_exit(191);
+	}
+	_mm_setcsr(host_mxcsr);
+	g_rsqrt_traps = g_rsqrt_traps + 1;
+}
+
+void TestPackedReciprocalSquareRoot() {
+	const char* test = "PackedReciprocalSquareRoot";
+	constexpr uint64_t code_size = 0x4000;
+	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x902000000, code_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "rsqrt_test");
+	Check(test, mapping != 0, "failed to allocate instruction test code");
+	struct RestoreState {
+		uint64_t mapping;
+		uint64_t size;
+		uint32_t mxcsr;
+		struct sigaction previous {};
+		bool installed = false;
+		~RestoreState() {
+			_mm_setcsr(mxcsr);
+			if (installed) {
+				sigaction(SIGILL, &previous, nullptr);
+			}
+			Libs::LibKernel::Memory::FreeGuestMemory(mapping, size);
+		}
+	} restore {mapping, code_size, _mm_getcsr()};
+	struct sigaction action {};
+	action.sa_sigaction = ReciprocalSquareRootHandler;
+	action.sa_flags = SA_SIGINFO;
+	sigemptyset(&action.sa_mask);
+	restore.installed = sigaction(SIGILL, &action, &restore.previous) == 0;
+	Check(test, restore.installed, "failed to install instruction handler");
+	using GuestFunction = void(KYTY_SYSV_ABI*)(const uint32_t*, uint32_t*);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	const auto refine = [](float estimate) {
+		return (estimate * 0.5f) * std::fma(-estimate, estimate, 3.0f);
+	};
+	std::array<uint32_t, 16> input {};
+	std::array<uint32_t, 16> output {};
+	input.fill(0x3f800000);
+	for (const auto registers: {std::array {2, 1}, std::array {10, 9}, std::array {1, 1}}) {
+		const auto destination = registers[0];
+		const auto source = registers[1];
+		input[0] = 0x3f800000;
+		uint32_t expected = 0x3f800000;
+		if (source == 9) {
+			input[0] = 0x40800000;
+			expected = 0x3f000000;
+		}
+		Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+		if (source == 9) {
+			code.vmovups(Xbyak::Ymm(1), code.ptr[code.rdi + 32]);
+		}
+		code.vmovups(Xbyak::Ymm(source), code.ptr[code.rdi]);
+		if (destination != source) {
+			code.vmovups(Xbyak::Ymm(destination), code.ptr[code.rdi + 32]);
+		}
+		code.vrsqrtps(Xbyak::Xmm(destination), Xbyak::Xmm(source));
+		code.vmovups(code.ptr[code.rsi], Xbyak::Ymm(destination));
+		code.vmovups(code.ptr[code.rsi + 32], Xbyak::Ymm(source));
+		code.vzeroupper();
+		code.ret();
+		const std::vector<uint8_t> original(code.getCode(), code.getCurr());
+		function(input.data(), output.data());
+		const float native = std::bit_cast<float>(output[0]);
+		Check(test, std::isfinite(native) && std::abs(native - std::bit_cast<float>(expected)) < 0.001f,
+		      "native reciprocal root is outside its error bound");
+		Check(test, Loader::X64InstructionEmulator::PatchReciprocalSquareRoots(mapping, code.getSize()) == 1,
+		      "instruction pass did not patch exactly one packed reciprocal root");
+		const auto* patched = reinterpret_cast<const uint8_t*>(mapping);
+		size_t changed = 0;
+		for (size_t i = 0; i < original.size(); ++i) {
+			changed += original[i] != patched[i];
+		}
+		Check(test, changed == 1, "instruction pass changed unrelated code bytes");
+		Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize());
+		const auto before = g_rsqrt_traps;
+		function(input.data(), output.data());
+		Check(test, g_rsqrt_traps == before + 1, "patched instruction did not execute its handler");
+		Check(test, output[0] == expected, "patched instruction read or wrote the wrong register");
+		if (source != 9) {
+			Check(test, refine(refine(std::bit_cast<float>(output[0]))) == 1.0f,
+			      "identity quaternion normalization drifted below one");
+		}
+		for (size_t i = 0; i < 4; ++i) {
+			Check(test, output[4 + i] == 0, "128-bit VEX destination retained upper YMM lanes");
+			const auto expected_upper = destination == source ? 0u : input[4 + i];
+			Check(test, output[12 + i] == expected_upper, "source upper YMM lanes were corrupted");
+		}
+		std::printf("[host]    rsqrt xmm%d,xmm%d native=%08x patched=%08x\n",
+		            destination, source, std::bit_cast<uint32_t>(native), output[0]);
+		if (destination != 2) {
+			continue;
+		}
+		constexpr std::array<std::array<uint32_t, 8>, 4> cases {{
+		    {0x00000000, 0x80000000, 0x00000001, 0x80000001,
+		     0x7f800000, 0xff800000, 0x7f800000, 0xff800000},
+		    {0x7f800000, 0xff800000, 0xbf800000, 0x7fc12345,
+		     0x00000000, 0xffc00000, 0xffc00000, 0x7fc12345},
+		    {0x7f812345, 0xff812345, 0x40800000, 0x40000000,
+		     0x7fc12345, 0xffc12345, 0x3f000000, 0x3f3504f3},
+		    {0x00800000, 0x7f7fffff, 0x3f800000, 0x41800000,
+		     0x5f000000, 0x1f800000, 0x3f800000, 0x3e800000},
+		}};
+		for (const auto& values: cases) {
+			std::copy_n(values.begin(), 4, input.begin());
+			for (uint32_t controls = 0; controls < 8; ++controls) {
+				const uint32_t mxcsr = 0x1fa1u | ((controls & 3u) << 13u) | ((controls & 4u) << 4u);
+				_mm_setcsr(mxcsr);
+				function(input.data(), output.data());
+				const auto result_mxcsr = _mm_getcsr();
+				_mm_setcsr(restore.mxcsr);
+				Check(test, result_mxcsr == mxcsr, "instruction changed MXCSR controls or exception flags");
+				Check(test, std::equal(output.begin(), output.begin() + 4, values.begin() + 4),
+				      "special values or round-independent reciprocal roots differ from ISA semantics");
+			}
+		}
+		input.fill(0x3f800000);
+	}
+	std::array<uint8_t, 16> unknown {0x0f, 0x0b};
+	ucontext_t context {};
+	context.uc_mcontext.gregs[REG_RIP] = reinterpret_cast<greg_t>(unknown.data());
+	Check(test, !Loader::X64InstructionEmulator::TryEmulate(&context), "unrecognized UD2 was swallowed");
+	_libc_fpstate fpstate {};
+	context.uc_mcontext.fpregs = &fpstate;
+	const auto emulate = [&](std::array<uint8_t, 16> instruction, size_t length) {
+		context.uc_mcontext.gregs[REG_RIP] = reinterpret_cast<greg_t>(instruction.data());
+		Check(test, Loader::X64InstructionEmulator::TryEmulate(&context), "existing instruction emulation was rejected");
+		Check(test, context.uc_mcontext.gregs[REG_RIP] == reinterpret_cast<greg_t>(instruction.data() + length),
+		      "existing instruction emulation advanced RIP incorrectly");
+	};
+	fpstate._xmm[8].element[0] = 0x1234;
+	fpstate._xmm[8].element[2] = 0xdeadbeef;
+	emulate({0x66, 0x41, 0x0f, 0x78, 0xc0, 8, 4}, 7); // extrq xmm8, 8, 4
+	Check(test, fpstate._xmm[8].element[0] == 0x23 && fpstate._xmm[8].element[2] == 0,
+	      "SSE4a extraction lost its extended register or upper-half semantics");
+	fpstate._xmm[8].element[0] = 0x1111;
+	fpstate._xmm[8].element[2] = 0xdeadbeef;
+	fpstate._xmm[9].element[0] = 0xab;
+	emulate({0xf2, 0x45, 0x0f, 0x78, 0xc1, 8, 4}, 7); // insertq xmm8, xmm9, 8, 4
+	Check(test, fpstate._xmm[8].element[0] == 0x1ab1 && fpstate._xmm[8].element[2] == 0xdeadbeef,
+	      "SSE4a insertion corrupted its destination lanes");
+	std::array<uint32_t, 8> sha_source {0, 0, 0, 0, 5, 6, 7, 8};
+	context.uc_mcontext.gregs[REG_RDI] = reinterpret_cast<greg_t>(sha_source.data());
+	for (uint32_t lane = 0; lane < 4; ++lane) {
+		fpstate._xmm[8].element[lane] = lane + 1;
+	}
+	emulate({0x44, 0x0f, 0x38, 0xc9, 0x47, 0x10}, 6); // sha1msg1 xmm8, [rdi+16]
+	constexpr std::array<uint32_t, 4> sha_expected {6, 10, 2, 6};
+	Check(test, std::equal(sha_expected.begin(), sha_expected.end(), fpstate._xmm[8].element),
+	      "SHA emulation lost its memory operand or extended destination register");
+	emulate({0x0f, 0x01, 0xfa}, 3); // monitorx
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+#if defined(__linux__)
+	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
+		RunTest(TestPackedReciprocalSquareRoot);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 
+#if defined(__linux__)
+	RunTest(TestPackedReciprocalSquareRoot);
+#endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);

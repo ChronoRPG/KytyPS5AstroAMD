@@ -2089,6 +2089,14 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			                     mode == Common::VirtualMemory::Mode::NoAccess);
 
 			if (Common::VirtualMemory::IsExecute(mode)) {
+				const auto reciprocal_sqrt_count =
+				    X64InstructionEmulator::PatchReciprocalSquareRoots(segment_addr,
+				                                                        segment_file_size);
+				if (reciprocal_sqrt_count != 0) {
+					LOGF("Guest VRSQRTPS emulation: %s, instructions=%" PRIu64 "\n",
+					     Common::PathToString(program->file_name.filename()).c_str(),
+					     reciprocal_sqrt_count);
+				}
 				PatchProgram(program, segment_addr, segment_memory_size);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 				if (use_red_zone_protection) {
