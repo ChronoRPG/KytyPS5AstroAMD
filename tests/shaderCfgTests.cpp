@@ -4130,6 +4130,56 @@ void CheckNewDecoderUnsupported(const uint32_t *shader, uint32_t words,
 #endif
 }
 
+void TestScalarAshrI64Decoder() {
+  using namespace ShaderRecompiler::Decoder;
+
+  const uint32_t shader[] = {
+      0x91860204u, // s_ashr_i64 s[6:7], s[4:5], s2
+      EncodeSop2(0x23, 8, 255, 129), 0xfffffffeu,
+      EncodeSop2(0x23, 10, 8, 255), 0xffffffffu,
+      EncodeSop2(0x23, 12, 255, 255), 0xffffffc0u,
+      EncodeSopp(0x01),
+  };
+  Program program;
+  ShaderRecompiler::Decoder::DecodeProgram(shader, program);
+  Check(program.instructions.size() == 5u,
+        "S_ASHR_I64 decoder lost instruction boundaries around literals");
+  const auto &reg = program.instructions[0];
+  Check(reg.family == Family::SOP2 && reg.opcode == Opcode::S_ASHR_I64 &&
+            reg.opcode_id == 0x23u && reg.pc == 0u && reg.word_count == 1u &&
+            reg.src_count == 2u && reg.dst.kind == OperandKind::Sgpr &&
+            reg.dst.reg == 6u && reg.src0.kind == OperandKind::Sgpr &&
+            reg.src0.reg == 4u && reg.src1.kind == OperandKind::Sgpr &&
+            reg.src1.reg == 2u,
+        "S_ASHR_I64 register encoding was decoded incorrectly");
+  const auto &source_literal = program.instructions[1];
+  const auto &count_literal = program.instructions[2];
+  const auto &shared_literal = program.instructions[3];
+  for (const auto *inst : {&source_literal, &count_literal, &shared_literal}) {
+    Check(inst->opcode == Opcode::S_ASHR_I64 && inst->word_count == 2u &&
+              inst->src_count == 2u,
+          "S_ASHR_I64 literal encoding was decoded incorrectly");
+  }
+  Check(source_literal.pc == 4u &&
+            source_literal.src0.kind == OperandKind::LiteralConstant &&
+            source_literal.src0.value == 0xfffffffeu &&
+            source_literal.src1.kind == OperandKind::IntegerInlineConstant &&
+            source_literal.src1.value == 1u && count_literal.pc == 12u &&
+            count_literal.src1.kind == OperandKind::LiteralConstant &&
+            count_literal.src1.value == 0xffffffffu &&
+            shared_literal.pc == 20u &&
+            shared_literal.src0.kind == OperandKind::LiteralConstant &&
+            shared_literal.src1.kind == OperandKind::LiteralConstant &&
+            shared_literal.src0.value == 0xffffffc0u &&
+            shared_literal.src1.value == 0xffffffc0u &&
+            program.instructions[4].pc == 28u &&
+            program.instructions[4].opcode == Opcode::S_ENDPGM,
+        "S_ASHR_I64 decoder mishandled source, count, or shared literals");
+  Check(Common::ContainsStr(ProgramToString(program),
+                            "S_ASHR_I64 s6, s4, s2"),
+        "S_ASHR_I64 is missing from the decoded dump");
+}
+
 void TestNewShaderDecoderArchitecture() {
   using namespace ShaderRecompiler::Decoder;
 
@@ -13493,6 +13543,7 @@ int main() {
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
+  TestScalarAshrI64Decoder();
   TestNewShaderDecoderArchitecture();
   TestImageAddressOperands();
   TestSopkCompareImmediateExtension();

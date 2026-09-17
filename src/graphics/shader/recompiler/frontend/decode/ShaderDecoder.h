@@ -106,6 +106,7 @@ enum class Opcode {
 	S_LSHR_B32,
 	S_LSHR_B64,
 	S_ASHR_I32,
+	S_ASHR_I64,
 	S_MUL_I32,
 	S_MUL_HI_U32,
 	S_MUL_HI_I32,
