@@ -10,7 +10,7 @@ namespace Loader {
 constexpr char LIB_PREFIX[] = "libSce";
 
 static std::string UpdateName(const std::string& str) {
-	return Common::StartsWith(str, LIB_PREFIX) ? Common::RemoveFirst(str, 6) : str;
+	return str.starts_with(LIB_PREFIX) ? Common::RemoveFirst(str, 6) : str;
 }
 
 std::string SymbolDatabase::GenerateName(const SymbolResolve& s) {
@@ -70,7 +70,7 @@ const SymbolRecord* SymbolDatabase::FindByNid(const std::string& nid, SymbolType
 	auto suffix = fmt::format("[{}]", magic_enum::enum_name(type));
 
 	for (const auto& symbol: m_symbols) {
-		if (Common::StartsWith(symbol.name, prefix) && Common::EndsWith(symbol.name, suffix)) {
+		if (symbol.name.starts_with(prefix) && symbol.name.ends_with(suffix)) {
 			return &symbol;
 		}
 	}
@@ -83,7 +83,7 @@ const SymbolRecord* SymbolDatabase::FindByName(const std::string& name, SymbolTy
 	auto suffix = fmt::format("[{}]", magic_enum::enum_name(type));
 
 	for (const auto& symbol: m_symbols) {
-		if (Common::StartsWith(symbol.name, prefix) && Common::EndsWith(symbol.name, suffix)) {
+		if (symbol.name.starts_with(prefix) && symbol.name.ends_with(suffix)) {
 			return &symbol;
 		}
 	}

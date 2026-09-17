@@ -191,7 +191,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		}
 #endif
 
-		if (!Common::StartsWith(arg, "--")) {
+		if (!arg.starts_with("--")) {
 			::printf("game input must be provided with --game\n");
 			return false;
 		}

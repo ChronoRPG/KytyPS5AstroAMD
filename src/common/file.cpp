@@ -251,8 +251,8 @@ void File::Printf(const char* format, ...) {
 
 bool File::IsDirectoryExisting(const std::filesystem::path& path) {
 	auto path_str = PathToGenericString(path);
-	return SysFileIsDirectoryExisting(
-	    Common::EndsWith(path_str, "/") ? Common::RemoveLast(path_str, 1) : path_str);
+	return SysFileIsDirectoryExisting(path_str.ends_with("/") ? Common::RemoveLast(path_str, 1)
+	                                                          : path_str);
 }
 
 bool File::IsFileExisting(const std::filesystem::path& name) {
@@ -263,14 +263,14 @@ bool File::CreateDirectory(
     const std::filesystem::path& path) // @suppress("Member declaration not found")
 {
 	auto path_str = PathToGenericString(path);
-	return SysFileCreateDirectory(Common::EndsWith(path_str, "/") ? Common::RemoveLast(path_str, 1)
-	                                                              : path_str);
+	return SysFileCreateDirectory(path_str.ends_with("/") ? Common::RemoveLast(path_str, 1)
+	                                                      : path_str);
 }
 
 bool File::DeleteDirectory(const std::filesystem::path& path) {
 	auto path_str = PathToGenericString(path);
-	return SysFileDeleteDirectory(Common::EndsWith(path_str, "/") ? Common::RemoveLast(path_str, 1)
-	                                                              : path_str);
+	return SysFileDeleteDirectory(path_str.ends_with("/") ? Common::RemoveLast(path_str, 1)
+	                                                      : path_str);
 }
 
 bool File::CreateDirectories(const std::filesystem::path& path) {
@@ -283,7 +283,7 @@ bool File::CreateDirectories(const std::filesystem::path& path) {
 	for (uint32_t si = 0; si < list.size(); si++) {
 		const std::string& s = list[si];
 
-		if (si != 0 || Common::StartsWith(real_path, "/")) {
+		if (si != 0 || real_path.starts_with("/")) {
 			p += "/";
 		}
 
@@ -313,7 +313,7 @@ bool File::DeleteDirectories(const std::filesystem::path& path) {
 	for (uint32_t si = 0; si < list.size(); si++) {
 		const std::string& s = list[si];
 
-		if (si != 0 || Common::StartsWith(real_path, "/")) {
+		if (si != 0 || real_path.starts_with("/")) {
 			p += "/";
 		}
 
@@ -478,7 +478,7 @@ std::vector<File::FindInfo> File::FindFiles(const std::filesystem::path& path) {
 	auto     path_str = PathToGenericString(path);
 	uint32_t len      = static_cast<uint32_t>(path_str.size());
 
-	if (!Common::EndsWith(path_str, "/") && !Common::EndsWith(path_str, "\\")) {
+	if (!path_str.ends_with("/") && !path_str.ends_with("\\")) {
 		len++;
 	}
 

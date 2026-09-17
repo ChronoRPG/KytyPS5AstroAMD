@@ -301,9 +301,9 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 	if (record_id < g_stubbed_imports.size()) {
 		auto& record = g_stubbed_imports[record_id];
 		auto  nid    = record.name;
-		auto  pos    = Common::FindIndex(nid, "[");
-		if (Common::IndexValid(nid, pos)) {
-			nid = Common::Left(nid, pos);
+		auto  pos    = nid.find('[');
+		if (pos != std::string::npos) {
+			nid.resize(pos);
 		}
 
 		SymbolRecord resolved {};
@@ -1088,7 +1088,7 @@ static void RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	}
 
 	if (program->dbg_print_reloc) {
-		if (/* !dbg_str.ContainsStr("libc_") && */ patched && !ri.bind_self &&
+		if (patched && !ri.bind_self &&
 		    (ri.bind == BindType::Global || ri.bind == BindType::Weak ||
 		     ri.type == SymbolType::TlsModule)) {
 			auto dbg_str = fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value,
@@ -1390,9 +1390,8 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 		Libs::LibKernel::SetProgName(elf_name.filename().string());
 	}
 
-	if (Common::EndsWith(Common::ToLower(Common::DirectoryWithoutFilename(
-	                         Common::PathToGenericString(elf_name))),
-	                     "_module/")) {
+	if (Common::ToLower(Common::DirectoryWithoutFilename(Common::PathToGenericString(elf_name)))
+	        .ends_with("_module/")) {
 		program->fail_if_global_not_resolved = false;
 	}
 
@@ -1818,7 +1817,7 @@ void RuntimeLinker::StopAllModules() {
 
 static bool IsAdjacentModuleFile(const std::string& name) {
 	auto lower = Common::ToLower(name);
-	return Common::EndsWith(lower, ".prx") || Common::EndsWith(lower, ".sprx");
+	return lower.ends_with(".prx") || lower.ends_with(".sprx");
 }
 
 static bool SkipAdjacentModuleFile(const std::string& name) {
