@@ -1465,7 +1465,7 @@ LIB_DEFINE(InitNet_1_NpManager) {
 	LIB_FUNC("Ec63y59l9tw", NpManager::NpSetNpTitleId);
 	LIB_FUNC("A2CQ3kgSopQ", NpManager::NpSetContentRestriction);
 	LIB_FUNC("VfRSmPmj8Q8", NpManager::NpRegisterStateCallback);
-	LIB_FUNC("qQJfO8HAiaY", NpManager::NpRegisterStateCallback);
+	LIB_FUNC("qQJfO8HAiaY", NpManager::NpRegisterStateCallbackA);
 	LIB_FUNC("M3wFXbYQtAA", NpManager::NpUnregisterStateCallback);
 	LIB_FUNC("uFJpaKNBAj4", NpManager::NpRegisterGamePresenceCallback);
 	LIB_FUNC("GImICnh+boA", NpManager::NpRegisterPlusEventCallback);

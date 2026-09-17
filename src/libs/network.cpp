@@ -23,6 +23,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
@@ -3370,14 +3371,24 @@ struct NpCheckPremiumResult {
 	uint8_t reserved[32];
 };
 
-constexpr int np_error_invalid_argument  = -2141913085; /* 0x80550003 */
-constexpr int np_error_signed_out        = -2141913082; /* 0x80550006 */
-constexpr int np_error_invalid_size      = -2141913071; /* 0x80550011 */
-constexpr int np_error_aborted           = -2141913070; /* 0x80550012 */
-constexpr int np_error_request_max       = -2141913069; /* 0x80550013 */
-constexpr int np_error_request_not_found = -2141913068; /* 0x80550014 */
-constexpr int np_error_invalid_id        = -2141913067; /* 0x80550015 */
-constexpr int np_request_max             = 128;
+constexpr int      np_error_invalid_argument            = -2141913085; /* 0x80550003 */
+constexpr int      np_error_signed_out                  = -2141913082; /* 0x80550006 */
+constexpr int      np_error_callback_already_registered = -2141913080; /* 0x80550008 */
+constexpr int      np_error_invalid_size                = -2141913071; /* 0x80550011 */
+constexpr int      np_error_aborted                     = -2141913070; /* 0x80550012 */
+constexpr int      np_error_request_max                 = -2141913069; /* 0x80550013 */
+constexpr int      np_error_request_not_found           = -2141913068; /* 0x80550014 */
+constexpr int      np_error_invalid_id                  = -2141913067; /* 0x80550015 */
+constexpr int      np_request_max                       = 128;
+constexpr uint32_t np_state_signed_out                  = 1;
+
+struct NpStateCallback {
+	NpStateCallbackA callback = nullptr;
+	void*            userdata = nullptr;
+	bool             pending  = false;
+};
+
+static std::vector<NpStateCallback> g_np_state_callbacks;
 
 enum class NpRequestState {
 	Free,
@@ -3448,6 +3459,17 @@ static int np_complete_signed_out_locked(NpRequest* request) {
 int KYTY_SYSV_ABI NpCheckCallback() {
 	PRINT_NAME();
 
+	std::vector<NpStateCallback> pending;
+	for (auto& entry: g_np_state_callbacks) {
+		if (entry.pending) {
+			pending.push_back(entry);
+			entry.pending = false;
+		}
+	}
+	for (const auto& entry: pending) {
+		entry.callback(Config::GetUserId(), np_state_signed_out, entry.userdata);
+	}
+
 	return OK;
 }
 
@@ -3494,6 +3516,21 @@ int KYTY_SYSV_ABI NpUnregisterStateCallback() {
 	PRINT_NAME();
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI NpRegisterStateCallbackA(NpStateCallbackA callback, void* userdata) {
+	PRINT_NAME();
+
+	if (callback == nullptr) {
+		return np_error_invalid_argument;
+	}
+	for (const auto& entry: g_np_state_callbacks) {
+		if (entry.callback == callback) {
+			return np_error_callback_already_registered;
+		}
+	}
+	g_np_state_callbacks.push_back({callback, userdata, true});
+	return static_cast<int>(g_np_state_callbacks.size());
 }
 
 void KYTY_SYSV_ABI NpRegisterGamePresenceCallback(void* /*callback*/, void* /*userdata*/) {
@@ -3801,7 +3838,7 @@ int KYTY_SYSV_ABI NpGetState(int user_id, uint32_t* state) {
 
 	LOGF("\t user_id = %d\n", user_id);
 
-	*state = 1; // Signed out
+	*state = np_state_signed_out;
 
 	return OK;
 }
