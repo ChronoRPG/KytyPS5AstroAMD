@@ -48,12 +48,16 @@ namespace {
 }
 
 [[nodiscard]] vk::ImageUsageFlags ImageUsageFlags(GraphicContext& graphics, const ImageInfo& info) {
+	auto usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	if (info.IsBlock()) {
-		return vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
-		       vk::ImageUsageFlagBits::eSampled;
+		usage |= vk::ImageUsageFlagBits::eSampled;
+		if (graphics.supports_block_texel_view) {
+			// Uncompressed block views use storage access; ExtendedUsage permits their formats.
+			usage |= vk::ImageUsageFlagBits::eStorage;
+		}
+		return usage;
 	}
 	const auto properties = graphics.GetFormatProperties(info.pixel_format);
-	auto       usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eSampledImage)) {
 		usage |= vk::ImageUsageFlagBits::eSampled;
 	}
