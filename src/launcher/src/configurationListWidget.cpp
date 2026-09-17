@@ -862,8 +862,7 @@ void ConfigurationListWidget::show_context_menu(const QPoint& pos) {
 	const bool has_trophy_data =
 	    item != nullptr && TrophyViewerDialog::HasTrophyData(&item->GetInfo());
 
-	QAction* action_run = menu.addAction(tr("Run"));
-	connect(action_run, &QAction::triggered, this, &ConfigurationListWidget::Run);
+	QAction* action_run = menu.addAction(tr("Run"), this, SIGNAL(Run()));
 	QAction* action_open_folder =
 	    menu.addAction(style()->standardIcon(QStyle::SP_DirOpenIcon), tr("Open game folder"), this,
 	                   SLOT(open_game_folder()));

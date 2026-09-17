@@ -10,10 +10,6 @@
 #include <algorithm>
 #include <array>
 #include <bit>
-#include <fmt/format.h>
-#include <fmt/ranges.h>
-#include <string>
-#include <vector>
 
 namespace Libs::Graphics {
 
@@ -1323,13 +1319,8 @@ void TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t 
 		return;
 	}
 	if (total_size != nullptr && total_size->size == 0) {
-		std::vector<std::string> list;
-		list.push_back(fmt::format("format = {}", static_cast<uint32_t>(format)));
-		list.push_back(fmt::format("width  = {}", width));
-		list.push_back(fmt::format("height = {}", height));
-		list.push_back(fmt::format("levels = {}", levels));
-		list.push_back(fmt::format("tile   = {}", static_cast<uint32_t>(tile)));
-		EXIT("unknown format:\n%s\n", fmt::format("{}", fmt::join(list, "\n")));
+		EXIT("unknown format:\nformat = %u\nwidth  = %u\nheight = %u\nlevels = %u\ntile   = %u\n",
+		     static_cast<uint32_t>(format), width, height, levels, static_cast<uint32_t>(tile));
 	}
 }
 
