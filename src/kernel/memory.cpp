@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -3879,10 +3880,6 @@ static bool IsAligned(uint64_t value, uint64_t alignment) {
 	return alignment == 0 || (value & (alignment - 1u)) == 0;
 }
 
-static bool IsPowerOfTwo(uint64_t value) {
-	return value != 0 && (value & (value - 1u)) == 0;
-}
-
 static void MemoryPoolSubtractCommitted(uint64_t len) {
 	auto current = g_memory_pool_committed.load(std::memory_order_relaxed);
 	while (current != 0) {
@@ -3904,7 +3901,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolExpand(int64_t search_start, int64_t search_en
 	if (search_start < 0 || search_end <= search_start || len == 0 ||
 	    (len & (POOL_PAGE_SIZE - 1u)) != 0 || phys_addr_out == nullptr ||
 	    (alignment != 0 &&
-	     (!IsPowerOfTwo(alignment) || (alignment & (POOL_PAGE_SIZE - 1u)) != 0))) {
+	     (!std::has_single_bit(alignment) || (alignment & (POOL_PAGE_SIZE - 1u)) != 0))) {
 		return KERNEL_ERROR_EINVAL;
 	}
 	if (static_cast<uint64_t>(search_end - search_start) < len) {
@@ -3953,7 +3950,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolReserve(void* addr_in, size_t len, size_t alig
 		return KERNEL_ERROR_EINVAL;
 	}
 	if (alignment != 0 &&
-	    (!IsPowerOfTwo(alignment) || !IsAligned(alignment, POOL_RESERVE_ALIGNMENT))) {
+	    (!std::has_single_bit(alignment) || !IsAligned(alignment, POOL_RESERVE_ALIGNMENT))) {
 		return KERNEL_ERROR_EINVAL;
 	}
 

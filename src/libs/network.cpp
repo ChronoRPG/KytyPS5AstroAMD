@@ -3103,17 +3103,10 @@ static HostNetworkInfo QueryHostNetworkInfo() {
 #endif
 }
 
-[[maybe_unused]] static bool HostNetworkConnected() {
-	return QueryHostNetworkInfo().connected;
-}
-
 static bool NetCtlConnected() {
 	if (!g_net_ctl_status_initialized.load()) {
-		// g_net_ctl_connected          = HostNetworkConnected();
 		g_net_ctl_connected          = false;
 		g_net_ctl_status_initialized = true;
-		// LOGF("\t host network connected = %s\n", (g_net_ctl_connected.load() ? "true" :
-		// "false"));
 		LOGF("\t host network connected = false (forced offline)\n");
 	}
 
@@ -3123,10 +3116,8 @@ static bool NetCtlConnected() {
 int KYTY_SYSV_ABI NetCtlInit() {
 	PRINT_NAME();
 
-	// g_net_ctl_connected = HostNetworkConnected();
 	g_net_ctl_connected          = false;
 	g_net_ctl_status_initialized = true;
-	// LOGF("\t host network connected = %s\n", (g_net_ctl_connected.load() ? "true" : "false"));
 	LOGF("\t host network connected = false (forced offline)\n");
 
 	return OK;

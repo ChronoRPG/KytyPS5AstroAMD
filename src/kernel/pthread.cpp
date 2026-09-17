@@ -1202,13 +1202,6 @@ static int32_t GetDstSeconds() {
 #endif
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-static void sec_to_timeval(KernelTimeval* ts, double sec) {
-	ts->tv_sec  = static_cast<int64_t>(sec);
-	ts->tv_usec = static_cast<int64_t>((sec - static_cast<double>(ts->tv_sec)) * 1000000.0);
-}
-#endif
-
 static bool GetPosixClockId(KernelClockid clock_id, clockid_t* out) {
 	EXIT_IF(out == nullptr);
 
