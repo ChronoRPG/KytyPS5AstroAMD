@@ -2,7 +2,6 @@
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
-#include "common/magicEnum.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -12,6 +11,7 @@
 #include <charconv>
 #include <cstdio>
 #include <fmt/format.h>
+#include <magic_enum.hpp>
 
 using namespace Common;
 using namespace Emulator;

@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "common/magicEnum.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -17,6 +16,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <magic_enum.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -2324,8 +2324,8 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 	     "\t flags    = 0x%08" PRIx32 "\n"
 	     "\t name     = %s\n"
 	     "\t gpu_mode = %s\n",
-	     in_addr, out_addr, len, Common::EnumName(mode).c_str(), static_cast<uint32_t>(flags), name,
-	     Common::EnumName(gpu_mode).c_str());
+	     in_addr, out_addr, len, magic_enum::enum_name(mode), static_cast<uint32_t>(flags), name,
+	     magic_enum::enum_name(gpu_mode));
 
 	MapGpuRange(out_addr, len);
 
@@ -3041,8 +3041,8 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 	     "\t shared   = %s\n"
 	     "\t reason   = %s\n",
 	     in_addr, out_addr, static_cast<uint64_t>(direct_memory_start), len,
-	     Common::EnumName(mode).c_str(), static_cast<uint32_t>(flags), alignment,
-	     Common::EnumName(gpu_mode).c_str(), shared_backing ? "yes" : "no", shared_reason);
+	     magic_enum::enum_name(mode), static_cast<uint32_t>(flags), alignment,
+	     magic_enum::enum_name(gpu_mode), shared_backing ? "yes" : "no", shared_reason);
 
 	if (out_addr == 0) {
 		if (consumed_reservation) {
@@ -3305,7 +3305,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 			           "\t reserve-fixed replace: backend unmap failed at 0x%016" PRIx64
 			           ", size=0x%016" PRIx64 ", type=%s\n",
 			           chunk.range.start, chunk.range.size,
-			           Common::EnumName(chunk.range.type).c_str());
+			           magic_enum::enum_name(chunk.range.type));
 			if (!restore_chunks()) {
 				EXIT("reserve-fixed backend-unmap rollback failed\n");
 			}
@@ -3769,7 +3769,7 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	}
 	g_virtual_ranges->Protect(aligned_addr, aligned_len, prot);
 
-	LOGF("\t prot: %s -> %s\n", Common::EnumName(old_mode).c_str(), Common::EnumName(mode).c_str());
+	LOGF("\t prot: %s -> %s\n", magic_enum::enum_name(old_mode), magic_enum::enum_name(mode));
 
 	return OK;
 }
