@@ -9,6 +9,17 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
+static IR::DppMoveFlags DppFlags(const Decoder::Operand& operand) {
+	return {
+	    .control        = operand.dpp_ctrl,
+	    .row_mask       = operand.dpp_row_mask,
+	    .bank_mask      = operand.dpp_bank_mask,
+	    .fetch_inactive = operand.dpp_fetch_inactive,
+	    .bound_control  = operand.dpp_bound_ctrl,
+	    .dpp8           = operand.dpp8,
+	};
+}
+
 const Decoder::Operand& Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
 	switch (index) {
 		case 0: return inst.src0;
@@ -30,6 +41,7 @@ Decoder::Operand Translator::DestinationOperand(const Decoder::Instruction& inst
 			continue;
 		}
 		destination.dpp                = true;
+		destination.dpp8               = source.dpp8;
 		destination.dpp_ctrl           = source.dpp_ctrl;
 		destination.dpp_row_mask       = source.dpp_row_mask;
 		destination.dpp_bank_mask      = source.dpp_bank_mask;
@@ -106,6 +118,7 @@ Decoder::Operand Translator::PlainOperand(const Decoder::Operand& operand) {
 	result.dpp_fetch_inactive = false;
 	result.dpp_bound_ctrl     = false;
 	result.dpp                = false;
+	result.dpp8               = false;
 	return result;
 }
 
@@ -167,14 +180,8 @@ IR::U32 Translator::ReadScalarCode(uint32_t code) {
 
 IR::U32 Translator::ApplyBitSourceModifiers(const Decoder::Operand& operand, IR::U32 value) {
 	if (operand.dpp) {
-		const IR::DppMoveFlags flags {
-		    .control        = static_cast<uint16_t>(operand.dpp_ctrl),
-		    .row_mask       = static_cast<uint8_t>(operand.dpp_row_mask),
-		    .bank_mask      = static_cast<uint8_t>(operand.dpp_bank_mask),
-		    .fetch_inactive = operand.dpp_fetch_inactive,
-		    .bound_control  = operand.dpp_bound_ctrl,
-		};
-		value = IR::U32(ir.Emit(IR::ValueOpcode::DppMoveU32, {value, ir.GetExec()}, flags));
+		value =
+		    IR::U32(ir.Emit(IR::ValueOpcode::DppMoveU32, {value, ir.GetExec()}, DppFlags(operand)));
 	}
 	if (operand.sdwa_sel != 6u) {
 		uint32_t offset = 0;
@@ -301,15 +308,8 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 			const auto reg = static_cast<IR::VectorReg>(operand.reg);
 			const auto old = ir.GetVectorReg(reg);
 			if (operand.dpp) {
-				const IR::DppMoveFlags flags {
-				    .control        = static_cast<uint16_t>(operand.dpp_ctrl),
-				    .row_mask       = static_cast<uint8_t>(operand.dpp_row_mask),
-				    .bank_mask      = static_cast<uint8_t>(operand.dpp_bank_mask),
-				    .fetch_inactive = operand.dpp_fetch_inactive,
-				    .bound_control  = operand.dpp_bound_ctrl,
-				};
-				value = IR::U32(
-				    ir.Emit(IR::ValueOpcode::DppUpdateU32, {value, old, ir.GetExec()}, flags));
+				value = IR::U32(ir.Emit(IR::ValueOpcode::DppUpdateU32, {value, old, ir.GetExec()},
+				                        DppFlags(operand)));
 			} else {
 				value = ir.Select(ir.GetExec(), value, old);
 			}

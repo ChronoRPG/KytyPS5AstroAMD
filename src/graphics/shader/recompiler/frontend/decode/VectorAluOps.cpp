@@ -682,10 +682,15 @@ void DecodeVop1Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 	ReadLiteralOperands(code, word_index, inst);
 }
 
-void ApplyDppModifier(Operand& operand, uint32_t modifier) {
+void ApplyDppModifier(Operand& operand, uint32_t modifier, uint32_t encoding) {
+	operand.dpp = true;
+	if (encoding == 233u) {
+		operand.dpp8     = true;
+		operand.dpp_ctrl = modifier >> 8u;
+		return;
+	}
 	operand.negate             = ((modifier >> 20u) & 0x1u) != 0u;
 	operand.absolute           = ((modifier >> 21u) & 0x1u) != 0u;
-	operand.dpp                = true;
 	operand.dpp_ctrl           = (modifier >> 8u) & 0x1ffu;
 	operand.dpp_fetch_inactive = ((modifier >> 18u) & 0x1u) != 0u;
 	operand.dpp_bound_ctrl     = ((modifier >> 19u) & 0x1u) != 0u;
@@ -706,7 +711,7 @@ void DecodeVop1Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 		DecodeVectorGpr(vdst, inst.dst);
 	}
 	DecodeScalarSource(src0 + 256u, pc, inst.src0);
-	ApplyDppModifier(inst.src0, modifier);
+	ApplyDppModifier(inst.src0, modifier, code[word_index] & 0x1ffu);
 	inst.src_count = 1;
 
 	if (!IsVop1FloatSourceOpcode(inst.opcode) && (inst.src0.negate || inst.src0.absolute)) {
@@ -1044,7 +1049,7 @@ void DecodeVop2Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	DecodeVectorGpr(vdst, inst.dst);
 	DecodeVectorGpr(vsrc1, inst.src1);
 	DecodeScalarSource(src0 + 256u, pc, inst.src0);
-	ApplyDppModifier(inst.src0, modifier);
+	ApplyDppModifier(inst.src0, modifier, code[word_index] & 0x1ffu);
 	inst.src1.negate       = ((modifier >> 22u) & 0x1u) != 0u;
 	inst.src1.absolute     = ((modifier >> 23u) & 0x1u) != 0u;
 	const bool packed_fmac = inst.opcode == Opcode::V_PK_FMAC_F16;
@@ -1153,7 +1158,7 @@ void DecodeVopcDpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	DecodeVectorGpr(vsrc1, inst.src1);
 	DecodeScalarSource(src0 + 256u, pc, inst.src0);
 	inst.dst.kind = IsVopcCompareExec(inst.opcode) ? OperandKind::ExecLo : OperandKind::VccLo;
-	ApplyDppModifier(inst.src0, modifier);
+	ApplyDppModifier(inst.src0, modifier, code[word_index] & 0x1ffu);
 	inst.src1.negate   = ((modifier >> 22u) & 0x1u) != 0u;
 	inst.src1.absolute = ((modifier >> 23u) & 0x1u) != 0u;
 	inst.src_count     = 2;
@@ -1508,6 +1513,7 @@ void DecodeVop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		return;
 	}
 	switch (src0) {
+		case 233u: DecodeVop1Dpp(pc, code, word_index, opcode, vdst, inst); return;
 		case 249u: DecodeVop1Sdwa(pc, code, word_index, opcode, vdst, inst); return;
 		case 250u: DecodeVop1Dpp(pc, code, word_index, opcode, vdst, inst); return;
 		default: break;

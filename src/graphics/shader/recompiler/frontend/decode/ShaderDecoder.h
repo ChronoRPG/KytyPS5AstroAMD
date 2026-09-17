@@ -667,6 +667,7 @@ struct Operand {
 	bool     absolute           = false;
 	bool     clamp              = false;
 	bool     dpp                = false;
+	bool     dpp8               = false;
 };
 
 struct Instruction {

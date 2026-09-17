@@ -19697,6 +19697,62 @@ TestCase VectorPermlane16FetchInactiveFi() {
   return test;
 }
 
+TestCase VectorDpp8Captured(bool masked_exec) {
+  using O = ShaderOpcode;
+  constexpr u32 sentinel = 0xaaaaaaaau;
+  const u32 masks[] = {masked_exec ? 0x0f0f0f0fu : 0xffffffffu,
+                      masked_exec ? 0xf0f0f0f0u : 0xffffffffu};
+  std::vector<u32> code;
+  AppendVMovU32(&code, 5, 100);
+  code.push_back(EncodeVop2(0x25, 5, Vgpr(0), 5));
+  AppendVMovLiteral(&code, 2, sentinel);
+  AppendVMovLiteral(&code, 3, sentinel);
+  AppendSMovLiteral(&code, 126, masks[0]);
+  AppendSMovLiteral(&code, 127, masks[1]);
+  // Captured DPP8 selectors broadcast each group's upper/lower four lanes.
+  code.push_back(EncodeVop1(0x01, 2, 233));
+  code.push_back(0xfacfac05u);
+  code.push_back(EncodeVop1(0x01, 3, 233));
+  code.push_back(0x68868805u);
+  AppendSMovLiteral(&code, 126, 0xffffffffu);
+  AppendSMovLiteral(&code, 127, 0xffffffffu);
+  code.push_back(EncodeVop2(0x1a, 6, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 6);
+  AppendVMovU32(&code, 7, 64u * sizeof(u32));
+  code.push_back(EncodeVop2(0x25, 6, Vgpr(7), 6));
+  AppendBufferStoreDword(&code, 3, 6);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = masked_exec ? "VectorDpp8CapturedMaskedExec"
+                          : "VectorDpp8Captured";
+  test.code = std::move(code);
+  test.expected.resize(128, sentinel);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    const auto mask = masks[lane / 32u];
+    if ((mask & (1u << (lane % 32u))) == 0) {
+      continue;
+    }
+    const u32 sources[] = {(lane & ~7u) | 4u | (lane & 3u),
+                           (lane & ~7u) | (lane & 3u)};
+    for (u32 permutation = 0; permutation < 2; ++permutation) {
+      const auto source = sources[permutation];
+      test.expected[permutation * 64u + lane] =
+          (mask & (1u << (source % 32u))) != 0 ? 100u + source : 0u;
+    }
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{".dpp8(", 2}};
+  test.compute_info.wave_size = 64;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorDppQuadPermuteReverse() {
   using O = ShaderOpcode;
 
@@ -26871,6 +26927,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorPermlanex16);
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);
+  cases.push_back(VectorDpp8Captured(false));
+  cases.push_back(VectorDpp8Captured(true));
   AddCase(VectorDppQuadPermuteReverse);
   AddCase(VectorDppRowXmask);
   AddCase(VectorDppBankMaskPreservesDestination);
@@ -31570,6 +31628,16 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--dpp-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorDpp8Captured(false));
+    RunCase(&vulkan, VectorDpp8Captured(true));
+    RunCase(&vulkan, VectorDppQuadPermuteReverse());
+    RunCase(&vulkan, VectorDppRowXmask());
+    RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
+    RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-snorm-store-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferStoreFormatXyzwSnorm16CapturedSkinningVectors());
