@@ -1,7 +1,6 @@
 #ifndef KYTY_COMMON_STRING_UTILS_H_
 #define KYTY_COMMON_STRING_UTILS_H_
 
-#include "common/byteBuffer.h"
 #include "common/common.h"
 
 #include <algorithm>
@@ -9,7 +8,6 @@
 #include <charconv>
 #include <codecvt>
 #include <filesystem>
-#include <fmt/format.h>
 #include <locale>
 #include <string>
 #include <string_view>
@@ -151,21 +149,6 @@ inline std::vector<std::string> Split(std::string_view text, char sep, bool keep
 	return Split(text, std::string_view(&sep, 1), keep_empty);
 }
 
-inline std::string Concat(const std::vector<std::string>& list, std::string_view sep) {
-	std::string ret;
-	for (size_t i = 0; i < list.size(); i++) {
-		if (i != 0) {
-			ret += sep;
-		}
-		ret += list[i];
-	}
-	return ret;
-}
-
-inline std::string Concat(const std::vector<std::string>& list, char sep) {
-	return Concat(list, std::string_view(&sep, 1));
-}
-
 inline int32_t ToInt32(std::string_view text, int base = 10) {
 	int32_t value = 0;
 	std::from_chars(text.data(), text.data() + text.size(), value, base);
@@ -178,15 +161,6 @@ inline std::string Utf16ToUtf8(std::u16string_view utf16) {
 	}
 	std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> convert;
 	return convert.to_bytes(utf16.data(), utf16.data() + utf16.size());
-}
-
-inline std::string HexFromBin(const ByteBuffer& bin) {
-	std::string ret;
-	ret.reserve(bin.Size() * 2);
-	for (uint32_t i = 0; i < bin.Size(); i++) {
-		ret += fmt::format("{:02X}", std::to_integer<uint8_t>(bin.At(i)));
-	}
-	return ret;
 }
 
 } // namespace Common

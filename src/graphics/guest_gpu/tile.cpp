@@ -4,7 +4,6 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
-#include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 
@@ -12,6 +11,8 @@
 #include <array>
 #include <bit>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -1328,7 +1329,7 @@ void TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t 
 		list.push_back(fmt::format("height = {}", height));
 		list.push_back(fmt::format("levels = {}", levels));
 		list.push_back(fmt::format("tile   = {}", static_cast<uint32_t>(tile)));
-		EXIT("unknown format:\n%s\n", Common::Concat(list, '\n').c_str());
+		EXIT("unknown format:\n%s\n", fmt::format("{}", fmt::join(list, "\n")));
 	}
 }
 

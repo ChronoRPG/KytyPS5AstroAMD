@@ -22,10 +22,8 @@
 #endif
 
 #include "common/assert.h"
-#include "common/byteBuffer.h"
 #include "common/common.h"
 #include "common/logging/log.h"
-#include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
@@ -40,6 +38,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -3460,7 +3459,7 @@ int KYTY_SYSV_ABI NpSetNpTitleId(const NpTitleId* title_id, const NpTitleSecret*
 
 	LOGF("\t title_id = %.12s\n"
 	     "\t title_secret = %s\n",
-	     title_id->id, Common::HexFromBin(Common::ByteBuffer(title_secret->data, 128)).c_str());
+	     title_id->id, fmt::format("{:02X}", fmt::join(title_secret->data, "")));
 
 	return OK;
 }

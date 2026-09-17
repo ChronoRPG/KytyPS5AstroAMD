@@ -136,10 +136,6 @@ bool File::OpenInMem(void* buf, uint32_t buf_size) {
 	return true;
 }
 
-bool File::OpenInMem(ByteBuffer& buf) {
-	return OpenInMem(buf.GetData(), buf.Size());
-}
-
 bool File::CreateInMem() {
 	EXIT_IF(m_p->f != nullptr);
 
@@ -345,7 +341,7 @@ bool File::Flush() {
 	return SysFileFlush(*m_p->f);
 }
 
-ByteBuffer File::ReadWholeBuffer() {
+std::vector<std::byte> File::ReadWholeBuffer() {
 	EXIT_IF(IsInvalid());
 	EXIT_IF(Tell() != 0);
 
@@ -353,23 +349,12 @@ ByteBuffer File::ReadWholeBuffer() {
 
 	EXIT_IF((s >> 32u) != 0);
 
-	ByteBuffer buf(s);
+	const auto            read_size = static_cast<uint32_t>(s);
+	std::vector<std::byte> buf(read_size);
 
-	Read(buf.GetData(), s);
+	Read(buf.data(), read_size);
 
 	return buf;
-}
-
-ByteBuffer File::Read(uint32_t size) {
-	ByteBuffer buf(size);
-	uint32_t   b = 0;
-	Read(buf.GetData(), size, &b);
-	buf.RemoveAt(b, size - b);
-	return buf;
-}
-
-void File::Write(const ByteBuffer& buf, uint32_t* bytes_written) {
-	Write(buf.GetDataConst(), buf.Size(), bytes_written);
 }
 
 DateTime File::GetLastAccessTimeUTC(const std::filesystem::path& name) {
