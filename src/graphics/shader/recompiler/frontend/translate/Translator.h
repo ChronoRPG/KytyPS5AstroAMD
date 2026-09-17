@@ -44,7 +44,7 @@ private:
 	IR::U32 ReadU16LaneRaw(const Decoder::Operand& operand, bool high_lane);
 	IR::U32 ReadU16LaneAsU32(const Decoder::Operand& operand, bool high_lane, bool sign_extend);
 	IR::U32 ReadU16AsU32(const Decoder::Operand& operand, bool sign_extend);
-	IR::U32 ReadF16LaneBits(const Decoder::Operand& operand, bool high_lane);
+	IR::U32 Read16LaneBits(const Decoder::Operand& operand, bool high_lane);
 	std::array<IR::U32, 2> ExtractU64(IR::U64 value);
 	void    WriteU32Pair(const Decoder::Operand& operand, const std::array<IR::U32, 2>& value);
 	IR::U32 ConditionBit(const Decoder::Operand& operand);

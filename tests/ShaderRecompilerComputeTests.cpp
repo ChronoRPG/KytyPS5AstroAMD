@@ -19000,6 +19000,37 @@ TestCase Vop3pOpselHiUsesArchitecturalSourceBits() {
           {O::V_MOV_B32, O::V_PK_FMA_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase Vop3pIntegerNegationCapturedAndSelectedHalves() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 6, 0xfed4ff38u); // (-200, -300)
+  AppendVMovLiteral(&code, 3, 0x012c00c8u); // (200, 300)
+  // Captured temporal shader: NEG_LO/HI turns 0x7fff into 0xffff (-1).
+  // Adding that clamped offset must select (199,299), not collapse to (0,0).
+  code.insert(code.end(), {0xcc074107u, 0x30020cffu, 0x00007fffu});
+  code.insert(code.end(), {0xcc0a4010u, 0x18020f03u});
+  AppendStoreVgpr(&code, 7, 0);
+  AppendStoreVgpr(&code, 16, 1);
+
+  AppendVMovLiteral(&code, 0, 0x80011234u);
+  AppendVMovLiteral(&code, 1, 0xbeef5678u);
+  // Independently negate src0 low and src1 high, then reverse both the
+  // modified sources and src1 half selection. NEG flips the selected sign bit.
+  AppendVop3p(&code, 0x0a, 10, Vgpr(0), Vgpr(1), 0, 0x3, 0, 0x2, 0x1);
+  AppendVop3p(&code, 0x0a, 11, Vgpr(0), Vgpr(1), 0, 0x1, 0x2, 0x1, 0x2);
+  AppendStoreVgpr(&code, 10, 2);
+  AppendStoreVgpr(&code, 11, 3);
+  AppendEnd(&code);
+
+  return {"Vop3pIntegerNegationCapturedAndSelectedHalves",
+          code,
+          {},
+          {0xffffffffu, 0x012b00c7u, 0xbef0e8acu, 0x56795123u},
+          {O::V_MOV_B32, O::V_PK_MAX_I16, O::V_PK_ADD_U16,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase CvtPkU8F32PacksSelectedByte() {
   using O = ShaderOpcode;
 
@@ -26908,6 +26939,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2PkFmacF16AccumulatesPackedHalvesIndependently);
   AddCase(Vop2PkFmacF16DppNegatesBothPackedHalves);
   AddCase(Vop3pOpselHiUsesArchitecturalSourceBits);
+  AddCase(Vop3pIntegerNegationCapturedAndSelectedHalves);
   AddCase(CvtPkU8F32PacksSelectedByte);
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
   AddCase(CvtPkrtzF16F32SdwaAndOutputModifiers);
@@ -31628,6 +31660,11 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--dpp-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorDpp8Captured(false));
