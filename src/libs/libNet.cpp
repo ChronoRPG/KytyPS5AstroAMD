@@ -14,16 +14,6 @@
 #include <string>
 #include <vector>
 
-// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define NET_CALL(func)                                                                             \
-	[&]() {                                                                                        \
-		auto result = func;                                                                        \
-		if (result < 0) {                                                                          \
-			*GetNetErrorAddr() = result;                                                           \
-		}                                                                                          \
-		return result;                                                                             \
-	}()
-
 namespace Libs {
 
 namespace Network::Net {
@@ -43,8 +33,15 @@ KYTY_SYSV_ABI int* GetNetErrorAddr() {
 	return &g_net_errno;
 }
 
+static int FinishNetCall(int result) {
+	if (result < 0) {
+		g_net_errno = result - Network::NET_ERROR_EPERM + 1;
+	}
+	return result;
+}
+
 static int KYTY_SYSV_ABI NetInit() {
-	return NET_CALL(Net::NetInit());
+	return FinishNetCall(Net::NetInit());
 }
 
 static int PosixToNetError(int error) {
@@ -66,13 +63,7 @@ static int PosixToNetError(int error) {
 }
 
 static int FinishSocketCall(int result) {
-	if (result >= 0) {
-		return result;
-	}
-
-	const int net_error = PosixToNetError(*Posix::GetErrorAddr());
-	*GetNetErrorAddr()  = net_error;
-	return net_error;
+	return FinishNetCall(result < 0 ? PosixToNetError(*Posix::GetErrorAddr()) : result);
 }
 
 int KYTY_SYSV_ABI NetSocket(const char* name, int family, int type, int protocol) {
@@ -102,48 +93,48 @@ int KYTY_SYSV_ABI NetGetsockname(int s, void* addr, uint32_t* addrlen) {
 }
 
 int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags) {
-	return NET_CALL(Net::NetPoolCreate(name, size, flags));
+	return FinishNetCall(Net::NetPoolCreate(name, size, flags));
 }
 
 int KYTY_SYSV_ABI NetPoolDestroy(int memid) {
-	return NET_CALL(Net::NetPoolDestroy(memid));
+	return FinishNetCall(Net::NetPoolDestroy(memid));
 }
 
 int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
-	return NET_CALL(Net::NetResolverCreate(name, memid, flags));
+	return FinishNetCall(Net::NetResolverCreate(name, memid, flags));
 }
 
 int KYTY_SYSV_ABI NetResolverDestroy(int rid) {
-	return NET_CALL(Net::NetResolverDestroy(rid));
+	return FinishNetCall(Net::NetResolverDestroy(rid));
 }
 
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags) {
-	return NET_CALL(Net::NetResolverStartNtoa(rid, hostname, addr, timeout, retry, flags));
+	return FinishNetCall(Net::NetResolverStartNtoa(rid, hostname, addr, timeout, retry, flags));
 }
 
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst) {
-	return NET_CALL(Net::NetInetPton(af, src, dst));
+	return FinishNetCall(Net::NetInetPton(af, src, dst));
 }
 
 const char* KYTY_SYSV_ABI NetInetNtop(int af, const void* src, char* dst, uint32_t size) {
 	const char* result = Net::NetInetNtop(af, src, dst, size);
 	if (result == nullptr) {
-		*GetNetErrorAddr() = PosixToNetError(*Posix::GetErrorAddr());
+		FinishNetCall(PosixToNetError(*Posix::GetErrorAddr()));
 	}
 	return result;
 }
 
 int KYTY_SYSV_ABI NetEtherNtostr(const Net::NetEtherAddr* n, char* str, size_t len) {
-	return NET_CALL(Net::NetEtherNtostr(n, str, len));
+	return FinishNetCall(Net::NetEtherNtostr(n, str, len));
 }
 
 int KYTY_SYSV_ABI NetGetMacAddress(Net::NetEtherAddr* addr, int flags) {
-	return NET_CALL(Net::NetGetMacAddress(addr, flags));
+	return FinishNetCall(Net::NetGetMacAddress(addr, flags));
 }
 
 int KYTY_SYSV_ABI NetGetSockInfo(int s, void* info, int n, int flags) {
-	return NET_CALL(Net::NetGetSockInfo(s, info, n, flags));
+	return FinishNetCall(Net::NetGetSockInfo(s, info, n, flags));
 }
 
 int KYTY_SYSV_ABI NetEpollCreate(const char* name, int flags) {
@@ -163,7 +154,7 @@ int KYTY_SYSV_ABI NetEpollDestroy(int eid) {
 }
 
 int KYTY_SYSV_ABI NetSocketClose(int s) {
-	return NET_CALL(Net::SocketClose(s));
+	return FinishNetCall(Net::SocketClose(s));
 }
 
 int KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optval,
