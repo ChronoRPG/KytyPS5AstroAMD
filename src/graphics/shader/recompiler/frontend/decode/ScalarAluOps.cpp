@@ -137,6 +137,10 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.family    = Family::SOP1;
 	inst.opcode_id = opcode;
 	inst.opcode    = Detail::LookupOpcode(SOP1_OPS, opcode);
+	if (opcode == 0x21u && sdst == 125u) {
+		// S_SWAPPC_B64 with NULL discards the return PC, so it is a plain jump.
+		inst.opcode = Opcode::S_SETPC_B64;
+	}
 	SetRawWords(inst, code, word_index, 1);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {

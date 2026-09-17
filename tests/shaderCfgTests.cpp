@@ -9435,7 +9435,7 @@ void TestNewShaderRecompilerSetpcBranch() {
 
 void TestFusedShaderHandoffPreservesRegisters() {
   using namespace ShaderRecompiler;
-  const uint32_t front[] = {
+  uint32_t front[] = {
       EncodeSMovB32(12, 255), 0x1003u, // three vertices and one primitive
       EncodeSop1(0x20, 0, 6), // merged-stage handoff through s[6:7]
       0xffffffffu,            // front shader metadata must not be decoded
@@ -9454,20 +9454,23 @@ void TestFusedShaderHandoffPreservesRegisters() {
   options.stage = ShaderType::Mesh;
   options.input_info.vertex = &input;
   options.back_code = back;
-  auto translated = TranslateProgram(front, options);
-  uint32_t allocations = 0;
-  for (const auto* block: translated.program.blocks) {
-    for (const auto& inst: *block) {
-      if (inst.GetOpcode() != IR::ValueOpcode::MeshAllocate) {
-        continue;
+  for (const auto handoff: {EncodeSop1(0x20, 0, 6), 0xbefd2106u}) {
+    front[2] = handoff; // SETPC or captured SWAPPC with NULL destination
+    auto translated = TranslateProgram(front, options);
+    uint32_t allocations = 0;
+    for (const auto* block: translated.program.blocks) {
+      for (const auto& inst: *block) {
+        if (inst.GetOpcode() != IR::ValueOpcode::MeshAllocate) {
+          continue;
+        }
+        const auto value = inst.Arg(0).Resolve();
+        Check(value.IsImmediate() && value.U32() == 0x1003u,
+              "fused back shader lost the front shader's scalar register value");
+        allocations++;
       }
-      const auto value = inst.Arg(0).Resolve();
-      Check(value.IsImmediate() && value.U32() == 0x1003u,
-            "fused back shader lost the front shader's scalar register value");
-      allocations++;
     }
+    Check(allocations == 1u, "fused shader omitted the back shader allocation");
   }
-  Check(allocations == 1u, "fused shader omitted the back shader allocation");
 }
 
 void TestMeshExportStorage() {
