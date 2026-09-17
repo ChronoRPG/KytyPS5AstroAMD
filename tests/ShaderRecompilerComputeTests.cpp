@@ -926,10 +926,6 @@ std::string Hex(u32 value) {
   return buffer;
 }
 
-std::string VulkanResultName(vk::Result result) {
-  return vk::to_string(result);
-}
-
 [[noreturn]] void Fail(const char *shader_name, const char *stage,
                        const std::string &message) {
   std::fprintf(stderr, "ShaderRecompilerComputeTests: %s failed at %s: %s\n",
@@ -960,7 +956,7 @@ void RequireVk(const char *shader_name, const char *stage, vk::Result result,
                const char *action) {
   if (result != vk::Result::eSuccess) {
     Fail(shader_name, stage,
-         std::string(action) + " returned " + VulkanResultName(result));
+         std::string(action) + " returned " + vk::to_string(result));
   }
 }
 
@@ -15597,15 +15593,11 @@ enum class CoverageClass {
   NeedsGraphicsStageCase,
 };
 
-bool IsCovered(const std::set<ShaderOpcode> &covered, ShaderOpcode opcode) {
-  return covered.find(opcode) != covered.end();
-}
-
 CoverageClass ClassifyOpcode(ShaderOpcode opcode,
                              const std::set<ShaderOpcode> &covered) {
   using ShaderRecompiler::Decoder::Opcode;
 
-  if (IsCovered(covered, opcode)) {
+  if (covered.contains(opcode)) {
     return CoverageClass::Covered;
   }
 

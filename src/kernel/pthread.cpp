@@ -149,7 +149,7 @@ static uint64_t KernelGetTscFrequencyNative() {
 		}
 
 		KernelReadTscNative();
-		Common::Thread::Sleep(1);
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		KernelReadTscNative();
 
 		const auto host_start = Common::Timer::QueryPerformanceCounter();
@@ -993,7 +993,7 @@ static void FreeDetachedThreads(void* /*arg*/) {
 	auto* pthread_pool = g_pthread_context->GetPthreadPool();
 
 	while (true) {
-		Common::Thread::Sleep(10000);
+		std::this_thread::sleep_for(std::chrono::milliseconds(10000));
 		pthread_pool->FreeDetachedThreads();
 	}
 }

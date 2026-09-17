@@ -27,8 +27,7 @@ static std::string GetBuildString() {
 	std::string type = "????";
 #endif
 
-	std::string compiler =
-	    Debug::GetCompiler() + "-" + Debug::GetLinker() + "-" + Debug::GetBitness();
+	std::string compiler = Debug::GetCompiler() + "-" + Debug::GetLinker();
 
 	std::string str =
 	    fmt::format("{}, {}, ver = {}, git = {}, date = {}", type.c_str(), compiler.c_str(),
