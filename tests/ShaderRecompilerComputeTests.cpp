@@ -5668,7 +5668,7 @@ public:
       auto stencil_storage_desc = MakeLinearDesc(
           base + second_stencil_offset, ms_stencil_size, vk::Format::eR8Uint,
           Prospero::BufferFormat::k8UInt, Prospero::ImageType::kColor2D,
-          {256, 256, 1}, 256, 1, 1);
+          ms_depth_desc.info.extent, 1, 1, 1);
       stencil_storage_desc.type = BindingType::Storage;
       stencil_storage_desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
       const auto stencil_storage_image =
@@ -7122,6 +7122,64 @@ public:
               !texture_cache.FindImageFromRange(base + second_stencil_offset,
                                                 ms_stencil_size, false),
               "unmapping depth retained its re-associated stencil proxy");
+
+      auto reused_stencil_color = MakeLinearDesc(
+          base + 0x2200000, 0x40000, vk::Format::eR8Unorm,
+          Prospero::BufferFormat::k8UNorm, Prospero::ImageType::kColor2D,
+          {480, 408, 1}, 1, 1, 1);
+      const auto reused_stencil_color_id =
+          texture_cache.FindImage(reused_stencil_color);
+      auto reused_stencil_depth = MakeLinearDesc(
+          base + 0x2240000, 0x10000, vk::Format::eD32SfloatS8Uint,
+          Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
+          {128, 128, 1}, 1, 4, 1);
+      reused_stencil_depth.type = BindingType::DepthTarget;
+      reused_stencil_depth.info.stencil = {reused_stencil_color.info.data.address,
+                                          0x10000};
+      reused_stencil_depth.view_info.aspect =
+          vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+      reused_stencil_depth.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto reused_stencil_depth_id =
+          texture_cache.FindImage(reused_stencil_depth);
+      TextureCacheTestAccess::AssociateStencil(
+          texture_cache, reused_stencil_depth_id,
+          reused_stencil_depth.info.stencil);
+      const auto reused_stencil_proxy = texture_cache.FindImageFromRange(
+          reused_stencil_depth.info.stencil.address,
+          reused_stencil_depth.info.stencil.size, false);
+      Require(name, "stencil address reuse preserves color",
+              reused_stencil_proxy &&
+                  reused_stencil_proxy != reused_stencil_color_id &&
+                  !texture_cache.GetImage(reused_stencil_color_id).depth_id &&
+                  texture_cache.GetImage(reused_stencil_proxy).depth_id ==
+                      reused_stencil_depth_id &&
+                  texture_cache.GetImage(reused_stencil_proxy).info.data ==
+                      reused_stencil_depth.info.stencil &&
+                  texture_cache.GetImage(reused_stencil_proxy).info.extent ==
+                      reused_stencil_depth.info.extent,
+              "a smaller stencil plane took ownership of an existing R8 image");
+      vk::ClearValue reused_stencil_color_clear{};
+      reused_stencil_color_clear.color.float32 =
+          std::array{1.0f, 0.0f, 0.0f, 0.0f};
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), reused_stencil_color_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+          reused_stencil_color_clear);
+      Require(name, "reused stencil plane clear",
+              texture_cache.ClearImageFromBuffer(
+                  scheduler.Current(), reused_stencil_depth.info.stencil.address,
+                  reused_stencil_depth.info.stencil.size, 0x5a5a5a5au) &&
+                  texture_cache.GetImage(reused_stencil_depth_id).IsGpuModified(),
+              "the separate stencil association did not resolve to depth");
+      Require(name, "color clear after stencil address reuse",
+              ReadCachedTexel(name, context, reused_stencil_color_id, {},
+                              {4, 1, 1}) == std::vector<u32>{0xffffffffu},
+              "stencil address reuse changed the native R8 clear contents");
+      texture_cache.UnmapMemory(reused_stencil_depth.info.data.address,
+                                reused_stencil_depth.info.data.size);
+      texture_cache.UnmapMemory(reused_stencil_color.info.data.address,
+                                reused_stencil_color.info.data.size);
 
       constexpr uint64_t exact_image_offset = 0x334100;
       constexpr uint64_t dirty_sibling_offset = 0x334200;
