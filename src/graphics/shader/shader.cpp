@@ -1005,8 +1005,4 @@ void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info) {
 	     info.group_id[1] ? "true" : "false", info.group_id[2] ? "true" : "false");
 }
 
-bool ShaderAddressValid(uint64_t addr) {
-	return reinterpret_cast<const uint32_t*>(addr) != nullptr;
-}
-
 } // namespace Libs::Graphics
