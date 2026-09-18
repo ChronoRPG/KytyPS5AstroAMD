@@ -276,6 +276,9 @@ bool Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMPX_NEQ_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordNotEqual32, true, true);
 			return true;
+		case O::V_CMP_NLT_F16:
+			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordGreaterThanEqual32, true, false);
+			return true;
 		case O::V_CMPX_NLT_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordGreaterThanEqual32, true, true);
 			return true;

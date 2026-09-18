@@ -381,6 +381,7 @@ enum class Opcode {
 	V_CMP_GE_F16,
 	V_CMP_NGT_F16,
 	V_CMP_NEQ_F16,
+	V_CMP_NLT_F16,
 	V_CMPX_LT_F16,
 	V_CMPX_EQ_F16,
 	V_CMPX_LE_F16,
