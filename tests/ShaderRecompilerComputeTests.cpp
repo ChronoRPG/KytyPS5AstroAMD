@@ -18159,6 +18159,51 @@ TestCase Vop3CvtPkI16I32Captured() {
   return test;
 }
 
+TestCase Vop3MulLoU16CapturedAndSelectors() {
+  using O = ShaderOpcode;
+
+  TestCase test;
+  test.name = "Vop3MulLoU16CapturedAndSelectors";
+  // Distinct runtime halves expose source selection and prevent constant folding.
+  test.initial = {0x00138001u, 0x0005ffffu, 0xffffffffu};
+  test.expected = {0x00138001u, 0x0005ffffu, 0xffffffffu,
+                   0xa5a57fffu, 0xa5a5ffedu, 0xa5a58005u, 0xa5a5005fu,
+                   0x7fff1234u, 0xffed1234u, 0x80051234u, 0x005f1234u,
+                   0xffff0001u, 0x00231234u};
+  auto &code = test.code;
+  AppendBufferLoadDword(&code, 12, 30);
+  AppendVMovU32(&code, 30, 4);
+  AppendBufferLoadDword(&code, 24, 30);
+  u32 output = 3;
+  for (u32 selectors : {0u, 1u, 2u, 3u, 8u, 9u, 10u, 11u}) {
+    AppendVMovLiteral(&code, 2, 0xa5a51234u);
+    if (selectors == 8u) {
+      code.push_back(0xd7054002u);
+      code.push_back(0x0002310cu); // Captured v_mul_lo_u16 v2.hi, v12.lo, v24.lo.
+    } else {
+      AppendVop3(&code, 0x305, 2, Vgpr(12), Vgpr(24), 0, 0, selectors);
+    }
+    AppendStoreVgpr(&code, 2, output++);
+  }
+
+  // 0xffff * 0xffff wraps to 1; aliasing preserves the original high half.
+  AppendVMovU32(&code, 30, 8);
+  AppendBufferLoadDword(&code, 12, 30);
+  AppendVop3(&code, 0x305, 12, Vgpr(12), Vgpr(12), 0, 0, 1);
+  AppendStoreVgpr(&code, 12, output++);
+
+  AppendVMovLiteral(&code, 2, 0xa5a51234u);
+  AppendVop3(&code, 0x305, 2, 255, Vgpr(24), 0, 0, 11);
+  code.push_back(0x0007deadu); // Select literal high half: 7 * 5 = 35.
+  AppendStoreVgpr(&code, 2, output);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MUL_LO_U16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MUL_LO_U16", 10}};
+  test.required_spirv = {"OpIMul"};
+  return test;
+}
+
 TestCase Vop3Med3I16Captured() {
   using O = ShaderOpcode;
 
@@ -26909,6 +26954,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaLshrrevCapturedByte1Source);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
+  AddCase(Vop3MulLoU16CapturedAndSelectors);
   AddCase(Vop3Med3I16Captured);
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
   AddCase(VectorShiftCountsMaskLowBits);
@@ -31911,6 +31957,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--med3-i16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3Med3I16Captured());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mul-lo-u16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3MulLoU16CapturedAndSelectors());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--waitcnt-depctr-only") == 0) {

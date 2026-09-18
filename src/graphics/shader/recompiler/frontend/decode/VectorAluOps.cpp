@@ -295,6 +295,7 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x300u, Opcode::V_LSHRREV_B64},
     {0x303u, Opcode::V_ADD_NC_U16},
     {0x304u, Opcode::V_SUB_NC_U16},
+    {0x305u, Opcode::V_MUL_LO_U16},
     {0x307u, Opcode::V_LSHRREV_B16},
     {0x308u, Opcode::V_ASHRREV_I16},
     {0x309u, Opcode::V_MAX_U16},
@@ -430,6 +431,7 @@ bool IsNativeVop3B16BinaryOpcode(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::V_ADD_NC_U16:
 		case Opcode::V_SUB_NC_U16:
+		case Opcode::V_MUL_LO_U16:
 		case Opcode::V_MAX_U16:
 		case Opcode::V_MAX_I16:
 		case Opcode::V_MIN_U16:
@@ -1174,6 +1176,7 @@ uint32_t NativeVop3SourceCount(Opcode opcode) {
 		case Opcode::V_MUL_I32_I24:
 		case Opcode::V_ADD_NC_U16:
 		case Opcode::V_SUB_NC_U16:
+		case Opcode::V_MUL_LO_U16:
 		case Opcode::V_MAX_U16:
 		case Opcode::V_MAX_I16:
 		case Opcode::V_MIN_U16:

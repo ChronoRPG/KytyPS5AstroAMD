@@ -300,6 +300,7 @@ enum class Opcode {
 	V_SUBREV_NC_U32,
 	V_ADD_NC_U16,
 	V_SUB_NC_U16,
+	V_MUL_LO_U16,
 	V_MAX_U16,
 	V_MAX_I16,
 	V_MIN_U16,
