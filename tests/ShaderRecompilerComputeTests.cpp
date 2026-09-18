@@ -10442,13 +10442,6 @@ public:
                   (vk::AccessFlagBits2::eShaderRead |
                    vk::AccessFlagBits2::eShaderWrite),
               "a later sampled alias dropped an earlier storage write access");
-      // Bind the raw block view through the existing uint storage descriptor layout.
-      auto block_bindings = graphics_bindings.vertex[0];
-      block_bindings.images[0] = raw_blocks_again;
-      block_bindings.images[0].image_view = texture_cache.FindTexture(
-          raw_blocks_again.image_id, raw_blocks_again.desc);
-      descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
-          executor, scheduler.Current(), block_bindings));
       RenderExecutorTestAccess::ResetBindings(executor);
 
       ShaderRecompiler::IR::Program vertex_sampled_program{};
