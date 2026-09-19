@@ -245,28 +245,33 @@ void File::Printf(const char* format, ...) {
 	Write(s.data(), static_cast<uint32_t>(s.size()));
 }
 
+static std::filesystem::path WithoutTrailingSeparator(
+	const std::filesystem::path& path) {
+		if (!path.empty() && !path.has_filename() &&
+			path != path.root_path()) {
+			return path.parent_path();
+		}
+
+		return path;
+}
+
+
 bool File::IsDirectoryExisting(const std::filesystem::path& path) {
-	auto path_str = PathToGenericString(path);
-	return SysFileIsDirectoryExisting(path_str.ends_with("/") ? Common::RemoveLast(path_str, 1)
-	                                                          : path_str);
+	return SysFileIsDirectoryExisting(WithoutTrailingSeparator(path));
 }
 
 bool File::IsFileExisting(const std::filesystem::path& name) {
 	return SysFileIsFileExisting(name);
 }
 
-bool File::CreateDirectory(
-    const std::filesystem::path& path) // @suppress("Member declaration not found")
-{
-	auto path_str = PathToGenericString(path);
-	return SysFileCreateDirectory(path_str.ends_with("/") ? Common::RemoveLast(path_str, 1)
-	                                                      : path_str);
+bool File::CreateDirectory(const std::filesystem::path& path) {
+    return SysFileCreateDirectory(
+        WithoutTrailingSeparator(path));
 }
 
 bool File::DeleteDirectory(const std::filesystem::path& path) {
-	auto path_str = PathToGenericString(path);
-	return SysFileDeleteDirectory(path_str.ends_with("/") ? Common::RemoveLast(path_str, 1)
-	                                                      : path_str);
+    return SysFileDeleteDirectory(
+        WithoutTrailingSeparator(path));
 }
 
 bool File::CreateDirectories(const std::filesystem::path& path) {
