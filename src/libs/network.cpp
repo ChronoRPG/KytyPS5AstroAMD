@@ -256,7 +256,7 @@ void Shutdown() {
 int Network::PoolCreate(const char* name, int size) {
 	Common::LockGuard lock(m_mutex);
 
-	for (int id = 0; id < POOLS_MAX; id++) {
+	for (int id = 1; id < POOLS_MAX; id++) {
 		if (!m_pools[id].used) {
 			m_pools[id].used = true;
 			m_pools[id].size = size;
