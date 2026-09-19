@@ -275,63 +275,48 @@ bool File::DeleteDirectory(const std::filesystem::path& path) {
 }
 
 bool File::CreateDirectories(const std::filesystem::path& path) {
-	std::string real_path = Common::ReplaceChar(PathToGenericString(path), '\\', '/');
+    const auto normalized_path =
+        WithoutTrailingSeparator(path);
 
-	std::vector<std::string> list = Common::Split(real_path, "/");
+    auto current_path = normalized_path.root_path();
 
-	std::string p;
+    for (const auto& component:
+         normalized_path.relative_path()) {
+        current_path /= component;
 
-	for (uint32_t si = 0; si < list.size(); si++) {
-		const std::string& s = list[si];
+        if (IsDirectoryExisting(current_path)) {
+            continue;
+        }
 
-		if (si != 0 || real_path.starts_with("/")) {
-			p += "/";
-		}
+        if (!CreateDirectory(current_path)) {
+            return false;
+        }
+    }
 
-		p += s;
-
-		if (IsDirectoryExisting(p)) {
-			continue;
-		}
-
-		if (!CreateDirectory(p)) // @suppress("Invalid arguments")
-		{
-			return false;
-		}
-	}
-
-	return true;
+    return true;
 }
 
 bool File::DeleteDirectories(const std::filesystem::path& path) {
-	std::string real_path = Common::ReplaceChar(PathToGenericString(path), '\\', '/');
+    const auto normalized_path =
+        WithoutTrailingSeparator(path);
 
-	std::vector<std::string> list = Common::Split(real_path, "/");
+    std::vector<std::filesystem::path> directories;
+    auto current_path = normalized_path.root_path();
 
-	std::string              p;
-	std::vector<std::string> list2;
+    for (const auto& component:
+         normalized_path.relative_path()) {
+        current_path /= component;
+        directories.push_back(current_path);
+    }
 
-	for (uint32_t si = 0; si < list.size(); si++) {
-		const std::string& s = list[si];
+    for (auto it = directories.rbegin();
+         it != directories.rend(); ++it) {
+        if (!DeleteDirectory(*it)) {
+            return false;
+        }
+    }
 
-		if (si != 0 || real_path.starts_with("/")) {
-			p += "/";
-		}
-
-		p += s;
-
-		list2.push_back(p);
-	}
-
-	uint32_t num = list2.size();
-
-	for (uint32_t si = num - 1; si < num; si--) {
-		if (!DeleteDirectory(list2[si])) {
-			return false;
-		}
-	}
-
-	return true;
+    return true;
 }
 
 bool File::DeleteFile(

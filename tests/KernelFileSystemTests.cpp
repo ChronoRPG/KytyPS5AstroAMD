@@ -137,20 +137,21 @@ void CheckUnicodePaths(const std::filesystem::path &root) {
 
   const auto unicode_root =
       root / Common::PathFromUtf8(HostDirectory);
+  const auto nested_root = unicode_root / "nested";
 
-  Check(std::filesystem::create_directories(unicode_root),
-        "create Unicode host directory");
+  Check(Common::File::CreateDirectories(nested_root),
+        "create nested Unicode host directory");
 
-  CheckMountRoot(unicode_root);
+  CheckMountRoot(nested_root);
 
   const auto native_file =
-      unicode_root / Common::PathFromUtf8(GuestFilename);
+      nested_root / Common::PathFromUtf8(GuestFilename);
 
   Common::File fixture;
   Check(fixture.Create(native_file), "create Unicode filename");
   fixture.Close();
 
-  FileSystem::Mount(unicode_root, "/app0");
+  FileSystem::Mount(nested_root, "/app0");
 
   const auto guest_file =
       std::string("/app0/") + std::string(GuestFilename);
