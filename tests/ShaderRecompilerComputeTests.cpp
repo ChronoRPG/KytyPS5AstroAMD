@@ -18205,6 +18205,64 @@ TestCase Vop3MulLoU16CapturedAndSelectors() {
   return test;
 }
 
+TestCase Vop3MadI16CapturedSelectorsAndSaturation() {
+  using O = ShaderOpcode;
+  struct MadCase {
+    u32 lhs, rhs, addend, expected;
+    u32 selectors = 0;
+    bool clamp = false;
+    u32 dst = 1;
+  };
+  constexpr u32 a = 0x8000fffdu, b = 0xfffe0005u, c = 0xfff90007u;
+  const std::array<MadCase, 14> cases{{
+      {a, b, c, 0xa5a5fff8u}, // Captured: -3 * 5 + 7 = -8.
+      {a, b, c, 0x8007beefu, 9}, // Source 0 high; destination high.
+      {a, b, c, 0xa5a5000du, 2}, // Source 1 high: -3 * -2 + 7.
+      {a, b, c, 0xa5a5ffeau, 4}, // Source 2 high: -3 * 5 - 7.
+      {a, b, c, 0xfff9beefu, 15}, // All high: -32768 * -2 - 7 wraps.
+      {a, b, c, 0xfff8fffdu, 8, false, 9}, // Destination aliases source 0.
+      {0x7fffu, 1, 1, 0xa5a58000u},
+      {0x7fffu, 1, 1, 0x7fffbeefu, 8, true}, // Positive saturation.
+      {0x8000u, 1, 0xffffu, 0xa5a57fffu},
+      {0x8000u, 1, 0xffffu, 0x8000beefu, 8, true}, // Negative saturation.
+      {0x8000u, 0x8000u, 0xffffu, 0xa5a5ffffu},
+      {0x8000u, 0x8000u, 0xffffu, 0xa5a57fffu, 0, true},
+      {200, 200, 0xd8f0u, 0xa5a57530u, 0, true}, // 40000 - 10000 = 30000.
+      {200, 0xff38u, 10000, 0xa5a58ad0u, 0, true}, // -40000 + 10000 = -30000.
+  }};
+  TestCase test;
+  test.name = "Vop3MadI16CapturedSelectorsAndSaturation";
+  for (const auto &entry : cases) {
+    test.initial.insert(test.initial.end(), {entry.lhs, entry.rhs, entry.addend});
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    u32 offset = i * 12u;
+    for (u32 reg : {9u, 6u, 15u}) {
+      AppendVMovU32(&code, 30, offset);
+      AppendBufferLoadDword(&code, reg, 30); // Runtime inputs prevent folding.
+      offset += 4u;
+    }
+    AppendVMovLiteral(&code, 1, 0xa5a5beefu);
+    if (i == 0u) {
+      code.insert(code.end(), {0xd75e0001u, 0x043e0d09u});
+    } else {
+      AppendVop3(&code, 0x35e, entry.dst, Vgpr(9), Vgpr(6), Vgpr(15), 0,
+                  entry.selectors, entry.clamp);
+    }
+    AppendStoreVgpr(&code, entry.dst, static_cast<u32>(test.initial.size()) + i);
+    test.expected.push_back(entry.expected);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAD_I16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MAD_I16", cases.size()}};
+  test.required_spirv = {"OpIMul", "OpIAdd"};
+  return test;
+}
+
 TestCase Vop3Med3I16Captured() {
   using O = ShaderOpcode;
 
@@ -27038,6 +27096,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
   AddCase(Vop3MulLoU16CapturedAndSelectors);
+  AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
   AddCase(Vop3Med3I16Captured);
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
   AddCase(VectorShiftCountsMaskLowBits);
@@ -32051,6 +32110,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--mul-lo-u16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3MulLoU16CapturedAndSelectors());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mad-i16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3MadI16CapturedSelectorsAndSaturation());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--waitcnt-depctr-only") == 0) {

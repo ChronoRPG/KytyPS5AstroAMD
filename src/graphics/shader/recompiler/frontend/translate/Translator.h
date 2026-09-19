@@ -164,6 +164,7 @@ private:
 	bool FloatCube(const Decoder::Instruction& inst, uint32_t result_kind);
 	bool Integer16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool arithmetic);
 	bool Integer16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
+	bool V_MAD_I16(const Decoder::Instruction& inst);
 	bool V_MED3_I16(const Decoder::Instruction& inst);
 	bool PackedInteger16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool arithmetic);

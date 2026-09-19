@@ -312,6 +312,7 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x345u, Opcode::V_XAD_U32},
     {0x346u, Opcode::V_LSHL_ADD_U32},
     {0x347u, Opcode::V_ADD_LSHL_U32},
+    {0x35eu, Opcode::V_MAD_I16},
     {0x360u, Opcode::V_READLANE_B32},
     {0x361u, Opcode::V_WRITELANE_B32},
     {0x362u, Opcode::V_LDEXP_F32},
@@ -424,7 +425,7 @@ bool IsNativeVop3F16TernaryOpcode(Opcode opcode) {
 }
 
 bool IsNativeVop3I16TernaryOpcode(Opcode opcode) {
-	return opcode == Opcode::V_MED3_I16;
+	return opcode == Opcode::V_MED3_I16 || opcode == Opcode::V_MAD_I16;
 }
 
 bool IsNativeVop3B16BinaryOpcode(Opcode opcode) {
@@ -1362,7 +1363,8 @@ bool SupportsNativeVop3ResultModifiers(Opcode opcode) {
 }
 
 bool SupportsNativeVop3Clamp(Opcode opcode) {
-	return SupportsNativeVop3ResultModifiers(opcode) || UsesInexactClampControl(opcode);
+	return SupportsNativeVop3ResultModifiers(opcode) || UsesInexactClampControl(opcode) ||
+	       opcode == Opcode::V_MAD_I16;
 }
 
 bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mix,
@@ -1383,7 +1385,7 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 		return opcode != Opcode::V_FMA_F16 && (clamp != 0u || omod != 0u);
 	}
 	if (IsNativeVop3I16TernaryOpcode(opcode)) {
-		return abs != 0u || clamp != 0u || omod != 0u || neg != 0u;
+		return abs != 0u || (clamp != 0u && !clamp_modifier) || omod != 0u || neg != 0u;
 	}
 	if (IsNativeVop3B16BinaryOpcode(opcode)) {
 		return abs != 0u || clamp != 0u || omod != 0u || neg != 0u;

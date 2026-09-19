@@ -228,6 +228,7 @@ enum class Opcode {
 	V_CVT_PKRTZ_F16_F32,
 	V_CVT_PK_U8_F32,
 	V_MAD_F32,
+	V_MAD_I16,
 	V_MAD_I32_I24,
 	V_MAD_U32_U24,
 	V_MAD_U64_U32,
