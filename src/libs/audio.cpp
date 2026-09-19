@@ -9,6 +9,7 @@
 #include "common/threads.h"
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
+#include "libs/ajm/atrac9_decoder.h"
 #include "libs/audio_internal.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -1888,7 +1889,9 @@ struct Ngs2VoiceInternal {
 	struct Block {
 		const uint8_t*    data;
 		Ngs2WaveformBlock info;
-		uint32_t          cursor = 0;
+		uint32_t          cursor         = 0;
+		size_t            data_cursor    = 0;
+		uint32_t          skip_remaining = info.num_skip_samples;
 	};
 	struct Module {
 		std::vector<uint8_t> param, work, state;
@@ -1911,6 +1914,35 @@ struct Ngs2VoiceInternal {
 	bool                            rendering       = false;
 	bool                            rendered        = false;
 	bool                            has_samples     = false;
+
+	std::unique_ptr<Ajm::AjmAt9Decoder> decoder;
+	std::vector<float>                 decoded_frame;
+	bool                               accepts_blocks = true;
+
+	void SetupSampler(const Ngs2WaveformFormat& format) {
+		EXIT_NOT_IMPLEMENTED(format.sample_rate != rack->ngs->option.sample_rate ||
+		                     format.frame_margin != 0 || format.frame_offset != 0);
+		channels = format.num_channels;
+		blocks.clear();
+		decoder.reset();
+		decoded_frame.clear();
+		accepts_blocks = true;
+		if (format.waveform_type == NGS2_WAVEFORM_TYPE_ATRAC9) {
+			decoder = std::make_unique<Ajm::AjmAt9Decoder>(channels, format.sample_rate,
+			                                               Ajm::AjmSampleEncoding::Float, 0);
+			const auto result =
+			    decoder->Initialize(&format.config_data, sizeof(format.config_data));
+			EXIT_NOT_IMPLEMENTED(result.result != OK);
+			EXIT_NOT_IMPLEMENTED(result.format.channel_num != channels ||
+			                     result.format.sampling_frequency != format.sample_rate);
+			Ajm::AjmSidebandDecAt9CodecInfo info {};
+			decoder->WriteCodecInfo(&info, sizeof(info), result);
+			EXIT_NOT_IMPLEMENTED(info.frame_samples > std::numeric_limits<uint16_t>::max());
+			decoded_frame.resize(info.frame_samples * channels);
+		} else {
+			EXIT_NOT_IMPLEMENTED(format.waveform_type != 0x12);
+		}
+	}
 
 	void SetMatrix(uint32_t index, const float* levels, uint32_t count) {
 		EXIT_NOT_IMPLEMENTED(index >= matrices.size());
@@ -2534,22 +2566,9 @@ int KYTY_SYSV_ABI Ngs2RackCreateWithAllocator(uintptr_t system_handle, uint32_t 
 
 	EXIT_NOT_IMPLEMENTED(option->size < sizeof(Ngs2RackOption));
 
-	LOGF("\t rack_id                = 0x%" PRIx32 "\n"
-	     "\t name                   = %.64s\n"
-	     "\t flags                  = %u\n"
-	     "\t max_grain_samples      = %u\n"
-	     "\t max_voices             = %u\n"
-	     "\t max_input_delay_blocks = %u\n"
-	     "\t max_matrices           = %u\n"
-	     "\t max_ports              = %u\n"
-	     "\t max_voice_channels     = %u\n"
-	     "\t max_output_channels    = %u\n"
-	     "\t alloc_handler          = 0x%016" PRIx64 "\n"
+	LOGF("\t alloc_handler          = 0x%016" PRIx64 "\n"
 	     "\t free_handler           = 0x%016" PRIx64 "\n"
 	     "\t user_data              = 0x%016" PRIx64 "\n",
-	     rack_id, option->name, option->flags, option->max_grain_samples, option->max_voices,
-	     option->max_input_delay_blocks, option->max_matrices, option->max_ports,
-	     option->max_voice_channels, option->max_output_channels,
 	     reinterpret_cast<uint64_t>(allocator->alloc_handler),
 	     reinterpret_cast<uint64_t>(allocator->free_handler),
 	     static_cast<uint64_t>(allocator->user_data));
@@ -2711,16 +2730,44 @@ static void Ngs2ApplyEvent(Ngs2VoiceInternal& voice) {
 	voice.event = Ngs2VoicePlayEvent::None;
 }
 
-static void Ngs2ConsumePcm(Ngs2VoiceInternal& voice, uint32_t grain) {
+static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 	uint32_t output = 0;
 	while (output < grain && !voice.blocks.empty()) {
-		auto&       block = voice.blocks.front();
-		const auto  count = std::min(grain - output, block.info.num_samples - block.cursor);
-		const auto* pcm   = reinterpret_cast<const int16_t*>(block.data) +
-		                    (block.info.num_skip_samples + block.cursor) * voice.channels;
+		auto&          block   = voice.blocks.front();
+		auto           count   = std::min(grain - output, block.info.num_samples - block.cursor);
+		const int16_t* pcm     = nullptr;
+		const float*   decoded = nullptr;
+		if (voice.decoder != nullptr) {
+			const auto skip =
+			    std::min(block.skip_remaining,
+			             static_cast<uint32_t>(voice.decoded_frame.size() / voice.channels));
+			Ajm::AjmGaplessState gapless;
+			gapless.Set({block.info.num_samples - block.cursor, static_cast<uint16_t>(skip), 0},
+			            true);
+			const auto result = voice.decoder->Decode(
+			    block.data + block.data_cursor, block.info.data_size - block.data_cursor,
+			    voice.decoded_frame.data(), voice.decoded_frame.size() * sizeof(float), false,
+			    &gapless);
+			EXIT_NOT_IMPLEMENTED(result.result != OK || result.input_consumed == 0);
+			block.data_cursor += result.input_consumed;
+			block.skip_remaining -= skip - gapless.current.skip_samples;
+			const auto decoded_samples =
+			    static_cast<uint32_t>(result.output_written / (sizeof(float) * voice.channels));
+			if (decoded_samples == 0) {
+				continue;
+			}
+			EXIT_NOT_IMPLEMENTED(decoded_samples > count);
+			count   = decoded_samples;
+			decoded = voice.decoded_frame.data();
+		} else {
+			pcm = reinterpret_cast<const int16_t*>(block.data) +
+			      (block.info.num_skip_samples + block.cursor) * voice.channels;
+		}
 		for (uint32_t c = 0; c < voice.channels; ++c) {
 			for (uint32_t i = 0; i < count; ++i) {
-				voice.samples[c * grain + output + i] = pcm[i * voice.channels + c] / 32768.0f;
+				const auto index = i * voice.channels + c;
+				voice.samples[c * grain + output + i] =
+				    decoded != nullptr ? decoded[index] : pcm[index] / 32768.0f;
 			}
 		}
 		output += count;
@@ -2744,6 +2791,9 @@ static void Ngs2ConsumePcm(Ngs2VoiceInternal& voice, uint32_t grain) {
 			        0};
 			static_assert(sizeof(CallbackInfo) == 56);
 			voice.blocks.pop_front();
+			if (voice.blocks.empty() && !voice.accepts_blocks) {
+				voice.state = Ngs2VoicePlayState::Empty;
+			}
 			if (voice.callback != 0 && (voice.callback_flags & 1u) != 0) {
 				reinterpret_cast<void KYTY_SYSV_ABI (*)(const CallbackInfo*)>(voice.callback)(
 				    &info);
@@ -2764,11 +2814,11 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 	voice.has_samples = false;
 	if (voice.state == Ngs2VoicePlayState::Playing) {
 		if (voice.rack->type == Ngs2RackType::CustomSampler) {
-			Ngs2ConsumePcm(voice, grain);
+			Ngs2ConsumeSamples(voice, grain);
 		}
 		for (auto* source: voices) {
 			for (const auto& port: source->ports) {
-				if (port.dest != &voice) {
+				if (port.dest != &voice || port.volume == 0.0f) {
 					continue;
 				}
 				Ngs2RenderVoice(*source, voices, grain);
@@ -3327,11 +3377,9 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::CustomSampler);
 				switch (param->id & 0xffffu) {
 					case 0: {
-						const auto& format = *reinterpret_cast<const Ngs2WaveformFormat*>(param + 1);
-						EXIT_NOT_IMPLEMENTED(format.waveform_type != 0x12 ||
-						                     format.sample_rate != voice->rack->ngs->option.sample_rate);
-						voice->channels = format.num_channels;
-						voice->blocks.clear();
+						const auto& format =
+						    *reinterpret_cast<const Ngs2WaveformFormat*>(param + 1);
+						voice->SetupSampler(format);
 						break;
 					}
 					case 1: {
@@ -3342,11 +3390,14 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 							const Ngs2WaveformBlock* blocks;
 						};
 						const auto& blocks = *reinterpret_cast<const BlocksParam*>(param);
-						EXIT_NOT_IMPLEMENTED(blocks.flags != 0x11);
+						EXIT_NOT_IMPLEMENTED(!voice->accepts_blocks ||
+						                     (blocks.flags != 0 && blocks.flags != 0x11));
+						voice->accepts_blocks = (blocks.flags & 1u) != 0;
 						for (uint32_t i = 0; i < blocks.count; ++i) {
 							const auto& block = blocks.blocks[i];
+							EXIT_NOT_IMPLEMENTED(block.num_repeats != 0 || block.num_samples == 0);
 							EXIT_NOT_IMPLEMENTED(
-							    block.num_repeats != 0 || block.num_samples == 0 ||
+							    voice->decoder == nullptr &&
 							    (uint64_t(block.num_skip_samples) + block.num_samples) *
 							            voice->channels * 2 >
 							        block.data_size);
