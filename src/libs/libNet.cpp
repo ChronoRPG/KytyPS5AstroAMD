@@ -8,6 +8,7 @@
 #include "loader/symbolDatabase.h"
 
 #include <cctype>
+#include <cstddef>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -3721,6 +3722,21 @@ namespace LibGameLiveStreaming {
 
 LIB_VERSION("GameLiveStreaming", 1, "GameLiveStreaming", 1, 1);
 
+constexpr int GAME_LIVE_STREAMING_ERROR_INVALID_PARAM = -2136997886;
+
+struct GameLiveStreamingStatus2 {
+	int32_t  user_id;
+	bool     is_on_air;
+	uint32_t spectator_count;
+	uint32_t text_message_count;
+	uint32_t command_message_count;
+	uint8_t  reserved[52];
+};
+
+static_assert(sizeof(GameLiveStreamingStatus2) == 72);
+static_assert(offsetof(GameLiveStreamingStatus2, is_on_air) == 4);
+static_assert(offsetof(GameLiveStreamingStatus2, spectator_count) == 8);
+
 static int KYTY_SYSV_ABI GameLiveStreamingInitialize(size_t heap_size) {
 	PRINT_NAME();
 
@@ -3735,9 +3751,34 @@ static int KYTY_SYSV_ABI GameLiveStreamingTerminate() {
 	return 0;
 }
 
+static int KYTY_SYSV_ABI GameLiveStreamingGetCurrentStatus2(GameLiveStreamingStatus2* status) {
+	PRINT_NAME();
+
+	if (status == nullptr) {
+		return GAME_LIVE_STREAMING_ERROR_INVALID_PARAM;
+	}
+
+	std::memset(status, 0, sizeof(*status));
+	status->user_id = -1;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI GameLiveStreamingGetSocialFeedbackMessagesCount(int type, uint32_t* count) {
+	PRINT_NAME();
+
+	if (type < 1 || type > 3 || count == nullptr) {
+		return GAME_LIVE_STREAMING_ERROR_INVALID_PARAM;
+	}
+
+	*count = 0;
+	return OK;
+}
+
 LIB_DEFINE(InitPlatform_1_GameLiveStreaming) {
 	LIB_FUNC("kvYEw2lBndk", LibGameLiveStreaming::GameLiveStreamingInitialize);
 	LIB_FUNC("9yK6Fk8mKOQ", LibGameLiveStreaming::GameLiveStreamingTerminate);
+	LIB_FUNC("lK8dLBNp9OE", LibGameLiveStreaming::GameLiveStreamingGetCurrentStatus2);
+	LIB_FUNC("yeQKjHETi40", LibGameLiveStreaming::GameLiveStreamingGetSocialFeedbackMessagesCount);
 }
 
 } // namespace LibGameLiveStreaming
