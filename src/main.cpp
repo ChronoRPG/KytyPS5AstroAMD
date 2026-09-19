@@ -238,7 +238,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("--game-patch must point to an existing file: %s\n", value.c_str());
 				return false;
 			}
-			options.game_patch = value;
+			options.game_patch = path;
 		} else if (arg == "--screen-width") {
 			options.config.screen_width = static_cast<uint32_t>(Common::ToInt32(value));
 		} else if (arg == "--screen-height") {
