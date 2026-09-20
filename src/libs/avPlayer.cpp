@@ -1405,15 +1405,8 @@ private:
 		return use_vdec2 ? static_cast<uint32_t>(s->codecpar->height)
 		                 : align_up(static_cast<uint32_t>(s->codecpar->height), 16);
 	}
-	float Aspect(AVStream* s) const {
-		if (s->codecpar->height == 0) {
-			return 0.0f;
-		}
-		double r = static_cast<double>(s->codecpar->width) / s->codecpar->height;
-		if (s->sample_aspect_ratio.num > 0 && s->sample_aspect_ratio.den > 0) {
-			r *= av_q2d(s->sample_aspect_ratio);
-		}
-		return static_cast<float>(r);
+	float Aspect(AVRational ratio) const {
+		return ratio.num > 0 && ratio.den > 0 ? static_cast<float>(av_q2d(ratio)) : 0.0f;
 	}
 	uint64_t Duration(AVStream* s) const {
 		return s->duration != AV_NOPTS_VALUE
@@ -1426,14 +1419,14 @@ private:
 		std::memset(v, 0, sizeof(*v));
 		v->width        = Width(s);
 		v->height       = Height(s);
-		v->aspect_ratio = Aspect(s);
+		v->aspect_ratio = Aspect(s->sample_aspect_ratio);
 		lang(v->language_code, s->metadata);
 	}
-	void FillVideoEx(AVStream* s, AvPlayerVideoEx* v) const {
+	void FillVideoEx(AVStream* s, AvPlayerVideoEx* v, AVRational aspect) const {
 		std::memset(v, 0, sizeof(*v));
 		v->width                 = Width(s);
 		v->height                = Height(s);
-		v->aspect_ratio          = Aspect(s);
+		v->aspect_ratio          = Aspect(aspect);
 		v->pitch                 = VideoPitch(s);
 		v->luma_bit_depth        = 8;
 		v->chroma_bit_depth      = 8;
@@ -1469,7 +1462,7 @@ private:
 					FillVideo(s, &d->video);
 				}
 				if (ex) {
-					FillVideoEx(s, &ex->video);
+					FillVideoEx(s, &ex->video, s->sample_aspect_ratio);
 				}
 				break;
 			case AVMEDIA_TYPE_AUDIO:
@@ -1554,7 +1547,7 @@ private:
 		info->time_stamp = to_ms(
 		    src->best_effort_timestamp != AV_NOPTS_VALUE ? src->best_effort_timestamp : src->pts,
 		    s->time_base);
-		FillVideoEx(s, &info->details.video);
+		FillVideoEx(s, &info->details.video, src->sample_aspect_ratio);
 		info->details.video.crop_left_offset = static_cast<uint32_t>(src->crop_left);
 		info->details.video.crop_right_offset =
 		    static_cast<uint32_t>(src->crop_right + (pitch - src->width));
