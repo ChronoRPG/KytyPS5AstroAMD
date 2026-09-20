@@ -17057,6 +17057,117 @@ TestCase ScalarGetpcWritesNextInstructionPc() {
           {O::S_GETPC_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarBitcmpB64DynamicOperands() {
+  using O = ShaderOpcode;
+
+  struct Input {
+    u32 low;
+    u32 high;
+    u32 index;
+  };
+  const Input inputs[] = {
+      {1u, 0u, 0u}, {0x80000000u, 0u, 31u}, {0u, 1u, 32u},
+      {0u, 0x80000000u, 63u}, {1u, 0u, 64u},
+      {0x80000000u, 0u, 95u}, {0u, 1u, 96u},
+      {0u, 0x80000000u, 127u}, {1u, 0u, 128u},
+      {0u, 0x80000000u, 0xffffffffu}, {0u, 0u, 17u},
+      {0xffffffffu, 0xffffffffu, 42u},
+      {0x89abcdefu, 0x76543210u, 4u},
+      {0x89abcdefu, 0x76543210u, 36u},
+  };
+  TestCase test;
+  test.name = "ScalarBitcmpB64DynamicOperands";
+  for (const auto &input : inputs) {
+    test.initial.insert(test.initial.end(), {input.low, input.high, input.index});
+  }
+  test.expected = test.initial;
+  for (u32 i = 0; i < std::size(inputs); ++i) {
+    // Load the value and index on the GPU so the compares cannot constant-fold.
+    for (u32 component = 0; component < 3; ++component) {
+      AppendVMovU32(&test.code, 30, (i * 3 + component) * 4);
+      AppendBufferLoadDword(&test.code, 0, 30);
+      test.code.push_back(EncodeVop1(0x02, 20 + component, Vgpr(0)));
+    }
+    const uint64_t value = uint64_t{inputs[i].low} | (uint64_t{inputs[i].high} << 32);
+    const u32 bit = static_cast<u32>((value >> (inputs[i].index & 63u)) & 1u);
+    for (u32 expected_bit = 0; expected_bit < 2; ++expected_bit) {
+      const bool scc = bit == expected_bit;
+      test.code.push_back(EncodeSopc(0x0e + expected_bit, 20, 22));
+      test.code.push_back(EncodeSop2(0x0a, 24, InlineU32(1), InlineU32(0)));
+      AppendStoreSgpr(&test.code, 24, static_cast<u32>(test.expected.size()));
+      test.expected.push_back(scc ? 1u : 0u);
+
+      // Exercise SCC-driven control flow as well as S_CSELECT_B32.
+      test.code.push_back(EncodeSopp(0x05, 2)); // s_cbranch_scc1 to the true arm.
+      test.code.push_back(EncodeSMovB32(24, InlineU32(3)));
+      test.code.push_back(EncodeSopp(0x02, 1)); // s_branch past the true arm.
+      test.code.push_back(EncodeSMovB32(24, InlineU32(7)));
+      AppendStoreSgpr(&test.code, 24, static_cast<u32>(test.expected.size()));
+      test.expected.push_back(scc ? 7u : 3u);
+    }
+  }
+  AppendEnd(&test.code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
+                  O::S_BITCMP0_B64, O::S_BITCMP1_B64, O::S_CSELECT_B32,
+                  O::S_CBRANCH_SCC1, O::S_BRANCH, O::S_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpBitFieldUExtract", "OpULessThan", "OpSelect"};
+  return test;
+}
+
+TestCase ScalarBitcmpB64IntegerConstants() {
+  using O = ShaderOpcode;
+
+  struct Source {
+    u32 encoding;
+    uint64_t bits;
+  };
+  // Negative integer inlines sign-extend; B64 literals zero-extend.
+  const Source sources[] = {
+      {128u, 0u}, {129u, 1u}, {192u, 64u},
+      {193u, 0xffffffffffffffffull}, {208u, 0xfffffffffffffff0ull},
+      {255u, 0xffffffffu}, {255u, 0x80000000u},
+  };
+  const u32 indices[] = {0u, 4u, 6u, 31u, 32u, 63u, 64u, 127u};
+  TestCase test;
+  test.name = "ScalarBitcmpB64IntegerConstants";
+  test.initial.assign(std::begin(indices), std::end(indices));
+  test.expected = test.initial;
+  for (u32 i = 0; i < std::size(indices); ++i) {
+    AppendVMovU32(&test.code, 30, i * 4);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    test.code.push_back(EncodeVop1(0x02, 22, Vgpr(0)));
+    for (const auto &source : sources) {
+      const u32 bit = static_cast<u32>((source.bits >> (indices[i] & 63u)) & 1u);
+      for (u32 expected_bit = 0; expected_bit < 2; ++expected_bit) {
+        test.code.push_back(EncodeSopc(0x0e + expected_bit, source.encoding, 22));
+        if (source.encoding == 255u) {
+          test.code.push_back(static_cast<u32>(source.bits));
+        }
+        test.code.push_back(EncodeSop2(0x0a, 24, InlineU32(1), InlineU32(0)));
+        AppendStoreSgpr(&test.code, 24, static_cast<u32>(test.expected.size()));
+        test.expected.push_back(bit == expected_bit ? 1u : 0u);
+      }
+    }
+  }
+  // An instruction has one literal word even when both sources select it.
+  for (u32 expected_bit = 0; expected_bit < 2; ++expected_bit) {
+    test.code.push_back(EncodeSopc(0x0e + expected_bit, 255u, 255u));
+    test.code.push_back(0x8000001fu); // Select bit 31 of the same zero-extended literal.
+    test.code.push_back(EncodeSop2(0x0a, 24, InlineU32(1), InlineU32(0)));
+    AppendStoreSgpr(&test.code, 24, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(expected_bit);
+  }
+  AppendEnd(&test.code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
+                  O::S_BITCMP0_B64, O::S_BITCMP1_B64, O::S_CSELECT_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpBitFieldUExtract"};
+  return test;
+}
+
 TestCase ScalarBitfieldPack() {
   using O = ShaderOpcode;
 
@@ -27172,6 +27283,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ScalarSubvectorLoops(64));
   AddCase(ScalarGetpcWritesNextInstructionPc);
   AddCase(ScalarBitfieldPack);
+  AddCase(ScalarBitcmpB64DynamicOperands);
+  AddCase(ScalarBitcmpB64IntegerConstants);
   AddCase(ScalarBrevB32PreservesScc);
   AddCase(ScalarBfeI32CapturedRawSignExtends);
   AddCase(BitfieldExtractWidthPastEndEdges);
