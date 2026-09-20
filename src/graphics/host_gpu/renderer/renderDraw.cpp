@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -813,6 +814,8 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
 			topology = vk::PrimitiveTopology::eTriangleStrip;
 			break;
 		case Prospero::PrimitiveType::kPatch:
+			if (!Config::TessellationEnabled()) return false;
+			[[fallthrough]];
 		case Prospero::PrimitiveType::kRectList:
 			topology = vk::PrimitiveTopology::ePatchList;
 			break;
