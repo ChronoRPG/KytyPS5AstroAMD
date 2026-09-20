@@ -144,7 +144,7 @@ public:
 		host_input_mapping = other.host_input_mapping;
 	}
 
-	void CopyFrom(const Configuration& other) {
+	void CopyGameInfoFrom(const Configuration& other) {
 		name            = other.name;
 		title_id        = other.title_id;
 		gameVersion     = other.gameVersion;
@@ -154,8 +154,6 @@ public:
 		custom_settings = other.custom_settings;
 		game_status     = other.game_status;
 		game_comment    = other.game_comment;
-		CopyEmulatorSettingsFrom(other);
-		elf = other.elf;
 	}
 
 	void WriteSettings(QSettings* s) const {

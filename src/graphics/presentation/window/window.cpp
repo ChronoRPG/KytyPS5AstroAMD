@@ -222,7 +222,7 @@ static void ToggleDesktopFullscreen() {
 	}
 }
 
-static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
+static void GameEventKeyboard(const EventKeyboard& key) {
 	static SDL_Keycode fullscreen_key = SDLK_UNKNOWN;
 
 #ifdef KYTY_DBG_INPUT
@@ -235,7 +235,6 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (key.down) {
 		switch (key.key_code) {
-			case SDLK_SPACE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
 			case SDLK_F1:
 				if (!key.repeat) {
 					RenderDocRequestCapture();
@@ -539,7 +538,7 @@ void WindowContext::ProcessEvent(double time_s) {
 			key.mod               = event->key.keysym.mod;
 			key.timestamp_seconds = time_s;
 
-			GameEventKeyboard(game, key);
+			GameEventKeyboard(key);
 
 			break;
 		}

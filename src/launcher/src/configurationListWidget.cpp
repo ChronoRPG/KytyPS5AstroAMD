@@ -410,10 +410,17 @@ void ConfigurationListWidget::ApplyCompatibility() {
 	}
 }
 
-static Configuration* CloneConfiguration(const Configuration& source) {
-	auto* ret = new Configuration;
-	ret->CopyFrom(source);
-	return ret;
+std::unique_ptr<Configuration>
+ConfigurationListWidget::CreateConfiguration(const ConfigurationItem& item) const {
+	auto        info   = std::make_unique<Configuration>();
+	const auto* custom = m_custom_infos.value(item.GetInfo().game_path);
+	info->CopyGameInfoFrom(item.GetInfo());
+	info->CopyEmulatorSettingsFrom(custom != nullptr ? *custom : m_global_info);
+	if (custom != nullptr && !custom->elf.isEmpty()) {
+		info->elf = custom->elf;
+	}
+	info->host_input_mapping = m_global_info.host_input_mapping;
+	return info;
 }
 
 struct GameMetadata {
@@ -528,9 +535,6 @@ static void SetGameFiles(Configuration& info, const QString& game_dir, const QSt
 	if (info.name.isEmpty()) {
 		info.name = game.dirName();
 	}
-	if (info.elf.isEmpty()) {
-		info.elf = QStringLiteral("eboot.bin");
-	}
 }
 
 static Configuration* FindCustomInfo(QMap<QString, Configuration*>* custom_infos,
@@ -634,16 +638,9 @@ void ConfigurationListWidget::ScanGameDirectory() {
 				auto metadata = GetGameMetadata(
 				    game_dir.filePath(QStringLiteral("sce_sys/param.json")), game_dir.dirName());
 
-				auto  info   = std::make_unique<Configuration>();
-				auto* custom = FindCustomInfo(&m_custom_infos, game_path, legacy_game_path);
-				if (custom != nullptr) {
-					info->CopyFrom(*custom);
-					info->custom_settings = true;
-				} else {
-					info->CopyEmulatorSettingsFrom(m_global_info);
-					info->custom_settings = false;
-				}
-
+				auto info = std::make_unique<Configuration>();
+				info->custom_settings =
+				    FindCustomInfo(&m_custom_infos, game_path, legacy_game_path) != nullptr;
 				SetGameFiles(*info, game_dir.absolutePath(), game_path, metadata);
 				const auto* compatibility = m_compatibility->Find(info->title_id);
 				if (compatibility != nullptr) {
@@ -652,10 +649,9 @@ void ConfigurationListWidget::ScanGameDirectory() {
 				}
 
 				if (auto* item = running_items.value(game_key); item != nullptr) {
-					// The process already has its own configuration copy. Refresh the
-					// row's settings for the next launch without losing its running state.
+					// Refresh metadata without losing the running row's identity.
 					const QSignalBlocker status_blocker(item->GetStatusCombo());
-					item->GetInfo().CopyFrom(*info);
+					item->GetInfo().CopyGameInfoFrom(*info);
 					item->Update();
 					item->SetCompatibilityEditable(m_compatibility->IsLocal() &&
 					                               !item->GetInfo().title_id.trimmed().isEmpty());
@@ -732,16 +728,19 @@ void ConfigurationListWidget::edit_configuration() {
 		return;
 	}
 
-	ConfigurationEditDialog dlg(item->GetInfo(), this);
+	auto                    info = CreateConfiguration(*item);
+	ConfigurationEditDialog dlg(*info, this);
 	dlg.setWindowTitle(tr("Edit game settings"));
 
 	if (dlg.exec() == QDialog::Accepted) {
+		info->custom_settings           = true;
 		item->GetInfo().custom_settings = true;
-		auto game_path                  = item->GetInfo().game_path;
+		auto game_path                  = info->game_path;
 		delete m_custom_infos.take(game_path);
-		m_custom_infos.insert(game_path, CloneConfiguration(item->GetInfo()));
+		m_custom_infos.insert(game_path, info.release());
 		WriteSettings();
-		ScanGameDirectory();
+		item->Update();
+		SelectItem(item);
 	}
 }
 
@@ -753,9 +752,11 @@ void ConfigurationListWidget::delete_configuartion() {
 
 	if (QMessageBox::Yes == QMessageBox::question(this, tr("Clear custom settings"),
 	                                              tr("Do you want to clear custom settings?"))) {
-		ClearCustomSettings(item);
+		delete m_custom_infos.take(item->GetInfo().game_path);
+		item->GetInfo().custom_settings = false;
 		WriteSettings();
-		ScanGameDirectory();
+		item->Update();
+		SelectItem(item);
 	}
 }
 
@@ -770,9 +771,13 @@ void ConfigurationListWidget::edit_global_settings() {
 
 	if (dlg.exec() == QDialog::Accepted) {
 		m_global_info.CopyEmulatorSettingsFrom(info);
-		m_game_dirs = NormalizeGameDirectories(dlg.GetGameDirectories());
+		const auto game_dirs         = NormalizeGameDirectories(dlg.GetGameDirectories());
+		const bool game_dirs_changed = game_dirs != m_game_dirs;
+		m_game_dirs                  = game_dirs;
 		WriteSettings();
-		ScanGameDirectory();
+		if (game_dirs_changed) {
+			ScanGameDirectory();
+		}
 	}
 }
 
@@ -782,10 +787,6 @@ void ConfigurationListWidget::edit_input_mapping() {
 		m_global_info.host_input_mapping = dialog.Mapping();
 		WriteSettings();
 	}
-}
-
-void ConfigurationListWidget::ClearCustomSettings(ConfigurationItem* item) {
-	delete m_custom_infos.take(item->GetInfo().game_path);
 }
 
 void ConfigurationListWidget::ViewTrophies() {

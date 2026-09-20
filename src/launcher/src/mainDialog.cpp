@@ -493,10 +493,8 @@ void MainDialogPrivate::Run() {
 
 	m_running_item->SetRunning(true);
 
-	Configuration info;
-	info.CopyFrom(m_running_item->GetInfo());
-	info.host_input_mapping = m_ui->widget->GetHostInputMapping();
-	m_main_dialog->RunInterpreter(&m_process, info);
+	auto info = m_ui->widget->CreateConfiguration(*m_running_item);
+	m_main_dialog->RunInterpreter(&m_process, *info);
 
 	Update();
 }
