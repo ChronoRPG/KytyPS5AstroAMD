@@ -829,20 +829,22 @@ public:
 	}
 	int Stop() {
 		bool                     was_playing_video = false;
-		AvPlayerEventReplacement stop_event;
+		AvPlayerEventReplacement stop_event {};
 		{
 			std::scoped_lock lifecycle_lock(lifecycle_mutex);
 			{
 				std::lock_guard lock(mutex);
-				was_playing_video = state == State::Playing && video_id.has_value();
-				state             = State::Stopped;
+				if (state == State::Playing) {
+					was_playing_video = video_id.has_value();
+					stop_event        = event;
+				}
+				state = State::Stopped;
 			}
 			StopWorkers();
 			{
 				std::lock_guard lock(mutex);
 				ResetNoLock();
 			}
-			stop_event = TakeStopEvent();
 		}
 		if (was_playing_video) {
 			::printf("AvPlayer video stopped\n");
@@ -960,7 +962,6 @@ public:
 		current_video = std::move(*frame);
 		*out          = current_video->info;
 		RecordLoopBoundary(*current_video);
-		completion_changed.notify_all();
 		if (deliver_seek_frame) {
 			seek_video_frame_pending = false;
 		}
@@ -993,7 +994,6 @@ public:
 		            current_audio->info.details.audio.language_code, 4);
 		last_audio_ts = out->time_stamp;
 		RecordLoopBoundary(*current_audio);
-		completion_changed.notify_all();
 		return true;
 	}
 	std::optional<int32_t> TakeWarning() {
@@ -1011,9 +1011,6 @@ private:
 	bool DrainedNoLock() const {
 		return demux_eof && video_done && audio_done && video_frames.Empty() &&
 		       audio_frames.Empty();
-	}
-	AvPlayerEventReplacement TakeStopEvent() {
-		return stop_event_sent.exchange(true) ? AvPlayerEventReplacement {} : event;
 	}
 	void RecordLoopBoundary(const ReadyFrame& frame) {
 		if (frame.timestamp_offset > last_output_loop_offset) {
@@ -1206,12 +1203,10 @@ private:
 			StopWorkers();
 			return false;
 		}
-		state           = State::Playing;
-		stop_event_sent = false;
+		state = State::Playing;
 		return true;
 	}
 	void NotifyWorkers() {
-		completion_changed.notify_all();
 		video_packets.Notify();
 		audio_packets.Notify();
 		video_buffers.Notify();
@@ -1298,13 +1293,6 @@ private:
 		demux_eof = true;
 		video_packets.Notify();
 		audio_packets.Notify();
-		std::unique_lock lock(mutex);
-		completion_changed.wait(lock, [&] { return worker_stop || DrainedNoLock(); });
-		if (!worker_stop) {
-			const auto stop_event = TakeStopEvent();
-			lock.unlock();
-			emit_event(stop_event, AVPLAYER_EVENT_STATE_STOP);
-		}
 	}
 	void VideoDecoder() {
 		Decoder(video_packets, video_ctx, video_buffers, video_frames, video_done,
@@ -1352,11 +1340,7 @@ private:
 				break;
 			}
 		}
-		{
-			std::lock_guard lock(mutex);
-			done = true;
-		}
-		completion_changed.notify_all();
+		done = true;
 	}
 	bool DecodePacket(AVCodecContext* codec, AVPacket* packet, uint64_t timestamp_offset,
 	                  WorkQueue<std::unique_ptr<GuestBuffer>>& buffers,
@@ -1681,8 +1665,6 @@ private:
 	std::atomic_bool                         demux_eof {true};
 	std::atomic_bool                         video_done {true};
 	std::atomic_bool                         audio_done {true};
-	std::atomic_bool                         stop_event_sent {true};
-	std::condition_variable                  completion_changed;
 	std::mutex                               lifecycle_mutex;
 	mutable std::mutex                       mutex;
 	State                                    state                    = State::Ready;
