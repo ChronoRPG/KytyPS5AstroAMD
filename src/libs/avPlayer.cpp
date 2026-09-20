@@ -706,7 +706,7 @@ public:
 	int Enable(uint32_t id) {
 		std::scoped_lock lifecycle_lock(lifecycle_mutex);
 		std::lock_guard  state_lock(mutex);
-		if (!stopped) {
+		if (state == State::Playing) {
 			return AVPLAYER_ERROR_OPERATION_FAILED;
 		}
 		if (fmt == nullptr || id >= fmt->nb_streams) {
@@ -724,7 +724,7 @@ public:
 	int Disable(uint32_t id) {
 		std::scoped_lock lifecycle_lock(lifecycle_mutex);
 		std::lock_guard  state_lock(mutex);
-		if (!stopped) {
+		if (state == State::Playing) {
 			return AVPLAYER_ERROR_OPERATION_FAILED;
 		}
 		if (video_id == static_cast<int>(id)) {
@@ -755,9 +755,11 @@ public:
 				return AVPLAYER_ERROR_OPERATION_FAILED;
 			}
 			time       = CurrentTimeNoLock();
-			restart    = !stopped;
+			restart    = state == State::Playing;
 			was_paused = paused;
-			stopped    = true;
+			if (restart) {
+				state = State::Ready;
+			}
 		}
 		if (restart) {
 			StopWorkers();
@@ -778,7 +780,7 @@ public:
 	int StartImpl(uint64_t ms, bool paused_after_start = false, bool show_seek_frame = false) {
 		{
 			std::lock_guard lock(mutex);
-			stopped = true;
+			state = State::Ready;
 		}
 		StopWorkers();
 		interrupt_io = false;
@@ -791,14 +793,17 @@ public:
 				AutoEnable();
 			}
 			if (!video_id && !audio_id) {
+				state = State::Stopped;
 				return AVPLAYER_ERROR_OPERATION_FAILED;
 			}
 			if (!OpenCodecs()) {
 				ResetNoLock(true);
+				state = State::Stopped;
 				return AVPLAYER_ERROR_OPERATION_FAILED;
 			}
 			if (!AllocateBuffers()) {
 				ResetNoLock(true);
+				state = State::Stopped;
 				return AVPLAYER_ERROR_NO_MEMORY;
 			}
 			SeekNoLock(ms);
@@ -809,12 +814,11 @@ public:
 			pause_time    = clock_start;
 			seek_video_frame_pending =
 			    paused_after_start && show_seek_frame && video_id.has_value();
-			stopped = false;
 		}
 
 		if (!StartWorkers()) {
 			std::lock_guard lock(mutex);
-			stopped = true;
+			state = State::Stopped;
 			ResetNoLock(true);
 			result = AVPLAYER_ERROR_OPERATION_FAILED;
 		}
@@ -830,8 +834,8 @@ public:
 			std::scoped_lock lifecycle_lock(lifecycle_mutex);
 			{
 				std::lock_guard lock(mutex);
-				was_playing_video = !stopped && video_id.has_value();
-				stopped           = true;
+				was_playing_video = state == State::Playing && video_id.has_value();
+				state             = State::Stopped;
 			}
 			StopWorkers();
 			{
@@ -872,7 +876,8 @@ public:
 	}
 	bool Active() const {
 		std::lock_guard lock(mutex);
-		return !stopped && !pipeline_failed && !DrainedNoLock();
+		return state == State::Ready ||
+		       (state == State::Playing && !pipeline_failed && !DrainedNoLock());
 	}
 	uint64_t CurrentTime() const {
 		std::lock_guard lock(mutex);
@@ -888,7 +893,7 @@ public:
 		return StartImpl(ms, was_paused, true);
 	}
 	uint64_t CurrentTimeNoLock() const {
-		if (stopped) {
+		if (state != State::Playing) {
 			return 0;
 		}
 		using namespace std::chrono;
@@ -925,7 +930,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(mutex);
-		if (stopped || !video_id) {
+		if (state != State::Playing || !video_id) {
 			return false;
 		}
 		const bool deliver_seek_frame = paused && seek_video_frame_pending;
@@ -966,7 +971,8 @@ public:
 			return false;
 		}
 		std::lock_guard lock(mutex);
-		if (paused || stopped || !audio_id || trick_speed != AVPLAYER_TRICK_SPEED_NORMAL) {
+		if (paused || state != State::Playing || !audio_id ||
+		    trick_speed != AVPLAYER_TRICK_SPEED_NORMAL) {
 			return false;
 		}
 		auto frame = audio_frames.TryPop();
@@ -1000,6 +1006,8 @@ public:
 	}
 
 private:
+	enum class State { Ready, Playing, Stopped };
+
 	bool DrainedNoLock() const {
 		return demux_eof && video_done && audio_done && video_frames.Empty() &&
 		       audio_frames.Empty();
@@ -1198,6 +1206,7 @@ private:
 			StopWorkers();
 			return false;
 		}
+		state           = State::Playing;
 		stop_event_sent = false;
 		return true;
 	}
@@ -1676,7 +1685,7 @@ private:
 	std::condition_variable                  completion_changed;
 	std::mutex                               lifecycle_mutex;
 	mutable std::mutex                       mutex;
-	bool                                     stopped                  = true;
+	State                                    state                    = State::Ready;
 	bool                                     paused                   = false;
 	bool                                     seek_video_frame_pending = false;
 	std::atomic_bool                         loop {false};
@@ -2029,7 +2038,7 @@ Bool KYTY_SYSV_ABI AvPlayerGetAudioData(AvPlayerInternal* h, AvPlayerFrameInfo* 
 }
 Bool KYTY_SYSV_ABI AvPlayerIsActive(AvPlayerInternal* h) {
 	PRINT_NAME();
-	return h != nullptr && h->source != nullptr && h->source->Active() ? 1 : 0;
+	return h != nullptr && (h->source == nullptr || h->source->Active());
 }
 uint64_t KYTY_SYSV_ABI AvPlayerCurrentTime(AvPlayerInternal* h) {
 	PRINT_NAME();
