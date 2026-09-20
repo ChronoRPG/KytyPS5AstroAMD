@@ -12,6 +12,22 @@ endif()
 
 project(Kyty)
 
+find_program(SCCACHE_PROGRAM sccache)
+find_program(CCACHE_PROGRAM ccache)
+
+foreach(lang IN ITEMS C CXX)
+    # An explicitly empty launcher disables caching for this language.
+    if(NOT DEFINED CMAKE_${lang}_COMPILER_LAUNCHER)
+        if(SCCACHE_PROGRAM)
+            set(CMAKE_${lang}_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+            message(STATUS "sccache enabled for ${lang}: ${SCCACHE_PROGRAM}")
+        elseif(CCACHE_PROGRAM)
+            set(CMAKE_${lang}_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+            message(STATUS "ccache enabled for ${lang}: ${CCACHE_PROGRAM}")
+        endif()
+    endif()
+endforeach()
+
 set(KYTY_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(KYTY_TESTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 set(KYTY_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty")
