@@ -12831,6 +12831,7 @@ public:
     const uint32_t extent = depth_feedback ? 8 : 32;
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
     constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t rect_address = depth_address + 0x8000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -12864,6 +12865,15 @@ public:
       for (uint32_t x = 0; x < extent; x++) {
         static_cast<float *>(mapped)[y * 64 + x] = initial_depth(x, y);
       }
+    }
+    if (!depth_feedback && !packed_vertex_color) {
+      // Rectangle input contains three position/UV records.
+      constexpr std::array<float, 24> rect_vertices{
+          -0.75f, -0.75f, 0, 0, 0, 0, 0, 0,
+           0.75f, -0.75f, 0, 0, 1, 0, 0, 0,
+          -0.75f,  0.75f, 0, 0, 0, 1, 0, 0};
+      std::memcpy(reinterpret_cast<void *>(rect_address), rect_vertices.data(),
+                  sizeof(rect_vertices));
     }
     resources.MapMemory(depth_address, allocation_size);
     if (depth_feedback) {
@@ -13520,6 +13530,82 @@ public:
         const auto expected = component % 4 == 3 ? 0x3f800000u : 0x3e800000u;
         Require(name, "sparse MRT3 output", sparse_pixels[component] == expected,
                 "MRT3 was compacted to a different slot or clipped by unused MRT0");
+      }
+
+      // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
+      const ShaderBufferResource rect_buffer{{
+          static_cast<u32>(rect_address),
+          static_cast<u32>(rect_address >> 32u) | (32u << 16u), 3,
+          DstSel(4, 5, 6, 7) |
+              (static_cast<u32>(Prospero::BufferFormat::k32Float) << 12u)}};
+      static const auto rect_vertex_code = [] {
+        std::vector<u32> code{
+            EncodeMubuf0(0x0d, 0, true, false), EncodeMubuf1(0, 2, 5),
+            EncodeMubuf0(0x0d, 16, true, false), EncodeMubuf1(2, 2, 5)};
+        AppendVMovU32(&code, 4, 0);
+        AppendVMovLiteral(&code, 6, 0x3f800000u);
+        code.insert(code.end(), {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 4, 6),
+                                 EncodeExp0(0x20, 0xf), EncodeExp1(2, 3, 4, 6)});
+        AppendEnd(&code);
+        return code;
+      }();
+      static const auto rect_pixel_code = [] {
+        std::vector<u32> code;
+        for (u32 component = 0; component < 2; component++) {
+          code.push_back(EncodeVintrp(0, 20 + component, 0, component, 0));
+          code.push_back(EncodeVintrp(1, 20 + component, 0, component, 1));
+        }
+        AppendVMovU32(&code, 22, 0);
+        AppendVMovLiteral(&code, 23, 0x3f800000u);
+        code.insert(code.end(), {EncodeExp0(0x03, 0xf), EncodeExp1(20, 21, 22, 23)});
+        AppendEnd(&code);
+        return code;
+      }();
+      const auto rect_vs = reinterpret_cast<uint64_t>(rect_vertex_code.data());
+      const auto rect_ps = reinterpret_cast<uint64_t>(rect_pixel_code.data());
+      ShaderMapUserData(rect_vs,
+          {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+           .code_size_bytes = static_cast<u32>(rect_vertex_code.size() * sizeof(u32))});
+      ShaderMapUserData(rect_ps,
+          {.type = Prospero::ShaderBinaryType::kPs,
+           .code_size_bytes = static_cast<u32>(rect_pixel_code.size() * sizeof(u32))});
+      shaders.SetEsShaderBase(rect_vs);
+      shaders.SetPsShaderBase(rect_ps);
+      shaders.SetGsShaderResource2({.user_sgpr = 4});
+      for (u32 i = 0; i < 4; i++) {
+        shaders.SetGsUserSgpr(i, rect_buffer.fields[i], HW::UserSgprType::Vsharp);
+      }
+      registers.SetPsInControl(0x8001);
+      registers.SetPsInputEna(2);
+      registers.SetPsInputAddr(2);
+      registers.SetPsInputSettings(0, 0);
+      for (const auto primitive : {Prospero::PrimitiveType::kRectList,
+                                    Prospero::PrimitiveType::kRectListLegacy}) {
+        const char *rect_name = primitive == Prospero::PrimitiveType::kRectList
+                                    ? "RectListThreeRecords" : "LegacyRectListThreeRecords";
+        user_config.SetPrimitiveType(primitive);
+        registers.SetModeControl({});
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+        RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+        const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                            {}, {extent, extent, 1});
+        for (u32 y = 0; y < extent; y++) {
+          for (u32 x = 0; x < extent; x++) {
+            const bool inside = x >= 4 && x < 28 && y >= 4 && y < 28;
+            const auto offset = 4 * (y * extent + x);
+            const std::array<float, 4> expected{
+                inside ? (x + 0.5f - 4) / 24 : 0,
+                inside ? (y + 0.5f - 4) / 24 : 0, 0, inside ? 1.0f : 0};
+            for (u32 component = 0; component < 4; component++) {
+              Require(rect_name, "three-vertex rectangle coverage and UV",
+                  std::abs(std::bit_cast<float>(pixels[offset + component]) -
+                           expected[component]) < 0.0001f,
+                  "rectangle reconstruction lost its fourth corner or interpolated UVs");
+            }
+          }
+        }
       }
       DestroyBuffer(&stencil_readback);
 
@@ -15011,6 +15097,7 @@ private:
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
     Require("VulkanHarness", "graphics", available_features.fillModeNonSolid &&
+                available_features.tessellationShader &&
                 available_depth_clip.depthClipEnable && available_clip_control.depthClipControl &&
                 available_color_write.colorWriteEnable &&
                 available_feedback_layout.attachmentFeedbackLoopLayout &&
@@ -15076,6 +15163,7 @@ private:
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
     device_features.fillModeNonSolid = true;
+    device_features.tessellationShader = true;
     device_info.pEnabledFeatures = &device_features;
     constexpr const char *device_extensions[] = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
