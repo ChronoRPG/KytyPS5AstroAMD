@@ -681,6 +681,12 @@ elseif(WIN32 OR LINUX)
 	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS} -Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")
 endif()
 
+if(LINUX)
+    target_link_options(kyty_emulator PRIVATE
+        $<$<CONFIG:Release>:-Wl,--strip-all>
+    )
+endif()
+
 if(APPLE)
 	# The emulator writes x86-64 trampolines/PLT stubs into memory and executes them, and
 	# runs guest code under Rosetta. That requires the JIT / unsigned-executable-memory
