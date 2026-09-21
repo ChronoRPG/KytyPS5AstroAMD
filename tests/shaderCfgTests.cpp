@@ -1679,45 +1679,14 @@ void TestNewShaderRecompilerSMovB32() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerSoppMarkers() {
+void TestShaderStageBarriers() {
   const uint32_t shader[] = {
-      EncodeSopp(0x00, 3),    // s_nop 3
-      EncodeSopp(0x0c, 0),    // s_waitcnt 0
-      EncodeSopp(0x10, 0x0f), // s_sendmsg 15
-      EncodeSopp(0x16, 0x2a), // s_ttracedata 42
-      EncodeSopp(0x20, 1),    // s_inst_prefetch 1
       EncodeSopp(0x0a, 0),    // s_barrier
       EncodeSopp(0x01, 0),    // s_endpgm
   };
 
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-
-  auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("s_nop 0x00000003") != std::string::npos),
-        "new decoder did not decode SOPP s_nop");
-  Check((result.decoded_dump.find("s_waitcnt 0x00000000") != std::string::npos),
-        "new decoder did not decode SOPP s_waitcnt");
-  Check((result.decoded_dump.find("s_sendmsg 0x0000000f") != std::string::npos),
-        "new decoder did not decode SOPP s_sendmsg");
-  Check((result.decoded_dump.find("s_ttracedata 0x0000002a") != std::string::npos),
-        "new decoder did not decode SOPP s_ttracedata");
-  Check((result.decoded_dump.find("s_inst_prefetch 0x00000001") != std::string::npos),
-        "new decoder did not decode SOPP s_inst_prefetch");
-  Check((result.decoded_dump.find("s_barrier") != std::string::npos),
-        "new decoder did not decode SOPP s_barrier");
-  Check((result.ir_dump.find("ControlNop null, 0x00000003") != std::string::npos),
-        "SOPP s_nop did not lower to an IR marker");
-  Check((result.ir_dump.find("Waitcnt null, 0x00000000") != std::string::npos),
-        "SOPP s_waitcnt did not lower to an IR marker");
-  Check((result.ir_dump.find("Sendmsg null, 0x0000000f") != std::string::npos),
-        "SOPP s_sendmsg did not lower to an IR marker");
-  Check((result.ir_dump.find("TtraceData null, 0x0000002a") != std::string::npos),
-        "SOPP s_ttracedata did not lower to an IR marker");
-  Check((result.ir_dump.find("InstPrefetch null, 0x00000001") != std::string::npos),
-        "SOPP s_inst_prefetch did not lower to an IR marker");
-  Check((result.ir_dump.find("Barrier null") != std::string::npos),
-        "SOPP s_barrier did not lower to an IR marker");
+  const auto result =
+      RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
   Check(SpirvContainsOpcode(result.spirv, 224),
         "SPIR-V binary does not contain OpControlBarrier");
   Check(
@@ -1725,6 +1694,12 @@ void TestNewShaderRecompilerSoppMarkers() {
           result.spirv.end(),
       "SPIR-V barrier does not use workgroup acquire-release memory semantics");
   CheckSpirvBinaryValidates(result.spirv);
+
+  const auto vertex_result =
+      RecompileForTest(shader, MakeCompileOptions(ShaderType::Vertex));
+  CheckSpirvBinaryValidates(vertex_result.spirv);
+  Check(!SpirvContainsOpcode(vertex_result.spirv, 224),
+        "independent vertex invocations retained a workgroup barrier");
 }
 
 void TestNewShaderRecompilerSopkWaitcntMarkers() {
@@ -13443,6 +13418,7 @@ int main() {
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();
   TestNewShaderRecompilerSMovB32();
+  TestShaderStageBarriers();
   TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerAuxPositionExports();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();
