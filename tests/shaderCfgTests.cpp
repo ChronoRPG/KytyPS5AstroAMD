@@ -1702,6 +1702,64 @@ void TestShaderStageBarriers() {
         "independent vertex invocations retained a workgroup barrier");
 }
 
+void TestNggVertexEntryState() {
+  using namespace ShaderRecompiler;
+  // PPSA03309 shader 5a39eb2021a5d2c1: retain its NGG prologue and replace
+  // the resource-dependent vertex body with a position export.
+  const uint32_t shader[] = {
+      0xbfa00003u, 0x93ebff03u, 0x00040018u, 0xbefe03c1u,
+      0x9380ff02u, 0x00090016u, 0x9381ff02u, 0x0009000cu,
+      0xbf8a0000u, 0xbf076b80u, 0xbf850003u, 0x8f6a8c00u,
+      0x887c6a01u, 0xbf900009u, 0xd7650001u, 0x000100c1u,
+      0xd7460001u, 0x04050a6bu, 0x7da80200u, 0xbf880002u,
+      0xf8000941u, 0x00000000u, 0xbf8cff0fu, 0xbefe03c1u,
+      0x7da80201u, EncodeSopp(0x08, 2),
+      EncodeExp0(0x0c, 0xf), EncodeExp1(5, 5, 5, 5), EncodeSopp(0x01),
+  };
+  HW::VertexShaderInfo regs{};
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+  ShaderUserData user_data{};
+  ShaderMappedData mapped{};
+  mapped.user_data = &user_data;
+  mapped.code_size_bytes = sizeof(shader);
+  ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  std::vector<uint32_t> previous_key;
+  for (const uint32_t wave_size : {32u, 64u}) {
+    HW::Context context;
+    context.SetShaderStages(wave_size == 32u ? 0x00400000u : 0u);
+    ShaderVertexInputInfo input{};
+    const auto params = PrepareProgram(regs, context, HW::UserConfig{}, input);
+    Check(input.wave_size == wave_size,
+          "vertex preparation lost the native NGG wave size");
+    const auto key = MakeStageStaticKey(input);
+    Check(previous_key != key, "NGG wave sizes shared a shader cache key");
+    previous_key = key;
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.user_data_base = 8;
+    options.user_data = params.user_data;
+    options.input_info.vertex = &input;
+    options.wave_size = input.wave_size;
+    const auto result = RecompileForTest(params.code, options);
+    bool live_vertex_range = false;
+    for (const auto *block : result.program.blocks) {
+      for (const auto &inst : *block) {
+        if (inst.GetOpcode() == IR::ValueOpcode::UGreaterThan32) {
+          const auto count = inst.Arg(0).Resolve();
+          live_vertex_range |= count.IsImmediate() && count.U32() == wave_size;
+        }
+      }
+    }
+    Check(live_vertex_range && std::ranges::any_of(result.program.info.outputs,
+              [](const auto &output) {
+                return output.kind == IR::StageOutputKind::Position;
+              }),
+          "NGG launch counts suppressed the captured vertex export");
+    Check(result.program.wave_size == wave_size,
+          "NGG wave size was lost during translation");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
 void TestNewShaderRecompilerSopkWaitcntMarkers() {
   const uint32_t shader[] = {
       EncodeSopk(0x17, 125, 0xffff), // s_waitcnt_vscnt null, 0xffff
@@ -13419,6 +13477,7 @@ int main() {
   TestDemandDrivenSpirvDeclarations();
   TestNewShaderRecompilerSMovB32();
   TestShaderStageBarriers();
+  TestNggVertexEntryState();
   TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerAuxPositionExports();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();
