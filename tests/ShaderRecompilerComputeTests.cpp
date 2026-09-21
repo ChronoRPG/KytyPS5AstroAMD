@@ -29200,6 +29200,17 @@ void CheckDepthTextureEncoding() {
           IsSupportedDepthTextureEncoding(compressed_descriptor),
           "valid compressed depth descriptor required a prior depth target");
 
+  const ShaderTextureResource disabled_metadata{{
+      0x20018100u, 0xc1600000u, 0x021bc1dfu, 0x91800204u,
+      0x00000000u, 0x00700000u, 0x00000000u, 0x0020037fu,
+  }};
+  auto retained_metadata_address = compressed_descriptor;
+  retained_metadata_address.fields[6] &= 0xff000000u;
+  Require("DepthTextureEncoding", "disabled metadata with retained address",
+          IsSupportedDepthTextureEncoding(disabled_metadata) &&
+              IsSupportedDepthTextureEncoding(retained_metadata_address),
+          "uncompressed depth rejected inactive metadata address bits");
+
   const ShaderTextureResource first_use_depth{{
       0x0225fc00u, 0x01600000u, 0x00000000u, 0x91800924u,
       0x00000000u, 0x00700000u, 0x80280000u, 0x000225fdu,
