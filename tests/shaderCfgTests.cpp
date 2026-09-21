@@ -1753,7 +1753,7 @@ void TestNggVertexEntryState() {
               [](const auto &output) {
                 return output.kind == IR::StageOutputKind::Position;
               }),
-          "NGG launch counts suppressed the captured vertex export");
+          "NGG launch counts suppressed the vertex export");
     Check(result.program.wave_size == wave_size,
           "NGG wave size was lost during translation");
     CheckSpirvBinaryValidates(result.spirv);
