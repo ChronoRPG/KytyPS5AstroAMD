@@ -3466,6 +3466,13 @@ void TestNewShaderRecompilerCapturedVop1SdwaByteConvert() {
   Check(SpirvContainsOpcode(result.spirv, 112),
         "captured SDWA byte conversion did not emit OpConvertUToF");
   CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t byte_sext[] = {0x7e20a0f9u, 0x000b1412u};
+  ShaderRecompiler::Decoder::Instruction decoded;
+  ShaderRecompiler::Decoder::DecodeInstruction(byte_sext, 0, decoded);
+  Check(decoded.word_count == 2u &&
+            decoded.opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED,
+        "V_CVT_F16_U16 accepted unimplemented SDWA byte sign extension");
 }
 
 void TestNewShaderRecompilerVop1SdwaNotDestination() {

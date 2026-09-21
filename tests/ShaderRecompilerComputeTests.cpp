@@ -19624,6 +19624,33 @@ TestCase VectorMinMaxF16Ops() {
            O::S_ENDPGM}};
 }
 
+TestCase VectorCvtF16U16CapturedByteSource() {
+  using O = ShaderOpcode;
+
+  constexpr std::array inputs = {0xff123456u, 0x80123456u, 0x00123456u};
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 16, 0xa5a55a5au);
+  for (u32 i = 0; i < inputs.size(); i++) {
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 18, 30);
+    // Captured shader 0x15082e211725205f: unsigned byte3 -> FP16 word0,
+    // preserving word1 of v16.
+    code.insert(code.end(), {0x7e20a0f9u, 0x00031412u});
+    AppendStoreVgpr(&code, 16, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorCvtF16U16CapturedByteSource";
+  test.code = std::move(code);
+  test.initial.assign(inputs.begin(), inputs.end());
+  test.expected = {0xa5a55bf8u, 0xa5a55800u, 0xa5a50000u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_CVT_F16_U16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpBitFieldUExtract", "OpConvertUToF"};
+  return test;
+}
+
 TestCase VectorCvtU16F16Sdwa() {
   using O = ShaderOpcode;
 
@@ -27458,6 +27485,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(CvtPkrtzF16F32SdwaAndOutputModifiers);
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
   AddCase(VectorMinMaxF16Ops);
+  AddCase(VectorCvtF16U16CapturedByteSource);
   AddCase(VectorCvtU16F16Sdwa);
   AddCase(NativeAndSdwa16BitDestinationWrites);
   AddCase(VectorMinMaxMed3F16Ops);
