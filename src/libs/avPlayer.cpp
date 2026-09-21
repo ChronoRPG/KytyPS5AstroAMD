@@ -852,11 +852,15 @@ public:
 		emit_event(stop_event, AVPLAYER_EVENT_STATE_STOP);
 		return 0;
 	}
-	void Pause() {
+	int Pause() {
 		std::scoped_lock lifecycle_lock(lifecycle_mutex);
 		std::lock_guard  lock(mutex);
+		if (state != State::Playing) {
+			return AVPLAYER_ERROR_OPERATION_FAILED;
+		}
 		paused     = true;
 		pause_time = std::chrono::steady_clock::now();
+		return 0;
 	}
 	void Resume() {
 		std::scoped_lock lifecycle_lock(lifecycle_mutex);
@@ -890,6 +894,9 @@ public:
 		bool             was_paused = false;
 		{
 			std::lock_guard lock(mutex);
+			if (state != State::Playing) {
+				return AVPLAYER_ERROR_OPERATION_FAILED;
+			}
 			was_paused = paused;
 		}
 		return StartImpl(ms, was_paused, true);
@@ -1917,9 +1924,11 @@ int KYTY_SYSV_ABI AvPlayerPause(AvPlayerInternal* h) {
 	if (h == nullptr || h->source == nullptr) {
 		return AVPLAYER_ERROR_INVALID_PARAMS;
 	}
-	h->source->Pause();
-	emit_event(h->event, AVPLAYER_EVENT_STATE_PAUSE);
-	return 0;
+	auto rc = h->source->Pause();
+	if (rc == 0) {
+		emit_event(h->event, AVPLAYER_EVENT_STATE_PAUSE);
+	}
+	return rc;
 }
 int KYTY_SYSV_ABI AvPlayerResume(AvPlayerInternal* h) {
 	PRINT_NAME();
