@@ -153,7 +153,7 @@ void CompilePixelRuntime(const ShaderParams &params,
                          ShaderPixelInputInfo &input_info) {
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.shader_hash = params.hash;
-  options.user_data = params.user_data;
+  options.user_data = std::span(params.user_data).first(params.user_data_count);
 
   options.input_info.pixel = &input_info;
   auto result = RecompileForTest(params.code, options);
@@ -1735,7 +1735,7 @@ void TestNggVertexEntryState() {
     previous_key = key;
     auto options = MakeCompileOptions(ShaderType::Vertex);
     options.user_data_base = 8;
-    options.user_data = params.user_data;
+    options.user_data = std::span(params.user_data).first(params.user_data_count);
     options.input_info.vertex = &input;
     options.wave_size = input.wave_size;
     const auto result = RecompileForTest(params.code, options);
@@ -9645,7 +9645,7 @@ void TestMergedShaderUserDataSnapshot() {
   regs.gs_user_sgpr.value[0]++;
   ShaderVertexInputInfo second_input{};
   const auto second = PrepareProgram(regs, context, user_config, second_input);
-  Check(first.user_data.size() == 12 && second.user_data.size() == 12 &&
+  Check(first.user_data_count == 12 && second.user_data_count == 12 &&
             std::equal(front_data.begin(), front_data.end(), first.user_data.begin() + 8) &&
             second.user_data[8] == front_data[0] + 1,
         "merged shader parameters did not snapshot ordinary user SGPRs at s8");
@@ -9656,7 +9656,7 @@ void TestMergedShaderUserDataSnapshot() {
   CompileOptions options{};
   options.stage = ShaderType::Mesh;
   options.user_data_base = 0;
-  options.user_data = first.user_data;
+  options.user_data = std::span(first.user_data).first(first.user_data_count);
   options.input_info.vertex = &first_input;
   options.back_code = first.back_code;
   const auto translated = TranslateProgram(first.code, options);
@@ -9664,13 +9664,14 @@ void TestMergedShaderUserDataSnapshot() {
   Check(program.info.buffers.size() == 2 && program.srt_reads.size() == 4,
         "merged shader lost front user SGPRs or the back-stage SRT load");
   for (const auto *params : {&first, &second}) {
-    const IR::SrtRuntime runtime{.user_data = params->user_data,
+    const auto user_data = std::span(params->user_data).first(params->user_data_count);
+    const IR::SrtRuntime runtime{.user_data = user_data,
                                  .read_memory = ReadHostTestMemory};
     IR::DescriptorValue front_descriptor, back_descriptor;
     const auto &table = params == &first ? first_table : second_table;
     Check(IR::SrtWalker(program, runtime).EvaluateDescriptor(program.info.buffers[0].source, front_descriptor) &&
               IR::SrtWalker(program, runtime).EvaluateDescriptor(program.info.buffers[1].source, back_descriptor) &&
-              std::equal(params->user_data.begin() + 8, params->user_data.end(),
+              std::equal(user_data.begin() + 8, user_data.end(),
                          front_descriptor.dwords.begin()) &&
               std::equal(table.begin(), table.end(), back_descriptor.dwords.begin()),
           "merged shader resource plan did not follow the current s0:s1 pointer and s8 data");
@@ -9688,12 +9689,27 @@ void TestMergedShaderUserDataSnapshot() {
     ShaderVertexInputInfo input{};
     const auto params = PrepareProgram(regs, context, user_config, input);
     Check(params.back_code.empty() && params.hash == XXH3_64bits(monolithic, sizeof(monolithic)) &&
-              input.mesh.scratch_size_dwords == 3 && params.user_data.size() == 12 &&
+              input.mesh.scratch_size_dwords == 3 && params.user_data_count == 12 &&
               params.user_data[0] == 0 && params.user_data[1] == 0 &&
-              std::equal(second.user_data.begin() + 8, second.user_data.end(),
+              std::equal(second.user_data.begin() + 8, second.user_data.begin() + second.user_data_count,
                          params.user_data.begin() + 8),
           "monolithic NGG shader used stale GS-back state or lost its s8 user data");
   }
+  regs.gs_regs.rsrc2.user_sgpr = HW::UserSgprInfo::SGPRS_MAX;
+  for (uint32_t i = 4; i < HW::UserSgprInfo::SGPRS_MAX; ++i) {
+    regs.gs_user_sgpr.value[i] = 0x10001000u + i;
+  }
+  ShaderVertexInputInfo full_input{};
+  const auto full = PrepareProgram(regs, context, user_config, full_input);
+  Check(full.user_data_count == 8u + HW::UserSgprInfo::SGPRS_MAX &&
+            std::ranges::all_of(std::span(full.user_data).first(8),
+                               [](uint32_t word) { return word == 0; }) &&
+            std::equal(std::begin(regs.gs_user_sgpr.value), std::end(regs.gs_user_sgpr.value),
+                       full.user_data.begin() + 8),
+        "merged shader did not preserve the full user-SGPR range after its reserved prefix");
+  regs.gs_user_sgpr.value[HW::UserSgprInfo::SGPRS_MAX - 1]++;
+  Check(full.user_data.back() == 0x10001000u + HW::UserSgprInfo::SGPRS_MAX - 1,
+        "merged shader parameters borrowed mutable register storage");
   context.SetMaxOutputPerSubgroup(256);
   context.SetGsMaxVertOut(8);
   user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriFan);
@@ -12839,7 +12855,7 @@ void TestComputeLdsAllocationIdentity() {
           "COMPUTE_PGM_RSRC2 LDS allocation units were not decoded");
     auto options = MakeCompileOptions(ShaderType::Compute);
     options.shader_hash = params.hash;
-    options.user_data = params.user_data;
+    options.user_data = std::span(params.user_data).first(params.user_data_count);
     options.input_info.compute = &input_info;
     options.wave_size = input_info.wave_size;
 
@@ -12905,7 +12921,7 @@ void TestComputeLdsAllocationIdentity() {
         "AGC per-thread scratch size was not propagated");
   auto scratch_options = MakeCompileOptions(ShaderType::Compute);
   scratch_options.shader_hash = scratch_params.hash;
-  scratch_options.user_data = scratch_params.user_data;
+  scratch_options.user_data = std::span(scratch_params.user_data).first(scratch_params.user_data_count);
   scratch_options.input_info.compute = &scratch_info;
   scratch_options.wave_size = scratch_info.wave_size;
 

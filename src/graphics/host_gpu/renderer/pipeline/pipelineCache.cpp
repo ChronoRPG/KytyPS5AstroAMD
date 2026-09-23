@@ -276,14 +276,15 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
+		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
-		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
+		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
-		    .user_data                  = params.user_data,
+		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
@@ -329,7 +330,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
 		options.shader_hash = params.hash;
-		options.user_data   = params.user_data;
+		options.user_data   = user_data;
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
