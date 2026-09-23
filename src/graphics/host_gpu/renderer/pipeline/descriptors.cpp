@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -989,19 +990,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
 					EXIT_IF(storage || host_view == image.views.end());
 					const auto aspect = host_view->info.aspect;
-					const bool depth_feedback =
-					    layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
-					    program.stage == ShaderType::Pixel;
-					const bool depth_read =
-					    depth_feedback || layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
-					    layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
-					    layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal;
-					const bool stencil_read =
-					    layout == vk::ImageLayout::eStencilReadOnlyOptimal ||
-					    layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
-					    layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;
-					if ((aspect & vk::ImageAspectFlagBits::eDepth && !depth_read) ||
-					    (aspect & vk::ImageAspectFlagBits::eStencil && !stencil_read)) {
+					if (aspect & ~DepthReadableAspects(layout)) {
 						EXIT("sampling a writable depth/stencil attachment aspect\n");
 					}
 				}
