@@ -20623,6 +20623,43 @@ TestCase VectorLaneWave32RuntimeSelectorWraps() {
   return test;
 }
 
+TestCase VectorReadlaneSelectsTwoKeysWithinWave() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x16, 1, InlineU32(4), 0)); // lanes 0..15: 0, 16..31: 1
+  AppendVop3(&code, 0x360, 20, Vgpr(1), InlineU32(0));
+  AppendVop3(&code, 0x360, 21, Vgpr(1), InlineU32(16));
+  AppendVMovU32(&code, 2, 0);
+  AppendVMovU32(&code, 3, 11);
+  AppendVMovU32(&code, 4, 22);
+  code.push_back(EncodeVopc(0xc2, 20, 1)); // selected lane 0 key == local key
+  code.push_back(EncodeVop2(0x01, 2, Vgpr(2), 3));
+  code.push_back(EncodeVopc(0xc2, 21, 1)); // selected lane 16 key == local key
+  code.push_back(EncodeVop2(0x01, 2, Vgpr(2), 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorReadlaneSelectsTwoKeysWithinWave";
+  test.code = std::move(code);
+  test.expected.resize(32);
+  std::fill_n(test.expected.begin(), 16, 11u);
+  std::fill_n(test.expected.begin() + 16, 16, 22u);
+  test.opcodes = {O::V_LSHRREV_B32, O::V_READLANE_B32, O::V_MOV_B32,
+                  O::V_CMP_EQ_U32, O::V_CNDMASK_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_READLANE_B32", 2}};
+  test.required_spirv = {"OpGroupNonUniformShuffle"};
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorPermlanex16() {
   using O = ShaderOpcode;
 
@@ -28227,6 +28264,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorWritelaneIgnoresExecMask);
   AddCase(VectorReadlaneFromInactiveWrittenLane);
   AddCase(VectorLaneWave32RuntimeSelectorWraps);
+  AddCase(VectorReadlaneSelectsTwoKeysWithinWave);
   AddCase(VectorPermlanex16);
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);
@@ -33447,6 +33485,11 @@ int main(int argc, char **argv) {
     CheckIndirectImageKeySwitch();
     VulkanHarness vulkan;
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--readlane-key-guard-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
     return 0;
   }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
