@@ -512,6 +512,28 @@ private:
 		}
 	}
 
+	const Block* FindBlock(uint32_t id) const {
+		const auto info = std::ranges::find(m_program.block_info, id, &BlockInfo::id);
+		return info == m_program.block_info.end()
+		           ? nullptr
+		           : m_program.blocks[info - m_program.block_info.begin()];
+	}
+
+	bool CanReach(const Block* start, const Block* target, const Block* avoid) const {
+		std::vector<const Block*> pending {start};
+		std::vector<const Block*> visited;
+		while (!pending.empty()) {
+			const auto* block = pending.back();
+			pending.pop_back();
+			if (block == nullptr || block == avoid ||
+			    std::ranges::find(visited, block) != visited.end()) continue;
+			if (block == target) return true;
+			visited.push_back(block);
+			for (const auto* next: block->ImmSuccessors()) pending.push_back(next);
+		}
+		return false;
+	}
+
 	Value BoundedLoopCount(Value key, const Block* use) const {
 		const auto* phi = key.Resolve().TryInstruction();
 		if (m_shader_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
@@ -537,26 +559,6 @@ private:
 		}
 		if (!induction) return {};
 
-		const auto find_block = [&](uint32_t id) -> const Block* {
-			const auto info = std::ranges::find(m_program.block_info, id, &BlockInfo::id);
-			return info == m_program.block_info.end()
-			           ? nullptr
-			           : m_program.blocks[info - m_program.block_info.begin()];
-		};
-		const auto reaches = [&](const Block* start, const Block* target, const Block* avoid) {
-			std::vector<const Block*> pending {start};
-			std::vector<const Block*> visited;
-			while (!pending.empty()) {
-				const auto* block = pending.back();
-				pending.pop_back();
-				if (block == nullptr || block == avoid ||
-				    std::ranges::find(visited, block) != visited.end()) continue;
-				if (block == target) return true;
-				visited.push_back(block);
-				for (const auto* next: block->ImmSuccessors()) pending.push_back(next);
-			}
-			return false;
-		};
 		const auto contains = [&](auto&& self, Value value, const Inst* comparison) -> bool {
 			value = value.Resolve();
 			if (value.TryInstruction() == comparison) return true;
@@ -576,10 +578,10 @@ private:
 				    negated->GetOpcode() != ValueOpcode::LogicalNot ||
 				    !contains(contains, negated->Arg(0), compare) ||
 				    use == m_program.blocks[i] ||
-				    reaches(m_program.blocks.front(), use, m_program.blocks[i]) ||
-				    reaches(phi->Parent(), use, m_program.blocks[i]) ||
-				    reaches(find_block(info.terminator.true_block), use, phi->Parent()) ||
-				    !reaches(find_block(info.terminator.false_block), use, phi->Parent())) {
+				    CanReach(m_program.blocks.front(), use, m_program.blocks[i]) ||
+				    CanReach(phi->Parent(), use, m_program.blocks[i]) ||
+				    CanReach(FindBlock(info.terminator.true_block), use, phi->Parent()) ||
+				    !CanReach(FindBlock(info.terminator.false_block), use, phi->Parent())) {
 					continue;
 				}
 				return compare->Arg(1);
