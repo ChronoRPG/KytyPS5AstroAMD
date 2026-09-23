@@ -1901,6 +1901,8 @@ struct Ngs2VoiceInternal {
 	struct Module {
 		std::vector<uint8_t> param, work, state;
 		uint32_t             flags = 1;
+		bool                 control_warned = false;
+		bool                 render_warned  = false;
 	};
 	Ngs2VoicePlayEvent              event          = Ngs2VoicePlayEvent::None;
 	Ngs2VoicePlayState              state          = Ngs2VoicePlayState::Empty;
@@ -2850,7 +2852,15 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 		if (voice.has_samples) {
 			const auto& custom = voice.rack->option.custom_sampler.custom_rack_option;
 			for (size_t m = 0; m < voice.modules.size(); ++m) {
-				EXIT_NOT_IMPLEMENTED(custom.module[m].module_id != 0x1f);
+				if (custom.module[m].module_id != 0x1f) {
+					if (!voice.modules[m].render_warned) {
+						Log::WriteToConsoleAndLog(fmt::sprintf(
+						    "warning: NGS2 custom module 0x%02x at index %zu is ignored during render\n",
+						    custom.module[m].module_id, m));
+						voice.modules[m].render_warned = true;
+					}
+					continue;
+				}
 				EXIT_NOT_IMPLEMENTED(custom.module[m].source_buffer_id != 0 ||
 				                     custom.module[m].dest_buffer_id != 0);
 				auto&               module = voice.modules[m];
@@ -3363,8 +3373,18 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 			case 0x4000: {
 				EXIT_NOT_IMPLEMENTED(!Ngs2RackIsCustom(voice->rack->type));
 				const auto index = param->id & 0x1fu;
-				EXIT_NOT_IMPLEMENTED((param->id & 0xffffffe0u) != 0x40001f00u ||
-				                     index >= voice->modules.size());
+				EXIT_NOT_IMPLEMENTED(index >= voice->modules.size());
+				if ((param->id & 0xffffffe0u) != 0x40001f00u ||
+				    voice->rack->option.custom_sampler.custom_rack_option.module[index].module_id !=
+				        0x1f) {
+					if (!voice->modules[index].control_warned) {
+						Log::WriteToConsoleAndLog(fmt::sprintf(
+						    "warning: NGS2 custom control 0x%08" PRIx32 " is ignored\n",
+						    param->id));
+						voice->modules[index].control_warned = true;
+					}
+					break;
+				}
 				struct FxParam {
 					Ngs2VoiceParamHeader header;
 					const void*          data;
