@@ -198,7 +198,8 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
                               const DescriptorSource::IndirectImage& indirect,
                               const DescriptorValue& material_value,
                               const DescriptorValue& table_value, uint32_t image_index,
-                              const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                              const SrtRuntime& runtime, SrtWalker& clean,
+                              ResourceSnapshot& snapshot,
                               ResourceSpecialization& specialization) {
 	uint64_t table_base = 0;
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
@@ -214,11 +215,15 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 	auto& keys = program.material_keys;
 	keys.clear();
 	if (indirect.material_source == UINT32_MAX) {
-		if (table_value.dword_count != 2u || indirect.key_count == 0u ||
-		    indirect.key_count > MaxIndirectImageProbes) {
+		uint32_t key_count = 0;
+		const bool evaluated = clean.Evaluate(indirect.key_count, key_count);
+		if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
+		if (table_value.dword_count != 2u || !evaluated ||
+		    key_count > MaxIndirectImageProbes ||
+		    uint64_t {indirect.table_offset} + uint64_t {key_count} * 32u > UINT32_MAX + 1ull) {
 			return false;
 		}
-		keys.resize(indirect.key_count);
+		keys.resize(key_count);
 		std::iota(keys.begin(), keys.end(), 0u);
 	} else {
 		ShaderBufferResource material;
@@ -816,6 +821,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		auto& target          = plan.descriptor_sources.emplace_back();
 		target.dword_count    = source.dword_count;
 		target.indirect_image = source.indirect_image;
+		if (target.indirect_image.has_value()) {
+			target.indirect_image->key_count = Clone(target.indirect_image->key_count);
+		}
 		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
 			target.dwords[dword] = Clone(source.dwords[dword]);
 		}
@@ -921,7 +929,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if ((indirect.material_source != UINT32_MAX &&
 			     !clean.EvaluateDescriptor(indirect.material_source, material)) ||
 			    !clean.EvaluateDescriptor(indirect.table_source, table) ||
-			    !MaterializeIndirectImage(program, indirect, material, table, i, runtime, snapshot,
+			    !MaterializeIndirectImage(program, indirect, material, table, i, runtime, clean, snapshot,
 			                              specialization)) {
 				return false;
 			}

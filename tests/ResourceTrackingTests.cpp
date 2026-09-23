@@ -614,7 +614,8 @@ void TestGuardedDirectImageTable() {
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_image;
     Check(indirect && indirect->material_source == UINT32_MAX &&
               indirect->selector_stride == 0u && indirect->table_offset == 344u &&
-              indirect->key_count == 32u &&
+              indirect->key_count.Resolve().IsImmediate() &&
+              indirect->key_count.Resolve().U32() == 32u &&
               fixture.program.descriptor_sources[indirect->table_source].dword_count == 2u,
           "guarded direct image table lost its pointer or proven selector range");
     return ExtractResourcePlan(fixture.program);
@@ -697,6 +698,153 @@ void TestGuardedDirectImageTable() {
   Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
             endpoint.watched_reads == 0u,
         "batched descriptor read crossed the 48-bit endpoint");
+}
+
+void TestBoundedComputeImageLoop() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant {
+    Bounded, WrongGuard, EntryBypass, ExitBypass, GuardBlock, WrongStep
+  };
+  const auto make_plan = [](Variant variant) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(header);
+    header->AddBranch(exit);
+    header->AddBranch(body);
+    body->AddBranch(latch);
+    latch->AddBranch(header);
+    if (variant == Variant::EntryBypass) entry->AddBranch(body);
+    if (variant == Variant::ExitBypass) exit->AddBranch(body);
+    fixture.program.block_info[0].terminator = {
+        .kind = variant == Variant::EntryBypass ? CFG::TerminatorKind::ConditionalBranch
+                                               : CFG::TerminatorKind::Branch,
+        .true_block = 1u, .false_block = 2u};
+    fixture.program.block_info[1].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = 4u, .false_block = 2u};
+    fixture.program.block_info[2].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = 3u};
+    fixture.program.block_info[3].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
+    fixture.program.block_info[4].terminator = {
+        .kind = variant == Variant::ExitBypass ? CFG::TerminatorKind::Branch
+                                              : CFG::TerminatorKind::Return,
+        .true_block = 2u};
+
+    auto &phi = header->AppendNewInst(ValueOpcode::Phi, {},
+                                      static_cast<uint64_t>(Type::U32));
+    const auto key = Value(&phi);
+    const auto count = fixture.UserData(2);
+    const auto in_range = fixture.Emit(ValueOpcode::SLessThan32,
+                                       {variant == Variant::WrongGuard
+                                            ? Value(0u) : key,
+                                        count}, 0, header);
+    const auto allowed = fixture.Emit(ValueOpcode::LogicalAnd,
+                                      {in_range, Value(true)}, 0, header);
+    fixture.program.block_info[1].condition =
+        fixture.Emit(ValueOpcode::LogicalNot, {allowed}, 0, header);
+    const auto step = fixture.Emit(ValueOpcode::IAdd32,
+                                   {key, Value(variant == Variant::WrongStep ? 2u : 1u)},
+                                   0, latch);
+    phi.AddPhiOperand(entry, Value(0u));
+    phi.AddPhiOperand(latch, step);
+
+    fixture.block = variant == Variant::GuardBlock ? header : body;
+    const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}),
+         Value(0x6b0u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * sizeof(uint32_t);
+      words[word] = fixture.Emit(
+          ValueOpcode::LoadAddressU32,
+          {table, offset, Value(0u), Value(true)},
+          fixture.AddMemory(memory, 0x29c));
+    }
+    const auto image = fixture.Image(words, 0x29c);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw,
+                 {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(sample, 0x29c));
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_image;
+    Check(indirect && indirect->material_source == UINT32_MAX &&
+              indirect->table_offset == 0x6b0u &&
+              indirect->key_count.Resolve() == count.Resolve(),
+          "bounded compute loop lost its runtime image count");
+    return ExtractResourcePlan(fixture.program);
+  };
+
+  auto plan = make_plan(Variant::Bounded);
+  CheckFatal([&] { make_plan(Variant::WrongGuard); },
+             "not a valid runtime value",
+             "compute image loop accepted an unrelated guard");
+  CheckFatal([&] { make_plan(Variant::EntryBypass); },
+             "not a valid runtime value",
+             "compute image loop accepted an entry bypass");
+  CheckFatal([&] { make_plan(Variant::ExitBypass); },
+             "not a valid runtime value",
+             "compute image loop accepted an exit bypass");
+  CheckFatal([&] { make_plan(Variant::GuardBlock); },
+             "not a valid runtime value",
+             "compute image loop accepted a descriptor read before the guard");
+  CheckFatal([&] { make_plan(Variant::WrongStep); },
+             "not a valid runtime value",
+             "compute image loop accepted a two-step induction");
+
+  LinearTestMemory memory;
+  const auto table = 0x1800u + 0x6b0u;
+  for (uint32_t key = 0; key < 3u; ++key) {
+    const auto word = (table - memory.base) / 4u + key * 8u;
+    memory.words[word] = 0x100u + key;
+    memory.words[word + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  std::array<uint32_t, 3> user_data{0x1800u, 0u, 2u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .read_memory = ReadLinearTestMemory,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const uint32_t count : {2u, 3u, 2u}) {
+    user_data[2] = count;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == count &&
+              specialization.images.size() == count &&
+              snapshot.flattened_srt[
+                  specialization.images[0].indirect_mapping_offset] == count &&
+              snapshot.images.back().dwords[0] == 0x100u + count - 1u,
+          "compute image table did not refresh for a changed loop bound");
+  }
+  for (const uint32_t count : {0u, UINT32_MAX}) {
+    user_data[2] = count;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 1u &&
+              specialization.images.size() == 1u &&
+              std::ranges::all_of(snapshot.images[0].dwords,
+                                  [](uint32_t word) { return word == 0u; }) &&
+              specialization.images[0].indirect_root ==
+                  ImageResource::NoIndirectImage &&
+              specialization.images[0].indirect_search_iterations == 0u,
+          "empty compute loop bound retained unreachable image candidates");
+  }
+  user_data[2] = 65537u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "oversized compute loop bound was accepted for image enumeration");
 }
 
 void TestImageDescriptorFields() {
@@ -2506,6 +2654,7 @@ int main() {
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("guarded direct image table", TestGuardedDirectImageTable);
+    Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);

@@ -313,8 +313,16 @@ private:
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			const auto& current = m_sources[candidate];
 			if (current.dword_count != descriptor.dword_count ||
-			    current.indirect_image != descriptor.indirect_image) {
+			    current.indirect_image.has_value() != descriptor.indirect_image.has_value()) {
 				continue;
+			}
+			if (current.indirect_image.has_value()) {
+				const auto& a = *current.indirect_image;
+				const auto& b = *descriptor.indirect_image;
+				if (a.material_source != b.material_source || a.table_source != b.table_source ||
+				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
+				    a.table_offset != b.table_offset ||
+				    !EquivalentValue(m_program, a.key_count, b.key_count)) continue;
 			}
 			bool same = true;
 			for (uint32_t i = 0; i < descriptor.dword_count; i++) {
@@ -504,6 +512,82 @@ private:
 		}
 	}
 
+	Value BoundedLoopCount(Value key, const Block* use) const {
+		const auto* phi = key.Resolve().TryInstruction();
+		if (m_shader_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
+		    phi->GetType() != Type::U32 || phi->NumArgs() != 2u ||
+		    m_program.blocks.size() != m_program.block_info.size()) {
+			return {};
+		}
+		bool induction = false;
+		for (uint32_t initial = 0; initial < 2u; ++initial) {
+			const auto zero = phi->Arg(initial).Resolve();
+			const auto* step = phi->Arg(initial ^ 1u).Resolve().TryInstruction();
+			if (!zero.IsImmediate() || zero.GetType() != Type::U32 || zero.U32() != 0u ||
+			    step == nullptr || step->GetOpcode() != ValueOpcode::IAdd32 ||
+			    step->Parent() != phi->PhiBlock(initial ^ 1u)) {
+				continue;
+			}
+			uint32_t increment = 0;
+			induction = (step->Arg(0).Resolve() == key &&
+			             ImmediateU32(step->Arg(1), increment) && increment == 1u) ||
+			            (step->Arg(1).Resolve() == key &&
+			             ImmediateU32(step->Arg(0), increment) && increment == 1u);
+			if (induction) break;
+		}
+		if (!induction) return {};
+
+		const auto find_block = [&](uint32_t id) -> const Block* {
+			const auto info = std::ranges::find(m_program.block_info, id, &BlockInfo::id);
+			return info == m_program.block_info.end()
+			           ? nullptr
+			           : m_program.blocks[info - m_program.block_info.begin()];
+		};
+		const auto reaches = [&](const Block* start, const Block* target, const Block* avoid) {
+			std::vector<const Block*> pending {start};
+			std::vector<const Block*> visited;
+			while (!pending.empty()) {
+				const auto* block = pending.back();
+				pending.pop_back();
+				if (block == nullptr || block == avoid ||
+				    std::ranges::find(visited, block) != visited.end()) continue;
+				if (block == target) return true;
+				visited.push_back(block);
+				for (const auto* next: block->ImmSuccessors()) pending.push_back(next);
+			}
+			return false;
+		};
+		const auto contains = [&](auto&& self, Value value, const Inst* comparison) -> bool {
+			value = value.Resolve();
+			if (value.TryInstruction() == comparison) return true;
+			const auto* inst = value.TryInstruction();
+			return inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalAnd &&
+			       (self(self, inst->Arg(0), comparison) || self(self, inst->Arg(1), comparison));
+		};
+		for (const auto& use_of_key: phi->Uses()) {
+			const auto* compare = use_of_key.user;
+			if (compare->GetOpcode() != ValueOpcode::SLessThan32 || use_of_key.operand != 0u ||
+			    !ValidateRuntimeValue(m_program, compare->Arg(1))) continue;
+			for (uint32_t i = 0; i < m_program.block_info.size(); ++i) {
+				const auto& info = m_program.block_info[i];
+				const auto* negated = info.condition.Resolve().TryInstruction();
+				if (info.terminator.kind != CFG::TerminatorKind::ConditionalBranch ||
+				    compare->Parent() != m_program.blocks[i] || negated == nullptr ||
+				    negated->GetOpcode() != ValueOpcode::LogicalNot ||
+				    !contains(contains, negated->Arg(0), compare) ||
+				    use == m_program.blocks[i] ||
+				    reaches(m_program.blocks.front(), use, m_program.blocks[i]) ||
+				    reaches(phi->Parent(), use, m_program.blocks[i]) ||
+				    reaches(find_block(info.terminator.true_block), use, phi->Parent()) ||
+				    !reaches(find_block(info.terminator.false_block), use, phi->Parent())) {
+					continue;
+				}
+				return compare->Arg(1);
+			}
+		}
+		return {};
+	}
+
 	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
@@ -562,13 +646,16 @@ private:
 		indirect.table_offset = table_offset;
 		if (table_source.dword_count == 2u) {
 			const auto* selector = key.Resolve().TryInstruction();
-			if (m_shader_writes || selector == nullptr ||
-			    selector->GetOpcode() != ValueOpcode::FindILsb32 || selector->NumArgs() != 1u ||
-			    !NonzeroOnEntry(selector->Arg(0), handle.Parent()) ||
-			    (table_offset & 3u) != 0u || table_offset > UINT32_MAX - (32u * 32u - 1u)) {
-				return false;
+			const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&
+			    selector->NumArgs() == 1u && !m_shader_writes &&
+			    NonzeroOnEntry(selector->Arg(0), handle.Parent());
+			if (bitscan) {
+				indirect.key_count = Value(32u);
+			} else {
+				indirect.key_count = BoundedLoopCount(key, handle.Parent());
 			}
-			indirect.key_count = 32u;
+			if (indirect.key_count.IsEmpty() || (table_offset & 3u) != 0u ||
+			    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
 		} else {
 			auto* material_read = key.Resolve().TryInstruction();
 			uint32_t material_memory_index = 0;
