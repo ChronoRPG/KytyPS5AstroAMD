@@ -507,8 +507,8 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
-// Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
-// uniform condition and fill values without retaining translated blocks.
+// Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
+// condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
 	struct EvaluationContext {
 		struct Entry {
@@ -536,7 +536,6 @@ struct ResourcePlan {
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
-	std::vector<uint32_t>               materialization_sources;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
@@ -544,10 +543,14 @@ struct ResourcePlan {
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
-	// GPU-thread scratch. Each nested clean/EXEC evaluation has its own reusable memo.
+	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;
 	mutable uint32_t                       evaluation_depth       = 0;
+	mutable std::vector<uint8_t>            active_sources;
+	mutable std::vector<uint8_t>            visited_blocks;
+	mutable std::vector<uint32_t>           pending_blocks;
+	mutable std::vector<uint32_t>           material_keys;
 };
 
 struct Program: ResourcePlan {

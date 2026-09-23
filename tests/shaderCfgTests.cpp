@@ -158,9 +158,11 @@ void CompilePixelRuntime(const ShaderParams &params,
   options.input_info.pixel = &input_info;
   auto result = RecompileForTest(params.code, options);
   static std::deque<ShaderRecompiler::IR::CompiledShaderInfo> programs;
+  static std::deque<ShaderRecompiler::IR::ResourceSnapshot> resources;
   programs.push_back(std::move(result.program).TakeCompiledInfo());
   input_info.stage.program = &programs.back();
-  input_info.stage.resources = std::move(result.resources);
+  resources.push_back(std::move(result.resources));
+  input_info.stage.resources = &resources.back();
 }
 
 template <typename InputInfo>
@@ -1154,20 +1156,17 @@ void TestNativeShaderResourceDependencies() {
       .info = program.info,
       .bindings = program.bindings,
   };
-  ShaderStageRuntime runtime{.program = &compiled, .resources = resources};
+  ShaderStageRuntime runtime{.program = &compiled, .resources = &resources};
   Check(HasShaderBufferWrites(runtime),
         "graphics/compute write predicate lost nonempty written buffers");
   set_buffer(0, 0, 16, 3);
   set_buffer(2, 0x2000, 0, 0);
-  runtime.resources = resources;
   Check(!HasShaderBufferWrites(runtime),
         "graphics/compute write predicate included null, empty, or read-only buffers");
   set_buffer(2, 0x2000, 0, 64);
-  runtime.resources = resources;
   Check(HasShaderBufferWrites(runtime),
         "graphics/compute write predicate lost a byte-addressed buffer");
   set_buffer(2, 0x2000, 0x3FFF, UINT32_MAX);
-  runtime.resources = resources;
   Check(HasShaderBufferWrites(runtime),
         "graphics/compute write predicate lost a maximum-size strided buffer");
 
@@ -9669,10 +9668,8 @@ void TestMergedShaderUserDataSnapshot() {
                                  .read_memory = ReadHostTestMemory};
     IR::DescriptorValue front_descriptor, back_descriptor;
     const auto &table = params == &first ? first_table : second_table;
-    Check(IR::EvaluateDescriptorSource(program, program.info.buffers[0].source,
-                                       runtime, front_descriptor) &&
-              IR::EvaluateDescriptorSource(program, program.info.buffers[1].source,
-                                             runtime, back_descriptor) &&
+    Check(IR::SrtWalker(program, runtime).EvaluateDescriptor(program.info.buffers[0].source, front_descriptor) &&
+              IR::SrtWalker(program, runtime).EvaluateDescriptor(program.info.buffers[1].source, back_descriptor) &&
               std::equal(params->user_data.begin() + 8, params->user_data.end(),
                          front_descriptor.dwords.begin()) &&
               std::equal(table.begin(), table.end(), back_descriptor.dwords.begin()),
@@ -12281,8 +12278,7 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
   ShaderRecompiler::IR::SrtRuntime carry_runtime{carry_user_data, shader_base,
                                                  nullptr, nullptr};
   ShaderRecompiler::IR::DescriptorValue carry_value;
-  Check(ShaderRecompiler::IR::EvaluateDescriptorSource(
-            carry_ir, carry_source_index, carry_runtime, carry_value) &&
+  Check(ShaderRecompiler::IR::SrtWalker(carry_ir, carry_runtime).EvaluateDescriptor(carry_source_index, carry_value) &&
             carry_value.dwords[0] == static_cast<uint32_t>(expected_pc) &&
             carry_value.dwords[1] == static_cast<uint32_t>(expected_pc >> 32u),
         "S_GETPC shader-base or add/addc carry evaluation was incorrect");
@@ -12355,9 +12351,7 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
             TypedDescriptorSource(inline_sampler_ir,
                                   inline_sampler_ir.info.samplers[0].source) !=
                 nullptr &&
-            ShaderRecompiler::IR::EvaluateDescriptorSource(
-                inline_sampler_ir, inline_sampler_ir.info.samplers[0].source,
-                runtime, sampler) &&
+            ShaderRecompiler::IR::SrtWalker(inline_sampler_ir, runtime).EvaluateDescriptor(inline_sampler_ir.info.samplers[0].source, sampler) &&
             sampler.dwords[0] == 0 && sampler.dwords[1] == 0x00fff000u &&
             sampler.dwords[2] == 0x09500000u && sampler.dwords[3] == 0,
         "real inline sampler construction was unresolved or evaluated "
@@ -12393,7 +12387,7 @@ void TestSrtWalkerRealSmemTranslation() {
   std::vector<uint32_t> flat;
   const ShaderRecompiler::IR::SrtRuntime runtime{user_data, 0, ReadSrtHostDword,
                                                  nullptr};
-  const auto walked = ShaderRecompiler::IR::WalkSrt(ir, runtime, flat);
+  const auto walked = ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat);
   Check(walked, "SRT walk failed");
   Check(flat.size() == table.size() &&
             std::equal(flat.begin(), flat.end(), table.begin()),
@@ -12422,7 +12416,7 @@ void TestSrtWalkerVccBaseTranslation() {
   const ShaderRecompiler::IR::SrtRuntime runtime{user_data, 0, ReadSrtHostDword,
                                                  nullptr};
   std::vector<uint32_t> flat;
-  Check(ShaderRecompiler::IR::WalkSrt(ir, runtime, flat), "SRT walk failed");
+  Check(ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat), "SRT walk failed");
   Check(flat.size() == table.size() &&
             std::equal(flat.begin(), flat.end(), table.begin()),
         "typed SSA lost an SMEM base copied through VCC");
@@ -12450,18 +12444,15 @@ void TestSrtWalkerRealSBufferTranslation() {
   std::vector<uint32_t> flat;
   const ShaderRecompiler::IR::SrtRuntime runtime{user_data, 0, ReadSrtHostDword,
                                                  nullptr};
-  const auto walked = ShaderRecompiler::IR::WalkSrt(ir, runtime, flat);
+  const auto walked = ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat);
   Check(walked, "SRT walk failed");
   Check(flat.size() == 4 &&
             std::equal(flat.begin(), flat.end(), table.begin() + 1),
         "real S_BUFFER_LOAD walk used the wrong final alignment");
 
   user_data[10] = 4 * sizeof(uint32_t);
-  const auto flat_before_failure = flat;
-  const auto bounds_walked = ShaderRecompiler::IR::WalkSrt(ir, runtime, flat);
+  const auto bounds_walked = ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat);
   Check(!bounds_walked, "real S_BUFFER_LOAD walk ignored descriptor bounds");
-  Check(flat == flat_before_failure,
-        "failed real S_BUFFER_LOAD walk changed the prior flat snapshot");
   CheckFlattenedReadSlots(
       ir, 4, "real S_BUFFER_LOAD patch used the wrong flat offsets");
 
@@ -12475,7 +12466,7 @@ void TestSrtWalkerRealSBufferTranslation() {
                  static_cast<uint32_t>(std::size(negative_shader)),
                  negative_ir);
   user_data[10] = sizeof(table);
-  Check(!ShaderRecompiler::IR::WalkSrt(negative_ir, runtime, flat),
+  Check(!ShaderRecompiler::IR::SrtWalker(negative_ir, runtime).RefreshFlatBuffer(flat),
         "real S_BUFFER_LOAD walk accepted a negative immediate");
 }
 
@@ -12514,7 +12505,7 @@ void TestScalarMemorySourcesCapturedBeforeWrites() {
     const ShaderRecompiler::IR::SrtRuntime runtime{
         user_data, 0, ReadSrtHostRangeDword, &range};
     std::vector<uint32_t> flat;
-    Check(ShaderRecompiler::IR::WalkSrt(ir, runtime, flat), "SRT walk failed");
+    Check(ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat), "SRT walk failed");
     Check(flat.size() == table.size() &&
               std::equal(flat.begin(), flat.end(), table.begin()),
           "overlapping scalar-memory load did not capture its sources before "

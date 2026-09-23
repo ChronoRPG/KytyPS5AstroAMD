@@ -753,7 +753,7 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
-	const auto& snapshot = runtime.resources;
+	const auto& snapshot = *runtime.resources;
 	PreparedBindings prepared;
 	prepared.runtime = &runtime;
 	prepared.images.reserve(program.info.images.size());
@@ -782,7 +782,7 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
-	const auto& snapshot = prepared.runtime->resources;
+	const auto& snapshot = *prepared.runtime->resources;
 	auto&       cache    = m_context.GetBufferCache();
 
 	prepared.buffer_sources.clear();
@@ -804,7 +804,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program   = *prepared.runtime->program;
-	const auto& snapshot  = prepared.runtime->resources;
+	const auto& snapshot  = *prepared.runtime->resources;
 	const auto& layout    = program.bindings;
 	EXIT_IF(prepared.buffer_sources.size() != program.info.buffers.size());
 
@@ -839,7 +839,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
-	const auto& snapshot = prepared.runtime->resources;
+	const auto& snapshot = *prepared.runtime->resources;
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();

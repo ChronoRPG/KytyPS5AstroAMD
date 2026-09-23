@@ -51,7 +51,7 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
-	const auto& resources = input.stage.resources;
+	const auto& resources = *input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
@@ -85,7 +85,7 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
                               uint32_t group_y, uint32_t group_z, uint32_t mode,
                               ShaderBufferResource& resolved_descriptor, uint32_t& resolved_clear,
                               uint64_t& resolved_size) {
-	const auto& resources = input.stage.resources;
+	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
 	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
 		return false;
@@ -128,7 +128,7 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
                                                 CommandBuffer& command, uint32_t group_x,
                                                 uint32_t group_y, uint32_t group_z, uint32_t mode) {
 	const auto& program   = *input.stage.program;
-	const auto& resources = input.stage.resources;
+	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
 	auto&       cache     = command.GetContext().GetTextureCache();
 	if (fill.kind == ShaderRecompiler::IR::UniformFillKind::Image) {
@@ -262,7 +262,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const auto& program   = *input_info.stage.program;
-	const auto& resources = input_info.stage.resources;
+	const auto& resources = *input_info.stage.resources;
 	if (TryConsumeComputeMetaClear(input_info, buffer)) {
 		ResetBindings();
 		return;

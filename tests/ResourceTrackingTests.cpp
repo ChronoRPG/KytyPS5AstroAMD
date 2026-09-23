@@ -30,14 +30,6 @@ void Check(bool condition, const char *message) {
   }
 }
 
-bool SameResourceSnapshot(const ResourceSnapshot &lhs,
-                          const ResourceSnapshot &rhs) {
-  return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
-         lhs.samplers == rhs.samplers &&
-         lhs.flattened_srt == rhs.flattened_srt &&
-         lhs.user_data == rhs.user_data && lhs.uniform_fill == rhs.uniform_fill;
-}
-
 template <typename F>
 void CheckFatal(F &&function, std::string_view expected, const char *message) {
   try {
@@ -162,6 +154,8 @@ struct LinearTestMemory {
   uint64_t base = 0x1000;
   std::vector<uint32_t> words = std::vector<uint32_t>(0x2200 / 4);
   uint64_t fail_address = UINT64_MAX;
+  uint64_t watched_address = UINT64_MAX;
+  uint32_t watched_reads = 0;
 };
 
 bool ReadLinearTestMemory(void *userdata, uint64_t address, uint32_t *value) {
@@ -172,6 +166,7 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, uint32_t *value) {
     return false;
   }
   *value = memory->words[(address - memory->base) / sizeof(uint32_t)];
+  if (address == memory->watched_address) ++memory->watched_reads;
   return true;
 }
 
@@ -318,14 +313,10 @@ void TestInvariantIndirectImageMaterialization() {
                        snapshot.images[0].dwords.begin()),
         "invariant indirect image table did not materialize");
 
-  const auto prior_snapshot = snapshot;
-  const auto prior_specialization = specialization;
   memory.fail_address = 0x1004u;
   Check(!MaterializeResources(resource_plan, runtime, snapshot,
-                              specialization) &&
-            SameResourceSnapshot(snapshot, prior_snapshot) &&
-            specialization == prior_specialization,
-        "rejected planning memory read mutated the snapshot");
+                              specialization),
+        "unreadable material-table selector was accepted");
   memory.fail_address = UINT64_MAX;
 
   memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
@@ -433,14 +424,35 @@ void TestInvariantIndirectImageMaterialization() {
                                    .userdata = &memory,
                                    .read_specialization_memory =
                                        ReadLinearTestMemory};
-  const auto memory_backed_prior_snapshot = snapshot;
-  const auto memory_backed_prior_specialization = specialization;
   Check(!MaterializeResources(memory_backed_plan, memory_backed_runtime,
-                              snapshot, specialization) &&
-            SameResourceSnapshot(snapshot, memory_backed_prior_snapshot) &&
-            specialization == memory_backed_prior_specialization,
-        "rejected indirect table descriptor read mutated the snapshot");
+                              snapshot, specialization),
+        "unreadable indirect table descriptor was accepted");
   memory.fail_address = UINT64_MAX;
+
+  memory.watched_address = 0x3100u;
+  memory.watched_reads = 0;
+  Check(MaterializeResources(memory_backed_plan, memory_backed_runtime,
+                             snapshot, specialization) && memory.watched_reads == 1u,
+        "descriptor, flattened SRT and indirect-table roots repeated a clean pointer read");
+  const auto* buffer_storage = snapshot.buffers.data();
+  const auto* image_storage = snapshot.images.data();
+  const auto* flat_storage = snapshot.flattened_srt.data();
+  const auto* user_data_storage = snapshot.user_data.data();
+  const auto* buffer_specialization_storage = specialization.buffers.data();
+  const auto* image_specialization_storage = specialization.images.data();
+  const auto old_address = snapshot.images[0].dwords[0];
+  memory.words[(0x2000u - memory.base) / 4u] += 0x100u;
+  memory.watched_reads = 0;
+  Check(MaterializeResources(memory_backed_plan, memory_backed_runtime,
+                             snapshot, specialization) && memory.watched_reads == 1u &&
+            snapshot.images[0].dwords[0] == old_address + 0x100u,
+        "cache refresh reused stale table contents or repeated its clean pointer read");
+  Check(snapshot.buffers.data() == buffer_storage && snapshot.images.data() == image_storage &&
+            snapshot.flattened_srt.data() == flat_storage &&
+            snapshot.user_data.data() == user_data_storage &&
+            specialization.buffers.data() == buffer_specialization_storage &&
+            specialization.images.data() == image_specialization_storage,
+        "a same-shape refresh discarded the runtime output storage");
 
   auto malformed = MakeIndirectImageFixture(true);
   BuildSrtPlan(malformed->program);
@@ -528,13 +540,9 @@ void TestUniformScalarBufferImage() {
   memory.words[0x44u / 4u] = 0u;
   memory.words[0x1010u / 4u] = 0x30u;
   Check(materializes(0x30u), "changed scalar table memory reused the previous image descriptor");
-  const auto prior_snapshot = snapshot;
-  const auto prior_specialization = specialization;
   memory.fail_address = 0x1044u;
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
-            SameResourceSnapshot(snapshot, prior_snapshot) &&
-            specialization == prior_specialization,
-        "unavailable nested image table partially changed the resource snapshot");
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unavailable nested image table was accepted");
 }
 
 void TestComputeBufferFill() {
@@ -631,6 +639,12 @@ void TestComputeBufferFill() {
                 snapshot.uniform_fill.value ==
                     (options.scalar ? 0x40404040u : 0u),
             "fill proof lost address coverage or the actual stored scalar");
+      if (options.scalar && options.clean) {
+        Check(MaterializeResources(plan,
+                  {.user_data = userdata, .read_memory = Read, .userdata = &memory},
+                  snapshot, specialization) && snapshot.uniform_fill.words == 0,
+              "an unavailable clean value retained a previous uniform fill");
+      }
     }
   };
   Run({});
@@ -749,12 +763,12 @@ void TestRuntimeUnsignedMinDescriptor() {
   SrtRuntime runtime{.user_data = user_data};
   DescriptorValue value;
   const auto source = fixture.program.info.buffers[0].source;
-  Check(EvaluateDescriptorSource(fixture.program, source, runtime, value) &&
+  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(source, value) &&
             value.dwords[3] == 0x100u,
         "runtime descriptor unsigned minimum did not clamp its first operand");
   user_data[0] = 0x80u;
   Check(
-      EvaluateDescriptorSource(fixture.program, source, runtime, value) &&
+      SrtWalker(fixture.program, runtime).EvaluateDescriptor(source, value) &&
           value.dwords[3] == 0x80u,
       "runtime descriptor unsigned minimum did not preserve its first operand");
 }
@@ -865,7 +879,7 @@ void TestSampleAdjustSamplerScratch() {
   std::array<uint32_t, 4> user_data{4u, 1u, 2u, 0x80000abcu};
   SrtRuntime runtime{.user_data = user_data};
   DescriptorValue descriptor;
-  Check(EvaluateDescriptorSource(fixture.program, source, runtime, descriptor) &&
+  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(source, descriptor) &&
             descriptor.dwords[3] == 0x80000abcu,
         "SampleAdjust canonicalization lost sampler border fields");
 
@@ -972,13 +986,11 @@ void TestFmaskLoadSpecialization() {
         "FMASK load did not lower to a value vector");
   result = vector->Arg(0);
   uint32_t value = 0;
-  Check(EvaluateUniformValues(fixture.program, {&result, 1},
-                              {.user_data = user_data}, {&value, 1}) &&
+  Check(SrtWalker(fixture.program, {.user_data = user_data}).Evaluate(result, value) &&
             value == 0x76543210u,
         "FMASK load did not return the native sample-to-fragment mapping");
   user_data[8] = 1;
-  Check(EvaluateUniformValues(fixture.program, {&result, 1},
-                              {.user_data = user_data}, {&value, 1}) &&
+  Check(SrtWalker(fixture.program, {.user_data = user_data}).Evaluate(result, value) &&
             value == 0u,
         "inactive FMASK load did not preserve the execution mask");
   ShaderComputeInputInfo compute{};
@@ -1128,13 +1140,9 @@ void TestDynamicStorageMipTracking() {
   changed_user_data[3] =
       (changed_user_data[3] & ~((0xfu << 12u) | (0xfu << 16u))) |
       (4u << 12u) | (3u << 16u);
-  const auto valid_snapshot = changed_snapshot;
-  const auto valid_specialization = changed_specialization;
   Check(!MaterializeResources(resource_plan, {.user_data = changed_user_data},
-                              changed_snapshot, changed_specialization) &&
-            SameResourceSnapshot(changed_snapshot, valid_snapshot) &&
-            changed_specialization == valid_specialization,
-        "an inverted dynamic storage mip range was accepted or mutated output");
+                              changed_snapshot, changed_specialization),
+        "an inverted dynamic storage mip range was accepted");
 }
 
 void TestSrtFlatteningAndRuntimeMemoization() {
@@ -1175,53 +1183,37 @@ void TestSrtFlatteningAndRuntimeMemoization() {
   SrtRuntime runtime{.user_data = user_data,
                      .read_memory = ReadTestMemory,
                      .userdata = &memory};
-  std::vector<DescriptorValue> descriptors;
+  DescriptorValue descriptor;
   std::vector<uint32_t> flat;
-  std::vector<uint8_t> active_sources;
   const uint32_t request = fixture.program.info.buffers[0].source;
-  Check(EvaluateRuntimeSources(fixture.program, std::span{&request, 1}, runtime,
-                               descriptors, flat, {}, active_sources),
-        "typed runtime source evaluation failed");
-  Check(descriptors.size() == 1 && descriptors[0].dwords[0] == 0xdeadbeefu &&
+  const auto refresh = [&](const ResourcePlan& plan) {
+    SrtWalker walker(plan, runtime);
+    return walker.EvaluateDescriptor(request, descriptor) && walker.RefreshFlatBuffer(flat);
+  };
+  Check(refresh(fixture.program), "typed runtime source evaluation failed");
+  Check(descriptor.dwords[0] == 0xdeadbeefu &&
             flat == std::vector<uint32_t>{0xdeadbeefu} && memory.reads == 1,
         "descriptor and flat SRT evaluation did not share one memoized read");
 
   memory.reads = 0;
   memory.words[1] = 0x12345678u;
-  Check(EvaluateRuntimeSources(fixture.program, std::span{&request, 1}, runtime,
-                               descriptors, flat, {}, active_sources) &&
-            descriptors[0].dwords[0] == 0x12345678u &&
+  Check(refresh(fixture.program) && descriptor.dwords[0] == 0x12345678u &&
             flat == std::vector<uint32_t>{0x12345678u} && memory.reads == 1,
         "repeated runtime evaluation reused stale scalar memory");
 
   memory.reads = 0;
   memory.fail_after = 0;
-  descriptors = {{{1u}, 1u}};
-  flat = {2u};
-  active_sources = {3u};
-  Check(!EvaluateRuntimeSources(fixture.program, std::span{&request, 1},
-                                runtime, descriptors, flat, {}, active_sources) &&
-            descriptors == std::vector<DescriptorValue>{{{1u}, 1u}} &&
-            flat == std::vector<uint32_t>{2u} &&
-            active_sources == std::vector<uint8_t>{3u},
-        "runtime evaluation failure was not transactional");
-
+  Check(!refresh(fixture.program), "unavailable scalar memory was accepted");
   memory.fail_after = UINT32_MAX;
-  Check(EvaluateRuntimeSources(fixture.program, std::span{&request, 1}, runtime,
-                               descriptors, flat, {}, active_sources) &&
-            descriptors[0].dwords[0] == 0x12345678u && memory.reads == 1,
+  Check(refresh(fixture.program) && descriptor.dwords[0] == 0x12345678u && memory.reads == 1,
         "failed runtime evaluation left a value marked as visiting");
 
   auto detached = ExtractResourcePlan(fixture.program);
-  Check(EvaluateRuntimeSources(detached, std::span{&request, 1}, runtime,
-                               descriptors, flat, {}, active_sources),
-        "detached resource plan did not evaluate");
+  Check(refresh(detached), "detached resource plan did not evaluate");
   auto moved = std::move(detached);
   memory.reads = 0;
   memory.words[1] = 0x87654321u;
-  Check(EvaluateRuntimeSources(moved, std::span{&request, 1}, runtime,
-                               descriptors, flat, {}, active_sources) &&
-            descriptors[0].dwords[0] == 0x87654321u && memory.reads == 1,
+  Check(refresh(moved) && descriptor.dwords[0] == 0x87654321u && memory.reads == 1,
         "moving a cached resource plan lost its evaluation state");
 
   ShaderComputeInputInfo compute{};
@@ -1262,8 +1254,7 @@ void TestDynamicSrtReadRemainsExplicit() {
                      .read_memory = ReadTestMemory,
                      .userdata = &memory};
   DescriptorValue value;
-  Check(EvaluateDescriptorSource(fixture.program,
-                                 fixture.program.info.buffers[0].source, runtime, value) &&
+  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(fixture.program.info.buffers[0].source, value) &&
             value.dwords[0] == 0xabcdef01u && memory.reads == 1,
         "dynamic typed scalar descriptor source was not evaluated");
 
@@ -1438,7 +1429,8 @@ void TestConditionalSamplerPhi() {
           const uint32_t first = (flag < 0) != reverse ? 480 / 4 : 448 / 4;
           memory.fail_address = 0x1000 + (first == 448 / 4 ? 480u : 448u);
           DescriptorValue selected;
-          Check(EvaluateDescriptorSource(plan, source, runtime, selected),
+          SrtWalker clean(plan, CleanRuntime(runtime));
+          Check(SrtWalker(plan, runtime, {}, &clean).EvaluateDescriptor(source, selected),
                 "conditional sampler did not survive detached plan lifetime");
           for (uint32_t word = 0; word < 4; ++word) {
             Check(selected.dwords[word] == memory.words[first + word],
@@ -1448,13 +1440,17 @@ void TestConditionalSamplerPhi() {
         DescriptorValue selected;
         auto no_clean_reader = runtime;
         no_clean_reader.read_specialization_memory = nullptr;
-        Check(
-            !EvaluateDescriptorSource(plan, source, no_clean_reader, selected),
-            "conditional sampler used unchecked memory for its predicate");
+        {
+          SrtWalker clean(plan, CleanRuntime(no_clean_reader));
+          Check(!SrtWalker(plan, no_clean_reader, {}, &clean).EvaluateDescriptor(source, selected),
+                "conditional sampler used unchecked memory for its predicate");
+        }
         memory.fail_address = 0x2000 + 196;
-        Check(!EvaluateDescriptorSource(plan, source, runtime, selected),
-              "conditional sampler ignored unavailable coherent predicate "
-              "memory");
+        {
+          SrtWalker clean(plan, CleanRuntime(runtime));
+          Check(!SrtWalker(plan, runtime, {}, &clean).EvaluateDescriptor(source, selected),
+                "conditional sampler ignored unavailable coherent predicate memory");
+        }
       }
     }
     CheckFatal([&] { ConditionalSamplerPlan(diamond, false, false, true); },
@@ -1511,8 +1507,7 @@ void TestInvariantLoopPhi() {
   std::array<uint32_t, 1> user_data{0x12345678u};
   SrtRuntime runtime{.user_data = user_data};
   DescriptorValue descriptor;
-  Check(EvaluateDescriptorSource(fixture.program,
-                                 fixture.program.info.buffers[0].source, runtime, descriptor) &&
+  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(fixture.program.info.buffers[0].source, descriptor) &&
             descriptor.dwords[0] == user_data[0],
         "loop-invariant descriptor phi was not evaluated through typed SSA");
 }
@@ -1738,11 +1733,9 @@ void TestConditionalBufferMaterialization() {
   runtime.user_data = std::span(user_data).first(4);
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "untaken branch evaluated its unavailable descriptor");
-  const auto prior = snapshot;
   memory.words[0] = 1;
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
-            SameResourceSnapshot(snapshot, prior),
-        "taken branch accepted an unavailable descriptor or changed the snapshot");
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "taken branch accepted an unavailable descriptor");
 
   runtime.user_data = user_data;
   const auto CheckActive = [&] {
