@@ -14,7 +14,7 @@ void Check(bool value, const char *text) {
   }
 }
 
-bool RejectSpecializationRead(void *userdata, uint64_t, uint32_t *) {
+bool RejectSpecializationRead(void *userdata, uint64_t, std::span<uint32_t>) {
   ++*static_cast<uint32_t *>(userdata);
   return false;
 }

@@ -79,13 +79,14 @@ struct TestMemory {
   uint32_t reads = 0;
 };
 
-bool ReadMemory(void *userdata, uint64_t address, uint32_t *value) {
+bool ReadMemory(void *userdata, uint64_t address, std::span<uint32_t> values) {
   auto &memory = *static_cast<TestMemory *>(userdata);
-  const auto it = memory.words.find(address);
-  if (it == memory.words.end()) {
-    return false;
+  for (auto &value : values) {
+    const auto it = memory.words.find(address);
+    if (it == memory.words.end()) return false;
+    value = it->second;
+    address += sizeof(uint32_t);
   }
-  *value = it->second;
   memory.reads++;
   return true;
 }

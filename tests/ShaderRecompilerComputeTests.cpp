@@ -1240,13 +1240,13 @@ std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
   return data;
 }
 
-bool ReadTestMemory(void *userdata, uint64_t address, u32 *value) {
+bool ReadTestMemory(void *userdata, uint64_t address, std::span<u32> values) {
   const auto *data = static_cast<const std::vector<u32> *>(userdata);
-  if (data == nullptr || value == nullptr || address % 4u != 0 ||
-      address / 4u >= data->size()) {
+  if (data == nullptr || address % 4u != 0 || values.size() > data->size() ||
+      address / 4u > data->size() - values.size()) {
     return false;
   }
-  *value = (*data)[address / 4u];
+  std::copy_n(data->begin() + address / 4u, values.size(), values.begin());
   return true;
 }
 
@@ -12122,9 +12122,9 @@ public:
       Require(name, "stencil fill materialization",
           ShaderRecompiler::IR::MaterializeResources(stencil_plan,
               {.user_data = stencil_userdata, .userdata = &stencil_byte,
-               .read_specialization_memory = +[](void *data, uint64_t address, uint32_t *word) {
-                 if (address != reinterpret_cast<uint64_t>(data)) return false;
-                 *word = *static_cast<uint32_t *>(data);
+               .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+                 if (address != reinterpret_cast<uint64_t>(data) || words.size() != 1u) return false;
+                 words[0] = *static_cast<uint32_t *>(data);
                  return true;
                }}, stencil_snapshot, stencil_specialization),
           "captured stencil shader could not resolve its clear byte");
@@ -28001,9 +28001,9 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
         .shader_base = reinterpret_cast<uint64_t>(code.data()),
         .userdata = &scalar_clear,
         .read_specialization_memory = clean_scalar
-            ? +[](void *data, uint64_t address, uint32_t *word) {
-                if (address != reinterpret_cast<uint64_t>(data)) return false;
-                *word = *static_cast<uint32_t *>(data);
+            ? +[](void *data, uint64_t address, std::span<uint32_t> words) {
+                if (address != reinterpret_cast<uint64_t>(data) || words.size() != 1u) return false;
+                words[0] = *static_cast<uint32_t *>(data);
                 return true;
               } : nullptr,
     };

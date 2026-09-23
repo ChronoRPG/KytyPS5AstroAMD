@@ -9,7 +9,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 class Value;
 
-using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, uint32_t* value);
+using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;

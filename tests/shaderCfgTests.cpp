@@ -107,11 +107,11 @@ ShaderRecompiler::CompileOptions MakeCompileOptions(ShaderType stage) {
   return options;
 }
 
-bool ReadHostTestMemory(void *, uint64_t address, uint32_t *value) {
-  if (address == 0 || value == nullptr) {
+bool ReadHostTestMemory(void *, uint64_t address, std::span<uint32_t> values) {
+  if (address == 0 || values.empty()) {
     return false;
   }
-  std::memcpy(value, reinterpret_cast<const void *>(address), sizeof(*value));
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
   return true;
 }
 
@@ -1425,11 +1425,8 @@ void SetImageTestFormat(std::array<uint32_t, 64> *data, uint32_t srsrc,
   (*data)[format_dword] = static_cast<uint32_t>(format) << 20u;
 }
 
-bool ReadZeroTestMemory(void *, uint64_t, uint32_t *value) {
-  if (value == nullptr) {
-    return false;
-  }
-  *value = 0;
+bool ReadZeroTestMemory(void *, uint64_t, std::span<uint32_t> values) {
+  std::ranges::fill(values, 0u);
   return true;
 }
 
@@ -12101,11 +12098,11 @@ void CheckFlattenedReadSlots(const ShaderRecompiler::IR::Program &program,
   }
 }
 
-bool ReadSrtHostDword(void *, uint64_t address, uint32_t *value) {
-  if (address == 0 || value == nullptr) {
+bool ReadSrtHostDword(void *, uint64_t address, std::span<uint32_t> values) {
+  if (address == 0 || values.empty()) {
     return false;
   }
-  std::memcpy(value, reinterpret_cast<const void *>(address), sizeof(*value));
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
   return true;
 }
 
@@ -12114,18 +12111,17 @@ struct SrtHostRange {
   size_t count;
 };
 
-bool ReadSrtHostRangeDword(void *userdata, uint64_t address, uint32_t *value) {
+bool ReadSrtHostRangeDword(void *userdata, uint64_t address, std::span<uint32_t> values) {
   const auto *range = static_cast<const SrtHostRange *>(userdata);
-  if (range == nullptr || range->data == nullptr || range->count == 0 ||
-      value == nullptr) {
+  if (range == nullptr || range->data == nullptr || range->count == 0 || values.empty()) {
     return false;
   }
   const auto base = reinterpret_cast<uint64_t>(range->data);
   const auto size = range->count * sizeof(uint32_t);
-  if (address < base || address - base > size - sizeof(uint32_t)) {
+  if (address < base || values.size_bytes() > size || address - base > size - values.size_bytes()) {
     return false;
   }
-  std::memcpy(value, reinterpret_cast<const void *>(address), sizeof(*value));
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
   return true;
 }
 

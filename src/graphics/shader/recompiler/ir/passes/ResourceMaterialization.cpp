@@ -161,28 +161,23 @@ void MarkCleanFlatSlots(const ResourcePlan& program, const DescriptorSource* sou
 	}
 }
 
-bool ReadSpecializationWord(const SrtRuntime& runtime, uint64_t address, uint32_t& word) {
-	return runtime.read_specialization_memory != nullptr &&
-	       runtime.read_specialization_memory(runtime.userdata, address, &word);
-}
-
-bool ReadScalarTableWord(uint64_t base, uint64_t size, uint32_t dynamic_offset,
-                         uint32_t immediate_offset, const SrtRuntime& runtime, uint32_t& word) {
-	const auto byte_offset = static_cast<uint64_t>(dynamic_offset) + immediate_offset;
-	const auto aligned     = byte_offset & ~uint64_t {3};
-	if (aligned > size || size - aligned < sizeof(uint32_t)) {
-		word = 0;
+bool ReadScalarTable(uint64_t base, uint64_t size, uint32_t dynamic_offset,
+                     const SrtRuntime& runtime, std::span<uint32_t> words) {
+	const auto offset = static_cast<uint64_t>(dynamic_offset) & ~uint64_t {3};
+	const auto count = std::min<uint64_t>(words.size(), offset < size ? (size - offset) / 4u : 0u);
+	std::ranges::fill(words.subspan(count), 0u);
+	if (count == 0u) {
 		return true;
 	}
 	base &= AddressMask & ~uint64_t {3};
-	if (aligned > AddressMask - base) {
+	if (offset > AddressMask - base) {
 		return false;
 	}
-	const auto address = base + aligned;
-	if (!ReadSpecializationWord(runtime, address, word)) {
-		return false;
-	}
-	return true;
+	const auto address = base + offset;
+	const auto prefix = words.first(count);
+	return prefix.size_bytes() - 1u <= AddressMask - address &&
+	       runtime.read_specialization_memory != nullptr &&
+	       runtime.read_specialization_memory(runtime.userdata, address, prefix);
 }
 
 bool MaterializeIndirectImage(const ResourcePlan& program,
@@ -229,8 +224,8 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		keys.push_back(0u);
 		for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
 			uint32_t key = 0;
-			if (!ReadScalarTableWord(material.Base48(), material.GetSize(),
-			                         static_cast<uint32_t>(offset), 0u, runtime, key)) {
+			if (!ReadScalarTable(material.Base48(), material.GetSize(),
+			                     static_cast<uint32_t>(offset), runtime, {&key, 1})) {
 				return false;
 			}
 			keys.push_back(key);
@@ -252,11 +247,8 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		DescriptorValue candidate;
 		candidate.dword_count = 8u;
 		const auto table_offset = (key << 5u) + indirect.table_offset;
-		for (uint32_t dword = 0; dword < candidate.dword_count; ++dword) {
-			if (!ReadScalarTableWord(table_base, table_size, table_offset, dword * sizeof(uint32_t),
-			                         runtime, candidate.dwords[dword])) {
-				return false;
-			}
+		if (!ReadScalarTable(table_base, table_size, table_offset, runtime, candidate.dwords)) {
+			return false;
 		}
 		if (NullImageDescriptor(candidate) ||
 		    !ValidImageDescriptor(candidate, program.info.images[image_index].r128)) {

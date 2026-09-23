@@ -15,7 +15,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
-	                          : +[](void*, uint64_t, uint32_t*) { return false; };
+	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
 	return runtime;
 }
 
@@ -635,7 +635,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	}
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
-		if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
+		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
 			return false;
 		}
 	} else {

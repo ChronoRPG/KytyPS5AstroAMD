@@ -138,14 +138,16 @@ struct TestMemory {
   uint32_t fail_after = UINT32_MAX;
 };
 
-bool ReadTestMemory(void *userdata, uint64_t address, uint32_t *value) {
+bool ReadTestMemory(void *userdata, uint64_t address, std::span<uint32_t> values) {
   auto *memory = static_cast<TestMemory *>(userdata);
-  if (memory == nullptr || value == nullptr || address < memory->base ||
-      address - memory->base >= memory->words.size() * sizeof(uint32_t) ||
+  if (memory == nullptr || address < memory->base ||
+      values.size_bytes() > memory->words.size() * sizeof(uint32_t) ||
+      address - memory->base > memory->words.size() * sizeof(uint32_t) - values.size_bytes() ||
       memory->reads >= memory->fail_after) {
     return false;
   }
-  *value = memory->words[(address - memory->base) / sizeof(uint32_t)];
+  std::copy_n(memory->words.begin() + (address - memory->base) / sizeof(uint32_t),
+               values.size(), values.begin());
   memory->reads++;
   return true;
 }
@@ -156,17 +158,29 @@ struct LinearTestMemory {
   uint64_t fail_address = UINT64_MAX;
   uint64_t watched_address = UINT64_MAX;
   uint32_t watched_reads = 0;
+  size_t watched_dwords = 0;
+  uint32_t reads = 0;
+  uint32_t descriptor_reads = 0;
 };
 
-bool ReadLinearTestMemory(void *userdata, uint64_t address, uint32_t *value) {
+bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> values) {
   auto *memory = static_cast<LinearTestMemory *>(userdata);
-  if (memory == nullptr || value == nullptr || address < memory->base ||
-      address - memory->base >= memory->words.size() * sizeof(uint32_t) ||
-      (address & 3u) != 0u || address == memory->fail_address) {
+  if (memory == nullptr || address < memory->base ||
+      values.size_bytes() > memory->words.size() * sizeof(uint32_t) ||
+      address - memory->base > memory->words.size() * sizeof(uint32_t) - values.size_bytes() ||
+      (address & 3u) != 0u ||
+      (memory->fail_address >= address && memory->fail_address - address < values.size_bytes())) {
     return false;
   }
-  *value = memory->words[(address - memory->base) / sizeof(uint32_t)];
-  if (address == memory->watched_address) ++memory->watched_reads;
+  std::copy_n(memory->words.begin() + (address - memory->base) / sizeof(uint32_t),
+               values.size(), values.begin());
+  ++memory->reads;
+  if (values.size() == 8u) ++memory->descriptor_reads;
+  if (memory->watched_address >= address &&
+      memory->watched_address - address < values.size_bytes()) {
+    ++memory->watched_reads;
+    memory->watched_dwords = values.size();
+  }
   return true;
 }
 
@@ -312,6 +326,22 @@ void TestInvariantIndirectImageMaterialization() {
             std::equal(image_descriptor.begin(), image_descriptor.end(),
                        snapshot.images[0].dwords.begin()),
         "invariant indirect image table did not materialize");
+
+  user_data[5] = 0u;
+  user_data[6] = 19u;
+  memory.fail_address = 0x2010u;
+  memory.watched_address = 0x2000u;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            memory.watched_dwords == 4u &&
+            std::equal(image_descriptor.begin(), image_descriptor.end(),
+                       snapshot.images[0].dwords.begin()),
+        "partial scalar-buffer descriptor read crossed bounds instead of zeroing its tail");
+  memory.fail_address = 0x2008u;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "unreadable memory inside the descriptor prefix was accepted");
+  user_data[5] = 16u << 16u;
+  user_data[6] = 4u;
+  memory.watched_address = UINT64_MAX;
 
   memory.fail_address = 0x1004u;
   Check(!MaterializeResources(resource_plan, runtime, snapshot,
@@ -609,7 +639,7 @@ void TestGuardedDirectImageTable() {
     }
   };
   fill_table(memory, table);
-  const std::array<uint32_t, 2> user_data{0x1000u, 0u};
+  std::array<uint32_t, 2> user_data{0x1000u, 0u};
   SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
                      .userdata = &memory,
                      .read_specialization_memory = ReadLinearTestMemory};
@@ -617,7 +647,8 @@ void TestGuardedDirectImageTable() {
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 32u && specialization.images.size() == 32u &&
-            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 32u,
+            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 32u &&
+            memory.reads == 34u && memory.descriptor_reads == 32u,
         "direct table did not retain all 32 reachable descriptors");
   memory.words[(table - memory.base) / 4u + 31u * 8u] = 0x987u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
@@ -637,6 +668,20 @@ void TestGuardedDirectImageTable() {
   Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
             wrapping.watched_reads == 0u,
         "direct table wrapped its descriptor address at the 48-bit boundary");
+
+  LinearTestMemory endpoint;
+  endpoint.base = (uint64_t{1} << 48u) - 0x1000u;
+  const auto crossing = (uint64_t{1} << 48u) - 16u;
+  endpoint.words[0] = static_cast<uint32_t>(crossing - 344u);
+  endpoint.words[1] = static_cast<uint32_t>((crossing - 344u) >> 32u);
+  fill_table(endpoint, crossing);
+  endpoint.watched_address = crossing;
+  user_data = {static_cast<uint32_t>(endpoint.base),
+               static_cast<uint32_t>(endpoint.base >> 32u)};
+  runtime.userdata = &endpoint;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            endpoint.watched_reads == 0u,
+        "batched descriptor read crossed the 48-bit endpoint");
 }
 
 void TestUniformScalarBufferImage() {
@@ -779,12 +824,12 @@ void TestComputeBufferFill() {
     std::array<uint32_t, 4> userdata{0x200000u, 4u << 16, 0x4000u, 0x14204u};
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
-    const auto Read = +[](void *data, uint64_t address, uint32_t *word) {
+    const auto Read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
       auto &memory = *static_cast<TestMemory *>(data);
-      if (address != memory.base)
+      if (address != memory.base || words.size() != 1u)
         return false;
       ++memory.reads;
-      *word = memory.words[0];
+      words[0] = memory.words[0];
       return true;
     };
     Check(MaterializeResources(
@@ -2051,7 +2096,7 @@ void TestConditionalIndirectImageMaterialization() {
   uint32_t reads = 0;
   const SrtRuntime runtime{
       .user_data = user_data, .userdata = &reads,
-      .read_specialization_memory = [](void *data, uint64_t, uint32_t *) {
+      .read_specialization_memory = [](void *data, uint64_t, std::span<uint32_t>) {
         ++*static_cast<uint32_t *>(data);
         return false;
       }};
