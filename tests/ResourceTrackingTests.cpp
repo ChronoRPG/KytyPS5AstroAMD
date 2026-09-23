@@ -1463,6 +1463,90 @@ void TestConditionalSamplerPhi() {
   }
 }
 
+void TestGuardedSamplerPhi() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  const auto make_plan = [](bool take_true, bool reverse_phi, bool bypass,
+                            bool mismatched, bool ambiguous) {
+    Fixture fixture(ShaderType::Pixel);
+    auto *entry = fixture.block;
+    auto *loaded = fixture.AddBlock();
+    auto *merge = fixture.AddBlock();
+    auto *sample = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(loaded);
+    entry->AddBranch(merge);
+    loaded->AddBranch(merge);
+    merge->AddBranch(sample);
+    merge->AddBranch(exit);
+    sample->AddBranch(exit);
+    if (bypass) exit->AddBranch(sample);
+    const auto lane = fixture.Emit(ValueOpcode::LaneId);
+    const auto predicate = fixture.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
+    fixture.program.block_info[0].condition = predicate;
+    fixture.program.block_info[0].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = 1u, .false_block = 2u};
+    fixture.program.block_info[1].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = 2u};
+    auto &guard = merge->AppendNewInst(ValueOpcode::Phi, {},
+                                       static_cast<uint64_t>(Type::U1));
+    guard.AddPhiOperand(entry, ambiguous ? predicate : Value(!take_true));
+    guard.AddPhiOperand(mismatched ? sample : loaded, predicate);
+    fixture.program.block_info[2].condition = Value(&guard);
+    fixture.program.block_info[2].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = take_true ? 3u : 4u,
+        .false_block = take_true ? 4u : 3u};
+    fixture.program.block_info[3].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = 4u};
+    fixture.program.block_info[4].terminator = {
+        .kind = bypass ? CFG::TerminatorKind::Branch : CFG::TerminatorKind::Return,
+        .true_block = 3u};
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      // An arbitrary excluded value proves this is control-flow reasoning, not null filtering.
+      const auto first = Value(0xbad000u + word);
+      const auto second = fixture.UserData(word);
+      auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {},
+                                       static_cast<uint64_t>(Type::U32));
+      phi.AddPhiOperand(reverse_phi ? loaded : entry, reverse_phi ? second : first);
+      phi.AddPhiOperand(reverse_phi ? entry : loaded, reverse_phi ? first : second);
+      words[word] = Value(&phi);
+    }
+    fixture.block = sample;
+    const auto image = fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u),
+                                      Value(0u), Value(0u), Value(0u), Value(0u)});
+    const auto sampler = fixture.Sampler(words);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw,
+                  {image, sampler, fixture.ImageAddress()},
+                  fixture.AddMemory(memory, 0x2a0));
+    fixture.PlanAndTrack();
+    Check(words[0].ResolveInstruction()->GetOpcode() == ValueOpcode::Phi,
+          "guarded host descriptor selection rewrote the GPU Phi");
+    return ExtractResourcePlan(fixture.program);
+  };
+  for (const bool take_true : {false, true}) {
+    for (const bool reverse_phi : {false, true}) {
+      auto plan = make_plan(take_true, reverse_phi, false, false, false);
+      const std::array<uint32_t, 4> user_data{0x444u, 0x555u, 0x666u, 0x777u};
+      DescriptorValue selected;
+      Check(SrtWalker(plan, {.user_data = user_data}).EvaluateDescriptor(
+                plan.info.samplers[0].source, selected) &&
+                std::equal(user_data.begin(), user_data.end(), selected.dwords.begin()),
+            "guarded sampler did not match descriptor and predicate predecessors");
+    }
+  }
+  CheckFatal([&] { make_plan(true, false, true, false, false); },
+              "not a valid runtime value", "sampler guard accepted an unguarded path");
+  CheckFatal([&] { make_plan(true, false, false, true, false); },
+              "not a valid runtime value", "sampler guard ignored predecessor identity");
+  CheckFatal([&] { make_plan(true, false, false, false, true); },
+              "not a valid runtime value", "sampler guard discarded a reachable alternative");
+}
+
 void TestLoopCycleEnteredThroughRuntimeValue() {
   Fixture fixture;
   auto *entry = fixture.block;
@@ -2119,6 +2203,7 @@ int main() {
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
+    Run("guarded sampler phi", TestGuardedSamplerPhi);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("DMA address materialization", TestDmaAddressMaterialization);

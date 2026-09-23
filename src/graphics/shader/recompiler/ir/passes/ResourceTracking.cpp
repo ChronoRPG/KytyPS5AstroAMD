@@ -169,7 +169,7 @@ private:
 		std::abort();
 	}
 
-	Value LowerDescriptorPhi(Value value) {
+	Value LowerDescriptorPhi(Value value, const Block* use) {
 		value           = value.Resolve();
 		const auto* phi = value.TryInstruction();
 		if (m_shader_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
@@ -177,16 +177,52 @@ private:
 		    m_program.blocks.size() != m_program.block_info.size()) {
 			return value;
 		}
-		for (const auto& [original, selected]: m_descriptor_selections) {
-			if (original == phi) {
-				return selected;
-			}
-		}
-		const auto* merge  = phi->Parent();
+		const auto* merge = phi->Parent();
 		const auto* branch = phi->PhiBlock(0);
 		if (merge == nullptr || branch == nullptr || phi->PhiBlock(1) == nullptr ||
 		    branch == phi->PhiBlock(1)) {
 			return value;
+		}
+		// Structurization can merge the descriptor and its use predicate in parallel Phis.
+		// Match their incoming blocks to exclude only edges that cannot reach this use.
+		if (use != nullptr && use->ImmPredecessors().size() == 1u &&
+		    use->ImmPredecessors()[0] == merge) {
+			const auto merge_it = std::ranges::find(m_program.blocks, merge);
+			const auto use_it   = std::ranges::find(m_program.blocks, use);
+			if (merge_it != m_program.blocks.end() && use_it != m_program.blocks.end()) {
+				const auto& info = m_program.block_info[merge_it - m_program.blocks.begin()];
+				const auto& term = info.terminator;
+				const auto id    = m_program.block_info[use_it - m_program.blocks.begin()].id;
+				const auto* condition = info.condition.Resolve().TryInstruction();
+				if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
+				    term.true_block != term.false_block &&
+				    (id == term.true_block || id == term.false_block) && condition != nullptr &&
+				    condition->GetOpcode() == ValueOpcode::Phi && condition->GetType() == Type::U1 &&
+				    condition->Parent() == merge && condition->NumArgs() == 2u &&
+				    condition->NumPhiBlocks() == 2u) {
+					const bool taken = id == term.true_block;
+					for (uint32_t skipped = 0; skipped < 2u; skipped++) {
+						const auto excluded = condition->Arg(skipped).Resolve();
+						const auto included = condition->Arg(skipped ^ 1u).Resolve();
+						if (!excluded.IsImmediate() || excluded.GetType() != Type::U1 ||
+						    excluded.U1() == taken ||
+						    (included.IsImmediate() && included.U1() != taken)) {
+							continue;
+						}
+						for (uint32_t selected = 0; selected < 2u; selected++) {
+							if (phi->PhiBlock(selected) == condition->PhiBlock(skipped ^ 1u) &&
+							    phi->PhiBlock(selected ^ 1u) == condition->PhiBlock(skipped)) {
+								return phi->Arg(selected);
+							}
+						}
+					}
+				}
+			}
+		}
+		for (const auto& [original, selected]: m_descriptor_selections) {
+			if (original == phi) {
+				return selected;
+			}
 		}
 		if (branch->ImmSuccessors().size() != 2u) {
 			if (branch->ImmPredecessors().size() != 1u) {
@@ -247,7 +283,7 @@ private:
 		}
 		descriptor.dword_count = width;
 		for (uint32_t i = 0; i < width; i++) {
-			descriptor.dwords[i] = LowerDescriptorPhi(handle.Arg(i));
+			descriptor.dwords[i] = LowerDescriptorPhi(handle.Arg(i), handle.Parent());
 		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
