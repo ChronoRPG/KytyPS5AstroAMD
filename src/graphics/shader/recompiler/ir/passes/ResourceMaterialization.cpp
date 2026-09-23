@@ -453,6 +453,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return SpecializationFail("indirect image specialization has no typed candidate");
 		}
 		const auto& image_class = specialization.images[exemplar];
+		const auto is_2d = [](Decoder::ImageDimension dimension) {
+			return dimension == Decoder::ImageDimension::Dim2D ||
+			       dimension == Decoder::ImageDimension::Dim2DArray;
+		};
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
 			auto& image = specialization.images[candidate];
 			if (image.indirect_root != root_index) {
@@ -466,12 +470,13 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
 			}
+			const bool same_coordinates = image.dimension == image_class.dimension &&
+			                              image.cube == image_class.cube;
 			if (image.numeric_class != image_class.numeric_class ||
-			    image.dimension != image_class.dimension ||
+			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
-			    image.shader_swizzle != image_class.shader_swizzle ||
-			    image.cube != image_class.cube) {
+			    image.shader_swizzle != image_class.shader_swizzle) {
 				return SpecializationFail(
 				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
 				                program.info.images[root_index].first_use_pc));

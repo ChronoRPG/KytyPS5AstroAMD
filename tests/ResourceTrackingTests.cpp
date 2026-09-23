@@ -352,6 +352,40 @@ void TestInvariantIndirectImageMaterialization() {
             dynamic_snapshot.images.size() == 2 &&
             dynamic_specialization.images.size() == 2,
         "dynamic indirect image table did not materialize");
+  const auto second_image = (0x2020u - memory.base) / 4u;
+  memory.words[second_image + 1u] |= 3u << 30u;
+  memory.words[second_image + 2u] = 3u << 14u;
+  memory.words[second_image + 3u] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kCube) << 28u);
+  memory.words[second_image + 4u] = 11u;
+  ResourceSnapshot mixed_snapshot;
+  ResourceSpecialization mixed_specialization;
+  Check(MaterializeResources(resource_plan, runtime, mixed_snapshot,
+                             mixed_specialization) &&
+            mixed_snapshot.images.size() == 2 &&
+            mixed_specialization.images.size() == 2 &&
+            mixed_specialization.images[0].dimension ==
+                Decoder::ImageDimension::Dim2D &&
+            !mixed_specialization.images[0].cube &&
+            mixed_specialization.images[1].dimension ==
+                Decoder::ImageDimension::Dim2DArray &&
+            mixed_specialization.images[1].cube &&
+            std::equal(mixed_snapshot.images[1].dwords.begin(),
+                       mixed_snapshot.images[1].dwords.end(),
+                       memory.words.begin() + second_image),
+        "mixed 2D and cube candidates were rejected or discarded");
+  memory.words[second_image + 1u] =
+      static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32UInt)
+          << 20u |
+      (3u << 30u);
+  Check(!MaterializeResources(resource_plan, runtime, mixed_snapshot,
+                              mixed_specialization),
+        "indirect images with different numeric classes were accepted");
+  for (const auto dword : {1u, 2u, 3u, 4u}) {
+    memory.words[second_image + dword] = image_descriptor[dword];
+  }
   ApplyResourceSpecialization(fixture->program, dynamic_specialization);
   Check(fixture->program.info.images.size() == 2 &&
             fixture->program.info.images[0].indirect_root == 0 &&

@@ -26174,6 +26174,48 @@ TestCase ImageSampleAndGather() {
   return test;
 }
 
+TestCase ImageCubeGradientsPreserveDerivatives() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ImageCubeGradientsPreserveDerivatives";
+  for (u32 component = 0; component < 7u; component++) {
+    constexpr std::array values{0.125f, 0.0f, 0.0f, 0.125f,
+                                1.375f, 1.625f, 10.0f};
+    AppendVMovLiteral(&test.code, 20u + component,
+                      std::bit_cast<u32>(values[component]));
+  }
+  test.code.push_back(EncodeMimg0(0x22, 0x1, 0, false, 3));
+  test.code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&test.code, 0, 0);
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  test.user_data[1] |= 3u << 30u;
+  test.user_data[2] = 3u << 14u;
+  test.user_data[3] =
+      (static_cast<u32>(Prospero::ImageType::kCube) << 28u) | (2u << 16u);
+  test.user_data[4] = 11u;
+  test.user_data[5] = 2u << 4u;
+  test.user_data[50] = sizeof(u32);
+  test.has_user_data = true;
+  test.sampled_image_view_type = vk::ImageViewType::e2DArray;
+  test.sampled_image_layers = 12;
+  for (u32 mip = 0; mip < 3u; mip++) {
+    const auto layer_dwords = (4u >> mip) * (4u >> mip) * 4u;
+    auto &pixels = test.sampled_image_rgba_mips.emplace_back(layer_dwords * 12u);
+    for (u32 layer = 0; layer < 12u; layer++) {
+      std::fill_n(pixels.begin() + layer * layer_dwords, layer_dwords,
+                  std::bit_cast<u32>(static_cast<float>(1u + layer + 100u * mip)));
+    }
+  }
+  // Guest face 10 is host layer 8. Unmodified gradients select mip 0;
+  // applying the cube coordinate bias to gradients instead selects mip 2.
+  test.expected = {std::bit_cast<u32>(9.0f)};
+  test.required_spirv = {"OpImageSampleExplicitLod", "Grad"};
+  return test;
+}
+
 TestCase ImageGatherLodApproximatesLevelZero() {
   using O = ShaderOpcode;
   std::vector<u32> code;
@@ -26549,6 +26591,63 @@ void CheckIndirectImageKeySwitch() {
               CountText(text, "OpImageSampleExplicitLod") == 2 &&
               CountText(text, "OpIEqual") == 11,
           "dynamic image key did not use a compact two-sample switch");
+
+  program.memory_info[0].image_dimension =
+      ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+  program.memory_info[0].image_address_components = 4;
+  for (u32 component = 0; component < 4u; component++) {
+    constexpr std::array values{1.375f, 1.625f, 10.0f, 2.0f};
+    address.SetArg(component, Value(std::bit_cast<u32>(values[component])));
+  }
+  root.indirect_resources = {0u, 1u, 2u};
+  program.info.images = {root, candidate, candidate};
+  for (const bool cube_first : {true, false}) {
+    for (u32 resource = 0; resource < 3u; resource++) {
+      auto &image_resource = program.info.images[resource];
+      image_resource.cube = resource == (cube_first ? 0u : 1u);
+      image_resource.dimension =
+          resource == (cube_first ? 1u : 0u)
+              ? ShaderRecompiler::Decoder::ImageDimension::Dim2D
+              : ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+    }
+    program.binding_layout_complete = false;
+    AllocateBindings(program);
+    spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+    ValidateSpirv(name, spirv);
+    Require(name, "mixed SPIR-V disassembly", tools.Disassemble(spirv, &text),
+            "failed to disassemble mixed indirect image shader");
+    Require(name, "mixed key switch",
+            CountText(text, "OpImageSampleExplicitLod") == 3 &&
+                CountText(text, "OpFSub") == 2,
+            "mixed candidates lost a sample or shared cube coordinate conversion");
+
+    std::vector<std::span<const u32>> definitions(spirv[3]);
+    u32 samples = 0;
+    for (size_t offset = 5; offset < spirv.size();) {
+      const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+      const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+      if (opcode == spv::OpTypeVector) {
+        definitions[words[1]] = words;
+      } else if (opcode == spv::OpCompositeConstruct || opcode == spv::OpBitcast ||
+                 opcode == spv::OpConstant) {
+        definitions[words[2]] = words;
+      } else if (opcode == spv::OpImageSampleExplicitLod) {
+        const auto coord = definitions[words[4]];
+        const auto lod = definitions[words[6]];
+        const auto components = samples == (cube_first ? 1u : 0u) ? 2u : 3u;
+        Require(name, "mixed coordinate and LOD layout",
+                !coord.empty() && definitions[coord[1]][3] == components &&
+                    words[5] == spv::ImageOperandsLodMask && lod.size() == 4u &&
+                    definitions[lod[3]].size() == 4u &&
+                    definitions[lod[3]][3] == std::bit_cast<u32>(2.0f),
+                "candidate coordinates changed the instruction's LOD operand");
+        samples++;
+      }
+      offset += words.size();
+    }
+    Require(name, "mixed sample count", samples == 3u,
+            "mixed candidate switch did not retain every image");
+  }
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
@@ -27795,6 +27894,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageGetResinfoDmaskWidthHeight);
   AddCase(ImageGetResinfoDmaskMipLevels);
   AddCase(ImageSampleAndGather);
+  AddCase(ImageCubeGradientsPreserveDerivatives);
   AddCase(ImageGatherLodApproximatesLevelZero);
   AddCase(ImageD16GatherPacksHalfPairs);
   AddCase(ImageSampleA16SamplerCoordsOnGpu);
@@ -32727,6 +32827,13 @@ int main(int argc, char **argv) {
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
+    CheckImageSamplerSpecialization();
+    CheckIndirectImageKeySwitch();
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
+    return 0;
+  }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-death") == 0) {
     RunReverseRenderTargetDeathCase();
@@ -32760,11 +32867,6 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedImageViewCache();
     RunCase(&vulkan, ImageStoreBgraUsesInverseSwizzle());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
-    CheckImageSamplerSpecialization();
-    CheckIndirectImageKeySwitch();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
