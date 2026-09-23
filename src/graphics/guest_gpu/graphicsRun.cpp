@@ -1090,19 +1090,16 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	}*/
 }
 
-void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
-	struct DispatchIndirectArgs {
-		uint32_t thread_group_x;
-		uint32_t thread_group_y;
-		uint32_t thread_group_z;
-	};
-
-	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
-
-	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
-	auto*      args      = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
-
-	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
+void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
+	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
+	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
+		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
+		DispatchDirect(args->x, args->y, args->z, mode);
+		return;
+	}
+	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	CheckBuffer();
+	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {

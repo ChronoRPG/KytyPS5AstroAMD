@@ -8703,6 +8703,181 @@ public:
     return result;
   }
 
+  void CheckNativeIndirectDispatch() {
+    constexpr const char *name = "NativeIndirectDispatch";
+    constexpr uintptr_t base = 0x0000000204600000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t case_size = 0x10000;
+    constexpr uint32_t sentinel = 0xa5a5a5a5u;
+    struct DispatchCase {
+      std::array<uint32_t, 3> dimensions;
+      uint32_t mode;
+      uint32_t expected_threads;
+      bool transfer = false;
+    };
+    constexpr std::array cases{
+        DispatchCase{{2, 1, 1}, 0x41u, 8},
+        DispatchCase{{0, 1, 1}, 0x41u, 0},
+        DispatchCase{{1, 0, 1}, 0x41u, 0},
+        DispatchCase{{1, 1, 0}, 0x41u, 0},
+        DispatchCase{{3, 1, 1}, 0x41u, 12, true},
+        DispatchCase{{8, 1, 1}, 0x61u, 8},
+    };
+
+    // Separate DWORD descriptors preserve two owners until the indirect argument
+    // range spans them. The consumer's output aliases the second owner.
+    std::vector<u32> writer;
+    for (u32 i = 0; i < 3; i++) {
+      writer.push_back(EncodeVop1(0x01u, 1, 12u + i));
+      writer.push_back(EncodeMubuf0(0x1cu, 0, false, false));
+      writer.push_back(EncodeMubuf1(1, i, 0));
+    }
+    AppendEnd(&writer);
+    std::vector<u32> consumer;
+    AppendVop3(&consumer, 0x346u, 1, 4, InlineU32(2), Vgpr(0));
+    consumer.push_back(EncodeVop2(0x25u, 2, InlineU32(1), 1));
+    consumer.push_back(EncodeVop2(0x1au, 1, InlineU32(2), 1));
+    consumer.push_back(EncodeMubuf0(0x1cu));
+    consumer.push_back(EncodeMubuf1(2, 0, 1));
+    AppendEnd(&consumer);
+    for (const auto *code : {&writer, &consumer}) {
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<uint32_t>(code->size() * sizeof(u32))});
+    }
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, case_size, 0, &direct_offset) == 0,
+            "indirect argument allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, case_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "indirect argument mapping failed");
+    std::memset(mapped, 0xa5, allocation_size);
+    const auto argument_address = [&](size_t index) {
+      return base + index * case_size +
+          (cases[index].transfer ? 0x200u : BufferCache::CACHING_PAGESIZE - 4u);
+    };
+    for (size_t i = 0; i < cases.size(); i++) {
+      std::memset(reinterpret_cast<void *>(argument_address(i)), 0, 12);
+    }
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(base, allocation_size);
+      const auto set_buffer = [&](u32 sgpr, uint64_t address, u32 bytes) {
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[2] = bytes;
+        descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+        for (u32 i = 0; i < 4; i++) {
+          shaders.SetCsUserSgpr(sgpr + i, descriptor.fields[i],
+                               HW::UserSgprType::Unknown);
+        }
+      };
+      for (size_t index = 0; index < cases.size(); index++) {
+        const auto &test = cases[index];
+        const auto args = argument_address(index);
+        const auto output = base + index * case_size + BufferCache::CACHING_PAGESIZE + 0x100u;
+        if (test.transfer) {
+          for (u32 i = 0; i < 3; i++) {
+            auto [buffer, offset] = cache.ObtainBuffer(args + i * 4u, 4, true);
+            buffer->Fill(offset, 4, test.dimensions[i]);
+          }
+        } else {
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(writer.data()),
+                               .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = 64, .user_sgpr = 15});
+          for (u32 i = 0; i < 3; i++) {
+            set_buffer(i * 4u, args + i * 4u, 4);
+            shaders.SetCsUserSgpr(12u + i, test.dimensions[i], HW::UserSgprType::Unknown);
+          }
+          processor.DispatchDirect(1, 1, 1, 0x41u);
+        }
+        std::array<u32, 3> stale{};
+        Require(name, "GPU-only argument write",
+                LibKernel::Memory::TryReadBacking(args, stale.data(), sizeof(stale)) &&
+                    stale == std::array<u32, 3>{},
+                "argument publication changed the CPU backing before indirect dispatch");
+        const auto first_owner = BufferCacheTestAccess::PageOwner(cache, args);
+        const auto second_owner = BufferCacheTestAccess::PageOwner(cache, args + 8u);
+        if (!test.transfer) {
+          Require(name, "separate argument owners",
+                  first_owner && second_owner && first_owner != second_owner,
+                  "the indirect argument merge fixture already shared one owner");
+        }
+
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(consumer.data()),
+                             .num_thread_x = 4, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
+        set_buffer(0, output, 16u * sizeof(u32));
+        const auto tick = scheduler.CurrentTick();
+        if (test.transfer) {
+          const std::array<u32, 3> packet{static_cast<u32>(args),
+                                         static_cast<u32>(args >> 32u), test.mode};
+          Require(name, "absolute indirect packet",
+                  CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3,
+                  "the absolute indirect packet was not consumed");
+        } else {
+          processor.SetDispatchIndirectArgsBaseAddress(base + index * case_size);
+          const std::array<u32, 2> packet{
+              static_cast<u32>(BufferCache::CACHING_PAGESIZE - 4u), test.mode};
+          Require(name, "offset indirect packet",
+                  CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
+                  "the offset indirect packet was not consumed");
+        }
+        if (test.mode == 0x41u) {
+          Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
+                  "workgroup-count arguments caused a host submission or readback");
+          if (!test.transfer) {
+            const auto merged = BufferCacheTestAccess::PageOwner(cache, args);
+            Require(name, "argument/output owner merge",
+                    merged && merged != first_owner && merged != second_owner &&
+                        merged == BufferCacheTestAccess::PageOwner(cache, output),
+                    "argument discovery did not merge the consumer's buffer owner");
+          }
+        }
+        cache.ReadMemory(output, 16u * sizeof(u32));
+        std::array<u32, 16> actual{};
+        Require(name, "output readback",
+                LibKernel::Memory::TryReadBacking(output, actual.data(), sizeof(actual)),
+                "consumer output could not be read back");
+        for (u32 i = 0; i < actual.size(); i++) {
+          const auto expected = i < test.expected_threads ? i + 1u : sentinel;
+          Require(name, "indirect invocation coverage", actual[i] == expected,
+                  "case " + std::to_string(index) + " word " + std::to_string(i) +
+                      " expected " + Hex(expected) + ", got " + Hex(actual[i]));
+        }
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "indirect argument mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "indirect argument allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorDccFixedClearFloat() {
     constexpr const char *name = "RenderExecutorDccFixedClearFloat";
     constexpr uintptr_t base = 0x0000000204100000ull;
@@ -32908,6 +33083,7 @@ int main(int argc, char **argv) {
     CheckDynamicRenderingState();
     VulkanHarness vulkan;
     vulkan.CheckComputeMetaClearClassification();
+    vulkan.CheckNativeIndirectDispatch();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorDccFixedClearFloat();
     vulkan.CheckSampledDccClear();
@@ -33094,6 +33270,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
   vulkan.CheckGpuTilerCpuParity();
+  vulkan.CheckNativeIndirectDispatch();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckRenderExecutorColorDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
