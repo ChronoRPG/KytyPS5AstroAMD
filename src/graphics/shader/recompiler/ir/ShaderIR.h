@@ -14,6 +14,7 @@
 
 #include <array>
 #include <bit>
+#include <deque>
 #include <list>
 #include <memory>
 #include <optional>
@@ -509,6 +510,16 @@ struct UniformFillPlan {
 // Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
 // uniform condition and fill values without retaining translated blocks.
 struct ResourcePlan {
+	struct EvaluationContext {
+		struct Entry {
+			uint64_t value      = 0;
+			uint64_t generation = 0;
+		};
+
+		std::vector<Entry> values;
+		uint64_t           generation = 0;
+	};
+
 	ResourcePlan() = default;
 	~ResourcePlan();
 
@@ -533,6 +544,10 @@ struct ResourcePlan {
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
+	// GPU-thread scratch. Each nested clean/EXEC evaluation has its own reusable memo.
+	mutable std::deque<EvaluationContext> evaluation_contexts;
+	mutable uint32_t                       evaluation_value_count = 0;
+	mutable uint32_t                       evaluation_depth       = 0;
 };
 
 struct Program: ResourcePlan {

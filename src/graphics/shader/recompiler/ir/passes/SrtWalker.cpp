@@ -8,7 +8,6 @@
 #include <cmath>
 #include <cstring>
 #include <fmt/format.h>
-#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -464,7 +463,12 @@ public:
 	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
 	          Value active_mask = {})
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
-	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()) {}
+	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
+	      m_context(AcquireContext(program)) {}
+
+	~Evaluator() { --m_program.evaluation_depth; }
+	Evaluator(const Evaluator&)            = delete;
+	Evaluator& operator=(const Evaluator&) = delete;
 
 	bool Evaluate(Value value, uint32_t& result) {
 		uint64_t wide = 0;
@@ -476,6 +480,15 @@ public:
 	}
 
 private:
+	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program) {
+		if (program.evaluation_depth == program.evaluation_contexts.size()) {
+			program.evaluation_contexts.emplace_back();
+		}
+		auto& context = program.evaluation_contexts[program.evaluation_depth++];
+		context.generation += 2;
+		return context;
+	}
+
 	static float Float32(uint64_t bits) {
 		return std::bit_cast<float>(static_cast<uint32_t>(bits));
 	}
@@ -497,30 +510,33 @@ private:
 		if (inst == nullptr) {
 			return false;
 		}
-		if (!m_reserved) {
-			m_cache.reserve(m_program.value_storage.size());
-			m_visiting.reserve(m_program.value_storage.size());
-			m_reserved = true;
-		}
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 			return EvaluateWide(inst->Arg(1), result);
 		}
-		if (const auto found = m_cache.find(inst); found != m_cache.end()) {
-			result = found->second;
+		const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
+		if (index >= m_context.values.size()) {
+			m_context.values.resize(m_program.evaluation_value_count);
+		}
+		if (m_context.values[index].generation == m_context.generation) {
+			result = m_context.values[index].value;
 			return true;
 		}
-		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
+		// The low generation bit marks an instruction that is still being evaluated.
+		if (m_context.values[index].generation == (m_context.generation | 1u)) {
 			return false;
 		}
-		m_visiting.push_back(inst);
+		m_context.values[index].generation = m_context.generation | 1u;
 		uint64_t out = 0;
 		const bool evaluated = EvaluateInst(*inst, out);
-		m_visiting.pop_back();
+		// Recursive evaluation may grow the dense memo vector.
+		auto& memo = m_context.values[index];
 		if (!evaluated) {
+			memo.generation = 0;
 			return false;
 		}
-		m_cache.emplace(inst, out);
+		memo.value      = out;
+		memo.generation = m_context.generation;
 		result = out;
 		return true;
 	}
@@ -977,9 +993,7 @@ private:
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
-	std::unordered_map<const Inst*, uint64_t> m_cache;
-	std::vector<const Inst*>                  m_visiting;
-	bool                                      m_reserved = false;
+	ResourcePlan::EvaluationContext&          m_context;
 };
 
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {

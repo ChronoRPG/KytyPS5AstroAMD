@@ -972,11 +972,13 @@ void TestFmaskLoadSpecialization() {
         "FMASK load did not lower to a value vector");
   result = vector->Arg(0);
   uint32_t value = 0;
-  Check(EvaluateUniformValues(plan, {&result, 1}, {.user_data = user_data}, {&value, 1}) &&
+  Check(EvaluateUniformValues(fixture.program, {&result, 1},
+                              {.user_data = user_data}, {&value, 1}) &&
             value == 0x76543210u,
         "FMASK load did not return the native sample-to-fragment mapping");
   user_data[8] = 1;
-  Check(EvaluateUniformValues(plan, {&result, 1}, {.user_data = user_data}, {&value, 1}) &&
+  Check(EvaluateUniformValues(fixture.program, {&result, 1},
+                              {.user_data = user_data}, {&value, 1}) &&
             value == 0u,
         "inactive FMASK load did not preserve the execution mask");
   ShaderComputeInputInfo compute{};
@@ -1185,6 +1187,14 @@ void TestSrtFlatteningAndRuntimeMemoization() {
         "descriptor and flat SRT evaluation did not share one memoized read");
 
   memory.reads = 0;
+  memory.words[1] = 0x12345678u;
+  Check(EvaluateRuntimeSources(fixture.program, std::span{&request, 1}, runtime,
+                               descriptors, flat, {}, active_sources) &&
+            descriptors[0].dwords[0] == 0x12345678u &&
+            flat == std::vector<uint32_t>{0x12345678u} && memory.reads == 1,
+        "repeated runtime evaluation reused stale scalar memory");
+
+  memory.reads = 0;
   memory.fail_after = 0;
   descriptors = {{{1u}, 1u}};
   flat = {2u};
@@ -1195,6 +1205,24 @@ void TestSrtFlatteningAndRuntimeMemoization() {
             flat == std::vector<uint32_t>{2u} &&
             active_sources == std::vector<uint8_t>{3u},
         "runtime evaluation failure was not transactional");
+
+  memory.fail_after = UINT32_MAX;
+  Check(EvaluateRuntimeSources(fixture.program, std::span{&request, 1}, runtime,
+                               descriptors, flat, {}, active_sources) &&
+            descriptors[0].dwords[0] == 0x12345678u && memory.reads == 1,
+        "failed runtime evaluation left a value marked as visiting");
+
+  auto detached = ExtractResourcePlan(fixture.program);
+  Check(EvaluateRuntimeSources(detached, std::span{&request, 1}, runtime,
+                               descriptors, flat, {}, active_sources),
+        "detached resource plan did not evaluate");
+  auto moved = std::move(detached);
+  memory.reads = 0;
+  memory.words[1] = 0x87654321u;
+  Check(EvaluateRuntimeSources(moved, std::span{&request, 1}, runtime,
+                               descriptors, flat, {}, active_sources) &&
+            descriptors[0].dwords[0] == 0x87654321u && memory.reads == 1,
+        "moving a cached resource plan lost its evaluation state");
 
   ShaderComputeInputInfo compute{};
   CollectShaderInfo(fixture.program, {.compute = &compute});
