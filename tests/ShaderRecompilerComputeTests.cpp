@@ -16610,6 +16610,32 @@ TestCase Shifts() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarZeroShiftWithRuntimeCount() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code = {
+      EncodeSop2(0x20, 8, InlineU32(0), 4),
+      EncodeSop2(0x20, 9, 6, 4),
+  };
+  AppendStoreSgpr(&code, 8, 0);
+  AppendStoreSgpr(&code, 9, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ScalarZeroShiftWithRuntimeCount";
+  test.code = std::move(code);
+  test.expected = {0, 0x40000000u};
+  test.opcodes = {O::S_LSHR_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(0, 2 * sizeof(u32));
+  test.user_data[4] = 33;
+  test.user_data[6] = 0x80000000u;
+  test.has_user_data = true;
+  test.ir_counts = {{" = ShiftRightLogical32 ", 1}};
+  test.required_spirv = {"OpShiftRightLogical"};
+  return test;
+}
+
 TestCase ExactPushConstantExtent() {
   using O = ShaderOpcode;
 
@@ -27970,6 +27996,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(IntegerAddSubMul);
   AddCase(BitwiseOps);
   AddCase(Shifts);
+  AddCase(ScalarZeroShiftWithRuntimeCount);
   AddCase(ExactPushConstantExtent);
   AddCase(ScalarShiftCountsMaskLowBits);
   AddCase(Rdna2ScalarOpcodes);
@@ -33043,6 +33070,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorAlignByteUsesFiveBitByteOffset());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--zero-shift-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarZeroShiftWithRuntimeCount());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-mov-only") == 0) {
