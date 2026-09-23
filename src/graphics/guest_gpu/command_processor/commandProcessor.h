@@ -151,7 +151,6 @@ private:
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
-	void                CheckBuffer() const { GetScheduler().CheckActive(); }
 
 	RenderContext&   m_renderer;
 	HW::Context      m_ctx;
