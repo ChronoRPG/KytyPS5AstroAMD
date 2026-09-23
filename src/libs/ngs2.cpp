@@ -440,8 +440,12 @@ struct Ngs2VoiceInternal {
 		if (format.waveform_type == NGS2_WAVEFORM_TYPE_ATRAC9) {
 			decoder = std::make_unique<Ajm::AjmAt9Decoder>(channels, format.sample_rate,
 			                                               Ajm::AjmSampleEncoding::Float, 0);
-			const auto result =
-			    decoder->Initialize(&format.config_data, sizeof(format.config_data));
+			const std::array<uint8_t, ATRAC9_CONFIG_DATA_SIZE> config = {
+			    static_cast<uint8_t>(format.config_data >> 24u),
+			    static_cast<uint8_t>(format.config_data >> 16u),
+			    static_cast<uint8_t>(format.config_data >> 8u),
+			    static_cast<uint8_t>(format.config_data)};
+			const auto result = decoder->Initialize(config.data(), config.size());
 			EXIT_NOT_IMPLEMENTED(result.result != OK);
 			EXIT_NOT_IMPLEMENTED(result.format.channel_num != channels ||
 			                     result.format.sampling_frequency != format.sample_rate);
@@ -1553,7 +1557,9 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 	info->format.waveform_type = NGS2_WAVEFORM_TYPE_ATRAC9;
 	info->format.num_channels  = static_cast<uint32_t>(codec.channels);
 	info->format.sample_rate   = static_cast<uint32_t>(codec.samplingRate);
-	std::memcpy(&info->format.config_data, config.data(), config.size());
+	info->format.config_data = (static_cast<uint32_t>(config[0]) << 24u) |
+	                           (static_cast<uint32_t>(config[1]) << 16u) |
+	                           (static_cast<uint32_t>(config[2]) << 8u) | config[3];
 	info->data_offset              = static_cast<uint32_t>(waveform_offset);
 	info->data_size                = waveform_size;
 	info->num_samples              = Ngs2ReadLe32(fact);
