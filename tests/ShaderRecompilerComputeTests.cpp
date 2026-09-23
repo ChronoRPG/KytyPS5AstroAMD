@@ -12374,7 +12374,25 @@ public:
         plane_depth.info.tile_mode = Prospero::TileMode::kDepth;
         plane_depth.info.mip_layout[0] = {0, plane_size, plane_depth.info.pitch, 2};
         const auto plane_depth_id = texture_cache.FindImage(plane_depth);
+        auto sampled_plane = plane_depth;
+        sampled_plane.type = BindingType::Texture;
+        sampled_plane.info.data = plane_depth.info.stencil;
+        sampled_plane.info.stencil = {};
+        sampled_plane.info.metadata = {};
+        sampled_plane.info.pixel_format = vk::Format::eR8Uint;
+        sampled_plane.info.guest_format = Prospero::BufferFormat::k8UInt;
+        sampled_plane.info.bytes_per_block = 1;
+        sampled_plane.info.pitch = TileGetDepthPitch(3, 1);
+        sampled_plane.info.mip_layout[0] = {0, plane_size, sampled_plane.info.pitch, 2};
+        sampled_plane.view_info.format = vk::Format::eR8Uint;
+        sampled_plane.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        sampled_plane.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        const auto sampled_plane_id = texture_cache.FindImage(sampled_plane);
+        (void)texture_cache.FindTexture(sampled_plane_id, sampled_plane);
         (void)texture_cache.FindDepthTarget(plane_depth_id, plane_depth);
+        Require(name, "sampled stencil association",
+                texture_cache.GetImage(sampled_plane_id).depth_id == plane_depth_id,
+                "depth acquisition did not associate the sampled stencil plane");
         TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), plane_depth_id,
             {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1},
             stencil_initial);
@@ -12480,6 +12498,25 @@ public:
         }
         std::memcpy(reinterpret_cast<void *>(plane_address), plane_words.data(), plane_size);
         check_plane("CPU stencil write after native clear", false);
+        for (uint32_t i = 0; i < texels; ++i) {
+          plane_bytes[plane_offsets[i]] += 0x10;
+        }
+        std::memcpy(reinterpret_cast<void *>(plane_address), plane_words.data(), plane_size);
+        Require(name, "sampled stencil view",
+                texture_cache.FindTexture(plane_depth_id, sampled_plane) != nullptr,
+                "an associated stencil plane could not be sampled");
+        texture_cache.GetImage(plane_depth_id).Download(
+            plane_copies, plane_readback.buffer, 0, plane_readback.size);
+        scheduler.Current().Handle().pipelineBarrier2(stencil_dependency);
+        scheduler.Finish();
+        const auto sampled_values = ReadBuffer(name, plane_readback, texels + 2);
+        const auto *sampled_bytes =
+            reinterpret_cast<const uint8_t *>(sampled_values.data() + texels);
+        for (uint32_t i = 0; i < texels; ++i) {
+          Require(name, "sampled stencil plane refresh",
+                  sampled_bytes[i] == plane_bytes[plane_offsets[i]],
+                  "sampling without another depth acquisition used stale stencil bytes");
+        }
         DestroyBuffer(&plane_readback);
         DestroyBuffer(&plane_upload);
         LibKernel::Memory::InstallGpuResources(nullptr);

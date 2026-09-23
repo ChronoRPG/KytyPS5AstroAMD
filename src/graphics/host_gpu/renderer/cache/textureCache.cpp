@@ -1221,9 +1221,6 @@ void TextureCache::RefreshImage(ImageId id) {
 	     m_slot_images[image.depth_id].info.samples != 1)) {
 		return;
 	}
-	if (image.info.HasStencil()) {
-		RefreshImage(AssociateStencil(id, image.info.stencil));
-	}
 	TrackImage(id);
 	if (image.IsMaybeCpuDirty()) {
 		const auto hash = image.HashGuestEdges();
@@ -1418,6 +1415,19 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	}
 	if (!image.info.data.Empty()) {
 		RefreshImage(id);
+		if (image.info.HasStencil() &&
+		    desc.info.data.address >= image.info.stencil.address &&
+		    desc.info.data.End() <= image.info.stencil.End()) {
+			for (const auto stencil_id:
+			     FindImagesInRegion(image.info.stencil.address, image.info.stencil.size, false)) {
+				const auto* stencil = m_slot_images.try_get(stencil_id);
+				if (stencil != nullptr && stencil->depth_id == id &&
+				    stencil->info.data == image.info.stencil) {
+					RefreshImage(stencil_id);
+					break;
+				}
+			}
+		}
 	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
@@ -1475,6 +1485,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
+	if (desc.info.HasStencil()) {
+		RefreshImage(AssociateStencil(id, desc.info.stencil));
+	}
 	const auto view = image.FindView(desc.view_info);
 	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
 	return view;
