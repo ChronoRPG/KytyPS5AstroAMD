@@ -650,6 +650,21 @@ void TestGuardedDirectImageTable() {
             snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 32u &&
             memory.reads == 34u && memory.descriptor_reads == 32u,
         "direct table did not retain all 32 reachable descriptors");
+  const auto captured_word = (table - memory.base) / 4u + 16u * 8u;
+  const auto original_descriptor = snapshot.images[16].dwords;
+  const std::array<uint32_t, 8> captured_invalid{
+      0x101f0000u, 0xcb500000u, 0x001fc01fu, 0xd0970facu,
+      0x86000000u, 0x00500003u, 0x00000400u, 0x00005204u};
+  std::copy(captured_invalid.begin(), captured_invalid.end(),
+             memory.words.begin() + captured_word);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 32u &&
+            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 32u &&
+            std::ranges::all_of(snapshot.images[16].dwords,
+                                [](uint32_t word) { return word == 0u; }),
+        "captured non-descriptor record became a host image or lost its key mapping");
+  std::copy(original_descriptor.begin(), original_descriptor.end(),
+             memory.words.begin() + captured_word);
   memory.words[(table - memory.base) / 4u + 31u * 8u] = 0x987u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images[31].dwords[0] == 0x987u,
@@ -682,6 +697,78 @@ void TestGuardedDirectImageTable() {
   Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
             endpoint.watched_reads == 0u,
         "batched descriptor read crossed the 48-bit endpoint");
+}
+
+void TestImageDescriptorFields() {
+  constexpr std::array<std::pair<uint32_t, uint32_t>, 5> reserved{
+      {{1u, 0x20000000u}, {2u, 0xf0003000u}, {4u, 0xe000e000u},
+       {5u, 0xf9000000u}, {6u, 0x00007b00u}}};
+  for (const bool r128 : {false, true}) {
+    Fixture fixture;
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      words[word] = fixture.UserData(word);
+    }
+    const auto image = fixture.Image(words);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    memory.image_r128 = r128;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(memory, 0x80));
+    fixture.PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture.program);
+    std::array<uint32_t, 8> user_data{};
+    user_data[0] = 0x100u;
+    user_data[1] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    user_data[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+    const SrtRuntime runtime{.user_data = user_data};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const auto is_null = [&] {
+      return std::ranges::all_of(snapshot.images[0].dwords,
+                                 [](uint32_t word) { return word == 0u; });
+    };
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images[0].dwords == user_data,
+          "valid texture descriptor was rejected");
+    for (const auto [word, mask] : reserved) {
+      for (uint32_t bits = mask; bits != 0u; bits &= bits - 1u) {
+        const auto bit = bits & (0u - bits);
+        user_data[word] |= bit;
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  (r128 && word >= 4u ? snapshot.images[0].dwords == user_data : is_null()),
+              "reserved descriptor bits or ignored R128 upper words were misclassified");
+        user_data[word] &= ~bit;
+      }
+    }
+    user_data[5] = 0x06800000u;
+    user_data[6] = 0x010880ffu;
+    user_data[7] = 0x1234u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images[0].dwords == user_data,
+          "defined mip-statistics, PRT, or metadata fields were treated as reserved");
+    user_data[3] |= 3u << 16u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images[0].dwords == user_data,
+          "view LAST_LEVEL above physical MAX_MIP was rejected");
+    if (!r128) {
+      user_data[3] = (user_data[3] & 0x0fffffffu) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2DArray) << 28u);
+      user_data[4] = 3u | (4u << 16u);
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) && is_null(),
+            "array view starting after its last slice was accepted");
+      for (const auto base : {1u, 3u}) {
+        user_data[4] = 3u | (base << 16u);
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  snapshot.images[0].dwords == user_data,
+              "valid array view with a nonzero base slice was rejected");
+      }
+    }
+  }
 }
 
 void TestUniformScalarBufferImage() {
@@ -2411,6 +2498,7 @@ int main() {
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("guarded direct image table", TestGuardedDirectImageTable);
+    Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);

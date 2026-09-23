@@ -62,6 +62,13 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 }
 
 bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) {
+	const auto& words = descriptor.dwords;
+	// Reject texture descriptors with nonzero reserved bits.
+	if ((words[1] & 0x20000000u) != 0u || (words[2] & 0xf0003000u) != 0u ||
+	    (!r128 && ((words[4] & 0xe000e000u) != 0u || (words[5] & 0xf9000000u) != 0u ||
+	               (words[6] & 0x00007b00u) != 0u))) {
+		return false;
+	}
 	const auto type   = static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu);
 	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
 	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid ||
@@ -70,6 +77,13 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	}
 	if (r128 && type != Prospero::ImageType::kColor1D && type != Prospero::ImageType::kColor2D &&
 	    type != Prospero::ImageType::kColor2DMsaa) {
+		return false;
+	}
+	const bool array = type == Prospero::ImageType::kColor1DArray ||
+	                   type == Prospero::ImageType::kColor2DArray ||
+	                   type == Prospero::ImageType::kColor2DMsaaArray ||
+	                   type == Prospero::ImageType::kCube;
+	if (array && ((words[4] >> 16u) & 0x1fffu) > (words[4] & 0x1fffu)) {
 		return false;
 	}
 	if (type == Prospero::ImageType::kColor2DMsaa ||
