@@ -2229,7 +2229,7 @@ public:
     constexpr std::array<std::pair<MemoryUsage, uint64_t>, 4> utilities{{
         {MemoryUsage::Upload, 512ull << 20},
         {MemoryUsage::Stream, 64ull << 20},
-        {MemoryUsage::Download, 32ull << 20},
+        {MemoryUsage::Download, 64ull << 20},
         {MemoryUsage::DeviceLocal, 128ull << 20},
     }};
     std::array<vk::Buffer, utilities.size()> handles{};
@@ -2260,7 +2260,7 @@ public:
                 download_probe != nullptr && download_probe_offset == 0 &&
                 &cache.GetUtilityBuffer(MemoryUsage::Download) ==
                     fixed_download &&
-                fixed_download->Size() == (32ull << 20) &&
+                fixed_download->Size() == (64ull << 20) &&
                 fixed_download->Handle() == fixed_handle,
             "oversized download replaced or corrupted the fixed shared ring");
     fixed_download->Commit();
@@ -3515,7 +3515,7 @@ public:
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
-    constexpr uint64_t allocation_size = 0x2400000;
+    constexpr uint64_t allocation_size = 0x5000000;
     constexpr uint64_t allocation_alignment = 0x10000;
     constexpr uint64_t first_offset = 0x100;
     constexpr uint64_t second_offset = 0x200;
@@ -3850,7 +3850,7 @@ public:
                   &BufferCacheTestAccess::DownloadBuffer(cache) ==
                       fixed_download &&
                   download.Handle() == fixed_download_handle &&
-                  download.Size() == (32ull << 20),
+                  download.Size() == (64ull << 20),
               "wrapped fault batch published incorrect disjoint ranges");
 
       constexpr uint64_t window_size = 512 * 1024;
@@ -4154,7 +4154,7 @@ public:
               "partial invalidation lost disjoint native bytes");
 
       constexpr uint64_t large_offset = 0x10000;
-      constexpr uint64_t large_size = 32ull << 20;
+      constexpr uint64_t large_size = 64ull << 20;
       constexpr uint32_t large_value = 0x5aa55aa5u;
       constexpr uint32_t large_stale = 0x12345678u;
       std::memcpy(memory + large_offset, &large_stale, sizeof(large_stale));
@@ -4191,7 +4191,7 @@ public:
                   &BufferCacheTestAccess::DownloadBuffer(cache) ==
                       fixed_download &&
                   fixed_download->Handle() == fixed_download_handle &&
-                  fixed_download->Size() == (32ull << 20),
+                  fixed_download->Size() == (64ull << 20),
               "image acquisition replaced the shared Buffer download stream");
       std::vector<uint32_t> large_published(large_size / sizeof(uint32_t));
       Require(name, "near-capacity Buffer publication contents",
@@ -4203,13 +4203,13 @@ public:
               "near-capacity Buffer GC did not publish its complete transfer");
 
       constexpr uint64_t grouped_first_offset = 0x10000;
-      constexpr uint64_t grouped_second_offset = 0x1200000;
-      constexpr uint64_t grouped_owner_size = 17ull * 1024 * 1024;
+      constexpr uint64_t grouped_second_offset = 0x2300000;
+      constexpr uint64_t grouped_owner_size = 33ull * 1024 * 1024;
       constexpr uint32_t grouped_first_value = 0x1122aabbu;
       constexpr uint32_t grouped_second_value = 0x3344ccddu;
       constexpr uint32_t grouped_stale = 0;
-      static_assert(grouped_owner_size < (32ull << 20) &&
-                    grouped_owner_size * 2 > (32ull << 20));
+      static_assert(grouped_owner_size < (64ull << 20) &&
+                    grouped_owner_size * 2 > (64ull << 20));
       Libs::LibKernel::Memory::WriteBacking(
           base + grouped_first_offset, &grouped_stale, sizeof(grouped_stale));
       Libs::LibKernel::Memory::WriteBacking(
