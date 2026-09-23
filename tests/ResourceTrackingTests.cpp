@@ -506,6 +506,139 @@ void TestInvariantIndirectImageMaterialization() {
         "wrapped scalar immediate entered the invariant image proof");
 }
 
+void TestGuardedDirectImageTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Guard { Nonzero, Zero, Unrelated, Bypass };
+  const auto make_plan = [](Guard guard) {
+    Fixture fixture(ShaderType::Pixel);
+    auto *entry = fixture.block;
+    auto *middle = fixture.AddBlock();
+    auto *before_sample = fixture.AddBlock();
+    auto *sample = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(middle);
+    entry->AddBranch(exit);
+    middle->AddBranch(before_sample);
+    before_sample->AddBranch(sample);
+    sample->AddBranch(exit);
+    if (guard == Guard::Bypass) exit->AddBranch(sample);
+    const auto mask = fixture.Emit(ValueOpcode::ReadFirstLane,
+        {fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)}), Value(true)});
+    const auto nonzero = fixture.Emit(
+        ValueOpcode::INotEqual32,
+        {Value(0u), guard == Guard::Unrelated ? fixture.UserData(2) : mask});
+    fixture.program.block_info[0].condition =
+        fixture.Emit(ValueOpcode::LogicalNot, {nonzero});
+    fixture.program.block_info[0].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = guard == Guard::Zero ? 1u : 4u,
+        .false_block = guard == Guard::Zero ? 4u : 1u};
+    for (uint32_t block = 1; block < 4; ++block) {
+      fixture.program.block_info[block].terminator = {
+          .kind = CFG::TerminatorKind::Branch, .true_block = block + 1u};
+    }
+    fixture.program.block_info[4].terminator = {
+        .kind = guard == Guard::Bypass ? CFG::TerminatorKind::Branch
+                                      : CFG::TerminatorKind::Return,
+        .true_block = 3u};
+    const auto srt = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    std::array<Value, 2> pointer;
+    for (uint32_t word = 0; word < pointer.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * 4u;
+      pointer[word] = fixture.Emit(
+          ValueOpcode::LoadAddressU32, {srt, Value(0u), Value(0u), Value(true)},
+          fixture.AddMemory(memory, 0x20));
+    }
+    fixture.block = sample;
+    const auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask});
+    const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}),
+         Value(344u)});
+    std::array<Value, 8> words;
+    for (uint32_t group = 0; group < 2u; ++group) {
+      // Separate equivalent pointer handles mirror the two scalar x4 loads.
+      const auto table = fixture.Address(pointer[0], pointer[1]);
+      const auto group_offset = group == 0u ? offset : fixture.Emit(
+          ValueOpcode::IAdd32, {offset, Value(16u)});
+      for (uint32_t word = 0; word < 4u; ++word) {
+        MemoryInfo memory;
+        memory.kind = ResourceKind::ScalarAddress;
+        memory.offset = word * 4u;
+        words[group * 4u + word] = fixture.Emit(
+            ValueOpcode::LoadAddressU32,
+            {table, group_offset, Value(0u), Value(true)},
+            fixture.AddMemory(memory, 0x100 + group * 8u));
+      }
+    }
+    const auto image = fixture.Image(words, 0x128);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(memory, 0x128));
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_image;
+    Check(indirect && indirect->material_source == UINT32_MAX &&
+              indirect->selector_stride == 0u && indirect->table_offset == 344u &&
+              indirect->key_count == 32u &&
+              fixture.program.descriptor_sources[indirect->table_source].dword_count == 2u,
+          "guarded direct image table lost its pointer or proven selector range");
+    return ExtractResourcePlan(fixture.program);
+  };
+
+  auto plan = make_plan(Guard::Nonzero);
+  for (const auto guard : {Guard::Zero, Guard::Unrelated, Guard::Bypass}) {
+    CheckFatal([&] { make_plan(guard); }, "not a valid runtime value",
+               "direct table accepted a selector without a dominating nonzero guard");
+  }
+  LinearTestMemory memory;
+  constexpr uint64_t table = 0x1800u + 344u;
+  memory.words[0] = 0x1800u;
+  const auto fill_table = [](LinearTestMemory &memory, uint64_t base) {
+    for (uint32_t key = 0; key < 32u; ++key) {
+      const auto word = (base - memory.base) / 4u + key * 8u;
+      memory.words[word] = 0x100u + key;
+      memory.words[word + 1u] = static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+      memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+    }
+  };
+  fill_table(memory, table);
+  const std::array<uint32_t, 2> user_data{0x1000u, 0u};
+  SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 32u && specialization.images.size() == 32u &&
+            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 32u,
+        "direct table did not retain all 32 reachable descriptors");
+  memory.words[(table - memory.base) / 4u + 31u * 8u] = 0x987u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images[31].dwords[0] == 0x987u,
+        "direct table refresh reused stale descriptor contents");
+  memory.fail_address = table + 31u * 32u + 28u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "direct table accepted an unreadable final descriptor word");
+
+  LinearTestMemory wrapping;
+  wrapping.base = 0u;
+  wrapping.words[0x1000u / 4u] = 0xffffff00u;
+  wrapping.words[0x1000u / 4u + 1u] = 0xffffu;
+  wrapping.watched_address = 88u;
+  fill_table(wrapping, 88u);
+  runtime.userdata = &wrapping;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            wrapping.watched_reads == 0u,
+        "direct table wrapped its descriptor address at the 48-bit boundary");
+}
+
 void TestUniformScalarBufferImage() {
   Fixture fixture(ShaderType::Pixel);
   std::array<Value, 4> material_words;
@@ -2232,6 +2365,7 @@ int main() {
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
+    Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);

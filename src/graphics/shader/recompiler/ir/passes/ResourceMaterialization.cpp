@@ -166,16 +166,15 @@ bool ReadSpecializationWord(const SrtRuntime& runtime, uint64_t address, uint32_
 	       runtime.read_specialization_memory(runtime.userdata, address, &word);
 }
 
-bool ReadScalarBufferWord(const ShaderBufferResource& descriptor, uint32_t dynamic_offset,
-                          uint32_t immediate_offset, const SrtRuntime& runtime, uint32_t& word) {
+bool ReadScalarTableWord(uint64_t base, uint64_t size, uint32_t dynamic_offset,
+                         uint32_t immediate_offset, const SrtRuntime& runtime, uint32_t& word) {
 	const auto byte_offset = static_cast<uint64_t>(dynamic_offset) + immediate_offset;
 	const auto aligned     = byte_offset & ~uint64_t {3};
-	const auto size        = descriptor.GetSize();
 	if (aligned > size || size - aligned < sizeof(uint32_t)) {
 		word = 0;
 		return true;
 	}
-	const auto base = descriptor.Base48() & ~uint64_t {3};
+	base &= AddressMask & ~uint64_t {3};
 	if (aligned > AddressMask - base) {
 		return false;
 	}
@@ -189,39 +188,59 @@ bool ReadScalarBufferWord(const ShaderBufferResource& descriptor, uint32_t dynam
 bool MaterializeIndirectImage(const ResourcePlan& program,
                               const DescriptorSource::IndirectImage& indirect,
                               const DescriptorValue& material_value,
-                              const DescriptorValue& heap_value, uint32_t image_index,
+                              const DescriptorValue& table_value, uint32_t image_index,
                               const SrtRuntime& runtime, ResourceSnapshot& snapshot,
                               ResourceSpecialization& specialization) {
-	ShaderBufferResource material;
-	ShaderBufferResource heap;
-	if (!DecodeBufferDescriptor(material_value, material) ||
-	    !DecodeBufferDescriptor(heap_value, heap) || material.Stride() != indirect.selector_stride) {
-		return false;
-	}
-	// Enumerate every wrapped scalar-buffer offset that can pass the descriptor bounds.
-	const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
-	const auto residue = static_cast<uint64_t>(indirect.selector_offset) % step;
-	const auto limit = std::min<uint64_t>(UINT32_MAX, material.GetSize() + 3u);
-	const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
-	if (probe_count > MaxIndirectImageProbes) {
+	uint64_t table_base = 0;
+	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
+	ShaderBufferResource table;
+	if (table_value.dword_count == 2u) {
+		table_base = (static_cast<uint64_t>(table_value.dwords[1]) << 32u) | table_value.dwords[0];
+	} else if (DecodeBufferDescriptor(table_value, table)) {
+		table_base = table.Base48();
+		table_size = table.GetSize();
+	} else {
 		return false;
 	}
 	auto& keys = program.material_keys;
 	keys.clear();
-	keys.reserve(static_cast<size_t>(probe_count) + 1u);
-	keys.push_back(0u);
-	for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
-		uint32_t key = 0;
-		if (!ReadScalarBufferWord(material, static_cast<uint32_t>(offset), 0u, runtime, key)) {
+	if (indirect.material_source == UINT32_MAX) {
+		if (table_value.dword_count != 2u || indirect.key_count == 0u ||
+		    indirect.key_count > MaxIndirectImageProbes) {
 			return false;
 		}
-		keys.push_back(key);
-		if (limit - offset < step) {
-			break;
+		keys.resize(indirect.key_count);
+		std::iota(keys.begin(), keys.end(), 0u);
+	} else {
+		ShaderBufferResource material;
+		if (!DecodeBufferDescriptor(material_value, material) || table_value.dword_count != 4u ||
+		    material.Stride() != indirect.selector_stride) {
+			return false;
 		}
+		// Enumerate every wrapped scalar-buffer offset that can pass the descriptor bounds.
+		const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
+		const auto residue = static_cast<uint64_t>(indirect.selector_offset) % step;
+		const auto limit = std::min<uint64_t>(UINT32_MAX, material.GetSize() + 3u);
+		const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
+		if (probe_count > MaxIndirectImageProbes) {
+			return false;
+		}
+		keys.reserve(static_cast<size_t>(probe_count) + 1u);
+		keys.push_back(0u);
+		for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
+			uint32_t key = 0;
+			if (!ReadScalarTableWord(material.Base48(), material.GetSize(),
+			                         static_cast<uint32_t>(offset), 0u, runtime, key)) {
+				return false;
+			}
+			keys.push_back(key);
+			if (limit - offset < step) {
+				break;
+			}
+		}
+		std::ranges::sort(keys);
+		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 	}
-	std::ranges::sort(keys);
-	keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 
 	const auto children_begin = snapshot.images.size();
 	const auto mapping_offset = snapshot.flattened_srt.size();
@@ -232,10 +251,10 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		const auto key = keys[entry];
 		DescriptorValue candidate;
 		candidate.dword_count = 8u;
-		const auto heap_offset = key << 5u;
+		const auto table_offset = (key << 5u) + indirect.table_offset;
 		for (uint32_t dword = 0; dword < candidate.dword_count; ++dword) {
-			if (!ReadScalarBufferWord(heap, heap_offset, dword * sizeof(uint32_t), runtime,
-			                          candidate.dwords[dword])) {
+			if (!ReadScalarTableWord(table_base, table_size, table_offset, dword * sizeof(uint32_t),
+			                         runtime, candidate.dwords[dword])) {
 				return false;
 			}
 		}
@@ -816,7 +835,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		plan.requires_specialization_memory = true;
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->material_source),
 		                   plan.clean_flat_slots);
-		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->heap_source),
+		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->table_source),
 		                   plan.clean_flat_slots);
 	}
 	return plan;
@@ -892,10 +911,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 			const auto& indirect = *source->indirect_image;
 			DescriptorValue material;
-			DescriptorValue heap;
-			if (!clean.EvaluateDescriptor(indirect.material_source, material) ||
-			    !clean.EvaluateDescriptor(indirect.heap_source, heap) ||
-			    !MaterializeIndirectImage(program, indirect, material, heap, i, runtime, snapshot,
+			DescriptorValue table;
+			if ((indirect.material_source != UINT32_MAX &&
+			     !clean.EvaluateDescriptor(indirect.material_source, material)) ||
+			    !clean.EvaluateDescriptor(indirect.table_source, table) ||
+			    !MaterializeIndirectImage(program, indirect, material, table, i, runtime, snapshot,
 			                              specialization)) {
 				return false;
 			}
