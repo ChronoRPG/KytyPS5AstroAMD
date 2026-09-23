@@ -346,7 +346,7 @@ struct TextureCacheTestAccess {
   static void AssociateStencil(TextureCache &cache, ImageId depth,
                                GuestRange stencil) {
     std::lock_guard lock(cache.m_lock);
-    cache.AssociateStencil(depth, stencil);
+    (void)cache.AssociateStencil(depth, stencil);
   }
 
   static void SetLinearReadback(TextureCache &cache, bool enabled) {
@@ -12183,6 +12183,132 @@ public:
               !texture_cache.GetImage(depth_id).usage.storage,
           "stencil clear altered depth, lost its scalar value, or used a storage view");
       DestroyBuffer(&stencil_readback);
+
+      // Buffer writes to the independent tiled stencil plane must reach the
+      // combined native attachment, including values that are not a clear.
+      {
+        LibKernel::Memory::InstallGpuResources(&resources);
+        constexpr uint64_t plane_size = 0x10000;
+        constexpr uint64_t plane_address = base + 0x910000;
+        constexpr uint32_t texels = 6;
+        auto plane_depth = depth;
+        plane_depth.info.data = {base + 0x900000, plane_size};
+        plane_depth.info.stencil = {plane_address, plane_size};
+        plane_depth.info.extent = {3, 2, 1};
+        plane_depth.info.pitch = TileGetDepthPitch(3, sizeof(uint32_t));
+        plane_depth.info.tile_mode = Prospero::TileMode::kDepth;
+        plane_depth.info.mip_layout[0] = {0, plane_size, plane_depth.info.pitch, 2};
+        const auto plane_depth_id = texture_cache.FindImage(plane_depth);
+        (void)texture_cache.FindDepthTarget(plane_depth_id, plane_depth);
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), plane_depth_id,
+            {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1},
+            stencil_initial);
+
+        TileBlockLayout stencil_block{};
+        Require(name, "independent stencil tile pitch",
+            TileGetBlockLayout(TileBlockFamily::Depth64KB, 1, stencil_block) &&
+                plane_depth.info.pitch == 128 && TileGetDepthPitch(3, 1) == 256,
+            "stencil must use its own one-byte tile layout");
+        std::vector<uint32_t> plane_words(plane_size / sizeof(uint32_t), 0);
+        auto *plane_bytes = reinterpret_cast<uint8_t *>(plane_words.data());
+        std::array<uint32_t, texels> plane_offsets{};
+        for (uint32_t i = 0; i < texels; ++i) {
+          Require(name, "stencil tile offset",
+              TileGetBlockOffset(stencil_block, i % 3, i / 3, 0, plane_offsets[i]),
+              "stencil texel offset is unavailable");
+          plane_bytes[plane_offsets[i]] = static_cast<uint8_t>(0x21 + i * 7);
+        }
+        auto plane_upload = CreateHostBuffer(name, plane_size,
+            vk::BufferUsageFlagBits::eTransferSrc, plane_words);
+        ShaderRecompiler::IR::Program plane_ir{};
+        plane_ir.stage = ShaderType::Compute;
+        plane_ir.resource_tracking_complete = true;
+        auto &plane_resource = plane_ir.info.buffers.emplace_back();
+        plane_resource.written = true;
+        plane_resource.formatted = true;
+        allocate_bindings(plane_ir);
+        ShaderRecompiler::IR::CompiledShaderInfo plane_program{};
+        plane_program.stage = plane_ir.stage;
+        plane_program.info = std::move(plane_ir.info);
+        plane_program.bindings = std::move(plane_ir.bindings);
+        ShaderBufferResource plane_descriptor{};
+        plane_descriptor.UpdateAddress48(plane_address);
+        plane_descriptor.fields[1] |= 4u << 16u;
+        plane_descriptor.fields[2] = plane_size / sizeof(uint32_t);
+        plane_descriptor.fields[3] = 0x00014204u;
+        ShaderRecompiler::IR::ResourceSnapshot plane_snapshot;
+        auto &plane_value = plane_snapshot.buffers.emplace_back();
+        std::memcpy(plane_value.dwords.data(), plane_descriptor.fields,
+                    sizeof(plane_descriptor.fields));
+        plane_value.dword_count = 4;
+        const ShaderStageRuntime plane_runtime{&plane_program, &plane_snapshot};
+        auto plane_bindings = executor.PrepareBindings(plane_runtime);
+        vk::MemoryBarrier2 plane_barrier{};
+        plane_barrier.srcStageMask = plane_barrier.dstStageMask =
+            vk::PipelineStageFlagBits2::eAllCommands;
+        plane_barrier.srcAccessMask = plane_barrier.dstAccessMask =
+            vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+        vk::DependencyInfo plane_dependency{};
+        plane_dependency.memoryBarrierCount = 1;
+        plane_dependency.pMemoryBarriers = &plane_barrier;
+        const auto write_plane = [&] {
+          executor.FindBuffers(plane_bindings);
+          executor.RebindBuffers(plane_bindings);
+          const auto &plane_buffer = plane_bindings.buffers[0];
+          const vk::BufferCopy plane_copy{0, plane_buffer.offset, plane_size};
+          scheduler.Current().Handle().pipelineBarrier2(plane_dependency);
+          scheduler.Current().Handle().copyBuffer(plane_upload.buffer, plane_buffer.buffer,
+                                                  1, &plane_copy);
+          scheduler.Current().Handle().pipelineBarrier2(plane_dependency);
+          RenderExecutorTestAccess::ResetBindings(executor);
+        };
+        write_plane();
+
+        auto plane_readback = CreateHostBuffer(name, texels * 4 + 8,
+            vk::BufferUsageFlagBits::eTransferDst, {});
+        const std::array<vk::BufferImageCopy, 2> plane_copies{{
+            {0, 0, 0, {vk::ImageAspectFlagBits::eDepth, 0, 0, 1}, {}, {3, 2, 1}},
+            {texels * 4, 0, 0, {vk::ImageAspectFlagBits::eStencil, 0, 0, 1}, {}, {3, 2, 1}}}};
+        const auto check_plane = [&](const char *phase, bool native_clear) {
+          (void)texture_cache.FindDepthTarget(plane_depth_id, plane_depth);
+          texture_cache.GetImage(plane_depth_id).Download(
+              plane_copies, plane_readback.buffer, 0, plane_readback.size);
+          scheduler.Current().Handle().pipelineBarrier2(stencil_dependency);
+          scheduler.Finish();
+          const auto values = ReadBuffer(name, plane_readback, texels + 2);
+          const auto *bytes = reinterpret_cast<const uint8_t *>(values.data() + texels);
+          for (uint32_t i = 0; i < texels; ++i) {
+            Require(name, phase,
+                values[i] == std::bit_cast<uint32_t>(0.625f) &&
+                    bytes[i] == (native_clear ? 0x67 : plane_bytes[plane_offsets[i]]),
+                "stencil acquisition lost bytes or overwrote the independent depth plane");
+          }
+        };
+        check_plane("GPU stencil buffer write", false);
+        write_plane();
+        vk::ClearValue stencil_again{};
+        stencil_again.depthStencil.stencil = 0x67;
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), plane_depth_id,
+            {vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1}, stencil_again);
+        check_plane("consumed stencil dirtiness", true);
+        check_plane("repeated clean stencil acquisition", true);
+        for (uint32_t i = 0; i < texels; ++i) {
+          plane_bytes[plane_offsets[i]] += 0x10;
+        }
+        std::memcpy(reinterpret_cast<void *>(plane_address), plane_words.data(), plane_size);
+        check_plane("CPU stencil plane write", false);
+        std::memcpy(reinterpret_cast<void *>(plane_address), plane_words.data(), plane_size);
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), plane_depth_id,
+            {vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1}, stencil_again);
+        for (uint32_t i = 0; i < texels; ++i) {
+          plane_bytes[plane_offsets[i]] += 0x10;
+        }
+        std::memcpy(reinterpret_cast<void *>(plane_address), plane_words.data(), plane_size);
+        check_plane("CPU stencil write after native clear", false);
+        DestroyBuffer(&plane_readback);
+        DestroyBuffer(&plane_upload);
+        LibKernel::Memory::InstallGpuResources(nullptr);
+      }
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       RenderExecutorTestAccess::DestroyDescriptorPipelines(
