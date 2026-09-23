@@ -9766,7 +9766,7 @@ public:
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
-    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_size = 0x1000000;
     constexpr uint64_t allocation_alignment = 0x10000;
     constexpr uint64_t depth_address = base + 0x40000;
     constexpr uint64_t stencil_address = base + 0x70000;
@@ -10084,18 +10084,39 @@ public:
                 std::end(overwide_mipped_storage.fields),
                 overwide_mipped_storage_descriptor.dwords.begin());
       overwide_mipped_storage_descriptor.dword_count = 8;
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-      ExpectFatal("MipViewPhysicalLayoutChange", [&] {
-        auto linear_view = overwide_mipped_storage_descriptor;
-        linear_view.dwords[3] &= ~(0x1fu << 20u);
-        (void)RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
-                                                       linear_view);
-      });
-#endif
+      // The captured IMAGE_STORE addresses only BASE_LEVEL=1. Including
+      // LAST_LEVEL=4 would shift this four-mip render-target allocation.
+      auto fixed_storage_resource = storage_resource;
+      fixed_storage_resource.numeric_class = Prospero::TextureNumericClass::Float;
+      ShaderRecompiler::IR::DescriptorValue fixed_storage_descriptor{};
+      fixed_storage_descriptor.dwords = {
+          static_cast<uint32_t>((base + 0x300000) >> 8u),
+          0xc4700000u, 0x001fc7ffu, 0x91b41facu,
+          0, 0x00700030u, 0, 0};
+      fixed_storage_descriptor.dword_count = 8;
+      const auto fixed_storage_binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, fixed_storage_resource, fixed_storage_descriptor);
+      Require(name, "fixed storage preserves physical mip layout",
+              fixed_storage_binding.desc.info.resources.levels == 4 &&
+                  fixed_storage_binding.desc.info.data.size == 0xb80000 &&
+                  fixed_storage_binding.desc.info.mip_layout[1].offset == 0x180000 &&
+                  fixed_storage_binding.desc.view_info.base_level == 1 &&
+                  fixed_storage_binding.desc.view_info.level_count == 1 &&
+                  texture_cache.FindTexture(fixed_storage_binding.image_id,
+                                             fixed_storage_binding.desc) != nullptr,
+              "IMAGE_STORE expanded an inaccessible mip and shifted physical storage");
       auto mipped_storage_resource = storage_resource;
       mipped_storage_resource.mip_mode =
           ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
       mipped_storage_resource.mip_count = 3;
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+      ExpectFatal("MipViewPhysicalLayoutChange", [&] {
+        auto linear_view = overwide_mipped_storage_descriptor;
+        linear_view.dwords[3] &= ~(0x1fu << 20u);
+        (void)RenderExecutorTestAccess::ResolveTexture(executor, mipped_storage_resource,
+                                                       linear_view);
+      });
+#endif
       auto sampled_overwide_resource = storage_resource;
       sampled_overwide_resource.resource_class =
           ShaderRecompiler::IR::ImageResourceClass::Sampled;
@@ -10119,10 +10140,10 @@ public:
       auto sampled_overwide_resolved = RenderExecutorTestAccess::ResolveTexture(
           executor, sampled_overwide_resource,
           overwide_mipped_storage_descriptor);
-      const auto tail0 = ReadCachedTexel(name, context, overwide_mipped_storage_binding.image_id);
-      const auto tail3 = ReadCachedTexel(name, context, overwide_mipped_storage_binding.image_id,
+      const auto tail0 = ReadCachedTexel(name, context, sampled_overwide_resolved.image_id);
+      const auto tail3 = ReadCachedTexel(name, context, sampled_overwide_resolved.image_id,
                                         {}, {1, 1, 1}, 0, 3);
-      const auto tail4 = ReadCachedTexel(name, context, overwide_mipped_storage_binding.image_id,
+      const auto tail4 = ReadCachedTexel(name, context, sampled_overwide_resolved.image_id,
                                         {}, {1, 1, 1}, 0, 4);
       Require(name, "expanded tail preserves GPU and backing data",
               tail0 == std::vector<u32>{tail_gpu_value} &&
@@ -10159,15 +10180,13 @@ public:
       mipped_binding.layout = vk::ImageLayout::eGeneral;
       overwide_mipped_binding.layout = vk::ImageLayout::eGeneral;
       sampled_overwide_binding.layout = vk::ImageLayout::eGeneral;
-      auto plain_view_desc = plain_mipped_binding.desc;
-      plain_view_desc.view_info.level_count = 1;
       Require(name, "dynamic storage mip views",
               plain_mipped_binding.desc.view_info.base_level == 1 &&
-                  plain_mipped_binding.desc.view_info.level_count == 3 &&
+                  plain_mipped_binding.desc.view_info.level_count == 1 &&
                   plain_mipped_binding.mip_views.empty() &&
                   plain_mipped_binding.image_view ==
                       texture_cache.FindTexture(plain_mipped_binding.image_id,
-                                                plain_view_desc) &&
+                                                plain_mipped_binding.desc) &&
                   mipped_binding.desc.info.resources.levels == 4 &&
                   mipped_binding.desc.view_info.base_level == 1 &&
                   mipped_binding.desc.view_info.level_count == 3 &&
@@ -10190,13 +10209,13 @@ public:
                   overwide_mipped_storage.MaxMip() == 3 &&
                   overwide_mipped_binding.image_id ==
                       plain_mipped_binding.image_id &&
-                  overwide_mipped_binding.desc.info.resources.levels == 5 &&
+                  overwide_mipped_binding.desc.info.resources.levels == 4 &&
                   overwide_mipped_binding.desc.view_info.base_level == 1 &&
-                  overwide_mipped_binding.desc.view_info.level_count == 4 &&
+                  overwide_mipped_binding.desc.view_info.level_count == 1 &&
                   overwide_mipped_binding.mip_views.empty() &&
                   overwide_mipped_binding.image_view ==
                       plain_mipped_binding.image_view,
-              "fixed storage view lost addressable mips in the allocated tail");
+              "fixed storage view included mips that IMAGE_STORE cannot address");
       Require(name, "over-wide sampled mip view",
               sampled_overwide_binding.image_id ==
                       plain_mipped_binding.image_id &&
