@@ -701,7 +701,7 @@ void TestGuardedDirectImageTable() {
 
 void TestImageDescriptorFields() {
   constexpr std::array<std::pair<uint32_t, uint32_t>, 5> reserved{
-      {{1u, 0x20000000u}, {2u, 0xf0003000u}, {4u, 0xe000e000u},
+      {{1u, 0x20000000u}, {2u, 0x70003000u}, {4u, 0xe000e000u},
        {5u, 0xf9000000u}, {6u, 0x00007b00u}}};
   for (const bool r128 : {false, true}) {
     Fixture fixture;
@@ -735,6 +735,14 @@ void TestImageDescriptorFields() {
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
               snapshot.images[0].dwords == user_data,
           "valid texture descriptor was rejected");
+    const auto valid_descriptor = user_data;
+    // Keep RESOURCE_LEVEL set in this valid texture descriptor.
+    user_data = {0x0208a200u, 0xca900000u, 0x800fc00fu, 0x90960facu,
+                 0u, 0x60u, 0u, 0u};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images[0].dwords == user_data,
+          "instruction-ready texture descriptor lost RESOURCE_LEVEL or became null");
+    user_data = valid_descriptor;
     for (const auto [word, mask] : reserved) {
       for (uint32_t bits = mask; bits != 0u; bits &= bits - 1u) {
         const auto bit = bits & (0u - bits);

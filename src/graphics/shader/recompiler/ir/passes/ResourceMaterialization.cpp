@@ -64,7 +64,7 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) {
 	const auto& words = descriptor.dwords;
 	// Reject texture descriptors with nonzero reserved bits.
-	if ((words[1] & 0x20000000u) != 0u || (words[2] & 0xf0003000u) != 0u ||
+	if ((words[1] & 0x20000000u) != 0u || (words[2] & 0x70003000u) != 0u ||
 	    (!r128 && ((words[4] & 0xe000e000u) != 0u || (words[5] & 0xf9000000u) != 0u ||
 	               (words[6] & 0x00007b00u) != 0u))) {
 		return false;
