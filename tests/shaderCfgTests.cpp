@@ -9885,6 +9885,7 @@ void TestMeshInputAssembly() {
     uint32_t capacity, count, group, lane, width, address_low, base_vertex;
     uint32_t wave_info, first, second, third, byte_offset, vertex_id;
     bool fetch;
+    uint32_t wave_size = 64;
   };
   const Case cases[] = {
       {Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, UINT32_MAX,
@@ -9931,11 +9932,14 @@ void TestMeshInputAssembly() {
        0x40000c0c, 1, 0, 0, 52, 0xabcd0128, true},
       {Prospero::PrimitiveType::kPointList, 12, 265, 1, 64, 4, 0x1000, 0,
        0x41000000, 64, 0, 0, 304, 0, false},
+      {Prospero::PrimitiveType::kTriStrip, 40, 40, 0, 32, 0, 0, 11,
+       0x81000608, 32, 33, 34, 0, 43, false, 32},
   };
   for (const auto &test : cases) {
     ShaderVertexInputInfo input{};
     auto &mesh = input.mesh;
     mesh.input_primitive = static_cast<uint32_t>(test.topology);
+    mesh.wave_size = test.wave_size;
     mesh.primitives_per_group = mesh.InputPrimitiveCount(test.capacity);
     mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
     mesh.threads_num[0] = 256;
@@ -9949,7 +9953,7 @@ void TestMeshInputAssembly() {
     graph.entry_block = 0;
     Frontend::TranslateOptions options{};
     options.stage = ShaderType::Mesh;
-    options.wave_size = 64;
+    options.wave_size = test.wave_size;
     options.user_data_count = 0;
     options.input_info.vertex = &input;
     auto program = Frontend::TranslateProgram(decoded, graph, options);
