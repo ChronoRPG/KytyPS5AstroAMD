@@ -22783,6 +22783,31 @@ TestCase BranchVccnzUsesWaveMask() {
   return test;
 }
 
+TestCase ScalarMemRealtimeCapturedPlaceholder() {
+  using O = ShaderOpcode;
+  namespace D = ShaderRecompiler::Decoder;
+
+  std::vector<u32> code = {0xf4940300u, 0xfa000000u};
+  D::Instruction decoded;
+  D::DecodeInstruction(code, 0, decoded);
+  Require("ScalarMemRealtimeCapturedPlaceholder", "decode",
+          decoded.opcode == O::S_MEMREALTIME && decoded.word_count == 2 &&
+              decoded.dst.kind == D::OperandKind::Sgpr && decoded.dst.reg == 12 &&
+              decoded.data_dwords == 2 && decoded.src_count == 0 &&
+              decoded.src0.kind == D::OperandKind::Unknown &&
+              decoded.src1.kind == D::OperandKind::Unknown,
+          "captured clock instruction must write s12:s13 without memory operands");
+  AppendStoreSgprPair(&code, 12, 0);
+  code.insert(code.end(), {0xf4940300u, 0xfa000000u});
+  AppendStoreSgprPair(&code, 12, 2);
+  AppendEnd(&code);
+  return {"ScalarMemRealtimeCapturedPlaceholder",
+          code,
+          {},
+          {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX},
+          {O::S_MEMREALTIME, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase ScalarMemoryLoadVariants() {
   using O = ShaderOpcode;
 
@@ -28436,6 +28461,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(SharedReturnKeepsSelectedValues);
   AddCase(BranchVccnzUsesWaveMask);
   AddCase(BranchVccnzUsesCarryProducedWaveMask);
+  AddCase(ScalarMemRealtimeCapturedPlaceholder);
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
@@ -33172,6 +33198,11 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarMemRealtimeCapturedPlaceholder());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());
