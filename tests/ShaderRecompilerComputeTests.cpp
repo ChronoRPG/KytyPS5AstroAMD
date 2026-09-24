@@ -25991,6 +25991,76 @@ TestCase Wave64AppendConsumeHighHalf() {
   return test;
 }
 
+TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false) {
+  using O = ShaderOpcode;
+  constexpr u32 groups = 31;
+  TestCase test;
+  test.name = dlc_only ? "BufferWorkgroupPublicationDlc"
+             : wave_size == 64 ? "BufferWorkgroupPublicationWave64"
+                               : "BufferWorkgroupPublicationWave32";
+  auto &code = test.code;
+  // Allocate work in execution order so every polled predecessor has started.
+  // Only one lane per workgroup owns a ticket and publishes its prefix total.
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(1)));
+  AppendVMovU32(&code, 1, 1);
+  AppendVMovU32(&code, 20, 0);
+  AppendBufferStoreOpcode(&code, 0x32, 1, 20, true);
+  code.push_back(EncodeVop1(0x02, 20, Vgpr(1)));
+  code.push_back(EncodeVop2(0x1a, 20, InlineU32(2), 1));
+  AppendVMovU32(&code, 2, 0);
+  code.push_back(EncodeSMovB32(21, InlineU32(0)));
+  AppendSMovLiteral(&code, 22, 1000000);
+  code.push_back(EncodeSopc(0x06, 20, InlineU32(0)));
+  const auto first_ticket = code.size();
+  code.push_back(0);
+
+  const auto poll = code.size();
+  code.push_back(EncodeMubuf0(0x0c, 0, false, true, !dlc_only) | (1u << 15u));
+  code.push_back(EncodeMubuf1(2, 12, 20));
+  code.push_back(EncodeSopp(0x0c, 0)); // S_WAITCNT vmcnt(0).
+  code.push_back(EncodeVop1(0x02, 23, Vgpr(2)));
+  code.push_back(EncodeSopc(0x07, 23, InlineU32(0)));
+  const auto ready = code.size();
+  code.push_back(0);
+  code.push_back(EncodeSop2(0x00, 21, 21, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 21, 22));
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(poll - code.size() - 1)));
+  // A broken poll reports an incorrect result instead of hanging the test GPU.
+  AppendVMovLiteral(&code, 2, 0x80000000u);
+  const auto publish = code.size();
+  code[first_ticket] = EncodeSopp(0x05, publish - first_ticket - 1);
+  code[ready] = EncodeSopp(0x05, publish - ready - 1);
+  code.push_back(EncodeVop2(0x25, 2, Vgpr(1), 2));
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 2));
+  code.push_back(EncodeVop2(0x25, 20, InlineU32(4), 20));
+  // RDNA2 stores publish to L2 even without GLC/DLC on the producer.
+  AppendBufferStoreDword(&code, 2, 20);
+  AppendEnd(&code);
+
+  test.initial.assign(groups + 1, 0);
+  test.expected = {groups};
+  for (u32 ticket = 0; ticket < groups; ++ticket) {
+    test.expected.push_back((ticket + 1) * (ticket + 2) / 2);
+  }
+  test.opcodes = {O::S_MOV_B64, O::S_MOV_B32, O::V_MOV_B32,
+                  O::BUFFER_ATOMIC_ADD, O::V_READFIRSTLANE_B32,
+                  O::V_LSHLREV_B32, O::S_CMP_EQ_U32, O::S_CMP_LG_U32,
+                  O::S_CMP_LT_U32, O::S_CBRANCH_SCC1, O::S_ADD_U32,
+                  O::S_WAITCNT, O::BUFFER_LOAD_DWORD, O::V_ADD_NC_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"Coherent", "Volatile", "OpAtomicIAdd", "OpLoopMerge"};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.dispatch_x = groups;
+  // DLC alone does not bypass RDNA2's L0, so only check its translated policy.
+  test.compile_only = dlc_only;
+  return test;
+}
+
 TestCase BufferAtomicVariants() {
   using O = ShaderOpcode;
 
@@ -28351,6 +28421,9 @@ std::vector<TestCase> MakeCases() {
   auto AddCase = [&cases](TestCase (*factory)()) {
     cases.push_back(factory());
   };
+  cases.push_back(BufferWorkgroupPublication(32));
+  cases.push_back(BufferWorkgroupPublication(64));
+  cases.push_back(BufferWorkgroupPublication(32, true));
 
   AddCase(IntegerAddSubMul);
   AddCase(BitwiseOps);
@@ -33477,6 +33550,14 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--shader-data-storage-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferOffsetsUsePackedLaneAndStorageFallback());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-publication-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferWorkgroupPublication(32));
+    RunCase(&vulkan, BufferWorkgroupPublication(64));
+    RunCase(&vulkan, BufferWorkgroupPublication(32, true));
+    RunCase(&vulkan, BufferAtomicVariants());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cmpswap-only") == 0) {

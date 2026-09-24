@@ -67,6 +67,7 @@ struct MemoryInfo {
 	bool                    image_r128                                            = false;
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
+	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
