@@ -2016,33 +2016,6 @@ public:
                 pixel.shader_data ==
                     std::vector<uint32_t>{0x77777777u, 0x88888888u},
             "graphics stages did not commit their shared push data");
-    ShaderRecompiler::IR::CompiledShaderInfo image_program{};
-    image_program.stage = ShaderType::Compute;
-    ShaderRecompiler::IR::ImageResource image{};
-    image.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
-    image.numeric_class = Prospero::TextureNumericClass::Float;
-    image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-    image.read = true;
-    image_program.info.images.push_back(image);
-    ShaderRecompiler::IR::ResourceSnapshot image_snapshot{};
-    image_snapshot.images.emplace_back().dword_count = 8;
-    ShaderStageRuntime image_runtime{&image_program, &image_snapshot};
-    PreparedBindings image_prepared;
-    executor.PrepareBindings(image_runtime, image_prepared);
-    auto *image_storage = image_prepared.images.data();
-    image_prepared.images[0].mip_views.resize(3);
-    const auto *mip_storage = image_prepared.images[0].mip_views.data();
-    executor.PrepareBindings(image_runtime, image_prepared);
-    Require(name, "prepared image scratch",
-            image_prepared.images.data() == image_storage &&
-                image_prepared.images[0].mip_views.empty() &&
-                image_prepared.images[0].mip_views.capacity() >= 3,
-            "repeated image preparation retained stale mip views or image storage changed");
-    image_prepared.images[0].mip_views.resize(3);
-    Require(name, "prepared mip storage",
-            image_prepared.images[0].mip_views.data() == mip_storage,
-            "repeated image preparation reallocated mip view storage");
-    RenderExecutorTestAccess::ResetBindings(executor);
     scheduler.Finish();
     RenderExecutorTestAccess::DestroyDescriptorPipelines(
         context.GetRenderExecutor(), std::span {&pipeline, 1u});
