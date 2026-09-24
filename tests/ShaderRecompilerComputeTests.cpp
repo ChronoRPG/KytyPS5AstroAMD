@@ -23706,6 +23706,38 @@ TestCase BufferStoreFormatXResource16UintPreservesAdjacentLanes() {
   return test;
 }
 
+TestCase BufferStoreFormatXyzwFloat16ConvertsComponents() {
+  using O = ShaderOpcode;
+
+  // This finite F32 has low bits 0x7e63, which form an F16 NaN if truncated.
+  constexpr std::array<float, 8> values = {
+      std::bit_cast<float>(0x3f807e63u), -2.0f, 0.5f, 0.25f,
+      -4.0f, 3.0f, 0.0f, 2.0f};
+  std::vector<u32> code;
+  for (u32 record = 0; record < 2; record++) {
+    for (u32 component = 0; component < 4; component++) {
+      AppendVMovLiteral(&code, component,
+                        std::bit_cast<u32>(values[record * 4 + component]));
+    }
+    AppendVMovU32(&code, 20, record);
+    code.push_back(EncodeMubuf0(0x07u, 0, true, false));
+    code.push_back(EncodeMubuf1(0, 0, 20));
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzwFloat16ConvertsComponents";
+  test.code = std::move(code);
+  test.initial = std::vector<u32>(4, 0xdeadbeefu);
+  test.expected = {0xc0003c04u, 0x34003800u, 0x4200c400u, 0x40000000u};
+  test.user_data = MakeStructuredStorageBufferData(
+      8, 2, false, BufferFormat(Prospero::BufferFormat::k16_16_16_16Float));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
+  test.required_spirv = {"PackHalf2x16"};
+  return test;
+}
+
 TestCase BufferStoreFormatXyzwSnorm16CapturedSkinningVectors() {
   using O = ShaderOpcode;
 
@@ -28430,6 +28462,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferFormatStoreVariants);
   AddCase(BufferStoreFormatXResource16UintWritesHalfword);
   AddCase(BufferStoreFormatXResource16UintPreservesAdjacentLanes);
+  AddCase(BufferStoreFormatXyzwFloat16ConvertsComponents);
   AddCase(BufferStoreFormatXyzwSnorm16CapturedSkinningVectors);
   AddCase(BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords);
   AddCase(BufferLoadFormatXResource8UintZeroExtendsByte);
@@ -33156,6 +33189,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferStoreFormatXyzwDropsPartialRecord());
     RunCase(&vulkan, BufferStoreFormatXChecksOnlyTransferredComponent());
     RunCase(&vulkan, BufferFormatStoreVariants());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-float16-store-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferStoreFormatXyzwFloat16ConvertsComponents());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--s-ashr-i64-only") == 0) {
