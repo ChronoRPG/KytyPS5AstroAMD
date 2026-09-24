@@ -19018,6 +19018,52 @@ TestCase Vop2SdwaAshrrevCapturedWord0SignExtends() {
   return test;
 }
 
+TestCase Vop2SdwaMaxI32CapturedHighWord(u32 wave_size) {
+  using O = ShaderOpcode;
+  struct MaxCase { u32 lhs, packed_rhs, expected, exec = 1; };
+  constexpr std::array<MaxCase, 9> cases{{
+      {0xfffffffbu, 0xfffe1234u, 0xfffffffeu}, // -5 versus sign-extended -2.
+      {0xffffffffu, 0x80007fffu, 0xffffffffu},
+      {3, 0x0007ffffu, 7},                  // Ignore the low word.
+      {0xffffffffu, 0x0000ffffu, 0},
+      {0x80000000u, 0x80000000u, 0xffff8000u},
+      {0x7fffffffu, 0x8000ffffu, 0x7fffffffu},
+      {0x0000ffffu, 0x7fffffffu, 0x0000ffffu}, // Source 0 stays 32-bit.
+      {0x00007fffu, 0x7fff8000u, 0x00007fffu},
+      {0x80000001u, 0x7fff0123u, 0x80000001u, 0}, // Inactive destination.
+  }};
+  TestCase test;
+  test.name = wave_size == 64 ? "Vop2SdwaMaxI32HighWordWave64"
+                             : "Vop2SdwaMaxI32HighWordWave32";
+  for (const auto &entry : cases) {
+    test.initial.insert(test.initial.end(), {entry.lhs, entry.packed_rhs});
+  }
+  test.initial.resize(cases.size() * 3u, 0xdeadbeefu);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    AppendVMovU32(&code, 30, i * 8u);
+    AppendBufferLoadDword(&code, 11, 30);
+    AppendVMovU32(&code, 30, i * 8u + 4u);
+    AppendBufferLoadDword(&code, 22, 30);
+    code.push_back(EncodeSMovB32(126, InlineU32(cases[i].exec)));
+    // Exact game encoding: v11 = max(v11, sign_extend(v22.word1)).
+    code.insert(code.end(), {0x24162cf9u, 0x0d06060bu});
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    const u32 out = cases.size() * 2u + i;
+    AppendStoreVgpr(&code, 11, out);
+    test.expected[out] = cases[i].expected;
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_MAX_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MAX_I32 v11, v11, v22.sdwa(sel=5,sext=1)", cases.size()}};
+  test.required_spirv = {"OpBitFieldSExtract"};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase Vop2SdwaLshrrevCapturedByte1Source() {
   using O = ShaderOpcode;
 
@@ -28370,6 +28416,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaSubNcExactByte2Destination);
   AddCase(Vop2SdwaAddNcCapturedHighWordDestination);
   AddCase(Vop2SdwaAshrrevCapturedWord0SignExtends);
+  cases.push_back(Vop2SdwaMaxI32CapturedHighWord(32));
+  cases.push_back(Vop2SdwaMaxI32CapturedHighWord(64));
   AddCase(Vop2SdwaLshrrevCapturedByte1Source);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
@@ -33488,6 +33536,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-ashr-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop2SdwaAshrrevCapturedWord0SignExtends());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sdwa-max-i32-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop2SdwaMaxI32CapturedHighWord(32));
+    RunCase(&vulkan, Vop2SdwaMaxI32CapturedHighWord(64));
+    RunCase(&vulkan, VectorIntegerOps());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-addc-only") == 0) {
