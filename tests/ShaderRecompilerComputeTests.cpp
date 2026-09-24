@@ -408,10 +408,11 @@ struct RenderExecutorTestAccess {
                                       const ShaderStageRuntime &pixel,
                                       bool pixel_active) {
     RenderExecutor::GraphicsBindings result;
-    result.vertex[0] = executor.PrepareBindings(vertex);
+    executor.PrepareBindings(vertex, result.vertex[0]);
     std::array<PreparedBindings *, 2> stages{&result.vertex[0], nullptr};
     if (pixel_active) {
-      result.pixel.emplace(executor.PrepareBindings(pixel));
+      result.pixel.emplace();
+      executor.PrepareBindings(pixel, *result.pixel);
       stages[1] = &*result.pixel;
     }
     executor.PrepareGraphicsBindings(
@@ -1983,17 +1984,65 @@ public:
     ShaderRecompiler::IR::ResourceSnapshot pixel_snapshot;
     pixel_snapshot.user_data = {0x33333333u, 0x44444444u};
     ShaderStageRuntime pixel_runtime{&pixel_program, &pixel_snapshot};
-    auto vertex = context.GetRenderExecutor().PrepareBindings(vertex_runtime);
-    auto pixel = context.GetRenderExecutor().PrepareBindings(pixel_runtime);
+    PreparedBindings vertex;
+    PreparedBindings pixel;
+    auto &executor = context.GetRenderExecutor();
+    executor.PrepareBindings(vertex_runtime, vertex);
+    executor.PrepareBindings(pixel_runtime, pixel);
+    const auto *vertex_storage = vertex.shader_data.data();
+    const auto *pixel_storage = pixel.shader_data.data();
+    vertex.buffer_sources.push_back({});
+    vertex.buffers.push_back({});
+    vertex.gds.offset = 1;
+    vertex.flattened_srt.offset = 1;
+    vertex.shader_data_buffer.offset = 1;
+    vertex_snapshot.user_data = {0x55555555u, 0x66666666u};
+    pixel_snapshot.user_data = {0x77777777u, 0x88888888u};
+    executor.PrepareBindings(vertex_runtime, vertex);
+    executor.PrepareBindings(pixel_runtime, pixel);
+    Require(name, "prepared binding scratch",
+            vertex.shader_data.data() == vertex_storage &&
+                pixel.shader_data.data() == pixel_storage &&
+                vertex.buffer_sources.empty() && vertex.buffers.empty() &&
+                vertex.gds.offset == 0 && vertex.flattened_srt.offset == 0 &&
+                vertex.shader_data_buffer.offset == 0,
+            "repeated shader binding preparation allocated or retained stale state");
 
     const auto pipeline = RenderExecutorTestAccess::CommitBindings(
         context.GetRenderExecutor(), scheduler.Current(), vertex, pixel);
     Require(name, "shared push data",
             vertex.shader_data ==
-                    std::vector<uint32_t>{0x11111111u, 0x22222222u} &&
+                    std::vector<uint32_t>{0x55555555u, 0x66666666u} &&
                 pixel.shader_data ==
-                    std::vector<uint32_t>{0x33333333u, 0x44444444u},
+                    std::vector<uint32_t>{0x77777777u, 0x88888888u},
             "graphics stages did not commit their shared push data");
+    ShaderRecompiler::IR::CompiledShaderInfo image_program{};
+    image_program.stage = ShaderType::Compute;
+    ShaderRecompiler::IR::ImageResource image{};
+    image.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+    image.numeric_class = Prospero::TextureNumericClass::Float;
+    image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    image.read = true;
+    image_program.info.images.push_back(image);
+    ShaderRecompiler::IR::ResourceSnapshot image_snapshot{};
+    image_snapshot.images.emplace_back().dword_count = 8;
+    ShaderStageRuntime image_runtime{&image_program, &image_snapshot};
+    PreparedBindings image_prepared;
+    executor.PrepareBindings(image_runtime, image_prepared);
+    auto *image_storage = image_prepared.images.data();
+    image_prepared.images[0].mip_views.resize(3);
+    const auto *mip_storage = image_prepared.images[0].mip_views.data();
+    executor.PrepareBindings(image_runtime, image_prepared);
+    Require(name, "prepared image scratch",
+            image_prepared.images.data() == image_storage &&
+                image_prepared.images[0].mip_views.empty() &&
+                image_prepared.images[0].mip_views.capacity() >= 3,
+            "repeated image preparation retained stale mip views or image storage changed");
+    image_prepared.images[0].mip_views.resize(3);
+    Require(name, "prepared mip storage",
+            image_prepared.images[0].mip_views.data() == mip_storage,
+            "repeated image preparation reallocated mip view storage");
+    RenderExecutorTestAccess::ResetBindings(executor);
     scheduler.Finish();
     RenderExecutorTestAccess::DestroyDescriptorPipelines(
         context.GetRenderExecutor(), std::span {&pipeline, 1u});
@@ -10092,7 +10141,8 @@ public:
         std::memcpy(value.dwords.data(), buffer_descriptor.fields,
                     sizeof(buffer_descriptor.fields));
         value.dword_count = 4;
-        auto buffer_bindings = executor.PrepareBindings(buffer_runtime);
+        PreparedBindings buffer_bindings;
+        executor.PrepareBindings(buffer_runtime, buffer_bindings);
         executor.FindBuffers(buffer_bindings);
         const auto original_id = buffer_bindings.buffer_sources[0].id;
 
@@ -10159,7 +10209,8 @@ public:
       null_info.info = std::move(null_program.info);
       null_info.bindings = std::move(null_program.bindings);
       ShaderStageRuntime null_runtime{&null_info, &null_snapshot};
-      auto null_bindings = executor.PrepareBindings(null_runtime);
+      PreparedBindings null_bindings;
+      executor.PrepareBindings(null_runtime, null_bindings);
       executor.RebindImages(null_bindings);
       Require(name, "null descriptor count",
               null_bindings.images.size() == 3,
@@ -10421,6 +10472,19 @@ public:
                   sampled_overwide_binding.mip_views.empty() &&
                   sampled_overwide_binding.image_view != nullptr,
               "sampled view lost addressable mips in the allocated tail");
+      const auto *image_storage = mipped_prepared.images.data();
+      const auto *mip_storage = mipped_prepared.images[1].mip_views.data();
+      executor.PrepareBindings(mipped_runtime, mipped_prepared);
+      Require(name, "prepared mip scratch",
+              mipped_prepared.images.data() == image_storage &&
+                  mipped_prepared.images[1].mip_views.empty() &&
+                  mipped_prepared.images[1].mip_views.capacity() >= 3,
+              "repeated image preparation retained stale mip views or reallocated scratch");
+      executor.RebindImages(mipped_prepared);
+      Require(name, "prepared mip views rebound",
+              mipped_prepared.images[1].mip_views.size() == 3 &&
+                  mipped_prepared.images[1].mip_views.data() == mip_storage,
+              "reused image scratch did not rebuild dynamic storage mip views");
       // Streaming T# clamps apply after S# max LOD, without changing the view
       // base.
       {
@@ -10665,7 +10729,8 @@ public:
       storage_info.info = std::move(storage_program.info);
       storage_info.bindings = std::move(storage_program.bindings);
       ShaderStageRuntime storage_runtime{&storage_info, &storage_snapshot};
-      auto storage_discovery = executor.PrepareBindings(storage_runtime);
+      PreparedBindings storage_discovery;
+      executor.PrepareBindings(storage_runtime, storage_discovery);
       const auto storage_id = storage_discovery.images[0].image_id;
       Require(name, "storage prefetch purity",
               storage_discovery.images[0].image_view == nullptr &&
@@ -11798,7 +11863,8 @@ public:
       array_snapshot.images.push_back(array_descriptor);
       ShaderStageRuntime array_runtime{&array_program, &array_snapshot};
 
-      auto array_binding = executor.PrepareBindings(array_runtime);
+      PreparedBindings array_binding;
+      executor.PrepareBindings(array_runtime, array_binding);
       executor.RebindImages(array_binding);
       const auto expanded_array_id = array_binding.images[0].image_id;
       const auto &expanded_array = texture_cache.GetImage(expanded_array_id);
@@ -11886,7 +11952,8 @@ public:
         auto &value = buffer_snapshot.buffers.emplace_back();
         std::memcpy(value.dwords.data(), descriptor.fields, sizeof(descriptor.fields));
         value.dword_count = 4;
-        auto buffer_bindings = executor.PrepareBindings(buffer_runtime);
+        PreparedBindings buffer_bindings;
+        executor.PrepareBindings(buffer_runtime, buffer_bindings);
         std::array stages{&buffer_bindings};
         RenderColorInfo target{};
         target.desc = array_target;
@@ -11971,8 +12038,8 @@ public:
       colliding_msaa_snapshot.images.push_back(colliding_msaa_descriptor);
       ShaderStageRuntime colliding_msaa_runtime{
           &colliding_msaa_program, &colliding_msaa_snapshot};
-      auto colliding_msaa_binding =
-          executor.PrepareBindings(colliding_msaa_runtime);
+      PreparedBindings colliding_msaa_binding;
+      executor.PrepareBindings(colliding_msaa_runtime, colliding_msaa_binding);
       executor.RebindImages(colliding_msaa_binding);
       const auto &resolved_colliding_msaa =
           colliding_msaa_binding.images[0];
@@ -12030,7 +12097,8 @@ public:
       ShaderRecompiler::IR::ResourceSnapshot msaa_snapshot{};
       msaa_snapshot.images.push_back(msaa_descriptor);
       ShaderStageRuntime msaa_runtime{&msaa_program, &msaa_snapshot};
-      auto msaa_binding = executor.PrepareBindings(msaa_runtime);
+      PreparedBindings msaa_binding;
+      executor.PrepareBindings(msaa_runtime, msaa_binding);
       executor.RebindImages(msaa_binding);
       const auto &resolved_msaa = msaa_binding.images[0];
       Require(
@@ -12069,7 +12137,8 @@ public:
       ShaderRecompiler::IR::ResourceSnapshot msaa_array_snapshot{};
       msaa_array_snapshot.images.push_back(msaa_array_descriptor);
       ShaderStageRuntime msaa_array_runtime{&msaa_array_program, &msaa_array_snapshot};
-      auto msaa_array_binding = executor.PrepareBindings(msaa_array_runtime);
+      PreparedBindings msaa_array_binding;
+      executor.PrepareBindings(msaa_array_runtime, msaa_array_binding);
       executor.RebindImages(msaa_array_binding);
       const auto &resolved_msaa_array = msaa_array_binding.images[0];
       Require(name, "MSAA array backing expansion",
@@ -12333,7 +12402,8 @@ public:
       snapshot.images.push_back(descriptor);
       ShaderStageRuntime runtime{&program, &snapshot};
 
-      auto prepared = context.GetRenderExecutor().PrepareBindings(runtime);
+      PreparedBindings prepared;
+      context.GetRenderExecutor().PrepareBindings(runtime, prepared);
       const auto sampled_stencil_id = prepared.images[0].image_id;
       Require(name, "first stencil discovery",
               prepared.images.size() == 1 &&
@@ -12365,7 +12435,8 @@ public:
               "at the stencil guest address");
       RenderExecutorTestAccess::ResetBindings(executor);
 
-      auto redirected = context.GetRenderExecutor().PrepareBindings(runtime);
+      PreparedBindings redirected;
+      context.GetRenderExecutor().PrepareBindings(runtime, redirected);
       Require(name, "redirected owner discovery",
               redirected.images.size() == 1 &&
                   redirected.images[0].image_id == depth_id &&
@@ -12555,7 +12626,8 @@ public:
                     sizeof(plane_descriptor.fields));
         plane_value.dword_count = 4;
         const ShaderStageRuntime plane_runtime{&plane_program, &plane_snapshot};
-        auto plane_bindings = executor.PrepareBindings(plane_runtime);
+        PreparedBindings plane_bindings;
+        executor.PrepareBindings(plane_runtime, plane_bindings);
         vk::MemoryBarrier2 plane_barrier{};
         plane_barrier.srcStageMask = plane_barrier.dstStageMask =
             vk::PipelineStageFlagBits2::eAllCommands;
