@@ -23196,7 +23196,7 @@ TestCase BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail() {
   return test;
 }
 
-TestCase BufferLoadsGpuSelectedDescriptors() {
+TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
   struct DescriptorCase {
@@ -23206,6 +23206,8 @@ TestCase BufferLoadsGpuSelectedDescriptors() {
   };
   const DescriptorCase cases[] = {
       {24, 2, 0, 0, false, true, {7, 8, 9, 10, 11, 12}},
+      // PPSA01417 selects XYZ vertices from a table of stride-16 descriptors.
+      {16, 2, 0, 0, false, true, {5, 6, 7, 8, 0, 0}},
       {12, 2, 0, 0, false, true, {4, 5, 6, 0, 0, 0}},
       {12, 2, 1, 0, false, true, {4, 5, 6, 7, 8, 9}},
       {12, 1, 2, 0, false, true, {4, 5, 6, 7, 8, 9}},
@@ -23219,7 +23221,8 @@ TestCase BufferLoadsGpuSelectedDescriptors() {
       {12, 4, 3, 4, true, true, {}},
   };
   TestCase test;
-  test.name = "BufferLoadsGpuSelectedDescriptors";
+  test.name = xyz ? "BufferLoadDwordx3GpuSelectedDescriptors"
+                  : "BufferLoadsGpuSelectedDescriptors";
   test.initial.resize(2048);
   for (u32 i = 0; i < std::size(cases); ++i) {
     const auto &input = cases[i];
@@ -23245,10 +23248,10 @@ TestCase BufferLoadsGpuSelectedDescriptors() {
     test.code.push_back(EncodeSmem1(520, 20));
     AppendSMovLiteral(&test.code, 22, cases[selected].soffset);
     AppendVMovU32(&test.code, 21, 1);
-    test.code.push_back(EncodeMubuf0(0x0e, 0, true, false));
+    test.code.push_back(EncodeMubuf0(xyz ? 0x0f : 0x0e, 0, true, false));
     test.code.push_back(EncodeMubuf1(0, 2, 21, 22));
-    test.code.push_back(EncodeMubuf0(0x0d, 16, true, false));
-    test.code.push_back(EncodeMubuf1(4, 2, 21, 22));
+    test.code.push_back(EncodeMubuf0(xyz ? 0x0f : 0x0d, xyz ? 12 : 16, true, false));
+    test.code.push_back(EncodeMubuf1(xyz ? 3 : 4, 2, 21, 22));
     for (u32 component = 0; component < 6; ++component) {
       AppendStoreVgpr(&test.code, component, i * 6 + component);
       const u32 expected = cases[selected].expected[component];
@@ -23259,10 +23262,22 @@ TestCase BufferLoadsGpuSelectedDescriptors() {
   test.bda_mappings = {{GuestBase, 0}};
   test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
                   O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
-                  O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX2,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  if (xyz) {
+    test.opcodes.push_back(O::BUFFER_LOAD_DWORDX3);
+  } else {
+    test.opcodes.insert(test.opcodes.end(), {O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX2});
+  }
   test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
   return test;
+}
+
+TestCase BufferLoadsGpuSelectedDescriptors() {
+  return BufferLoadsGpuSelectedDescriptors(false);
+}
+
+TestCase BufferLoadDwordx3GpuSelectedDescriptors() {
+  return BufferLoadsGpuSelectedDescriptors(true);
 }
 
 TestCase BufferStoreDwordx4DropsOnlyOutOfBoundsTail() {
@@ -28479,6 +28494,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx4SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
   AddCase(BufferLoadsGpuSelectedDescriptors);
+  AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
@@ -33307,6 +33323,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--indirect-buffer-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadDwordx3GpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());
     RunCase(&vulkan, BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail());
     RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());
