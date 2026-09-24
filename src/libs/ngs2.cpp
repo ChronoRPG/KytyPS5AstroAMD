@@ -1244,6 +1244,34 @@ static void Ngs2ApplyEvent(Ngs2VoiceInternal& voice) {
 	voice.event = Ngs2VoicePlayEvent::None;
 }
 
+static void Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
+	const auto& block = voice.blocks.front();
+	struct CallbackInfo {
+		uintptr_t   data, voice;
+		uint32_t    flag, reserved;
+		uintptr_t   user;
+		const void* block_data;
+		size_t      size;
+		uint32_t    repeats, attributes;
+	} info {voice.callback_data,
+	        reinterpret_cast<uintptr_t>(&voice),
+	        1,
+	        0,
+	        block.info.user_data,
+	        block.data,
+	        block.info.data_size,
+	        0,
+	        0};
+	static_assert(sizeof(CallbackInfo) == 56);
+	voice.blocks.pop_front();
+	if (voice.blocks.empty() && !voice.accepts_blocks) {
+		voice.state = Ngs2VoicePlayState::Empty;
+	}
+	if (voice.callback != 0 && (voice.callback_flags & 1u) != 0) {
+		reinterpret_cast<void KYTY_SYSV_ABI (*)(const CallbackInfo*)>(voice.callback)(&info);
+	}
+}
+
 static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 	uint32_t output = 0;
 	while (output < grain && !voice.blocks.empty()) {
@@ -1287,31 +1315,7 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 		output += count;
 		block.cursor += count;
 		if (block.cursor == block.info.num_samples) {
-			struct CallbackInfo {
-				uintptr_t   data, voice;
-				uint32_t    flag, reserved;
-				uintptr_t   user;
-				const void* block_data;
-				size_t      size;
-				uint32_t    repeats, attributes;
-			} info {voice.callback_data,
-			        reinterpret_cast<uintptr_t>(&voice),
-			        1,
-			        0,
-			        block.info.user_data,
-			        block.data,
-			        block.info.data_size,
-			        0,
-			        0};
-			static_assert(sizeof(CallbackInfo) == 56);
-			voice.blocks.pop_front();
-			if (voice.blocks.empty() && !voice.accepts_blocks) {
-				voice.state = Ngs2VoicePlayState::Empty;
-			}
-			if (voice.callback != 0 && (voice.callback_flags & 1u) != 0) {
-				reinterpret_cast<void KYTY_SYSV_ABI (*)(const CallbackInfo*)>(voice.callback)(
-				    &info);
-			}
+			Ngs2FinishBlock(voice);
 		}
 	}
 	voice.has_samples = output != 0;
