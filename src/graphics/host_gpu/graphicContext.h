@@ -34,6 +34,11 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
+	// Native indirect draws (vkCmdDraw*Indirect*). Each form is used only when enabled here.
+	bool                               draw_indirect_first_instance_enabled  = false;
+	bool                               multi_draw_indirect_enabled           = false;
+	bool                               draw_indirect_count_enabled           = false;
+	bool                               index_type_uint8_enabled              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

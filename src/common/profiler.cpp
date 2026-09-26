@@ -120,6 +120,9 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.NativeOcclusionReductions.Cumulative",
     "FrameEvent.MeshRestartMarkers.Cumulative",
     "FrameEvent.MeshRestartSegments.Cumulative",
+    "FrameEvent.DrawIndirectNative.Cumulative",
+    "FrameEvent.DrawIndirectFallback.Cumulative",
+    "FrameEvent.DrawIndirectInstanceReads.Cumulative",
     "FrameEvent.GpuTimingDropped.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");

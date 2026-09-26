@@ -662,6 +662,9 @@ struct DrawEmitInfo {
 	int32_t  vertex_offset = 0;
 	uint32_t first_vertex  = 0;
 	uint32_t first_instance = 0;
+	// Non-null: counts and offsets are GPU data in these records, emitted with
+	// vkCmdDraw*Indirect*; the fields above are unused.
+	const DrawIndirectSource* indirect = nullptr;
 };
 
 struct DrawIndexBufferSource {
@@ -677,6 +680,110 @@ struct PreparedIndexBuffer {
 	vk::DeviceSize offset = 0;
 	vk::IndexType  type   = vk::IndexType::eUint16;
 };
+
+struct PreparedIndirectBuffers {
+	vk::Buffer     args         = nullptr;
+	vk::DeviceSize args_offset  = 0;
+	vk::Buffer     count        = nullptr;
+	vk::DeviceSize count_offset = 0;
+};
+
+// Pure superset of the ConsumeMetadataColorOperation, DepthStencilCopy and ResolveColorTargets
+// conditions. Those draws run an operation instead of drawing, but only when their CPU-visible
+// counts are nonzero, so indirect draws in these modes keep the CPU-read arguments.
+static bool DrawMayRunTargetOperation(const CommandBuffer& buffer) {
+	const auto& hw   = buffer.GetRegisters();
+	const auto  mode = hw.GetColorControl().mode;
+	if (ConsumeMetadataColorOperation(buffer) ||
+	    mode == static_cast<uint8_t>(CbColorMode::Resolve)) {
+		return true;
+	}
+	const auto& override = hw.GetDepthRenderOverride();
+	return mode == static_cast<uint8_t>(CbColorMode::Disable) &&
+	       ((override.force_z_dirty && override.force_z_valid) ||
+	        (override.force_stencil_dirty && override.force_stencil_valid));
+}
+
+// ResolvePrimitiveRestart without its index scan. nullopt when only a scan of CPU-visible
+// indices could decide (a custom reset value), or when the CPU path would reject the control.
+static std::optional<bool> ResolveNativePrimitiveRestart(const CommandBuffer& buffer,
+                                                         uint32_t element_size) {
+	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
+	if ((control & ~0x3u) != 0) {
+		return std::nullopt;
+	}
+	if ((control & 0x1u) == 0) {
+		return false;
+	}
+	switch (buffer.GetUserConfig().GetPrimType()) {
+		case Prospero::PrimitiveType::kLineStrip:
+		case Prospero::PrimitiveType::kTriFan:
+		case Prospero::PrimitiveType::kTriStrip: break;
+		default: return false;
+	}
+	const auto index_mask  = UINT32_MAX >> ((4 - element_size) * 8);
+	const auto reset_index = buffer.GetRegisters().GetPrimitiveResetIndex();
+	if ((control & 0x2u) != 0 && (reset_index & ~index_mask) != 0) {
+		return false;
+	}
+	if ((reset_index & index_mask) == index_mask) {
+		return true;
+	}
+	return std::nullopt;
+}
+
+// Argument and count records stay in GPU memory. The stream-buffer path of ObtainBuffer only
+// applies to CPU-written ranges, whose snapshot is then equally current.
+static PreparedIndirectBuffers ObtainIndirectBuffers(CommandBuffer&            buffer,
+                                                     const DrawIndirectSource& source) {
+	auto&                   cache = buffer.GetContext().GetBufferCache();
+	PreparedIndirectBuffers prepared;
+	const auto [args, args_offset] = cache.ObtainBuffer(source.args_addr, source.ArgsSize(), false);
+	EXIT_IF(args == nullptr || (args_offset & 3u) != 0);
+	prepared.args        = args->Handle();
+	prepared.args_offset = args_offset;
+	if (source.count_addr != 0) {
+		const auto [count, count_offset] =
+		    cache.ObtainBuffer(source.count_addr, sizeof(uint32_t), false);
+		EXIT_IF(count == nullptr || (count_offset & 3u) != 0);
+		prepared.count        = count->Handle();
+		prepared.count_offset = count_offset;
+	}
+	return prepared;
+}
+
+// Shader and transfer writes (compute culling, DMA, cache uploads) -> indirect command fetch.
+// Must be recorded outside a rendering instance.
+static void IndirectArgumentsBarrier(vk::CommandBuffer vk_buffer) {
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+	                              vk::PipelineStageFlagBits::eComputeShader |
+	                              vk::PipelineStageFlagBits::eTransfer,
+	                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0,
+	                          nullptr, 0, nullptr);
+}
+
+static void EmitIndirectDraw(vk::CommandBuffer vk_buffer, const DrawIndirectSource& source,
+                             const PreparedIndirectBuffers& prepared) {
+	if (source.count_addr != 0) {
+		if (source.indexed) {
+			vk_buffer.drawIndexedIndirectCount(prepared.args, prepared.args_offset, prepared.count,
+			                                   prepared.count_offset, source.max_count,
+			                                   source.stride);
+		} else {
+			vk_buffer.drawIndirectCount(prepared.args, prepared.args_offset, prepared.count,
+			                            prepared.count_offset, source.max_count, source.stride);
+		}
+	} else if (source.indexed) {
+		vk_buffer.drawIndexedIndirect(prepared.args, prepared.args_offset, source.max_count,
+		                              source.stride);
+	} else {
+		vk_buffer.drawIndirect(prepared.args, prepared.args_offset, source.max_count,
+		                       source.stride);
+	}
+}
 
 static uint64_t VertexBufferDescriptorSize(const ShaderVertexInputBuffer& buffer,
                                            const ShaderVertexInputInfo& info) {
@@ -811,9 +918,10 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 }
 
 static void SetDrawDebugPhase(CommandBuffer& buffer, uint64_t submit_id, const DrawCallInfo& draw,
-                              uint32_t phase) {
+                              const DrawEmitInfo& emit, uint32_t phase) {
 	buffer.SetDebugInfo(static_cast<uint32_t>(draw.debug_op), submit_id, phase, draw.index_count, 0,
-	                    draw.instance_count, draw.first_instance);
+	                    draw.instance_count,
+	                    emit.indirect != nullptr ? emit.indirect->args_addr : draw.first_instance);
 }
 
 static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& topology) {
@@ -1142,6 +1250,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);
 	}
+	const auto* indirect = emit.indirect;
+	EXIT_IF(indirect != nullptr && mesh_active);
+	if (indirect != nullptr) {
+		// ObtainBuffer can merge cache buffers, which must not retire buffers that the shader
+		// bindings below already resolved. Acquire the argument, count and whole index ranges
+		// first; acquiring them again after the bindings then finds the same or a merged,
+		// still covering, buffer and merges nothing.
+		(void)ObtainIndirectBuffers(buffer, *indirect);
+		if (index_source.size != 0) {
+			(void)m_context.GetBufferCache().ObtainBuffer(index_source.address, index_source.size,
+			                                              false);
+		}
+	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
@@ -1164,6 +1285,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	PreparedIndirectBuffers indirect_buffers;
+	if (indirect != nullptr) {
+		indirect_buffers = ObtainIndirectBuffers(buffer, *indirect);
+	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
@@ -1180,12 +1305,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
 	auto vk_buffer = buffer.Handle();
-	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
+	SetDrawDebugPhase(buffer, submit_id, draw, emit, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
 	if (state.ps_active && !draw.IsIndexed()) {
-		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
+		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (!mesh_active) CommitIndexBuffer(vk_buffer, index_binding);
@@ -1197,12 +1322,26 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
-		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
+		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x400u);
+	}
+	if (indirect != nullptr) {
+		// Pipeline barriers cannot be recorded inside dynamic rendering. Every buffer write is
+		// recorded outside rendering or ends it (ShaderWriteBarrier), so the rendering instance
+		// begun right after the previous barrier needs no new one while it remains active.
+		const auto active = buffer.ActiveRenderingSerial();
+		if (active == 0 || active != m_indirect_barrier_rendering) {
+			m_context.GetCommandScheduler().EndRendering();
+			IndirectArgumentsBarrier(vk_buffer);
+		}
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
+	if (indirect != nullptr) {
+		// A state change above only switched instances; no buffer write came in between.
+		m_indirect_barrier_rendering = buffer.ActiveRenderingSerial();
+	}
 	buffer.BindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	if (!draw.IsIndexed()) {
-		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
+		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x500u);
 	}
 	if (mesh_active) {
 		for (const auto& segment: mesh_segments) {
@@ -1219,12 +1358,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			    0, sizeof(draw_data), draw_data);
 			vk_buffer.drawMeshTasksEXT(segment.groups, draw.instance_count, 1);
 		}
+	} else if (indirect != nullptr) {
+		EmitIndirectDraw(vk_buffer, *indirect, indirect_buffers);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
 
 	if (!draw.IsIndexed()) {
-		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
+		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x600u);
 	}
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
@@ -1241,7 +1382,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
-		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
+		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x700u);
 	}
 }
 
@@ -1456,6 +1597,158 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
 	ResetBindings();
+}
+
+// Mirrors DrawIndex/DrawAuto with DrawOffsetSource::IndirectArgs, except that the counts, first
+// index/vertex, vertex offset and first instance stay GPU data. Every check that needs a
+// CPU-visible count returns false before a command is recorded.
+bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffer,
+                                        const DrawIndirectSource& source) {
+	KYTY_PROFILER_FUNCTION();
+	EXIT_IF(buffer.IsInvalid() || source.args_addr == 0 || source.max_count == 0);
+	const auto& graphics = m_context.GetGraphics();
+	const auto& limits   = graphics.GetPhysicalDeviceProperties().limits;
+	// Host command forms. firstInstance is GPU data, so its feature is always required.
+	if (!graphics.draw_indirect_first_instance_enabled || (source.args_addr & 3u) != 0 ||
+	    source.stride < source.RecordSize() || (source.stride & 3u) != 0 ||
+	    source.max_count > limits.maxDrawIndirectCount ||
+	    (source.max_count > 1 && !graphics.multi_draw_indirect_enabled) ||
+	    (source.count_addr != 0 &&
+	     (!graphics.draw_indirect_count_enabled || (source.count_addr & 3u) != 0)) ||
+	    !m_context.IsMapped(source.args_addr, source.ArgsSize()) ||
+	    (source.count_addr != 0 && !m_context.IsMapped(source.count_addr, sizeof(uint32_t)))) {
+		return false;
+	}
+
+	DrawIndexBufferSource index_source {};
+	if (source.indexed) {
+		switch (static_cast<Prospero::IndexType>(source.index_type_and_size)) {
+			case Prospero::IndexType::kIndex16:
+				index_source.type               = vk::IndexType::eUint16;
+				index_source.guest_element_size = 2;
+				break;
+			case Prospero::IndexType::kIndex32:
+				index_source.type               = vk::IndexType::eUint32;
+				index_source.guest_element_size = 4;
+				break;
+			case Prospero::IndexType::kIndex8:
+				// The CPU path widens 8-bit indices to 16 bits on the host.
+				if (!graphics.index_type_uint8_enabled) {
+					return false;
+				}
+				index_source.type               = vk::IndexType::eUint8;
+				index_source.guest_element_size = 1;
+				break;
+			default: EXIT("unknown index_type_and_size: %u\n", source.index_type_and_size);
+		}
+		// The bound range is [INDEX_BASE, +INDEX_BUFFER_SIZE); firstIndex comes from each record.
+		// The CPU path clamps the index count to INDEX_BUFFER_SIZE instead. Past that range the
+		// host reads the neighbouring cached guest bytes, or robustBufferAccess values past the
+		// host buffer (KYTY_INDIRECT_VALIDATE=1 reports such records). Without a size there is
+		// no range to bind.
+		if (source.index_base_addr == 0 || source.index_buffer_size == 0 ||
+		    !m_context.IsMapped(source.index_base_addr, index_source.guest_element_size)) {
+			return false;
+		}
+		index_source.address = source.index_base_addr;
+		index_source.size    = Libs::LibKernel::Memory::ClampRangeSize(
+		    source.index_base_addr,
+		    static_cast<uint64_t>(source.index_buffer_size) * index_source.guest_element_size);
+	}
+
+	{
+		KYTY_PROFILER_DETAIL_BLOCK("Draw::DrainPendingOperations");
+		m_context.GetCommandScheduler().PopPendingOperations();
+	}
+	auto& ucfg   = buffer.GetUserConfig();
+	auto& sh_ctx = buffer.GetShaders();
+
+	const auto debug_op =
+	    source.indexed ? CommandBufferDebugOp::DrawIndex : CommandBufferDebugOp::DrawIndexAuto;
+	// Counts are unknown on the CPU: 0xFFFFFFFF, with the argument address in place of the index
+	// or first-instance detail.
+	buffer.SetDebugInfo(static_cast<uint32_t>(debug_op), submit_id, UINT32_MAX, 0, 1, UINT32_MAX,
+	                    source.args_addr);
+
+	KYTY_PROFILER_DETAIL_BLOCK("Draw::SetupAndExecution");
+	Common::LockGuard lock(m_context.GetMutex());
+	if (DrawMayRunTargetOperation(buffer)) {
+		return false;
+	}
+	if (!DrawHasValidVertexShader(sh_ctx)) {
+		return true;
+	}
+
+	if (graphics_debug_dump_enabled()) {
+		LOGF("GraphicsRenderDrawIndirectNative():Shader:\n");
+		uc_print("GraphicsRenderDrawIndirectNative():UserConfig:", ucfg);
+		hw_print(buffer);
+
+		LOGF("GraphicsRenderDrawIndirectNative():Parameters:\n"
+		     "\t args_addr           = 0x%016" PRIx64 "\n"
+		     "\t stride              = 0x%08" PRIx32 "\n"
+		     "\t max_count           = 0x%08" PRIx32 "\n"
+		     "\t count_addr          = 0x%016" PRIx64 "\n"
+		     "\t indexed             = %u\n"
+		     "\t index_base_addr     = 0x%016" PRIx64 "\n"
+		     "\t index_buffer_size   = 0x%08" PRIx32 "\n"
+		     "\t index_type_and_size = 0x%08" PRIx32 "\n",
+		     source.args_addr, source.stride, source.max_count, source.count_addr,
+		     source.indexed ? 1u : 0u, source.index_base_addr, source.index_buffer_size,
+		     source.index_type_and_size);
+	}
+
+	uc_check(ucfg);
+
+	hw_check(buffer);
+
+	// Legacy quads are split into per-quad host draws from the vertex count.
+	if (ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy) {
+		return false;
+	}
+	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
+	if (!GetDrawTopology(ucfg, topology)) {
+		return true;
+	}
+	bool primitive_restart = false;
+	if (source.indexed) {
+		const auto restart =
+		    ResolveNativePrimitiveRestart(buffer, index_source.guest_element_size);
+		if (!restart) {
+			return false;
+		}
+		primitive_restart = *restart;
+	}
+
+	const DrawCallInfo draw {debug_op, UINT32_MAX, UINT32_MAX, 0};
+	DrawRenderState state {};
+	if (!PrepareDrawRenderState(buffer, draw, 0, state)) {
+		ResetBindings();
+		return true;
+	}
+	// Mesh draws derive group counts, restart segments and push data from the counts.
+	if (state.vertex_info[0].stage.program->stage == ShaderType::Mesh) {
+		ResetBindings();
+		return false;
+	}
+	if (!source.indexed && Prospero::IsRectList(ucfg.GetPrimType()) &&
+	    state.vertex_info[0].buffers_num == 0 &&
+	    state.vertex_info[0].stage.program->param_export_mask == 0 &&
+	    state.ps_input_info.input_num != 0) {
+		ResetBindings();
+		return true;
+	}
+
+	LogDrawStateIfNeeded(buffer, draw, state, source.index_type_and_size,
+	                     reinterpret_cast<const void*>(source.index_base_addr));
+
+	DrawEmitInfo emit {};
+	emit.indirect = &source;
+	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
+	                    primitive_restart);
+	ResetBindings();
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectNative);
+	return true;
 }
 
 bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_target_slice_offset) {
