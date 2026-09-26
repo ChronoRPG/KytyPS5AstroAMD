@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -281,6 +282,93 @@ void TestSealedPlanEvaluatesConcurrently() {
         "evaluation assigned memo slots on a sealed plan");
 }
 
+// Draw-prep S3 (pipelineCache.cpp MakeSpeculativeRuntime): a materialization whose every read
+// goes through the silent clean probe must equal the serial runtime's result on clean memory,
+// and must fail, without reading the unclean word, when any read is not provably clean.
+struct ProbeMemory {
+  uint64_t dirty_address = 0;
+  uint32_t strict_failures = 0;
+  uint32_t probe_failures = 0;
+};
+ProbeMemory g_probe_memory;
+
+bool CleanProbe(void *, uint64_t address, std::span<uint32_t> values) {
+  const auto end = address + values.size_bytes();
+  if (g_probe_memory.dirty_address != 0 &&
+      g_probe_memory.dirty_address >= address &&
+      g_probe_memory.dirty_address < end) {
+    ++g_probe_memory.probe_failures;
+    return false;
+  }
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address),
+              values.size_bytes());
+  return true;
+}
+
+bool StrictRead(void *userdata, uint64_t address, std::span<uint32_t> values) {
+  if (CleanProbe(userdata, address, values)) {
+    return true;
+  }
+  ++g_probe_memory.strict_failures;
+  return false;
+}
+
+void TestSpeculativeRuntimeMatchesSerial() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const std::array<uint32_t, 4> table{0x30000u, 0x00300000u, 0xc0u, 0x00027facu};
+  const auto plan = SharedEvaluationPlan(table.data());
+  const std::array<uint32_t, 1> user_data{0x55u};
+  const SrtRuntime serial{.user_data = user_data,
+                          .read_specialization_memory = StrictRead,
+                          .try_read_clean_backing = CleanProbe,
+                          .share_clean_values = true};
+  const SrtRuntime speculative{.user_data = user_data,
+                               .read_memory = StrictRead,
+                               .read_specialization_memory = StrictRead,
+                               .try_read_clean_backing = CleanProbe,
+                               .share_clean_values = false};
+  g_probe_memory = {};
+  ResourceSnapshot serial_snapshot;
+  ResourceSpecialization serial_specialization;
+  Check(MaterializeResources(plan, serial, serial_snapshot, serial_specialization),
+        "serial clean materialization failed");
+  ResourceSnapshot speculative_snapshot;
+  ResourceSpecialization speculative_specialization;
+  Check(MaterializeResources(plan, speculative, speculative_snapshot,
+                             speculative_specialization),
+        "speculative clean materialization failed");
+  Check(serial_snapshot.flattened_srt == speculative_snapshot.flattened_srt &&
+            serial_snapshot.buffers == speculative_snapshot.buffers &&
+            serial_snapshot.images == speculative_snapshot.images &&
+            serial_snapshot.samplers == speculative_snapshot.samplers &&
+            serial_snapshot.user_data == speculative_snapshot.user_data &&
+            serial_snapshot.uniform_fill == speculative_snapshot.uniform_fill &&
+            serial_specialization == speculative_specialization,
+        "speculative materialization differed from the serial runtime");
+  Check(g_probe_memory.strict_failures == 0 && g_probe_memory.probe_failures == 0,
+        "clean materializations reported failed reads");
+
+  // One unclean word (the base address, which no specialization depends on): the serial
+  // runtime reads it through its ordinary fallback, the speculative one must refuse the stage.
+  g_probe_memory = {};
+  g_probe_memory.dirty_address = reinterpret_cast<uint64_t>(&table[0]);
+  ResourceSnapshot dirty_serial;
+  ResourceSpecialization dirty_serial_specialization;
+  Check(MaterializeResources(plan, serial, dirty_serial, dirty_serial_specialization),
+        "serial materialization did not fall back for an unclean word");
+  Check(dirty_serial.buffers == serial_snapshot.buffers,
+        "serial fallback read different bytes");
+  g_probe_memory.strict_failures = 0;
+  ResourceSnapshot dirty_speculative;
+  ResourceSpecialization dirty_speculative_specialization;
+  Check(!MaterializeResources(plan, speculative, dirty_speculative,
+                              dirty_speculative_specialization),
+        "speculative materialization accepted an unclean word");
+  Check(g_probe_memory.strict_failures != 0,
+        "speculative failure did not come from the silent reader");
+  g_probe_memory = {};
+}
+
 void TestMappedSrtUsesDirectReaderByDefault() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
@@ -406,6 +494,7 @@ int main() {
   TestFailedMaterializationRejectsStage();
   TestMixedSamplerDuplicatesTheCorrectSnapshot();
   TestSealedPlanEvaluatesConcurrently();
+  TestSpeculativeRuntimeMatchesSerial();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

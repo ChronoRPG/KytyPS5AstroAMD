@@ -68,6 +68,9 @@ struct ShaderBinaryInfo {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMappedData>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+// Bumped under g_shader_map_mutex after every map update. Starts at 1 so that zero-initialized
+// memo entries never match.
+static std::atomic<uint64_t> g_shader_map_generation {1};
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -81,11 +84,18 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	(*g_shader_map)[addr] = data;
+	g_shader_map_generation.fetch_add(1, std::memory_order_release);
 }
 
-static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
-	EXIT_IF(g_shader_map == nullptr);
+static bool ShaderMapMemoEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_SHADER_MAP_MEMO");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
 
+static ShaderMappedData ShaderGetMappedDataLocked(uint64_t addr, const char* label) {
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
@@ -93,6 +103,43 @@ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 	}
 
 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
+}
+
+static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
+	EXIT_IF(g_shader_map == nullptr);
+
+	if (!ShaderMapMemoEnabled()) {
+		return ShaderGetMappedDataLocked(addr, label);
+	}
+	// Per-thread memo of recent lookups (KYTY_SHADER_MAP_MEMO), tagged with the map generation
+	// loaded before the locked lookup: an update racing that lookup leaves the entry stale, and
+	// any later update changes the generation, so a hit always returns the current mapping.
+	struct Entry {
+		uint64_t         addr       = 0;
+		uint64_t         generation = 0;
+		ShaderMappedData data;
+	};
+	static thread_local std::array<Entry, 16> memo {};
+	auto&      entry      = memo[(addr >> 8u) % memo.size()];
+	const auto generation = g_shader_map_generation.load(std::memory_order_acquire);
+	if (entry.generation == generation && entry.addr == addr) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderMapMemoHits);
+		return entry.data;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderMapMemoMisses);
+	const auto data  = ShaderGetMappedDataLocked(addr, label);
+	entry            = {addr, generation, data};
+	return data;
+}
+
+// KYTY_SHADER_METADATA_BATCH=0 restores one clean-backing probe per header word, vertex
+// attribute and vertex-buffer descriptor.
+static bool ShaderMetadataBatchEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_SHADER_METADATA_BATCH");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
 }
 
 static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
@@ -125,8 +172,20 @@ static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 		};
 		const auto* code = reinterpret_cast<const uint32_t*>(shader_addr);
 		EXIT_IF(code == nullptr);
-		if (read_word(code) != 0xBEEB03FF) return 0;
-		const auto offset = read_word(code + 1);
+		// Both leading words in one silent probe. It reads the second word even when the
+		// first is not the marker, which a silent probe may do: it cannot fault, and a
+		// failure falls back to the exact per-word reads below.
+		std::array<uint32_t, 2> head {};
+		uint32_t                offset = 0;
+		if (ShaderMetadataBatchEnabled() &&
+		    LibKernel::Memory::TryReadGpuCleanBacking(shader_addr, head.data(), sizeof(head))) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderHeaderProbeHits);
+			if (head[0] != 0xBEEB03FF) return 0;
+			offset = head[1];
+		} else {
+			if (read_word(code) != 0xBEEB03FF) return 0;
+			offset = read_word(code + 1);
+		}
 		const auto* header = reinterpret_cast<const ShaderBinaryInfo*>(
 		    code + static_cast<size_t>(offset + 1u) * 2);
 		std::array<uint32_t, 2> hashes {};
@@ -429,28 +488,93 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		const auto* value = std::getenv("KYTY_SHADER_METADATA_BACKING");
 		return value != nullptr && std::strcmp(value, "1") == 0;
 	}();
+	EXIT_NOT_IMPLEMENTED(num_input_semantics > ShaderVertexInputInfo::RES_MAX);
 
+	// KYTY_SHADER_METADATA_BATCH: read the used span of each table with one silent probe. A
+	// successful probe proves every word of the span clean, so each word equals what its own
+	// probe returns; a failed probe falls back to exactly the per-word reads.
+	const bool batch = use_clean_backing && ShaderMetadataBatchEnabled() && num_input_semantics > 1;
+	constexpr uint32_t          MaxBatchWords = 64;
+	std::array<uint32_t, MaxBatchWords> attribute_words {};
+	uint32_t                    attribute_first   = 0;
+	bool                        attributes_batched = false;
+	if (batch) {
+		uint32_t first = UINT32_MAX;
+		uint32_t last  = 0;
+		for (uint32_t i = 0; i < num_input_semantics; i++) {
+			first = std::min<uint32_t>(first, input_semantics[i].semantic);
+			last  = std::max<uint32_t>(last, input_semantics[i].semantic);
+		}
+		if (last - first < MaxBatchWords) {
+			attribute_first    = first;
+			attributes_batched = LibKernel::Memory::TryReadGpuCleanBacking(
+			    reinterpret_cast<uint64_t>(attrib + first), attribute_words.data(),
+			    (last - first + 1u) * sizeof(uint32_t));
+			Profiler::CountFrameEvent(attributes_batched ? Profiler::FrameEvent::VertexTableBatchHits
+			                                             : Profiler::FrameEvent::VertexTableBatchMisses);
+		}
+	}
+
+	// Pass 1: validate each semantic and read its attribute word, in the original order.
+	std::array<uint32_t, ShaderVertexInputInfo::RES_MAX> attributes {};
 	for (uint32_t i = 0; i < num_input_semantics; i++) {
 		const auto& in = input_semantics[i];
 
 		EXIT_NOT_IMPLEMENTED(in.static_vb_index == 1 || in.static_attribute == 1);
 
-		uint32_t reg  = in.hardware_mapping;
-		uint32_t size = in.size_in_elements;
 		uint32_t attribute = 0;
-		const bool attribute_clean = use_clean_backing &&
-		    LibKernel::Memory::TryReadGpuCleanBacking(
-		        reinterpret_cast<uint64_t>(attrib + in.semantic), &attribute, sizeof(attribute));
-		if (use_clean_backing) {
-			Profiler::CountFrameEvent(attribute_clean ? Profiler::FrameEvent::VertexMetadataProbeHits
-			                                         : Profiler::FrameEvent::VertexMetadataProbeMisses);
+		if (attributes_batched) {
+			attribute = attribute_words[in.semantic - attribute_first];
+		} else {
+			const bool attribute_clean = use_clean_backing &&
+			    LibKernel::Memory::TryReadGpuCleanBacking(
+			        reinterpret_cast<uint64_t>(attrib + in.semantic), &attribute, sizeof(attribute));
+			if (use_clean_backing) {
+				Profiler::CountFrameEvent(attribute_clean
+				                              ? Profiler::FrameEvent::VertexMetadataProbeHits
+				                              : Profiler::FrameEvent::VertexMetadataProbeMisses);
+			}
+			if (!attribute_clean) attribute = attrib[in.semantic];
 		}
-		if (!attribute_clean) attribute = attrib[in.semantic];
+		attributes[i] = attribute;
 
 		if (debug_dump) {
-			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
-			     attribute);
+			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n",
+			     static_cast<uint32_t>(in.hardware_mapping),
+			     static_cast<uint32_t>(in.size_in_elements), i, attribute);
 		}
+	}
+
+	// The vertex-buffer descriptors those attributes select, again as one span when possible.
+	std::array<uint32_t, MaxBatchWords * 2> sharp_words {};
+	uint32_t                                sharp_first  = 0;
+	bool                                    sharps_batched = false;
+	if (batch) {
+		uint32_t first = UINT32_MAX;
+		uint32_t last  = 0;
+		bool     valid = true;
+		for (uint32_t i = 0; i < num_input_semantics; i++) {
+			const uint32_t index = attributes[i] & 0x1fu;
+			valid &= index < static_cast<uint32_t>(ShaderVertexInputInfo::RES_MAX);
+			first = std::min(first, index);
+			last  = std::max(last, index);
+		}
+		if (valid && (last - first + 1u) * 4u <= sharp_words.size()) {
+			sharp_first    = first;
+			sharps_batched = LibKernel::Memory::TryReadGpuCleanBacking(
+			    reinterpret_cast<uint64_t>(buffer + static_cast<size_t>(first) * 4u),
+			    sharp_words.data(), (last - first + 1u) * 4u * sizeof(uint32_t));
+			Profiler::CountFrameEvent(sharps_batched ? Profiler::FrameEvent::VertexTableBatchHits
+			                                         : Profiler::FrameEvent::VertexTableBatchMisses);
+		}
+	}
+
+	for (uint32_t i = 0; i < num_input_semantics; i++) {
+		const auto& in = input_semantics[i];
+
+		uint32_t reg  = in.hardware_mapping;
+		uint32_t size = in.size_in_elements;
+		const uint32_t attribute = attributes[i];
 
 		size_t index = attribute & 0x1fu;
 		auto   format =
@@ -470,12 +594,19 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		rd.registers_num  = static_cast<int>(size);
 		rd.attr_id        = static_cast<int>(in.semantic);
 		rd.fetch_index    = fetch_index;
-		const bool descriptor_clean = use_clean_backing &&
-		    LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(sharp),
-		                                             r.fields, 4 * sizeof(uint32_t));
-		if (use_clean_backing) {
-			Profiler::CountFrameEvent(descriptor_clean ? Profiler::FrameEvent::VertexMetadataProbeHits
-			                                          : Profiler::FrameEvent::VertexMetadataProbeMisses);
+		bool descriptor_clean = false;
+		if (sharps_batched) {
+			std::copy_n(sharp_words.data() + (index - sharp_first) * 4u, 4, r.fields);
+			descriptor_clean = true;
+		} else {
+			descriptor_clean = use_clean_backing &&
+			    LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(sharp),
+			                                             r.fields, 4 * sizeof(uint32_t));
+			if (use_clean_backing) {
+				Profiler::CountFrameEvent(descriptor_clean
+				                              ? Profiler::FrameEvent::VertexMetadataProbeHits
+				                              : Profiler::FrameEvent::VertexMetadataProbeMisses);
+			}
 		}
 		if (!descriptor_clean) {
 			r.fields[0] = sharp[0];

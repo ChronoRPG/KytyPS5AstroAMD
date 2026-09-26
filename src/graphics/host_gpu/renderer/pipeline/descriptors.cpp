@@ -674,25 +674,38 @@ static TextureCache::ImageDesc BuildTextureDescription(
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
+	TextureBinding binding;
+	ResolveTexture(resource, value, binding);
+	return binding;
+}
+
+void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                    const ShaderRecompiler::IR::DescriptorValue& value,
+                                    TextureBinding&                              binding) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage = resource.written;
 	if (storage) {
 		ValidateStorageImageResource(resource);
 	}
+	// The same state a freshly returned binding had: no view yet, no mip views (their capacity
+	// is kept), undefined layout.
+	binding.image_view = nullptr;
+	binding.layout     = vk::ImageLayout::eUndefined;
+	binding.mip_views.clear();
+	auto& desc = binding.desc;
 
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                         : TextureCache::BindingType::Texture);
+		binding.image_id = texture_cache.FindImage(desc);
+		return;
 	}
 
 	if (HangTrace::Enabled()) {
 		HangTrace::RecordTexture(descriptor.fields);
 	}
 
-	TextureCache::ImageDesc desc;
 	if (Common::RendererBatchEnabled() && resource.indirect_resources.size() <= 256u) {
 		const TextureDescriptionKey key {resource.resource_class, resource.numeric_class,
 		                                 resource.dimension,      resource.mip_mode,
@@ -747,13 +760,20 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
-	return {id, nullptr, std::move(desc)};
+	binding.image_id = id;
 }
 
-static vk::Sampler NativeSampler(RenderContext&                       context,
-                                 const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                 uint32_t index,
-                                 const ShaderRecompiler::IR::DescriptorValue& value) {
+static bool SamplerMemoEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_SAMPLER_MEMO");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                          uint32_t                                        index,
+                                          const ShaderRecompiler::IR::DescriptorValue&    value) {
 	auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	if (!program.info.samplers[index].depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
@@ -761,7 +781,25 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	if (program.info.samplers[index].force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
-	return context.GetSamplerCache().GetSampler(descriptor);
+	if (!SamplerMemoEnabled()) {
+		return m_context.GetSamplerCache().GetSampler(descriptor);
+	}
+	// Keyed on exactly the SamplerCache key (the four final dwords).
+	static_assert(sizeof(descriptor.fields) == sizeof(SamplerMemoEntry::fields));
+	const auto slot = (descriptor.fields[0] * 0x9e3779b1u ^ descriptor.fields[1] * 0x85ebca6bu ^
+	                   descriptor.fields[2] * 0xc2b2ae35u ^ descriptor.fields[3]) >>
+	                  26u;
+	auto& entry = m_sampler_memo[slot % m_sampler_memo.size()];
+	if (entry.sampler != nullptr &&
+	    std::memcmp(entry.fields.data(), descriptor.fields, sizeof(descriptor.fields)) == 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::SamplerMemoHits);
+		return entry.sampler;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::SamplerMemoMisses);
+	const auto sampler = m_context.GetSamplerCache().GetSampler(descriptor);
+	std::memcpy(entry.fields.data(), descriptor.fields, sizeof(descriptor.fields));
+	entry.sampler = sampler;
+	return sampler;
 }
 
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
@@ -848,15 +886,13 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		auto& binding = prepared.images[i];
+		ResolveTexture(program.info.images[i], snapshot.images[i], binding);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-		binding.mip_views.swap(prepared.images[i].mip_views);
-		binding.mip_views.clear();
-		prepared.images[i] = std::move(binding);
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
+		prepared.samplers.push_back(NativeSampler(program, i, snapshot.samplers[i]));
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.bindings.user_data_registers) {
@@ -957,7 +993,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			if (old_image != nullptr) {
 				old_image->binding = {};
 			}
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			ResolveTexture(program.info.images[i], snapshot.images[i], images[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}

@@ -9,6 +9,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
+#include "graphics/host_gpu/gpuReadDelegate.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -886,7 +887,9 @@ static bool IsGpuRangeCleanForBackingRead(uint64_t vaddr, uint64_t size) {
 
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-		if (!Graphics::GuestGpu::IsGpuThread()) {
+		// A draw-preparation helper may probe only inside a GPU-thread fork window
+		// (gpuReadDelegate.h), during which the GPU-thread-owned dirty state is stable.
+		if (!Graphics::GuestGpu::IsGpuThread() && !Graphics::GpuReadDelegate::Active()) {
 			return false;
 		}
 		namespace CleanVerdict = Graphics::CleanVerdict;

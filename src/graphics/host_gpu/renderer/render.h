@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/queueSubmission.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -187,6 +188,10 @@ public:
 		return m_rendering ? m_rendering_serial : 0;
 	}
 	void BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline);
+	// The pipeline last bound through BindPipeline since Begin (null after Begin).
+	[[nodiscard]] vk::Pipeline BoundPipeline(vk::PipelineBindPoint point) const {
+		return m_bound_pipelines[point == vk::PipelineBindPoint::eCompute ? 1u : 0u];
+	}
 	void PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
 	                     uint32_t count, const vk::WriteDescriptorSet* writes);
 	void InvalidateDescriptors(vk::PipelineBindPoint point);
@@ -287,6 +292,40 @@ private:
 	friend class CommandScheduler;
 };
 
+// Graphics dynamic state last recorded by a draw (KYTY_DYNAMIC_STATE_SHADOW). Dynamic state
+// persists in a command buffer until it is set again or a pipeline with that state static is
+// bound. It is therefore reusable only in the same command buffer while the graphics pipeline
+// bound there is still the one the recording draw bound: every renderer pipeline declares the
+// same dynamic states (color-write enable only with color attachments, tracked separately), and
+// any other graphics pipeline bind (blits) or a Begin changes the bound pipeline.
+struct GraphicsDynamicStateShadow {
+	static constexpr uint32_t MaxViewports = 16;
+
+	vk::CommandBuffer command  = nullptr;
+	vk::Pipeline      pipeline = nullptr;
+	bool              valid    = false;
+	uint32_t          viewport_count = 0;
+	std::array<vk::Viewport, MaxViewports> viewports {};
+	std::array<vk::Rect2D, MaxViewports>   scissors {};
+	float                line_width = 0.0f;
+	std::array<float, 4> blend_constants {};
+	vk::Bool32           depth_test_enable  = VK_FALSE;
+	vk::Bool32           depth_write_enable = VK_FALSE;
+	vk::CompareOp        depth_compare_op   = vk::CompareOp::eNever;
+	vk::Bool32           depth_bias_enable  = VK_FALSE;
+	bool                 depth_bias_valid   = false;
+	std::array<float, 3> depth_bias {};
+	vk::Bool32           stencil_test_enable = VK_FALSE;
+	bool                 stencil_valid       = false;
+	vk::StencilOpState   stencil_front {};
+	vk::StencilOpState   stencil_back {};
+	bool                 color_write_valid = false;
+	uint32_t             color_write_count = 0;
+	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write {};
+	bool                 feedback_valid = false;
+	vk::ImageAspectFlags feedback;
+};
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context);
@@ -319,8 +358,15 @@ private:
 		std::optional<PreparedBindings> pixel;
 	};
 
+	// Resolves into `binding` (image, description) in place; its view and mip views are left
+	// for RebindImages. Writing in place avoids copying the ~0.5 KB description twice.
+	void ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+	                    const ShaderRecompiler::IR::DescriptorValue& value, TextureBinding& binding);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	[[nodiscard]] vk::Sampler NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                                        uint32_t                                        index,
+	                                        const ShaderRecompiler::IR::DescriptorValue&    value);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -403,6 +449,34 @@ private:
 		TextureCache::ImageDesc desc;
 	};
 	std::array<TextureDescriptionEntry, 4096> m_texture_descriptions;
+	// KYTY_SAMPLER_MEMO: final sampler dwords -> native sampler. The sampler cache never evicts,
+	// so a remembered handle stays the one GetSampler returns for those dwords.
+	struct SamplerMemoEntry {
+		std::array<uint32_t, 4> fields {};
+		vk::Sampler             sampler = nullptr;
+	};
+	std::array<SamplerMemoEntry, 64> m_sampler_memo {};
+	// KYTY_TARGET_DESC_MEMO: target descriptions are pure functions of the target registers
+	// (and constant device format support). Keyed on the exact register bytes; FindImage and
+	// everything after it still run for every draw.
+	struct ColorTargetDescMemo {
+		bool                            valid = false;
+		HW::RenderTarget                registers {};
+		uint32_t                        mask         = 0;
+		uint32_t                        slice_offset = 0;
+		TextureCache::ImageDesc         desc;
+		uint32_t                        guest_mip_level   = 0;
+		uint32_t                        guest_array_layer = 0;
+		Prospero::ColorComponentMapping export_mapping;
+	};
+	std::array<ColorTargetDescMemo, RENDER_COLOR_ATTACHMENTS_MAX> m_color_target_memo {};
+	struct DepthTargetDescMemo {
+		bool                    valid = false;
+		HW::DepthRenderTarget   registers {};
+		TextureCache::ImageDesc desc;
+	};
+	DepthTargetDescMemo        m_depth_target_memo {};
+	GraphicsDynamicStateShadow m_dynamic_state {};
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
