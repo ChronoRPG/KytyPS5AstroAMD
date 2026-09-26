@@ -40,6 +40,11 @@ struct ResourceSpecialization {
 ResourcePlan ExtractResourcePlan(const Program& program);
 
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
+// Threads may refresh one sealed plan concurrently when each supplies its own scratch.
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          EvaluationScratch& scratch, ResourceSnapshot& snapshot,
+                          ResourceSpecialization& specialization);
+// Uses this thread's scratch.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 

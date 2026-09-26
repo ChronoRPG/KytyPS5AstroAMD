@@ -525,7 +525,8 @@ struct UniformFillPlan {
 };
 
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
-// condition and fill values without translated blocks, plus reusable evaluation scratch.
+// condition and fill values without translated blocks. Evaluation scratch lives in
+// EvaluationScratch so that a sealed plan can be evaluated by several threads at once.
 struct ResourcePlan {
 	// Immutable operand recipes use the same indices as the legacy evaluator's memo.
 	// They contain no guest memory values and are rebuilt for each retained IR plan.
@@ -607,8 +608,6 @@ struct ResourcePlan {
 	// or source activations are removed. Separate from decoded expression roots.
 	std::vector<uint32_t>               flow_aliases;
 	std::vector<uint8_t>                flow_initial_sources;
-	mutable std::vector<uint32_t>       flow_visit_tags;
-	mutable uint32_t                    flow_visit_epoch = 0;
 	std::vector<ArithmeticTape>         arithmetic_tapes;
 	std::vector<ArithmeticTapeInstruction> arithmetic_tape_instructions;
 	std::vector<uint8_t>                clean_flat_slots;
@@ -618,15 +617,32 @@ struct ResourcePlan {
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
-	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
-	mutable std::deque<EvaluationContext> evaluation_contexts;
-	mutable uint32_t                       evaluation_value_count = 0;
-	mutable uint32_t                       evaluation_depth       = 0;
-	mutable std::vector<uint8_t>            active_sources;
-	mutable std::vector<uint8_t>            visited_blocks;
-	mutable std::vector<uint32_t>           pending_blocks;
-	mutable std::vector<uint32_t>           material_keys;
-	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
+	// Dense memo slot count. Unsealed programs still grow it lazily while evaluating;
+	// a sealed plan assigned every slot when it was extracted and never writes it again.
+	mutable uint32_t                    evaluation_value_count = 0;
+	bool                                evaluation_sealed      = false;
+};
+
+// Per-thread scratch for nested clean/EXEC memos, activity and material keys. Plans stay
+// read-only during evaluation. Memo entries and visit tags are generation-stamped, so a
+// scratch can serve different plans in turn without clearing; walkers release LIFO.
+struct EvaluationScratch {
+	EvaluationScratch() = default;
+
+	EvaluationScratch(const EvaluationScratch&)            = delete;
+	EvaluationScratch& operator=(const EvaluationScratch&) = delete;
+	EvaluationScratch(EvaluationScratch&&) noexcept         = default;
+	EvaluationScratch& operator=(EvaluationScratch&&) noexcept = default;
+
+	std::deque<ResourcePlan::EvaluationContext> evaluation_contexts;
+	uint32_t                                    evaluation_depth = 0;
+	std::vector<uint32_t>                       flow_visit_tags;
+	uint32_t                                    flow_visit_epoch = 0;
+	std::vector<uint8_t>                        active_sources;
+	std::vector<uint8_t>                        visited_blocks;
+	std::vector<uint32_t>                       pending_blocks;
+	std::vector<uint32_t>                       material_keys;
+	std::vector<std::pair<uint64_t, uint64_t>>  specialization_reads;
 };
 
 struct Program: ResourcePlan {

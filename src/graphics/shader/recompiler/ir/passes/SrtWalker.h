@@ -52,6 +52,11 @@ void BuildSrtReadRuns(ResourcePlan& program);
 void BuildSrtEvaluationRecipes(ResourcePlan& program);
 // Opt-in linear pure regions; guest reads and control flow stay evaluator boundaries.
 void BuildSrtArithmeticTapes(ResourcePlan& program);
+// Assigns every remaining memo slot of an extracted plan. Evaluation of a sealed plan
+// never writes to it, so any number of threads may walk it with their own scratch.
+void SealEvaluationIndices(ResourcePlan& program);
+// This thread's scratch, used by callers that do not supply their own.
+EvaluationScratch& ThreadEvaluationScratch();
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 // Uses the strict reader for values that affect shader specialization.
@@ -60,7 +65,12 @@ SrtRuntime CleanRuntime(SrtRuntime runtime);
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {
 public:
+	// Uses the clean evaluator's scratch, or this thread's scratch without one.
 	SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
+	          std::span<const uint8_t> clean_flat_slots = {}, SrtWalker* clean_evaluator = nullptr,
+	          Value active_mask = {});
+	// Walkers sharing a scratch must be destroyed in reverse construction order.
+	SrtWalker(const ResourcePlan& program, EvaluationScratch& scratch, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, SrtWalker* clean_evaluator = nullptr,
 	          Value active_mask = {});
 	~SrtWalker();
@@ -74,8 +84,9 @@ public:
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
 private:
-	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
+	static ResourcePlan::EvaluationContext& AcquireContext(EvaluationScratch& scratch);
 	static float Float32(uint64_t bits);
+	uint32_t MemoIndex(const Inst& inst) const;
 	bool EvaluateWide(Value value, uint64_t& result);
 	bool EvaluateRoot(Value value, const ResourcePlan::EvaluationOperand& root, uint32_t& result);
 	const Inst* FlatReadInstruction(uint32_t slot, uint32_t& memo_index) const;
@@ -100,6 +111,7 @@ private:
 	bool EvaluateInstWithOperands(const Inst& inst, uint64_t& result, ReadOperand&& arg);
 
 	const ResourcePlan&              m_program;
+	EvaluationScratch&               m_scratch;
 	SrtRuntime                      m_runtime;
 	std::span<const uint8_t>         m_clean_flat_slots;
 	SrtWalker*                      m_clean_evaluator = nullptr;

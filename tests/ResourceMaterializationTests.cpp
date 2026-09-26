@@ -1,9 +1,13 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -140,6 +144,143 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan() {
   return ExtractResourcePlan(program);
 }
 
+// Four adjacent raw SRT reads feed flat slots, and a buffer descriptor mixes them with
+// user data, so each walk exercises nested memo contexts, flat reads and user data.
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan
+SharedEvaluationPlan(const uint32_t *table) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const auto address = reinterpret_cast<uint64_t>(table);
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &value_block = AddValueBlock(program);
+
+  MemoryInfo memory;
+  memory.kind = ResourceKind::ScalarAddress;
+  memory.planning_only = true;
+  program.memory_info.push_back(memory);
+  auto &handle = value_block.AppendNewInst(
+      ValueOpcode::GetAddressResource,
+      {Value(static_cast<uint32_t>(address)),
+       Value(static_cast<uint32_t>(address >> 32u))});
+  auto &srt = value_block.AppendNewInst(ValueOpcode::GetSrtResource);
+  std::array<Value, 4> flat;
+  for (uint32_t i = 0; i < flat.size(); i++) {
+    auto &raw = value_block.AppendNewInst(
+        ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(i * 4u), Value(0u), Value(true)});
+    raw.SetFlags(MemoryFlags{.index = 0, .pc = 0x40 + i * 4u});
+    program.srt_reads.push_back({Value(&raw), i});
+    flat[i] = Value(&value_block.AppendNewInst(ValueOpcode::ReadConst,
+                                               {Value(&srt), Value(i)}));
+  }
+  auto &user_data = value_block.AppendNewInst(
+      ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(0))});
+  auto &sum = value_block.AppendNewInst(ValueOpcode::IAdd32,
+                                        {flat[0], Value(&user_data)});
+  auto &shifted = value_block.AppendNewInst(
+      ValueOpcode::ShiftLeftLogical32, {Value(&user_data), Value(4u)});
+  auto &records =
+      value_block.AppendNewInst(ValueOpcode::IAdd32, {flat[2], Value(&shifted)});
+  DescriptorSource source;
+  source.dwords[0] = Value(&sum);
+  source.dwords[1] = flat[1];
+  source.dwords[2] = Value(&records);
+  source.dwords[3] = flat[3];
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  return ExtractResourcePlan(program);
+}
+
+void TestSealedPlanEvaluatesConcurrently() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const std::array<uint32_t, 4> first_table{0x10000u, 0x00100000u, 0x40u,
+                                            0x00027facu};
+  const std::array<uint32_t, 4> second_table{0x20000u, 0x00200000u, 0x80u,
+                                             0x00027facu};
+  const std::array<ResourcePlan, 2> plans{
+      SharedEvaluationPlan(first_table.data()),
+      SharedEvaluationPlan(second_table.data())};
+  const std::array<uint32_t, 2> counts{plans[0].evaluation_value_count,
+                                       plans[1].evaluation_value_count};
+  Check(plans[0].evaluation_sealed && plans[1].evaluation_sealed,
+        "extracted resource plan was not sealed");
+  Check(counts[0] == plans[0].value_storage.size(),
+        "sealing did not assign every memo slot");
+
+  constexpr std::array<uint32_t, 3> user_values{7u, 0x100u, 0xfffffff0u};
+  struct Result {
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+  };
+  const auto run = [&](size_t plan, uint32_t user, EvaluationScratch *scratch,
+                       Result &result) {
+    const std::array<uint32_t, 1> user_data{user_values[user]};
+    const SrtRuntime runtime{.user_data = user_data};
+    return scratch != nullptr
+               ? MaterializeResources(plans[plan], runtime, *scratch,
+                                      result.snapshot, result.specialization)
+               : MaterializeResources(plans[plan], runtime, result.snapshot,
+                                      result.specialization);
+  };
+  const auto same = [](const Result &left, const Result &right) {
+    return left.snapshot.flattened_srt == right.snapshot.flattened_srt &&
+           left.snapshot.buffers == right.snapshot.buffers &&
+           left.snapshot.user_data == right.snapshot.user_data &&
+           left.specialization == right.specialization;
+  };
+
+  // Serial reference results, each from a fresh scratch.
+  std::array<std::array<Result, user_values.size()>, 2> expected;
+  for (size_t plan = 0; plan < plans.size(); plan++) {
+    for (size_t user = 0; user < user_values.size(); user++) {
+      EvaluationScratch scratch;
+      Check(run(plan, static_cast<uint32_t>(user), &scratch,
+                expected[plan][user]),
+            "serial shared-plan materialization failed");
+    }
+  }
+  // Every case differs, so a stale memo entry from another plan or user-data
+  // set in a reused scratch would produce a detectable mismatch.
+  Check(expected[0][0].snapshot.flattened_srt !=
+                expected[1][0].snapshot.flattened_srt &&
+            expected[0][0].snapshot.buffers != expected[0][1].snapshot.buffers &&
+            expected[0][1].snapshot.buffers != expected[0][2].snapshot.buffers,
+        "shared-plan cases are not distinguishable");
+
+  // Half the workers own a scratch; the others use their thread's default one.
+  // Each worker alternates plans and user data on the same scratch.
+  constexpr uint32_t ThreadCount = 6;
+  constexpr uint32_t Iterations = 2000;
+  std::atomic<uint32_t> failures{0};
+  std::vector<std::thread> threads;
+  for (uint32_t thread = 0; thread < ThreadCount; thread++) {
+    threads.emplace_back([&, thread] {
+      EvaluationScratch owned;
+      auto *scratch = thread % 2u == 0u ? &owned : nullptr;
+      for (uint32_t i = 0; i < Iterations; i++) {
+        const auto plan = (i + thread) % plans.size();
+        const auto user = (i / 2u + thread) % user_values.size();
+        Result result;
+        if (!run(plan, static_cast<uint32_t>(user), scratch, result) ||
+            !same(result, expected[plan][user])) {
+          failures.fetch_add(1u, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+  for (auto &thread : threads) {
+    thread.join();
+  }
+  Check(failures.load() == 0,
+        "concurrent shared-plan materialization differed from serial");
+  Check(plans[0].evaluation_value_count == counts[0] &&
+            plans[1].evaluation_value_count == counts[1],
+        "evaluation assigned memo slots on a sealed plan");
+}
+
 void TestMappedSrtUsesDirectReaderByDefault() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
@@ -264,6 +405,7 @@ int main() {
   TestUnbasedFlatCacheHitMaterializes();
   TestFailedMaterializationRejectsStage();
   TestMixedSamplerDuplicatesTheCorrectSnapshot();
+  TestSealedPlanEvaluatesConcurrently();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

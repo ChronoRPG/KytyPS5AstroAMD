@@ -122,10 +122,16 @@ public:
 	[[nodiscard]] Block*                  Parent() const;
 	[[nodiscard]] const std::vector<Use>& Uses() const;
 	// Runtime indices belong to the resource plan that owns this instruction.
+	// Lazy assignment is for plan construction and unsealed, single-threaded programs.
 	[[nodiscard]] uint32_t EvaluationIndex(uint32_t& count) const {
 		if (evaluation_index == UINT32_MAX) {
 			evaluation_index = count++;
 		}
+		return evaluation_index;
+	}
+	// A sealed plan assigned every index at extraction; reading one never writes.
+	[[nodiscard]] uint32_t SealedEvaluationIndex() const {
+		EXIT_IF(evaluation_index == UINT32_MAX);
 		return evaluation_index;
 	}
 
