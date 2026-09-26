@@ -71,7 +71,8 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer:
 		case BindingKind::FlattenedSrt:
-		case BindingKind::ShaderData: return vk::DescriptorType::eStorageBuffer;
+		case BindingKind::ShaderData:
+		case BindingKind::MipStats: return vk::DescriptorType::eStorageBuffer;
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
 	EXIT("invalid native descriptor binding kind");
@@ -901,6 +902,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
 	}
+	// GET_LOD_STATS counter id per image: T# MipStatsCntEn (dword 5 bit 25) and MipStatsCntId
+	// (dword 6 bits 0..7); 0xffff when statistics are disabled for the texture.
+	for (uint32_t i = 0; i < layout.mip_stats_count; i++) {
+		const auto& words = snapshot.images.at(i).dwords;
+		const uint32_t id = ((words[5] >> 25u) & 1u) != 0u ? (words[6] & 0xffu) : 0xffffu;
+		prepared.shader_data[layout.MipStatsOffsetDword() + i / 2u] |= id << ((i & 1u) * 16u);
+	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		prepared.flattened_srt = UploadShaderData(snapshot.flattened_srt);
@@ -1132,6 +1140,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						                             : cache.GetFaultBuffer();
 						m_descriptor_buffers.emplace_back(bda_buffer->Handle(), 0,
 						                                  bda_buffer->Size());
+						break;
+					}
+					case BindingKind::MipStats: {
+						auto& counters = m_context.GetLodStats().CounterBuffer();
+						m_descriptor_buffers.emplace_back(counters.Handle(), 0, counters.Size());
 						break;
 					}
 					case BindingKind::FlattenedSrt:

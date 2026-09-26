@@ -554,6 +554,68 @@ spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
 
 } // namespace
 
+// GET_LOD_STATS feedback. The per-draw shader data holds each image's mip-statistics counter
+// id (16 bits, 0xffff when the T# has MipStatsCntEn clear). The mip_stats buffer holds 257
+// finest-mip words followed by 257 sample counts; entry 256 absorbs images without a counter.
+// The id is uniform per draw, so one atomic pair per subgroup records the subgroup minimum.
+void EmitMipStatsRecord(EmitterState& state, uint32_t resource, uint32_t lod) {
+	if (state.mip_stats_variable == 0 || resource >= state.program.bindings.mip_stats_count) {
+		return;
+	}
+	constexpr uint32_t Entries = 257;
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
+	auto id = EmitShaderDataDwordLoad(state,
+	                                  state.program.bindings.MipStatsOffsetDword() + resource / 2u);
+	if ((resource & 1u) != 0u) {
+		id = Binary(state, spv::OpShiftRightLogical, TypeU32(state), id, ConstantU32(state, 16));
+	}
+	id = Binary(state, spv::OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 0xffff));
+	const auto has_counter =
+	    Binary(state, spv::OpULessThan, TypeBool(state), id, ConstantU32(state, Entries - 1u));
+	const auto slot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), slot, has_counter, id,
+	                          ConstantU32(state, Entries - 1u));
+
+	// Finest level this sample wanted: floor of the unclamped LOD, limited to 0..14.
+	const auto clamped = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
+	                          GLSLstd450FClamp, lod, ConstantF32Value(state, 0.0f),
+	                          ConstantF32Value(state, 14.0f));
+	const auto floored = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floored, GlslStd450(state),
+	                          GLSLstd450Floor, clamped);
+	const auto level = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), level, floored);
+	const auto finest = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformUMin, TypeU32(state), finest,
+	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
+	                          level);
+	const auto elected = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformElect, TypeBool(state), elected,
+	                          ConstantU32(state, spv::ScopeSubgroup));
+	EmitIfCondition(state, elected, [&]() {
+		const auto Element = [&](uint32_t index) {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+			                          pointer, state.mip_stats_variable, ConstantU32(state, 0),
+			                          index);
+			return pointer;
+		};
+		const auto min_result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicUMin, TypeU32(state), min_result, Element(slot),
+		                          ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone), finest);
+		const auto count_index =
+		    Binary(state, spv::OpIAdd, TypeU32(state), slot, ConstantU32(state, Entries));
+		const auto add_result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), add_result,
+		                          Element(count_index), ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+		                          ConstantU32(state, 1));
+	});
+}
+
 void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op         = inst.GetOpcode();
 	const auto image_info = IR::ImageOpcodeInfoOf(op);
@@ -768,6 +830,29 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				sample_operands.insert(sample_operands.end(), operands.begin(), operands.end());
 			}
 			state.builder.AddFunction(opcode, sample_operands);
+			if (state.mip_stats_variable != 0) {
+				uint32_t lod = ZeroF32(state);
+				if (HasFlag(mem, Decoder::ImageSampleFlagLevelZero)) {
+					// Level 0 explicitly.
+				} else if (HasFlag(mem, Decoder::ImageSampleFlagLod) &&
+				           layout.lod != NoImageComponent) {
+					lod = AddressF32(ctx, mem, *address, layout.lod);
+				} else {
+					// Implicit or gradient sampling: the unclamped LOD (before MIN_LOD and the
+					// resident range), which is what the streamer needs to know.
+					state.builder.RequireCapability(spv::CapabilityImageQuery);
+					const auto query = state.builder.AllocateId();
+					state.builder.AddFunction(
+					    spv::OpImageQueryLod, TypeF32Vector(state, 2), query, sampled,
+					    CoordF32(ctx, mem, *address, layout.coord,
+					             ImageDimensionInfoFor(candidate.dimension).spatial_components,
+					             candidate.cube));
+					lod = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), lod, query,
+					                          1u);
+				}
+				EmitMipStatsRecord(state, resource, lod);
+			}
 			return sample;
 		};
 		if (image.indirect_root != mem.resource) {

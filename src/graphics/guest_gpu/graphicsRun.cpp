@@ -1133,6 +1133,12 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
 }
 
+void CommandProcessor::ReportLodStats(uint64_t destination, uint32_t size, uint32_t control) {
+	(void)CurrentBuffer(); // the report is recorded at this command position
+	Common::LockGuard lock(m_renderer.GetMutex());
+	m_renderer.GetLodStats().Report(destination, size, control);
+}
+
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;

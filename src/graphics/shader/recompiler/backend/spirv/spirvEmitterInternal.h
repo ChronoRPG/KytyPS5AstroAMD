@@ -98,6 +98,7 @@ struct EmitterState {
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
+	uint32_t                                         mip_stats_variable           = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};

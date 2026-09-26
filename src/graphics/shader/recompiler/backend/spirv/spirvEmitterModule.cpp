@@ -222,6 +222,9 @@ void DefineDescriptors(EmitterState& state) {
 				state.shader_data_storage_variable =
 				    Define(StorageBufferType(state), "shader_data");
 				break;
+			case IR::DescriptorBindingKind::MipStats:
+				state.mip_stats_variable = Define(StorageBufferType(state), "mip_stats");
+				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
 				state.flattened_srt_variable = Define(StorageBufferType(state), "flattened_srt");
 				break;

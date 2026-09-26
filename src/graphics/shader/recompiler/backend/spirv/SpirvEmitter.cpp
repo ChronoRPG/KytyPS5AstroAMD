@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 
 #include <algorithm>
 #include <array>
@@ -89,6 +90,10 @@ void ValidateNativeProgram(const IR::Program& program) {
 	if (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData()) {
 		Expect(Kind::ShaderData);
 	}
+	const bool mip_stats = IR::UsesMipStats(program);
+	if (mip_stats) {
+		Expect(Kind::MipStats);
+	}
 
 	std::array<bool, KindCount> seen {};
 	for (const auto& binding: program.bindings.descriptors) {
@@ -110,6 +115,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
 	    program.bindings.memory_offset_count != program.info.buffers.size() ||
+	    program.bindings.mip_stats_count != (mip_stats ? program.info.images.size() : 0u) ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
 	                    program.bindings.user_data_registers.end()) ||

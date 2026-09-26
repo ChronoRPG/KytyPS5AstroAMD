@@ -1377,15 +1377,22 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	HangTrace::DisarmLodReportWatch();
 	HangTrace::RecordLodStats(dst, buffer_size, buffer[3]);
 
-	// GET_LOD_STATS writes a mip-statistics report. Kyty does not collect per-texture mip usage
-	// yet. Astro Bot's streamer (eboot+0x7022f24) treats a non-zero first dword as "report valid"
-	// and only then parses the counters; a zeroed report means "no data yet" and it keeps its
-	// previous streaming decisions. The old placeholder (zero counters plus 1 in dword 0) declared
-	// every texture unused and made the streamer evict and re-stream textures continuously.
-	// KYTY_LOD_STATS_MODE (read once): zero (default), legacy, untouched, ones.
+	// GET_LOD_STATS writes a mip-statistics report: a 64-byte header whose first dword marks it
+	// valid, then one 64-bit entry per T# counter (sample count in bits 0..23, finest mip in
+	// bits 56..59, 0xF when unsampled). Astro Bot's streamer (eboot+0x479d40 / +0x7021175) moves
+	// each texture's desired detail to the reported mip and lets unsampled textures decay.
+	// KYTY_LOD_STATS_MODE (read once):
+	//   gpu (default) real statistics from instrumented pixel shaders (LodStatsCounter)
+	//   zero          "no data yet": no thrash, but textures decay to low detail
+	//   legacy        old placeholder: every texture wants mip 0, which thrashes the streamer
+	//   untouched / ones  diagnostics
 	static const int lod_mode = [] {
 		const auto* mode = std::getenv("KYTY_LOD_STATS_MODE");
-		if (mode != nullptr && std::strcmp(mode, "legacy") == 0) {
+		if (mode == nullptr || mode[0] == 0 || std::strcmp(mode, "gpu") == 0) {
+			std::printf("GET_LOD_STATS mode: gpu\n");
+			return 4;
+		}
+		if (std::strcmp(mode, "legacy") == 0) {
 			std::printf("GET_LOD_STATS mode: legacy\n");
 			return 0;
 		}
@@ -1400,7 +1407,9 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 		return 1;
 	}();
 
-	if (dst != nullptr && buffer_size != 0 && lod_mode != 2) {
+	if (lod_mode == 4) {
+		cp.ReportLodStats(reinterpret_cast<uint64_t>(dst), buffer_size, buffer[3]);
+	} else if (dst != nullptr && buffer_size != 0 && lod_mode != 2) {
 		memset(dst, lod_mode == 3 ? 0xff : 0, buffer_size);
 		if ((lod_mode == 0 || lod_mode == 3) && buffer_size >= sizeof(uint32_t)) {
 			auto* label = static_cast<uint32_t*>(dst);

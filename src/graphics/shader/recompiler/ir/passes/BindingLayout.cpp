@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <cstring>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -69,6 +71,24 @@ bool UsesGds(const Program& program) {
 
 } // namespace
 
+bool UsesMipStats(const Program& program) {
+	static const bool enabled = [] {
+		const auto* mode = std::getenv("KYTY_LOD_STATS_MODE");
+		return mode == nullptr || mode[0] == 0 || std::strcmp(mode, "gpu") == 0;
+	}();
+	if (!enabled || program.stage != ShaderType::Pixel || program.info.images.empty()) {
+		return false;
+	}
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
@@ -79,6 +99,8 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	next.user_data_registers = CollectUserData(program);
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
 	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
+	const bool mip_stats     = UsesMipStats(program);
+	next.mip_stats_count     = mip_stats ? static_cast<uint32_t>(program.info.images.size()) : 0u;
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
@@ -141,6 +163,9 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 
 	if (next.ShaderDataDwords() != 0 && !next.UsesPushData()) {
 		AddBinding(next, DescriptorBindingKind::ShaderData);
+	}
+	if (mip_stats) {
+		AddBinding(next, DescriptorBindingKind::MipStats);
 	}
 
 	program.bindings                = std::move(next);
