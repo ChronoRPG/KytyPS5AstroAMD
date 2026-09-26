@@ -30,6 +30,7 @@ public:
 	[[nodiscard]] bool HasUnpublishedDumps() const noexcept {
 		return m_published.load(std::memory_order_acquire) != m_issued;
 	}
+	[[nodiscard]] bool Active() const noexcept { return m_active; }
 private:
 	static constexpr uint32_t PublishSlots    = 1024;
 	static constexpr uint64_t PublishSlotSize = 256;
@@ -51,6 +52,7 @@ private:
 	bool m_prepared = false;
 	bool m_active = false;
 	uint32_t m_pending = 0;
+	uint32_t m_scopes_since_dump = 0; // hang-trace diagnostics only
 };
 }
 #endif

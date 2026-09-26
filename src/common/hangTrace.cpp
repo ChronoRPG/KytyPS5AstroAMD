@@ -254,8 +254,14 @@ struct Files {
 	std::FILE* readbacks     = nullptr;
 	std::FILE* images        = nullptr;
 	std::FILE* lodwatch      = nullptr;
+	std::FILE* occlusion     = nullptr;
 };
 Files g_files;
+
+constexpr uint64_t       kOcclusionRowLimit = 2'000'000;
+std::mutex               g_occlusion_mutex;
+std::vector<std::string> g_pending_occlusion_rows;
+uint64_t                 g_occlusion_rows_total = 0;
 
 void UpdateMax(std::atomic<uint64_t>& target, uint64_t value) {
 	auto current = target.load(std::memory_order_relaxed);
@@ -488,6 +494,12 @@ void Publish() {
 	WriteRows(g_files.readbacks, rows);
 
 	{
+		std::scoped_lock lock(g_occlusion_mutex);
+		rows.swap(g_pending_occlusion_rows);
+	}
+	WriteRows(g_files.occlusion, rows);
+
+	{
 		std::scoped_lock lock(g_image_mutex);
 		rows.swap(g_pending_image_rows);
 		for (const auto& [key, totals]: g_native_images) {
@@ -667,6 +679,9 @@ void Initialize() {
 	                             "t_ms,kind,vaddr,size,window_begin,window_size,downloaded,"
 	                             "duration_us,host_tid,thread,pc,stack_callers,last_gpu_writer,"
 	                             "last_gpu_write_age_ms,last_gpu_write_size");
+	g_files.occlusion = OpenFile("occlusion.csv",
+	                             "t_ms,event,address,value,scopes,width,height,colors,has_depth,"
+	                             "depth_format,condition,skip");
 	g_files.lodwatch  = OpenFile("lodwatch.csv",
 	                             "t_ms,report_seq,fault_vaddr,report_offset,access,pc,thread,"
 	                             "rax,rbx,rcx,rdx,rsi,rdi,rbp,rsp,r8,r9,r10,r11,r12,r13,r14,r15,"
@@ -1087,6 +1102,22 @@ void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64
 	}
 	g_readback_rows_total++;
 	g_pending_readback_rows.push_back(std::move(row));
+}
+
+void RecordOcclusion(const OcclusionEvent& event) {
+	if (!Enabled()) {
+		return;
+	}
+	auto row = fmt::format("{},{},0x{:x},{},{},{},{},{},{},{},{},{}", NowMs(), event.event,
+	                       event.address, event.value, event.scopes, event.width, event.height,
+	                       event.colors, event.has_depth ? 1 : 0, event.depth_format,
+	                       event.condition, event.skip ? 1 : 0);
+	std::scoped_lock lock(g_occlusion_mutex);
+	if (g_occlusion_rows_total >= kOcclusionRowLimit) {
+		return;
+	}
+	g_occlusion_rows_total++;
+	g_pending_occlusion_rows.push_back(std::move(row));
 }
 
 ScopedGpuWriteKind::ScopedGpuWriteKind(GpuWriteKind kind) : m_previous(g_gpu_write_kind) {

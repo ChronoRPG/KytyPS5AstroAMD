@@ -958,6 +958,15 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x01: m_predicate_skip = (value == 0); break;
 		default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
 	}
+	if (op == 0x01 && HangTrace::Enabled()) {
+		HangTrace::OcclusionEvent event;
+		event.event     = "predicate";
+		event.address   = reinterpret_cast<uint64_t>(address);
+		event.value     = value;
+		event.condition = condition;
+		event.skip      = m_predicate_skip;
+		HangTrace::RecordOcclusion(event);
+	}
 	if (op == 0x03) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1) < 128) {

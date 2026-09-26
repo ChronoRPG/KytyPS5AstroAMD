@@ -103,6 +103,26 @@ void SetReadbackKind(ReadbackKind kind);
 void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64_t window_size,
                     bool downloaded, uint64_t duration_ns);
 
+// occlusion.csv (KYTY_GPU_OCCLUSION=1): "scope" rows for each counted rendering scope (target
+// size, colour count, depth format), "dump" rows for each ZPASS_DONE dump (scopes counted since
+// the previous dump) and "predicate" rows for each SET_PREDICATION op 1 (sample delta, condition,
+// resulting skip). A predicate with value 0 whose dumps bracket counted scopes means the samples
+// were rejected; one bracketing no scopes means the draws never reached a counted scope.
+struct OcclusionEvent {
+	const char* event        = "";
+	uint64_t    address      = 0;
+	uint64_t    value        = 0;
+	uint32_t    scopes       = 0;
+	uint32_t    width        = 0;
+	uint32_t    height       = 0;
+	uint32_t    colors       = 0;
+	bool        has_depth    = false;
+	uint32_t    depth_format = 0;
+	uint32_t    condition    = 0;
+	bool        skip         = false;
+};
+void RecordOcclusion(const OcclusionEvent& event);
+
 // Which kind of recorded GPU write last marked a guest page GPU-owned (reported per readback).
 enum class GpuWriteKind : uint8_t { ShaderStorage, OcclusionDump, Fill, Copy };
 class ScopedGpuWriteKind {

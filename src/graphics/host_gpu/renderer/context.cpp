@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/hangTrace.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "common/threads.h"
@@ -190,6 +191,18 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Handle().beginRendering(rendering);
 	m_context.GetOcclusionCounter().Begin();
+	if (m_context.GetOcclusionCounter().Active() && HangTrace::Enabled()) {
+		const auto&               db = GetRegisters().GetDepthRenderTarget();
+		HangTrace::OcclusionEvent event;
+		event.event        = "scope";
+		event.address      = db.z_read_base_addr;
+		event.width        = state.width;
+		event.height       = state.height;
+		event.colors       = state.num_color_attachments;
+		event.has_depth    = depth_stencil.has_depth;
+		event.depth_format = static_cast<uint32_t>(db.z_info.format);
+		HangTrace::RecordOcclusion(event);
+	}
 	m_render_state = state;
 	m_rendering    = true;
 	++m_rendering_serial;

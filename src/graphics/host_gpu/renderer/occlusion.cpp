@@ -94,6 +94,7 @@ void OcclusionCounter::Begin() {
 	m_context.GetCommandScheduler().Current().Handle().beginQuery(m_pool, m_pending, vk::QueryControlFlagBits::ePrecise);
 	m_active = true;
 	m_prepared = false;
+	++m_scopes_since_dump;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionScopes);
 }
 
@@ -183,5 +184,14 @@ void OcclusionCounter::Dump(uint64_t address) {
 		m_published.fetch_add(1, std::memory_order_release);
 	});
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionDumps);
+	if (HangTrace::Enabled()) {
+		HangTrace::OcclusionEvent event;
+		event.event   = "dump";
+		event.address = address;
+		event.value   = m_issued;
+		event.scopes  = m_scopes_since_dump;
+		HangTrace::RecordOcclusion(event);
+	}
+	m_scopes_since_dump = 0;
 }
 }
