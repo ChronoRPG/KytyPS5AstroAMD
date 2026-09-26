@@ -422,7 +422,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	// Observe only dispatches that actually reached the native path. This reuses the
 	// already materialized descriptor/value proof and performs no guest-memory reads.
-	if (Profiler::DetailedEnabled() && TracyIsConnected) {
+	if (Profiler::DetailedEnabled() && tracy::ProfilerAvailable() && TracyIsConnected) {
 		ShaderBufferResource fill_descriptor;
 		uint32_t fill_value = 0;
 		uint64_t fill_size = 0;

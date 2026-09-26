@@ -60,7 +60,7 @@ std::atomic<uint32_t> g_dcc_diagnostic_messages {0};
 
 template <typename... Args>
 void TraceDccDiagnostic(const char* format, Args... args) {
-	if (!Profiler::DetailedEnabled() || !TracyIsConnected) return;
+	if (!Profiler::DetailedEnabled() || !tracy::ProfilerAvailable() || !TracyIsConnected) return;
 	constexpr uint32_t MaxMessages = 8192;
 	const auto ordinal = g_dcc_diagnostic_messages.fetch_add(1, std::memory_order_relaxed);
 	if (ordinal >= MaxMessages) {
@@ -1431,9 +1431,11 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			const bool native = TryMaterializeGpuDccClear(id, desc, metadata_base_layer);
 			if (!native) ++m_gpu_dcc_fallbacks;
 			if ((m_gpu_dcc_attempts & 255u) == 0) {
-				TracyPlot("DCC.NativeInspections", static_cast<double>(m_gpu_dcc_records));
-				TracyPlot("DCC.ReusedInspections", static_cast<double>(m_gpu_dcc_reuses));
-				TracyPlot("DCC.CpuFallbacks", static_cast<double>(m_gpu_dcc_fallbacks));
+				if (tracy::ProfilerAvailable()) {
+					TracyPlot("DCC.NativeInspections", static_cast<double>(m_gpu_dcc_records));
+					TracyPlot("DCC.ReusedInspections", static_cast<double>(m_gpu_dcc_reuses));
+					TracyPlot("DCC.CpuFallbacks", static_cast<double>(m_gpu_dcc_fallbacks));
+				}
 				LOGF("GPU DCC totals: requests=%" PRIu64 " native=%" PRIu64
 				     " reused=%" PRIu64 " CPU_fallback=%" PRIu64 "\n",
 				     m_gpu_dcc_attempts, m_gpu_dcc_records, m_gpu_dcc_reuses, m_gpu_dcc_fallbacks);
@@ -1441,7 +1443,7 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			if (native) return;
 		}
 		KYTY_PROFILER_DETAIL_BLOCK("DCC::Readback");
-		if (Profiler::DetailedEnabled() && TracyIsConnected) {
+		if (Profiler::DetailedEnabled() && tracy::ProfilerAvailable() && TracyIsConnected) {
 			static std::atomic<uint64_t> readback_count {0};
 			diagnostic_readback = readback_count.fetch_add(1, std::memory_order_relaxed) + 1u;
 			TraceDccDiagnostic(
