@@ -64,6 +64,16 @@ public:
 	}
 	void MarkGpuWritten(ImageId id);
 
+	// Content identity around an attachment binding (see Image::ContentSerial). Take a mark
+	// before FindDepthTarget; once the draw is known not to write the attachment, restoring it
+	// keeps the image's serial when nothing else (upload, copy, clear) wrote the image meanwhile.
+	struct ContentMark {
+		uint64_t serial          = 0;
+		uint64_t definite_writes = 0;
+	};
+	[[nodiscard]] ContentMark MarkContent(ImageId id);
+	void                      RestoreContentIfUnwritten(ImageId id, const ContentMark& mark);
+
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);

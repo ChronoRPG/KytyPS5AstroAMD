@@ -584,6 +584,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (owner == nullptr || !owner->registered || owner->binding.needs_rebind) {
 			EXIT("depth target changed after render-state discovery\n");
 		}
+		// FindDepthTarget treats the binding as a write. Restored below for draws that write
+		// neither aspect, so an alias synchronized from this image stays provably identical.
+		const auto  content_mark = cache.MarkContent(depth.image_id);
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		const auto& metadata   = depth.desc.info.metadata;
 		if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
@@ -601,6 +604,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto& image = cache.GetImage(depth.image_id);
 		EXIT_IF(image_view == nullptr || image.backing.samples != depth.desc.info.samples);
 		const auto draw_writes = depth.AttachmentWriteAspects();
+		if (!draw_writes) {
+			// Load-op LOAD, store-op STORE, no depth/stencil writes or clears: contents unchanged.
+			cache.RestoreContentIfUnwritten(depth.image_id, content_mark);
+		}
 		vk::ImageAspectFlags sampled_aspects;
 		for (const auto* stage: stages) {
 			for (const auto& binding: stage->images) {

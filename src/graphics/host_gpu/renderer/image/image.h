@@ -76,8 +76,13 @@ public:
 	// (Image copy/upload/resolve methods here, TextureCache::MarkImageGpuModified for draws,
 	// dispatches, clears and helper passes). A bit-exact copy from another image may adopt
 	// the source's serial afterwards: equal nonzero serials then prove equal native bits.
+	// NoteContentWrite: a write that is recorded (also counted in DefiniteWrites).
+	// NotePossibleWrite: a binding that may write (render/depth target, storage image); the
+	// caller can restore the previous serial once it knows the binding wrote nothing.
 	[[nodiscard]] uint64_t ContentSerial() const noexcept { return m_content_serial; }
+	[[nodiscard]] uint64_t DefiniteWrites() const noexcept { return m_definite_writes; }
 	void                   NoteContentWrite() noexcept;
+	void                   NotePossibleWrite() noexcept;
 	void AdoptContentSerial(uint64_t serial) noexcept { m_content_serial = serial; }
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
@@ -219,6 +224,7 @@ private:
 	bool              m_dirty_from_hash  = false;
 	bool              m_refreshed        = false;
 	uint64_t          m_content_serial   = 0;
+	uint64_t          m_definite_writes  = 0;
 	uint64_t          m_dirty_begin      = 0;
 	uint64_t          m_dirty_end        = 0;
 	uint32_t          m_uploads          = 0;

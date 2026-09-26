@@ -88,6 +88,11 @@ std::atomic<uint64_t> g_content_serial {0};
 } // namespace
 
 void Image::NoteContentWrite() noexcept {
+	m_definite_writes++;
+	NotePossibleWrite();
+}
+
+void Image::NotePossibleWrite() noexcept {
 	m_content_serial = g_content_serial.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 

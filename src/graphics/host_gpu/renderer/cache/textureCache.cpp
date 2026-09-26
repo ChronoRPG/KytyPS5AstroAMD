@@ -2220,6 +2220,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		rendering.pColorAttachments    = &attachment;
 		command.Handle().beginRendering(&rendering);
 		command.Handle().endRendering();
+		image.NoteContentWrite();
 		CommitGpuWrite(image);
 		return;
 	}
@@ -2238,6 +2239,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		                                        vk::ImageLayout::eTransferDstOptimal,
 		                                        &clear.depthStencil, 1, &native_range);
 	}
+	image.NoteContentWrite();
 	CommitGpuWrite(image);
 }
 
@@ -2495,7 +2497,26 @@ void TextureCache::MarkImageGpuModified(Image& image) {
 	image.MarkGpuModified();
 	// Every GPU writer (draw targets, storage bindings, clears, helper passes, copies) passes
 	// here before or right after recording its write: the native contents get a new identity.
-	image.NoteContentWrite();
+	image.NotePossibleWrite();
+}
+
+TextureCache::ContentMark TextureCache::MarkContent(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	const auto*      image = m_slot_images.try_get(id);
+	return image == nullptr ? ContentMark {}
+	                        : ContentMark {image->ContentSerial(), image->DefiniteWrites()};
+}
+
+void TextureCache::RestoreContentIfUnwritten(ImageId id, const ContentMark& mark) {
+	if (!AliasSyncSkipEnabled() || mark.serial == 0) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	auto*            image = m_slot_images.try_get(id);
+	// Only bind-time possible writes happened since the mark: no upload, copy or clear.
+	if (image != nullptr && image->DefiniteWrites() == mark.definite_writes) {
+		image->AdoptContentSerial(mark.serial);
+	}
 }
 
 bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {

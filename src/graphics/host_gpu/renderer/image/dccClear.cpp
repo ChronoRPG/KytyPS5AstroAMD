@@ -136,6 +136,7 @@ void DccClearHelper::Record(Image& image, vk::Buffer metadata, uint64_t metadata
 	view_info.format = vk::Format::eR16G16B16A16Sfloat;
 	view_info.usage = vk::ImageUsageFlagBits::eStorage;
 	const auto view = image.FindView(view_info);
+	image.NoteContentWrite();
 
 	m_scheduler.EndRendering();
 	const auto command = m_scheduler.Current().Handle();
