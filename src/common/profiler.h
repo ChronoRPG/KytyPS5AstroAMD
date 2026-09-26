@@ -138,6 +138,14 @@ enum class FrameEvent : uint32_t {
 	// KYTY_GPU_TIMING: command buffers without a usable timestamp pair (ring full, results
 	// unavailable, ambiguous wrap, or pending samples over capacity). Busy/idle exclude them.
 	GpuTimingDropped,
+	// TryReadGpuCleanBacking calls answered from (hits) or not fully from (misses) the
+	// per-page clean verdict cache; stores count 4 KiB pages newly proven clean.
+	CleanVerdictHits,
+	CleanVerdictMisses,
+	CleanVerdictStores,
+	// Direct-backing reads translated by the per-thread mapping cache without m_mutex.
+	BackingMapCacheHits,
+	BackingMapCacheMisses,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

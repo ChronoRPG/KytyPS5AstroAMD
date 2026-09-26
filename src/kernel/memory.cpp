@@ -8,6 +8,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -875,13 +876,37 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+// The exact GPU-ownership predicates of a clean backing read. GPU thread only.
+static bool IsGpuRangeCleanForBackingRead(uint64_t vaddr, uint64_t size) {
+	auto& resources = GetGpuResources();
+	return !resources.GetBufferCache().HasGpuDirtyBytes(vaddr, size) &&
+	       !resources.GetBufferCache().HasPendingBackingPublication(vaddr, size) &&
+	       !resources.GetTextureCache().IsRegionGpuModified(vaddr, size);
+}
+
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-		if (!Graphics::GuestGpu::IsGpuThread() ||
-		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
-		    GetGpuResources().GetBufferCache().HasPendingBackingPublication(vaddr, size) ||
-		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread()) {
 			return false;
+		}
+		namespace CleanVerdict = Graphics::CleanVerdict;
+		if (!CleanVerdict::Enabled()) {
+			if (!IsGpuRangeCleanForBackingRead(vaddr, size)) {
+				return false;
+			}
+		} else {
+			// Only the ownership verdict is cached; the bytes below are still read fresh.
+			static thread_local CleanVerdict::Table verdicts;
+			const auto result =
+			    CleanVerdict::Query(verdicts, vaddr, size, IsGpuRangeCleanForBackingRead);
+			Profiler::CountFrameEvent(result.hit ? Profiler::FrameEvent::CleanVerdictHits
+			                                     : Profiler::FrameEvent::CleanVerdictMisses);
+			if (result.stores != 0) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::CleanVerdictStores, result.stores);
+			}
+			if (!result.clean) {
+				return false;
+			}
 		}
 	}
 	return TryReadBacking(vaddr, data, size);

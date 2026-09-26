@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
@@ -72,6 +73,9 @@ public:
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
+		if constexpr (clear) {
+			CleanVerdict::Invalidate();
+		}
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);
 			const auto       address = manager->GetCpuAddr() + offset;
@@ -99,6 +103,8 @@ public:
 			}
 		});
 		upload_func();
+		// No clean-verdict bump: these GPU bits are not read by clean-read verdicts, and the
+		// only writer (BufferCache::ObtainBuffer) bumps when it adds the exact dirty range.
 		if (is_written) {
 			Iterate<false>(vaddr, size,
 			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {

@@ -1925,6 +1925,77 @@ void TestDirectMapUnmapReusesHostAddress() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// Backing reads may translate through a per-thread mapping cache. A remap of the same guest
+// address to other physical memory must retire it, and an unmapped range must stay unreadable.
+void TestBackingReadCacheFollowsRemap() {
+	const char* test = "BackingReadCacheFollowsRemap";
+
+	int64_t first_phys = 0;
+	int64_t second_phys = 0;
+	const auto direct_size = Libs::LibKernel::Memory::KernelGetDirectMemorySize();
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, direct_size, SceKernelPageSize, SceKernelPageSize,
+	            SceKernelMtypeC, &first_phys),
+	        "KernelAllocateDirectMemory(first)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, direct_size, SceKernelPageSize, SceKernelPageSize,
+	            SceKernelMtypeC, &second_phys),
+	        "KernelAllocateDirectMemory(second)");
+
+	void* address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(&address, SceKernelPageSize,
+	                                                            SceKernelProtCpuRw, 0, first_phys,
+	                                                            SceKernelPageSize, "cache_first"),
+	        "KernelMapNamedDirectMemory(first)");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	constexpr uint64_t first_value  = 0x4649525354424b47ull;
+	constexpr uint64_t second_value = 0x5345434f4e44424bull;
+	Check(test,
+	      Libs::LibKernel::Memory::TryWriteBacking(base + 0x40, &first_value, sizeof(first_value)),
+	      "TryWriteBacking(first)");
+	for (int read = 0; read < 2; read++) {
+		uint64_t value = 0;
+		Check(test, Libs::LibKernel::Memory::TryReadBacking(base + 0x40, &value, sizeof(value)),
+		      "TryReadBacking(first)");
+		Check(test, value == first_value, "backing read did not return the first mapping");
+	}
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap(first)");
+	uint64_t rejected = second_value;
+	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base + 0x40, &rejected, sizeof(rejected)),
+	      "backing read resolved an unmapped range through a cached translation");
+	Check(test, rejected == second_value, "failed backing read modified its destination");
+
+	void* remap = reinterpret_cast<void*>(base);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &remap, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, second_phys,
+	            SceKernelPageSize, "cache_second"),
+	        "KernelMapNamedDirectMemory(second)");
+	Check(test, reinterpret_cast<uint64_t>(remap) == base, "fixed remap moved");
+	Check(test,
+	      Libs::LibKernel::Memory::TryWriteBacking(base + 0x40, &second_value, sizeof(second_value)),
+	      "TryWriteBacking(second)");
+	uint64_t value = 0;
+	Check(test, Libs::LibKernel::Memory::TryReadBacking(base + 0x40, &value, sizeof(value)),
+	      "TryReadBacking(second)");
+	Check(test, value == second_value, "backing read used a stale cached translation");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap(second)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(first_phys, SceKernelPageSize),
+	        "KernelReleaseDirectMemory(first)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(second_phys, SceKernelPageSize),
+	        "KernelReleaseDirectMemory(second)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFixedReserveReplacesPartialDirectMapping() {
 	const char*        test         = "FixedReserveReplacesPartialDirectMapping";
 	constexpr uint64_t page_count   = 13;
@@ -3150,6 +3221,7 @@ int main(int argc, char** argv) {
 	RunTest(TestHintlessDirectMapUsesCanonicalGuestBase);
 	RunTest(TestDirectMemoryContentPersistsAcrossRemap);
 	RunTest(TestDirectMapUnmapReusesHostAddress);
+	RunTest(TestBackingReadCacheFollowsRemap);
 	RunTest(TestFixedReserveReplacesPartialDirectMapping);
 	RunTest(TestFixedReserveRollbackConsumesRestoredPlaceholder);
 	RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);
