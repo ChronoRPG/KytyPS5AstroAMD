@@ -213,13 +213,33 @@ private:
 		std::vector<uint32_t> words;
 	};
 	std::array<ShaderUploadEntry, 64> m_shader_uploads;
+	// The ImageResource fields BuildTextureDescription reads. The shader-specific identity
+	// (source slot, first use pc, indirect-image tables) is excluded, so one texture bound from
+	// different shaders shares an entry.
+	struct TextureDescriptionKey {
+		ShaderRecompiler::IR::ImageResourceClass resource_class {};
+		Prospero::TextureNumericClass            numeric_class {};
+		ShaderRecompiler::Decoder::ImageDimension dimension {};
+		ShaderRecompiler::IR::ImageMipMode       mip_mode {};
+		uint32_t                                 mip_count         = 0;
+		Prospero::BufferFormat                   conversion_format {};
+		uint32_t                                 shader_swizzle    = 0;
+		bool                                     read              = false;
+		bool                                     written           = false;
+		bool                                     atomic            = false;
+		bool                                     depth_compare     = false;
+		bool                                     cube              = false;
+		bool                                     r128              = false;
+
+		bool operator==(const TextureDescriptionKey&) const = default;
+	};
 	struct TextureDescriptionEntry {
 		bool valid = false;
-		ShaderRecompiler::IR::ImageResource resource;
+		TextureDescriptionKey key;
 		std::array<uint32_t, 8> words {};
 		TextureCache::ImageDesc desc;
 	};
-	std::array<TextureDescriptionEntry, 256> m_texture_descriptions;
+	std::array<TextureDescriptionEntry, 4096> m_texture_descriptions;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

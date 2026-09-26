@@ -692,15 +692,27 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	TextureCache::ImageDesc desc;
 	if (Common::RendererBatchEnabled() && resource.indirect_resources.size() <= 256u) {
-		const auto hash = XXH3_64bits(descriptor.fields, sizeof(descriptor.fields));
+		const TextureDescriptionKey key {resource.resource_class, resource.numeric_class,
+		                                 resource.dimension,      resource.mip_mode,
+		                                 resource.mip_count,      resource.conversion_format,
+		                                 resource.shader_swizzle, resource.read,
+		                                 resource.written,        resource.atomic,
+		                                 resource.depth_compare,  resource.cube,
+		                                 resource.r128};
+		const auto hash =
+		    XXH3_64bits_withSeed(descriptor.fields, sizeof(descriptor.fields),
+		                         (static_cast<uint64_t>(key.dimension) << 32u) ^
+		                             (static_cast<uint64_t>(key.numeric_class) << 16u) ^
+		                             (key.written ? 1u : 0u) ^ (key.depth_compare ? 2u : 0u) ^
+		                             (static_cast<uint64_t>(key.mip_mode) << 8u));
 		auto& entry = m_texture_descriptions[hash % m_texture_descriptions.size()];
-		if (entry.valid && entry.resource == resource &&
+		if (entry.valid && entry.key == key &&
 		    std::ranges::equal(entry.words, descriptor.fields)) {
 			desc = entry.desc;
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureDescriptionHits);
 		} else {
 			desc = BuildTextureDescription(resource, descriptor);
-			entry.resource = resource;
+			entry.key = key;
 			std::ranges::copy(descriptor.fields, entry.words.begin());
 			entry.desc = desc;
 			entry.valid = true;
