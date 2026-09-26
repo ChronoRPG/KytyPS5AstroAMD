@@ -135,6 +135,7 @@ private:
 	void                      FreeImage(ImageId id, HangTrace::ImageFreeReason reason =
 	                                                    HangTrace::ImageFreeReason::Other);
 	void                      TouchImage(Image& image);
+	void                      SyncAliasFromOwner(ImageId id);
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);
 	void                      TrackImageTail(ImageId id);

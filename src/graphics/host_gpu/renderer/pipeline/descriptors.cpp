@@ -914,11 +914,14 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
 	}
-	// GET_LOD_STATS counter id per image: T# MipStatsCntEn (dword 5 bit 25) and MipStatsCntId
-	// (dword 6 bits 0..7); 0xffff when statistics are disabled for the texture.
+	// GET_LOD_STATS counter per image, 16 bits: MipStatsCntId (T# dword 6 bits 0..7) in bits 0..7,
+	// BASE_LEVEL (dword 3 bits 12..15) in bits 8..11 so the shader reports absolute mip levels,
+	// and bit 15 set when MipStatsCntEn (dword 5 bit 25) is clear.
 	for (uint32_t i = 0; i < layout.mip_stats_count; i++) {
 		const auto& words = snapshot.images.at(i).dwords;
-		const uint32_t id = ((words[5] >> 25u) & 1u) != 0u ? (words[6] & 0xffu) : 0xffffu;
+		const uint32_t id = ((words[5] >> 25u) & 1u) != 0u
+		                        ? (words[6] & 0xffu) | (((words[3] >> 12u) & 0xfu) << 8u)
+		                        : 0x8000u;
 		prepared.shader_data[layout.MipStatsOffsetDword() + i / 2u] |= id << ((i & 1u) * 16u);
 	}
 	if (ShaderRecompiler::IR::FindBinding(

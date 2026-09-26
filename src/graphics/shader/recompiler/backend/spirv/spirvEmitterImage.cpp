@@ -570,17 +570,29 @@ void EmitMipStatsRecord(EmitterState& state, uint32_t resource, uint32_t lod) {
 	if ((resource & 1u) != 0u) {
 		id = Binary(state, spv::OpShiftRightLogical, TypeU32(state), id, ConstantU32(state, 16));
 	}
-	id = Binary(state, spv::OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 0xffff));
+	// 16-bit field: counter id in bits 0..7, T# BASE_LEVEL in bits 8..11, bit 15 = no counter.
+	const auto disabled = Binary(state, spv::OpBitwiseAnd, TypeU32(state), id,
+	                             ConstantU32(state, 0x8000u));
 	const auto has_counter =
-	    Binary(state, spv::OpULessThan, TypeBool(state), id, ConstantU32(state, Entries - 1u));
+	    Binary(state, spv::OpIEqual, TypeBool(state), disabled, ConstantU32(state, 0));
+	const auto counter =
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 0xffu));
 	const auto slot = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpSelect, TypeU32(state), slot, has_counter, id,
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), slot, has_counter, counter,
 	                          ConstantU32(state, Entries - 1u));
+	const auto base_level = Binary(
+	    state, spv::OpBitwiseAnd, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), id, ConstantU32(state, 8)),
+	    ConstantU32(state, 0xfu));
+	const auto base_f32 = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), base_f32, base_level);
+	// The query LOD is relative to the view's base level (T# BASE_LEVEL); report absolute mips.
+	const auto absolute = Binary(state, spv::OpFAdd, TypeF32(state), lod, base_f32);
 
 	// Finest level this sample wanted: floor of the unclamped LOD, limited to 0..14.
 	const auto clamped = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
-	                          GLSLstd450FClamp, lod, ConstantF32Value(state, 0.0f),
+	                          GLSLstd450FClamp, absolute, ConstantF32Value(state, 0.0f),
 	                          ConstantF32Value(state, 14.0f));
 	const auto floored = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floored, GlslStd450(state),
@@ -850,6 +862,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					lod = state.builder.AllocateId();
 					state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), lod, query,
 					                          1u);
+					// IMAGE_SAMPLE_B*: the shader bias adds to the computed LOD.
+					if (!explicit_lod && layout.bias != NoImageComponent) {
+						lod = Binary(state, spv::OpFAdd, TypeF32(state), lod,
+						             AddressF32(ctx, mem, *address, layout.bias));
+					}
 				}
 				EmitMipStatsRecord(state, resource, lod);
 			}

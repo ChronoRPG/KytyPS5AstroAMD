@@ -858,6 +858,24 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (!recreate) {
 		return cached_id;
 	}
+	// Guests reuse one allocation as depth and as color (e.g. D32F <-> R32F) every frame. Keep one
+	// image per interpretation alive and reuse it: FindImage copies the current owner's contents
+	// into a non-owner alias (SyncAliasFromOwner) instead of destroying and recreating images.
+	const bool keep_aliases = AliasAgeByFrames() && !(cached.info.resources < requested.resources);
+	if (keep_aliases) {
+		for (const auto other_id: FindImagesInRegion(requested.data.address, requested.data.size, false)) {
+			const auto* other = m_slot_images.try_get(other_id);
+			if (other == nullptr || other_id == cached_id || !other->registered || other->depth_id ||
+			    other->backing.samples != cached.backing.samples ||
+			    !SameBacking(other->info, requested, true)) {
+				continue;
+			}
+			if (cached.binding.is_bound || cached.binding.is_target) {
+				cached.binding.needs_rebind = true;
+			}
+			return other_id;
+		}
+	}
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
@@ -898,6 +916,15 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		LOGF_COLOR(Log::Color::BrightYellow,
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
+	}
+	if (keep_aliases && cached.backing.samples == replacement.backing.samples &&
+	    !cached.info.HasStencil() && !replacement.info.HasStencil()) {
+		// The replacement now holds the newest contents; the cached interpretation stays alive
+		// as a non-owner alias for the next switch back.
+		if (replacement.IsGpuModified()) {
+			CommitGpuWrite(replacement);
+		}
+		return replacement_id;
 	}
 	FreeImage(cached_id, HangTrace::ImageFreeReason::DepthRecreate);
 	return replacement_id;
@@ -1663,6 +1690,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		if (view_layer >= 0) {
 			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
 		}
+		SyncAliasFromOwner(result);
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
 	}
@@ -1827,6 +1855,29 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 		const auto stencil_id = AssociateStencil(id, image.info.stencil);
 		TrackImage(stencil_id);
 		CommitGpuWrite(m_slot_images[stencil_id]);
+	}
+}
+
+void TextureCache::SyncAliasFromOwner(ImageId id) {
+	auto& image = m_slot_images[id];
+	if (!AliasAgeByFrames() || image.alias_owner || image.depth_id || image.info.data.Empty() ||
+	    image.info.HasStencil() || image.backing.image == nullptr) {
+		return;
+	}
+	// A kept alias (same memory, another format) is stale when another interpretation wrote the
+	// memory since. Reinterpret the owner's contents, as the recreate path used to, and take over.
+	for (const auto other_id: FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
+		const auto* other = m_slot_images.try_get(other_id);
+		if (other_id == id || other == nullptr || !other->registered || other->depth_id ||
+		    !other->alias_owner || !other->IsGpuModified() || other->IsBufferModified() ||
+		    other->info.HasStencil() || other->info.data != image.info.data ||
+		    other->info.extent != image.info.extent ||
+		    other->backing.samples != image.backing.samples) {
+			continue;
+		}
+		CopyImage(id, other_id);
+		CommitGpuWrite(image);
+		return;
 	}
 }
 
