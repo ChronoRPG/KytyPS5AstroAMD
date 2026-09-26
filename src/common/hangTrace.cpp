@@ -1001,8 +1001,11 @@ void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64
 	const bool fault  = kind == ReadbackKind::FaultRead || kind == ReadbackKind::FaultWrite;
 	const auto pc     = fault && g_fault_context.pc != 0 ? FormatAddress(g_fault_context.pc) : std::string();
 	const auto thread = fault ? std::string_view(g_fault_context.thread) : std::string_view();
-	// Stack scanning only helps when a guest thread is on this stack (CPU faults).
-	const auto callers = fault ? CaptureGuestCallers() : std::string();
+	// Stack scanning only helps when a guest thread is on this stack (CPU faults). It costs a dozen
+	// VirtualQuery calls, so scan only the first few faults of each faulting instruction.
+	thread_local std::unordered_map<uint64_t, uint32_t> scanned_pcs;
+	const bool scan    = fault && scanned_pcs.size() < 4096 && scanned_pcs[g_fault_context.pc]++ < 4;
+	const auto callers = scan ? CaptureGuestCallers() : std::string();
 	auto row = fmt::format("{},{},0x{:x},{},0x{:x},{},{},{},{},{},{},{}", NowMs(),
 	                       kReadbackKindNames[static_cast<uint32_t>(kind)], vaddr, size, window_begin,
 	                       window_size, downloaded ? 1 : 0, duration_ns / 1000u, OsThreadId(),

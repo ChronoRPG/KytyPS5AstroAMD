@@ -1377,16 +1377,17 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	HangTrace::DisarmLodReportWatch();
 	HangTrace::RecordLodStats(dst, buffer_size, buffer[3]);
 
-	// KYTY_LOD_STATS_MODE (diagnostic A/B switch, read once):
-	//   legacy    (default) zero the report and write 1 into its first dword
-	//   zero      zero the whole report
-	//   untouched leave the guest buffer as the guest left it
-	//   ones      fill the report with 0xff bytes, then write 1 into its first dword
+	// GET_LOD_STATS writes a mip-statistics report. Kyty does not collect per-texture mip usage
+	// yet. Astro Bot's streamer (eboot+0x7022f24) treats a non-zero first dword as "report valid"
+	// and only then parses the counters; a zeroed report means "no data yet" and it keeps its
+	// previous streaming decisions. The old placeholder (zero counters plus 1 in dword 0) declared
+	// every texture unused and made the streamer evict and re-stream textures continuously.
+	// KYTY_LOD_STATS_MODE (read once): zero (default), legacy, untouched, ones.
 	static const int lod_mode = [] {
 		const auto* mode = std::getenv("KYTY_LOD_STATS_MODE");
-		if (mode != nullptr && std::strcmp(mode, "zero") == 0) {
-			std::printf("GET_LOD_STATS mode: zero\n");
-			return 1;
+		if (mode != nullptr && std::strcmp(mode, "legacy") == 0) {
+			std::printf("GET_LOD_STATS mode: legacy\n");
+			return 0;
 		}
 		if (mode != nullptr && std::strcmp(mode, "untouched") == 0) {
 			std::printf("GET_LOD_STATS mode: untouched\n");
@@ -1396,12 +1397,11 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 			std::printf("GET_LOD_STATS mode: ones\n");
 			return 3;
 		}
-		return 0;
+		return 1;
 	}();
 
 	if (dst != nullptr && buffer_size != 0 && lod_mode != 2) {
 		memset(dst, lod_mode == 3 ? 0xff : 0, buffer_size);
-		// Hack?
 		if ((lod_mode == 0 || lod_mode == 3) && buffer_size >= sizeof(uint32_t)) {
 			auto* label = static_cast<uint32_t*>(dst);
 			*label      = 1;
