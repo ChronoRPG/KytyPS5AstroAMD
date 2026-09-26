@@ -135,6 +135,9 @@ enum class FrameEvent : uint32_t {
 	NativeOcclusionReductions,
 	MeshRestartMarkers,
 	MeshRestartSegments,
+	// KYTY_GPU_TIMING: command buffers without a usable timestamp pair (ring full, results
+	// unavailable, ambiguous wrap, or pending samples over capacity). Busy/idle exclude them.
+	GpuTimingDropped,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
@@ -150,6 +153,20 @@ enum class FrameWait : uint32_t {
 	ResourceReuseValidation,
 	NativeImageCreate,
 	NativeImageDestroy,
+	// KYTY_GPU_TIMING (GpuTiming::OnGuestFlip), added once per guest flip. These are GPU
+	// timeline spans, not CPU scopes. GpuBusy: calls = timed command buffers, time = union of
+	// their [top-of-pipe, all-commands] spans. GpuIdle: calls = gaps between merged spans
+	// (including the gap after the previous flip's last span), time = their sum. GpuStarved: the
+	// part of those gaps before the next buffer's vkQueueSubmit returned. GpuRecordToStart /
+	// GpuDispatchToStart / GpuEndToObserved: calls = calibrated samples, time = summed latency
+	// from recording start / native submit to GPU start, and from GPU end to CPU collection.
+	// Latencies and GpuStarved need VK_KHR/EXT_calibrated_timestamps.
+	GpuBusy,
+	GpuIdle,
+	GpuStarved,
+	GpuRecordToStart,
+	GpuDispatchToStart,
+	GpuEndToObserved,
 	Count,
 };
 
@@ -176,6 +193,10 @@ private:
 	uint64_t m_connection = 0;
 	bool m_active = false;
 };
+
+// Adds externally measured totals (the GPU timeline entries above) with the same gating as
+// ScopedFrameWait: aggregate diagnostics enabled and a connected profiler.
+void AddFrameWait(FrameWait kind, uint64_t calls, uint64_t nanoseconds);
 
 // Call immediately after the existing completed guest-flip marker. Snapshots
 // include workload and wait totals, and are cumulative so an on-demand connection

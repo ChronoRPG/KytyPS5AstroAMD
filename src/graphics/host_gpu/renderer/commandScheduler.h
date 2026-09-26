@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 
 #include <queue>
@@ -16,12 +17,17 @@
 
 namespace Libs::Graphics {
 
+class GpuTimestampRing;
+
 class CommandScheduler {
 public:
 	// Diagnostic attribution only; both kinds retain the same completion boundary.
 	enum class PriorityOperationKind { Generic, EopInterrupt };
+	// Only the guest scheduler carries KYTY_GPU_TIMING timestamps. Presenter submissions wait on
+	// image acquisition at the transfer stage, so their top-of-pipe spans would include that wait.
+	enum class Role { Guest, Presenter };
 
-	CommandScheduler(RenderContext& context, GraphicContext& graphics);
+	CommandScheduler(RenderContext& context, GraphicContext& graphics, Role role);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
@@ -108,6 +114,8 @@ private:
 	// Aggregate tracing reasons, guarded by m_operation_mutex. They never affect submission.
 	bool                         m_diagnostic_eop_completion     = false;
 	bool                         m_diagnostic_generic_completion = false;
+	// KYTY_GPU_TIMING ring; null when disabled. Owned by the recording producer, like m_command.
+	std::unique_ptr<GpuTimestampRing> m_gpu_timing;
 };
 
 } // namespace Libs::Graphics

@@ -220,6 +220,15 @@ struct Totals {
 	std::atomic<uint64_t> image_frees {0};
 	std::atomic<uint64_t> native_creates {0};
 	std::atomic<uint64_t> native_create_bytes {0};
+	std::atomic<uint64_t> gpu_busy_ns {0};
+	std::atomic<uint64_t> gpu_idle_ns {0};
+	std::atomic<uint64_t> gpu_max_gap_ns {0};
+	std::atomic<uint64_t> gpu_starved_ns {0};
+	std::atomic<uint64_t> gpu_cmdbufs {0};
+	std::atomic<uint64_t> gpu_latency_samples {0};
+	std::atomic<uint64_t> gpu_record_latency_ns {0};
+	std::atomic<uint64_t> gpu_dispatch_latency_ns {0};
+	std::atomic<uint64_t> gpu_dropped {0};
 };
 Totals g_totals;
 
@@ -562,6 +571,18 @@ void Publish() {
 		                    take(g_totals.readback_ns) / 1000u, take(g_totals.readback_downloads),
 		                    take(g_totals.image_frees), take(g_totals.native_creates),
 		                    take(g_totals.native_create_bytes));
+		// Appended GPU timeline columns; keep them last so older column indices stay valid.
+		const auto gpu_samples = take(g_totals.gpu_latency_samples);
+		const auto gpu_record  = take(g_totals.gpu_record_latency_ns);
+		const auto gpu_dispatch = take(g_totals.gpu_dispatch_latency_ns);
+		line += fmt::format(",{},{},{},{},{},{},{},{}", take(g_totals.gpu_busy_ns) / 1000u,
+		                    take(g_totals.gpu_cmdbufs),
+		                    gpu_samples != 0 ? gpu_record / gpu_samples / 1000u : 0,
+		                    take(g_totals.gpu_idle_ns) / 1000u,
+		                    take(g_totals.gpu_max_gap_ns) / 1000u,
+		                    take(g_totals.gpu_starved_ns) / 1000u,
+		                    gpu_samples != 0 ? gpu_dispatch / gpu_samples / 1000u : 0,
+		                    take(g_totals.gpu_dropped));
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
@@ -630,6 +651,8 @@ void Initialize() {
 	}
 	summary_header += ",readbacks,readback_us,readback_downloads,image_frees,native_creates,"
 	                  "native_create_bytes";
+	summary_header += ",gpu_busy_us,gpu_cmdbufs,gpu_latency_avg_us,gpu_idle_us,gpu_max_gap_us,"
+	                  "gpu_starved_us,gpu_dispatch_latency_avg_us,gpu_dropped";
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.readbacks = OpenFile("readbacks.csv",
 	                             "t_ms,kind,vaddr,size,window_begin,window_size,downloaded,"
@@ -1148,6 +1171,22 @@ void RecordFlip() {
 		return;
 	}
 	g_totals.flips.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordGpuFrame(const GpuFrame& frame) {
+	if (!Enabled()) {
+		return;
+	}
+	g_totals.gpu_busy_ns.fetch_add(frame.busy_ns, std::memory_order_relaxed);
+	g_totals.gpu_idle_ns.fetch_add(frame.idle_ns, std::memory_order_relaxed);
+	UpdateMax(g_totals.gpu_max_gap_ns, frame.max_gap_ns);
+	g_totals.gpu_starved_ns.fetch_add(frame.starved_ns, std::memory_order_relaxed);
+	g_totals.gpu_cmdbufs.fetch_add(frame.command_buffers, std::memory_order_relaxed);
+	g_totals.gpu_latency_samples.fetch_add(frame.latency_samples, std::memory_order_relaxed);
+	g_totals.gpu_record_latency_ns.fetch_add(frame.record_latency_ns, std::memory_order_relaxed);
+	g_totals.gpu_dispatch_latency_ns.fetch_add(frame.dispatch_latency_ns,
+	                                           std::memory_order_relaxed);
+	g_totals.gpu_dropped.fetch_add(frame.dropped, std::memory_order_relaxed);
 }
 
 } // namespace HangTrace

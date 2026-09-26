@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuTiming.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -95,10 +96,17 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
-CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
+CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics, Role role)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	if (role == Role::Guest && GpuTiming::Enabled()) {
+		m_gpu_timing = std::make_unique<GpuTimestampRing>(graphics, GpuTimestampRing::GuestPairs);
+		if (!m_gpu_timing->Valid()) {
+			m_gpu_timing.reset();
+		}
+	}
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -128,6 +136,11 @@ void CommandScheduler::Shutdown() {
 		Submit({}, true);
 	}
 	m_master.Wait(CurrentTick() - 1);
+	if (m_gpu_timing) {
+		// Every submitted tick is complete: collect the remaining pairs before the ring (and its
+		// query pool) is destroyed with this scheduler. No slot is left recording here.
+		m_gpu_timing->Collect(m_master.KnownGpuTick(), true);
+	}
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -372,6 +385,12 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	if (m_gpu_timing) {
+		// Reuse the retirement point that just recycled a command buffer: read completed pairs
+		// without waiting, then reset and stamp this buffer's pair before any rendering begins.
+		m_gpu_timing->Collect(m_master.KnownGpuTick());
+		m_gpu_timing->BeginCommand(m_command.m_buffer);
+	}
 	return m_command;
 }
 
@@ -398,8 +417,14 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		m_diagnostic_generic_completion = false;
 	};
 
+	const uint64_t submit_ns = m_gpu_timing ? GpuTiming::NowNs() : 0;
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("CommandScheduler::SubmitEnd");
+		if (m_gpu_timing) {
+			// End's own EndRendering becomes a no-op; the end stamp follows the final store ops.
+			m_command.EndRendering();
+			m_gpu_timing->EndCommand(m_command.m_buffer);
+		}
 		m_command.End();
 	}
 	const auto buffer   = m_command.m_buffer;
@@ -430,6 +455,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 			m_preserve_current_completion = false;
 		}
 		const auto tick = queued.tick;
+		if (m_gpu_timing) {
+			// The broker stores the native submit time through this pointer before it publishes
+			// the tick; the slot is not reused until KnownGpuTick() covers the tick.
+			queued.dispatch_ns = m_gpu_timing->Submitted(tick, submit_ns);
+		}
 		graphics.submission_queue.Enqueue(std::move(queued));
 		m_command.m_buffer = nullptr;
 		return tick;
@@ -478,6 +508,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		                  m_command.m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (m_gpu_timing) {
+		if (auto* dispatch_ns = m_gpu_timing->Submitted(tick, submit_ns); dispatch_ns != nullptr) {
+			*dispatch_ns = GpuTiming::NowNs();
+		}
+	}
 
 	m_command.m_buffer = nullptr;
 	return tick;
