@@ -2,14 +2,20 @@
 #define KYTY_RENDERER_OCCLUSION_H_
 
 #include "graphics/host_gpu/vulkanCommon.h"
+#include <array>
+#include <atomic>
+#include <cstdint>
 #include <memory>
 
 namespace Libs::Graphics {
 class Buffer;
 class RenderContext;
 
-// GPU-resident cumulative counter. Guest dumps use normal buffer-cache ownership
-// and readback, including the ready bit; no host callback publishes an early result.
+// GPU-resident cumulative counter. A guest dump is reduced by the GPU into a private
+// host-visible slot and published into guest memory by a completion callback once that GPU
+// work has finished, so results (including the ready bit) appear no earlier than on hardware.
+// Publishing from the host keeps the dump pages CPU-owned: the game keeps EOP labels on the
+// same pages, and GPU-owned dump pages made every label write fault and drain the GPU.
 class OcclusionCounter {
 public:
 	explicit OcclusionCounter(RenderContext& context);
@@ -20,7 +26,13 @@ public:
 	void End();                    // before ending guest rendering
 	void Accumulate();             // after ending rendering; flush only when pool is full
 	void Dump(uint64_t address);
+	// True while a dump has been recorded but not yet published to guest memory.
+	[[nodiscard]] bool HasUnpublishedDumps() const noexcept {
+		return m_published.load(std::memory_order_acquire) != m_issued;
+	}
 private:
+	static constexpr uint32_t PublishSlots    = 1024;
+	static constexpr uint64_t PublishSlotSize = 256;
 	void Initialize();
 	void FlushPending();
 	void Dispatch(uint32_t mode, vk::Buffer output, uint64_t offset, uint64_t range);
@@ -32,6 +44,10 @@ private:
 	vk::Pipeline m_pipeline;
 	std::unique_ptr<Buffer> m_counter;
 	std::unique_ptr<Buffer> m_result;
+	std::unique_ptr<Buffer> m_publish;
+	std::array<uint64_t, PublishSlots> m_slot_ticks {};
+	uint64_t m_issued = 0;
+	std::atomic<uint64_t> m_published {0};
 	bool m_prepared = false;
 	bool m_active = false;
 	uint32_t m_pending = 0;

@@ -5,6 +5,7 @@
 #include "gpu_dcc_shaders/gpu_dcc_occlusion_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "kernel/memory.h"
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -68,6 +69,8 @@ void OcclusionCounter::Initialize() {
 	m_counter = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0, usage, 256);
 	m_result = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0, usage,
 	                                  QueryCapacity * sizeof(uint64_t));
+	m_publish = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0, usage,
+	                                   PublishSlots * PublishSlotSize);
 	scheduler.Current().Handle().fillBuffer(m_counter->Handle(), 0, 256, 0);
 }
 
@@ -154,12 +157,28 @@ void OcclusionCounter::Dump(uint64_t address) {
 	scheduler.EndRendering();
 	Initialize();
 	FlushPending();
-	// Last qword is at +240. Track precisely the 248 bytes touched or preserved.
-	HangTrace::ScopedGpuWriteKind trace_kind(HangTrace::GpuWriteKind::OcclusionDump);
-	auto [buffer, offset] = m_context.GetBufferCache().ObtainBuffer(address, 248, true);
-	m_context.GetTextureCache().InvalidateMemoryFromGPU(address, 248);
+	// Reduce into a private slot. A slot is reused only after its previous publication's tick
+	// has completed (1024 dumps in flight never happens in practice; the wait bounds it).
+	const auto slot = static_cast<uint32_t>(m_issued % PublishSlots);
+	if (m_issued >= PublishSlots && !scheduler.IsFree(m_slot_ticks[slot])) {
+		scheduler.Wait(m_slot_ticks[slot]);
+	}
+	const uint64_t slot_offset = uint64_t {slot} * PublishSlotSize;
 	scheduler.EndRendering();
-	Dispatch(1, buffer->Handle(), offset, 248);
+	Dispatch(1, m_publish->Handle(), slot_offset, 248);
+	m_slot_ticks[slot] = scheduler.CurrentTick();
+	++m_issued;
+	// The shader writes the first qword of each of the 16 interleaved begin/end pairs and leaves
+	// the other member untouched; publish exactly those qwords.
+	scheduler.DeferOperation([this, address, slot_offset] {
+		m_publish->Invalidate(slot_offset, 248);
+		const auto* source = m_publish->Mapped().data() + slot_offset;
+		for (uint32_t db = 0; db < 16u; db++) {
+			(void)LibKernel::Memory::TryWriteBacking(address + db * 16u, source + db * 16u,
+			                                         sizeof(uint64_t));
+		}
+		m_published.fetch_add(1, std::memory_order_release);
+	});
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionDumps);
 }
 }

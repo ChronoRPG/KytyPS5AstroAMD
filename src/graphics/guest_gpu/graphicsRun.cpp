@@ -857,6 +857,12 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionPredicates);
+			// Native dumps are published to guest memory when their GPU work completes. Make every
+			// recorded dump visible before this CPU-side read.
+			if (OcclusionCounter::Enabled() &&
+			    m_renderer.GetOcclusionCounter().HasUnpublishedDumps()) {
+				BufferWait();
+			}
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
 			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
