@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -46,6 +47,7 @@ Buffer& LodStatsCounter::CounterBuffer() {
 }
 
 void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t control) {
+	KYTY_GPU_OP_SITE("lodstats.report");
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
 	auto& counters = CounterBuffer();

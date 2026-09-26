@@ -116,6 +116,8 @@ private:
 	bool                         m_diagnostic_generic_completion = false;
 	// KYTY_GPU_TIMING ring; null when disabled. Owned by the recording producer, like m_command.
 	std::unique_ptr<GpuTimestampRing> m_gpu_timing;
+	// Guest scheduler with KYTY_GPU_OP_PROFILE / counters enabled (gpuOpProfiler.h).
+	bool m_gpu_ops = false;
 };
 
 } // namespace Libs::Graphics

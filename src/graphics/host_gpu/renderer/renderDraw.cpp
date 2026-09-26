@@ -30,6 +30,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
 #include <array>
@@ -1077,6 +1078,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
+	KYTY_GPU_OP_SITE("draw.execute");
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
@@ -1247,6 +1249,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
+	KYTY_GPU_OP_SITE("draw.index");
 	KYTY_PROFILER_FUNCTION();
 	Profiler::CountFrameWork(Profiler::FrameWork::DrawIndex);
 
@@ -1366,6 +1369,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
+	KYTY_GPU_OP_SITE("draw.auto");
 	KYTY_PROFILER_FUNCTION();
 	Profiler::CountFrameWork(Profiler::FrameWork::DrawAuto);
 

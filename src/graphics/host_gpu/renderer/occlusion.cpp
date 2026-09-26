@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -110,6 +111,7 @@ void OcclusionCounter::Accumulate() {
 }
 
 void OcclusionCounter::FlushPending() {
+	KYTY_GPU_OP_SITE("occlusion.flush");
 	EXIT_IF(m_active || m_prepared);
 	if (!m_pending) return;
 	auto native = m_context.GetCommandScheduler().Current().Handle();
@@ -121,6 +123,7 @@ void OcclusionCounter::FlushPending() {
 }
 
 void OcclusionCounter::Dispatch(uint32_t mode, vk::Buffer output, uint64_t offset, uint64_t range) {
+	KYTY_GPU_OP_SITE("occlusion.reduce");
 	auto& command = m_context.GetCommandScheduler().Current();
 	auto native = command.Handle();
 	const auto alignment = m_context.GetGraphics().StorageMinAlignment();

@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
 #include <array>
@@ -121,6 +122,7 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 }
 
 void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
+	KYTY_GPU_OP_SITE("blit.color_to_ms_depth");
 	const auto& source_info      = source.info;
 	const auto& destination_info = destination.info;
 	EXIT_IF(DepthAspectTransferFormat(source_info.pixel_format) != vk::Format::eUndefined ||

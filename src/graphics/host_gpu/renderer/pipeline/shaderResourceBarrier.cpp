@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <cstring>
 
@@ -109,6 +110,7 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 }
 
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
+	KYTY_GPU_OP_SITE("shader.access_barrier");
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderAccessDependency();
 	vk_buffer.pipelineBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
@@ -117,6 +119,7 @@ void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags sou
 
 void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
                               vk::PipelineStageFlags destination_stages) {
+	KYTY_GPU_OP_SITE("shader.write_hazard_barrier");
 	EXIT_IF(vk_buffer == nullptr || !destination_stages);
 	const auto barrier = MakeShaderWriteHazardDependency();
 	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, destination_stages,
@@ -124,6 +127,7 @@ void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
 }
 
 void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
+	KYTY_GPU_OP_SITE("shader.write_barrier");
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderWriteDependency();
 	vk_buffer.pipelineBarrier(source_stages,

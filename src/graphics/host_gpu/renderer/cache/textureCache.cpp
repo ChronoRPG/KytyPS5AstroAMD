@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
 #include <array>
@@ -1915,6 +1916,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
                                         uint32_t packed_clear) {
+	KYTY_GPU_OP_SITE("texcache.clear_from_buffer");
 	if (command.IsInvalid() || !GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid image clear\n");
 	}
@@ -1976,6 +1978,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
+	KYTY_GPU_OP_SITE("texcache.clear");
 	auto& image = m_slot_images[id];
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
@@ -2225,6 +2228,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 }
 
 bool TextureCache::DownloadImageMemory(ImageId id) {
+	KYTY_GPU_OP_SITE("texcache.download");
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;

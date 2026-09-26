@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
 #include <array>
@@ -363,6 +364,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
                                         uint64_t tiled_capacity, uint64_t linear_capacity,
                                         std::span<const GpuTileInfo> infos) {
+	KYTY_GPU_OP_SITE("tiler.detile");
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -379,6 +381,7 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,
                        vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
                        std::span<const GpuTileInfo> infos) {
+	KYTY_GPU_OP_SITE("tiler.tile");
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -394,6 +397,7 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
                             vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
                             uint64_t linear_capacity, std::span<const GpuTileInfo> infos,
                             ColorTransform transform) {
+	KYTY_GPU_OP_SITE("tiler.tile_image");
 	EXIT_IF(regions.empty());
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
@@ -448,6 +452,7 @@ uint32_t TileManager::ConversionRows(uint64_t offset, uint64_t row_stride, uint6
 
 void TileManager::ConvertD16(Result source, Result target, D16Direction direction, bool d32,
                              const D16Layout& layout) {
+	KYTY_GPU_OP_SITE("tiler.convert_d16");
 	vk::Pipeline* pipeline_pointer = nullptr;
 	if (direction == D16Direction::Promote) {
 		pipeline_pointer = d32 ? &m_d16_to_d32 : &m_d16_to_d24;
@@ -601,6 +606,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 }
 
 void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
+	KYTY_GPU_OP_SITE("tiler.swap_bgra16");
 	if (m_swap_bgra16 == nullptr) {
 		const auto module = CompileSPV(GPU_TILER_SWAP_BGRA16_SPV, m_graphics.device);
 		vk::PipelineShaderStageCreateInfo stage {};
