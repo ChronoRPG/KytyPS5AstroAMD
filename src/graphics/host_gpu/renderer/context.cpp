@@ -192,6 +192,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	m_context.GetOcclusionCounter().Begin();
 	m_render_state = state;
 	m_rendering    = true;
+	++m_rendering_serial;
 	m_occlusion_control = count_control;
 }
 

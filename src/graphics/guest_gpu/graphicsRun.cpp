@@ -24,7 +24,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -54,6 +57,63 @@ struct DrawIndexedIndirectArgs {
 	uint32_t base_vertex_location;
 	uint32_t start_instance_location;
 };
+
+// Native indirect draws hand these records to the host GPU unchanged.
+static_assert(sizeof(DrawIndirectArgs) == sizeof(vk::DrawIndirectCommand) &&
+              offsetof(DrawIndirectArgs, instance_count) ==
+                  offsetof(vk::DrawIndirectCommand, instanceCount) &&
+              offsetof(DrawIndirectArgs, start_instance_location) ==
+                  offsetof(vk::DrawIndirectCommand, firstInstance));
+static_assert(sizeof(DrawIndexedIndirectArgs) == sizeof(vk::DrawIndexedIndirectCommand) &&
+              offsetof(DrawIndexedIndirectArgs, instance_count) ==
+                  offsetof(vk::DrawIndexedIndirectCommand, instanceCount) &&
+              offsetof(DrawIndexedIndirectArgs, base_vertex_location) ==
+                  offsetof(vk::DrawIndexedIndirectCommand, vertexOffset) &&
+              offsetof(DrawIndexedIndirectArgs, start_instance_location) ==
+                  offsetof(vk::DrawIndexedIndirectCommand, firstInstance));
+constexpr uint64_t IndirectInstanceCountOffset = offsetof(DrawIndirectArgs, instance_count);
+static_assert(offsetof(DrawIndexedIndirectArgs, instance_count) == IndirectInstanceCountOffset);
+
+// KYTY_NATIVE_INDIRECT=0 keeps every indirect draw on CPU-read arguments.
+static bool NativeIndirectEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_NATIVE_INDIRECT");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// KYTY_INDIRECT_VALIDATE=1 (diagnostic): also read native arguments on the CPU, which drains
+// the GPU, and log where the native and CPU-read draws would differ.
+static bool IndirectValidateEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_INDIRECT_VALIDATE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+static uint64_t IndexElementSize(uint32_t index_type_and_size) {
+	switch (index_type_and_size) {
+		case 0: return 2;
+		case 1: return 4;
+		case 2: return 1;
+		default: EXIT("unknown index_type_and_size: %u\n", index_type_and_size);
+	}
+	return 0;
+}
+
+void ReadGuestForCp(uint64_t vaddr, uint64_t size, void* dst) {
+	EXIT_IF(vaddr == 0 || dst == nullptr);
+	if (LibKernel::Memory::TryReadGpuCleanBacking(vaddr, dst, size)) {
+		return;
+	}
+	if (LibKernel::Memory::SynchronizeGpuBackingForRead(vaddr, size) &&
+	    LibKernel::Memory::TryReadGpuCleanBacking(vaddr, dst, size)) {
+		return;
+	}
+	std::memcpy(dst, reinterpret_cast<const void*>(vaddr), size);
+}
 
 class GpuMutexLock final {
 public:
@@ -349,7 +409,8 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	const auto value = ReadGuestForCp<T>(reinterpret_cast<uint64_t>(addr));
+	if (!TestWaitRegMemValue(value, ref, mask, func)) {
 		SuspendPm4();
 	}
 }
@@ -843,6 +904,7 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 	}
 
 	m_num_instances = num_instances;
+	m_pending_num_instances.clear();
 }
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
@@ -886,7 +948,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				BufferFlushAndWait();
 			}
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
-			value = *reinterpret_cast<const volatile uint64_t*>(address);
+			value = ReadGuestForCp<uint64_t>(reinterpret_cast<uint64_t>(address));
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
 	}
@@ -909,7 +971,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+		args.instance_count = NumInstances();
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
@@ -933,16 +995,153 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
 }
 
+uint32_t CommandProcessor::NumInstances() {
+	if (m_pending_num_instances.empty()) {
+		return m_num_instances;
+	}
+	// A draw without its own count inherits instance_count of the last record a native indirect
+	// draw drew. Reading it synchronizes (drains) as the CPU-read path would have at the
+	// indirect draw, but reads the bytes now: a record rewritten in between yields its newer
+	// value (KYTY_INDIRECT_VALIDATE=1 reports that case).
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectInstanceReads);
+	for (auto it = m_pending_num_instances.rbegin(); it != m_pending_num_instances.rend(); ++it) {
+		const auto& pending = *it;
+		uint32_t    count   = pending.max_count;
+		if (pending.count_addr != 0) {
+			if (!m_renderer.IsMapped(pending.count_addr, sizeof(uint32_t))) {
+				break; // Unmapped since: keep the last known count.
+			}
+			count = std::min(ReadGuestForCp<uint32_t>(pending.count_addr), pending.max_count);
+		}
+		if (count == 0) {
+			// That draw drew nothing and left the count unchanged: an older source decides.
+			continue;
+		}
+		const auto address = pending.args_addr +
+		                     static_cast<uint64_t>(count - 1u) * pending.stride +
+		                     IndirectInstanceCountOffset;
+		if (!m_renderer.IsMapped(address, sizeof(uint32_t))) {
+			break;
+		}
+		const auto instances = ReadGuestForCp<uint32_t>(address);
+		if (pending.has_expected && pending.expected != instances) {
+			LOGF("IndirectValidate: inherited instance count changed after the native draw: "
+			     "args=0x%016" PRIx64 " at_draw=%u now=%u\n",
+			     pending.args_addr, pending.expected, instances);
+		}
+		m_num_instances = instances;
+		break;
+	}
+	m_pending_num_instances.clear();
+	return m_num_instances;
+}
+
+void CommandProcessor::ValidateIndirectSource(const DrawIndirectSource& source) {
+	static std::atomic<uint32_t> log_count {0};
+	const auto log_enabled = [] { return log_count.fetch_add(1, std::memory_order_relaxed) < 256; };
+	uint32_t   count       = source.max_count;
+	if (source.count_addr != 0) {
+		count = std::min(ReadGuestForCp<uint32_t>(source.count_addr), source.max_count);
+	}
+	if (log_enabled()) {
+		LOGF("IndirectValidate: native %s draw args=0x%016" PRIx64 " stride=%u count=%u/%u\n",
+		     source.indexed ? "indexed" : "auto", source.args_addr, source.stride, count,
+		     source.max_count);
+	}
+	if (!source.indexed) {
+		return;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		const auto record = source.args_addr + static_cast<uint64_t>(i) * source.stride;
+		const auto args   = ReadGuestForCp<DrawIndexedIndirectArgs>(record);
+		// The CPU path clamps the index count to INDEX_BUFFER_SIZE (ignoring firstIndex); the
+		// native draw reads past the bound range instead.
+		const auto end =
+		    static_cast<uint64_t>(args.start_index_location) + args.index_count_per_instance;
+		if (args.instance_count != 0 && args.index_count_per_instance != 0 &&
+		    end > source.index_buffer_size && log_enabled()) {
+			LOGF("IndirectValidate: record %u/%u args=0x%016" PRIx64 " indices [%u, +%u) exceed "
+			     "INDEX_BUFFER_SIZE=%u (the CPU-read draw uses %u indices)\n",
+			     i, count, record, args.start_index_location, args.index_count_per_instance,
+			     source.index_buffer_size,
+			     std::min(args.index_count_per_instance, source.index_buffer_size));
+		}
+	}
+}
+
+// Takes the host indirect path when the argument (or count) bytes are GPU-owned, i.e. when a CPU
+// read would page-fault and drain the GPU. CPU-clean arguments stay on the CPU path, which then
+// reads them without synchronization.
+bool CommandProcessor::TryDrawIndirectNative(DrawIndirectSource source) {
+	if (!NativeIndirectEnabled() || !GuestRange {source.args_addr, source.ArgsSize()}.Valid() ||
+	    (source.count_addr != 0 && !GuestRange {source.count_addr, sizeof(uint32_t)}.Valid())) {
+		return false;
+	}
+	auto&      cache     = m_renderer.GetBufferCache();
+	const auto gpu_owned = [&cache](uint64_t address, uint64_t size) {
+		return cache.HasGpuDirtyBytes(address, size) ||
+		       cache.HasPendingBackingPublication(address, size);
+	};
+	if (!gpu_owned(source.args_addr, source.ArgsSize()) &&
+	    (source.count_addr == 0 || !gpu_owned(source.count_addr, sizeof(uint32_t)))) {
+		return false;
+	}
+	if (source.indexed) {
+		source.index_base_addr     = m_index_base_addr;
+		source.index_buffer_size   = m_index_buffer_size;
+		source.index_type_and_size = m_index_type_and_size;
+	}
+
+	PendingNumInstances pending {.args_addr  = source.args_addr,
+	                             .stride     = source.stride,
+	                             .max_count  = source.max_count,
+	                             .count_addr = source.count_addr};
+	if (IndirectValidateEnabled()) {
+		ValidateIndirectSource(source);
+		uint32_t count = source.max_count;
+		if (source.count_addr != 0) {
+			count = std::min(ReadGuestForCp<uint32_t>(source.count_addr), source.max_count);
+		}
+		if (count != 0) {
+			pending.has_expected = true;
+			pending.expected     = ReadGuestForCp<uint32_t>(
+			    source.args_addr + static_cast<uint64_t>(count - 1u) * source.stride +
+			    IndirectInstanceCountOffset);
+		}
+	}
+
+	if (!m_renderer.GetRenderExecutor().DrawIndirectNative(m_submit_id, CurrentBuffer(), source)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectFallback);
+		return false;
+	}
+	if (source.count_addr == 0) {
+		// At least one record was drawn: older sources can no longer decide.
+		m_pending_num_instances.clear();
+	} else if (m_pending_num_instances.size() >= 64) {
+		(void)NumInstances();
+	}
+	m_pending_num_instances.push_back(pending);
+	return true;
+}
+
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
-	const auto* args_addr =
-	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
+	const auto args_addr   = m_draw_indirect_args_base_addr + data_offset;
+	const auto record_size = static_cast<uint32_t>(indexed ? sizeof(DrawIndexedIndirectArgs)
+	                                                       : sizeof(DrawIndirectArgs));
+	if (TryDrawIndirectNative({.args_addr  = args_addr,
+	                           .stride     = record_size,
+	                           .max_count  = 1,
+	                           .count_addr = 0,
+	                           .indexed    = indexed})) {
+		return;
+	}
 
+	m_pending_num_instances.clear();
 	if (!indexed) {
-		DrawIndirectArgs args {};
-		std::memcpy(&args, args_addr, sizeof(args));
+		const auto args = ReadGuestForCp<DrawIndirectArgs>(args_addr);
 		m_num_instances = args.instance_count;
 		DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
 		               .instance_count = args.instance_count,
@@ -952,16 +1151,8 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 		return;
 	}
 
-	DrawIndexedIndirectArgs args {};
-	std::memcpy(&args, args_addr, sizeof(args));
-
-	uint64_t index_size = 0;
-	switch (m_index_type_and_size) {
-		case 0: index_size = 2; break;
-		case 1: index_size = 4; break;
-		case 2: index_size = 1; break;
-		default: EXIT("unknown index_type_and_size: %u\n", m_index_type_and_size);
-	}
+	const auto args       = ReadGuestForCp<DrawIndexedIndirectArgs>(args_addr);
+	const auto index_size = IndexElementSize(m_index_type_and_size);
 
 	auto* index_addr = reinterpret_cast<const void*>(
 	    m_index_base_addr + static_cast<uint64_t>(args.start_index_location) * index_size);
@@ -994,9 +1185,24 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
+	// Zero records draw nothing and leave the instance count unchanged on either path.
+	if (max_count_or_count == 0) {
+		return;
+	}
+
+	// The renderer rejects strides shorter than a record; the CPU path below reports them.
+	const auto args_base = m_draw_indirect_args_base_addr + data_offset;
+	if (TryDrawIndirectNative({.args_addr  = args_base,
+	                           .stride     = stride_in_bytes,
+	                           .max_count  = max_count_or_count,
+	                           .count_addr = reinterpret_cast<uint64_t>(count_addr),
+	                           .indexed    = indexed})) {
+		return;
+	}
+
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
-		draw_count = *count_addr;
+		draw_count = ReadGuestForCp<uint32_t>(reinterpret_cast<uint64_t>(count_addr));
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
 		}
@@ -1005,59 +1211,51 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	if (draw_count == 0) {
 		return;
 	}
-
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
+	// Every drawn record sets the count, so pending native sources cannot decide any more.
+	m_pending_num_instances.clear();
 
-	uint64_t index_size = 0;
-	if (indexed) {
-		switch (m_index_type_and_size) {
-			case 0: index_size = 2; break;
-			case 1: index_size = 4; break;
-			case 2: index_size = 1; break;
-			default: EXIT("unknown index_type_and_size: %u\n", m_index_type_and_size);
-		}
-	}
+	const uint64_t index_size = indexed ? IndexElementSize(m_index_type_and_size) : 0;
 
 	for (uint32_t i = 0; i < draw_count; i++) {
-		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
-		                       static_cast<uint64_t>(i) * stride_in_bytes;
+		const auto args_addr = args_base + static_cast<uint64_t>(i) * stride_in_bytes;
 
 		if (!indexed) {
-			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
-			m_num_instances = args->instance_count;
-			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
-			               .instance_count = args->instance_count,
-			               .first_vertex   = args->start_vertex_location,
-			               .first_instance = args->start_instance_location,
+			const auto args = ReadGuestForCp<DrawIndirectArgs>(args_addr);
+			m_num_instances = args.instance_count;
+			DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
+			               .instance_count = args.instance_count,
+			               .first_vertex   = args.start_vertex_location,
+			               .first_instance = args.start_instance_location,
 			               .offset_source  = DrawOffsetSource::IndirectArgs});
 			continue;
 		}
 
-		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
+		const auto args = ReadGuestForCp<DrawIndexedIndirectArgs>(args_addr);
 
 		auto* index_addr = reinterpret_cast<const void*>(
-		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
+		    m_index_base_addr + static_cast<uint64_t>(args.start_index_location) * index_size);
 
 		const uint32_t index_count =
 		    (m_index_buffer_size != 0
-		         ? std::min(args->index_count_per_instance, m_index_buffer_size)
-		         : args->index_count_per_instance);
-		if (GraphicsRunDebugDumpEnabled() && index_count != args->index_count_per_instance) {
+		         ? std::min(args.index_count_per_instance, m_index_buffer_size)
+		         : args.index_count_per_instance);
+		if (GraphicsRunDebugDumpEnabled() && index_count != args.index_count_per_instance) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
 				LOGF("\t DrawIndexIndirectMulti: clamped index_count from %" PRIu32 " to %" PRIu32
 				     " using INDEX_BUFFER_SIZE\n",
-				     args->index_count_per_instance, index_count);
+				     args.index_count_per_instance, index_count);
 			}
 		}
 
-		m_num_instances = args->instance_count;
+		m_num_instances = args.instance_count;
 		DrawIndex({.index_count    = index_count,
 		           .index_addr     = index_addr,
-		           .instance_count = args->instance_count,
-		           .base_vertex    = static_cast<int32_t>(args->base_vertex_location),
-		           .first_instance = args->start_instance_location,
+		           .instance_count = args.instance_count,
+		           .base_vertex    = static_cast<int32_t>(args.base_vertex_location),
+		           .first_instance = args.start_instance_location,
 		           .offset_source  = DrawOffsetSource::IndirectArgs});
 	}
 }
@@ -1125,8 +1323,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
-		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
-		DispatchDirect(args->x, args->y, args->z, mode);
+		const auto args = ReadGuestForCp<vk::DispatchIndirectCommand>(args_addr);
+		DispatchDirect(args.x, args.y, args.z, mode);
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
@@ -1141,7 +1339,7 @@ void CommandProcessor::ReportLodStats(uint64_t destination, uint32_t size, uint3
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+		args.instance_count = NumInstances();
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }

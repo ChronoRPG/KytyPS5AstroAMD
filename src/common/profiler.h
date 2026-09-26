@@ -135,6 +135,12 @@ enum class FrameEvent : uint32_t {
 	NativeOcclusionReductions,
 	MeshRestartMarkers,
 	MeshRestartSegments,
+	// Indirect draws whose GPU-written arguments were consumed by vkCmdDraw*Indirect*, and those
+	// that fell back to reading (and so synchronizing) the arguments on the CPU.
+	DrawIndirectNative,
+	DrawIndirectFallback,
+	// Later draws that inherited a native indirect draw's instance count and read it back.
+	DrawIndirectInstanceReads,
 	// KYTY_GPU_TIMING: command buffers without a usable timestamp pair (ring full, results
 	// unavailable, ambiguous wrap, or pending samples over capacity). Busy/idle exclude them.
 	GpuTimingDropped,

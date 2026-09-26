@@ -14,6 +14,18 @@ namespace Libs::Graphics {
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 
+// CP read of guest memory the GPU may have written: the clean backing when no GPU-owned byte
+// overlaps, else after synchronizing those bytes (the drain a page fault would cause), else the
+// mapped read with its page-fault readback path. GPU thread, at packet boundaries only.
+void ReadGuestForCp(uint64_t vaddr, uint64_t size, void* dst);
+
+template <typename T>
+[[nodiscard]] T ReadGuestForCp(uint64_t vaddr) {
+	T value {};
+	ReadGuestForCp(vaddr, sizeof(T), &value);
+	return value;
+}
+
 enum class Pm4ProcessResult { Complete, Blocked };
 
 enum class ContextStateOperation : uint32_t {
@@ -150,6 +162,9 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	[[nodiscard]] bool  TryDrawIndirectNative(DrawIndirectSource source);
+	void                ValidateIndirectSource(const DrawIndirectSource& source);
+	[[nodiscard]] uint32_t NumInstances();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
@@ -167,6 +182,19 @@ private:
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
+	// After native indirect draws the instance count is still GPU data: instance_count of the
+	// last record drawn, which a draw without its own count reads back (NumInstances). With a
+	// GPU count that may be zero, older sources remain candidates, newest last. Empty whenever
+	// m_num_instances is current; SetNumInstances and CPU-read indirect draws clear it.
+	struct PendingNumInstances {
+		uint64_t args_addr  = 0;
+		uint32_t stride     = 0;
+		uint32_t max_count  = 0;
+		uint64_t count_addr = 0;
+		bool     has_expected = false; // KYTY_INDIRECT_VALIDATE: value read at the draw
+		uint32_t expected     = 0;
+	};
+	std::vector<PendingNumInstances> m_pending_num_instances;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;

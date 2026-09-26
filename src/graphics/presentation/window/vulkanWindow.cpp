@@ -523,6 +523,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	auto features12  = WindowContext::RequiredVulkan12Features();
 	features12.pNext = &depth_clip_control;
+	// drawIndirectCount is set below, once the supported features are known.
 
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
 
@@ -557,8 +558,32 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = supported_features2.pNext;
 		supported_features2.pNext = &provoking_vertex;
 	}
+	const bool index_type_uint8_extension =
+	    HasExtension(device_extensions, VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME) ||
+	    HasExtension(device_extensions, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME);
+	vk::PhysicalDeviceIndexTypeUint8FeaturesKHR supported_index_type_uint8 {};
+	if (index_type_uint8_extension) {
+		supported_index_type_uint8.pNext = supported_features2.pNext;
+		supported_features2.pNext        = &supported_index_type_uint8;
+	}
+	vk::PhysicalDeviceVulkan12Features supported_features12 {};
+	supported_features12.pNext = supported_features2.pNext;
+	supported_features2.pNext  = &supported_features12;
 	physical_device.getFeatures2(&supported_features2);
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	// Optional: native indirect draws fall back to CPU-read arguments without these.
+	graphics.draw_indirect_first_instance_enabled =
+	    supported_features2.features.drawIndirectFirstInstance == VK_TRUE;
+	graphics.multi_draw_indirect_enabled =
+	    supported_features2.features.multiDrawIndirect == VK_TRUE;
+	graphics.draw_indirect_count_enabled = supported_features12.drawIndirectCount == VK_TRUE;
+	graphics.index_type_uint8_enabled =
+	    index_type_uint8_extension && supported_index_type_uint8.indexTypeUint8 == VK_TRUE;
+	LOGF("Vulkan indirect draws: firstInstance=%s multiDraw=%s count=%s indexUint8=%s\n",
+	     graphics.draw_indirect_first_instance_enabled ? "true" : "false",
+	     graphics.multi_draw_indirect_enabled ? "true" : "false",
+	     graphics.draw_indirect_count_enabled ? "true" : "false",
+	     graphics.index_type_uint8_enabled ? "true" : "false");
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
@@ -630,6 +655,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.occlusionQueryPrecise = supported_features2.features.occlusionQueryPrecise;
+	device_features.drawIndirectFirstInstance =
+	    graphics.draw_indirect_first_instance_enabled ? VK_TRUE : VK_FALSE;
+	device_features.multiDrawIndirect = graphics.multi_draw_indirect_enabled ? VK_TRUE : VK_FALSE;
 	graphics.precise_occlusion_enabled = device_features.occlusionQueryPrecise == VK_TRUE;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
@@ -676,6 +704,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
+	}
+	features12.drawIndirectCount = graphics.draw_indirect_count_enabled ? VK_TRUE : VK_FALSE;
+	vk::PhysicalDeviceIndexTypeUint8FeaturesKHR index_type_uint8 {};
+	if (graphics.index_type_uint8_enabled) {
+		index_type_uint8.indexTypeUint8 = VK_TRUE;
+		index_type_uint8.pNext          = const_cast<void*>(create_info.pNext);
+		create_info.pNext               = &index_type_uint8;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1045,6 +1080,12 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		// Native 8-bit index buffers for indirect draws; the KHR and EXT features are identical.
+		if (HasExtension(available_extensions, VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME);
+		} else if (HasExtension(available_extensions, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME);
 		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
