@@ -768,7 +768,14 @@ void RecordAprRead(uint32_t file_id, std::string_view host_path, uint64_t file_o
 		g_totals.apr_errors.fetch_add(1, std::memory_order_relaxed);
 	}
 	const auto caller  = g_guest_caller != 0 ? FormatAddress(g_guest_caller) : std::string();
-	const auto callers = CaptureGuestCallers();
+	// A stack scan costs hundreds of VirtualQuery calls. Boot issues thousands of reads from a
+	// few call sites, and scanning every one stalled the guest streamer (4 s -> 25 s to the
+	// first level). Scan only the first reads of each call site, then every 1024th.
+	thread_local std::unordered_map<uint64_t, uint32_t> scanned_callers;
+	auto&      seen    = scanned_callers[g_guest_caller];
+	const bool scan    = seen < 4 || (seen % 1024u) == 0;
+	seen++;
+	const auto callers = scan ? CaptureGuestCallers() : std::string();
 
 	std::scoped_lock lock(g_apr_mutex);
 	auto& info = g_apr_keys[AprKey {file_id, file_offset, size}];
