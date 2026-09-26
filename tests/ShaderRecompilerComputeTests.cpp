@@ -13939,6 +13939,8 @@ public:
     ShaderPixelInputInfo pixel{};
     pixel.stage.program = &pixel_program;
     pixel.stage.resources = &fragment.resources;
+    // Owns the resources that GetGraphicsPrograms points the stage runtimes at.
+    PipelineCache::GraphicsStagePreps native_stage_preps;
 
     RenderColorInfo color{};
     color.desc.type = BindingType::RenderTarget;
@@ -14316,7 +14318,8 @@ public:
         registers.SetPsInControl(wave.control);
         const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
             native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
-            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+            registers, user_config, export_mapping, true, native_vertex_info, pixel,
+            native_stage_preps);
         Require(name, "pixel wave metadata propagation",
                 pixel.input_num == 8 && pixel.stage.program->wave_size == wave.width,
                 "SPI_PS_IN_CONTROL width did not reach the compiled pixel program");
@@ -14387,7 +14390,8 @@ public:
              .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
         const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
             native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
-            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+            registers, user_config, export_mapping, true, native_vertex_info, pixel,
+            native_stage_preps);
         vertex_shader = programs.vertex[0];
         pixel_shader = programs.pixel;
         vertex = native_vertex_info[0];
