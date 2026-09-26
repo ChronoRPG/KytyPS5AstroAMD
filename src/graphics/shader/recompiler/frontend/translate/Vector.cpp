@@ -535,6 +535,7 @@ bool Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_LSHL_ADD_U32: return V_LSHL_ADD_U32(inst);
 		case O::V_ADD_LSHL_U32: return V_ADD_LSHL_U32(inst);
 		case O::V_XAD_U32: return V_XAD_U32(inst);
+		case O::V_PERM_B32: return V_PERM_B32(inst);
 		case O::V_LSHL_OR_B32: return V_LSHL_OR_B32(inst);
 		case O::V_CNDMASK_B32: return V_CNDMASK_B32(inst);
 		default: return false;

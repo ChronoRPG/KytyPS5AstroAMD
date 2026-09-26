@@ -570,6 +570,38 @@ bool Translator::V_XAD_U32(const Decoder::Instruction& inst) {
 	return true;
 }
 
+bool Translator::V_PERM_B32(const Decoder::Instruction& inst) {
+	// Each selector byte of S2 picks from the byte array {S0, S1} (S1 holds bytes 0-3):
+	// 0-7 copy a byte, 8-11 replicate the sign of bytes 1/3/5/7, 12 is 0x00, 13+ is 0xff.
+	const auto hi       = ReadU32(inst.src0);
+	const auto lo       = ReadU32(inst.src1);
+	const auto selector = ReadU32(inst.src2);
+	const auto constant = [](uint32_t value) { return IR::U32(IR::Value(value)); };
+	IR::U32    result   = constant(0u);
+	for (uint32_t byte = 0; byte < 4u; byte++) {
+		const auto sel = IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract,
+		                                 {selector, IR::Value(byte * 8u), IR::Value(8u)}));
+		const auto from_hi = ir.INotEqual(ir.BitwiseAnd(sel, constant(4u)), constant(0u));
+		const auto word    = ir.Select(from_hi, hi, lo);
+		const auto shift = ir.ShiftLeftLogical(ir.BitwiseAnd(sel, constant(3u)), constant(3u));
+		const auto data  = ir.BitwiseAnd(ir.ShiftRightLogical(word, shift), constant(0xffu));
+		// Selectors 8-11: sign of S1[15], S1[31], S0[15], S0[31].
+		const auto sign_word =
+		    ir.Select(ir.INotEqual(ir.BitwiseAnd(sel, constant(2u)), constant(0u)), hi, lo);
+		const auto sign_bit = ir.Select(ir.INotEqual(ir.BitwiseAnd(sel, constant(1u)), constant(0u)),
+		                                constant(31u), constant(15u));
+		const auto sign     = ir.BitwiseAnd(IR::U32(ir.Emit(IR::ValueOpcode::BitFieldSExtract,
+		                                                    {sign_word, sign_bit, IR::Value(1u)})),
+		                                    constant(0xffu));
+		auto value = ir.Select(ir.ULessThan(sel, constant(8u)), data, sign);
+		value      = ir.Select(ir.IEqual(sel, constant(12u)), constant(0u), value);
+		value      = ir.Select(ir.UGreaterThan(sel, constant(12u)), constant(0xffu), value);
+		result     = ir.BitwiseOr(result, ir.ShiftLeftLogical(value, constant(byte * 8u)));
+	}
+	WriteOperand(DestinationOperand(inst), result);
+	return true;
+}
+
 bool Translator::V_LSHL_OR_B32(const Decoder::Instruction& inst) {
 	const auto shift = ir.BitwiseAnd(ReadU32(inst.src1), IR::U32(IR::Value(31u)));
 	const auto result =

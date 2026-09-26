@@ -13557,13 +13557,229 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 
 #include "ShaderRayTracingTests.inc"
 
+void TestRdna2IsaAccuracyDecode() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+  using O = Decoder::Opcode;
+  const auto decode = [](std::span<const uint32_t> words) {
+    Decoder::Instruction inst;
+    Decoder::DecodeInstruction(words, 0, inst);
+    return inst;
+  };
+
+  struct ScalarCase {
+    uint32_t encoding;
+    O opcode;
+  };
+  const ScalarCase sop1_cases[] = {
+      {0x05, O::S_CMOV_B32},           {0x19, O::S_SEXT_I32_I8},
+      {0x1a, O::S_SEXT_I32_I16},       {0x25, O::S_OR_SAVEEXEC_B64},
+      {0x26, O::S_XOR_SAVEEXEC_B64},   {0x27, O::S_ANDN2_SAVEEXEC_B64},
+      {0x29, O::S_NAND_SAVEEXEC_B64},  {0x2a, O::S_NOR_SAVEEXEC_B64},
+      {0x2b, O::S_XNOR_SAVEEXEC_B64},  {0x38, O::S_ORN1_SAVEEXEC_B64},
+      {0x3d, O::S_OR_SAVEEXEC_B32},    {0x3e, O::S_XOR_SAVEEXEC_B32},
+      {0x3f, O::S_ANDN2_SAVEEXEC_B32}, {0x41, O::S_NAND_SAVEEXEC_B32},
+      {0x42, O::S_NOR_SAVEEXEC_B32},   {0x43, O::S_XNOR_SAVEEXEC_B32},
+      {0x45, O::S_ORN1_SAVEEXEC_B32},
+  };
+  for (const auto &item : sop1_cases) {
+    const uint32_t words[] = {EncodeSop1(item.encoding, 20, 22)};
+    const auto inst = decode(words);
+    Check(inst.opcode == item.opcode &&
+              inst.dst.kind == Decoder::OperandKind::Sgpr && inst.dst.reg == 20 &&
+              inst.src0.kind == Decoder::OperandKind::Sgpr && inst.src0.reg == 22,
+          "RDNA2 SOP1 opcode did not decode");
+  }
+
+  const uint32_t cmovk[] = {EncodeSopk(0x02, 21, -3)};
+  const auto cmovk_inst = decode(cmovk);
+  Check(cmovk_inst.opcode == O::S_CMOVK_I32 &&
+            cmovk_inst.dst.kind == Decoder::OperandKind::Sgpr &&
+            cmovk_inst.dst.reg == 21 && cmovk_inst.src0.signed_val == -3,
+        "S_CMOVK_I32 did not decode a sign-extended immediate into SDST");
+
+  const uint32_t clause[] = {EncodeSopp(0x21, 3)};
+  Check(decode(clause).opcode == O::S_CLAUSE, "S_CLAUSE did not decode");
+  const uint32_t dcache_inv[] = {EncodeSmem0(0x20, 0, 0), 0};
+  const uint32_t gl1_inv[] = {EncodeSmem0(0x1f, 0, 0), 0};
+  Check(decode(dcache_inv).opcode == O::S_DCACHE_INV &&
+            decode(gl1_inv).opcode == O::S_GL1_INV &&
+            decode(gl1_inv).src_count == 0u,
+        "scalar cache invalidations did not decode as operand-free no-ops");
+  const uint32_t gl0_inv[] = {EncodeMubuf0(0x71, 0, false), EncodeMubuf1(0, 0, 0)};
+  const uint32_t buffer_gl1_inv[] = {EncodeMubuf0(0x72, 0, false),
+                                     EncodeMubuf1(0, 0, 0)};
+  Check(decode(gl0_inv).opcode == O::BUFFER_GL0_INV &&
+            decode(buffer_gl1_inv).opcode == O::BUFFER_GL1_INV &&
+            decode(gl0_inv).dst.kind == Decoder::OperandKind::Null,
+        "vector cache invalidations did not decode as operand-free no-ops");
+
+  const ScalarCase mubuf_cases[] = {
+      {0x3c, O::BUFFER_ATOMIC_INC},       {0x3d, O::BUFFER_ATOMIC_DEC},
+      {0x51, O::BUFFER_ATOMIC_CMPSWAP_X2}, {0x52, O::BUFFER_ATOMIC_ADD_X2},
+      {0x53, O::BUFFER_ATOMIC_SUB_X2},     {0x55, O::BUFFER_ATOMIC_SMIN_X2},
+      {0x56, O::BUFFER_ATOMIC_UMIN_X2},    {0x57, O::BUFFER_ATOMIC_SMAX_X2},
+      {0x58, O::BUFFER_ATOMIC_UMAX_X2},    {0x59, O::BUFFER_ATOMIC_AND_X2},
+      {0x5b, O::BUFFER_ATOMIC_XOR_X2},
+  };
+  for (const auto &item : mubuf_cases) {
+    const uint32_t words[] = {EncodeMubuf0(item.encoding), EncodeMubuf1(4, 0, 1)};
+    Check(decode(words).opcode == item.opcode, "MUBUF atomic opcode did not decode");
+  }
+
+  const uint32_t buffer_tfe[] = {EncodeMubuf0(0x0c), EncodeMubuf1(4, 0, 1) | (1u << 23u)};
+  const auto buffer_tfe_inst = decode(buffer_tfe);
+  Check(buffer_tfe_inst.opcode == O::BUFFER_LOAD_DWORD && buffer_tfe_inst.tfe &&
+            !buffer_tfe_inst.lwe,
+        "MUBUF TFE bit was not decoded");
+  const uint32_t tbuffer_tfe[] = {EncodeMtbuf0(0x00, 4, 4),
+                                  EncodeMtbuf1(0x00, 4, 0, 1) | (1u << 23u)};
+  Check(decode(tbuffer_tfe).tfe, "MTBUF TFE bit was not decoded");
+
+  const uint32_t image_tfe[] = {EncodeMimg0(0x00, 0xf) | (1u << 16u),
+                                EncodeMimg1(0, 0, 0, 8)};
+  const uint32_t image_lwe[] = {EncodeMimg0(0x20, 0x1) | (1u << 17u),
+                                EncodeMimg1(0, 0, 0, 8)};
+  const auto image_tfe_inst = decode(image_tfe);
+  const auto image_lwe_inst = decode(image_lwe);
+  Check(image_tfe_inst.tfe && !image_tfe_inst.lwe && image_lwe_inst.lwe &&
+            !image_lwe_inst.tfe && image_tfe_inst.data_dwords == 4u,
+        "MIMG TFE/LWE bits were not decoded");
+
+  const ScalarCase image_atomic_cases[] = {
+      {0x10, O::IMAGE_ATOMIC_CMPSWAP}, {0x12, O::IMAGE_ATOMIC_SUB},
+      {0x14, O::IMAGE_ATOMIC_SMIN},    {0x16, O::IMAGE_ATOMIC_SMAX},
+      {0x1b, O::IMAGE_ATOMIC_INC},     {0x1c, O::IMAGE_ATOMIC_DEC},
+  };
+  for (const auto &item : image_atomic_cases) {
+    const uint32_t words[] = {EncodeMimg0(item.encoding, 0x1, true),
+                              EncodeMimg1(0, 0, 0, 8)};
+    Check(decode(words).opcode == item.opcode, "MIMG atomic opcode did not decode");
+  }
+
+  const uint32_t perm[] = {EncodeVop3Word0(0x344, 3), EncodeVop3Word1(256, 257, 258)};
+  const auto perm_inst = decode(perm);
+  Check(perm_inst.opcode == O::V_PERM_B32 && perm_inst.src_count == 3u,
+        "V_PERM_B32 did not decode as a three-source VOP3 operation");
+
+  // GLC/SLC/DLC on FLAT/GLOBAL accesses are cache hints.
+  const uint32_t global_glc[] = {EncodeFlat0(0x0c, 2) | (1u << 12u) | (1u << 16u) |
+                                     (1u << 17u),
+                                 EncodeFlat1(3, 0x7d, 0, 0)};
+  const auto global_glc_inst = decode(global_glc);
+  Check(global_glc_inst.opcode == O::FLAT_LOAD_DWORD && global_glc_inst.glc &&
+            global_glc_inst.slc && global_glc_inst.dlc,
+        "GLOBAL load with GLC/SLC/DLC was rejected");
+  const uint32_t flat_lds[] = {EncodeFlat0(0x0c, 2) | (1u << 13u),
+                               EncodeFlat1(3, 0x7d, 0, 0)};
+  Check(decode(flat_lds).opcode == O::UNSUPPORTED,
+        "FLAT LDS-return modifier must stay unsupported");
+}
+
+void TestRdna2LdsWaitcntBarrierAndFloatControls() {
+  namespace Spirv = ShaderRecompiler::Spirv;
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = 1;
+  compute.threads_num[2] = 1;
+  compute.thread_ids_num = 1;
+  compute.lds_size_dwords = 256;
+  compute.wave_size = 64;
+  compute.host_subgroup_size = 64;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
+  options.wave_size = 64;
+
+  constexpr uint32_t WaitLgkm0 = 0xc07fu; // vmcnt/expcnt at maximum, lgkmcnt(0)
+  constexpr uint32_t WaitLgkm1 = 0xc17fu;
+  const auto compile = [&](std::initializer_list<uint32_t> words) {
+    std::vector<uint32_t> code(words);
+    return RecompileForTest(code, options);
+  };
+  const auto barriers = [](const TestCompileResult &result) {
+    return CountSourceOccurrences(result.ir_dump, "SharedMemoryBarrier");
+  };
+
+  // ds_write_b32 v1 -> [v0]; s_waitcnt lgkmcnt(0); ds_read_b32 v2 <- [v0 ^ 4]
+  const auto exchange = compile({
+      EncodeVop2(0x1a, 0, 130, 0), // v_lshlrev_b32 v0, 2, v0
+      EncodeDs0(0x0d), EncodeDs1(0, 1, 0),
+      EncodeSopp(0x0c, WaitLgkm0),
+      EncodeVop2(0x1d, 3, 132, 0), // v_xor_b32 v3, 4, v0
+      EncodeDs0(0x36), EncodeDs1(2, 0, 3),
+      EncodeSopp(0x0c, WaitLgkm0),
+      EncodeSopp(0x01),
+  });
+  Check(barriers(exchange) == 1u,
+        "S_WAITCNT lgkmcnt(0) after an LDS write did not order LDS exactly once");
+  Check(SpirvContainsOpcode(exchange.spirv, 225),
+        "LDS waitcnt barrier did not emit OpMemoryBarrier");
+  CheckSpirvBinaryValidates(exchange.spirv);
+
+  const auto nonzero_wait = compile({
+      EncodeDs0(0x0d), EncodeDs1(0, 1, 0),
+      EncodeSopp(0x0c, WaitLgkm1),
+      EncodeDs0(0x36), EncodeDs1(2, 0, 0),
+      EncodeSopp(0x01),
+  });
+  Check(barriers(nonzero_wait) == 0u,
+        "S_WAITCNT with a nonzero LGKM count inserted an LDS barrier");
+  const auto read_only = compile({
+      EncodeDs0(0x36), EncodeDs1(2, 0, 0),
+      EncodeSopp(0x0c, WaitLgkm0),
+      EncodeSopp(0x01),
+  });
+  Check(barriers(read_only) == 0u,
+        "S_WAITCNT without a preceding LDS write inserted an LDS barrier");
+  const auto split_wait = compile({
+      EncodeDs0(0x0d), EncodeDs1(0, 1, 0),
+      EncodeSopk(0x1a, 125, 0), // s_waitcnt_lgkmcnt null, 0
+      EncodeSopp(0x01),
+  });
+  Check(barriers(split_wait) == 1u,
+        "S_WAITCNT_LGKMCNT 0 after an LDS write did not order LDS");
+  const auto barrier_first = compile({
+      EncodeDs0(0x0d), EncodeDs1(0, 1, 0),
+      EncodeSopp(0x0a), // s_barrier already orders workgroup memory
+      EncodeSopp(0x0c, WaitLgkm0),
+      EncodeSopp(0x01),
+  });
+  Check(barriers(barrier_first) == 0u,
+        "S_BARRIER did not clear the pending LDS write state");
+
+  const auto original = Spirv::GetHostFloatControls();
+  Spirv::SetHostFloatControls({.denorm_flush_f32 = true,
+                               .denorm_preserve_f16 = true,
+                               .denorm_preserve_f64 = true});
+  const auto controlled = compile({EncodeSopp(0x01)});
+  Spirv::SetHostFloatControls({});
+  const auto defaults = compile({EncodeSopp(0x01)});
+  Spirv::SetHostFloatControls(original);
+  CheckSpirvBinaryValidates(controlled.spirv);
+  CheckSpirvBinaryValidates(defaults.spirv);
+  const auto controlled_text = DisassembleSpirvBinary(controlled.spirv);
+  const auto default_text = DisassembleSpirvBinary(defaults.spirv);
+  Check(controlled_text.find("DenormFlushToZero 32") != std::string::npos &&
+            controlled_text.find("DenormPreserve 16") != std::string::npos &&
+            controlled_text.find("DenormPreserve 64") != std::string::npos &&
+            controlled_text.find("OpCapability DenormFlushToZero") != std::string::npos,
+        "supported float controls were not declared");
+  Check(default_text.find("DenormFlushToZero") == std::string::npos &&
+            default_text.find("DenormPreserve") == std::string::npos,
+        "float controls were declared without device support");
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--isa-accuracy-only") == 0) {
+    TestRdna2IsaAccuracyDecode();
+    TestRdna2LdsWaitcntBarrierAndFloatControls();
+    return 0;
+  }
   TestRayTracingDispatchDetection();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
@@ -13710,6 +13926,8 @@ int main() {
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
+  TestRdna2IsaAccuracyDecode();
+  TestRdna2LdsWaitcntBarrierAndFloatControls();
 
   return 0;
 }

@@ -21,6 +21,7 @@ constexpr MemoryOpcodeInfo SMEM_OPCODE_LIST[] = {
     {0x04u, Opcode::S_LOAD_DWORDX16, 16, 32},      {0x08u, Opcode::S_BUFFER_LOAD_DWORD, 1, 32},
     {0x09u, Opcode::S_BUFFER_LOAD_DWORDX2, 2, 32}, {0x0au, Opcode::S_BUFFER_LOAD_DWORDX4, 4, 32},
     {0x0bu, Opcode::S_BUFFER_LOAD_DWORDX8, 8, 32}, {0x0cu, Opcode::S_BUFFER_LOAD_DWORDX16, 16, 32},
+    {0x1fu, Opcode::S_GL1_INV, 0, 32},             {0x20u, Opcode::S_DCACHE_INV, 0, 32},
     {0x25u, Opcode::S_MEMREALTIME, 2, 32},
 };
 
@@ -58,10 +59,23 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x39u, Opcode::BUFFER_ATOMIC_AND, 1, 32},
     {0x3au, Opcode::BUFFER_ATOMIC_OR, 1, 32},
     {0x3bu, Opcode::BUFFER_ATOMIC_XOR, 1, 32},
+    {0x3cu, Opcode::BUFFER_ATOMIC_INC, 1, 32},
+    {0x3du, Opcode::BUFFER_ATOMIC_DEC, 1, 32},
     {0x3fu, Opcode::BUFFER_ATOMIC_FMIN, 1, 32},
     {0x40u, Opcode::BUFFER_ATOMIC_FMAX, 1, 32},
     {0x50u, Opcode::BUFFER_ATOMIC_SWAP_X2, 2, 32},
+    {0x51u, Opcode::BUFFER_ATOMIC_CMPSWAP_X2, 2, 32},
+    {0x52u, Opcode::BUFFER_ATOMIC_ADD_X2, 2, 32},
+    {0x53u, Opcode::BUFFER_ATOMIC_SUB_X2, 2, 32},
+    {0x55u, Opcode::BUFFER_ATOMIC_SMIN_X2, 2, 32},
+    {0x56u, Opcode::BUFFER_ATOMIC_UMIN_X2, 2, 32},
+    {0x57u, Opcode::BUFFER_ATOMIC_SMAX_X2, 2, 32},
+    {0x58u, Opcode::BUFFER_ATOMIC_UMAX_X2, 2, 32},
+    {0x59u, Opcode::BUFFER_ATOMIC_AND_X2, 2, 32},
     {0x5au, Opcode::BUFFER_ATOMIC_OR_X2, 2, 32},
+    {0x5bu, Opcode::BUFFER_ATOMIC_XOR_X2, 2, 32},
+    {0x71u, Opcode::BUFFER_GL0_INV, 0, 32},
+    {0x72u, Opcode::BUFFER_GL1_INV, 0, 32},
 };
 
 constexpr MemoryOpcodeInfo MTBUF_OPCODE_LIST[] = {
@@ -250,6 +264,12 @@ void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		inst.src_count = 0;
 		return;
 	}
+	if (inst.opcode == Opcode::S_DCACHE_INV || inst.opcode == Opcode::S_GL1_INV) {
+		// Cache invalidations have no operands; host memory is coherent at this level.
+		inst.dst.kind  = OperandKind::Null;
+		inst.src_count = 0;
+		return;
+	}
 	// SMEM encodes SBASE in SGPR pairs. Scalar-buffer loads still use the same
 	// pair index; their descriptor operand consumes four SGPRs from that base.
 	DecodeScalarSource(sbase * 2u, pc, inst.src0);
@@ -275,6 +295,7 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	inst.glc         = ((word0 >> 14u) & 1u) != 0;
 	inst.dlc         = ((word0 >> 15u) & 1u) != 0;
 	inst.slc         = ((word1 >> 22u) & 1u) != 0;
+	inst.tfe         = ((word1 >> 23u) & 1u) != 0;
 	inst.family      = Family::MUBUF;
 	inst.opcode_id   = opcode;
 	const auto* info = Detail::FindOpcode(MUBUF_OPS, opcode);
@@ -282,6 +303,12 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	SetRawWords(inst, code, word_index, 2);
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MUBUF, opcode, "MUBUF opcode is not implemented");
+	}
+	if (inst.opcode == Opcode::BUFFER_GL0_INV || inst.opcode == Opcode::BUFFER_GL1_INV) {
+		// Cache invalidations ignore every operand field.
+		inst.dst.kind  = OperandKind::Null;
+		inst.src_count = 0;
+		return;
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);
@@ -311,6 +338,7 @@ void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	inst.glc           = ((word0 >> 14u) & 1u) != 0;
 	inst.dlc           = ((word0 >> 15u) & 1u) != 0;
 	inst.slc           = ((word1 >> 22u) & 1u) != 0;
+	inst.tfe           = ((word1 >> 23u) & 1u) != 0;
 	inst.family        = Family::MTBUF;
 	inst.opcode_id     = opcode;
 	inst.data_format   = dfmt;
@@ -348,6 +376,7 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.offset         = seg == 0u ? (offset & 0x7ffu) : SignExtendU32(offset, 12u);
 	inst.glc            = ((word0 >> 16u) & 1u) != 0;
 	inst.slc            = ((word0 >> 17u) & 1u) != 0;
+	inst.dlc            = dlc != 0u;
 	inst.family         = Family::FLAT;
 	inst.opcode_id      = opcode;
 	inst.memory_segment = seg;
@@ -355,7 +384,9 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 
-	if (dlc != 0 || lds != 0 || inst.glc || inst.slc || seg == 3u) {
+	// GLC/SLC/DLC only select cache policy for loads and stores; the host path accesses
+	// memory coherently, so they are accepted as hints.
+	if (lds != 0 || seg == 3u) {
 		SetUnsupported(inst, Family::FLAT, opcode, "FLAT modifiers or segment are not implemented");
 		return;
 	}

@@ -571,6 +571,20 @@ void EmitBarrier(EmitterState& state) {
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
 }
 
+void EmitSharedMemoryBarrier(EmitterState& state) {
+	// S_WAITCNT lgkmcnt(0) after LDS writes: lanes of one guest wave may live in different
+	// host invocations (and host subgroups for split wave64), so make their LDS writes
+	// visible before the wave reads the exchanged data. Only compute-like stages own
+	// workgroup memory; Vulkan rejects Workgroup memory scope elsewhere.
+	if (state.program.stage == ShaderType::TessellationControl ||
+	    ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
+		return;
+	}
+	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeWorkgroup),
+	                          ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
+	                                                 spv::MemorySemanticsWorkgroupMemoryMask));
+}
+
 uint32_t EmitLaneId(EmitterState& state) {
 	return state.program.stage == ShaderType::TessellationControl
 	           ? EmitBuiltinU32(state, IR::StageInputKind::InvocationId, 0)
@@ -641,8 +655,22 @@ uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 }
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state  = ctx.state;
 	const auto ballot = ctx.Ballot(inst.Arg(1));
-	const auto lane   = ctx.FirstLane(ballot);
+	const auto first  = ctx.FirstLane(ballot);
+	// With EXEC == 0, V_READFIRSTLANE_B32 reads lane 0; FindLSB of an empty ballot is -1.
+	uint32_t any_bits = ConstantU32(state, 0);
+	for (uint32_t word = 0; word < 4u; word++) {
+		const auto bits = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), bits, ballot, word);
+		any_bits = EmitBinaryU32(state, spv::OpBitwiseOr, any_bits, bits);
+	}
+	const auto active = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), active, any_bits,
+	                          ConstantU32(state, 0));
+	const auto lane = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), lane, active, first,
+	                          ConstantU32(state, 0));
 	return ctx.Shuffle(inst, 0, lane);
 }
 

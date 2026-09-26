@@ -92,7 +92,8 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::SetAttribute:
 		case ValueOpcode::SetTessellationAttribute:
 		case ValueOpcode::MeshAllocate:
-		case ValueOpcode::Barrier: return true;
+		case ValueOpcode::Barrier:
+		case ValueOpcode::SharedMemoryBarrier: return true;
 		default: return false;
 	}
 }
@@ -125,6 +126,17 @@ BufferAccess BufferAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::BufferAtomicOr32:
 		case ValueOpcode::BufferAtomicOr64:
 		case ValueOpcode::BufferAtomicXor32:
+		case ValueOpcode::BufferAtomicInc32:
+		case ValueOpcode::BufferAtomicDec32:
+		case ValueOpcode::BufferAtomicCmpSwap64:
+		case ValueOpcode::BufferAtomicIAdd64:
+		case ValueOpcode::BufferAtomicISub64:
+		case ValueOpcode::BufferAtomicSMin64:
+		case ValueOpcode::BufferAtomicUMin64:
+		case ValueOpcode::BufferAtomicSMax64:
+		case ValueOpcode::BufferAtomicUMax64:
+		case ValueOpcode::BufferAtomicAnd64:
+		case ValueOpcode::BufferAtomicXor64:
 		case ValueOpcode::BufferAtomicFMin32:
 		case ValueOpcode::BufferAtomicFMax32: return BufferAccess::Atomic;
 		default: return BufferAccess::None;
@@ -135,6 +147,15 @@ uint32_t BufferComponentCount(ValueOpcode opcode) {
 	switch (opcode) {
 		case ValueOpcode::BufferAtomicSwap64:
 		case ValueOpcode::BufferAtomicOr64:
+		case ValueOpcode::BufferAtomicCmpSwap64:
+		case ValueOpcode::BufferAtomicIAdd64:
+		case ValueOpcode::BufferAtomicISub64:
+		case ValueOpcode::BufferAtomicSMin64:
+		case ValueOpcode::BufferAtomicUMin64:
+		case ValueOpcode::BufferAtomicSMax64:
+		case ValueOpcode::BufferAtomicUMax64:
+		case ValueOpcode::BufferAtomicAnd64:
+		case ValueOpcode::BufferAtomicXor64:
 		case ValueOpcode::LoadBufferU32x2:
 		case ValueOpcode::StoreBufferU32x2: return 2u;
 		case ValueOpcode::LoadBufferU32x3:
@@ -220,6 +241,12 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 		case ValueOpcode::ImageAtomicAnd32:
 		case ValueOpcode::ImageAtomicOr32:
 		case ValueOpcode::ImageAtomicXor32:
+		case ValueOpcode::ImageAtomicCmpSwap32:
+		case ValueOpcode::ImageAtomicISub32:
+		case ValueOpcode::ImageAtomicSMin32:
+		case ValueOpcode::ImageAtomicSMax32:
+		case ValueOpcode::ImageAtomicInc32:
+		case ValueOpcode::ImageAtomicDec32:
 			return {ImageAccess::Atomic, ImageResourceClass::Storage, false};
 		default: return {};
 	}
