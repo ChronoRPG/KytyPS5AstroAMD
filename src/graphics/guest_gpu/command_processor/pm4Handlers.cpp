@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -20,6 +21,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -1372,10 +1374,34 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	auto*      dst         = reinterpret_cast<void*>((buffer[1] & 0xffffffc0u) |
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
-	if (dst != nullptr && buffer_size != 0) {
-		memset(dst, 0, buffer_size);
+	HangTrace::RecordLodStats(dst, buffer_size, buffer[3]);
+
+	// KYTY_LOD_STATS_MODE (diagnostic A/B switch, read once):
+	//   legacy    (default) zero the report and write 1 into its first dword
+	//   zero      zero the whole report
+	//   untouched leave the guest buffer as the guest left it
+	//   ones      fill the report with 0xff bytes, then write 1 into its first dword
+	static const int lod_mode = [] {
+		const auto* mode = std::getenv("KYTY_LOD_STATS_MODE");
+		if (mode != nullptr && std::strcmp(mode, "zero") == 0) {
+			std::printf("GET_LOD_STATS mode: zero\n");
+			return 1;
+		}
+		if (mode != nullptr && std::strcmp(mode, "untouched") == 0) {
+			std::printf("GET_LOD_STATS mode: untouched\n");
+			return 2;
+		}
+		if (mode != nullptr && std::strcmp(mode, "ones") == 0) {
+			std::printf("GET_LOD_STATS mode: ones\n");
+			return 3;
+		}
+		return 0;
+	}();
+
+	if (dst != nullptr && buffer_size != 0 && lod_mode != 2) {
+		memset(dst, lod_mode == 3 ? 0xff : 0, buffer_size);
 		// Hack?
-		if (buffer_size >= sizeof(uint32_t)) {
+		if ((lod_mode == 0 || lod_mode == 3) && buffer_size >= sizeof(uint32_t)) {
 			auto* label = static_cast<uint32_t*>(dst);
 			*label      = 1;
 		}

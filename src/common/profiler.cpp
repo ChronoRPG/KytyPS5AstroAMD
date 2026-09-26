@@ -1,6 +1,7 @@
 #include "common/profiler.h"
 
 #include "common/emulatorConfig.h"
+#include "common/hangTrace.h"
 #include "common/stringUtils.h"
 
 #include <algorithm>
@@ -653,6 +654,7 @@ void Initialize() {
 			::printf("Tracy detailed zones enabled (KYTY_PROFILE_DETAILS=1)\n");
 		}
 	}
+	HangTrace::Initialize();
 	if (LoadingEnabled() && tracy::ProfilerAvailable() && !g_loading_publisher.joinable()) {
 		try {
 			g_loading_publisher = std::jthread([](std::stop_token stop) {
@@ -683,6 +685,7 @@ void Initialize() {
 }
 
 void Shutdown() {
+	HangTrace::Shutdown();
 	// The publisher must finish before Tracy's global state is torn down. Its wait
 	// is interruptible and uses only a private host mutex, never guest/GPU locks.
 	if (g_loading_publisher.joinable()) {

@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/hangTrace.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "common/stringUtils.h"
@@ -682,6 +683,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                                                    : TextureCache::BindingType::Texture);
 		const auto id   = texture_cache.FindImage(desc);
 		return {id, nullptr, std::move(desc)};
+	}
+
+	if (HangTrace::Enabled()) {
+		HangTrace::RecordTexture(descriptor.fields);
 	}
 
 	TextureCache::ImageDesc desc;

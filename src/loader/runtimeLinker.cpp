@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hangTrace.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
@@ -30,6 +31,7 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -266,6 +268,74 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	std::memcpy(code, bytes, sizeof(bytes));
 	Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code), thunk_size);
 	return reinterpret_cast<uint64_t>(code);
+}
+
+// Hang trace: route a resolved guest->HLE PLT import through a tiny counting thunk.
+//   movabs r11, &counter ; lock inc qword [r11] ; movabs r11, target ; jmp r11
+// r11 is a SysV scratch register that is never used for arguments, and the jump keeps the
+// guest return address and stack exactly as the direct call would. Counters live in ordinary
+// host memory, away from the executable page.
+static std::mutex            g_count_thunk_mutex;
+static std::vector<uint64_t> g_count_thunk_pages;
+static uint64_t              g_count_thunk_offset = 0;
+
+static uint64_t GetCountingImportThunk(uint64_t target, const RelocationInfo& ri,
+                                       const Program* program) {
+	if (target == 0 || HangTrace::IsGuestAddress(target)) {
+		return target;
+	}
+	std::scoped_lock lock(g_count_thunk_mutex);
+	if (const auto existing = HangTrace::FindImportThunk(target); existing != 0) {
+		return existing;
+	}
+	const auto program_name =
+	    program != nullptr ? Common::PathToString(program->file_name.filename()) : std::string();
+	auto* counter = HangTrace::AllocateImportCounter(target, ri.name, ri.dbg_name, program_name);
+	if (counter == nullptr) {
+		return target;
+	}
+
+	constexpr uint64_t thunk_size = 32;
+	if (g_count_thunk_pages.empty() || g_count_thunk_offset + thunk_size > UNRESOLVED_STUB_PAGE_SIZE) {
+		auto page = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+		    0, UNRESOLVED_STUB_PAGE_SIZE, Common::VirtualMemory::Mode::ExecuteReadWrite,
+		    "hang_trace_import_thunk");
+		if (page == 0) {
+			return target;
+		}
+		g_count_thunk_pages.push_back(page);
+		g_count_thunk_offset = 0;
+	}
+	auto* code = reinterpret_cast<uint8_t*>(g_count_thunk_pages.back() + g_count_thunk_offset);
+	g_count_thunk_offset += thunk_size;
+
+	uint8_t    bytes[thunk_size];
+	std::memset(bytes, 0xcc, sizeof(bytes));
+	size_t     i      = 0;
+	const auto emit   = [&](uint8_t b) { bytes[i++] = b; };
+	const auto emit64 = [&](uint64_t v) {
+		std::memcpy(bytes + i, &v, sizeof(v));
+		i += sizeof(v);
+	};
+	emit(0x49);
+	emit(0xbb);
+	emit64(reinterpret_cast<uint64_t>(counter)); // movabs r11, counter
+	emit(0xf0);
+	emit(0x49);
+	emit(0xff);
+	emit(0x03); // lock inc qword ptr [r11]
+	emit(0x49);
+	emit(0xbb);
+	emit64(target); // movabs r11, target
+	emit(0x41);
+	emit(0xff);
+	emit(0xe3); // jmp r11
+	EXIT_NOT_IMPLEMENTED(i > thunk_size);
+	std::memcpy(code, bytes, sizeof(bytes));
+	Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code), thunk_size);
+	const auto thunk = reinterpret_cast<uint64_t>(code);
+	HangTrace::SetImportThunk(target, thunk);
+	return thunk;
 }
 
 static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
@@ -1025,7 +1095,13 @@ static void RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	// KYTY_PROFILER_BLOCK("patch");
 
 	if (ri.resolved) {
-		patched = PatchGuestMemory64(ri.vaddr, ri.value);
+		auto value = ri.value;
+		if (jmprela_table && ri.type == SymbolType::Func && !ri.bind_self &&
+		    (ri.bind == BindType::Global || ri.bind == BindType::Weak) &&
+		    HangTrace::ImportsEnabled()) {
+			value = GetCountingImportThunk(value, ri, program);
+		}
+		patched = PatchGuestMemory64(ri.vaddr, value);
 	} else {
 		uint64_t value = 0;
 		bool     weak  = (ri.bind == BindType::Weak || !program->fail_if_global_not_resolved);
@@ -1377,6 +1453,8 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 
 	if (program->elf->IsValid()) {
 		LoadProgramToMemory(program);
+		HangTrace::RegisterGuestCode(program->base_vaddr, program->base_size,
+		                             Common::PathToString(elf_name.filename()));
 		ParseProgramDynamicInfo(program);
 		CreateSymbolDatabase(program);
 	} else {

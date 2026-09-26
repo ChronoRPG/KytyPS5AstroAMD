@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/hangTrace.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -1179,6 +1180,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		FrameMarkNamed("Guest flip completed");
 	}
 	Profiler::PublishFrameWork();
+	HangTrace::RecordFlip();
 
 	if (Config::GraphicsDebugDumpEnabled() &&
 	    Config::GetPrintfDirection() != Config::LogDirection::Silent) {

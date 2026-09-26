@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/hangTrace.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -199,7 +200,11 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 void GuestGpu::Done() {
 	GpuMutexLock lock(m_submission_mutex);
 	if (!IsGpuThread()) {
+		const auto wait_start = HangTrace::Enabled() ? HangTrace::NowNs() : 0;
 		WaitForIdle();
+		if (HangTrace::Enabled()) {
+			HangTrace::RecordDoneWait(HangTrace::NowNs() - wait_start);
+		}
 	}
 	m_graphics_done = true;
 	m_done_num++;
@@ -453,6 +458,9 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
+	if (HangTrace::Enabled()) {
+		submission.enqueue_ns = HangTrace::NowNs();
+	}
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_queues[submission.queue_id].push_back(std::move(submission));
@@ -543,7 +551,18 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
+		uint64_t slice_start = 0;
+		if (HangTrace::Enabled()) {
+			slice_start = HangTrace::NowNs();
+			if (!submission.started && submission.enqueue_ns != 0) {
+				HangTrace::RecordQueueWait(submission.queue_id, slice_start - submission.enqueue_ns);
+			}
+		}
 		const bool complete = gpu->Process(submission);
+		if (HangTrace::Enabled()) {
+			HangTrace::RecordQueueBusy(submission.queue_id, HangTrace::NowNs() - slice_start,
+			                           complete);
+		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {

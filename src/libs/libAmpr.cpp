@@ -1,12 +1,14 @@
 #include "common/abi.h"
 #include "common/dateTime.h"
 #include "common/file.h"
+#include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
@@ -15,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -574,6 +577,7 @@ static int KYTY_SYSV_ABI SubmitCommandBufferAndGetResult(void*     command_buffe
                                                          void*     result,
                                                          uint32_t* out_submission_id) {
 	PRINT_NAME();
+	HangTrace::SetGuestCaller(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprSubmitAndGetResult);
 	AprShared::LoadingSubmissionDiagnostic diagnostic(
 	    1, reinterpret_cast<uint64_t>(command_buffer), argument, reinterpret_cast<uint64_t>(result),
@@ -610,6 +614,7 @@ static int KYTY_SYSV_ABI SubmitCommandBufferAndGetResult(void*     command_buffe
 
 static int KYTY_SYSV_ABI SubmitCommandBuffer(void* command_buffer, uint64_t argument) {
 	PRINT_NAME();
+	HangTrace::SetGuestCaller(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprSubmitPlain);
 	AprShared::LoadingSubmissionDiagnostic diagnostic(
 	    0, reinterpret_cast<uint64_t>(command_buffer), argument);
@@ -627,6 +632,7 @@ static int KYTY_SYSV_ABI SubmitCommandBuffer(void* command_buffer, uint64_t argu
 static int KYTY_SYSV_ABI SubmitCommandBufferAndGetId(void*     command_buffer, uint64_t argument,
                                                      uint32_t* out_submission_id) {
 	PRINT_NAME();
+	HangTrace::SetGuestCaller(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprSubmitAndGetId);
 	AprShared::LoadingSubmissionDiagnostic diagnostic(
 	    2, reinterpret_cast<uint64_t>(command_buffer), argument, 0,
@@ -1547,6 +1553,17 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 				auto result = ReadHostFileToGuest(host_path, command.file_offset,
 				                                  command.destination, command.size, &bytes_read);
 				if (diagnostic != nullptr) diagnostic->read_bytes += bytes_read;
+				if (HangTrace::Enabled()) {
+					char thread_name[64] = "(host)";
+					if (auto self = LibKernel::PthreadSelfOrNull(); self != nullptr) {
+						if (LibKernel::PthreadGetname(self, thread_name) != 0) {
+							std::snprintf(thread_name, sizeof(thread_name), "(unnamed)");
+						}
+					}
+					HangTrace::RecordAprRead(command.file_id, host_path, command.file_offset,
+					                         command.size, command.destination, bytes_read, result,
+					                         thread_name);
+				}
 				if (result != OK) {
 					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
 					LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32
@@ -2646,6 +2663,7 @@ static int KYTY_SYSV_ABI AmmSetPageTablePoolOccupancyNotificationThreshold(uint3
 static int KYTY_SYSV_ABI AmmSubmitCommandBuffer(void* command_buffer_base, uint32_t argument1,
                                                uint32_t argument2) {
 	PRINT_NAME();
+	HangTrace::SetGuestCaller(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprSubmitPlain);
 	AprShared::LoadingSubmissionDiagnostic diagnostic(
 	    3, reinterpret_cast<uint64_t>(command_buffer_base), argument1, 0, 0, argument2);
@@ -2663,6 +2681,7 @@ static int KYTY_SYSV_ABI AmmSubmitCommandBuffer(void* command_buffer_base, uint3
 static int KYTY_SYSV_ABI AmmSubmitCommandBufferAndGetId(void* command_buffer_base, uint32_t argument1,
                                                         uint32_t argument2, uint32_t* out_submission_id) {
 	PRINT_NAME();
+	HangTrace::SetGuestCaller(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprSubmitAndGetId);
 	AprShared::LoadingSubmissionDiagnostic diagnostic(
 	    5, reinterpret_cast<uint64_t>(command_buffer_base), argument1, 0,
@@ -2696,6 +2715,7 @@ static int KYTY_SYSV_ABI AmmSubmitCommandBufferAndGetResult(void* command_buffer
                                                             uint32_t argument2, void* result,
                                                             uint32_t* out_submission_id) {
 	PRINT_NAME();
+	HangTrace::SetGuestCaller(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprSubmitAndGetResult);
 	AprShared::LoadingSubmissionDiagnostic diagnostic(
 	    4, reinterpret_cast<uint64_t>(command_buffer_base), argument1, reinterpret_cast<uint64_t>(result),
