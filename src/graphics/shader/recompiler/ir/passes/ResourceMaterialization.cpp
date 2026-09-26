@@ -332,7 +332,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
                               const DescriptorValue& material_value,
                               const DescriptorValue& table_value, uint32_t image_index,
                               const SrtRuntime& runtime, SrtWalker& clean,
-                              ResourceSnapshot& snapshot,
+                              EvaluationScratch& scratch, ResourceSnapshot& snapshot,
                               ResourceSpecialization& specialization) {
 	uint64_t table_base = 0;
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
@@ -345,7 +345,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 	} else {
 		return false;
 	}
-	auto& keys = program.material_keys;
+	auto& keys = scratch.material_keys;
 	keys.clear();
 	if (indirect.material_source == UINT32_MAX) {
 		uint32_t key_count = 0;
@@ -1028,7 +1028,6 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	if (Common::RendererBatchEnabled() && !plan.control_flow.empty()) {
 		const auto count = plan.control_flow.size();
 		plan.flow_aliases.resize(count);
-		plan.flow_visit_tags.resize(count);
 		plan.flow_initial_sources.assign(plan.descriptor_sources.size(), 1u);
 		std::vector<uint8_t> resolved(count, 0u);
 		std::vector<uint32_t> path;
@@ -1057,12 +1056,14 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			}
 		}
 	}
+	// Last: the builders above may still assign memo slots. From here the plan is read-only.
+	SealEvaluationIndices(plan);
 	return plan;
 }
 
 template <bool Optimize>
 static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& runtime,
-                                    ResourceSnapshot& snapshot,
+                                    EvaluationScratch& scratch, ResourceSnapshot& snapshot,
                                     ResourceSpecialization& specialization) {
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
@@ -1080,7 +1081,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	}
 	const bool capture_reads = masked_image &&
 	    std::ranges::any_of(program.info.buffers, &BufferResource::written);
-	auto& reads = program.specialization_reads;
+	auto& reads = scratch.specialization_reads;
 	ReadCapture capture {runtime, reads};
 	SrtRuntime observed = runtime;
 	if (capture_reads) {
@@ -1096,8 +1097,8 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			observed.try_read_specialization_backing = ProbeStrictBacking;
 		}
 	}
-	SrtWalker clean(program, CleanRuntime(observed));
-	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);
+	SrtWalker clean(program, scratch, CleanRuntime(observed));
+	SrtWalker walker(program, scratch, observed, program.clean_flat_slots, &clean);
 	std::span<const uint8_t> active;
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Resources::SRT refresh");
@@ -1191,7 +1192,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 				     !clean.EvaluateDescriptor(indirect.material_source, material)) ||
 				    !clean.EvaluateDescriptor(indirect.table_source, table) ||
 				    !MaterializeIndirectImage<Optimize>(program, indirect, material, table, i, observed,
-				                                         clean, snapshot, specialization)) {
+				                                         clean, scratch, snapshot, specialization)) {
 					return false;
 				}
 			} else {
@@ -1219,15 +1220,23 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                          EvaluationScratch& scratch, ResourceSnapshot& snapshot,
+                          ResourceSpecialization& specialization) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::ResourceMaterialization);
 	static const bool optimized = [] {
 		const auto* setting = std::getenv("KYTY_RESOURCE_MATERIALIZATION");
 		return setting != nullptr && std::strcmp(setting, "optimized") == 0;
 	}();
-	return optimized ? MaterializeResourcesImpl<true>(program, runtime, snapshot, specialization)
-	                 : MaterializeResourcesImpl<false>(program, runtime, snapshot, specialization);
+	return optimized
+	           ? MaterializeResourcesImpl<true>(program, runtime, scratch, snapshot, specialization)
+	           : MaterializeResourcesImpl<false>(program, runtime, scratch, snapshot, specialization);
+}
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	return MaterializeResources(program, runtime, ThreadEvaluationScratch(), snapshot,
+	                            specialization);
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

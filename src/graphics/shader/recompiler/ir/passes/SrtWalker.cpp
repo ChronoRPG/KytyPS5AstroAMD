@@ -863,12 +863,33 @@ void BuildSrtArithmeticTapes(ResourcePlan& program) {
 	}
 }
 
+void SealEvaluationIndices(ResourcePlan& program) {
+	// Value storage owns every instruction reachable from the plan's roots, so no
+	// later walk can meet an unassigned node. Earlier builders keep their indices.
+	for (const auto& inst: program.value_storage) {
+		(void)inst.EvaluationIndex(program.evaluation_value_count);
+	}
+	program.evaluation_sealed = true;
+}
+
+EvaluationScratch& ThreadEvaluationScratch() {
+	thread_local EvaluationScratch scratch;
+	return scratch;
+}
+
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      std::span<const uint8_t> clean_flat_slots, SrtWalker* clean_evaluator,
                      Value active_mask)
-    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
-      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
-      m_context(AcquireContext(program)),
+    : SrtWalker(program,
+                clean_evaluator != nullptr ? clean_evaluator->m_scratch : ThreadEvaluationScratch(),
+                runtime, clean_flat_slots, clean_evaluator, active_mask) {}
+
+SrtWalker::SrtWalker(const ResourcePlan& program, EvaluationScratch& scratch,
+                     const SrtRuntime& runtime, std::span<const uint8_t> clean_flat_slots,
+                     SrtWalker* clean_evaluator, Value active_mask)
+    : m_program(program), m_scratch(scratch), m_runtime(runtime),
+      m_clean_flat_slots(clean_flat_slots), m_clean_evaluator(clean_evaluator),
+      m_active_mask(active_mask.Resolve()), m_context(AcquireContext(scratch)),
       m_count_recipes(!program.evaluation_recipes.empty() && Profiler::AggregateEnabled()) {
 	// CleanRuntime preserves these identities and replaces only the reader. Custom
 	// ordinary readers may represent another memory domain and cannot borrow.
@@ -897,7 +918,9 @@ SrtWalker::~SrtWalker() {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::SrtTapeBoundaryCalls, m_tape_boundary_calls);
 		}
 	}
-	--m_program.evaluation_depth;
+	EXIT_IF(m_scratch.evaluation_depth == 0u ||
+	        &m_scratch.evaluation_contexts[m_scratch.evaluation_depth - 1u] != &m_context);
+	--m_scratch.evaluation_depth;
 	if (m_shared_clean_hits != 0) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::SrtSharedCleanMemoHits, m_shared_clean_hits);
 	}
@@ -926,13 +949,21 @@ bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 	return true;
 }
 
-ResourcePlan::EvaluationContext& SrtWalker::AcquireContext(const ResourcePlan& program) {
-	if (program.evaluation_depth == program.evaluation_contexts.size()) {
-		program.evaluation_contexts.emplace_back();
+ResourcePlan::EvaluationContext& SrtWalker::AcquireContext(EvaluationScratch& scratch) {
+	if (scratch.evaluation_depth == scratch.evaluation_contexts.size()) {
+		scratch.evaluation_contexts.emplace_back();
 	}
-	auto& context = program.evaluation_contexts[program.evaluation_depth++];
+	// A new generation hides every entry left by an earlier walk, of any plan.
+	auto& context = scratch.evaluation_contexts[scratch.evaluation_depth++];
 	context.generation += 2;
 	return context;
+}
+
+uint32_t SrtWalker::MemoIndex(const Inst& inst) const {
+	// Sealed plans are shared read-only. Unsealed programs (translation-time passes
+	// and tests) still assign slots lazily on their only evaluating thread.
+	return m_program.evaluation_sealed ? inst.SealedEvaluationIndex()
+	                                   : inst.EvaluationIndex(m_program.evaluation_value_count);
 }
 
 float SrtWalker::Float32(uint64_t bits) {
@@ -957,7 +988,7 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 		return false;
 	}
 	if (!m_program.evaluation_recipes.empty()) {
-		const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
+		const auto index = MemoIndex(*inst);
 		if (index < m_program.evaluation_recipes.size()) {
 			return EvaluateRecipeNode(index, result);
 		}
@@ -966,7 +997,7 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 		return EvaluateWide(inst->Arg(1), result);
 	}
-	const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
+	const auto index = MemoIndex(*inst);
 	if (index >= m_context.values.size()) {
 		m_context.values.resize(m_program.evaluation_value_count);
 	}
@@ -1015,7 +1046,7 @@ const Inst* SrtWalker::FlatReadInstruction(uint32_t slot, uint32_t& memo_index) 
 		}
 	}
 	const auto* inst = m_program.srt_reads[slot].value.ResolveInstruction();
-	memo_index = inst->EvaluationIndex(m_program.evaluation_value_count);
+	memo_index = MemoIndex(*inst);
 	return inst;
 }
 
@@ -1232,7 +1263,7 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 bool SrtWalker::ResolveRawReadAddress(const Inst& inst, uint64_t& address,
 	                                  uint64_t& available) {
 	if (!m_program.evaluation_recipes.empty()) {
-		const auto index = inst.EvaluationIndex(m_program.evaluation_value_count);
+		const auto index = MemoIndex(inst);
 		if (index < m_program.evaluation_recipes.size()) {
 			const auto& recipe = m_program.evaluation_recipes[index];
 			if (recipe.kind == ResourcePlan::EvaluationRecipe::Kind::RawAddress ||
@@ -1803,7 +1834,7 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 	if (m_program.control_flow.empty()) {
 		return {};
 	}
-	auto& active = m_program.active_sources;
+	auto& active = m_scratch.active_sources;
 	const bool decoded = m_program.condition_roots.size() == m_program.control_flow.size();
 	const bool compact = m_program.flow_aliases.size() == m_program.control_flow.size();
 	if (compact) {
@@ -1818,14 +1849,19 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 			}
 		}
 	}
-	auto& visited = m_program.visited_blocks;
-	auto& pending = m_program.pending_blocks;
+	auto& visited = m_scratch.visited_blocks;
+	auto& pending = m_scratch.pending_blocks;
+	auto& visit_tags = m_scratch.flow_visit_tags;
 	uint32_t visit_epoch = 0;
 	if (compact) {
-		visit_epoch = ++m_program.flow_visit_epoch;
+		// Tags are epoch-stamped per scratch, so tags left by other plans never match.
+		if (visit_tags.size() < m_program.control_flow.size()) {
+			visit_tags.resize(m_program.control_flow.size(), 0u);
+		}
+		visit_epoch = ++m_scratch.flow_visit_epoch;
 		if (visit_epoch == 0u) {
-			std::ranges::fill(m_program.flow_visit_tags, 0u);
-			visit_epoch = ++m_program.flow_visit_epoch;
+			std::ranges::fill(visit_tags, 0u);
+			visit_epoch = ++m_scratch.flow_visit_epoch;
 		}
 	} else {
 		visited.assign(m_program.control_flow.size(), 0u);
@@ -1837,8 +1873,8 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 		const auto index = compact ? m_program.flow_aliases.at(requested) : requested;
 		pending.pop_back();
 		if (compact) {
-			if (m_program.flow_visit_tags.at(index) == visit_epoch) continue;
-			m_program.flow_visit_tags[index] = visit_epoch;
+			if (visit_tags.at(index) == visit_epoch) continue;
+			visit_tags[index] = visit_epoch;
 		} else {
 			if (visited.at(index)) continue;
 			visited[index] = 1u;
