@@ -2221,6 +2221,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	}
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, std::move(transfer));
 	buffer.MarkContentWritten();
+	NoteBufferContentWrite(image.info.data.address, copy_size);
 	return true;
 }
 

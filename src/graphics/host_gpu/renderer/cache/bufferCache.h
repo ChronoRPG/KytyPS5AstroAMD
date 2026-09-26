@@ -10,9 +10,11 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/writeTickMap.h"
 
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -49,7 +51,13 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Guest read faults outside the GPU thread use a side copy when every dirty byte they need
+	// was written by an already submitted recording (KYTY_READBACK_SIDE_COPY=0 disables it).
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// Publishes (waiting if necessary) every pending side readback overlapping the range. Any
+	// thread; never waits for the current recording. Required before other ownership changes.
+	void CompleteSideReadbacks(uint64_t vaddr, uint64_t size);
+	void CompleteAllSideReadbacks();
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -86,6 +94,7 @@ public:
 	[[nodiscard]] std::optional<BufferContentRevision> GetContentRevision(uint64_t vaddr,
 	                                                                    uint64_t size);
 	// Invalidate retained results before commands whose writes cannot be bounded to one buffer.
+	// Also disables side readbacks until the current recording is submitted.
 	void InvalidateContentRevisions();
 	// Publications can outlive cache ownership. Registration is on the GPU thread; completion
 	// is on the priority worker, and these queries never wait for GPU work or backing writes.
@@ -147,6 +156,30 @@ private:
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	struct ReadMemoryTrace {
+		uint64_t begin      = 0;
+		uint64_t size       = 0;
+		bool     downloaded = false;
+	};
+	// The drain path: GPU thread only.
+	void ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write, ReadMemoryTrace& trace);
+
+	// Side readbacks. Issue runs on the GPU thread; completion on any thread.
+	struct SideReadback;
+	struct SideReadbackState;
+	enum class SideIssueResult : uint8_t {
+		Issued,
+		Pending,
+		CurrentWriter,
+		Unbounded,
+		Other,
+	};
+	[[nodiscard]] SideIssueResult TryIssueSideReadback(uint64_t vaddr, uint64_t size,
+	                                                  std::shared_ptr<SideReadback>& issued);
+	void CompleteSideReadback(SideReadback& readback);
+	[[nodiscard]] bool OverlapsPendingSideReadback(uint64_t begin, uint64_t end) const;
+	// Every GPU-side write of cached buffer contents for a guest range (GPU thread).
+	void NoteBufferContentWrite(uint64_t vaddr, uint64_t size);
 
 	struct BackingPublication {
 		uint64_t                token;
@@ -193,6 +226,13 @@ private:
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
 	uint64_t m_content_revision_epoch = 1;
+	// Writer ticks of buffer contents (GPU thread). Missing ranges are no newer than the floor.
+	WriteTickMap m_write_ticks;
+	uint64_t     m_write_tick_floor      = 0;
+	size_t       m_write_tick_prune_size = 1024;
+	// Recording tick that holds an unbounded (address) GPU writer; 0 when none.
+	uint64_t     m_unbounded_write_tick  = 0;
+	std::unique_ptr<SideReadbackState> m_side;
 };
 
 } // namespace Libs::Graphics

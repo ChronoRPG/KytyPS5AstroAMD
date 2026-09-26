@@ -125,6 +125,30 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+void MemoryTracker::MarkReadbackPending(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	// No clean-verdict bump: no dirty or protection state changes here.
+	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		manager->MarkReadbackPending(manager->GetCpuAddr() + offset, bytes);
+	});
+}
+
+MemoryTracker::ReadbackUnmarkResult MemoryTracker::UnmarkReadbackPending(uint64_t vaddr,
+                                                                         uint64_t size) {
+	CheckNotInUploadCallback();
+	CleanVerdict::Invalidate();
+	ReadbackUnmarkResult result;
+	Iterate<false>(vaddr, size, [&result](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		const auto [unmarked, retained] =
+		    manager->ClearReadbackPending(manager->GetCpuAddr() + offset, bytes);
+		result.unmarked_pages += unmarked;
+		result.retained_pages += retained;
+	});
+	return result;
+}
+
 void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	std::vector<RegionManager*> managers;

@@ -77,11 +77,21 @@ void ArmLodReportWatch(const void* destination, uint32_t size);
 void RecordTexture(const uint32_t* fields);
 
 // GPU->CPU readbacks (BufferCache::ReadMemory), attributed to the path that requested them.
-enum class ReadbackKind : uint8_t { Invalidate, FaultRead, FaultWrite, GpuSync };
+// FaultReadSide / FaultReadDuplicate: a guest read fault served by a side copy (no drain of the
+// current recording), or by waiting on another thread's pending side copy.
+enum class ReadbackKind : uint8_t {
+	Invalidate,
+	FaultRead,
+	FaultWrite,
+	GpuSync,
+	FaultReadSide,
+	FaultReadDuplicate
+};
 // Guest access fault context for readbacks on this thread (instruction address, guest thread).
 void SetFaultContext(uint64_t pc, std::string_view thread_name);
 void ClearFaultContext();
 void SetReadbackKind(ReadbackKind kind);
+[[nodiscard]] ReadbackKind GetReadbackKind();
 void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64_t window_size,
                     bool downloaded, uint64_t duration_ns);
 

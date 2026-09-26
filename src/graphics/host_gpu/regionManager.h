@@ -128,6 +128,11 @@ public:
 		} else {
 			bits.UnsetRange(start, end);
 		}
+		if constexpr (source == DirtySource::Gpu) {
+			// Any GPU ownership transition supersedes an outstanding side readback: a newer
+			// writer (enable) or an explicit download/unmark (disable) now owns these pages.
+			m_readback_pending.UnsetRange(start, end);
+		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>();
 		} else {
@@ -145,12 +150,45 @@ public:
 			if constexpr (source == DirtySource::Cpu) {
 				UpdateProtection<true, false>();
 			} else {
+				m_readback_pending.UnsetRange(start, end);
 				UpdateProtection<false, true>();
 			}
 		}
 		for (const auto [first, last]: mask) {
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}
+	}
+
+	// Side readbacks (BufferCache::ReadMemory). Pending marks the GPU-dirty pages of a range whose
+	// exact dirty bytes were handed to one side-copy publication. Any later GPU transition of a
+	// page clears its mark, so completion unprotects only pages that no newer writer re-owned.
+	void MarkReadbackPending(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		const RegionBits dirty(m_gpu_dirty, start, end);
+		for (const auto [first, last]: dirty) {
+			m_readback_pending.SetRange(first, last);
+		}
+	}
+
+	// Returns {pages unprotected, GPU-dirty pages retained in the range}.
+	std::pair<uint64_t, uint64_t> ClearReadbackPending(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		const RegionBits pending(m_readback_pending, start, end);
+		uint64_t         cleared = 0;
+		for (const auto [first, last]: pending) {
+			m_gpu_dirty.UnsetRange(first, last);
+			m_readback_pending.UnsetRange(first, last);
+			cleared += last - first;
+		}
+		uint64_t         retained = 0;
+		const RegionBits dirty(m_gpu_dirty, start, end);
+		for (const auto [first, last]: dirty) {
+			retained += last - first;
+		}
+		if (cleared != 0) {
+			UpdateProtection<false, true>();
+		}
+		return {cleared, retained};
 	}
 
 	TrackingSpinLock lock;
@@ -200,6 +238,7 @@ private:
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
+	RegionBits   m_readback_pending;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
 };

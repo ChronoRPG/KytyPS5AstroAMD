@@ -2,6 +2,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/writeTickMap.h"
 
 #include <atomic>
 #include <chrono>
@@ -37,6 +38,7 @@ using Libs::Graphics::MemoryTracker;
 using Libs::Graphics::PageManager;
 using Libs::Graphics::RangeSet;
 using Libs::Graphics::TRACKER_ADDRESS_SIZE;
+using Libs::Graphics::WriteTickMap;
 
 void Check(bool value, const char *text) {
   if (!value) {
@@ -416,6 +418,78 @@ void TestGpuDirtyBits() {
         "GPU dirty state did not restore write-only tracking");
   tracker.MarkRegionAsCpuModified(address, page_size);
   tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
+void TestWriteTickMap() {
+  WriteTickMap ticks;
+  Check(ticks.MaxTick(0x1000, 0x1000) == 0, "empty write-tick map reported a writer");
+  ticks.Assign(0x1000, 0x4000, 5);
+  ticks.Assign(0x2000, 0x1000, 7);
+  Check(ticks.MaxTick(0x1000, 0x1000) == 5 && ticks.MaxTick(0x2000, 0x10) == 7 &&
+            ticks.MaxTick(0x3000, 0x2000) == 5 && ticks.MaxTick(0x1000, 0x4000) == 7 &&
+            ticks.MaxTick(0x5000, 0x1000) == 0 && ticks.Size() == 3,
+        "write-tick map did not split an overwritten interval");
+  ticks.Assign(0x1000, 0x4000, 9);
+  Check(ticks.Size() == 1 && ticks.MaxTick(0x2000, 1) == 9,
+        "write-tick map did not replace covered intervals");
+  ticks.Assign(0x5000, 0x1000, 9);
+  Check(ticks.Size() == 1 && ticks.MaxTick(0x5000, 1) == 9,
+        "write-tick map did not coalesce equal-tick neighbours");
+  ticks.Assign(0x8000, 0x1000, 3);
+  ticks.Prune(4);
+  Check(ticks.Size() == 1 && ticks.MaxTick(0x8000, 1) == 0 && ticks.MaxTick(0x1000, 1) == 9,
+        "write-tick prune removed the wrong entries");
+}
+
+void TestReadbackPendingUnmark() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  auto *second = reinterpret_cast<void *>(address + page_size);
+
+  // Two GPU-dirty pages handed to one side readback.
+  tracker.ForEachUploadRange(
+      address, page_size * 2, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.MarkReadbackPending(address, page_size * 3);
+  auto result = tracker.UnmarkReadbackPending(address, page_size * 3);
+  Check(result.unmarked_pages == 2 && result.retained_pages == 0 &&
+            !tracker.IsRegionGpuModified(address, page_size * 3) &&
+            Protection(memory) == PAGE_READONLY && Protection(second) == PAGE_READONLY,
+        "readback completion did not release its pending pages");
+
+  // A newer writer re-dirties the second page while the copy is in flight.
+  tracker.ForEachUploadRange(
+      address, page_size * 2, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.MarkReadbackPending(address, page_size * 2);
+  tracker.ForEachUploadRange(
+      address + page_size, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  result = tracker.UnmarkReadbackPending(address, page_size * 2);
+  Check(result.unmarked_pages == 1 && result.retained_pages == 1 &&
+            !tracker.IsRegionGpuModified(address, page_size) &&
+            tracker.IsRegionGpuModified(address + page_size, page_size) &&
+            Protection(memory) == PAGE_READONLY && Protection(second) == PAGE_NOACCESS,
+        "readback completion released a page a newer writer re-owned");
+
+  // An explicit download/unmark in between cancels the pending mark.
+  tracker.MarkReadbackPending(address + page_size, page_size);
+  tracker.UnmarkRegionAsGpuModified(address + page_size, page_size);
+  tracker.ForEachUploadRange(
+      address + page_size, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  result = tracker.UnmarkReadbackPending(address, page_size * 2);
+  Check(result.unmarked_pages == 0 && result.retained_pages == 1 &&
+            tracker.IsRegionGpuModified(address + page_size, page_size),
+        "readback pending mark survived a GPU ownership transition");
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 3);
+  tracker.MarkRegionAsCpuModified(address, page_size * 3);
+  tracker.UntrackMemory(address, page_size * 3);
   Release(memory);
 }
 
@@ -1073,6 +1147,8 @@ int main(int argc, char **argv) {
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
+  TestWriteTickMap();
+  TestReadbackPendingUnmark();
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();

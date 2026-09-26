@@ -30,6 +30,16 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Side readbacks: mark the GPU-dirty pages of a range whose dirty bytes a side copy now
+	// publishes. Any later GPU ownership change of a page cancels its mark. Unmark clears
+	// the GPU bit (and read protection) only of pages whose mark survived; it may run on any
+	// thread after the copy's backing publication has completed.
+	struct ReadbackUnmarkResult {
+		uint64_t unmarked_pages = 0;
+		uint64_t retained_pages = 0;
+	};
+	void                               MarkReadbackPending(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] ReadbackUnmarkResult UnmarkReadbackPending(uint64_t vaddr, uint64_t size);
 	// A dirty-state mutation token, not a backing/GPU cleanliness proof. UINT64_MAX means
 	// saturated: callers must conservatively stop reusing any previously observed token.
 	[[nodiscard]] uint64_t CpuMutationEpoch() const noexcept {

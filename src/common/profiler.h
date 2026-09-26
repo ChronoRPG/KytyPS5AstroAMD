@@ -152,6 +152,21 @@ enum class FrameEvent : uint32_t {
 	// Direct-backing reads translated by the per-thread mapping cache without m_mutex.
 	BackingMapCacheHits,
 	BackingMapCacheMisses,
+	// Guest-fault readbacks (BufferCache::ReadMemory, KYTY_READBACK_SIDE_COPY). SideCopies are
+	// copies recorded on the side command buffer without draining the current recording; bytes
+	// are the dirty bytes copied. DuplicateWaits are faults served by another thread's pending
+	// side copy. Fallbacks took the drain path: the current recording wrote a dirty byte of the
+	// faulting page, it holds an unbounded (address) writer, or another reason (no buffer, no
+	// dirty bytes, an overlapping non-side publication, no free slot). PagesUnmarked counts
+	// pages unprotected at completion; PagesRetained counts pages a newer writer re-dirtied.
+	ReadbackSideCopies,
+	ReadbackSideCopyBytes,
+	ReadbackSideDuplicateWaits,
+	ReadbackSideFallbackCurrentWriter,
+	ReadbackSideFallbackUnbounded,
+	ReadbackSideFallbackOther,
+	ReadbackSidePagesUnmarked,
+	ReadbackSidePagesRetained,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
@@ -181,6 +196,9 @@ enum class FrameWait : uint32_t {
 	GpuRecordToStart,
 	GpuDispatchToStart,
 	GpuEndToObserved,
+	// Guest thread time waiting for a side-copy readback (its own or a duplicate) and publishing
+	// it to the backing. Nested inside ReadMemory; the GPU thread does not wait for these.
+	ReadbackSideWait,
 	Count,
 };
 
