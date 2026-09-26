@@ -15,7 +15,8 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
+      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
+      m_occlusion_counter(*this) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 }
 
@@ -87,9 +88,36 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
+	if (!GuestGpu::IsGpuThread() || CommandScheduler::InDeferredOperation() ||
+	    !m_command_scheduler.Active() || m_command_scheduler.Current().IsInvalid() ||
+	    !IsMapped(vaddr, size) || m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+
+	// Exact dirty ranges are removed when a download is queued, before its backing publication.
+	// Retired images can likewise have an outstanding publication without a live image owner.
+	// Never hold the registry, mapping, texture-cache, or tracker locks over these waits.
+	if (const auto tick = m_buffer_cache.PendingBackingPublicationTick(vaddr, size)) {
+		m_command_scheduler.Wait(*tick);
+		m_command_scheduler.WaitPriorityOperations(*tick);
+	}
+	if (m_buffer_cache.HasGpuDirtyBytes(vaddr, size)) {
+		// Retain the CPU fault path's canonical-buffer discovery, clipped readback window,
+		// actual backing copy, and dirty-page ownership transition.
+		m_buffer_cache.ReadMemory(vaddr, size);
+	}
+	// A publication may already have finished since the failed strict read. Such a range is
+	// ready too; callers still retry the actual read and bound their preparation retries.
+	return IsMapped(vaddr, size) && !m_buffer_cache.HasGpuDirtyBytes(vaddr, size) &&
+	       !m_texture_cache.IsRegionGpuModified(vaddr, size) &&
+	       !m_buffer_cache.HasPendingBackingPublication(vaddr, size);
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_buffer_cache.InvalidateBdaSynchronization();
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -108,6 +136,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_buffer_cache.InvalidateBdaSynchronization();
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -120,9 +149,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 
 void RenderContext::PrepareBda() {
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	m_buffer_cache.SynchronizeBdaBuffers(m_mapped_ranges);
 	m_fault_process_pending = true;
 }
 

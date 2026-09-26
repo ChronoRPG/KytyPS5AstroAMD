@@ -632,6 +632,8 @@ public:
 	KYTY_CLASS_DEFAULT_COPY(Context);
 
 	void Reset() { *this = Context(); }
+	[[nodiscard]] uint32_t GetDepthCountControl() const { return m_depth_count_control; }
+	void SetDepthCountControl(uint32_t value) { m_depth_count_control = value; }
 
 	void SetColorBase(uint32_t slot, const ColorBase& base) { m_render_targets[slot].base = base; }
 	void SetColorView(uint32_t slot, const ColorView& view) { m_render_targets[slot].view = view; }
@@ -921,6 +923,7 @@ private:
 	DepthRenderTarget   m_depth_render_target;
 	RenderControl       m_render_control;
 	DepthRenderOverride m_depth_render_override;
+	uint32_t m_depth_count_control = 0;
 	DepthControl        m_depth_control;
 	StencilControl      m_stencil_control;
 	StencilMask         m_stencil_mask;

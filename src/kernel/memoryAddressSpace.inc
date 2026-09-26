@@ -104,6 +104,7 @@ public:
 		for (const auto& [_, entry]: m_maps) {
 			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size);
 		}
+		InvalidateMapHints();
 		m_maps.clear();
 		if (m_backing_base != nullptr) {
 			UnmapViewOfFile(m_backing_base);
@@ -116,6 +117,7 @@ public:
 			EXIT_IF(
 			    !UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size));
 		}
+		InvalidateMapHints();
 		m_maps.clear();
 		if (m_backing_base != nullptr) {
 			munmap(m_backing_base, m_size);
@@ -246,6 +248,7 @@ public:
 
 		{
 			std::lock_guard lock(m_mutex);
+			InvalidateMapHints();
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
@@ -257,6 +260,7 @@ public:
 		}
 		{
 			std::lock_guard lock(m_mutex);
+			InvalidateMapHints();
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
@@ -347,6 +351,7 @@ public:
 				if (vaddr + size <= entry->second.vaddr + entry->second.size) {
 					old = entry->second;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+					InvalidateMapHints();
 					m_maps.erase(entry);
 #endif
 				}
@@ -369,6 +374,7 @@ public:
 			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
+				InvalidateMapHints();
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
@@ -417,6 +423,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
+		InvalidateMapHints();
 		m_maps.emplace(old.vaddr, old);
 		return false;
 #else
@@ -427,12 +434,15 @@ public:
 		}
 
 		std::lock_guard lock(m_mutex);
+		InvalidateMapHints();
 		m_maps.erase(old.vaddr);
 		if (left_size != 0) {
+			InvalidateMapHints();
 			m_maps.emplace(old.vaddr,
 			               MapEntry {old.vaddr, left_size, old.backing_offset, old.mode});
 		}
 		if (right_size != 0) {
+			InvalidateMapHints();
 			m_maps.emplace(right_addr,
 			               MapEntry {right_addr, right_size,
 			                         old.backing_offset + right_addr - old.vaddr, old.mode});
@@ -478,6 +488,27 @@ private:
 
 		std::lock_guard lock(m_mutex);
 		const auto      end     = vaddr + size;
+		// Shader descriptor reads normally fit in one mapping. Validate that
+		// complete range before copying, under the same mapping lock, so the
+		// common path needs one tree lookup instead of validation plus lookup.
+		static const bool fast_transfers = [] {
+			const auto* value = std::getenv("KYTY_FAST_BACKING_TRANSFERS");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		if (fast_transfers) {
+			MapEntry entry {};
+			if (!FindContainingUnlocked(vaddr, 1, &entry)) {
+				return false;
+			}
+			if (size <= entry.size - (vaddr - entry.vaddr)) {
+				const auto offset = entry.backing_offset + vaddr - entry.vaddr;
+				if (!RangeOk(offset, size)) {
+					return false;
+				}
+				transfer(m_backing_base + offset, 0, static_cast<size_t>(size));
+				return true;
+			}
+		}
 		auto            current = vaddr;
 		while (current < end) {
 			MapEntry entry {};
@@ -516,6 +547,17 @@ private:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
+		if (Common::RendererBatchEnabled()) {
+			// These are mapping records, never cached guest bytes. Both lookup and
+			// transfer remain under m_mutex; every map mutation clears the hints.
+			for (const auto& hint: m_map_hints) {
+				if (hint.size != 0 && vaddr >= hint.vaddr &&
+				    vaddr - hint.vaddr < hint.size && size <= hint.size - (vaddr - hint.vaddr)) {
+					*out = hint;
+					return true;
+				}
+			}
+		}
 
 		auto next = m_maps.upper_bound(vaddr);
 		if (next == m_maps.begin()) {
@@ -524,11 +566,16 @@ private:
 		const auto& entry = std::prev(next)->second;
 		if (vaddr + size <= entry.vaddr + entry.size) {
 			*out = entry;
+			if (Common::RendererBatchEnabled()) {
+				m_map_hints[m_next_map_hint++ % m_map_hints.size()] = entry;
+			}
 			return true;
 		}
 
 		return false;
 	}
+
+	void InvalidateMapHints() { m_map_hints = {}; }
 
 	[[nodiscard]] bool RangeOk(uint64_t backing_offset, uint64_t size) const {
 		return size != 0 && backing_offset < m_size && size <= m_size - backing_offset;
@@ -638,6 +685,8 @@ private:
 	uint64_t                     m_size         = 0;
 	std::mutex                   m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+	mutable std::array<MapEntry, 4> m_map_hints {};
+	mutable size_t m_next_map_hint = 0;
 };
 
 class GuestAddressSpace {

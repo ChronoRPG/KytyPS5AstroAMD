@@ -21,8 +21,40 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics {
+
+namespace {
+constexpr uint64_t kRetiredImageByteLimit = 128ull * 1024 * 1024;
+constexpr size_t kRetiredImageCountLimit = 128;
+
+bool NativeImagePoolEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_NATIVE_IMAGE_POOL");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+bool CanRecycleImage(const vk::ImageCreateInfo& info) {
+	const auto allowed_flags = vk::ImageCreateFlagBits::eMutableFormat |
+	                           vk::ImageCreateFlagBits::eExtendedUsage |
+	                           vk::ImageCreateFlagBits::eBlockTexelViewCompatible |
+	                           vk::ImageCreateFlagBits::e2DArrayCompatible;
+	return info.pNext == nullptr && info.pQueueFamilyIndices == nullptr &&
+	       info.queueFamilyIndexCount == 0 && info.sharingMode == vk::SharingMode::eExclusive &&
+	       info.tiling == vk::ImageTiling::eOptimal &&
+	       info.initialLayout == vk::ImageLayout::eUndefined && !(info.flags & ~allowed_flags);
+}
+
+void DestroyNativeImage(VmaAllocator allocator, vk::Image image, VmaAllocation allocation) {
+	Profiler::ScopedFrameWait timing(Profiler::FrameWait::NativeImageDestroy);
+	vmaDestroyImage(allocator, image, allocation);
+}
+} // namespace
 
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
@@ -56,8 +88,20 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	ClearRetiredImages();
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
+}
+
+void GraphicContext::ClearRetiredImages() {
+	std::scoped_lock lock(m_retired_image_mutex);
+	for (const auto& retired: m_retired_images) {
+		DestroyNativeImage(allocator, retired.image, retired.allocation);
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeImagePoolRemovedBytes,
+	                          m_retired_image_bytes);
+	m_retired_images.clear();
+	m_retired_image_bytes = 0;
 }
 
 void GraphicContext::LogMemoryBudget() const {
@@ -132,17 +176,54 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
-	VmaAllocationCreateInfo alloc_info {};
-	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-
-	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
-	image.image = native_image;
-	if (result != vk::Result::eSuccess) {
-		LogMemoryBudget();
-		return false;
+	const bool recycle = NativeImagePoolEnabled() && CanRecycleImage(image_info);
+	if (recycle) {
+		if (CanReportMemoryUsage() && GetDeviceMemoryUsage() >= GetTotalMemoryBudget()) {
+			ClearRetiredImages();
+		}
+		std::scoped_lock lock(m_retired_image_mutex);
+		for (size_t i = m_retired_images.size(); i > 0; --i) {
+			const auto& retired = m_retired_images[i - 1];
+			if (retired.create == image_info) {
+				image.image = retired.image;
+				image.allocation = retired.allocation;
+				EXIT_IF(retired.bytes > m_retired_image_bytes);
+				m_retired_image_bytes -= retired.bytes;
+				Profiler::CountFrameEvent(Profiler::FrameEvent::NativeImagePoolRemovedBytes,
+				                          retired.bytes);
+				m_retired_images.erase(m_retired_images.begin() + static_cast<std::ptrdiff_t>(i - 1));
+				break;
+			}
+		}
+		Profiler::CountFrameEvent(image.image != nullptr ? Profiler::FrameEvent::NativeImagePoolHits
+		                                                 : Profiler::FrameEvent::NativeImagePoolMisses);
+	}
+	if (image.image == nullptr) {
+		VmaAllocationCreateInfo alloc_info {};
+		alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		auto allocate = [&] {
+			Profiler::ScopedFrameWait timing(Profiler::FrameWait::NativeImageCreate);
+			vk::Image::CType native_image = VK_NULL_HANDLE;
+			VmaAllocation allocation = nullptr;
+			const auto result = static_cast<vk::Result>(vmaCreateImage(
+			    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+			    &alloc_info, &native_image, &allocation, nullptr));
+			if (result == vk::Result::eSuccess) {
+				image.image = native_image;
+				image.allocation = allocation;
+			}
+			return result;
+		};
+		auto result = allocate();
+		if (result == vk::Result::eErrorOutOfDeviceMemory && NativeImagePoolEnabled()) {
+			// Retained objects are optional. Release them before one allocation retry.
+			ClearRetiredImages();
+			result = allocate();
+		}
+		if (result != vk::Result::eSuccess) {
+			LogMemoryBudget();
+			return false;
+		}
 	}
 
 	image.format     = image_info.format;
@@ -155,6 +236,8 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	image.flags      = image_info.flags;
 	image.state      = {.layout = image_info.initialLayout};
 	image.subresource_states.clear();
+	image.pool_eligible = recycle;
+	image.pool_create_info = recycle ? image_info : vk::ImageCreateInfo {};
 
 	return true;
 }
@@ -163,9 +246,44 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
-	vmaDestroyImage(allocator, image.image, image.allocation);
+	// This is the existing destruction boundary: Image's views are already destroyed,
+	// and TextureCache's deferred callback has waited for native completion/publication.
+	// Only native storage is retained; no guest address, content-validity or view survives.
+	bool retained = false;
+	if (image.pool_eligible && NativeImagePoolEnabled()) {
+		const bool pressure = CanReportMemoryUsage() && GetDeviceMemoryUsage() >= GetTotalMemoryBudget();
+		if (pressure) {
+			ClearRetiredImages();
+		} else {
+			VmaAllocationInfo allocation_info {};
+			vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
+			const auto bytes = static_cast<uint64_t>(allocation_info.size);
+			if (bytes <= kRetiredImageByteLimit) {
+				std::scoped_lock lock(m_retired_image_mutex);
+				while (!m_retired_images.empty() &&
+				       (m_retired_images.size() >= kRetiredImageCountLimit ||
+				        bytes > kRetiredImageByteLimit - m_retired_image_bytes)) {
+					const auto oldest = m_retired_images.front();
+					DestroyNativeImage(allocator, oldest.image, oldest.allocation);
+					m_retired_image_bytes -= oldest.bytes;
+					Profiler::CountFrameEvent(Profiler::FrameEvent::NativeImagePoolRemovedBytes,
+					                          oldest.bytes);
+					m_retired_images.erase(m_retired_images.begin());
+				}
+				m_retired_images.push_back({image.pool_create_info, image.image, image.allocation, bytes});
+				m_retired_image_bytes += bytes;
+				Profiler::CountFrameEvent(Profiler::FrameEvent::NativeImagePoolRetires);
+				Profiler::CountFrameEvent(Profiler::FrameEvent::NativeImagePoolAddedBytes, bytes);
+				retained = true;
+			}
+		}
+	}
+	if (!retained) {
+		DestroyNativeImage(allocator, image.image, image.allocation);
+	}
 	image.image      = nullptr;
 	image.allocation = nullptr;
+	image.pool_eligible = false;
 }
 
 } // namespace Libs::Graphics

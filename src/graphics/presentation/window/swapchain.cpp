@@ -500,6 +500,7 @@ void Swapchain::Destroy() {
 
 	{
 		Common::LockGuard queue_lock(graphics.queue_mutex);
+		graphics.submission_queue.DrainPendingLocked();
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
 	}
 	if (m_system_overlay != nullptr) {
@@ -695,6 +696,7 @@ Swapchain::Status Swapchain::Present() {
 	vk::Result result;
 	{
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
+		m_window.graphic_ctx.submission_queue.DrainPendingLocked();
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
 	switch (result) {

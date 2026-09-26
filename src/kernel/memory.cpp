@@ -2,6 +2,8 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
+#include "common/rendererBatch.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -877,11 +879,17 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread() ||
 		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
+		    GetGpuResources().GetBufferCache().HasPendingBackingPublication(vaddr, size) ||
 		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 			return false;
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
+}
+
+bool SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       GetGpuResources().SynchronizeGpuBackingForRead(vaddr, size);
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
@@ -2563,6 +2571,7 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
 	PRINT_NAME();
+	Profiler::CountLoadingEvent(Profiler::LoadingEvent::DirectMemorySizeQueries);
 
 	return PhysicalMemory::Size();
 }
@@ -2571,6 +2580,7 @@ int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t 
                                                   size_t alignment, int64_t* phys_addr_out,
                                                   size_t* size_out) {
 	PRINT_NAME();
+	Profiler::CountLoadingEvent(Profiler::LoadingEvent::DirectMemoryAvailableQueries);
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -2606,6 +2616,10 @@ int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t 
 
 	*phys_addr_out = static_cast<int64_t>(phys_addr);
 	*size_out      = static_cast<size_t>(size);
+	if (Profiler::LoadingEnabled()) {
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::DirectMemoryAvailableSuccesses);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::DirectMemoryAvailableBytesSum, size);
+	}
 
 	LOGF_COLOR(Log::Color::Green,
 	           "\t phys_addr = 0x%016" PRIx64 "\n"
@@ -2619,6 +2633,7 @@ int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t 
 int KYTY_SYSV_ABI KernelGetPageTableStats(int* cpu_total, int* cpu_available, int* gpu_total,
                                           int* gpu_available) {
 	PRINT_NAME();
+	Profiler::CountLoadingEvent(Profiler::LoadingEvent::PageTableStatsQueries);
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -2638,6 +2653,17 @@ int KYTY_SYSV_ABI KernelGetPageTableStats(int* cpu_total, int* cpu_available, in
 	                 static_cast<int>(std::min<uint64_t>(cpu_used, PAGE_TABLE_POOL_ENTRIES));
 	*gpu_available = PAGE_TABLE_POOL_ENTRIES -
 	                 static_cast<int>(std::min<uint64_t>(gpu_used, PAGE_TABLE_POOL_ENTRIES));
+	if (Profiler::LoadingEnabled()) {
+		const auto cpu_free = PAGE_TABLE_POOL_ENTRIES -
+		                      std::min<uint64_t>(cpu_used, PAGE_TABLE_POOL_ENTRIES);
+		const auto gpu_free = PAGE_TABLE_POOL_ENTRIES -
+		                      std::min<uint64_t>(gpu_used, PAGE_TABLE_POOL_ENTRIES);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PageTableStatsSuccesses);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PageTableCpuAvailableSum, cpu_free);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PageTableGpuAvailableSum, gpu_free);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PageTableCpuZeroAvailable, cpu_free == 0);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PageTableGpuZeroAvailable, gpu_free == 0);
+	}
 
 	LOGF_COLOR(Log::Color::Green,
 	           "\t cpu_total     = %d\n"
@@ -3538,6 +3564,7 @@ int KYTY_SYSV_ABI KernelIsStack(void* addr, void** start, void** end) {
 
 int KYTY_SYSV_ABI KernelAvailableFlexibleMemorySize(size_t* size) {
 	PRINT_NAME();
+	Profiler::CountLoadingEvent(Profiler::LoadingEvent::FlexibleAvailableQueries);
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -3545,7 +3572,12 @@ int KYTY_SYSV_ABI KernelAvailableFlexibleMemorySize(size_t* size) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	*size = g_flexible_memory->Available();
+	const auto available = g_flexible_memory->Available();
+	*size = available;
+	if (Profiler::LoadingEnabled()) {
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::FlexibleAvailableSuccesses);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::FlexibleAvailableBytesSum, available);
+	}
 
 	LOGF("\t *size = 0x%016" PRIx64 "\n", *size);
 
@@ -4187,6 +4219,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolBatch(const KernelMemoryPoolBatchEntry* entrie
 int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* output,
                                                 size_t                      output_size) {
 	PRINT_NAME();
+	Profiler::CountLoadingEvent(Profiler::LoadingEvent::MemoryPoolStatsQueries);
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -4198,6 +4231,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 	constexpr uint64_t         BLOCK_SIZE = 0x10000;
 	const uint64_t             committed  = g_memory_pool_committed.load(std::memory_order_relaxed);
 	const uint64_t available = (g_pooled_memory != nullptr ? g_pooled_memory->Available() : 0);
+	Profiler::CountLoadingEvent(Profiler::LoadingEvent::MemoryPoolAvailableBytesSum, available);
 
 	stats.available_flushed_blocks = static_cast<int32_t>(available / BLOCK_SIZE);
 	stats.available_cached_blocks  = 0;

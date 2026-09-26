@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/rendererBatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -23,9 +24,11 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <nlohmann/json.hpp>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -92,10 +95,264 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
-bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+struct ShaderReadAttempt {
+	std::array<GuestRange, 64> missing {};
+	size_t count = 0;
+	bool materialization_failed = false;
+	bool overflow = false;
+
+	void Missing(uint64_t address, uint64_t size) {
+		const GuestRange range {address, size};
+		if (!range.Valid()) return;
+		for (size_t i = 0; i < count; ++i) {
+			if (missing[i] == range) return;
+		}
+		if (count < missing.size()) missing[count++] = range;
+		else overflow = true;
+	}
+
+	bool Synchronize() const {
+		KYTY_PROFILER_DETAIL_BLOCK("SRT::ReadinessWait");
+		Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::ShaderReadiness);
+		if (overflow) EXIT("resource readiness exceeded 64 missing ranges\n");
+		bool ready = false;
+		for (size_t i = 0; i < count; ++i) {
+			ready |= LibKernel::Memory::SynchronizeGpuBackingForRead(missing[i].address,
+			                                                          missing[i].size);
+		}
+		return ready;
+	}
+};
+
+bool NativeDccEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DCC_GPU");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
 }
+
+bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	const bool read = !values.empty() &&
+	    LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+	if (!read && userdata != nullptr) {
+		static_cast<ShaderReadAttempt*>(userdata)->Missing(address, values.size_bytes());
+	}
+	return read;
+}
+
+bool SrtReadRunsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_SRT_READ_RUNS");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+bool TryReadShaderCleanBacking(void*, uint64_t address, std::span<uint32_t> values) {
+	// A failed probe must not request synchronization or alter the shader retry list.
+	const bool read = !values.empty() &&
+	    LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+	Profiler::CountFrameEvent(read ? Profiler::FrameEvent::SrtProbeHits
+	                              : Profiler::FrameEvent::SrtProbeMisses);
+	if (read) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::SrtProbeBytes, values.size_bytes());
+		if (values.size() > 1) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::SrtProbeBatchHits);
+		}
+	}
+	return read;
+}
+
+bool ResourceReuseEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_RESOURCE_REUSE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+bool ResourceDependencyCacheEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_RESOURCE_DEPENDENCY_CACHE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+bool SharedResourceEvaluationEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_SRT_SHARED_CLEAN_VALUES");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+// A successful materialization certificate. Every hit rereads all exact observed
+// bytes through the current clean-backing predicate. Its output bundle travels
+// with the certificate and is invalidated before a refresh can modify it.
+class PreparedResourceReads {
+public:
+	static constexpr size_t MaxBytes = 32u * 1024u;
+	static constexpr size_t MaxRanges = 256u;
+
+	void Begin(std::span<const uint32_t> user_data, uint64_t shader_base,
+	           std::span<uint8_t, MaxBytes> scratch) {
+		m_valid = false;
+		m_recordable = true;
+		m_ranges.clear();
+		m_storage.clear();
+		m_capture_scratch = scratch;
+		m_user_data.assign(user_data.begin(), user_data.end());
+		m_shader_base = shader_base;
+	}
+
+	void Invalidate() { m_valid = false; }
+	bool Valid() const { return m_valid; }
+	size_t CapacityBytes() const {
+		return m_ranges.capacity() * sizeof(Range) + m_storage.capacity() +
+		       m_user_data.capacity() * sizeof(uint32_t);
+	}
+
+	void Finish(bool success) {
+		m_valid = success && m_recordable;
+		m_capture_scratch = {};
+		if (!m_valid) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceReuseRejectedCaptures);
+		}
+	}
+
+	static void Observe(void* userdata, uint64_t address, std::span<const uint32_t> values,
+	                    bool success) {
+		static_cast<PreparedResourceReads*>(userdata)->Record(address, values, success);
+	}
+
+	bool Matches(std::span<const uint32_t> user_data, uint64_t shader_base,
+	             std::span<const uint32_t> dependencies, bool projected) const {
+		if (!m_valid || shader_base != m_shader_base || user_data.size() != m_user_data.size()) return false;
+		if (!projected) return std::ranges::equal(user_data, m_user_data);
+		for (const auto index: dependencies) {
+			if (index >= user_data.size() || user_data[index] != m_user_data[index]) return false;
+		}
+		return true;
+	}
+
+	bool Validate(std::span<uint8_t, MaxBytes> scratch) const {
+		if (!m_valid) return false;
+		Profiler::ScopedFrameWait wait(Profiler::FrameWait::ResourceReuseValidation);
+		uint64_t validation_bytes = 0;
+		const auto finish = [&](bool valid) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceReuseValidationBytes,
+			                          validation_bytes);
+			return valid;
+		};
+		for (const auto& range: m_ranges) {
+			validation_bytes += range.size;
+			// This is a silent validation. Failure must not synchronize, alter protection,
+			// or append a missing range; the normal refresh below owns those operations.
+			if (!LibKernel::Memory::TryReadGpuCleanBacking(range.address, scratch.data(),
+			                                               range.size) ||
+			    std::memcmp(scratch.data(), m_storage.data() + range.offset, range.size) != 0) {
+				return finish(false);
+			}
+		}
+		return finish(true);
+	}
+
+private:
+	struct Range {
+		uint64_t address;
+		size_t offset;
+		size_t size;
+		uint64_t End() const { return address + size; }
+	};
+
+	void Record(uint64_t address, std::span<const uint32_t> values, bool success) {
+		if (!m_recordable) return;
+		constexpr uint64_t gpu_limit = uint64_t {1} << 40u;
+		const auto bytes = values.size_bytes();
+		if (!success || bytes == 0 || bytes > MaxBytes || address == 0 ||
+		    address >= gpu_limit || bytes >= gpu_limit - address) {
+			m_recordable = false;
+			return;
+		}
+		const auto end = address + bytes;
+		const auto* observed = reinterpret_cast<const uint8_t*>(values.data());
+		auto first = std::lower_bound(m_ranges.begin(), m_ranges.end(), address,
+		                             [](const Range& range, uint64_t value) {
+			                             return range.address < value;
+		                             });
+		if (first != m_ranges.begin() && std::prev(first)->End() >= address) --first;
+		auto last = first;
+		uint64_t begin_union = address;
+		uint64_t end_union = end;
+		size_t replaced_bytes = 0;
+		while (last != m_ranges.end() && last->address <= end_union) {
+			// Reject differing snapshots of any overlapping bytes. No final reread is
+			// substituted for what a branch, pointer or descriptor actually observed.
+			const auto begin_overlap = std::max(address, last->address);
+			const auto end_overlap = std::min(end, last->End());
+			if (begin_overlap < end_overlap &&
+			    std::memcmp(observed + (begin_overlap - address),
+			                m_storage.data() + last->offset + (begin_overlap - last->address),
+			                static_cast<size_t>(end_overlap - begin_overlap)) != 0) {
+				m_recordable = false;
+				return;
+			}
+			begin_union = std::min(begin_union, last->address);
+			end_union = std::max(end_union, last->End());
+			replaced_bytes += last->size;
+			++last;
+		}
+		const auto merged_bytes = static_cast<size_t>(end_union - begin_union);
+		const auto replaced_ranges = static_cast<size_t>(last - first);
+		const auto stored_bytes = m_storage.size();
+		const auto new_bytes = stored_bytes - replaced_bytes + merged_bytes;
+		if (new_bytes > MaxBytes ||
+		    m_ranges.size() - replaced_ranges + 1u > MaxRanges) {
+			m_recordable = false;
+			return;
+		}
+		if (replaced_ranges == 1u && begin_union == first->address &&
+		    end_union == first->End()) return;
+		// Allocate at most one bounded byte arena per source, then retain it across
+		// misses. Range metadata likewise keeps its capacity when Begin clears it.
+		if (m_storage.capacity() < MaxBytes) m_storage.reserve(MaxBytes);
+		if (replaced_ranges == 1u && begin_union == first->address && last == m_ranges.end()) {
+			// The usual ascending SRT sequence extends the final range in place.
+			m_storage.resize(new_bytes);
+			std::memcpy(m_storage.data() + first->offset + (address - begin_union), observed, bytes);
+			first->size = merged_bytes;
+			return;
+		}
+		// Existing ranges are packed in address order in the arena. Reconstruct the
+		// changed union in shared scratch, shift its packed suffix, and keep no holes.
+		const auto offset = first != m_ranges.end() ? first->offset : stored_bytes;
+		const auto old_suffix = offset + replaced_bytes;
+		for (auto it = first; it != last; ++it) {
+			std::memcpy(m_capture_scratch.data() + (it->address - begin_union),
+			            m_storage.data() + it->offset, it->size);
+		}
+		std::memcpy(m_capture_scratch.data() + (address - begin_union), observed, bytes);
+		m_storage.resize(new_bytes);
+		std::memmove(m_storage.data() + offset + merged_bytes,
+		             m_storage.data() + old_suffix, stored_bytes - old_suffix);
+		std::memcpy(m_storage.data() + offset, m_capture_scratch.data(), merged_bytes);
+		const auto position = m_ranges.erase(first, last);
+		for (auto it = position; it != m_ranges.end(); ++it) {
+			it->offset += merged_bytes - replaced_bytes;
+		}
+		m_ranges.insert(position, Range {begin_union, offset, merged_bytes});
+	}
+
+	std::vector<Range> m_ranges;
+	std::vector<uint8_t> m_storage;
+	std::vector<uint32_t> m_user_data;
+	std::span<uint8_t> m_capture_scratch;
+	uint64_t m_shader_base = 0;
+	bool m_valid = false;
+	bool m_recordable = false;
+};
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
@@ -143,6 +400,208 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 			file.Write(data, size);
 		}
 	}
+}
+
+void DumpMatchedShaderInputs(const ShaderParams& params,
+                             const ShaderRecompiler::CompileOptions& options,
+                             const char* stage_name, std::span<const uint32_t> static_state,
+                             uint32_t push_data_start_dword,
+                             const std::vector<uint32_t>& spirv, std::string_view ir_dump) {
+	if (!Config::GraphicsDebugDumpEnabled() ||
+	    !((options.stage == ShaderType::Pixel && options.shader_hash == 0x3b809f9d156a95ddull) ||
+	      (options.stage == ShaderType::Vertex && options.shader_hash == 0xe5398a1c6007f356ull))) {
+		return;
+	}
+
+	// This is a compile-permutation snapshot. User data may change on later
+	// draws that reuse the compiled module; no draw-time work is added here.
+	using Json = nlohmann::ordered_json;
+	const auto spirv_bytes = spirv.size() * sizeof(uint32_t);
+	const auto spirv_hash  = XXH3_64bits(spirv.data(), spirv_bytes);
+	const auto key_hash    = XXH3_64bits(static_state.data(), static_state.size_bytes());
+	static std::atomic_uint32_t id = 0;
+	const auto base = Config::GetShaderLogFolder() /
+	                  fmt::format("{:04d}_matched_inputs_{}_{:016x}_{:016x}", id++, stage_name,
+	                              options.shader_hash, spirv_hash);
+	auto spirv_path = base;
+	auto json_path  = base;
+	auto ir_path    = base;
+	spirv_path += ".spv";
+	json_path += ".json";
+	ir_path += ".ir.txt";
+	constexpr size_t MaxIrDumpBytes = 16 * 1024 * 1024;
+	const auto ir_bytes = std::min(ir_dump.size(), MaxIrDumpBytes);
+	Json metadata = {
+	    {"schema_version", 1},
+	    {"snapshot_kind", "compile_permutation"},
+	    {"stage", stage_name},
+	    {"shader_hash", fmt::format("0x{:016x}", options.shader_hash)},
+	    {"guest_code_base", fmt::format("0x{:016x}", params.Base())},
+	    {"guest_code_words", params.code.size()},
+	    {"guest_code_xxh3_64", fmt::format("0x{:016x}", XXH3_64bits(params.code.data(), params.code.size_bytes()))},
+	    {"spirv_file", Common::PathToString(spirv_path.filename())},
+	    {"spirv_bytes", spirv_bytes},
+	    {"spirv_xxh3_64", fmt::format("0x{:016x}", spirv_hash)},
+	    {"ir_file", Common::PathToString(ir_path.filename())},
+	    {"ir_bytes", ir_bytes}, {"ir_original_bytes", ir_dump.size()},
+	    {"ir_truncated", ir_bytes != ir_dump.size()},
+	    {"static_state_xxh3_64", fmt::format("0x{:016x}", key_hash)},
+	    {"static_state_words", std::vector<uint32_t>(static_state.begin(), static_state.end())},
+	    {"user_data_count", params.user_data_count},
+	    {"user_data_base", options.user_data_base},
+	    {"user_data_words", std::vector<uint32_t>(options.user_data.begin(), options.user_data.end())},
+	    {"captured_user_data_storage", params.user_data},
+	    {"compile_wave_size", options.wave_size},
+	    {"push_data_start_dword", push_data_start_dword},
+	};
+	metadata["program_key"] = {
+	    {"stage", static_cast<uint32_t>(options.stage)},
+	    {"hash", metadata["shader_hash"]},
+	    {"user_data_count", params.user_data_count},
+	    {"code_size_words", params.code.size()},
+	    {"static_state_words", metadata["static_state_words"]},
+	};
+	if (options.stage == ShaderType::Pixel) {
+		const auto& ps = *options.input_info.pixel;
+		const auto input_count = std::min<uint32_t>(ps.input_num, std::size(ps.interpolator_settings));
+		auto& pixel = metadata["pixel"];
+		pixel = {
+		    {"input_num", ps.input_num},
+		    {"interpolator_settings", std::vector<uint32_t>(ps.interpolator_settings,
+		                                                   ps.interpolator_settings + input_count)},
+		    {"custom_interpolation_mask", ps.custom_interpolation_mask},
+		    {"wave_size", ps.wave_size},
+		    {"scratch_size_dwords", ps.scratch_size_dwords},
+		    {"ps_system_input_base", ps.ps_system_input_base},
+		    {"ps_perspective_center_vgpr", ps.ps_perspective_center_vgpr},
+		    {"ps_perspective_centroid_vgpr", ps.ps_perspective_centroid_vgpr},
+		    {"ps_pos_x", ps.ps_pos_x}, {"ps_pos_y", ps.ps_pos_y},
+		    {"ps_pos_z", ps.ps_pos_z}, {"ps_pos_w", ps.ps_pos_w},
+		    {"ps_front_face", ps.ps_front_face}, {"ps_ancillary", ps.ps_ancillary},
+		    {"ps_no_perspective", ps.ps_no_perspective},
+		    {"ps_sample_shading", ps.ps_sample_shading},
+		    {"ps_pixel_kill_enable", ps.ps_pixel_kill_enable},
+		    {"ps_depth_export_enable", ps.ps_depth_export_enable},
+		    {"ps_sample_mask_export_enable", ps.ps_sample_mask_export_enable},
+		    {"dual_source_blending", ps.dual_source_blending},
+		    {"ps_early_z", ps.ps_early_z}, {"ps_execute_on_noop", ps.ps_execute_on_noop},
+		    {"target_output_mode", std::vector<uint32_t>(std::begin(ps.target_output_mode),
+		                                               std::end(ps.target_output_mode))},
+		};
+		pixel["interpolator_settings_hex"] = Json::array();
+		for (uint32_t i = 0; i < input_count; i++) {
+			pixel["interpolator_settings_hex"].push_back(fmt::format("0x{:08x}", ps.interpolator_settings[i]));
+		}
+		pixel["target_export_mapping_packed"] = Json::array();
+		for (const auto& mapping: ps.target_export_mapping) {
+			pixel["target_export_mapping_packed"].push_back(static_cast<uint32_t>(mapping.packed));
+		}
+
+		// This exact guest PS uses s28:s29 for its original SRT. Read only
+		// clean backing: this diagnostic must not force GPU synchronization.
+		constexpr uint32_t SrtRegister = 28;
+		constexpr size_t SrtDwords = 384;
+		constexpr size_t MaterialDescriptorByteOffset = 1328;
+		const bool has_srt_registers = options.user_data_base <= SrtRegister &&
+		                              options.user_data.size() >=
+		                                  SrtRegister - options.user_data_base + 2;
+		auto& srt = pixel["original_srt"];
+		srt = {{"snapshot_kind", "compile_permutation"},
+		       {"base_sgpr", SrtRegister}, {"registers_available", has_srt_registers},
+		       {"requested_dwords", SrtDwords}, {"read_success", false},
+		       {"memory_reader", "TryReadGpuCleanBacking"}, {"words", Json::array()}};
+		if (has_srt_registers) {
+			const auto register_index = SrtRegister - options.user_data_base;
+			const uint64_t raw_address = options.user_data[register_index] |
+			                             (static_cast<uint64_t>(options.user_data[register_index + 1]) << 32u);
+			const uint64_t address = raw_address & 0x0000ffffffffffffull;
+			srt["raw_register_address"] = fmt::format("0x{:016x}", raw_address);
+			srt["address"] = fmt::format("0x{:016x}", address);
+			std::array<uint32_t, SrtDwords> words {};
+			const bool success = address != 0 && ReadShaderGuestMemory(nullptr, address, words);
+			srt["read_success"] = success;
+			if (success) {
+				srt["words"] = words;
+				ShaderBufferResource descriptor {};
+				std::copy_n(words.data() + MaterialDescriptorByteOffset / sizeof(uint32_t),
+				            std::size(descriptor.fields), descriptor.fields);
+				std::array<uint32_t, 64> material_words {};
+				const auto material_dwords = static_cast<size_t>(
+				    std::min<uint64_t>(descriptor.GetSize(), sizeof(material_words)) / sizeof(uint32_t));
+				const bool material_valid = descriptor.Type() == 0 && descriptor.Base48() != 0 &&
+				                            material_dwords != 0;
+				const bool material_success = material_valid && ReadShaderGuestMemory(
+				    nullptr, descriptor.Base48(), std::span(material_words).first(material_dwords));
+				srt["material"] = {
+				    {"descriptor_table_byte_offset", MaterialDescriptorByteOffset},
+				    {"descriptor_words", std::vector<uint32_t>(std::begin(descriptor.fields),
+				                                                std::end(descriptor.fields))},
+				    {"address", fmt::format("0x{:016x}", descriptor.Base48())},
+				    {"descriptor_size_bytes", descriptor.GetSize()},
+				    {"requested_bytes", material_dwords * sizeof(uint32_t)},
+				    {"descriptor_valid", material_valid}, {"read_success", material_success},
+				    {"words", material_success
+				                  ? Json(std::vector<uint32_t>(material_words.begin(),
+				                                               material_words.begin() + material_dwords))
+				                  : Json::array()},
+				};
+			}
+		}
+	} else {
+		const auto& vs = *options.input_info.vertex;
+		auto& vertex = metadata["vertex"];
+		vertex = {
+		    {"logical_stage", static_cast<uint32_t>(vs.logical_stage)},
+		    {"wave_size", vs.wave_size}, {"scratch_size_dwords", vs.scratch_size_dwords},
+		    {"pa_cl_vs_out_cntl", vs.pa_cl_vs_out_cntl},
+		    {"fetch_attrib_reg", vs.fetch_attrib_reg}, {"fetch_buffer_reg", vs.fetch_buffer_reg},
+		    {"fetch_external", vs.fetch_external}, {"fetch_embedded", vs.fetch_embedded},
+		    {"resources_num", vs.resources_num}, {"buffers_num", vs.buffers_num},
+		    {"resources", Json::array()}, {"buffers", Json::array()},
+		};
+		for (int i = 0; i < std::clamp(vs.resources_num, 0, ShaderVertexInputInfo::RES_MAX); i++) {
+			const auto& resource = vs.resources[i];
+			const auto& destination = vs.resources_dst[i];
+			vertex["resources"].push_back({
+			    {"index", i}, {"fields", std::vector<uint32_t>(std::begin(resource.fields), std::end(resource.fields))},
+			    {"base", fmt::format("0x{:016x}", resource.Base48())},
+			    {"stride", resource.Stride()}, {"num_records", resource.NumRecords()},
+			    {"format", resource.RawFormat()}, {"dst_sel_xyzw", resource.DstSelXYZW()},
+			    {"swizzle_enabled", resource.SwizzleEnabled()},
+			    {"out_of_bounds", resource.OutOfBounds()}, {"add_tid", resource.AddTid()},
+			    {"destination", {{"register_start", destination.register_start},
+			                     {"registers_num", destination.registers_num},
+			                     {"attr_id", destination.attr_id}, {"fetch_index", destination.fetch_index}}},
+			});
+		}
+		for (int i = 0; i < std::clamp(vs.buffers_num, 0, ShaderVertexInputInfo::RES_MAX); i++) {
+			const auto& buffer = vs.buffers[i];
+			const auto attr_count = std::clamp(buffer.attr_num, 0, ShaderVertexInputBuffer::ATTR_MAX);
+			vertex["buffers"].push_back({
+			    {"index", i}, {"address", fmt::format("0x{:016x}", buffer.addr)},
+			    {"stride", buffer.stride}, {"num_records", buffer.num_records},
+			    {"fetch_index", buffer.fetch_index}, {"attr_num", buffer.attr_num},
+			    {"attr_indices", std::vector<int>(buffer.attr_indices, buffer.attr_indices + attr_count)},
+			    {"attr_offsets", std::vector<uint32_t>(buffer.attr_offsets, buffer.attr_offsets + attr_count)},
+			});
+		}
+	}
+	Common::File::CreateDirectories(base.parent_path());
+	const auto write_dump = [](const auto& path, const void* data, size_t size) {
+		Common::File file(path);
+		if (file.IsInvalid()) {
+			const auto path_text = Common::PathToString(path);
+			LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", path_text.c_str());
+			return;
+		}
+		file.Write(data, static_cast<uint32_t>(size));
+	};
+	write_dump(spirv_path, spirv.data(), spirv_bytes);
+	if (ir_bytes != 0) {
+		write_dump(ir_path, ir_dump.data(), ir_bytes);
+	}
+	const auto text = metadata.dump(2);
+	write_dump(json_path, text.data(), text.size());
 }
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
@@ -194,18 +653,79 @@ struct PipelineCache::ProgramCache {
 		ShaderProgram                                handle;
 	};
 
-	struct SourceEntry {
+	struct PreparedState {
+		ShaderRecompiler::IR::ResourceSnapshot       resources;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		PreparedResourceReads                       prepared_reads;
+		size_t permutation_index = std::numeric_limits<size_t>::max();
+
+		size_t CapacityBytes() const {
+			const auto bytes = [](const auto& values) {
+				return values.capacity() * sizeof(typename std::decay_t<decltype(values)>::value_type);
+			};
+			return prepared_reads.CapacityBytes() + bytes(resources.buffers) + bytes(resources.images) +
+			       bytes(resources.samplers) + bytes(resources.flattened_srt) + bytes(resources.user_data) +
+			       bytes(specialization.buffers) + bytes(specialization.images);
+		}
+	};
+
+	struct SourceEntry: PreparedState {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
 		    : resource_plan(std::move(plan)) {
 			permutations.reserve(8);
+			if (!ResourceDependencyCacheEnabled()) return;
+			using namespace ShaderRecompiler::IR;
+			// ExtractResourcePlan clones every descriptor, flat read, branch condition,
+			// indirect selector and uniform-fill root into this owned graph. Include all
+			// retained register reads, even those on currently inactive paths.
+			projected_key = true;
+			for (const auto& inst: resource_plan.value_storage) {
+				if (inst.GetOpcode() != ValueOpcode::GetUserData) continue;
+				if (inst.NumArgs() != 1 || !inst.Arg(0).IsImmediate() ||
+				    inst.Arg(0).GetType() != Type::ScalarReg) {
+					projected_key = false;
+					break;
+				}
+				const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
+				if (reg < resource_plan.user_data_base ||
+				    reg - resource_plan.user_data_base >= resource_plan.user_data_count) {
+					projected_key = false;
+					break;
+				}
+				user_dependencies.push_back(reg - resource_plan.user_data_base);
+			}
+			std::ranges::sort(user_dependencies);
+			user_dependencies.erase(std::unique(user_dependencies.begin(), user_dependencies.end()),
+			                        user_dependencies.end());
 		}
 
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
-		ShaderRecompiler::IR::ResourceSnapshot       resources;
-		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		std::vector<uint32_t>                       user_dependencies;
+		std::array<PreparedState, 3>                 history;
+		size_t                                      next_victim = 0;
+		bool                                        projected_key = false;
 		std::vector<Permutation>                    permutations;
 		bool                                        skip_dispatch = false;
 	};
+
+	static constexpr size_t MaxHistoryBytes = 64u * 1024u * 1024u;
+	static constexpr size_t MaxHistoryEntryBytes = 256u * 1024u;
+
+	void ExchangeHistory(SourceEntry& source, size_t index) {
+		auto& current = static_cast<PreparedState&>(source);
+		auto& previous = source.history[index];
+		const auto old_bytes = previous.CapacityBytes();
+		auto new_bytes = current.CapacityBytes();
+		// The current working output is mandatory; only the three extra states count
+		// against this cache budget. Release an oversized outgoing state before a hit.
+		if (new_bytes > MaxHistoryEntryBytes || history_bytes - old_bytes + new_bytes > MaxHistoryBytes) {
+			current = PreparedState {};
+			new_bytes = 0;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceCacheBudgetRejects);
+		}
+		std::swap(current, previous);
+		history_bytes = history_bytes - old_bytes + new_bytes;
+	}
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
@@ -229,7 +749,8 @@ struct PipelineCache::ProgramCache {
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword) {
+	                               uint32_t push_data_start_dword,
+	                               std::span<const uint32_t> static_state) {
 		const char* stage_name = nullptr;
 		switch (options.stage) {
 			case ShaderType::Vertex: stage_name = "vs"; break;
@@ -243,6 +764,8 @@ struct PipelineCache::ProgramCache {
 		}
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		DumpMatchedShaderInputs(params, options, stage_name, static_state,
+		                        push_data_start_dword, result.spirv, result.ir_dump);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
@@ -266,7 +789,8 @@ struct PipelineCache::ProgramCache {
 
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor) {
+	                  uint32_t& push_data_cursor, ShaderReadAttempt& read_attempt) {
+		KYTY_PROFILER_DETAIL_BLOCK("ProgramCache::Get");
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -290,12 +814,89 @@ struct PipelineCache::ProgramCache {
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
+		    .userdata                   = NativeDccEnabled() ? &read_attempt : nullptr,
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .try_read_clean_backing = SrtReadRunsEnabled() ? TryReadShaderCleanBacking : nullptr,
+		    .share_clean_values = SharedResourceEvaluationEnabled(),
+		};
+		const auto materialize = [&](SourceEntry& source) {
+			read_attempt.count = 0;
+			read_attempt.materialization_failed = false;
+			read_attempt.overflow = false;
+			const bool reuse = ResourceReuseEnabled();
+			const bool multi_state = reuse && ResourceDependencyCacheEnabled();
+			const auto validate = [&](PreparedResourceReads& reads) {
+				if (!reads.Matches(user_data, runtime.shader_base, source.user_dependencies,
+				                   multi_state && source.projected_key)) return false;
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceCacheKeyMatches);
+				if (reads.Validate(validation_scratch)) return true;
+				// Matching registers with stale/dirty backing must never become a hit.
+				reads.Invalidate();
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceCacheBackingRejects);
+				return false;
+			};
+			const auto hit = [&] {
+				// These registers also supply shader constants and vertex/instance offsets.
+				// Only descriptor evaluation uses the projected key; passthrough stays live.
+				source.resources.user_data.assign(user_data.begin(), user_data.end());
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceReuseHits);
+				return true;
+			};
+			if (reuse && validate(source.prepared_reads)) return hit();
+			if (multi_state) {
+				for (size_t index = 0; index < source.history.size(); ++index) {
+					if (!validate(source.history[index].prepared_reads)) continue;
+					ExchangeHistory(source, index);
+					Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceCacheHistoryHits);
+					return hit();
+				}
+				if (source.prepared_reads.Valid()) {
+					auto victim = source.next_victim;
+					for (size_t index = 0; index < source.history.size(); ++index) {
+						if (!source.history[index].prepared_reads.Valid()) { victim = index; break; }
+					}
+					ExchangeHistory(source, victim);
+					source.next_victim = (victim + 1u) % source.history.size();
+				}
+			}
+			// SourceEntry owns the final successful outputs. Clear their certificate
+			// before any refresh can partially overwrite either output object.
+			source.prepared_reads.Invalidate();
+			source.permutation_index = std::numeric_limits<size_t>::max();
+			auto observed_runtime = runtime;
+			if (reuse) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceReuseMisses);
+				source.prepared_reads.Begin(user_data, runtime.shader_base, validation_scratch);
+				observed_runtime.observe_read = PreparedResourceReads::Observe;
+				observed_runtime.observer_userdata = &source.prepared_reads;
+			}
+			if (ShaderRecompiler::IR::MaterializeResources(
+			        source.resource_plan, observed_runtime, source.resources, source.specialization)) {
+				if (reuse) source.prepared_reads.Finish(true);
+				return true;
+			}
+			if (reuse) source.prepared_reads.Finish(false);
+			// An unsuccessful optional uniform-fill/active-source probe is harmless if the
+			// complete refresh succeeded. Only a failed refresh requests a retry.
+			EXIT_IF(!NativeDccEnabled() || read_attempt.count == 0);
+			read_attempt.materialization_failed = true;
+			return false;
 		};
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			if (!materialize(entry->second)) return {};
+			auto& source = entry->second;
+			if (ResourceDependencyCacheEnabled() && source.prepared_reads.Valid() &&
+			    source.permutation_index < source.permutations.size()) {
+				auto& cached = source.permutations[source.permutation_index];
+				const auto& layout = cached.program.bindings;
+				if (layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
+				        push_data_cursor, layout.ShaderDataDwords())) {
+					input_info.stage = {.program = &cached.program, .resources = &source.resources};
+					layout.AdvancePushData(push_data_cursor);
+					Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceCachePermutationHits);
+					return cached.handle;
+				}
+			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -305,6 +906,7 @@ struct PipelineCache::ProgramCache {
 				               candidate.specialization == entry->second.specialization;
 			        });
 			    permutation != entry->second.permutations.end()) {
+				entry->second.permutation_index = static_cast<size_t>(permutation - entry->second.permutations.begin());
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
@@ -312,6 +914,9 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		// Cache hits returned above. This covers translation through native shader-module
+		// creation; readiness failures can retry, so count successful creations separately.
+		Profiler::ScopedFrameWait shader_miss(Profiler::FrameWait::ShaderProgramMiss);
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage_input.vertex = &input_info;
@@ -360,12 +965,13 @@ struct PipelineCache::ProgramCache {
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			if (!materialize(entry->second)) return {};
 		}
 		entry->second.permutations.push_back(CompilePermutation(
-		    params, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		    params, options, std::move(translated), entry->second.specialization, push_data_cursor,
+		    entry->first.static_state));
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderProgramsCreated);
+		entry->second.permutation_index = entry->second.permutations.size() - 1u;
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -400,6 +1006,8 @@ struct PipelineCache::ProgramCache {
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
+	std::array<uint8_t, PreparedResourceReads::MaxBytes>          validation_scratch;
+	size_t history_bytes = 0;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };
@@ -577,6 +1185,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -636,17 +1245,29 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
-	Common::LockGuard lock(m_mutex);
-	uint32_t          push_data_cursor =
-	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
-	GraphicsPrograms  result;
-	if (pixel_active) {
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+	for (uint32_t attempt = 0; attempt < 64; ++attempt) {
+		ShaderReadAttempt read_attempt;
+		{
+			Common::LockGuard lock(m_mutex);
+			uint32_t push_data_cursor =
+			    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+			GraphicsPrograms result;
+			if (pixel_active) {
+				result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor,
+				                                   read_attempt);
+			}
+			for (uint32_t i = 0; i < (tess_active ? 3u : 1u) &&
+			                     !read_attempt.materialization_failed; ++i) {
+				result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i],
+				                                      push_data_cursor, read_attempt);
+			}
+			if (!read_attempt.materialization_failed) return result;
+		}
+		// No pipeline or texture-cache lock is held while the scheduler publishes bytes.
+		// Restart all stages before final bindings/uploads, including their SRT refresh.
+		EXIT_IF(!read_attempt.Synchronize());
 	}
-	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
-	}
-	return result;
+	EXIT("graphics resource readiness did not converge after 64 attempts\n");
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
@@ -654,13 +1275,33 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
-	Common::LockGuard lock(m_mutex);
-	uint32_t          push_data_cursor = 0;
-	return m_program_cache->Get(params, input_info, push_data_cursor);
+	for (uint32_t attempt = 0; attempt < 64; ++attempt) {
+		ShaderReadAttempt read_attempt;
+		{
+			Common::LockGuard lock(m_mutex);
+			uint32_t push_data_cursor = 0;
+			const auto result = m_program_cache->Get(params, input_info, push_data_cursor,
+			                                         read_attempt);
+			if (!read_attempt.materialization_failed) return result;
+		}
+		EXIT_IF(!read_attempt.Synchronize());
+	}
+	EXIT("compute resource readiness did not converge after 64 attempts\n");
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
+}
+
+void PipelineCache::PipelineKeyHash::MixStaticParams(std::size_t& hash,
+                                                    const PipelineStaticParameters& params) {
+	if (Common::RendererBatchEnabled()) {
+		// Equality already compares this exact byte representation, including padding.
+		Mix(hash, static_cast<std::size_t>(XXH3_64bits(&params, sizeof(params))));
+		return;
+	}
+	const auto* bytes = reinterpret_cast<const uint8_t*>(&params);
+	for (std::size_t i = 0; i < sizeof(params); ++i) Mix(hash, bytes[i]);
 }
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
@@ -819,12 +1460,16 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-	                       ps_input_info, programs, static_params, m_driver_cache);
+	{
+		Profiler::ScopedFrameWait pipeline_create(Profiler::FrameWait::GraphicsPipelineCreate);
+		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
+		                       ps_input_info, programs, static_params, m_driver_cache);
+	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GraphicsPipelinesCreated);
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);

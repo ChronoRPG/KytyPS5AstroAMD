@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/image/dccClear.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
@@ -18,8 +19,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -32,6 +37,26 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+
+// The stock Tracy CSV exporter supports -m. Keep messages free of commas/newlines,
+// and bound diagnostics independently of how long a detailed capture stays connected.
+std::atomic<uint32_t> g_dcc_diagnostic_messages {0};
+
+template <typename... Args>
+void TraceDccDiagnostic(const char* format, Args... args) {
+	if (!Profiler::DetailedEnabled() || !TracyIsConnected) return;
+	constexpr uint32_t MaxMessages = 8192;
+	const auto ordinal = g_dcc_diagnostic_messages.fetch_add(1, std::memory_order_relaxed);
+	if (ordinal >= MaxMessages) {
+		if (ordinal == MaxMessages) TracyMessageLS("DCC_DIAG_LIMIT messages=8192", 0);
+		return;
+	}
+	char text[768];
+	const auto written = std::snprintf(text, sizeof(text), format, args...);
+	if (written > 0 && static_cast<size_t>(written) < sizeof(text)) {
+		TracyMessageS(text, static_cast<size_t>(written), 0);
+	}
+}
 
 [[nodiscard]] bool DecodeDccClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -188,9 +213,47 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
 	}
+	const auto* lookup = std::getenv("KYTY_IMAGE_LOOKUP");
+	if (lookup != nullptr && std::strcmp(lookup, "legacy") == 0) {
+		m_image_lookup_mode = ImageLookupMode::Legacy;
+		LOGF("Image lookup: legacy full-region search\n");
+	} else if (lookup != nullptr && std::strcmp(lookup, "verify") == 0) {
+		m_image_lookup_mode = ImageLookupMode::Verify;
+		LOGF("Image lookup: cross-check first-page search, use legacy results\n");
+	} else {
+		LOGF("Image lookup: first-page exact search\n");
+	}
+	const auto* dirty_query = std::getenv("KYTY_DIRTY_IMAGE_QUERY");
+	m_direct_dirty_image_query = dirty_query != nullptr && std::strcmp(dirty_query, "direct") == 0;
+	const auto* clean_proofs = std::getenv("KYTY_TEXTURE_CLEAN_PROOFS");
+	m_clean_image_proofs = clean_proofs != nullptr && std::strcmp(clean_proofs, "1") == 0;
+	if (m_direct_dirty_image_query) {
+		LOGF("Dirty image query: direct page-owner search\n");
+	}
+	const auto* gpu_dcc = std::getenv("KYTY_DCC_GPU");
+	if (gpu_dcc != nullptr && std::strcmp(gpu_dcc, "1") == 0) {
+		m_dcc_clear = std::make_unique<DccClearHelper>(graphics, scheduler);
+		LOGF("DCC materialization: GPU validation and conditional clear for eligible RGBA16F targets\n");
+	}
+	const auto* policy = std::getenv("KYTY_IMAGE_CACHE_POLICY");
+	m_pressure_gc_enabled = policy != nullptr && std::strcmp(policy, "pressure") == 0;
+	if (m_pressure_gc_enabled) {
+		m_pressure_gc_policy.SetBudget(m_graphics.GetTotalMemoryBudget());
+		LOGF("Image cache policy: pressure (Approach B), low=%" PRIu64
+		     " MiB high=%" PRIu64 " MiB critical=%" PRIu64 " MiB\n",
+		     m_pressure_gc_policy.Low() / ImageCacheGcPolicy::MiB,
+		     m_pressure_gc_policy.High() / ImageCacheGcPolicy::MiB,
+		     m_pressure_gc_policy.Critical() / ImageCacheGcPolicy::MiB);
+	} else {
+		LOGF("Image cache policy: submission age (Approach A)\n");
+	}
 }
 
 TextureCache::~TextureCache() {
+	if (m_image_lookup_mode == ImageLookupMode::Verify) {
+		LOGF("Image lookup verification final: checks=%" PRIu64 " mismatches=%" PRIu64 "\n",
+		     m_image_lookup_checks, m_image_lookup_mismatches);
+	}
 	m_slot_images.ForEach([&](ImageId id, const Image& image) {
 		if (image.registered) {
 			UnregisterImage(id);
@@ -274,12 +337,14 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
+	InvalidateCleanImageProofs();
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
+	m_registered_image_memory += image.AccountedSize();
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -287,6 +352,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	if (!image.registered) {
 		return;
 	}
+	InvalidateCleanImageProofs();
 	UntrackImage(id);
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
@@ -304,6 +370,8 @@ void TextureCache::UnregisterImage(ImageId id) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
 	m_total_used_memory -= accounted;
+	EXIT_IF(accounted > m_registered_image_memory);
+	m_registered_image_memory -= accounted;
 	image.registered = false;
 }
 
@@ -338,7 +406,18 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		uint64_t retiring_bytes = 0;
+		if (m_pressure_gc_enabled && image->backing.allocation != nullptr) {
+			VmaAllocationInfo allocation {};
+			vmaGetAllocationInfo(m_graphics.allocator, image->backing.allocation, &allocation);
+			retiring_bytes = allocation.size;
+			m_pressure_retirement_bytes += retiring_bytes;
+		}
+		m_scheduler.DeferOperation([this, id, retiring_bytes] {
+			m_slot_images.erase(id);
+			EXIT_IF(retiring_bytes > m_pressure_retirement_bytes);
+			m_pressure_retirement_bytes -= retiring_bytes;
+		});
 	} else {
 		m_slot_images.erase(id);
 	}
@@ -518,6 +597,32 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 	return result;
 }
 
+ImageId TextureCache::FindImageWithSameBacking(const ImageInfo& requested,
+                                               bool exact_format) const {
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(requested.data.address, requested.data.size, pages)) {
+		return {};
+	}
+	const auto* owners = m_image_page_table.Find(pages.first);
+	if (owners == nullptr) {
+		return {};
+	}
+	ImageId result {};
+	// SameBacking requires an identical start address, so every possible exact match is
+	// already present on the first page. Preserve the last-match ordering used by the
+	// full region search without visiting the remaining pages or building a candidate list.
+	// Read the live index under m_lock so unregister, alias replacement and reused slot
+	// generations cannot leave a cached result pointing at a retired image.
+	owners->ForEach([&](ImageId id) {
+		const auto* image = m_slot_images.try_get(id);
+		if (image != nullptr && image->registered &&
+		    SameBacking(image->info, requested, exact_format)) {
+			result = id;
+		}
+	});
+	return result;
+}
+
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	const auto format = desc.info.pixel_format;
 	if (const auto found = m_null_images.find(format); found != m_null_images.end()) {
@@ -682,7 +787,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		destination.CopyImageWithBuffer(source, copy_buffer);
 	}
 	if (source.IsGpuModified()) {
-		destination.MarkGpuModified();
+		MarkImageGpuModified(destination);
 	}
 	destination.ClearBufferModified();
 }
@@ -698,7 +803,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 	destination.CopyMip(source, mip, layer);
 	if (source.IsGpuModified()) {
-		destination.MarkGpuModified();
+		MarkImageGpuModified(destination);
 	}
 }
 
@@ -1148,11 +1253,90 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 }
 
+bool TextureCache::TryMaterializeGpuDccClear(ImageId id, const ImageDesc& desc,
+                                              uint32_t metadata_base_layer) {
+	const auto metadata = desc.info.metadata.range;
+	const auto& view = desc.view_info;
+	if (!m_dcc_clear || view.format != vk::Format::eR16G16B16A16Sfloat ||
+	    desc.info.IsVolume() ||
+	    desc.info.resources.levels != 1 || desc.info.TransferLayers() != 1 ||
+	    view.base_level != 0 || view.level_count != 1 ||
+	    metadata_base_layer != 0 || view.base_layer != 0 || view.layer_count != 1 ||
+	    view.aspect != vk::ImageAspectFlagBits::eColor) {
+		return false;
+	}
+	{
+		std::scoped_lock lock {m_lock};
+		if (!FindImagesInRegion(metadata.address, metadata.size, false).empty()) return false;
+		const auto revision = m_buffer_cache.GetContentRevision(metadata.address, metadata.size);
+		const auto found = m_gpu_dcc_inspections.find(metadata.address);
+		if (revision && found != m_gpu_dcc_inspections.end() &&
+		    found->second.metadata == metadata && found->second.revision == *revision) {
+			// A prior full-range RGBA16F pass leaves FF, nonuniform bytes, or an unsupported
+			// code. None can trigger another RGBA16F clear, for any binding or alpha order.
+			// Skip only metadata processing: the caller still refreshes this image normally.
+			++m_gpu_dcc_reuses;
+			return true;
+		}
+	}
+	if (desc.type != BindingType::RenderTarget ||
+	    desc.info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
+	    desc.info.samples != 1 || view.type != vk::ImageViewType::e2D ||
+	    desc.info.metadata.compression != VideoOutCompression::Uncompressed ||
+	    ImageRangeOverlaps(metadata, desc.info.data)) return false;
+	const auto eligible = [&] {
+		const auto* image = m_slot_images.try_get(id);
+		return image != nullptr && image->registered && !image->depth_id &&
+		       image->info.data == desc.info.data && image->info.extent == desc.info.extent &&
+		       SafeToDownload(*image) && m_dcc_clear->Supports(*image, metadata.size) &&
+		       FindImagesInRegion(metadata.address, metadata.size, false).empty();
+	};
+	{
+		std::scoped_lock lock {m_lock};
+		if (!eligible()) return false;
+	}
+	// Use the canonical buffer and its normal GPU-write tracking. No CPU shadow of the
+	// clear value is trusted. Acquiring it may upload/submit, so hold no texture lock.
+	auto [buffer, offset] =
+	    m_buffer_cache.ObtainBuffer(metadata.address, metadata.size, true, false);
+	if (buffer == nullptr || offset % m_graphics.StorageMinAlignment() != 0) return false;
+	std::scoped_lock lock {m_lock};
+	if (!eligible()) return false;
+	auto& image = m_slot_images[id];
+	TrackImage(id);
+	{
+		KYTY_PROFILER_DETAIL_BLOCK("DCC::GpuMaterialize");
+		m_dcc_clear->Record(image, buffer->Handle(), offset, metadata.size,
+		                    desc.info.metadata.dcc_alpha_msb);
+	}
+	CommitGpuWrite(image);
+	++m_gpu_dcc_records;
+	if (const auto revision = m_buffer_cache.GetContentRevision(metadata.address, metadata.size)) {
+		// Retained metadata is independent of image lifetime; cap address reuse history.
+		if (m_gpu_dcc_inspections.size() >= 256 &&
+		    !m_gpu_dcc_inspections.contains(metadata.address)) m_gpu_dcc_inspections.clear();
+		m_gpu_dcc_inspections.insert_or_assign(
+		    metadata.address, GpuDccInspection {metadata, *revision});
+	} else {
+		m_gpu_dcc_inspections.erase(metadata.address);
+	}
+	if (m_gpu_dcc_records <= 8) {
+		LOGF("GPU DCC inspection: metadata=0x%016" PRIx64 " bytes=%" PRIu64
+		     " image=0x%016" PRIx64 "\n", metadata.address, metadata.size, desc.info.data.address);
+	}
+	TraceDccDiagnostic("DCC_GPU_RECORD meta=0x%" PRIx64 " bytes=%" PRIu64
+	                   " data=0x%" PRIx64 " tick=%" PRIu64,
+	                   metadata.address, metadata.size, desc.info.data.address,
+	                   m_scheduler.CurrentTick());
+	return true;
+}
+
 void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc) {
 		return;
 	}
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	const auto range = desc.info.metadata.range;
 	{
 		std::scoped_lock lock {m_lock};
@@ -1181,11 +1365,77 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
+	uint64_t diagnostic_readback = 0;
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
-		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		if (m_dcc_clear) {
+			++m_gpu_dcc_attempts;
+			const bool native = TryMaterializeGpuDccClear(id, desc, metadata_base_layer);
+			if (!native) ++m_gpu_dcc_fallbacks;
+			if ((m_gpu_dcc_attempts & 255u) == 0) {
+				TracyPlot("DCC.NativeInspections", static_cast<double>(m_gpu_dcc_records));
+				TracyPlot("DCC.ReusedInspections", static_cast<double>(m_gpu_dcc_reuses));
+				TracyPlot("DCC.CpuFallbacks", static_cast<double>(m_gpu_dcc_fallbacks));
+				LOGF("GPU DCC totals: requests=%" PRIu64 " native=%" PRIu64
+				     " reused=%" PRIu64 " CPU_fallback=%" PRIu64 "\n",
+				     m_gpu_dcc_attempts, m_gpu_dcc_records, m_gpu_dcc_reuses, m_gpu_dcc_fallbacks);
+			}
+			if (native) return;
+		}
+		KYTY_PROFILER_DETAIL_BLOCK("DCC::Readback");
+		if (Profiler::DetailedEnabled() && TracyIsConnected) {
+			static std::atomic<uint64_t> readback_count {0};
+			diagnostic_readback = readback_count.fetch_add(1, std::memory_order_relaxed) + 1u;
+			TraceDccDiagnostic(
+			    "DCC_READBACK_BEGIN id=%" PRIu64 " meta=0x%" PRIx64 " bytes=%" PRIu64
+			    " data=0x%" PRIx64 " data_bytes=%" PRIu64 " format=%u type=%u first=%u count=%u"
+			    " layers=%u mip=%u tick=%" PRIu64,
+			    diagnostic_readback, range.address, range.size, desc.info.data.address,
+			    desc.info.data.size, static_cast<uint32_t>(view.format),
+			    static_cast<uint32_t>(desc.type), first, count, layers, view.base_level,
+			    m_scheduler.CurrentTick());
+		}
+		// An odd period avoids repeatedly sampling the same member of an alternating pair.
+		const bool sample_fallback = m_dcc_clear && TracyIsConnected &&
+		                             (m_gpu_dcc_fallbacks % 257u) == 0;
+		uint32_t ownership = 0;
+		if (sample_fallback) {
+			std::scoped_lock lock {m_lock};
+			const auto& image = m_slot_images[id];
+			ownership = (image.IsCpuDirty() ? 1u : 0u) |
+			            (image.IsBufferModified() ? 2u : 0u) |
+			            (image.IsGpuModified() ? 4u : 0u) |
+			            (m_buffer_cache.HasGpuDirtyBytes(image.info.data.address,
+			                                              image.info.data.size) ? 8u : 0u);
+		}
+		const auto readback_start = sample_fallback ? std::chrono::steady_clock::now()
+		                                            : std::chrono::steady_clock::time_point {};
+		{
+			Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::DccFallback);
+			m_buffer_cache.ReadMemory(range.address, range.size, false);
+		}
+		if (sample_fallback) {
+			const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			    std::chrono::steady_clock::now() - readback_start).count();
+			char message[400];
+			const auto length = std::snprintf(message, sizeof(message),
+			    "DCC_CPU_FALLBACK meta=0x%" PRIx64 " bytes=%" PRIu64 " data=0x%" PRIx64
+			    " format=%u type=%u ownership=%u layers=%u first=%u count=%u ns=%" PRIu64,
+			    range.address, range.size, desc.info.data.address,
+			    static_cast<uint32_t>(view.format), static_cast<uint32_t>(desc.type),
+			    ownership, layers, first, count,
+			    static_cast<uint64_t>(elapsed));
+			if (length > 0 && static_cast<size_t>(length) < sizeof(message)) {
+				TracyMessageS(message, static_cast<size_t>(length), 0);
+			}
+		}
+		if (diagnostic_readback != 0) {
+			TraceDccDiagnostic("DCC_READBACK_END id=%" PRIu64 " tick=%" PRIu64,
+			                   diagnostic_readback, m_scheduler.CurrentTick());
+		}
 	}
 	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
+		KYTY_PROFILER_DETAIL_BLOCK("DCC::InspectSlice");
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
@@ -1193,6 +1443,12 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		}
 		vk::ClearValue clear {};
 		if (!DecodeDccClear(desc, code, clear.color)) {
+			if (diagnostic_readback != 0) {
+				TraceDccDiagnostic(
+				    "DCC_SLICE id=%" PRIu64 " slice=%u address=0x%" PRIx64 " bytes=%" PRIu64
+				    " code=0x%02x decoded=0 uniform=-1 consumed=0",
+				    diagnostic_readback, first + slice, address, slice_size, unsigned(code));
+			}
 			continue;
 		}
 		std::vector<uint8_t> bytes(slice_size);
@@ -1200,9 +1456,16 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			EXIT("TextureCache: failed to read DCC metadata slice\n");
 		}
 		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
+			if (diagnostic_readback != 0) {
+				TraceDccDiagnostic(
+				    "DCC_SLICE id=%" PRIu64 " slice=%u address=0x%" PRIx64 " bytes=%" PRIu64
+				    " code=0x%02x decoded=1 uniform=0 consumed=0",
+				    diagnostic_readback, first + slice, address, slice_size, unsigned(code));
+			}
 			continue;
 		}
 		{
+			KYTY_PROFILER_DETAIL_BLOCK("DCC::ClearImage");
 			std::scoped_lock lock {m_lock};
 			ClearImage(m_scheduler.Current(), id, view.format,
 			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
@@ -1211,7 +1474,15 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		// Native expanded keys own consumption. Existing buffer tracking publishes this CPU
 		// write to future GPU readers; FillBuffer can fault and must run outside the texture lock.
 		if (desc.type != BindingType::VideoOut) {
+			KYTY_PROFILER_DETAIL_BLOCK("DCC::ConsumeClearKey");
 			m_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
+		}
+		if (diagnostic_readback != 0) {
+			TraceDccDiagnostic(
+			    "DCC_SLICE id=%" PRIu64 " slice=%u address=0x%" PRIx64 " bytes=%" PRIu64
+			    " code=0x%02x decoded=1 uniform=1 consumed=%u",
+			    diagnostic_readback, first + slice, address, slice_size, unsigned(code),
+			    desc.type != BindingType::VideoOut ? 1u : 0u);
 		}
 	}
 }
@@ -1275,6 +1546,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -1289,19 +1561,42 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
-
-		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
-			if (SameBacking(image.info, desc.info, exact_format)) {
-				result = id;
+		ImageIds candidates;
+		const bool use_legacy = m_image_lookup_mode != ImageLookupMode::FirstPage;
+		if (use_legacy) {
+			candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+			for (const auto id: candidates) {
+				if (SameBacking(m_slot_images[id].info, desc.info, exact_format)) {
+					result = id;
+				}
 			}
+			if (m_image_lookup_mode == ImageLookupMode::Verify) {
+				const auto fast = FindImageWithSameBacking(desc.info, exact_format);
+				++m_image_lookup_checks;
+				if (fast != result) {
+					++m_image_lookup_mismatches;
+					if (m_image_lookup_mismatches <= 32) {
+						LOGF("Image lookup mismatch: address=0x%016" PRIx64
+						     " size=0x%016" PRIx64 " exact=%u fast=%u:%u legacy=%u:%u\n",
+						     desc.info.data.address, desc.info.data.size, exact_format ? 1u : 0u,
+						     fast.index, fast.generation, result.index, result.generation);
+					}
+				}
+				if ((m_image_lookup_checks & 0xffffu) == 0) {
+					LOGF("Image lookup verification: checks=%" PRIu64 " mismatches=%" PRIu64 "\n",
+					     m_image_lookup_checks, m_image_lookup_mismatches);
+				}
+			}
+		} else {
+			result = FindImageWithSameBacking(desc.info, exact_format);
 		}
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
 		if (!result) {
+			if (!use_legacy) {
+				candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+			}
 			for (const auto candidate: candidates) {
 				view_mip                = -1;
 				view_layer              = -1;
@@ -1415,7 +1710,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		}
 	}
 	if (desc.type == BindingType::Storage) {
-		image.MarkGpuModified();
+		MarkImageGpuModified(image);
 	}
 	if (!image.info.data.Empty()) {
 		RefreshImage(id);
@@ -1458,7 +1753,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
-	image.MarkGpuModified();
+	MarkImageGpuModified(image);
 	image.usage.render_target = true;
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -1478,7 +1773,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
-	image.MarkGpuModified();
+	MarkImageGpuModified(image);
 	image.usage.depth_target = true;
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
@@ -1520,7 +1815,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
-	image.MarkGpuModified();
+	MarkImageGpuModified(image);
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -1830,6 +2125,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		}
 	}
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, std::move(transfer));
+	buffer.MarkContentWritten();
 	return true;
 }
 
@@ -1869,9 +2165,12 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
+	const auto publication = m_buffer_cache.BeginBackingPublication(
+	    std::span<const GuestRange>(&range, 1), m_scheduler.CurrentTick());
+	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, publication] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		m_buffer_cache.EndBackingPublication(publication);
 	});
 	return true;
 }
@@ -1893,11 +2192,85 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	}
 }
 
+void TextureCache::InvalidateCleanImageProofs() {
+	if (!m_clean_image_proofs) {
+		return;
+	}
+	// Saturation disables reuse permanently instead of allowing an old epoch to match.
+	if (m_clean_image_epoch != UINT64_MAX) {
+		++m_clean_image_epoch;
+	}
+}
+
+void TextureCache::MarkImageGpuModified(Image& image) {
+	if (!image.IsGpuModified()) {
+		InvalidateCleanImageProofs();
+	}
+	image.MarkGpuModified();
+}
+
 bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return false;
 	}
 	std::scoped_lock lock {m_lock};
+	// A negative proof covers one complete 4 KiB page, while the owner index uses
+	// 1 MiB pages. Dirty neighboring bytes only prevent caching: the exact query
+	// below must still succeed for clean subranges. No guest bytes are cached/read.
+	constexpr uint64_t proof_size = 4096;
+	const auto proof_begin = Common::AlignDown(address, proof_size);
+	const bool use_proof = m_clean_image_proofs && m_clean_image_epoch != UINT64_MAX &&
+	                       size <= proof_size - (address - proof_begin);
+	if (use_proof) {
+		const auto page = proof_begin / proof_size;
+		auto& proof = m_clean_image_pages[(page ^ (page >> 8)) % m_clean_image_pages.size()];
+		if (proof.epoch == m_clean_image_epoch && proof.page == page) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureCleanProofHits);
+			return false;
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureCleanProofMisses);
+		const auto* owners = m_image_page_table.Find(address >> ImagePageTable::kPageBits);
+		bool page_modified = false;
+		if (owners != nullptr) {
+			for (const auto id: *owners) {
+				const auto* image = m_slot_images.try_get(id);
+				if (image == nullptr || image->depth_id || !image->IsGpuModified()) {
+					continue;
+				}
+				if (image->Overlaps(address, size, false)) {
+					return true;
+				}
+				page_modified |= image->Overlaps(proof_begin, proof_size, false);
+			}
+		}
+		if (!page_modified) {
+			proof = {page, m_clean_image_epoch};
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureCleanProofStores);
+		}
+		return false;
+	}
+	if (m_direct_dirty_image_query) {
+		ImagePageTable::PageRange pages {};
+		if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+			return false;
+		}
+		// Scalar SRT reads stay within one page. Keep multi-page queries on the
+		// deduplicated path so large clean ranges cannot revisit every owner.
+		if (pages.last_exclusive - pages.first == 1) {
+			const auto* owners = m_image_page_table.Find(pages.first);
+			if (owners == nullptr) {
+				return false;
+			}
+			for (const auto id: *owners) {
+				const auto* image = m_slot_images.try_get(id);
+				if (image != nullptr && image->Overlaps(address, size, false) &&
+				    !image->depth_id && image->IsGpuModified()) {
+					return true;
+				}
+			}
+			return false;
+		}
+	}
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
 		if (!image.depth_id && image.IsGpuModified()) {
@@ -1976,6 +2349,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	m_gpu_dcc_inspections.clear();
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {
@@ -1999,6 +2373,17 @@ void TextureCache::RunGarbageCollector() {
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	}
+	if ((tick & 63u) == 0 && Profiler::DetailedEnabled() && tracy::ProfilerAvailable()) {
+		if (m_graphics.CanReportMemoryUsage()) {
+			TracyPlot("ImageCache.DeviceMemoryBytes", static_cast<double>(m_total_used_memory));
+		}
+		TracyPlot("ImageCache.RegisteredGuestBytes", static_cast<double>(m_registered_image_memory));
+		TracyPlot("ImageCache.PendingRetirementBytes", static_cast<double>(m_pressure_retirement_bytes));
+	}
+	if (m_pressure_gc_enabled) {
+		RunPressureGarbageCollector(tick);
+		return;
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
@@ -2052,6 +2437,68 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
 	}
+}
+
+void TextureCache::RunPressureGarbageCollector(uint64_t tick) {
+	// Driver heap usage includes images awaiting deferred destruction. Do not evict
+	// a second cache's worth of resources while those bytes are already retiring.
+	const auto pending_bytes = m_graphics.CanReportMemoryUsage() ? m_pressure_retirement_bytes : 0;
+	const auto effective_usage = m_total_used_memory - std::min(m_total_used_memory, pending_bytes);
+	const auto plan = m_pressure_gc_policy.Begin(effective_usage, tick);
+	if (plan.deletions == 0) {
+		return;
+	}
+	KYTY_PROFILER_BLOCK("TextureCache::PressureGarbageCollection");
+	m_scheduler.GetMasterSemaphore().Refresh();
+	const auto completed_tick = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	std::vector<ImageId> candidates;
+	candidates.reserve(std::min<size_t>(plan.candidates, 256));
+	// Complete traversal before deleting depth images and their stencil associations.
+	m_lru_cache.ScanItemsBelow(tick, m_pressure_gc_cursor, plan.candidates,
+	                          [&](ImageId id) { candidates.push_back(id); });
+
+	uint64_t reclaimed_bytes = 0;
+	size_t deletions = 0;
+	for (const auto id: candidates) {
+		if (deletions >= plan.deletions || reclaimed_bytes >= plan.bytes ||
+		    effective_usage - std::min(effective_usage, reclaimed_bytes) <= m_pressure_gc_policy.Low()) {
+			break;
+		}
+		auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered || owner->depth_id) {
+			continue;
+		}
+		// Retain resources still in use whenever pressure leaves room to do so.
+		// The critical path retains the existing deferred timeline retirement.
+		if (!plan.critical && owner->tick_accessed_last > completed_tick) {
+			continue;
+		}
+		if (owner->IsGpuModified()) {
+			const bool safe = SafeToDownload(*owner);
+			if (safe && !plan.critical) {
+				continue;
+			}
+			if (safe && owner->info.IsTiled()) {
+				continue;
+			}
+			if (safe && !DownloadImageMemory(id)) {
+				continue;
+			}
+		}
+		const auto before = m_total_used_memory;
+		FreeImage(id);
+		const auto accounted = before - m_total_used_memory;
+		reclaimed_bytes += accounted;
+		++deletions;
+	}
+	// A download can drain the scheduler mid-collection, running destruction
+	// callbacks. Refresh actual heap usage instead of inferring release by tick.
+	if (m_graphics.CanReportMemoryUsage()) {
+		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	}
+	const auto pending_after = m_graphics.CanReportMemoryUsage() ? m_pressure_retirement_bytes : 0;
+	m_pressure_gc_policy.Complete(tick,
+	    m_total_used_memory - std::min(m_total_used_memory, pending_after), deletions != 0);
 }
 
 void TextureCache::ProcessDownloadImages() {

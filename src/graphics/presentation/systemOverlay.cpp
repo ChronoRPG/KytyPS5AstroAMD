@@ -1007,6 +1007,7 @@ struct SystemOverlay::Impl {
 		command.beginRendering(rendering);
 		{
 			Common::LockGuard queue_lock(graphics.queue_mutex);
+			graphics.submission_queue.DrainPendingLocked();
 			ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),
 			                                static_cast<VkCommandBuffer>(command));
 		}

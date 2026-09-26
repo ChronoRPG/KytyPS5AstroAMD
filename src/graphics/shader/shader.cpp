@@ -15,12 +15,17 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
+#include <cstddef>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -102,6 +107,37 @@ static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
 }
 
 static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
+	static const bool use_clean_backing = [] {
+		const auto* value = std::getenv("KYTY_SHADER_METADATA_BACKING");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (use_clean_backing) {
+		// Probe only the bytes this path consumes, in its original dependent order.
+		// A shader header may share a protected page with unrelated GPU-owned bytes.
+		// No values persist across calls; failed proofs retain the fault/readback path.
+		const auto read_word = [](const uint32_t* address) {
+			uint32_t value = 0;
+			const bool clean = LibKernel::Memory::TryReadGpuCleanBacking(
+			    reinterpret_cast<uint64_t>(address), &value, sizeof(value));
+			Profiler::CountFrameEvent(clean ? Profiler::FrameEvent::ShaderHeaderProbeHits
+			                               : Profiler::FrameEvent::ShaderHeaderProbeMisses);
+			return clean ? value : *address;
+		};
+		const auto* code = reinterpret_cast<const uint32_t*>(shader_addr);
+		EXIT_IF(code == nullptr);
+		if (read_word(code) != 0xBEEB03FF) return 0;
+		const auto offset = read_word(code + 1);
+		const auto* header = reinterpret_cast<const ShaderBinaryInfo*>(
+		    code + static_cast<size_t>(offset + 1u) * 2);
+		std::array<uint32_t, 2> hashes {};
+		static_assert(offsetof(ShaderBinaryInfo, hash1) == offsetof(ShaderBinaryInfo, hash0) + sizeof(uint32_t));
+		const bool clean = LibKernel::Memory::TryReadGpuCleanBacking(
+		    reinterpret_cast<uint64_t>(&header->hash0), hashes.data(), sizeof(hashes));
+		Profiler::CountFrameEvent(clean ? Profiler::FrameEvent::ShaderHeaderProbeHits
+		                               : Profiler::FrameEvent::ShaderHeaderProbeMisses);
+		return clean ? (static_cast<uint64_t>(hashes[1]) << 32u) | hashes[0]
+		             : (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0;
+	}
 	const auto* header = GetBinaryInfo(reinterpret_cast<const uint32_t*>(shader_addr));
 	return header != nullptr ? (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0 : 0;
 }
@@ -389,6 +425,10 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 	EXIT_IF(attrib == nullptr || buffer == nullptr);
 
 	const bool debug_dump = Config::GraphicsDebugDumpEnabled();
+	static const bool use_clean_backing = [] {
+		const auto* value = std::getenv("KYTY_SHADER_METADATA_BACKING");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
 
 	for (uint32_t i = 0; i < num_input_semantics; i++) {
 		const auto& in = input_semantics[i];
@@ -397,17 +437,26 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
+		uint32_t attribute = 0;
+		const bool attribute_clean = use_clean_backing &&
+		    LibKernel::Memory::TryReadGpuCleanBacking(
+		        reinterpret_cast<uint64_t>(attrib + in.semantic), &attribute, sizeof(attribute));
+		if (use_clean_backing) {
+			Profiler::CountFrameEvent(attribute_clean ? Profiler::FrameEvent::VertexMetadataProbeHits
+			                                         : Profiler::FrameEvent::VertexMetadataProbeMisses);
+		}
+		if (!attribute_clean) attribute = attrib[in.semantic];
 
 		if (debug_dump) {
 			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
-			     attrib[in.semantic]);
+			     attribute);
 		}
 
-		size_t index = attrib[in.semantic] & 0x1fu;
+		size_t index = attribute & 0x1fu;
 		auto   format =
-		    static_cast<Prospero::VertexAttribFormat>((attrib[in.semantic] >> 5u) & 0x1ffu);
-		uint32_t offset      = (attrib[in.semantic] >> 14u) & 0xfffu;
-		uint32_t fetch_index = (attrib[in.semantic] >> 26u) & 0x1u;
+		    static_cast<Prospero::VertexAttribFormat>((attribute >> 5u) & 0x1ffu);
+		uint32_t offset      = (attribute >> 14u) & 0xfffu;
+		uint32_t fetch_index = (attribute >> 26u) & 0x1u;
 
 		if (fetch_index != 0) {
 			static std::atomic<uint64_t> log_count = 0;
@@ -431,10 +480,19 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		rd.registers_num  = static_cast<int>(size);
 		rd.attr_id        = static_cast<int>(in.semantic);
 		rd.fetch_index    = fetch_index;
-		r.fields[0]       = sharp[0];
-		r.fields[1]       = sharp[1];
-		r.fields[2]       = sharp[2];
-		r.fields[3]       = sharp[3];
+		const bool descriptor_clean = use_clean_backing &&
+		    LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(sharp),
+		                                             r.fields, 4 * sizeof(uint32_t));
+		if (use_clean_backing) {
+			Profiler::CountFrameEvent(descriptor_clean ? Profiler::FrameEvent::VertexMetadataProbeHits
+			                                          : Profiler::FrameEvent::VertexMetadataProbeMisses);
+		}
+		if (!descriptor_clean) {
+			r.fields[0] = sharp[0];
+			r.fields[1] = sharp[1];
+			r.fields[2] = sharp[2];
+			r.fields[3] = sharp[3];
+		}
 		if (format != Prospero::VertexAttribFormat::kInvalid) {
 			const auto                   format_raw    = static_cast<uint32_t>(format);
 			const auto                   buffer_format = format_raw >> 2u;

@@ -118,9 +118,10 @@ void FaultManager::ProcessFaultBuffer() {
 	dependency.bufferMemoryBarrierCount = 1;
 	dependency.pBufferMemoryBarriers    = &pre_barrier;
 	command.pipelineBarrier2(dependency);
-	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
-	                             m_fault_process_pipeline_layout, 0, writes);
+	m_scheduler.Current().BindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
+	m_scheduler.Current().PushDescriptors(vk::PipelineBindPoint::eCompute,
+	                             m_fault_process_pipeline_layout, 0,
+	                             static_cast<uint32_t>(writes.size()), writes.data());
 	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);

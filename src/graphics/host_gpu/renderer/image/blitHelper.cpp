@@ -176,9 +176,9 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	descriptor_write.descriptorCount = 1;
 	descriptor_write.descriptorType  = vk::DescriptorType::eSampledImage;
 	descriptor_write.pImageInfo      = &descriptor_image;
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_pipeline_layout, 0, 1,
+	m_scheduler.Current().PushDescriptors(vk::PipelineBindPoint::eGraphics, m_pipeline_layout, 0, 1,
 	                             &descriptor_write);
-	command.bindPipeline(vk::PipelineBindPoint::eGraphics,
+	m_scheduler.Current().BindPipeline(vk::PipelineBindPoint::eGraphics,
 	                     GetPipeline({destination_info.samples, destination_info.pixel_format}));
 
 	const vk::Viewport viewport {0.0f,

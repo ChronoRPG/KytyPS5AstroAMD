@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "common/profiler.h"
+#include "common/rendererBatch.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
@@ -9,6 +11,7 @@
 #include <array>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
@@ -161,6 +164,23 @@ bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> v
 	return true;
 }
 
+bool ProbeOrdinaryBacking(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<ReadCapture*>(userdata);
+	return capture.source.try_read_clean_backing(capture.source.userdata, address, values);
+}
+
+bool ProbeStrictBacking(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<ReadCapture*>(userdata);
+	const auto probe = capture.source.try_read_specialization_backing != nullptr
+	                       ? capture.source.try_read_specialization_backing
+	                       : capture.source.try_read_clean_backing;
+	if (!probe(capture.source.userdata, address, values)) return false;
+	// The exact union has the same written-buffer intersections as its dwords.
+	// A failed probe is silent; scalar fallback records its actual successful prefix.
+	capture.ranges.emplace_back(address, values.size_bytes());
+	return true;
+}
+
 bool WrittenBuffersDisjoint(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                             std::span<const std::pair<uint64_t, uint64_t>> reads) {
 	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
@@ -232,15 +252,81 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint32_t dynamic_offset,
 	}
 	base &= AddressMask & ~uint64_t {3};
 	if (offset > AddressMask - base) {
+		ObserveSrtRead(runtime, base, {}, false);
 		return false;
 	}
 	const auto address = base + offset;
 	const auto prefix = words.first(count);
-	return prefix.size_bytes() - 1u <= AddressMask - address &&
+	const bool read = prefix.size_bytes() - 1u <= AddressMask - address &&
 	       runtime.read_specialization_memory != nullptr &&
 	       runtime.read_specialization_memory(runtime.userdata, address, prefix);
+	ObserveSrtRead(runtime, address, prefix, read);
+	return read;
 }
 
+// Indirect tables can contain many keys but at most MaxImages distinct descriptors. Keep
+// small tables on the linear path; build a local index only once that scan becomes long.
+// Slots store child ordinals, never descriptor pointers, so vector growth is harmless.
+class IndirectImageIndex {
+public:
+	struct Lookup {
+		uint32_t ordinal;
+		uint32_t slot = UINT32_MAX;
+	};
+
+	Lookup Find(const std::vector<DescriptorValue>& images, size_t children_begin,
+	            const DescriptorValue& candidate) {
+		const auto count = static_cast<uint32_t>(images.size() - children_begin);
+		if (!m_indexed && count < LinearLimit) {
+			const auto found = std::find(images.begin() + children_begin, images.end(), candidate);
+			return {static_cast<uint32_t>(found - images.begin() - children_begin + 1u)};
+		}
+		if (!m_indexed) {
+			m_ordinals.fill(0);
+			for (uint32_t child = 0; child < count; ++child) {
+				auto slot = Hash(images[children_begin + child]);
+				while (m_ordinals[slot] != 0u) slot = (slot + 1u) & SlotMask;
+				m_ordinals[slot] = static_cast<uint8_t>(child + 1u);
+			}
+			m_indexed = true;
+		}
+		auto slot = Hash(candidate);
+		while (m_ordinals[slot] != 0u) {
+			const auto ordinal = m_ordinals[slot];
+			if (images[children_begin + ordinal - 1u] == candidate) return {ordinal, slot};
+			slot = (slot + 1u) & SlotMask;
+		}
+		return {count + 1u, slot};
+	}
+
+	void Insert(Lookup lookup) {
+		if (lookup.slot != UINT32_MAX) {
+			m_ordinals[lookup.slot] = static_cast<uint8_t>(lookup.ordinal);
+		}
+	}
+
+private:
+	static constexpr uint32_t LinearLimit = 8;
+	static constexpr uint32_t SlotCount = std::bit_ceil(ShaderInfo::MaxImages * 2u);
+	static constexpr uint32_t SlotMask = SlotCount - 1u;
+	static_assert(ShaderInfo::MaxImages <= UINT8_MAX);
+
+	static uint32_t Hash(const DescriptorValue& descriptor) {
+		// Hash explicit fields, excluding any padding. Equality below still compares the
+		// complete descriptor, so collisions cannot merge different views or formats.
+		uint64_t hash = 14695981039346656037ull ^ descriptor.dword_count;
+		for (const auto word: descriptor.dwords) {
+			hash = (hash ^ word) * 1099511628211ull;
+		}
+		hash ^= hash >> 32u;
+		return static_cast<uint32_t>(hash) & SlotMask;
+	}
+
+	std::array<uint8_t, SlotCount> m_ordinals;
+	bool                          m_indexed = false;
+};
+
+template <bool Optimize>
 bool MaterializeIndirectImage(const ResourcePlan& program,
                               const DescriptorSource::IndirectImage& indirect,
                               const DescriptorValue& material_value,
@@ -331,6 +417,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 	const auto children_begin = snapshot.images.size();
 	const auto mapping_offset = snapshot.flattened_srt.size();
 	const auto root_image = specialization.images[image_index];
+	IndirectImageIndex children;
 	snapshot.flattened_srt.resize(mapping_offset + 1u + keys.size() * 2u);
 	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(keys.size());
 	for (uint32_t entry = 0; entry < keys.size(); ++entry) {
@@ -349,10 +436,18 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		if (entry == 0) {
 			snapshot.images[image_index] = candidate;
 		} else if (snapshot.images[image_index] != candidate) {
-			const auto found = std::find(snapshot.images.begin() + children_begin,
-			                             snapshot.images.end(), candidate);
-			ordinal = static_cast<uint32_t>(found - snapshot.images.begin() - children_begin + 1u);
-			if (found == snapshot.images.end()) {
+			const auto lookup = [&] {
+				if constexpr (Optimize) {
+					return children.Find(snapshot.images, children_begin, candidate);
+				} else {
+					const auto found = std::find(snapshot.images.begin() + children_begin,
+					                             snapshot.images.end(), candidate);
+					return IndirectImageIndex::Lookup {
+					    static_cast<uint32_t>(found - snapshot.images.begin() - children_begin + 1u)};
+				}
+			}();
+			ordinal = lookup.ordinal;
+			if (ordinal > snapshot.images.size() - children_begin) {
 				if (snapshot.images.size() >= ShaderInfo::MaxImages) {
 					return false;
 				}
@@ -360,6 +455,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 				auto child = root_image;
 				child.indirect_root = image_index;
 				specialization.images.push_back(child);
+				if constexpr (Optimize) children.Insert(lookup);
 			}
 		}
 		snapshot.flattened_srt[mapping_offset + 1u + entry * 2u] = key;
@@ -926,11 +1022,48 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->table_source),
 		                   plan.clean_flat_slots);
 	}
+	BuildSrtReadRuns(plan);
+	BuildSrtEvaluationRecipes(plan);
+	BuildSrtArithmeticTapes(plan);
+	if (Common::RendererBatchEnabled() && !plan.control_flow.empty()) {
+		const auto count = plan.control_flow.size();
+		plan.flow_aliases.resize(count);
+		plan.flow_visit_tags.resize(count);
+		plan.flow_initial_sources.assign(plan.descriptor_sources.size(), 1u);
+		std::vector<uint8_t> resolved(count, 0u);
+		std::vector<uint32_t> path;
+		for (const auto& block: plan.control_flow) {
+			for (const auto source: block.sources) plan.flow_initial_sources.at(source) = 0u;
+		}
+		for (uint32_t start = 0; start < count; ++start) {
+			if (resolved[start] == 2u) continue;
+			path.clear();
+			auto index = start;
+			for (;;) {
+				if (resolved[index] == 2u) { index = plan.flow_aliases[index]; break; }
+				if (resolved[index] == 1u) break; // retain one anchor for an empty cycle
+				const auto& block = plan.control_flow[index];
+				if (!block.sources.empty() || !block.condition.IsEmpty() ||
+				    block.successors.size() != 1u || block.successors.front() >= count) break;
+				resolved[index] = 1u;
+				path.push_back(index);
+				index = block.successors.front();
+			}
+			plan.flow_aliases[index] = index;
+			resolved[index] = 2u;
+			for (const auto skipped: path) {
+				plan.flow_aliases[skipped] = index;
+				resolved[skipped] = 2u;
+			}
+		}
+	}
 	return plan;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+template <bool Optimize>
+static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& runtime,
+                                    ResourceSnapshot& snapshot,
+                                    ResourceSpecialization& specialization) {
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
 		return false;
@@ -955,24 +1088,35 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		observed.userdata = &capture;
 		observed.read_specialization_memory = CaptureStrictRead;
 		if (observed.read_memory != nullptr) observed.read_memory = CaptureOrdinaryRead;
+		if (runtime.try_read_clean_backing != nullptr) {
+			observed.try_read_clean_backing = ProbeOrdinaryBacking;
+		}
+		if (runtime.try_read_specialization_backing != nullptr ||
+		    runtime.try_read_clean_backing != nullptr) {
+			observed.try_read_specialization_backing = ProbeStrictBacking;
+		}
 	}
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);
-	const auto active = clean.FindActiveSources();
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
-		return false;
-	}
-	snapshot.uniform_fill = {};
-	const auto& fill = program.uniform_fill;
-	const auto words = fill.fill.words;
-	std::array<uint32_t, 4> stored {};
-	bool uniform_fill = words != 0;
-	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
-		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
-	}
-	if (uniform_fill) {
-		snapshot.uniform_fill = fill.fill;
-		snapshot.uniform_fill.value = stored[0];
+	std::span<const uint8_t> active;
+	{
+		KYTY_PROFILER_DETAIL_BLOCK("Resources::SRT refresh");
+		active = clean.FindActiveSources();
+		if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
+			return false;
+		}
+		snapshot.uniform_fill = {};
+		const auto& fill = program.uniform_fill;
+		const auto words = fill.fill.words;
+		std::array<uint32_t, 4> stored {};
+		bool uniform_fill = words != 0;
+		for (uint32_t i = 0; i < words && uniform_fill; ++i) {
+			uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
+		}
+		if (uniform_fill) {
+			snapshot.uniform_fill = fill.fill;
+			snapshot.uniform_fill.value = stored[0];
+		}
 	}
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value) {
 		if (source >= program.descriptor_sources.size()) {
@@ -985,76 +1129,105 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		value.dword_count = program.descriptor_sources[source].dword_count;
 		return true;
 	};
-	snapshot.buffers.resize(program.info.buffers.size());
-	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
-		if (!evaluate(program.info.buffers[i].source, snapshot.buffers[i])) {
-			return false;
-		}
-	}
-	if (capture_reads) {
+	{
+		KYTY_PROFILER_DETAIL_BLOCK("Resources::Buffers");
+		snapshot.buffers.resize(program.info.buffers.size());
 		for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
-			const auto& buffer = program.info.buffers[i];
-			if (!buffer.written || (!active.empty() && !active[buffer.source])) continue;
-			DescriptorValue strict;
-			if (!clean.EvaluateDescriptor(buffer.source, strict) ||
-			    strict != snapshot.buffers[i]) return false;
-		}
-	}
-	snapshot.images.resize(program.info.images.size());
-	specialization.images.clear();
-	specialization.images.reserve(program.info.images.size());
-	for (const auto& image: program.info.images) {
-		specialization.images.push_back({
-		    .numeric_class = image.numeric_class,
-		    .dimension = image.dimension,
-		    .mip_count = image.mip_count,
-		    .conversion_format = image.conversion_format,
-		    .shader_swizzle = image.shader_swizzle,
-		    .indirect_root = image.indirect_root,
-		    .indirect_mapping_offset = image.indirect_mapping_offset,
-		    .indirect_search_iterations = image.indirect_search_iterations,
-		    .cube = image.cube,
-		});
-	}
-	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
-		const auto& image = program.info.images[i];
-		const auto* source = Source(program, image.source);
-		if (source == nullptr) {
-			return false;
-		}
-		if (source->indirect_image.has_value()) {
-			snapshot.images[i] = {.dword_count = 8u};
-			if (!active.empty() && !active[image.source]) {
-				continue;
-			}
-			const auto& indirect = *source->indirect_image;
-			DescriptorValue material;
-			DescriptorValue table;
-			if ((indirect.material_source != UINT32_MAX &&
-			     !clean.EvaluateDescriptor(indirect.material_source, material)) ||
-			    !clean.EvaluateDescriptor(indirect.table_source, table) ||
-			    !MaterializeIndirectImage(program, indirect, material, table, i, observed, clean, snapshot,
-			                              specialization)) {
+			if (!evaluate(program.info.buffers[i].source, snapshot.buffers[i])) {
 				return false;
 			}
+		}
+		if (capture_reads) {
+			for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+				const auto& buffer = program.info.buffers[i];
+				if (!buffer.written || (!active.empty() && !active[buffer.source])) continue;
+				DescriptorValue strict;
+				if (!clean.EvaluateDescriptor(buffer.source, strict) ||
+				    strict != snapshot.buffers[i]) return false;
+			}
+		}
+	}
+	{
+		KYTY_PROFILER_DETAIL_BLOCK("Resources::Images");
+		snapshot.images.resize(program.info.images.size());
+		const auto initial_image = [](const ImageResource& image) {
+			return ResourceSpecialization::Image {
+			    .numeric_class = image.numeric_class,
+			    .dimension = image.dimension,
+			    .mip_count = image.mip_count,
+			    .conversion_format = image.conversion_format,
+			    .shader_swizzle = image.shader_swizzle,
+			    .indirect_root = image.indirect_root,
+			    .indirect_mapping_offset = image.indirect_mapping_offset,
+			    .indirect_search_iterations = image.indirect_search_iterations,
+			    .cube = image.cube,
+			};
+		};
+		if constexpr (Optimize) {
+			specialization.images.resize(program.info.images.size());
 		} else {
-			if (!evaluate(image.source, snapshot.images[i])) {
+			specialization.images.clear();
+			specialization.images.reserve(program.info.images.size());
+			for (const auto& image: program.info.images) {
+				specialization.images.push_back(initial_image(image));
+			}
+		}
+		for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+			const auto& image = program.info.images[i];
+			if constexpr (Optimize) specialization.images[i] = initial_image(image);
+			const auto* source = Source(program, image.source);
+			if (source == nullptr) {
 				return false;
 			}
-			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
-				snapshot.images[i].dwords.fill(0);
+			if (source->indirect_image.has_value()) {
+				snapshot.images[i] = {.dword_count = 8u};
+				if (!active.empty() && !active[image.source]) {
+					continue;
+				}
+				const auto& indirect = *source->indirect_image;
+				DescriptorValue material;
+				DescriptorValue table;
+				if ((indirect.material_source != UINT32_MAX &&
+				     !clean.EvaluateDescriptor(indirect.material_source, material)) ||
+				    !clean.EvaluateDescriptor(indirect.table_source, table) ||
+				    !MaterializeIndirectImage<Optimize>(program, indirect, material, table, i, observed,
+				                                         clean, snapshot, specialization)) {
+					return false;
+				}
+			} else {
+				if (!evaluate(image.source, snapshot.images[i])) {
+					return false;
+				}
+				if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
+					snapshot.images[i].dwords.fill(0);
+				}
 			}
 		}
 	}
-	snapshot.samplers.resize(program.info.samplers.size());
-	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
-		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
-			return false;
+	{
+		KYTY_PROFILER_DETAIL_BLOCK("Resources::Specialization");
+		snapshot.samplers.resize(program.info.samplers.size());
+		for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
+			if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
+				return false;
+			}
 		}
+		if (capture_reads && !WrittenBuffersDisjoint(program, snapshot, reads)) return false;
+		snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+		return BuildResourceSpecialization(program, snapshot, specialization);
 	}
-	if (capture_reads && !WrittenBuffersDisjoint(program, snapshot, reads)) return false;
-	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+}
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
+	Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::ResourceMaterialization);
+	static const bool optimized = [] {
+		const auto* setting = std::getenv("KYTY_RESOURCE_MATERIALIZATION");
+		return setting != nullptr && std::strcmp(setting, "optimized") == 0;
+	}();
+	return optimized ? MaterializeResourcesImpl<true>(program, runtime, snapshot, specialization)
+	                 : MaterializeResourcesImpl<false>(program, runtime, snapshot, specialization);
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

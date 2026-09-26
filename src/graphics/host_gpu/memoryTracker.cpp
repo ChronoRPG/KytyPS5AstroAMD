@@ -7,11 +7,25 @@ namespace Libs::Graphics {
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
-MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
+MemoryTracker::MemoryTracker(PageManager& page_manager, bool track_cpu_mutations)
+    : m_page_manager(page_manager), m_track_cpu_mutations(track_cpu_mutations) {
 	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
 }
 
 MemoryTracker::~MemoryTracker() = default;
+
+void MemoryTracker::NotifyCpuMutation() noexcept {
+	if (!m_track_cpu_mutations) {
+		return;
+	}
+	// Publish before dirtying/unprotecting under the region lock. A scanner observing this
+	// token still acquires that lock; saturation permanently disables token reuse, avoiding ABA.
+	auto epoch = m_cpu_mutation_epoch.load(std::memory_order_relaxed);
+	while (epoch != UINT64_MAX &&
+	       !m_cpu_mutation_epoch.compare_exchange_weak(epoch, epoch + 1,
+	                                                   std::memory_order_release,
+	                                                   std::memory_order_relaxed)) {}
+}
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
@@ -62,6 +76,8 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	auto  manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE);
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
+	// New regions start entirely CPU dirty. Notify before making the region visible.
+	NotifyCpuMutation();
 	m_regions[index].store(ptr, std::memory_order_release);
 	return ptr;
 }
@@ -84,8 +100,9 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
+		NotifyCpuMutation();
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
 }
@@ -125,7 +142,8 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	    })) {
 		EXIT("cannot untrack GPU-dirty memory\n");
 	}
-	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	Iterate<false>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		NotifyCpuMutation();
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
 }

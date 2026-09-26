@@ -48,6 +48,9 @@ public:
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
+	// GPU-thread command-recording revision, including writes that have not executed yet.
+	[[nodiscard]] uint64_t ContentRevision() const noexcept { return m_content_revision; }
+	void MarkContentWritten();
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
@@ -86,6 +89,7 @@ private:
 	CommandScheduler*             m_scheduler   = nullptr;
 	MemoryUsage                   m_usage       = MemoryUsage::DeviceLocal;
 	uint64_t                      m_cpu_address = 0;
+	uint64_t                      m_content_revision = 1;
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;

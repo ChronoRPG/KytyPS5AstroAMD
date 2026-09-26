@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_COMMON_LRUCACHE_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <type_traits>
 #include <utility>
@@ -15,14 +16,23 @@ class LeastRecentlyUsedCache {
 		Tick   tick {};
 		Item*  next = nullptr;
 		Item*  prev = nullptr;
+		uint64_t generation = 0;
+		bool linked = false;
 	};
 
 public:
+	struct Cursor {
+		size_t id = static_cast<size_t>(-1);
+		uint64_t generation = 0;
+	};
+
 	[[nodiscard]] size_t Insert(Object object, Tick tick) {
 		const auto id   = Build();
 		auto&      item = m_items[id];
 		item.object     = std::move(object);
 		item.tick       = tick;
+		++item.generation;
+		item.linked     = true;
 		Attach(item);
 		return id;
 	}
@@ -44,6 +54,7 @@ public:
 		Detach(item);
 		item.next = nullptr;
 		item.prev = nullptr;
+		item.linked = false;
 		m_free.push_back(id);
 	}
 
@@ -64,6 +75,29 @@ public:
 			}
 			item = next;
 		}
+	}
+
+	// Rotate through physical slots rather than links: touching the saved boundary
+	// item can move its LRU link to the tail, but must not hide intervening entries.
+	// Each visit reads the currently linked generation and applies the age cutoff;
+	// no pointers or objects from a previous scan survive slot deletion/reuse.
+	// The callback must not mutate this cache while the scan is in progress.
+	template <typename Function>
+	void ScanItemsBelow(Tick tick, Cursor& cursor, size_t limit, Function&& function) {
+		if (m_items.empty()) {
+			cursor = {};
+			return;
+		}
+		auto index = cursor.id < m_items.size() ? cursor.id : size_t {0};
+		const auto count = limit < m_items.size() ? limit : m_items.size();
+		for (size_t visited = 0; visited < count; ++visited) {
+			auto& item = m_items[index];
+			if (item.linked && item.tick <= tick) {
+				function(item.object);
+			}
+			index = index + 1 == m_items.size() ? 0 : index + 1;
+		}
+		cursor = Cursor {index, m_items[index].generation};
 	}
 
 private:

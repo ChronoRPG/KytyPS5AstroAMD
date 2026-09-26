@@ -6,6 +6,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/rendererBatch.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -37,6 +38,7 @@
 #include <limits>
 #include <span>
 #include <vector>
+#include <xxhash.h>
 
 #ifdef min
 #undef min
@@ -527,22 +529,9 @@ static bool TextureViewPreservesMipLayout(const TileSurfaceDescription& descript
 	                  std::begin(view.mips));
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
-	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+static TextureCache::ImageDesc BuildTextureDescription(
+    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor) {
 	const bool storage = resource.written;
-	if (storage) {
-		ValidateStorageImageResource(resource);
-	}
-
-	auto& texture_cache = m_context.GetTextureCache();
-	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
-	}
-
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
@@ -585,8 +574,6 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
 	const auto format         = descriptor.Format();
 	const auto surface_format = TextureGetSurfaceFormatInfo(format);
-	const bool shader_conversion =
-	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
 	const bool sampled_numeric_class =
 	    storage || resource.numeric_class == Prospero::SampledTextureNumericClass(format);
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
@@ -678,6 +665,51 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 view_levels, desc.info.resources.layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
+	return desc;
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const bool storage = resource.written;
+	if (storage) {
+		ValidateStorageImageResource(resource);
+	}
+
+	auto& texture_cache = m_context.GetTextureCache();
+	if (descriptor.IsNull()) {
+		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                    : TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
+
+	TextureCache::ImageDesc desc;
+	if (Common::RendererBatchEnabled() && resource.indirect_resources.size() <= 256u) {
+		const auto hash = XXH3_64bits(descriptor.fields, sizeof(descriptor.fields));
+		auto& entry = m_texture_descriptions[hash % m_texture_descriptions.size()];
+		if (entry.valid && entry.resource == resource &&
+		    std::ranges::equal(entry.words, descriptor.fields)) {
+			desc = entry.desc;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureDescriptionHits);
+		} else {
+			desc = BuildTextureDescription(resource, descriptor);
+			entry.resource = resource;
+			std::ranges::copy(descriptor.fields, entry.words.begin());
+			entry.desc = desc;
+			entry.valid = true;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureDescriptionMisses);
+		}
+	} else {
+		desc = BuildTextureDescription(resource, descriptor);
+	}
+	// Only descriptor-derived geometry is retained. FindImage may alter the local
+	// description and must still resolve ownership, aliases, uploads and metadata.
+	const auto pixel_format = desc.info.pixel_format;
+	const auto view_format = desc.view_info.format;
+	const auto byte_size = desc.info.data.size;
+	const bool shader_conversion = TextureGetSurfaceFormatInfo(descriptor.Format()).conversion_format !=
+	                               Prospero::BufferFormat::kInvalid;
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
@@ -688,7 +720,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
+		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, byte_size);
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
@@ -722,6 +754,32 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
+vk::DescriptorBufferInfo RenderExecutor::UploadShaderData(std::span<const uint32_t> data) {
+	// These shader tables are read-only and ring allocations live until their GPU
+	// tick retires. A wrap that reuses them must submit/wait and advance that tick.
+	if (!Common::RendererBatchEnabled() || data.size_bytes() > 16u * 1024u) {
+		return NativeUpload(m_context, data);
+	}
+	EXIT_IF(data.empty());
+	auto& scheduler = m_context.GetCommandScheduler();
+	const auto tick = scheduler.CurrentTick();
+	const auto hash = XXH3_64bits(data.data(), data.size_bytes());
+	auto& cached = m_shader_uploads[hash % m_shader_uploads.size()];
+	if (cached.allocation.buffer != nullptr && cached.tick == tick && cached.hash == hash &&
+	    std::ranges::equal(data, cached.words)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadReuseHits);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadBytesAvoided, data.size_bytes());
+		return cached.allocation;
+	}
+	const auto allocation = NativeUpload(m_context, data);
+	cached.words.assign(data.begin(), data.end());
+	cached.allocation = allocation;
+	cached.hash = hash;
+	cached.tick = scheduler.CurrentTick();
+	Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadReuseMisses);
+	return allocation;
+}
+
 void RenderExecutor::BindImage(ImageId id, bool storage) {
 	auto& image = m_context.GetTextureCache().GetImage(id);
 	if (image.info.data.Empty()) {
@@ -730,15 +788,19 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 	if (image.binding.is_bound) {
 		image.binding.force_general |= image.binding.shader_write != storage;
 	}
+	if (!Common::RendererBatchEnabled() || (!image.binding.is_bound && !image.binding.is_target)) {
+		m_bound_images.push_back(id);
+	}
 	image.binding.is_bound = true;
 	image.binding.shader_write |= storage;
-	m_bound_images.push_back(id);
 }
 
 void RenderExecutor::BindRenderTarget(ImageId id) {
 	auto& image             = m_context.GetTextureCache().GetImage(id);
+	if (!Common::RendererBatchEnabled() || (!image.binding.is_bound && !image.binding.is_target)) {
+		m_bound_images.push_back(id);
+	}
 	image.binding.is_target = true;
-	m_bound_images.push_back(id);
 }
 
 void RenderExecutor::ResetBindings() {
@@ -836,11 +898,11 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
-		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		prepared.flattened_srt = UploadShaderData(snapshot.flattened_srt);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
-		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
+		prepared.shader_data_buffer = UploadShaderData(prepared.shader_data);
 	}
 }
 
@@ -929,6 +991,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
+	// Run after resource discovery so an unbounded address writer cannot retain a
+	// metadata-inspection memo created during preparation of this same command.
+	// Read-only BDA access leaves contents unchanged; tracked descriptor writes carry
+	// their own canonical-buffer revisions.
+	if (std::ranges::any_of(prepared_bindings, [](const auto* prepared) {
+		    return prepared->runtime->program->has_address_writes;
+	    })) {
+		m_context.GetBufferCache().InvalidateContentRevisions();
+	}
 	auto   vk_buffer        = buffer.Handle();
 	size_t descriptor_count = 0;
 	size_t write_count      = 0;
@@ -1115,7 +1186,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	if (!m_descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		if (pipeline.uses_push_descriptors) {
-			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
+			buffer.PushDescriptors(pipeline_bind_point, pipeline.pipeline_layout, 0,
 			                               static_cast<uint32_t>(m_descriptor_writes.size()),
 			                               m_descriptor_writes.data());
 		} else {
@@ -1126,6 +1197,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			m_context.GetGraphics().device.updateDescriptorSets(
 			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
 			    nullptr);
+			buffer.InvalidateDescriptors(pipeline_bind_point);
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);
 		}

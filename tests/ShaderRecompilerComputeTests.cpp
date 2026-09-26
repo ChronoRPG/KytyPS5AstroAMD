@@ -225,6 +225,9 @@ struct TextureCacheTestAccess {
   static void ConfigureGarbageCollection(TextureCache &cache,
                                          std::span<const ImageId> oldest,
                                          uint64_t tick, uint64_t pressure) {
+    // This fixture asserts the legacy submission-age thresholds and exact
+    // ten-entry traversal budget, independently of the launch environment.
+    cache.m_pressure_gc_enabled = false;
     cache.m_trigger_gc_memory = 0;
     cache.m_pressure_gc_memory = pressure;
     cache.m_critical_gc_memory = UINT64_MAX;
@@ -314,6 +317,52 @@ struct TextureCacheTestAccess {
   static uint32_t QueryEpoch(TextureCache &cache) {
     std::lock_guard lock(cache.m_lock);
     return cache.m_image_query_epoch;
+  }
+
+  static bool UsesFirstPageLookup(const TextureCache &cache) {
+    return cache.m_image_lookup_mode == TextureCache::ImageLookupMode::FirstPage;
+  }
+
+  static bool LookupVerificationHealthy(const TextureCache &cache) {
+    return cache.m_image_lookup_mode != TextureCache::ImageLookupMode::Verify ||
+           (cache.m_image_lookup_checks != 0 && cache.m_image_lookup_mismatches == 0);
+  }
+
+  static void EnablePressureCollection(TextureCache &cache) {
+    cache.m_pressure_gc_enabled = true;
+  }
+
+  static uint64_t PendingRetirementBytes(const TextureCache &cache) {
+    return cache.m_pressure_retirement_bytes;
+  }
+
+  static void ConfigurePressureCollection(TextureCache &cache, uint64_t budget) {
+    cache.m_pressure_gc_enabled = true;
+    cache.m_pressure_gc_policy = ImageCacheGcPolicy(budget);
+    cache.m_pressure_gc_cursor = {};
+  }
+
+  static void RunPressureCollection(TextureCache &cache, uint64_t usage, uint64_t tick) {
+    auto lock = Lock(cache);
+    cache.m_total_used_memory = std::max(usage, cache.m_registered_image_memory);
+    cache.RunPressureGarbageCollector(tick);
+  }
+
+  static ImageId FindSameBacking(TextureCache &cache, const ImageInfo &info,
+                                 bool exact_format = false,
+                                 bool full_region_search = false) {
+    std::lock_guard lock(cache.m_lock);
+    if (!full_region_search) {
+      return cache.FindImageWithSameBacking(info, exact_format);
+    }
+    ImageId result{};
+    for (const auto id : cache.FindImagesInRegion(info.data.address,
+                                                 info.data.size, false)) {
+      if (cache.SameBacking(cache.m_slot_images[id].info, info, exact_format)) {
+        result = id;
+      }
+    }
+    return result;
   }
 
   static ImageId InsertImage(TextureCache &cache, const ImageInfo &info) {
@@ -4602,6 +4651,260 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckImageExactBackingLookup() {
+    constexpr const char *name = "ImageExactBackingLookup";
+    constexpr uint64_t base = 0x0000000260000000ull;
+    constexpr uint64_t page = 0x100000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &cache = context.GetTextureCache();
+
+    // Ownership-only records exercise large guest ranges without requiring large
+    // Vulkan allocations or reading guest bytes. This is the same representation
+    // used for unformatted stencil associations.
+    ImageInfo info{};
+    info.data = {base, 64 * page};
+    const auto first = TextureCacheTestAccess::InsertImage(cache, info);
+    const auto second = TextureCacheTestAccess::InsertImage(cache, info);
+    auto overlapping = info;
+    overlapping.data = {base + page, 63 * page};
+    const auto later_page = TextureCacheTestAccess::InsertImage(cache, overlapping);
+    const auto query_epoch = TextureCacheTestAccess::QueryEpoch(cache);
+    Require(name, "first page exact lookup",
+            TextureCacheTestAccess::FindSameBacking(cache, info) == second &&
+                TextureCacheTestAccess::QueryEpoch(cache) == query_epoch,
+            "exact lookup traversed all pages or changed last-match selection");
+    Require(name, "legacy candidate ordering",
+            TextureCacheTestAccess::FindSameBacking(cache, info, false, true) == second,
+            "first-page result differs from the full-region exact-match search");
+    auto shifted = info;
+    shifted.data.address += 16;
+    Require(name, "overlap is not exact",
+            !TextureCacheTestAccess::FindSameBacking(cache, shifted) &&
+                !TextureCacheTestAccess::FindSameBacking(cache, shifted, false, true),
+            "an overlap was incorrectly accepted without alias resolution");
+    const ImageId stale{second.index, second.generation + 1};
+    TextureCacheTestAccess::AddPageOwner(cache, base, stale);
+    Require(name, "stale generation",
+            TextureCacheTestAccess::FindSameBacking(cache, info) == second &&
+                TextureCacheTestAccess::RemovePageOwner(cache, base, stale),
+            "a stale page owner changed the exact lookup result");
+    TextureCacheTestAccess::DeleteImage(cache, second);
+    Require(name, "unregistered exact owner",
+            TextureCacheTestAccess::FindSameBacking(cache, info) == first,
+            "a retired image survived in the exact lookup");
+    const auto replacement = TextureCacheTestAccess::InsertImage(cache, info);
+    Require(name, "slot reuse",
+            replacement != second &&
+                TextureCacheTestAccess::FindSameBacking(cache, info) == replacement,
+            "slot reuse returned a retired generation");
+    auto invalid = info;
+    invalid.data = {UINT64_MAX - 8, 16};
+    Require(name, "overflowing range",
+            !TextureCacheTestAccess::FindSameBacking(cache, invalid),
+            "overflowing guest range entered the page index");
+
+    ImageInfo formatted{};
+    formatted.data = {base + 128 * page, 4};
+    formatted.pixel_format = vk::Format::eR8G8B8A8Srgb;
+    formatted.guest_format = Prospero::BufferFormat::k8_8_8_8Srgb;
+    formatted.pitch = 1;
+    formatted.bytes_per_block = 4;
+    formatted.mip_layout[0] = {0, 4, 1, 1};
+    const auto format_owner = TextureCacheTestAccess::InsertImage(cache, formatted);
+    auto compatible = formatted;
+    compatible.pixel_format = vk::Format::eR8G8B8A8Uint;
+    compatible.guest_format = Prospero::BufferFormat::k8_8_8_8UInt;
+    Require(name, "compatible versus exact format",
+            TextureCacheTestAccess::FindSameBacking(cache, compatible) == format_owner &&
+                !TextureCacheTestAccess::FindSameBacking(cache, compatible, true) &&
+                TextureCacheTestAccess::FindSameBacking(cache, formatted, true) == format_owner,
+            "first-page lookup changed exact-format semantics");
+
+    // Report a focused synthetic comparison, not an emulator FPS claim. Both
+    // paths use the production cache and lock, with the same 64-page owner list.
+    constexpr uint32_t iterations = 20000;
+    const auto measure = [&](bool full_region_search) {
+      uint64_t checksum = 0;
+      const auto start = std::chrono::steady_clock::now();
+      for (uint32_t i = 0; i < iterations; ++i) {
+        checksum += TextureCacheTestAccess::FindSameBacking(
+                        cache, info, false, full_region_search).generation;
+      }
+      const auto elapsed = std::chrono::duration<double, std::nano>(
+          std::chrono::steady_clock::now() - start).count();
+      Require(name, "benchmark result", checksum == uint64_t{iterations} * replacement.generation,
+              "repeated lookup returned an unexpected image generation");
+      return elapsed / iterations;
+    };
+    const auto full_ns = measure(true);
+    const auto first_ns = measure(false);
+    std::printf("[bench]   exact image lookup (64 pages): full %.1f ns, first %.1f ns\n",
+                full_ns, first_ns);
+    TextureCacheTestAccess::DeleteImage(cache, format_owner);
+    TextureCacheTestAccess::DeleteImage(cache, replacement);
+    TextureCacheTestAccess::DeleteImage(cache, later_page);
+    TextureCacheTestAccess::DeleteImage(cache, first);
+    Require(name, "final owner removal",
+            !TextureCacheTestAccess::FindSameBacking(cache, info),
+            "the exact lookup retained a removed image");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckImagePressureRetirement() {
+    constexpr const char *name = "ImagePressureRetirement";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &cache = context.GetTextureCache();
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    TextureCacheTestAccess::EnablePressureCollection(cache);
+
+    ImageInfo info{};
+    info.data = {0x0000000268000000ull, 4};
+    info.pixel_format = vk::Format::eR8G8B8A8Srgb;
+    info.guest_format = Prospero::BufferFormat::k8_8_8_8Srgb;
+    info.pitch = 1;
+    info.bytes_per_block = 4;
+    info.mip_layout[0] = {0, 4, 1, 1};
+    const auto first = TextureCacheTestAccess::InsertImage(cache, info);
+    TextureCacheTestAccess::DeleteImage(cache, first);
+    const auto bytes = TextureCacheTestAccess::PendingRetirementBytes(cache);
+    Require(name, "retirement scheduled", bytes != 0,
+            "deferred image allocation was not counted");
+    scheduler.FlushAndWait();
+    Require(name, "GPU complete but destructor pending",
+            TextureCacheTestAccess::PendingRetirementBytes(cache) == bytes &&
+                TextureCacheTestAccess::Owner(cache, first) != nullptr,
+            "timeline completion prematurely released pending allocation accounting");
+    scheduler.PopPendingOperations();
+    Require(name, "actual destruction releases accounting",
+            TextureCacheTestAccess::PendingRetirementBytes(cache) == 0 &&
+                TextureCacheTestAccess::Owner(cache, first) == nullptr,
+            "deferred destruction left pending bytes behind");
+
+    const auto second = TextureCacheTestAccess::InsertImage(cache, info);
+    info.data.address += 0x10000;
+    const auto third = TextureCacheTestAccess::InsertImage(cache, info);
+    TextureCacheTestAccess::DeleteImage(cache, second);
+    scheduler.Finish();
+    Require(name, "mid-batch finish releases earlier image",
+            TextureCacheTestAccess::PendingRetirementBytes(cache) == 0,
+            "scheduler drain did not retire earlier allocation bytes");
+    TextureCacheTestAccess::DeleteImage(cache, third);
+    Require(name, "later batch tracks only remaining image",
+            TextureCacheTestAccess::PendingRetirementBytes(cache) == bytes,
+            "a retired image was recounted in the later batch");
+    scheduler.Finish();
+    Require(name, "final retirement",
+            TextureCacheTestAccess::PendingRetirementBytes(cache) == 0,
+            "pending image bytes survived final scheduler drain");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckImagePressureReadback() {
+    constexpr const char *name = "ImagePressureReadback";
+    constexpr uintptr_t base = 0x000000026a000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t budget = 1024ull * 1024 * 1024;
+    constexpr std::array<uint32_t, 2> expected{0x76543210u, 0x89abcdefu};
+    constexpr std::array<uint32_t, 2> stale{0x10293847u, 0x56473829u};
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_size, 0, &direct_offset) == 0,
+            "pressure test direct allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "pressure test fixed mapping failed");
+
+    RenderContext context(m_runtime_context);
+    auto &cache = context.GetTextureCache();
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.MapMemory(base, allocation_size);
+    TextureCacheTestAccess::ConfigurePressureCollection(cache, budget);
+    std::array<ImageId, 2> images{};
+    for (size_t index = 0; index < images.size(); ++index) {
+      const auto address = base + index * 0x10000;
+      LibKernel::Memory::WriteBacking(address, &expected[index], sizeof(uint32_t));
+      ImageDesc desc{};
+      desc.type = BindingType::Texture;
+      desc.info.data = {address, sizeof(uint32_t)};
+      desc.info.pixel_format = vk::Format::eR32Uint;
+      desc.info.guest_format = Prospero::BufferFormat::k32UInt;
+      desc.info.type = Prospero::ImageType::kColor2D;
+      desc.info.extent = {1, 1, 1};
+      desc.info.resources = {1, 1};
+      desc.info.pitch = 1;
+      desc.info.bytes_per_block = 4;
+      desc.info.samples = 1;
+      desc.info.tile_mode = Prospero::TileMode::kLinear;
+      desc.info.mip_layout[0] = {0, 4, 1, 1};
+      desc.view_info.format = desc.info.pixel_format;
+      desc.view_info.type = vk::ImageViewType::e2D;
+      desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      images[index] = cache.FindImage(desc);
+      (void)cache.FindTexture(images[index], desc);
+      cache.MarkGpuWritten(images[index]);
+      LibKernel::Memory::WriteBacking(address, &stale[index], sizeof(uint32_t));
+    }
+    const auto batch_tick = scheduler.CurrentTick();
+    TextureCacheTestAccess::RunPressureCollection(cache, budget * 79 / 100, 100);
+    Require(name, "retain below pressure watermark",
+            std::ranges::all_of(images, [&](ImageId id) {
+              return TextureCacheTestAccess::Contains(cache, id);
+            }) && scheduler.CurrentTick() == batch_tick,
+            "B evicted or submitted while memory had headroom");
+    TextureCacheTestAccess::RunPressureCollection(cache, budget * 85 / 100, 101);
+    Require(name, "normal pressure preserves in-flight dirty images",
+            std::ranges::all_of(images, [&](ImageId id) {
+              return TextureCacheTestAccess::Contains(cache, id);
+            }) && scheduler.CurrentTick() == batch_tick,
+            "B forced dirty-image readback below critical pressure");
+    TextureCacheTestAccess::RunPressureCollection(cache, budget, 102);
+    std::array<uint32_t, 2> before{};
+    for (size_t index = 0; index < images.size(); ++index) {
+      LibKernel::Memory::TryReadBacking(base + index * 0x10000, &before[index], sizeof(uint32_t));
+    }
+    Require(name, "critical readbacks share pending submission",
+            std::ranges::none_of(images, [&](ImageId id) {
+              return TextureCacheTestAccess::Contains(cache, id);
+            }) && scheduler.CurrentTick() == batch_tick && before == stale &&
+                TextureCacheTestAccess::PendingRetirementBytes(cache) != 0,
+            "B submitted per image or published before GPU completion");
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+    std::array<uint32_t, 2> after{};
+    for (size_t index = 0; index < images.size(); ++index) {
+      LibKernel::Memory::TryReadBacking(base + index * 0x10000, &after[index], sizeof(uint32_t));
+    }
+    Require(name, "critical readback content and retirement",
+            after == expected && scheduler.CurrentTick() == batch_tick + 1 &&
+                TextureCacheTestAccess::PendingRetirementBytes(cache) == 0,
+            "B lost GPU image data or retained bytes after destruction");
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    Require(name, "release mapping", LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "pressure test mapping release failed");
+    Require(name, "release allocation",
+            LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "pressure test allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
@@ -4668,6 +4971,7 @@ public:
       auto &command = scheduler.Current();
       auto first_desc = sampled;
       const auto first = texture_cache.FindImage(first_desc);
+      const auto exact_query_epoch = TextureCacheTestAccess::QueryEpoch(texture_cache);
       auto repeated_desc = sampled;
       const auto repeated = texture_cache.FindImage(repeated_desc);
       auto compatible_desc = sampled;
@@ -4677,6 +4981,9 @@ public:
       const auto compatible = texture_cache.FindImage(compatible_desc);
       Require(name, "normalized FindImage",
               first && repeated == first && compatible == first &&
+                  (!TextureCacheTestAccess::UsesFirstPageLookup(texture_cache) ||
+                   TextureCacheTestAccess::QueryEpoch(texture_cache) == exact_query_epoch) &&
+                  TextureCacheTestAccess::LookupVerificationHealthy(texture_cache) &&
                   texture_cache.GetImage(first).info.pixel_format ==
                       vk::Format::eR8G8B8A8Srgb,
               "registered compatible backing did not reuse one ImageId");
@@ -33778,6 +34085,17 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckBgra16Readback();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-exact-lookup-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImageExactBackingLookup();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-pressure-retirement-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImagePressureRetirement();
+    vulkan.CheckImagePressureReadback();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {

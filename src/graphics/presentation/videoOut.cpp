@@ -1173,6 +1173,12 @@ bool FlipQueue::Flip(uint32_t micros) {
 	r.cfg->mutex.Unlock();
 
 	Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
+	// A completed guest flip, not the polling iterations of FlipQueue::Flip.
+	// This is a CPU presentation marker; it does not measure GPU execution time.
+	if (tracy::ProfilerAvailable()) {
+		FrameMarkNamed("Guest flip completed");
+	}
+	Profiler::PublishFrameWork();
 
 	if (Config::GraphicsDebugDumpEnabled() &&
 	    Config::GetPrintfDirection() != Config::LogDirection::Silent) {

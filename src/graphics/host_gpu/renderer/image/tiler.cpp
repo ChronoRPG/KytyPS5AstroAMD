@@ -346,9 +346,9 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 			                                           : vk::DescriptorType::eStorageBuffer;
 			writes[index].pBufferInfo     = &infos[index];
 		}
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
+		m_scheduler.Current().PushDescriptors(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 		                             static_cast<uint32_t>(writes.size()), writes.data());
-		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
+		m_scheduler.Current().BindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
 		command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
 		                 dispatch.push.depth);
 	}
@@ -533,7 +533,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
-	command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+	m_scheduler.Current().BindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
 	const auto& limits              = m_graphics.GetPhysicalDeviceProperties().limits;
 	const auto descriptor_alignment = std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
 	const auto rows_for = [&](Result buffer, uint64_t relative, uint64_t stride, uint64_t active,
@@ -578,7 +578,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 				writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
 				writes[index].pBufferInfo     = &infos[index];
 			}
-			command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
+			m_scheduler.Current().PushDescriptors(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 			                             static_cast<uint32_t>(writes.size()), writes.data());
 			Push push {};
 			push.src_base    = source_binding.base;
@@ -649,8 +649,8 @@ void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
-	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_swap_bgra16);
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
+	m_scheduler.Current().BindPipeline(vk::PipelineBindPoint::eCompute, m_swap_bgra16);
+	m_scheduler.Current().PushDescriptors(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
 	Push push {};
 	push.src_base = input_binding.base;

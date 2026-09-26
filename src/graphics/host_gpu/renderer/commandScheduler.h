@@ -18,6 +18,9 @@ namespace Libs::Graphics {
 
 class CommandScheduler {
 public:
+	// Diagnostic attribution only; both kinds retain the same completion boundary.
+	enum class PriorityOperationKind { Generic, EopInterrupt };
+
 	CommandScheduler(RenderContext& context, GraphicContext& graphics);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
@@ -30,7 +33,7 @@ public:
 	void           FlushAndWait();
 	void           Finish();
 	CommandBuffer& BeginCommand();
-	uint64_t       Submit(SubmitInfo submit = {});
+	uint64_t       Submit(SubmitInfo submit = {}, bool force_completion = false);
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
@@ -39,7 +42,9 @@ public:
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
-	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	void                      DeferPriorityOperation(
+	    Common::UniqueFunction<void>&& operation,
+	    PriorityOperationKind kind = PriorityOperationKind::Generic);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
@@ -97,6 +102,12 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	// Guarded by m_operation_mutex, alongside callback registration and the
+	// queued-submit tick transition. Captured into each owned submission record.
+	bool                         m_preserve_current_completion = false;
+	// Aggregate tracing reasons, guarded by m_operation_mutex. They never affect submission.
+	bool                         m_diagnostic_eop_completion     = false;
+	bool                         m_diagnostic_generic_completion = false;
 };
 
 } // namespace Libs::Graphics

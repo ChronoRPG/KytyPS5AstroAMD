@@ -507,6 +507,7 @@ struct CompiledShaderInfo {
 	uint32_t                      user_data_count     = 64;
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
+	bool                          has_address_writes  = false;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
 };
@@ -519,6 +520,42 @@ struct UniformFillPlan {
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
+	// Immutable operand recipes use the same indices as the legacy evaluator's memo.
+	// They contain no guest memory values and are rebuilt for each retained IR plan.
+	struct EvaluationOperand {
+		enum class Kind : uint32_t { Invalid, Immediate, Node };
+		uint64_t value = 0;
+		uint32_t index = 0;
+		Kind kind = Kind::Invalid;
+	};
+	struct EvaluationRecipe {
+		enum class Kind : uint32_t {
+			Fallback, Operation, UserData, FlatRead, Forward, Extract, ExtractCarry,
+			RawAddress, RawBuffer, Select,
+		};
+		const Inst* instruction = nullptr;
+		std::array<EvaluationOperand, 5> operands {};
+		Value selection_mask;
+		int64_t offset = 0;
+		uint32_t parameter = 0;
+		Kind kind = Kind::Fallback;
+	};
+	struct ArithmeticTapeOperand {
+		uint64_t value = 0; // Immediate bits, or an earlier tape instruction's result index.
+		bool immediate = true;
+	};
+	struct ArithmeticTapeInstruction {
+		enum class Kind : uint8_t { Boundary, Operation, Forward, Extract, ExtractCarry };
+		std::array<ArithmeticTapeOperand, 4> operands {};
+		const Inst* instruction = nullptr;
+		uint32_t parameter = 0; // Boundary recipe index or extract component.
+		Kind kind = Kind::Boundary;
+		uint8_t operand_count = 0;
+	};
+	struct ArithmeticTape {
+		uint32_t first = 0;
+		uint32_t count = 0; // Zero keeps the original evaluator path.
+	};
 	struct EvaluationContext {
 		struct Entry {
 			uint64_t value      = 0;
@@ -526,6 +563,9 @@ struct ResourcePlan {
 		};
 
 		std::vector<Entry> values;
+		// Nested tapes in this memo context use disjoint, stack-allocated slices.
+		std::vector<uint64_t> tape_values;
+		size_t               tape_values_used = 0;
 		uint64_t           generation = 0;
 	};
 
@@ -546,6 +586,24 @@ struct ResourcePlan {
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
+	// Exclusive run ends for adjacent raw flat reads; empty on untranslated plans.
+	// Runs preserve read order, resolved handle, opcode and clean/ordinary context.
+	std::vector<uint32_t>               srt_read_run_ends;
+	std::vector<EvaluationRecipe>       evaluation_recipes;
+	// Immutable entry points for the same evaluator, decoded once after cloning.
+	// These contain indices/immediate constants only, never guest read results.
+	std::vector<std::array<EvaluationOperand, 8>> descriptor_roots;
+	std::vector<EvaluationOperand>      flat_read_roots;
+	std::vector<EvaluationOperand>      condition_roots;
+	std::vector<uint8_t>                initial_active_sources;
+	// Compacted traversal skips only empty unconditional blocks; no guest reads
+	// or source activations are removed. Separate from decoded expression roots.
+	std::vector<uint32_t>               flow_aliases;
+	std::vector<uint8_t>                flow_initial_sources;
+	mutable std::vector<uint32_t>       flow_visit_tags;
+	mutable uint32_t                    flow_visit_epoch = 0;
+	std::vector<ArithmeticTape>         arithmetic_tapes;
+	std::vector<ArithmeticTapeInstruction> arithmetic_tape_instructions;
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                has_address_writes = false;

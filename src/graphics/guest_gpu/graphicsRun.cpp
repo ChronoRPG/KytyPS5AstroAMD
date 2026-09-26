@@ -265,10 +265,12 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	GetScheduler().Flush();
 }
 
 void CommandProcessor::BufferFlushAndWait() {
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	GetScheduler().FlushAndWait();
 }
 
@@ -726,7 +728,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
 		}
 
+		if ((packet_header & 1u) != 0) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::PredicatedPackets);
+		}
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::PredicatedPacketsSkipped);
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
 			static std::atomic<uint32_t> skip_log_count {0};
@@ -831,6 +837,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionPredicates);
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
 			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
@@ -838,6 +845,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				const auto begin = results[db * 2u];
 				const auto end   = results[db * 2u + 1u];
 				if ((begin & end & ready_bit) == 0) {
+					Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionPredicatesPending);
 					if (wait_op == 0) {
 						SuspendPm4();
 					} else {
@@ -1166,7 +1174,12 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		std::memcpy(dst, &data, sizeof(data));
+		{
+			// Guest label pages can be protected by resource tracking. Attribute any
+			// resulting fault separately from the end-of-pipe submission/interrupt work.
+			KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel32");
+			std::memcpy(dst, &data, sizeof(data));
+		}
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -1216,7 +1229,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			} else {
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					std::memcpy(dst, &value, sizeof(value));
+					{
+						KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel64");
+						std::memcpy(dst, &value, sizeof(value));
+					}
 
 					if (with_interrupt) {
 						if (with_writeback) {
@@ -1306,7 +1322,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			if constexpr (sizeof(T) == sizeof(uint64_t)) {
 				const auto clock = Sync::ReadReferenceClock();
 				auto*      dst   = static_cast<uint64_t*>(dst_gpu_addr);
-				std::memcpy(dst, &clock, sizeof(clock));
+				{
+					KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteClockLabel");
+					std::memcpy(dst, &clock, sizeof(clock));
+				}
 				switch (cache_action) {
 					case 0x00:
 						if ((eop_event_type == 0x04 && event_index == 0x05) ||
@@ -1353,6 +1372,7 @@ void CommandProcessor::WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_
                                           void* dst_gpu_addr, uint32_t value,
                                           uint32_t interrupt_selector,
                                           uint32_t interrupt_context_id) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	WriteAtEndOfPipe(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
 	                 event_write_source, dst_gpu_addr, value, interrupt_selector,
 	                 interrupt_context_id);
@@ -1364,13 +1384,17 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
                                           void* dst_gpu_addr, uint64_t value,
                                           uint32_t interrupt_selector,
                                           uint32_t interrupt_context_id) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	WriteAtEndOfPipe(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
 	                 event_write_source, dst_gpu_addr, value, interrupt_selector,
 	                 interrupt_context_id);
 }
 
 void CommandProcessor::EmitGlobalBarrier() {
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	Common::LockGuard lock(m_renderer.GetMutex());
+	// Keep renderer-lock contention in the parent zone's self time.
+	KYTY_PROFILER_DETAIL_BLOCK("CommandProcessor::RecordGlobalBarrier");
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -1439,10 +1463,16 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			     event_type, event_index);
 			break;
 		case 0x00000039: {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionCounterDumps);
 			if (event_index != 0x00000001 || event_address == 0 || (event_address & 0x7u) != 0) {
 				EXIT("invalid occlusion-counter dump: index=0x%08" PRIx32 ", address=0x%016" PRIx64
 				     "\n",
 				     event_index, event_address);
+			}
+			if (OcclusionCounter::Enabled()) {
+				Common::LockGuard lock(m_renderer.GetMutex());
+				m_renderer.GetOcclusionCounter().Dump(event_address);
+				break;
 			}
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
@@ -1542,6 +1572,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 }
 
 void CommandProcessor::SynchronizeGpu() {
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	GetScheduler().Finish();
 }
 

@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/queueSubmission.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -74,32 +75,6 @@ struct DrawAutoArgs {
 	uint32_t         render_target_slice_offset = 0;
 };
 
-struct SubmitInfo {
-	static constexpr uint32_t MaxSemaphores = 3;
-
-	std::array<vk::Semaphore, MaxSemaphores>          wait_semaphores {};
-	std::array<uint64_t, MaxSemaphores>               wait_ticks {};
-	std::array<vk::PipelineStageFlags, MaxSemaphores> wait_stages {};
-	std::array<vk::Semaphore, MaxSemaphores>          signal_semaphores {};
-	std::array<uint64_t, MaxSemaphores>               signal_ticks {};
-	uint32_t                                          num_wait_semaphores   = 0;
-	uint32_t                                          num_signal_semaphores = 0;
-
-	void AddWait(vk::Semaphore semaphore, uint64_t tick = 1,
-	             vk::PipelineStageFlags stage = vk::PipelineStageFlagBits::eAllCommands) {
-		EXIT_IF(semaphore == nullptr || num_wait_semaphores >= MaxSemaphores);
-		wait_semaphores[num_wait_semaphores] = semaphore;
-		wait_ticks[num_wait_semaphores]      = tick;
-		wait_stages[num_wait_semaphores++]   = stage;
-	}
-
-	void AddSignal(vk::Semaphore semaphore, uint64_t tick = 1) {
-		EXIT_IF(semaphore == nullptr || num_signal_semaphores >= MaxSemaphores);
-		signal_semaphores[num_signal_semaphores] = semaphore;
-		signal_ticks[num_signal_semaphores++]    = tick;
-	}
-};
-
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
@@ -112,6 +87,10 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	void BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline);
+	void PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
+	                     uint32_t count, const vk::WriteDescriptorSet* writes);
+	void InvalidateDescriptors(vk::PipelineBindPoint point);
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -143,9 +122,18 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable uint32_t    m_occlusion_control = 0;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
+	std::array<vk::Pipeline, 2> m_bound_pipelines {};
+	struct DescriptorState {
+		vk::PipelineLayout layout = nullptr;
+		std::vector<vk::WriteDescriptorSet> writes;
+		std::vector<vk::DescriptorBufferInfo> buffers;
+		std::vector<vk::DescriptorImageInfo> images;
+	};
+	std::array<DescriptorState, 2> m_descriptor_states;
 
 	friend class CommandScheduler;
 };
@@ -203,6 +191,7 @@ private:
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
+	[[nodiscard]] vk::DescriptorBufferInfo UploadShaderData(std::span<const uint32_t> data);
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
@@ -217,6 +206,20 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	struct ShaderUploadEntry {
+		uint64_t tick = 0;
+		uint64_t hash = 0;
+		vk::DescriptorBufferInfo allocation;
+		std::vector<uint32_t> words;
+	};
+	std::array<ShaderUploadEntry, 64> m_shader_uploads;
+	struct TextureDescriptionEntry {
+		bool valid = false;
+		ShaderRecompiler::IR::ImageResource resource;
+		std::array<uint32_t, 8> words {};
+		TextureCache::ImageDesc desc;
+	};
+	std::array<TextureDescriptionEntry, 256> m_texture_descriptions;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

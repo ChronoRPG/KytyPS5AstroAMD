@@ -7,6 +7,7 @@
 #include "common/file.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/memory.h"
@@ -703,22 +704,28 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 
 int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset) {
 	PRINT_NAME();
+	Profiler::ScopedLoadingOperation loading(Profiler::LoadingOperation::Pread);
+	Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadRequestedBytes, nbytes);
 
 	if (d < DESCRIPTOR_MIN) {
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadErrors);
 		return KERNEL_ERROR_EPERM;
 	}
 
 	if (buf == nullptr) {
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadErrors);
 		return KERNEL_ERROR_EFAULT;
 	}
 
 	if (offset < 0) {
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadErrors);
 		return KERNEL_ERROR_EINVAL;
 	}
 
 	auto* file = g_files->GetFile(d);
 
 	if (file == nullptr) {
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadErrors);
 		return KERNEL_ERROR_EBADF;
 	}
 
@@ -730,6 +737,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 
 	if (file->special == SpecialFile::Random) {
 		FillRandomBuffer(buf, nbytes);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadReadBytes, nbytes);
 
 		LOGF("\tRead %" PRIu64 " random bytes (pos = %" PRId64 ") from: %s\n",
 		     static_cast<uint64_t>(nbytes), offset, Common::PathToString(file->real_name).c_str());
@@ -737,23 +745,33 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		return static_cast<int64_t>(nbytes);
 	}
 
+	Profiler::ScopedLoadingOperation mutex_wait(Profiler::LoadingOperation::PreadFileMutex);
 	file->mutex.Lock();
+	mutex_wait.End();
 
 	bool       is_invalid = file->f.IsInvalid();
 	auto       pos        = file->f.Tell();
 	const auto file_size  = file->f.Size();
 	const auto remaining =
 	    static_cast<uint64_t>(offset) < file_size ? file_size - static_cast<uint64_t>(offset) : 0;
-	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
-	                         std::min<uint64_t>(nbytes, remaining));
+	{
+		Profiler::ScopedLoadingOperation coherence(Profiler::LoadingOperation::PreadCoherence);
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
+		                         std::min<uint64_t>(nbytes, remaining));
+	}
 	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	{
+		Profiler::ScopedLoadingOperation native_read(Profiler::LoadingOperation::PreadNativeRead);
+		file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	}
+	Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadReadBytes, bytes_read);
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();
 
 	if (is_invalid) {
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadErrors);
 		LOGF("\tfile is invalid\n");
 		return KERNEL_ERROR_EIO;
 	}

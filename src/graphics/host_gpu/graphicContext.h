@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/queueSubmission.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
 #include <map>
@@ -29,6 +30,7 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
+	bool                               precise_occlusion_enabled             = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
@@ -40,6 +42,7 @@ struct GraphicContext {
 	uint32_t                           max_push_descriptors                  = 0;
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	Common::Mutex                      queue_mutex;
+	QueueSubmissionBroker              submission_queue;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
 
@@ -103,6 +106,16 @@ struct GraphicContext {
 	uint32_t screen_height = 0;
 
 private:
+	struct RetiredNativeImage {
+		vk::ImageCreateInfo create;
+		vk::Image image;
+		VmaAllocation allocation;
+		uint64_t bytes;
+	};
+	void ClearRetiredImages();
+	std::mutex m_retired_image_mutex;
+	std::vector<RetiredNativeImage> m_retired_images;
+	uint64_t m_retired_image_bytes = 0;
 	mutable std::mutex                                 m_format_properties_mutex;
 	mutable std::map<vk::Format, vk::FormatProperties> m_format_properties;
 	mutable std::mutex                                 m_image_format_properties_mutex;
@@ -134,6 +147,10 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	// Only pointer-free, ordinary optimal images are eligible for native recycling.
+	// Guest contents, views and layout tracking are never retained across owners.
+	bool                         pool_eligible = false;
+	vk::ImageCreateInfo          pool_create_info {};
 };
 
 

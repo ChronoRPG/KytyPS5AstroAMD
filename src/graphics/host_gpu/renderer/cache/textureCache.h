@@ -7,12 +7,16 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/imageCacheGcPolicy.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
 #include <map>
+#include <memory>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -25,6 +29,7 @@ class Buffer;
 class BufferCache;
 class CommandBuffer;
 class CommandScheduler;
+class DccClearHelper;
 class RenderExecutor;
 struct TextureCacheTestAccess;
 
@@ -74,6 +79,7 @@ public:
 
 private:
 	enum class TransferDirection { Upload, Download };
+	enum class ImageLookupMode { FirstPage, Legacy, Verify };
 	struct TextureTransfer;
 	struct ImageDownload;
 
@@ -88,6 +94,11 @@ private:
 		ImageId image;
 		int32_t mip   = -1;
 		int32_t layer = -1;
+	};
+
+	struct GpuDccInspection {
+		GuestRange metadata;
+		BufferContentRevision revision;
 	};
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
@@ -124,6 +135,9 @@ private:
 	void                      UntrackImageHead(ImageId id);
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
+	// All callers hold m_lock; negative ownership proofs contain no guest values.
+	void                      MarkImageGpuModified(Image& image);
+	void                      InvalidateCleanImageProofs();
 	void                      TrackImageDownload(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
@@ -133,6 +147,9 @@ private:
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
+	// Caller holds m_lock. Equal backing ranges must begin in the same indexed page.
+	[[nodiscard]] ImageId       FindImageWithSameBacking(const ImageInfo& requested,
+	                                                     bool exact_format) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
@@ -141,6 +158,8 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
+	[[nodiscard]] bool TryMaterializeGpuDccClear(ImageId id, const ImageDesc& desc,
+	                                             uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
@@ -163,6 +182,7 @@ private:
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	void RunPressureGarbageCollector(uint64_t tick);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -171,6 +191,12 @@ private:
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
+	std::unique_ptr<DccClearHelper>                    m_dcc_clear;
+	std::unordered_map<uint64_t, GpuDccInspection>      m_gpu_dcc_inspections;
+	uint64_t m_gpu_dcc_attempts = 0;
+	uint64_t m_gpu_dcc_records = 0;
+	uint64_t m_gpu_dcc_reuses = 0;
+	uint64_t m_gpu_dcc_fallbacks = 0;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
@@ -178,11 +204,27 @@ private:
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
+	uint64_t                                          m_registered_image_memory = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
+	ImageCacheGcPolicy m_pressure_gc_policy;
+	bool             m_pressure_gc_enabled   = false;
+	Common::LeastRecentlyUsedCache<ImageId, uint64_t>::Cursor m_pressure_gc_cursor;
+	uint64_t m_pressure_retirement_bytes = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
+	bool             m_direct_dirty_image_query = false;
+	struct CleanImagePageProof {
+		uint64_t page = 0;
+		uint64_t epoch = 0;
+	};
+	std::array<CleanImagePageProof, 256> m_clean_image_pages {};
+	uint64_t m_clean_image_epoch = 1;
+	bool m_clean_image_proofs = false;
+	ImageLookupMode  m_image_lookup_mode = ImageLookupMode::FirstPage;
+	uint64_t         m_image_lookup_checks = 0;
+	uint64_t         m_image_lookup_mismatches = 0;
 	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;

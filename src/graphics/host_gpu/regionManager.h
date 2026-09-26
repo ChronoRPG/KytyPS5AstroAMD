@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "common/rendererBatch.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
@@ -37,7 +38,23 @@ public:
 			if (m_owner.load(std::memory_order_relaxed) == thread) {
 				EXIT("recursive region tracking lock while contended\n");
 			}
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+			if (Common::RendererBatchEnabled()) {
+				// Wait using shared reads instead of continuously taking exclusive
+				// ownership of the cache line from its current owner.
+				while (m_lock.test(std::memory_order_relaxed)) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+					YieldProcessor();
+#elif defined(__x86_64__) || defined(__i386__)
+					__builtin_ia32_pause();
+#elif defined(__aarch64__)
+					__asm__ volatile("yield");
+#else
+					std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+				}
+			} else {
+				std::atomic_signal_fence(std::memory_order_seq_cst);
+			}
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}

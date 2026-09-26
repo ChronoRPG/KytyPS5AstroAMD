@@ -1,17 +1,413 @@
 #include "common/profiler.h"
 
 #include "common/emulatorConfig.h"
+#include "common/stringUtils.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cinttypes>
+#include <condition_variable>
 #include <common/TracyProtocol.hpp>
 #include <common/TracyVersion.hpp>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <tracy/Tracy.hpp>
 #include <vector>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <process.h>
+#include <share.h>
+#include <sys/stat.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
 thread_local std::vector<Profiler::ScopedBlock*> g_block_stack;
+
+constexpr size_t kFrameWorkCount = static_cast<size_t>(Profiler::FrameWork::Count);
+std::array<std::atomic<uint64_t>, kFrameWorkCount> g_frame_work {};
+std::atomic<uint64_t> g_completed_flips {0};
+constexpr std::array<const char*, kFrameWorkCount> kFrameWorkNames {
+    "FrameWork.DrawIndex.Cumulative",
+    "FrameWork.DrawAuto.Cumulative",
+    "FrameWork.DrawIndirectCommands.Cumulative",
+    "FrameWork.DrawIndirectMultiCommands.Cumulative",
+    "FrameWork.DispatchDirectCommands.Cumulative",
+    "FrameWork.DispatchIndirectCommands.Cumulative",
+};
+
+constexpr size_t kFrameEventCount = static_cast<size_t>(Profiler::FrameEvent::Count);
+std::array<std::atomic<uint64_t>, kFrameEventCount> g_frame_events {};
+constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
+    "FrameEvent.SubmitBoundaryUnprotected.Cumulative",
+    "FrameEvent.SubmitBoundaryEopOnly.Cumulative",
+    "FrameEvent.SubmitBoundaryEopMixed.Cumulative",
+    "FrameEvent.SubmitBoundaryGeneric.Cumulative",
+    "FrameEvent.MeshDraws.Cumulative",
+    "FrameEvent.MeshRestartEnabledDraws.Cumulative",
+    "FrameEvent.MeshInputIndices.Cumulative",
+    "FrameEvent.MeshWorkgroups.Cumulative",
+    "FrameEvent.ShaderProgramsCreated.Cumulative",
+    "FrameEvent.GraphicsPipelinesCreated.Cumulative",
+    "FrameEvent.SrtProbeHits.Cumulative",
+    "FrameEvent.SrtProbeMisses.Cumulative",
+    "FrameEvent.SrtProbeBytes.Cumulative",
+    "FrameEvent.SrtProbeBatchHits.Cumulative",
+    "FrameEvent.ResourceReuseHits.Cumulative",
+    "FrameEvent.ResourceReuseMisses.Cumulative",
+    "FrameEvent.ResourceReuseValidationBytes.Cumulative",
+    "FrameEvent.ResourceReuseRejectedCaptures.Cumulative",
+    "FrameEvent.SrtRecipeSessions.Cumulative",
+    "FrameEvent.SrtRecipeCompiledNodes.Cumulative",
+    "FrameEvent.SrtRecipeFallbackNodes.Cumulative",
+    "FrameEvent.SrtRecipeMemoHits.Cumulative",
+    "FrameEvent.SrtTapeExecutions.Cumulative",
+    "FrameEvent.SrtTapeOperations.Cumulative",
+    "FrameEvent.SrtTapeBoundaryCalls.Cumulative",
+    "FrameEvent.BdaSyncPasses.Cumulative",
+    "FrameEvent.BdaSyncSkips.Cumulative",
+    "FrameEvent.BdaSyncScannedBuffers.Cumulative",
+    "FrameEvent.BdaSyncUploadBytes.Cumulative",
+    "FrameEvent.BdaSyncUploadCopies.Cumulative",
+    "FrameEvent.ShaderHeaderProbeHits.Cumulative",
+    "FrameEvent.ShaderHeaderProbeMisses.Cumulative",
+    "FrameEvent.VertexMetadataProbeHits.Cumulative",
+    "FrameEvent.VertexMetadataProbeMisses.Cumulative",
+    "FrameEvent.NativeImagePoolHits.Cumulative",
+    "FrameEvent.NativeImagePoolMisses.Cumulative",
+    "FrameEvent.NativeImagePoolRetires.Cumulative",
+    "FrameEvent.NativeImagePoolAddedBytes.Cumulative",
+    "FrameEvent.NativeImagePoolRemovedBytes.Cumulative",
+    "FrameEvent.TextureCleanProofHits.Cumulative",
+    "FrameEvent.TextureCleanProofMisses.Cumulative",
+    "FrameEvent.TextureCleanProofStores.Cumulative",
+    "FrameEvent.ResourceCacheKeyMatches.Cumulative",
+    "FrameEvent.ResourceCacheBackingRejects.Cumulative",
+    "FrameEvent.ResourceCacheHistoryHits.Cumulative",
+    "FrameEvent.ResourceCacheBudgetRejects.Cumulative",
+    "FrameEvent.ResourceCachePermutationHits.Cumulative",
+    "FrameEvent.SrtSharedCleanMemoHits.Cumulative",
+    "FrameEvent.UploadReservationsOutsideLocks.Cumulative",
+    "FrameEvent.ShaderUploadReuseHits.Cumulative",
+    "FrameEvent.ShaderUploadReuseMisses.Cumulative",
+    "FrameEvent.ShaderUploadBytesAvoided.Cumulative",
+    "FrameEvent.TextureDescriptionHits.Cumulative",
+    "FrameEvent.TextureDescriptionMisses.Cumulative",
+    "FrameEvent.PipelineBindsAvoided.Cumulative",
+    "FrameEvent.DescriptorPushesAvoided.Cumulative",
+    "FrameEvent.PredicatedPackets.Cumulative",
+    "FrameEvent.PredicatedPacketsSkipped.Cumulative",
+    "FrameEvent.OcclusionPredicates.Cumulative",
+    "FrameEvent.OcclusionPredicatesPending.Cumulative",
+    "FrameEvent.OcclusionCounterDumps.Cumulative",
+    "FrameEvent.NativeOcclusionScopes.Cumulative",
+    "FrameEvent.NativeOcclusionDumps.Cumulative",
+    "FrameEvent.NativeOcclusionReductions.Cumulative",
+    "FrameEvent.MeshRestartMarkers.Cumulative",
+    "FrameEvent.MeshRestartSegments.Cumulative",
+};
+
+constexpr size_t kFrameWaitCount = static_cast<size_t>(Profiler::FrameWait::Count);
+struct FrameWaitTotals {
+	std::atomic<uint64_t> calls {0};
+	std::atomic<uint64_t> nanoseconds {0};
+};
+std::array<FrameWaitTotals, kFrameWaitCount> g_frame_waits {};
+constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
+    "FrameWait.ReadMemory.Calls.Cumulative",
+    "FrameWait.ShaderReadiness.Calls.Cumulative",
+    "FrameWait.DccFallback.Calls.Cumulative",
+    "FrameWait.ResourceMaterialization.Calls.Cumulative",
+    "FrameWait.DriverSubmit.Calls.Cumulative",
+    "FrameWait.ShaderProgramMiss.Calls.Cumulative",
+    "FrameWait.GraphicsPipelineCreate.Calls.Cumulative",
+    "FrameWait.ResourceReuseValidation.Calls.Cumulative",
+    "FrameWait.NativeImageCreate.Calls.Cumulative",
+    "FrameWait.NativeImageDestroy.Calls.Cumulative",
+};
+constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
+    "FrameWait.ReadMemory.Nanoseconds.Cumulative",
+    "FrameWait.ShaderReadiness.Nanoseconds.Cumulative",
+    "FrameWait.DccFallback.Nanoseconds.Cumulative",
+    "FrameWait.ResourceMaterialization.Nanoseconds.Cumulative",
+    "FrameWait.DriverSubmit.Nanoseconds.Cumulative",
+    "FrameWait.ShaderProgramMiss.Nanoseconds.Cumulative",
+    "FrameWait.GraphicsPipelineCreate.Nanoseconds.Cumulative",
+    "FrameWait.ResourceReuseValidation.Nanoseconds.Cumulative",
+    "FrameWait.NativeImageCreate.Nanoseconds.Cumulative",
+    "FrameWait.NativeImageDestroy.Nanoseconds.Cumulative",
+};
+
+uint64_t FrameWaitClockNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	    std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+constexpr size_t kLoadingEventCount = static_cast<size_t>(Profiler::LoadingEvent::Count);
+std::array<std::atomic<uint64_t>, kLoadingEventCount> g_loading_events {};
+constexpr std::array<const char*, kLoadingEventCount> kLoadingEventNames {
+    "Loading.AprRecordsCompleted.Cumulative",
+    "Loading.AprRequestedBytes.Cumulative",
+    "Loading.AprHostReadBytes.Cumulative",
+    "Loading.AprGuestCopiedBytes.Cumulative",
+    "Loading.AprErrors.Cumulative",
+    "Loading.AprShortReads.Cumulative",
+    "Loading.AmmErrors.Cumulative",
+    "Loading.PreadRequestedBytes.Cumulative",
+    "Loading.PreadReadBytes.Cumulative",
+    "Loading.PreadErrors.Cumulative",
+    "Loading.LodStatsPackets.Cumulative",
+    "Loading.LodStatsBufferBytes.Cumulative",
+    "Loading.LodStatsReportAndResetPackets.Cumulative",
+    "Loading.LodStatsForceResetPackets.Cumulative",
+    "Loading.LodStatsResetCountSum.Cumulative",
+    "Loading.LodStatsInterval100kSum.Cumulative",
+    "Loading.LodStatsCachePolicySum.Cumulative",
+    "Loading.DirectMemorySizeQueries.Cumulative",
+    "Loading.DirectMemoryAvailableQueries.Cumulative",
+    "Loading.DirectMemoryAvailableSuccesses.Cumulative",
+    "Loading.DirectMemoryAvailableBytesSum.Cumulative",
+    "Loading.PageTableStatsQueries.Cumulative",
+    "Loading.PageTableStatsSuccesses.Cumulative",
+    "Loading.PageTableCpuAvailableSum.Cumulative",
+    "Loading.PageTableGpuAvailableSum.Cumulative",
+    "Loading.PageTableCpuZeroAvailable.Cumulative",
+    "Loading.PageTableGpuZeroAvailable.Cumulative",
+    "Loading.FlexibleAvailableQueries.Cumulative",
+    "Loading.FlexibleAvailableSuccesses.Cumulative",
+    "Loading.FlexibleAvailableBytesSum.Cumulative",
+    "Loading.MemoryPoolStatsQueries.Cumulative",
+    "Loading.MemoryPoolAvailableBytesSum.Cumulative",
+    "Loading.AmmUsageStatsQueries.Cumulative",
+    "Loading.AmmOccupancyThresholdCalls.Cumulative",
+    "Loading.AmmOccupancyThresholdSum.Cumulative",
+    "Loading.AprReadCommandsAppended.Cumulative",
+    "Loading.AprCommandResets.Cumulative",
+    "Loading.AprCommandBufferSets.Cumulative",
+    "Loading.AprCommandBufferClears.Cumulative",
+    "Loading.AprSubmitAndGetResult.Cumulative",
+    "Loading.AprSubmitPlain.Cumulative",
+    "Loading.AprSubmitAndGetId.Cumulative",
+    "Loading.AprWaitCompleted.Cumulative",
+    "Loading.AprWaitUnknownId.Cumulative",
+    "Loading.AprUnsupportedWaitCommands.Cumulative",
+    "Loading.AprUnsupportedCounterCommands.Cumulative",
+    "Loading.AprDiagnosticRowsDropped.Cumulative",
+};
+struct LoadingTotals {
+	std::atomic<uint64_t> started {0};
+	std::atomic<uint64_t> completed {0};
+	std::atomic<uint64_t> in_flight {0};
+	std::atomic<uint64_t> nanoseconds {0};
+};
+struct LoadingPlotNames {
+	const char* started;
+	const char* completed;
+	const char* in_flight;
+	const char* nanoseconds;
+};
+constexpr size_t kLoadingOperationCount = static_cast<size_t>(Profiler::LoadingOperation::Count);
+std::array<LoadingTotals, kLoadingOperationCount> g_loading_operations {};
+#define KYTY_LOADING_PLOT_NAMES(name) \
+    LoadingPlotNames {"Loading." #name ".Started.Cumulative", \
+                      "Loading." #name ".Completed.Cumulative", \
+                      "Loading." #name ".InFlight", \
+                      "Loading." #name ".Nanoseconds.Cumulative"}
+constexpr std::array<LoadingPlotNames, kLoadingOperationCount> kLoadingOperationNames {
+    KYTY_LOADING_PLOT_NAMES(AprSubmit),
+    KYTY_LOADING_PLOT_NAMES(AprRead),
+    KYTY_LOADING_PLOT_NAMES(AprHostRead),
+    KYTY_LOADING_PLOT_NAMES(AprGuestCopy),
+    KYTY_LOADING_PLOT_NAMES(AmmMap),
+    KYTY_LOADING_PLOT_NAMES(AmmUnmap),
+    KYTY_LOADING_PLOT_NAMES(Pread),
+    KYTY_LOADING_PLOT_NAMES(PreadFileMutex),
+    KYTY_LOADING_PLOT_NAMES(PreadCoherence),
+    KYTY_LOADING_PLOT_NAMES(PreadNativeRead),
+};
+#undef KYTY_LOADING_PLOT_NAMES
+std::mutex g_loading_publish_mutex;
+std::condition_variable_any g_loading_publish_condition;
+
+constexpr size_t kLoadingAprQueueSize = 1024;
+constexpr uint64_t kLoadingAprMaxRows = 8192;
+std::mutex g_loading_apr_mutex;
+std::array<Profiler::LoadingAprSubmission, kLoadingAprQueueSize> g_loading_apr_queue {};
+size_t g_loading_apr_head = 0, g_loading_apr_size = 0;
+std::atomic<uint64_t> g_loading_apr_sequence {0}, g_loading_apr_retained {0};
+constexpr const char* kLoadingAprHeader =
+    "sequence,timestamp_ns,api_kind,command_buffer,argument1,argument2,result_address,out_id_address,"
+    "submission_id,resolved_object,generation,append_serial,submits_in_generation,unchanged_submits,"
+    "cached_buffer,cached_size,cached_offset,header_valid,header_buffer,header_size,header_offset,"
+    "header_commands,header_type,header_mismatch,read_count,event_count,write_count,map_count,"
+    "commands_signature,first_read_id,first_read_destination,first_read_size,first_read_offset,"
+    "read_bytes,execution_observed,execution_result,error_offset,submit_result,api_kernel_result\n";
+// Destroy the publisher before its queue, condition variable and mutexes.
+std::jthread g_loading_publisher;
+
+struct LoadingLogCloser {
+	void operator()(std::FILE* file) const { std::fclose(file); }
+};
+using LoadingLog = std::unique_ptr<std::FILE, LoadingLogCloser>;
+
+LoadingLog OpenLoadingLog(bool apr = false) {
+	const auto* setting = std::getenv("KYTY_LOADING_LOG");
+	if (setting == nullptr || *setting == '\0') return {};
+	try {
+		auto path = std::filesystem::u8path(setting);
+		if (!path.is_absolute()) {
+			::printf("Loading diagnostics CSV requires a new absolute path; log disabled\n");
+			return {};
+		}
+		// A launcher can start more than one emulator with the same inherited
+		// requested path. Give each process its own destination without replacing
+		// an earlier capture; the timestamp also distinguishes reused process IDs.
+		static const auto startup_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		    std::chrono::system_clock::now().time_since_epoch()).count();
+#ifdef _WIN32
+		const auto process_id = _getpid();
+#else
+		const auto process_id = ::getpid();
+#endif
+		auto filename = path.stem();
+		if (apr) filename += ".apr-submissions";
+		filename += ".pid-" + std::to_string(process_id) + ".start-" + std::to_string(startup_ns);
+		filename += path.extension();
+		path = path.parent_path() / filename;
+		::printf("Loading %s CSV path: %s\n", apr ? "APR submissions" : "diagnostics",
+		         Common::PathToString(path).c_str());
+		std::FILE* handle = nullptr;
+#ifdef _WIN32
+		// Exclusive creation preserves earlier captures; allow readers while this
+		// publisher writes, so loading progress can be inspected during a stall.
+		int descriptor = -1;
+		if (_wsopen_s(&descriptor, path.c_str(), _O_CREAT | _O_EXCL | _O_WRONLY | _O_TEXT,
+		              _SH_DENYWR, _S_IREAD | _S_IWRITE) == 0) {
+			handle = _wfdopen(descriptor, L"w");
+			if (handle == nullptr) _close(descriptor);
+		}
+#else
+		handle = std::fopen(path.c_str(), "wx");
+#endif
+		LoadingLog log(handle);
+		if (!log) {
+			::printf("Loading diagnostics CSV could not be opened; log disabled\n");
+			return {};
+		}
+		if (apr) {
+			std::fputs(kLoadingAprHeader, log.get());
+			std::fflush(log.get());
+			return log;
+		}
+		std::fprintf(log.get(), "elapsed_ns");
+		for (const auto* name: kLoadingEventNames) std::fprintf(log.get(), ",%s", name);
+		for (const auto& names: kLoadingOperationNames) {
+			std::fprintf(log.get(), ",%s,%s,%s,%s", names.started, names.completed,
+			             names.in_flight, names.nanoseconds);
+		}
+		std::fprintf(log.get(), ",Loading.CompletedFlips.Cumulative\n");
+		std::fflush(log.get());
+		return log;
+	} catch (const std::exception&) {
+		::printf("Loading diagnostics CSV path could not be used; log disabled\n");
+		return {};
+	}
+}
+
+void PublishLoadingAprSubmissions(std::FILE* log) {
+	// Copy a bounded batch under the diagnostic mutex, then release it before I/O.
+	// The guest path never takes the publisher/file lock and never writes a file.
+	std::array<Profiler::LoadingAprSubmission, 128> batch {};
+	for (;;) {
+		size_t count = 0;
+		{
+			std::scoped_lock lock(g_loading_apr_mutex);
+			count = std::min(batch.size(), g_loading_apr_size);
+			for (size_t i = 0; i < count; ++i) {
+				batch[i] = g_loading_apr_queue[g_loading_apr_head];
+				g_loading_apr_head = (g_loading_apr_head + 1) % kLoadingAprQueueSize;
+			}
+			g_loading_apr_size -= count;
+		}
+		if (count == 0) break;
+		for (size_t i = 0; i < count; ++i) {
+			if (log == nullptr || std::ferror(log) != 0) {
+				Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprDiagnosticRowsDropped);
+				continue;
+			}
+			const auto& r = batch[i];
+			const std::array values {
+			    r.sequence, r.timestamp_ns, r.api_kind, r.command_buffer, r.argument1, r.argument2,
+			    r.result_address, r.out_id_address, r.submission_id, r.resolved_object, r.generation,
+			    r.append_serial, r.submits_in_generation, r.unchanged_submits, r.cached_buffer,
+			    r.cached_size, r.cached_offset, r.header_valid, r.header_buffer, r.header_size,
+			    r.header_offset, r.header_commands, r.header_type, r.header_mismatch, r.read_count,
+			    r.event_count, r.write_count, r.map_count, r.commands_signature, r.first_read_id,
+			    r.first_read_destination, r.first_read_size, r.first_read_offset, r.read_bytes,
+			    r.execution_observed, r.execution_result, r.error_offset, r.submit_result, r.api_kernel_result};
+			for (size_t column = 0; column < values.size(); ++column) {
+				std::fprintf(log, column == 0 ? "%" PRIu64 : ",%" PRIu64, values[column]);
+			}
+			std::fputc('\n', log);
+			if (std::ferror(log) != 0)
+				Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprDiagnosticRowsDropped);
+		}
+	}
+	if (log != nullptr) std::fflush(log);
+}
+
+void PublishLoadingProgress(uint64_t elapsed_ns, std::FILE* log) {
+	const bool plot = tracy::ProfilerAvailable() && TracyIsConnected;
+	if (!plot && log == nullptr) return;
+	if (log != nullptr) std::fprintf(log, "%" PRIu64, elapsed_ns);
+	for (size_t i = 0; i < kLoadingEventCount; ++i) {
+		const auto value = g_loading_events[i].load(std::memory_order_relaxed);
+		if (plot) TracyPlot(kLoadingEventNames[i], static_cast<int64_t>(value));
+		if (log != nullptr) std::fprintf(log, ",%" PRIu64, value);
+	}
+	for (size_t i = 0; i < kLoadingOperationCount; ++i) {
+		const auto& totals = g_loading_operations[i];
+		const auto& names = kLoadingOperationNames[i];
+		const auto started = totals.started.load(std::memory_order_relaxed);
+		const auto completed = totals.completed.load(std::memory_order_relaxed);
+		const auto in_flight = totals.in_flight.load(std::memory_order_relaxed);
+		const auto nanoseconds = totals.nanoseconds.load(std::memory_order_relaxed);
+		if (plot) {
+			TracyPlot(names.started, static_cast<int64_t>(started));
+			TracyPlot(names.completed, static_cast<int64_t>(completed));
+			TracyPlot(names.in_flight, static_cast<int64_t>(in_flight));
+			TracyPlot(names.nanoseconds, static_cast<int64_t>(nanoseconds));
+		}
+		if (log != nullptr) {
+			std::fprintf(log, ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64,
+			             started, completed, in_flight, nanoseconds);
+		}
+	}
+	// Independently atomic fields can straddle operations. The heartbeat terminates a
+	// publication group; it does not turn that group into a transactional snapshot.
+	const auto flips = g_completed_flips.load(std::memory_order_relaxed);
+	if (plot) {
+		TracyPlot("Loading.CompletedFlips.Cumulative", static_cast<int64_t>(flips));
+		TracyPlot("Loading.HeartbeatMilliseconds", static_cast<int64_t>(elapsed_ns / 1000000));
+	}
+	if (log != nullptr) {
+		std::fprintf(log, ",%" PRIu64 "\n", flips);
+		std::fflush(log);
+	}
+}
 
 void RemoveBlock(Profiler::ScopedBlock* block) {
 	auto block_it = std::find(g_block_stack.rbegin(), g_block_stack.rend(), block);
@@ -24,8 +420,8 @@ void RemoveBlock(Profiler::ScopedBlock* block) {
 
 namespace Profiler {
 
-ScopedBlock::ScopedBlock(const tracy::SourceLocationData* source_location) {
-	if (tracy::ProfilerAvailable()) {
+ScopedBlock::ScopedBlock(const tracy::SourceLocationData* source_location, bool active) {
+	if (active && !FramesOnlyEnabled() && tracy::ProfilerAvailable()) {
 		m_zone.emplace(source_location, TRACY_CALLSTACK, true);
 		g_block_stack.push_back(this);
 	}
@@ -43,7 +439,7 @@ void ScopedBlock::End() {
 }
 
 void EndBlock() {
-	if (!g_block_stack.empty()) {
+	if (!FramesOnlyEnabled() && !g_block_stack.empty()) {
 		g_block_stack.back()->End();
 	}
 }
@@ -54,18 +450,245 @@ void SetThreadName(const char* name) {
 	}
 }
 
+bool DetailedEnabled() {
+	if (FramesOnlyEnabled()) {
+		return false;
+	}
+	static const bool enabled = [] {
+		const auto* setting = std::getenv("KYTY_PROFILE_DETAILS");
+		return setting != nullptr && std::strcmp(setting, "1") == 0;
+	}();
+	return enabled;
+}
+
+bool FramesOnlyEnabled() {
+	static const bool enabled = [] {
+		const auto* setting = std::getenv("KYTY_PROFILE_FRAMES_ONLY");
+		return setting != nullptr && std::strcmp(setting, "1") == 0;
+	}();
+	return enabled;
+}
+
+bool AggregateEnabled() {
+	if (!FramesOnlyEnabled()) {
+		return false;
+	}
+	static const bool enabled = [] {
+		const auto* setting = std::getenv("KYTY_PROFILE_AGGREGATES");
+		return setting != nullptr && std::strcmp(setting, "1") == 0;
+	}();
+	return enabled;
+}
+
+void CountFrameWork(FrameWork kind) {
+	if (FramesOnlyEnabled()) {
+		g_frame_work[static_cast<size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void CountFrameEvent(FrameEvent kind, uint64_t amount) {
+	if (AggregateEnabled() && tracy::ProfilerAvailable() && TracyIsConnected) {
+		g_frame_events[static_cast<size_t>(kind)].fetch_add(amount, std::memory_order_relaxed);
+	}
+}
+
+ScopedFrameWait::ScopedFrameWait(FrameWait kind): m_kind(kind) {
+	if (!AggregateEnabled() || !tracy::ProfilerAvailable() || !TracyIsConnected) {
+		return;
+	}
+#ifdef TRACY_ON_DEMAND
+	m_connection = tracy::GetProfiler().ConnectionId();
+#endif
+	m_active = true;
+	m_start_ns = FrameWaitClockNs();
+}
+
+ScopedFrameWait::~ScopedFrameWait() {
+	if (!m_active || !tracy::ProfilerAvailable() || !TracyIsConnected) {
+		return;
+	}
+#ifdef TRACY_ON_DEMAND
+	if (m_connection != tracy::GetProfiler().ConnectionId()) {
+		return;
+	}
+#endif
+	const auto elapsed = FrameWaitClockNs() - m_start_ns;
+	auto& totals = g_frame_waits[static_cast<size_t>(m_kind)];
+	totals.nanoseconds.fetch_add(elapsed, std::memory_order_relaxed);
+	totals.calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PublishFrameWork() {
+	if (!FramesOnlyEnabled()) {
+		return;
+	}
+	const auto flip = g_completed_flips.fetch_add(1, std::memory_order_relaxed) + 1;
+	std::array<uint64_t, kFrameWorkCount> snapshot {};
+	for (size_t i = 0; i < kFrameWorkCount; ++i) {
+		snapshot[i] = g_frame_work[i].load(std::memory_order_relaxed);
+	}
+	// Each category is monotonic, but this is not an atomic cross-category
+	// snapshot. Producer work can straddle the marker and these relaxed loads.
+	if (tracy::ProfilerAvailable()) {
+		for (size_t i = 0; i < kFrameWorkCount; ++i) {
+			TracyPlot(kFrameWorkNames[i], static_cast<int64_t>(snapshot[i]));
+		}
+		if (AggregateEnabled() && TracyIsConnected) {
+			for (size_t i = 0; i < kFrameEventCount; ++i) {
+				const auto count = g_frame_events[i].load(std::memory_order_relaxed);
+				TracyPlot(kFrameEventNames[i], static_cast<int64_t>(count));
+			}
+			// Calls/time are independently atomic, not a cross-thread transaction. A scope
+			// completing at this boundary can split the pair across adjacent samples.
+			// Durations belong to the completion interval, including time before its marker.
+			for (size_t i = 0; i < kFrameWaitCount; ++i) {
+				const auto calls = g_frame_waits[i].calls.load(std::memory_order_relaxed);
+				const auto ns = g_frame_waits[i].nanoseconds.load(std::memory_order_relaxed);
+				TracyPlot(kFrameWaitCallNames[i], static_cast<int64_t>(calls));
+				TracyPlot(kFrameWaitTimeNames[i], static_cast<int64_t>(ns));
+			}
+		}
+		// Written last so the exporter can identify a complete snapshot group.
+		TracyPlot("FrameWork.CompletedFlips.Cumulative", static_cast<int64_t>(flip));
+	}
+}
+
+bool LoadingEnabled() {
+	static const bool enabled = [] {
+		const auto* setting = std::getenv("KYTY_PROFILE_LOADING");
+		return setting != nullptr && std::strcmp(setting, "1") == 0;
+	}();
+	return enabled;
+}
+
+void CountLoadingEvent(LoadingEvent kind, uint64_t amount) {
+	if (LoadingEnabled()) {
+		g_loading_events[static_cast<size_t>(kind)].fetch_add(amount, std::memory_order_relaxed);
+	}
+}
+
+bool BeginLoadingAprSubmission(LoadingAprSubmission* record) {
+	if (!LoadingEnabled() || record == nullptr) return false;
+	const auto sequence = g_loading_apr_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((sequence > 512 && (sequence - 512) % 257 != 0) ||
+	    g_loading_apr_retained.load(std::memory_order_relaxed) >= kLoadingAprMaxRows) {
+		return false;
+	}
+	record->sequence = sequence;
+	record->timestamp_ns = FrameWaitClockNs();
+	return true;
+}
+
+void RecordLoadingAprSubmission(const LoadingAprSubmission& record) {
+	if (!LoadingEnabled()) return;
+	std::scoped_lock lock(g_loading_apr_mutex);
+	if (g_loading_apr_size == kLoadingAprQueueSize ||
+	    g_loading_apr_retained.load(std::memory_order_relaxed) >= kLoadingAprMaxRows) {
+		CountLoadingEvent(LoadingEvent::AprDiagnosticRowsDropped);
+		return;
+	}
+	g_loading_apr_queue[(g_loading_apr_head + g_loading_apr_size) % kLoadingAprQueueSize] = record;
+	++g_loading_apr_size;
+	g_loading_apr_retained.fetch_add(1, std::memory_order_relaxed);
+}
+
+ScopedLoadingOperation::ScopedLoadingOperation(LoadingOperation kind): m_kind(kind) {
+	if (!LoadingEnabled()) return;
+	m_active = true;
+	m_start_ns = FrameWaitClockNs();
+	auto& totals = g_loading_operations[static_cast<size_t>(m_kind)];
+	totals.started.fetch_add(1, std::memory_order_relaxed);
+	totals.in_flight.fetch_add(1, std::memory_order_relaxed);
+}
+
+ScopedLoadingOperation::~ScopedLoadingOperation() {
+	End();
+}
+
+void ScopedLoadingOperation::End() {
+	if (!m_active) return;
+	m_active = false;
+	auto& totals = g_loading_operations[static_cast<size_t>(m_kind)];
+	totals.nanoseconds.fetch_add(FrameWaitClockNs() - m_start_ns, std::memory_order_relaxed);
+	totals.completed.fetch_add(1, std::memory_order_relaxed);
+	totals.in_flight.fetch_sub(1, std::memory_order_relaxed);
+}
+
 void Initialize() {
 	if (Config::ProfilerEnabled() && !tracy::ProfilerAvailable()) {
 		tracy::StartupProfiler();
-		TracySetProgramName("KytyPS5");
+		const auto* cache_policy = std::getenv("KYTY_IMAGE_CACHE_POLICY");
+		const bool pressure_cache = cache_policy != nullptr && std::strcmp(cache_policy, "pressure") == 0;
+		TracySetProgramName(pressure_cache ? "KytyPS5 - B pressure cache" : "KytyPS5 - A exact lookup");
+		const auto* lookup = std::getenv("KYTY_IMAGE_LOOKUP");
+		if (lookup != nullptr && std::strcmp(lookup, "legacy") == 0) {
+			TracySetProgramName(pressure_cache ? "KytyPS5 - B pressure cache, legacy lookup"
+			                                : "KytyPS5 - diagnostic legacy lookup");
+		} else if (lookup != nullptr && std::strcmp(lookup, "verify") == 0) {
+			TracySetProgramName(pressure_cache ? "KytyPS5 - B pressure cache, lookup verification"
+			                                : "KytyPS5 - lookup verification");
+		}
+		const auto* resources = std::getenv("KYTY_RESOURCE_MATERIALIZATION");
+		const auto* submissions = std::getenv("KYTY_SUBMISSION_MODE");
+		if (submissions != nullptr && std::strcmp(submissions, "queued") == 0) {
+			const auto* coalesce = std::getenv("KYTY_SUBMISSION_COALESCE");
+			TracySetProgramName(coalesce != nullptr && std::strcmp(coalesce, "1") == 0
+			                        ? "KytyPS5 - C3 coalesced submissions"
+			                        : "KytyPS5 - B2 queued submissions");
+		} else if (resources != nullptr && std::strcmp(resources, "optimized") == 0) {
+			TracySetProgramName("KytyPS5 - A2 resource preparation");
+		}
 		::printf("Tracy profiler enabled: client %d.%d.%d, protocol %u, "
 		         "broadcast %u, connect to 127.0.0.1:8086\n",
 		         tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch,
 		         tracy::ProtocolVersion, tracy::BroadcastVersion);
+		if (FramesOnlyEnabled()) {
+			::printf("Tracy frame-only profiling enabled (KYTY_PROFILE_FRAMES_ONLY=1); "
+			         "per-call zones and detailed plots disabled\n");
+			if (AggregateEnabled()) {
+				::printf("Tracy aggregate CPU work/wait diagnostics enabled "
+				         "(KYTY_PROFILE_AGGREGATES=1); inclusive timings overlap\n");
+			}
+		} else if (DetailedEnabled()) {
+			::printf("Tracy detailed zones enabled (KYTY_PROFILE_DETAILS=1)\n");
+		}
+	}
+	if (LoadingEnabled() && tracy::ProfilerAvailable() && !g_loading_publisher.joinable()) {
+		try {
+			g_loading_publisher = std::jthread([](std::stop_token stop) {
+				tracy::SetThreadName("Loading diagnostics");
+				const auto start = FrameWaitClockNs();
+				auto log = OpenLoadingLog();
+				auto apr_log = OpenLoadingLog(true);
+				uint32_t log_rows = 0;
+				constexpr uint32_t max_log_rows = 7200;
+				std::unique_lock lock(g_loading_publish_mutex);
+				while (!stop.stop_requested()) {
+					const bool write_log = log != nullptr && std::ferror(log.get()) == 0 &&
+					                       log_rows < max_log_rows;
+					PublishLoadingProgress(FrameWaitClockNs() - start, write_log ? log.get() : nullptr);
+					PublishLoadingAprSubmissions(apr_log.get());
+					if (write_log && ++log_rows == max_log_rows) log.reset();
+					g_loading_publish_condition.wait_for(lock, stop, std::chrono::seconds(1),
+					                                     [] { return false; });
+				}
+				PublishLoadingAprSubmissions(apr_log.get());
+			});
+			::printf("Tracy loading progress diagnostics enabled (KYTY_PROFILE_LOADING=1); "
+			         "independent one-second cumulative snapshots\n");
+		} catch (const std::exception&) {
+			::printf("Loading diagnostics publisher could not start; game startup continues\n");
+		}
 	}
 }
 
 void Shutdown() {
+	// The publisher must finish before Tracy's global state is torn down. Its wait
+	// is interruptible and uses only a private host mutex, never guest/GPU locks.
+	if (g_loading_publisher.joinable()) {
+		g_loading_publisher.request_stop();
+		g_loading_publisher.join();
+	}
 	if (tracy::ProfilerAvailable()) {
 		tracy::ShutdownProfiler();
 	}

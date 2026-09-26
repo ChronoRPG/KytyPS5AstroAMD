@@ -2,6 +2,8 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
+#include "common/rendererBatch.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -123,7 +125,7 @@ void CommandScheduler::Shutdown() {
 		m_operation_state = OperationState::Draining;
 	}
 	if (!m_command.IsInvalid()) {
-		Submit();
+		Submit({}, true);
 	}
 	m_master.Wait(CurrentTick() - 1);
 	PopPendingOperations();
@@ -176,7 +178,7 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 }
 
 void CommandScheduler::FlushAndWait() {
-	const auto tick = Submit();
+	const auto tick = Submit({}, true);
 	m_master.Wait(tick);
 	BeginNext();
 }
@@ -184,7 +186,7 @@ void CommandScheduler::FlushAndWait() {
 void CommandScheduler::Finish() {
 	CheckActive();
 	if (!m_command.IsInvalid()) {
-		Submit();
+		Submit({}, true);
 	}
 	m_master.Wait(CurrentTick() - 1);
 	BeginNext();
@@ -198,7 +200,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
-		const auto submitted_tick = Submit();
+		const auto submitted_tick = Submit({}, true);
 		EXIT_IF(submitted_tick != tick);
 		m_master.Wait(tick);
 		BeginNext();
@@ -208,7 +210,20 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	if (Common::RendererBatchEnabled()) {
+		uint64_t first_tick = 0;
+		{
+			std::lock_guard lock(m_operation_mutex);
+			if (m_pending_operations.empty()) return;
+			first_tick = m_pending_operations.front().tick;
+		}
+		// A callback on the recording tick cannot have completed. Known completed
+		// ticks need no driver query; explicit waits and allocation paths still refresh.
+		if (first_tick >= CurrentTick()) return;
+		if (!m_master.IsFree(first_tick)) m_master.Refresh();
+	} else {
+		m_master.Refresh();
+	}
 	for (;;) {
 		PendingOperation operation;
 		{
@@ -230,6 +245,12 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
+		if (m_graphics.submission_queue.Enabled()) {
+			m_preserve_current_completion = true;
+		}
+		if (Profiler::AggregateEnabled()) {
+			m_diagnostic_generic_completion = true;
+		}
 		m_pending_operations.push({std::move(operation), CurrentTick()});
 		return;
 	}
@@ -244,11 +265,22 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 	operation();
 }
 
-void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+                                             PriorityOperationKind kind) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
+		if (m_graphics.submission_queue.Enabled()) {
+			m_preserve_current_completion = true;
+		}
+		if (Profiler::AggregateEnabled()) {
+			if (kind == PriorityOperationKind::EopInterrupt) {
+				m_diagnostic_eop_completion = true;
+			} else {
+				m_diagnostic_generic_completion = true;
+			}
+		}
 		m_priority_operations.push({std::move(operation), CurrentTick()});
 		lock.unlock();
 		m_operation_available.notify_one();
@@ -343,21 +375,78 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	return m_command;
 }
 
-uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
+	const auto count_boundary = [this, &submit, force_completion] {
+		if (!Profiler::AggregateEnabled()) {
+			return;
+		}
+		// Explicit waits/signals independently prevent native submit coalescing. Include
+		// them as generic obstacles so EopOnly describes the potential optimization scope.
+		// The caller holds m_operation_mutex across this and the submit tick transition.
+		const bool generic = m_diagnostic_generic_completion || force_completion ||
+		                     submit.num_wait_semaphores != 0 || submit.num_signal_semaphores != 0;
+		const auto kind = m_diagnostic_eop_completion
+		                      ? (generic ? Profiler::FrameEvent::SubmitBoundaryEopMixed
+		                                 : Profiler::FrameEvent::SubmitBoundaryEopOnly)
+		                      : (generic ? Profiler::FrameEvent::SubmitBoundaryGeneric
+		                                 : Profiler::FrameEvent::SubmitBoundaryUnprotected);
+		Profiler::CountFrameEvent(kind);
+		m_diagnostic_eop_completion     = false;
+		m_diagnostic_generic_completion = false;
+	};
 
-	m_command.End();
+	{
+		KYTY_PROFILER_DETAIL_BLOCK("CommandScheduler::SubmitEnd");
+		m_command.End();
+	}
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
+	if (graphics.submission_queue.Enabled()) {
+		KYTY_PROFILER_DETAIL_BLOCK("CommandScheduler::QueueDispatch");
+		QueuedSubmission queued {.submit = submit,
+		                         .progress = m_master.GetSubmissionProgress(),
+		                         .master_semaphore = m_master.Handle(),
+		                         .command = buffer,
+		                         .debug_op = m_command.m_debug_op,
+		                         .debug_submit = m_command.m_debug_submit_id,
+		                         .debug_arg0 = m_command.m_debug_arg0,
+		                         .debug_arg1 = m_command.m_debug_arg1,
+		                         .debug_arg2 = m_command.m_debug_arg2,
+		                         .debug_arg3 = m_command.m_debug_arg3,
+		                         .debug_arg4 = m_command.m_debug_arg4};
+		{
+			// The callback runner may already have popped a callback. Record the
+			// boundary at registration, never by inspecting the callback queues here.
+			std::lock_guard lock(m_operation_mutex);
+			count_boundary();
+			queued.tick = m_master.NextTick();
+			queued.submit.AddSignal(m_master.Handle(), queued.tick);
+			queued.preserve_completion = force_completion || m_preserve_current_completion;
+			m_preserve_current_completion = false;
+		}
+		const auto tick = queued.tick;
+		graphics.submission_queue.Enqueue(std::move(queued));
+		m_command.m_buffer = nullptr;
+		return tick;
+	}
+
 	vk::Result result;
 	uint64_t   tick;
 	{
+		KYTY_PROFILER_DETAIL_BLOCK("CommandScheduler::QueueDispatch");
 		Common::LockGuard lock(graphics.queue_mutex);
-		tick = m_master.NextTick();
+		if (Profiler::AggregateEnabled()) {
+			std::lock_guard operation_lock(m_operation_mutex);
+			count_boundary();
+			tick = m_master.NextTick();
+		} else {
+			tick = m_master.NextTick();
+		}
 		submit.AddSignal(m_master.Handle(), tick);
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
@@ -376,7 +465,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		{
+			KYTY_PROFILER_DETAIL_BLOCK("CommandScheduler::DriverSubmit");
+			result = graphics.queue.submit(1, &submit_info, nullptr);
+		}
 	}
 
 	if (result != vk::Result::eSuccess) {
@@ -392,6 +484,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 }
 
 void CommandScheduler::BeginNext() {
+	KYTY_PROFILER_DETAIL_BLOCK("CommandScheduler::BeginNext");
 	CheckActive();
 	BeginCommand();
 }

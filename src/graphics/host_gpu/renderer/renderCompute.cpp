@@ -29,6 +29,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -393,11 +394,47 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// Observe only dispatches that actually reached the native path. This reuses the
+	// already materialized descriptor/value proof and performs no guest-memory reads.
+	if (Profiler::DetailedEnabled() && TracyIsConnected) {
+		ShaderBufferResource fill_descriptor;
+		uint32_t fill_value = 0;
+		uint64_t fill_size = 0;
+		const auto groups_x = use_thread_dimensions ? input_info.dispatch_threads_num[0]
+		                                           : thread_group_x;
+		const auto groups_y = use_thread_dimensions ? input_info.dispatch_threads_num[1]
+		                                           : thread_group_y;
+		const auto groups_z = use_thread_dimensions ? input_info.dispatch_threads_num[2]
+		                                           : thread_group_z;
+		if (ResolveComputeBufferFill(input_info, groups_x, groups_y, groups_z, mode,
+		                             fill_descriptor, fill_value, fill_size)) {
+			KYTY_PROFILER_DETAIL_BLOCK("Compute::UniformFillEligible");
+			static std::atomic<uint32_t> fill_count {0};
+			constexpr uint32_t MaxFillMessages = 4096;
+			const auto ordinal = fill_count.fetch_add(1, std::memory_order_relaxed);
+			if (ordinal < MaxFillMessages) {
+				char text[512];
+				const uint32_t byte = fill_value & 0xffu;
+				const auto written = std::snprintf(
+				    text, sizeof(text),
+				    "COMPUTE_UNIFORM_FILL id=%u shader=0x%" PRIx64 " address=0x%" PRIx64
+				    " bytes=%" PRIu64 " value=0x%08x byte_uniform=%u tick=%" PRIu64,
+				    ordinal + 1u, program.shader_hash, fill_descriptor.Base48(), fill_size,
+				    fill_value, fill_value == byte * 0x01010101u ? 1u : 0u,
+				    m_context.GetCommandScheduler().CurrentTick());
+				if (written > 0 && static_cast<size_t>(written) < sizeof(text)) {
+					TracyMessageS(text, static_cast<size_t>(written), 0);
+				}
+			} else if (ordinal == MaxFillMessages) {
+				TracyMessageLS("COMPUTE_UNIFORM_FILL_LIMIT messages=4096", 0);
+			}
+		}
+	}
 	ResetBindings();
 }
 
@@ -456,7 +493,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                              vk::PipelineStageFlagBits::eTransfer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();

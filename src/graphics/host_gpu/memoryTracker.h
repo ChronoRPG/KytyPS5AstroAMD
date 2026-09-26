@@ -18,7 +18,7 @@ namespace Libs::Graphics {
 
 class MemoryTracker final {
 public:
-	explicit MemoryTracker(PageManager& page_manager);
+	explicit MemoryTracker(PageManager& page_manager, bool track_cpu_mutations = false);
 	~MemoryTracker();
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);
@@ -29,6 +29,11 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// A dirty-state mutation token, not a backing/GPU cleanliness proof. UINT64_MAX means
+	// saturated: callers must conservatively stop reusing any previously observed token.
+	[[nodiscard]] uint64_t CpuMutationEpoch() const noexcept {
+		return m_cpu_mutation_epoch.load(std::memory_order_acquire);
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -44,6 +49,7 @@ public:
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
+				NotifyCpuMutation();
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 				return false;
 			}();
@@ -146,11 +152,14 @@ private:
 
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
+	void           NotifyCpuMutation() noexcept;
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	const bool                                     m_track_cpu_mutations;
+	std::atomic_uint64_t                            m_cpu_mutation_epoch {1};
 };
 
 } // namespace Libs::Graphics

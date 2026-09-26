@@ -11,7 +11,10 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <atomic>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -24,6 +27,13 @@ class TextureCache;
 
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
+
+struct BufferContentRevision {
+	BufferId id;
+	uint64_t write_revision;
+	uint64_t global_epoch;
+	bool operator==(const BufferContentRevision&) const noexcept = default;
+};
 
 class BufferCache {
 public:
@@ -65,10 +75,27 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// A native-buffer revision only: callers must separately rule out newer image ownership.
+	// No buffer is created or synchronized. CPU-dirty and pending-publication ranges have no token.
+	[[nodiscard]] std::optional<BufferContentRevision> GetContentRevision(uint64_t vaddr,
+	                                                                    uint64_t size);
+	// Invalidate retained results before commands whose writes cannot be bounded to one buffer.
+	void InvalidateContentRevisions();
+	// Publications can outlive cache ownership. Registration is on the GPU thread; completion
+	// is on the priority worker, and these queries never wait for GPU work or backing writes.
+	[[nodiscard]] uint64_t BeginBackingPublication(std::span<const GuestRange> ranges,
+	                                               uint64_t tick);
+	void EndBackingPublication(uint64_t token);
+	[[nodiscard]] bool HasPendingBackingPublication(uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] std::optional<uint64_t> PendingBackingPublicationTick(uint64_t vaddr,
+	                                                                  uint64_t size) const;
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
-	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Caller holds the mapped-range lock. Cache/tracker iteration remains on the GPU thread.
+	void               SynchronizeBdaBuffers(const RangeSet& mapped_ranges);
+	// Map/unmap callers may run outside the GPU thread, under the mapped-range lock.
+	void               InvalidateBdaSynchronization() noexcept;
 	void               RunGarbageCollector();
 
 private:
@@ -100,13 +127,30 @@ private:
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
+	struct BdaSyncStats {
+		uint64_t scanned_buffers = 0;
+		uint64_t upload_bytes    = 0;
+		uint64_t upload_copies   = 0;
+	};
+	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSyncStats* stats);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                     bool is_written, bool is_texel_buffer);
+	                                     bool is_written, bool is_texel_buffer,
+	                                     BdaSyncStats* stats = nullptr);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+
+	struct BackingPublication {
+		uint64_t                token;
+		uint64_t                tick;
+		std::vector<GuestRange> ranges;
+	};
+	mutable std::mutex               m_backing_publication_mutex;
+	std::vector<BackingPublication> m_backing_publications;
+	std::atomic<size_t>              m_backing_publication_count {0};
+	uint64_t                        m_next_backing_publication_token = 0;
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -118,7 +162,12 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	const bool                                        m_bda_incremental_sync;
 	MemoryTracker                                     m_memory_tracker;
+	std::atomic_uint64_t                               m_bda_structure_epoch {1};
+	// GPU-thread-only snapshots taken BEFORE the last full scan, never after it.
+	uint64_t                                          m_bda_scanned_cpu_epoch = 0;
+	uint64_t                                          m_bda_scanned_structure_epoch = 0;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
@@ -128,6 +177,7 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	uint64_t m_content_revision_epoch = 1;
 };
 
 } // namespace Libs::Graphics

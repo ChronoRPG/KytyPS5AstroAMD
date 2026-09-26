@@ -1,0 +1,52 @@
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Metadata { uint words[]; } metadata;
+layout(set = 0, binding = 1, std430) writeonly buffer Decision {
+	uvec4 dispatch_args;
+	vec4 color;
+} decision;
+
+layout(push_constant, std430) uniform Push {
+	uint metadata_base_words;
+	uint metadata_words;
+	uint width;
+	uint height;
+	uint clear_groups;
+	uint alpha_msb;
+} params;
+
+shared uint mismatched;
+
+void main() {
+	uint lane = gl_LocalInvocationID.x;
+	if (lane == 0) {
+		mismatched = 0;
+	}
+	barrier();
+
+	uint code = metadata.words[params.metadata_base_words] & 0xffu;
+	bool recognized = code == 0x00u || code == 0x40u || code == 0x80u || code == 0xc0u;
+	uint packed = code * 0x01010101u;
+	bool valid = recognized;
+	for (uint index = lane; index < params.metadata_words; index += 128u) {
+		valid = (metadata.words[params.metadata_base_words + index] == packed) && valid;
+	}
+	if (!valid) {
+		atomicOr(mismatched, 1u);
+	}
+	barrier();
+
+	if (lane == 0) {
+		bool accepted = mismatched == 0;
+		decision.dispatch_args = uvec4(accepted ? params.clear_groups : 0u, 1u, 1u, 0u);
+		float rgb = (code & 0x80u) != 0 ? 1.0 : 0.0;
+		float alpha = (code & 0x40u) != 0 ? 1.0 : 0.0;
+		vec4 color = vec4(rgb, rgb, rgb, alpha);
+		if (params.alpha_msb == 0) {
+			color = color.wyzx;
+		}
+		decision.color = accepted ? color : vec4(0.0);
+	}
+}

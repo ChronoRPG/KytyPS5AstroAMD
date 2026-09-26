@@ -2,9 +2,12 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MASTERSEMAPHORE_H_
 
 #include "common/common.h"
+#include "graphics/host_gpu/queueSubmission.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <atomic>
+#include <memory>
 
 namespace Libs::Graphics {
 
@@ -20,13 +23,22 @@ public:
 		return m_current_tick.load(std::memory_order_acquire);
 	}
 	[[nodiscard]] uint64_t KnownGpuTick() const noexcept {
-		return m_gpu_tick.load(std::memory_order_acquire);
+		// In queued mode the GPU can finish before the host driver returns. Every
+		// resource-retirement caller must also wait for that host call to finish.
+		const auto gpu_tick = m_gpu_tick.load(std::memory_order_acquire);
+		return m_submission_progress
+		           ? std::min(gpu_tick, m_submission_progress->dispatched_tick.load(
+		                                    std::memory_order_acquire))
+		           : gpu_tick;
 	}
 	[[nodiscard]] bool     IsFree(uint64_t tick) const noexcept { return KnownGpuTick() >= tick; }
 	[[nodiscard]] uint64_t NextTick() noexcept {
 		return m_current_tick.fetch_add(1, std::memory_order_release);
 	}
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
+	[[nodiscard]] const std::shared_ptr<SubmissionProgress>& GetSubmissionProgress() const noexcept {
+		return m_submission_progress;
+	}
 
 	void Refresh();
 	void Wait(uint64_t tick);
@@ -36,6 +48,7 @@ private:
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
+	std::shared_ptr<SubmissionProgress> m_submission_progress;
 };
 
 } // namespace Libs::Graphics

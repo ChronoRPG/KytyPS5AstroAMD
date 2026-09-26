@@ -25,7 +25,7 @@ namespace Profiler {
 
 class ScopedBlock {
 public:
-	explicit ScopedBlock(const tracy::SourceLocationData* source_location);
+	explicit ScopedBlock(const tracy::SourceLocationData* source_location, bool active = true);
 	ScopedBlock(const ScopedBlock&)            = delete;
 	ScopedBlock& operator=(const ScopedBlock&) = delete;
 	ScopedBlock(ScopedBlock&&)                 = delete;
@@ -40,6 +40,254 @@ private:
 
 void EndBlock();
 void SetThreadName(const char* name);
+// Opt in before launching with KYTY_PROFILE_DETAILS=1. High-frequency nested
+// zones remain disabled for measurements comparable to the normal instrumentation.
+[[nodiscard]] bool DetailedEnabled();
+// Keep frame markers and aggregate workload counters, without per-call zones.
+// Set KYTY_PROFILE_FRAMES_ONLY=1 before launching; it overrides detailed profiling.
+[[nodiscard]] bool FramesOnlyEnabled();
+// Additional diagnostic counters/timers; requires KYTY_PROFILE_AGGREGATES=1 and frame-only
+// mode. Collection separately requires a connected profiler. Keep off for performance runs.
+[[nodiscard]] bool AggregateEnabled();
+
+enum class FrameWork : uint32_t {
+	DrawIndex,
+	DrawAuto,
+	DrawIndirectCommands,
+	DrawIndirectMultiCommands,
+	DispatchDirectCommands,
+	DispatchIndirectCommands,
+	Count,
+};
+
+// DrawIndex/DrawAuto include expanded indirect draws. The command categories
+// describe their origins and must not be added to those renderer-call totals.
+void CountFrameWork(FrameWork kind);
+
+// The first four categories are mutually exclusive per original scheduler submission,
+// not per driver call or merged VkSubmitInfo. Generic also includes forced completion
+// and caller-supplied wait/signal semaphores. Remaining categories count separate work.
+enum class FrameEvent : uint32_t {
+	SubmitBoundaryUnprotected,
+	SubmitBoundaryEopOnly,
+	SubmitBoundaryEopMixed,
+	SubmitBoundaryGeneric,
+	MeshDraws,
+	MeshRestartEnabledDraws,
+	MeshInputIndices,
+	MeshWorkgroups,
+	ShaderProgramsCreated,
+	GraphicsPipelinesCreated,
+	SrtProbeHits,
+	SrtProbeMisses,
+	SrtProbeBytes,
+	SrtProbeBatchHits,
+	ResourceReuseHits,
+	ResourceReuseMisses,
+	ResourceReuseValidationBytes,
+	ResourceReuseRejectedCaptures,
+	SrtRecipeSessions,
+	SrtRecipeCompiledNodes,
+	SrtRecipeFallbackNodes,
+	SrtRecipeMemoHits,
+	SrtTapeExecutions,
+	SrtTapeOperations,
+	SrtTapeBoundaryCalls,
+	BdaSyncPasses,
+	BdaSyncSkips,
+	BdaSyncScannedBuffers,
+	BdaSyncUploadBytes,
+	BdaSyncUploadCopies,
+	ShaderHeaderProbeHits,
+	ShaderHeaderProbeMisses,
+	VertexMetadataProbeHits,
+	VertexMetadataProbeMisses,
+	NativeImagePoolHits,
+	NativeImagePoolMisses,
+	NativeImagePoolRetires,
+	NativeImagePoolAddedBytes,
+	NativeImagePoolRemovedBytes,
+	TextureCleanProofHits,
+	TextureCleanProofMisses,
+	TextureCleanProofStores,
+	ResourceCacheKeyMatches,
+	ResourceCacheBackingRejects,
+	ResourceCacheHistoryHits,
+	ResourceCacheBudgetRejects,
+	ResourceCachePermutationHits,
+	SrtSharedCleanMemoHits,
+	UploadReservationsOutsideLocks,
+	ShaderUploadReuseHits,
+	ShaderUploadReuseMisses,
+	ShaderUploadBytesAvoided,
+	TextureDescriptionHits,
+	TextureDescriptionMisses,
+	PipelineBindsAvoided,
+	DescriptorPushesAvoided,
+	PredicatedPackets,
+	PredicatedPacketsSkipped,
+	OcclusionPredicates,
+	OcclusionPredicatesPending,
+	OcclusionCounterDumps,
+	NativeOcclusionScopes,
+	NativeOcclusionDumps,
+	NativeOcclusionReductions,
+	MeshRestartMarkers,
+	MeshRestartSegments,
+	Count,
+};
+void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
+
+enum class FrameWait : uint32_t {
+	ReadMemory,
+	ShaderReadiness,
+	DccFallback,
+	ResourceMaterialization,
+	DriverSubmit,
+	ShaderProgramMiss,
+	GraphicsPipelineCreate,
+	ResourceReuseValidation,
+	NativeImageCreate,
+	NativeImageDestroy,
+	Count,
+};
+
+// Aggregate inclusive CPU work/wait durations, not GPU time or an additive frame budget.
+// ReadMemory may nest within DCC fallback, shader readiness or resource materialization,
+// and may itself be reentrant. DriverSubmit can overlap renderer work on another thread.
+// ShaderProgramMiss includes translation and may nest resource materialization; it counts
+// miss attempts/retries. ShaderProgramsCreated separately counts compiled permutations.
+// GraphicsPipelineCreate excludes cache hits and includes native layout/pipeline setup.
+// Completed scopes contribute only while connected with aggregate diagnostics enabled. Scopes
+// spanning an on-demand connection change are omitted; no per-call zones are emitted.
+class ScopedFrameWait {
+public:
+	explicit ScopedFrameWait(FrameWait kind);
+	ScopedFrameWait(const ScopedFrameWait&) = delete;
+	ScopedFrameWait& operator=(const ScopedFrameWait&) = delete;
+	ScopedFrameWait(ScopedFrameWait&&) = delete;
+	ScopedFrameWait& operator=(ScopedFrameWait&&) = delete;
+	~ScopedFrameWait();
+
+private:
+	FrameWait m_kind;
+	uint64_t m_start_ns = 0;
+	uint64_t m_connection = 0;
+	bool m_active = false;
+};
+
+// Call immediately after the existing completed guest-flip marker. Snapshots
+// include workload and wait totals, and are cumulative so an on-demand connection
+// can discard its first sample. Independently atomic values can straddle a flip.
+void PublishFrameWork();
+
+// Opt-in loading diagnostics collected even before a Tracy client connects. A separate
+// host thread publishes cumulative totals once a second, independently of guest flips.
+[[nodiscard]] bool LoadingEnabled();
+enum class LoadingEvent : uint32_t {
+	AprRecordsCompleted,
+	AprRequestedBytes,
+	AprHostReadBytes,
+	AprGuestCopiedBytes,
+	AprErrors,
+	AprShortReads,
+	AmmErrors,
+	PreadRequestedBytes,
+	PreadReadBytes,
+	PreadErrors,
+	LodStatsPackets,
+	LodStatsBufferBytes,
+	LodStatsReportAndResetPackets,
+	LodStatsForceResetPackets,
+	LodStatsResetCountSum,
+	LodStatsInterval100kSum,
+	LodStatsCachePolicySum,
+	DirectMemorySizeQueries,
+	DirectMemoryAvailableQueries,
+	DirectMemoryAvailableSuccesses,
+	DirectMemoryAvailableBytesSum,
+	PageTableStatsQueries,
+	PageTableStatsSuccesses,
+	PageTableCpuAvailableSum,
+	PageTableGpuAvailableSum,
+	PageTableCpuZeroAvailable,
+	PageTableGpuZeroAvailable,
+	FlexibleAvailableQueries,
+	FlexibleAvailableSuccesses,
+	FlexibleAvailableBytesSum,
+	MemoryPoolStatsQueries,
+	MemoryPoolAvailableBytesSum,
+	AmmUsageStatsQueries,
+	AmmOccupancyThresholdCalls,
+	AmmOccupancyThresholdSum,
+	AprReadCommandsAppended,
+	AprCommandResets,
+	AprCommandBufferSets,
+	AprCommandBufferClears,
+	AprSubmitAndGetResult,
+	AprSubmitPlain,
+	AprSubmitAndGetId,
+	AprWaitCompleted,
+	AprWaitUnknownId,
+	AprUnsupportedWaitCommands,
+	AprUnsupportedCounterCommands,
+	AprDiagnosticRowsDropped,
+	Count,
+};
+void CountLoadingEvent(LoadingEvent kind, uint64_t amount = 1);
+
+// Request metadata only: no asset contents or faulting guest reads. The first 512
+// submissions and every 257th thereafter are eligible, up to 8192 queued rows per
+// process. The independent loading publisher drains the bounded queue to a CSV.
+struct LoadingAprSubmission {
+	uint64_t sequence = 0, timestamp_ns = 0, api_kind = 0;
+	uint64_t command_buffer = 0, argument1 = 0, argument2 = 0;
+	uint64_t result_address = 0, out_id_address = 0, submission_id = 0;
+	uint64_t resolved_object = 0, generation = 0, append_serial = 0;
+	uint64_t submits_in_generation = 0, unchanged_submits = 0;
+	uint64_t cached_buffer = 0, cached_size = 0, cached_offset = 0;
+	uint64_t header_valid = 0, header_buffer = 0, header_size = 0, header_offset = 0;
+	uint64_t header_commands = 0, header_type = 0, header_mismatch = 0;
+	uint64_t read_count = 0, event_count = 0, write_count = 0, map_count = 0;
+	uint64_t commands_signature = 0, first_read_id = 0, first_read_destination = 0;
+	uint64_t first_read_size = 0, first_read_offset = 0, read_bytes = 0;
+	uint64_t execution_observed = 0, execution_result = 0, error_offset = 0;
+	uint64_t submit_result = 0, api_kernel_result = 0;
+};
+[[nodiscard]] bool BeginLoadingAprSubmission(LoadingAprSubmission* record);
+void RecordLoadingAprSubmission(const LoadingAprSubmission& record);
+
+enum class LoadingOperation : uint32_t {
+	AprSubmit,
+	AprRead,
+	AprHostRead,
+	AprGuestCopy,
+	AmmMap,
+	AmmUnmap,
+	Pread,
+	PreadFileMutex,
+	PreadCoherence,
+	PreadNativeRead,
+	Count,
+};
+
+// Completed means the scope returned, including errors. Durations are inclusive,
+// may overlap across threads/nested scopes, and become visible only on completion.
+class ScopedLoadingOperation {
+public:
+	explicit ScopedLoadingOperation(LoadingOperation kind);
+	ScopedLoadingOperation(const ScopedLoadingOperation&) = delete;
+	ScopedLoadingOperation& operator=(const ScopedLoadingOperation&) = delete;
+	ScopedLoadingOperation(ScopedLoadingOperation&&) = delete;
+	ScopedLoadingOperation& operator=(ScopedLoadingOperation&&) = delete;
+	~ScopedLoadingOperation();
+	void End();
+
+private:
+	LoadingOperation m_kind;
+	uint64_t m_start_ns = 0;
+	bool m_active = false;
+};
 
 void Initialize();
 void Shutdown();
@@ -60,23 +308,28 @@ struct Lifecycle {
 #define KYTY_PROFILER_COLOR_OR_DEFAULT_IMPL(default_color, color, ...) color
 
 #define KYTY_PROFILER_BLOCK(name, ...)                                                             \
-	KYTY_PROFILER_BLOCK_IMPL(__LINE__, name __VA_OPT__(, ) __VA_ARGS__)
-#define KYTY_PROFILER_BLOCK_IMPL(line, name, ...)                                                  \
+	KYTY_PROFILER_BLOCK_IMPL(__LINE__, true, name __VA_OPT__(, ) __VA_ARGS__)
+#define KYTY_PROFILER_DETAIL_BLOCK(name, ...)                                                      \
+	KYTY_PROFILER_BLOCK_IMPL(__LINE__, Profiler::DetailedEnabled(), name __VA_OPT__(, ) __VA_ARGS__)
+#define KYTY_PROFILER_BLOCK_IMPL(line, active, name, ...)                                          \
 	static constexpr tracy::SourceLocationData KYTY_PROFILER_CONCAT(                               \
 	    kyty_profiler_source_location_, line) {name, TracyFunction, TracyFile,                     \
 	                                           static_cast<uint32_t>(line),                        \
 	                                           KYTY_PROFILER_COLOR_OR_DEFAULT(0, __VA_ARGS__)};    \
 	Profiler::ScopedBlock KYTY_PROFILER_CONCAT(kyty_profiler_block_, line)(                        \
-	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line))
+	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line), active)
 
-#define KYTY_PROFILER_FUNCTION(...) KYTY_PROFILER_FUNCTION_IMPL(__LINE__ __VA_OPT__(, ) __VA_ARGS__)
-#define KYTY_PROFILER_FUNCTION_IMPL(line, ...)                                                     \
+#define KYTY_PROFILER_FUNCTION(...)                                                               \
+	KYTY_PROFILER_FUNCTION_IMPL(__LINE__, true __VA_OPT__(, ) __VA_ARGS__)
+#define KYTY_PROFILER_DETAIL_FUNCTION(...)                                                        \
+	KYTY_PROFILER_FUNCTION_IMPL(__LINE__, Profiler::DetailedEnabled() __VA_OPT__(, ) __VA_ARGS__)
+#define KYTY_PROFILER_FUNCTION_IMPL(line, active, ...)                                             \
 	static constexpr tracy::SourceLocationData KYTY_PROFILER_CONCAT(                               \
 	    kyty_profiler_source_location_, line) {nullptr, TracyFunction, TracyFile,                  \
 	                                           static_cast<uint32_t>(line),                        \
 	                                           KYTY_PROFILER_COLOR_OR_DEFAULT(0, __VA_ARGS__)};    \
 	Profiler::ScopedBlock KYTY_PROFILER_CONCAT(kyty_profiler_block_, line)(                        \
-	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line))
+	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line), active)
 
 #define KYTY_PROFILER_END_BLOCK Profiler::EndBlock()
 

@@ -6,6 +6,9 @@
 namespace Libs::Graphics {
 
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
+	if (graphics.submission_queue.Enabled()) {
+		m_submission_progress = std::make_shared<SubmissionProgress>();
+	}
 	vk::SemaphoreTypeCreateInfo type_info {};
 	type_info.semaphoreType = vk::SemaphoreType::eTimeline;
 	type_info.initialValue  = 0;
@@ -36,6 +39,13 @@ void MasterSemaphore::Refresh() {
 }
 
 void MasterSemaphore::Wait(uint64_t tick) {
+	if (m_submission_progress) {
+		auto submitted = m_submission_progress->dispatched_tick.load(std::memory_order_acquire);
+		while (submitted < tick) {
+			m_submission_progress->dispatched_tick.wait(submitted, std::memory_order_acquire);
+			submitted = m_submission_progress->dispatched_tick.load(std::memory_order_acquire);
+		}
+	}
 	if (IsFree(tick)) {
 		return;
 	}

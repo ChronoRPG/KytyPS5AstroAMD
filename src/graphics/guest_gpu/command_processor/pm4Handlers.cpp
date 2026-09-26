@@ -317,6 +317,10 @@ static void HwCtxSetDepthBoundsRegister(CommandProcessor& cp, uint32_t cmd_offse
 
 static void HwCtxSetDepthMetadataRegister(CommandProcessor& cp, uint32_t cmd_offset,
                                          uint32_t value) {
+	if (cmd_offset == Pm4::DB_COUNT_CONTROL) {
+		cp.GetCtx().SetDepthCountControl(value);
+		return;
+	}
 	if (cmd_offset == Pm4::DB_RENDER_OVERRIDE) {
 		HW::DepthRenderOverride control;
 		control.force_z_valid       = (value & 0x20000000u) != 0;
@@ -1311,6 +1315,7 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 
 KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 	KYTY_PROFILER_FUNCTION();
+	Profiler::CountFrameWork(Profiler::FrameWork::DispatchDirectCommands);
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_DISPATCH_DIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
@@ -1327,6 +1332,7 @@ KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 
 KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 	KYTY_PROFILER_FUNCTION();
+	Profiler::CountFrameWork(Profiler::FrameWork::DispatchIndirectCommands);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0011600 && cmd_id != 0xc0021600);
 
@@ -1346,6 +1352,21 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0038e00);
+	if (Profiler::LoadingEnabled()) {
+		const auto control = buffer[3];
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::LodStatsPackets);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::LodStatsBufferBytes, buffer[0]);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::LodStatsReportAndResetPackets,
+		                            (control >> 19u) & 1u);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::LodStatsForceResetPackets,
+		                            (control >> 18u) & 1u);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::LodStatsResetCountSum,
+		                            (control >> 10u) & 0xffu);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::LodStatsInterval100kSum,
+		                            (control >> 2u) & 0xffu);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::LodStatsCachePolicySum,
+		                            (control >> 28u) & 3u);
+	}
 
 	const auto buffer_size = buffer[0];
 	auto*      dst         = reinterpret_cast<void*>((buffer[1] & 0xffffffc0u) |
@@ -1636,6 +1657,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 
 KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	KYTY_PROFILER_FUNCTION();
+	Profiler::CountFrameWork(Profiler::FrameWork::DrawIndirectCommands);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0032400 && cmd_id != 0xc0032500);
 
@@ -1650,6 +1672,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 
 KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	KYTY_PROFILER_FUNCTION();
+	Profiler::CountFrameWork(Profiler::FrameWork::DrawIndirectMultiCommands);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0082c00 && cmd_id != 0xc0083800);
 
