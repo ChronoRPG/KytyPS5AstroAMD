@@ -599,10 +599,21 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_index_type_uint8.pNext = supported_features2.pNext;
 		supported_features2.pNext        = &supported_index_type_uint8;
 	}
+	const bool maintenance8_extension =
+	    HasExtension(device_extensions, VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+	vk::PhysicalDeviceMaintenance8FeaturesKHR supported_maintenance8 {};
+	if (maintenance8_extension) {
+		supported_maintenance8.pNext = supported_features2.pNext;
+		supported_features2.pNext    = &supported_maintenance8;
+	}
 	vk::PhysicalDeviceVulkan12Features supported_features12 {};
 	supported_features12.pNext = supported_features2.pNext;
 	supported_features2.pNext  = &supported_features12;
 	physical_device.getFeatures2(&supported_features2);
+	graphics.maintenance8_enabled =
+	    maintenance8_extension && supported_maintenance8.maintenance8 == VK_TRUE;
+	LOGF("Vulkan maintenance8 (depth/color image copies): %s\n",
+	     graphics.maintenance8_enabled ? "true" : "false");
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
 	// Optional: native indirect draws fall back to CPU-read arguments without these.
 	graphics.draw_indirect_first_instance_enabled =
@@ -748,6 +759,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		index_type_uint8.indexTypeUint8 = VK_TRUE;
 		index_type_uint8.pNext          = const_cast<void*>(create_info.pNext);
 		create_info.pNext               = &index_type_uint8;
+	}
+	vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8 {};
+	if (graphics.maintenance8_enabled) {
+		maintenance8.maintenance8 = VK_TRUE;
+		maintenance8.pNext        = const_cast<void*>(create_info.pNext);
+		create_info.pNext         = &maintenance8;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1123,6 +1140,16 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME);
 		} else if (HasExtension(available_extensions, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME);
+		}
+		// Direct depth <-> color image copies (texture-cache reinterpretation without a staging
+		// buffer). KYTY_DIRECT_IMAGE_COPY=0 or KYTY_DIRECT_IMAGE_COPY_M8=0 leaves it disabled.
+		if (HasExtension(available_extensions, VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
+			const auto* all = std::getenv("KYTY_DIRECT_IMAGE_COPY");
+			const auto* m8  = std::getenv("KYTY_DIRECT_IMAGE_COPY_M8");
+			if ((all == nullptr || std::strcmp(all, "0") != 0) &&
+			    (m8 == nullptr || std::strcmp(m8, "0") != 0)) {
+				device_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+			}
 		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {

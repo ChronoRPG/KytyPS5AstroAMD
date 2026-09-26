@@ -64,6 +64,16 @@ public:
 	}
 	void MarkGpuWritten(ImageId id);
 
+	// Content identity around an attachment binding (see Image::ContentSerial). Take a mark
+	// before FindDepthTarget; once the draw is known not to write the attachment, restoring it
+	// keeps the image's serial when nothing else (upload, copy, clear) wrote the image meanwhile.
+	struct ContentMark {
+		uint64_t serial          = 0;
+		uint64_t definite_writes = 0;
+	};
+	[[nodiscard]] ContentMark MarkContent(ImageId id);
+	void                      RestoreContentIfUnwritten(ImageId id, const ContentMark& mark);
+
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
@@ -183,7 +193,12 @@ private:
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
-	void               CopyImage(ImageId destination, ImageId source);
+	// Depth <-> color reinterpretation without a staging buffer (VK_KHR_maintenance8 copy or a
+	// one-pass shader). Returns the path name, or nullptr when nothing was recorded.
+	[[nodiscard]] const char* TryDirectReinterpret(Image& destination, Image& source);
+	// Returns true when the destination's copied subresources now hold exactly the source's
+	// native bits for every subresource of both images (same shape, lossless path).
+	bool CopyImage(ImageId destination, ImageId source, const char* context = "other");
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;

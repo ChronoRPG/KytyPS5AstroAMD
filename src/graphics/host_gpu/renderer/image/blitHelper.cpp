@@ -1,16 +1,20 @@
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 
 #include "common/assert.h"
+#include "gpu_blit_shaders/gpu_blit_color32_to_depth_spv.h"
 #include "gpu_blit_shaders/gpu_blit_color_to_ms_depth_spv.h"
+#include "gpu_blit_shaders/gpu_blit_depth_to_color32_spv.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
 #include <array>
+#include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
 
@@ -39,11 +43,84 @@ BlitHelper::BlitHelper(GraphicContext& graphics, CommandScheduler& scheduler)
 
 	m_vertex_shader   = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, m_graphics.device);
 	m_fragment_shader = CompileSPV(GPU_BLIT_COLOR_TO_MS_DEPTH_SPV, m_graphics.device);
+
+	// Depth <-> 32-bit color reinterpretation passes.
+	const auto& limits  = m_graphics.physical_device_properties.limits;
+	const auto  r32uint = m_graphics.GetFormatProperties(vk::Format::eR32Uint);
+	m_reinterpret_supported =
+	    m_graphics.max_push_descriptors >= 2 &&
+	    limits.maxPushConstantsSize >= sizeof(DepthToColorPush) &&
+	    static_cast<bool>(r32uint.optimalTilingFeatures & vk::FormatFeatureFlagBits::eStorageImage);
+	if (!m_reinterpret_supported) {
+		return;
+	}
+
+	const std::array<vk::DescriptorSetLayoutBinding, 2> d2c_bindings {{
+	    {0, vk::DescriptorType::eSampledImage, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	    {1, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	}};
+	descriptor_info.bindingCount = static_cast<uint32_t>(d2c_bindings.size());
+	descriptor_info.pBindings    = d2c_bindings.data();
+	RequireVulkanSuccess(m_graphics.device.createDescriptorSetLayout(&descriptor_info, nullptr,
+	                                                                 &m_d2c_descriptor_layout),
+	                     "create depth-to-color descriptor layout");
+	const vk::PushConstantRange d2c_push {vk::ShaderStageFlagBits::eCompute, 0,
+	                                      sizeof(DepthToColorPush)};
+	layout_info.pSetLayouts            = &m_d2c_descriptor_layout;
+	layout_info.pushConstantRangeCount = 1;
+	layout_info.pPushConstantRanges    = &d2c_push;
+	RequireVulkanSuccess(
+	    m_graphics.device.createPipelineLayout(&layout_info, nullptr, &m_d2c_pipeline_layout),
+	    "create depth-to-color pipeline layout");
+	{
+		const auto module = CompileSPV(GPU_BLIT_DEPTH_TO_COLOR32_SPV, m_graphics.device);
+		vk::ComputePipelineCreateInfo create {};
+		create.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		create.stage.module = module;
+		create.stage.pName  = "main";
+		create.layout       = m_d2c_pipeline_layout;
+		const auto result   = m_graphics.device.createComputePipelines(nullptr, 1, &create, nullptr,
+		                                                               &m_d2c_pipeline);
+		m_graphics.device.destroyShaderModule(module, nullptr);
+		RequireVulkanSuccess(result, "create depth-to-color pipeline");
+	}
+
+	const vk::DescriptorSetLayoutBinding c2d_binding {
+	    0, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eFragment, nullptr};
+	descriptor_info.bindingCount = 1;
+	descriptor_info.pBindings    = &c2d_binding;
+	RequireVulkanSuccess(m_graphics.device.createDescriptorSetLayout(&descriptor_info, nullptr,
+	                                                                 &m_c2d_descriptor_layout),
+	                     "create color-to-depth descriptor layout");
+	const vk::PushConstantRange c2d_push {vk::ShaderStageFlagBits::eFragment, 0,
+	                                      sizeof(ColorToDepthPush)};
+	layout_info.pSetLayouts         = &m_c2d_descriptor_layout;
+	layout_info.pPushConstantRanges = &c2d_push;
+	RequireVulkanSuccess(
+	    m_graphics.device.createPipelineLayout(&layout_info, nullptr, &m_c2d_pipeline_layout),
+	    "create color-to-depth pipeline layout");
+	m_c2d_fragment_shader = CompileSPV(GPU_BLIT_COLOR32_TO_DEPTH_SPV, m_graphics.device);
 }
 
 BlitHelper::~BlitHelper() {
 	for (const auto& pipeline: m_pipelines) {
 		m_graphics.device.destroyPipeline(pipeline.handle, nullptr);
+	}
+	if (m_d2c_pipeline != nullptr) {
+		m_graphics.device.destroyPipeline(m_d2c_pipeline, nullptr);
+	}
+	for (auto* layout: {&m_d2c_pipeline_layout, &m_c2d_pipeline_layout}) {
+		if (*layout != nullptr) {
+			m_graphics.device.destroyPipelineLayout(*layout, nullptr);
+		}
+	}
+	for (auto* layout: {&m_d2c_descriptor_layout, &m_c2d_descriptor_layout}) {
+		if (*layout != nullptr) {
+			m_graphics.device.destroyDescriptorSetLayout(*layout, nullptr);
+		}
+	}
+	if (m_c2d_fragment_shader != nullptr) {
+		m_graphics.device.destroyShaderModule(m_c2d_fragment_shader, nullptr);
 	}
 	if (m_fragment_shader != nullptr) {
 		m_graphics.device.destroyShaderModule(m_fragment_shader, nullptr);
@@ -72,8 +149,10 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 	stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
 	stages[0].module = m_vertex_shader;
 	stages[0].pName  = "main";
+	const bool color32 = key.kind == PipelineKind::Color32ToDepth;
+	EXIT_IF(color32 && m_c2d_fragment_shader == nullptr);
 	stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
-	stages[1].module = m_fragment_shader;
+	stages[1].module = color32 ? m_c2d_fragment_shader : m_fragment_shader;
 	stages[1].pName  = "main";
 
 	vk::PipelineVertexInputStateCreateInfo vertex_input {};
@@ -111,7 +190,7 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 	create.pDepthStencilState  = &depth;
 	create.pColorBlendState    = &color_blend;
 	create.pDynamicState       = &dynamic;
-	create.layout              = m_pipeline_layout;
+	create.layout              = color32 ? m_c2d_pipeline_layout : m_pipeline_layout;
 
 	vk::Pipeline pipeline = nullptr;
 	RequireVulkanSuccess(
@@ -134,6 +213,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	        source_info.extent.height != destination_info.extent.height ||
 	        source_info.extent.depth != 1 || destination_info.extent.depth != 1 ||
 	        source.backing.image == nullptr || destination.backing.image == nullptr);
+	destination.NoteContentWrite();
 	m_scheduler.EndRendering();
 
 	ImageViewInfo source_view_info {};
@@ -195,6 +275,182 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	command.setScissor(0, 1, &scissor);
 	command.draw(3, 1, 0, 0);
 	command.endRendering();
+}
+
+namespace {
+
+[[nodiscard]] bool SameBaseExtent2D(const Image& a, const Image& b) {
+	return a.backing.extent.width == b.backing.extent.width &&
+	       a.backing.extent.height == b.backing.extent.height;
+}
+
+[[nodiscard]] bool SingleSample2D(const Image& image) {
+	return image.backing.image != nullptr && image.backing.image_type == vk::ImageType::e2D &&
+	       image.backing.samples == 1 && image.backing.extent.depth == 1 &&
+	       image.backing.mip_levels != 0 && image.backing.layers != 0;
+}
+
+} // namespace
+
+bool BlitHelper::SupportsColor32Side(const Image& color) const {
+	const auto format = color.backing.format;
+	return SingleSample2D(color) && DepthAspectTransferFormat(format) == vk::Format::eUndefined &&
+	       !color.info.IsBlock() && vk::blockSize(format) == 4 &&
+	       ImageViewOps::FormatsCompatible(format, vk::Format::eR32Uint) &&
+	       static_cast<bool>(color.backing.usage & vk::ImageUsageFlagBits::eStorage) &&
+	       (format == vk::Format::eR32Uint ||
+	        static_cast<bool>(color.backing.flags & vk::ImageCreateFlagBits::eMutableFormat));
+}
+
+bool BlitHelper::SupportsDepthToColor32(const Image& source, const Image& destination) const {
+	return m_reinterpret_supported && SingleSample2D(source) &&
+	       DepthAspectTransferFormat(source.backing.format) == vk::Format::eD32Sfloat &&
+	       static_cast<bool>(source.backing.usage & vk::ImageUsageFlagBits::eSampled) &&
+	       SupportsColor32Side(destination) && SameBaseExtent2D(source, destination);
+}
+
+bool BlitHelper::SupportsColor32ToDepth(const Image& source, const Image& destination) const {
+	// Depth-only destination: a depth/stencil attachment view must cover both aspects.
+	return m_reinterpret_supported && SingleSample2D(destination) &&
+	       destination.backing.format == vk::Format::eD32Sfloat &&
+	       static_cast<bool>(destination.backing.usage &
+	                         vk::ImageUsageFlagBits::eDepthStencilAttachment) &&
+	       SupportsColor32Side(source) && SameBaseExtent2D(source, destination);
+}
+
+void BlitHelper::CopyDepthToColor32(Image& source, Image& destination) {
+	KYTY_GPU_OP_SITE("image.reinterpret_depth_to_color");
+	EXIT_IF(!SupportsDepthToColor32(source, destination));
+	const uint32_t levels = std::min(source.backing.mip_levels, destination.backing.mip_levels);
+	const uint32_t layers = std::min(source.backing.layers, destination.backing.layers);
+	destination.NoteContentWrite();
+	m_scheduler.EndRendering();
+
+	ImageViewInfo source_view_info {};
+	source_view_info.format      = source.backing.format;
+	source_view_info.type        = vk::ImageViewType::e2DArray;
+	source_view_info.aspect      = vk::ImageAspectFlagBits::eDepth;
+	source_view_info.level_count = levels;
+	source_view_info.layer_count = layers;
+	source_view_info.usage       = vk::ImageUsageFlagBits::eSampled;
+	const auto source_view       = source.FindView(source_view_info);
+
+	auto& command_buffer = m_scheduler.Current();
+	auto  command        = command_buffer.Handle();
+	source.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
+	               command);
+	destination.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, {}, command);
+	command_buffer.BindPipeline(vk::PipelineBindPoint::eCompute, m_d2c_pipeline);
+	for (uint32_t level = 0; level < levels; level++) {
+		ImageViewInfo destination_view_info {};
+		destination_view_info.format      = vk::Format::eR32Uint;
+		destination_view_info.type        = vk::ImageViewType::e2DArray;
+		destination_view_info.aspect      = vk::ImageAspectFlagBits::eColor;
+		destination_view_info.base_level  = level;
+		destination_view_info.level_count = 1;
+		destination_view_info.layer_count = layers;
+		destination_view_info.usage       = vk::ImageUsageFlagBits::eStorage;
+		const auto destination_view       = destination.FindView(destination_view_info);
+
+		const vk::DescriptorImageInfo source_image {nullptr, source_view,
+		                                            vk::ImageLayout::eShaderReadOnlyOptimal};
+		const vk::DescriptorImageInfo destination_image {nullptr, destination_view,
+		                                                 vk::ImageLayout::eGeneral};
+		std::array<vk::WriteDescriptorSet, 2> writes {};
+		writes[0].dstBinding      = 0;
+		writes[0].descriptorCount = 1;
+		writes[0].descriptorType  = vk::DescriptorType::eSampledImage;
+		writes[0].pImageInfo      = &source_image;
+		writes[1].dstBinding      = 1;
+		writes[1].descriptorCount = 1;
+		writes[1].descriptorType  = vk::DescriptorType::eStorageImage;
+		writes[1].pImageInfo      = &destination_image;
+		command_buffer.PushDescriptors(vk::PipelineBindPoint::eCompute, m_d2c_pipeline_layout, 0,
+		                               static_cast<uint32_t>(writes.size()), writes.data());
+		const DepthToColorPush push {std::max(source.backing.extent.width >> level, 1u),
+		                             std::max(source.backing.extent.height >> level, 1u), level};
+		command.pushConstants(m_d2c_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+		                      sizeof(push), &push);
+		command.dispatch((push.width + 7u) / 8u, (push.height + 7u) / 8u, layers);
+	}
+}
+
+void BlitHelper::CopyColor32ToDepth(Image& source, Image& destination) {
+	KYTY_GPU_OP_SITE("image.reinterpret_color_to_depth");
+	EXIT_IF(!SupportsColor32ToDepth(source, destination));
+	const uint32_t levels = std::min(source.backing.mip_levels, destination.backing.mip_levels);
+	const uint32_t layers = std::min(source.backing.layers, destination.backing.layers);
+	destination.NoteContentWrite();
+	m_scheduler.EndRendering();
+
+	auto& command_buffer = m_scheduler.Current();
+	auto  command        = command_buffer.Handle();
+	source.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead, {}, command);
+	destination.Transit(ColorToMsDepthLayout, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {},
+	                    command);
+	const auto pipeline =
+	    GetPipeline({1, destination.backing.format, PipelineKind::Color32ToDepth});
+	for (uint32_t level = 0; level < levels; level++) {
+		const uint32_t width  = std::max(destination.backing.extent.width >> level, 1u);
+		const uint32_t height = std::max(destination.backing.extent.height >> level, 1u);
+
+		ImageViewInfo source_view_info {};
+		source_view_info.format      = vk::Format::eR32Uint;
+		source_view_info.type        = vk::ImageViewType::e2DArray;
+		source_view_info.aspect      = vk::ImageAspectFlagBits::eColor;
+		source_view_info.base_level  = level;
+		source_view_info.level_count = 1;
+		source_view_info.layer_count = layers;
+		source_view_info.usage       = vk::ImageUsageFlagBits::eStorage;
+		const auto source_view       = source.FindView(source_view_info);
+		const vk::DescriptorImageInfo source_image {nullptr, source_view,
+		                                            vk::ImageLayout::eGeneral};
+
+		for (uint32_t layer = 0; layer < layers; layer++) {
+			ImageViewInfo destination_view_info {};
+			destination_view_info.format      = destination.backing.format;
+			destination_view_info.type        = vk::ImageViewType::e2D;
+			destination_view_info.aspect      = vk::ImageAspectFlagBits::eDepth;
+			destination_view_info.base_level  = level;
+			destination_view_info.level_count = 1;
+			destination_view_info.base_layer  = layer;
+			destination_view_info.layer_count = 1;
+			destination_view_info.usage       = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+			const auto destination_view       = destination.FindView(destination_view_info);
+
+			vk::RenderingAttachmentInfo depth_attachment {};
+			depth_attachment.imageView   = destination_view;
+			depth_attachment.imageLayout = ColorToMsDepthLayout;
+			// The fullscreen triangle writes every texel of the render area.
+			depth_attachment.loadOp  = vk::AttachmentLoadOp::eDontCare;
+			depth_attachment.storeOp = vk::AttachmentStoreOp::eStore;
+
+			vk::RenderingInfo rendering {};
+			rendering.renderArea.extent = vk::Extent2D {width, height};
+			rendering.layerCount        = 1;
+			rendering.pDepthAttachment  = &depth_attachment;
+			command.beginRendering(&rendering);
+
+			vk::WriteDescriptorSet write {};
+			write.dstBinding      = 0;
+			write.descriptorCount = 1;
+			write.descriptorType  = vk::DescriptorType::eStorageImage;
+			write.pImageInfo      = &source_image;
+			command_buffer.PushDescriptors(vk::PipelineBindPoint::eGraphics,
+			                               m_c2d_pipeline_layout, 0, 1, &write);
+			command_buffer.BindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+			const ColorToDepthPush push {layer};
+			command.pushConstants(m_c2d_pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
+			                      sizeof(push), &push);
+			const vk::Viewport viewport {0.0f, 0.0f, static_cast<float>(width),
+			                             static_cast<float>(height), 0.0f, 1.0f};
+			const vk::Rect2D   scissor {{0, 0}, {width, height}};
+			command.setViewport(0, 1, &viewport);
+			command.setScissor(0, 1, &scissor);
+			command.draw(3, 1, 0, 0);
+			command.endRendering();
+		}
+	}
 }
 
 } // namespace Libs::Graphics
