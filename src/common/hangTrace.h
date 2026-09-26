@@ -28,9 +28,14 @@
 // gpu_cmdbufs, gpu_latency_avg_us (recording start -> GPU start), gpu_idle_us, gpu_max_gap_us,
 // gpu_starved_us (idle before the next buffer reached vkQueueSubmit), gpu_dispatch_latency_avg_us
 // (vkQueueSubmit return -> GPU start) and gpu_dropped. Latency/starved columns are 0 without
-// calibrated timestamps. New columns are only ever appended.
+// calibrated timestamps. After them come GPU recording counters (KYTY_GPU_OP_COUNTERS, default on
+// with this trace; see graphics/host_gpu/renderer/gpuOpProfiler.h): gpu_render_passes (guest
+// dynamic-rendering begins), gpu_barriers (guest pipeline barrier calls), gpu_layout_transitions
+// (image barriers changing layout) and gpu_guest_cmdbufs (guest command buffers begun).
+// New columns are only ever appended.
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 namespace HangTrace {
@@ -40,6 +45,9 @@ namespace HangTrace {
 
 void Initialize();
 void Shutdown();
+
+// Output directory of this trace, or empty when the trace is disabled or failed to start.
+[[nodiscard]] std::string OutputDirectory();
 
 [[nodiscard]] uint64_t NowNs();
 
@@ -149,6 +157,15 @@ struct GpuFrame {
 	uint64_t dropped             = 0;
 };
 void RecordGpuFrame(const GpuFrame& frame);
+
+// Guest GPU recording counters for one guest flip (graphics/host_gpu/renderer/gpuOpProfiler.h).
+struct GpuOpCounts {
+	uint64_t render_passes      = 0;
+	uint64_t barriers           = 0;
+	uint64_t layout_transitions = 0;
+	uint64_t command_buffers    = 0;
+};
+void RecordGpuOpCounts(const GpuOpCounts& counts);
 
 } // namespace HangTrace
 

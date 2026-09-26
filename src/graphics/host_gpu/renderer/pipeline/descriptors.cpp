@@ -31,6 +31,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1074,6 +1075,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		const auto  shader_stage  = NativeShaderStage(program.stage);
 		const auto  shader_stages = ShaderPipelineStages(shader_stage);
 		if (descriptors.gds.buffer != nullptr) {
+			KYTY_GPU_OP_SITE("descriptors.gds_barrier");
 			buffer.EndRendering();
 			const auto barrier = MakeGdsDependency(descriptors.gds.buffer);
 			vk_buffer.pipelineBarrier(

@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
 #include <array>
@@ -115,6 +116,7 @@ bool DccClearHelper::Supports(const Image& image, uint64_t metadata_size) const 
 
 void DccClearHelper::Record(Image& image, vk::Buffer metadata, uint64_t metadata_offset,
                            uint64_t metadata_size, bool alpha_msb) {
+	KYTY_GPU_OP_SITE("dcc.clear");
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	EXIT_IF(!Supports(image, metadata_size) || metadata == nullptr || metadata_offset % 4 != 0 ||
 	        metadata_offset > std::numeric_limits<uint64_t>::max() - metadata_size);

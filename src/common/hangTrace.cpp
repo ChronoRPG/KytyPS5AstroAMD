@@ -230,6 +230,10 @@ struct Totals {
 	std::atomic<uint64_t> gpu_record_latency_ns {0};
 	std::atomic<uint64_t> gpu_dispatch_latency_ns {0};
 	std::atomic<uint64_t> gpu_dropped {0};
+	std::atomic<uint64_t> gpu_render_passes {0};
+	std::atomic<uint64_t> gpu_barriers {0};
+	std::atomic<uint64_t> gpu_layout_transitions {0};
+	std::atomic<uint64_t> gpu_guest_cmdbufs {0};
 };
 Totals g_totals;
 
@@ -584,6 +588,9 @@ void Publish() {
 		                    take(g_totals.gpu_starved_ns) / 1000u,
 		                    gpu_samples != 0 ? gpu_dispatch / gpu_samples / 1000u : 0,
 		                    take(g_totals.gpu_dropped));
+		line += fmt::format(",{},{},{},{}", take(g_totals.gpu_render_passes),
+		                    take(g_totals.gpu_barriers), take(g_totals.gpu_layout_transitions),
+		                    take(g_totals.gpu_guest_cmdbufs));
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
@@ -654,6 +661,7 @@ void Initialize() {
 	                  "native_create_bytes";
 	summary_header += ",gpu_busy_us,gpu_cmdbufs,gpu_latency_avg_us,gpu_idle_us,gpu_max_gap_us,"
 	                  "gpu_starved_us,gpu_dispatch_latency_avg_us,gpu_dropped";
+	summary_header += ",gpu_render_passes,gpu_barriers,gpu_layout_transitions,gpu_guest_cmdbufs";
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.readbacks = OpenFile("readbacks.csv",
 	                             "t_ms,kind,vaddr,size,window_begin,window_size,downloaded,"
@@ -694,6 +702,13 @@ void Initialize() {
 		}
 	});
 	std::printf("Hang trace enabled (KYTY_HANG_TRACE=1): writing %s\n", g_dir.string().c_str());
+}
+
+std::string OutputDirectory() {
+	if (!Enabled() || !g_publisher.joinable()) {
+		return {};
+	}
+	return g_dir.string();
 }
 
 void Shutdown() {
@@ -1193,6 +1208,17 @@ void RecordGpuFrame(const GpuFrame& frame) {
 	g_totals.gpu_dispatch_latency_ns.fetch_add(frame.dispatch_latency_ns,
 	                                           std::memory_order_relaxed);
 	g_totals.gpu_dropped.fetch_add(frame.dropped, std::memory_order_relaxed);
+}
+
+void RecordGpuOpCounts(const GpuOpCounts& counts) {
+	if (!Enabled()) {
+		return;
+	}
+	g_totals.gpu_render_passes.fetch_add(counts.render_passes, std::memory_order_relaxed);
+	g_totals.gpu_barriers.fetch_add(counts.barriers, std::memory_order_relaxed);
+	g_totals.gpu_layout_transitions.fetch_add(counts.layout_transitions,
+	                                          std::memory_order_relaxed);
+	g_totals.gpu_guest_cmdbufs.fetch_add(counts.command_buffers, std::memory_order_relaxed);
 }
 
 } // namespace HangTrace

@@ -20,6 +20,7 @@
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
 #include <array>
@@ -1582,6 +1583,7 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 }
 
 void CommandProcessor::EmitGlobalBarrier() {
+	KYTY_GPU_OP_SITE("guest.global_barrier");
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	Common::LockGuard lock(m_renderer.GetMutex());
 	// Keep renderer-lock contention in the parent zone's self time.

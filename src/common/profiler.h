@@ -167,6 +167,13 @@ enum class FrameEvent : uint32_t {
 	ReadbackSideFallbackOther,
 	ReadbackSidePagesUnmarked,
 	ReadbackSidePagesRetained,
+	// Guest GPU recording counters (KYTY_GPU_OP_COUNTERS, gpuOpProfiler.h), added per guest
+	// flip: dynamic-rendering begins, pipeline barrier calls, image barriers that change layout
+	// and guest command buffers begun. Per-site barrier plots are GpuOps.Barriers.<site>.
+	GpuRenderPassBegins,
+	GpuPipelineBarriers,
+	GpuImageLayoutTransitions,
+	GpuGuestCommandBuffers,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

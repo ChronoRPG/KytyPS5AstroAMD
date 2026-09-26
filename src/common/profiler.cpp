@@ -137,6 +137,10 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.ReadbackSideFallbackOther.Cumulative",
     "FrameEvent.ReadbackSidePagesUnmarked.Cumulative",
     "FrameEvent.ReadbackSidePagesRetained.Cumulative",
+    "FrameEvent.GpuRenderPassBegins.Cumulative",
+    "FrameEvent.GpuPipelineBarriers.Cumulative",
+    "FrameEvent.GpuImageLayoutTransitions.Cumulative",
+    "FrameEvent.GpuGuestCommandBuffers.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 

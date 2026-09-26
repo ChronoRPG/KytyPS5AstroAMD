@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 
 #include <algorithm>
@@ -106,6 +107,7 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 			m_gpu_timing.reset();
 		}
 	}
+	m_gpu_ops = role == Role::Guest && GpuOpProfiler::Enabled();
 }
 
 CommandScheduler::~CommandScheduler() {
@@ -140,6 +142,9 @@ void CommandScheduler::Shutdown() {
 		// Every submitted tick is complete: collect the remaining pairs before the ring (and its
 		// query pool) is destroyed with this scheduler. No slot is left recording here.
 		m_gpu_timing->Collect(m_master.KnownGpuTick(), true);
+	}
+	if (m_gpu_ops) {
+		GpuOpProfiler::OnSchedulerShutdown(m_graphics);
 	}
 	PopPendingOperations();
 	DrainPriorityOperations();
@@ -390,6 +395,10 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 		// without waiting, then reset and stamp this buffer's pair before any rendering begins.
 		m_gpu_timing->Collect(m_master.KnownGpuTick());
 		m_gpu_timing->BeginCommand(m_command.m_buffer);
+	}
+	if (m_gpu_ops) {
+		GpuOpProfiler::OnBeginCommand(m_graphics, m_command.m_buffer, m_master.CurrentTick(),
+		                              m_master.KnownGpuTick());
 	}
 	return m_command;
 }
