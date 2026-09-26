@@ -54,6 +54,58 @@ static bool AliasAgeByFrames() {
 	return enabled;
 }
 
+[[nodiscard]] bool EnvNotZero(const char* name) {
+	const auto* value = std::getenv(name);
+	return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
+// KYTY_DIRECT_IMAGE_COPY=0 restores the image->buffer->image copy for every depth<->color
+// reinterpretation. KYTY_DIRECT_IMAGE_COPY_SHADER=0 disables only the one-pass shader
+// reinterpretation; KYTY_DIRECT_IMAGE_COPY_M8=0 (read at device creation) only the
+// VK_KHR_maintenance8 depth<->color vkCmdCopyImage.
+static bool DirectImageCopyEnabled() {
+	static const bool enabled = EnvNotZero("KYTY_DIRECT_IMAGE_COPY");
+	return enabled;
+}
+
+static bool DirectImageCopyShaderEnabled() {
+	static const bool enabled =
+	    DirectImageCopyEnabled() && EnvNotZero("KYTY_DIRECT_IMAGE_COPY_SHADER");
+	return enabled;
+}
+
+// KYTY_ALIAS_SYNC_SKIP=0 copies the owner into a kept alias on every ownership switch, even when
+// the alias already holds exactly the owner's native contents (see Image::ContentSerial).
+static bool AliasSyncSkipEnabled() {
+	static const bool enabled = EnvNotZero("KYTY_ALIAS_SYNC_SKIP");
+	return enabled;
+}
+
+// VK_KHR_maintenance8 "depth/stencil to color" copy compatibility, restricted to depth-only
+// images and to the color formats listed for their depth aspect.
+[[nodiscard]] bool Maintenance8CopyCompatible(vk::Format depth, vk::Format color) {
+	switch (depth) {
+		case vk::Format::eD32Sfloat:
+			return color == vk::Format::eR32Sfloat || color == vk::Format::eR32Uint ||
+			       color == vk::Format::eR32Sint;
+		case vk::Format::eD16Unorm:
+			return color == vk::Format::eR16Unorm || color == vk::Format::eR16Uint ||
+			       color == vk::Format::eR16Sint;
+		default: return false;
+	}
+}
+
+[[nodiscard]] const char* UploadBindingName(TextureCache::BindingType binding) {
+	switch (binding) {
+		case TextureCache::BindingType::Texture: return "texture";
+		case TextureCache::BindingType::Storage: return "storage";
+		case TextureCache::BindingType::RenderTarget: return "render-target";
+		case TextureCache::BindingType::DepthTarget: return "depth-target";
+		case TextureCache::BindingType::VideoOut: return "video-out";
+	}
+	return "other";
+}
+
 // The stock Tracy CSV exporter supports -m. Keep messages free of commas/newlines,
 // and bound diagnostics independently of how long a detailed capture stays connected.
 std::atomic<uint32_t> g_dcc_diagnostic_messages {0};
@@ -754,7 +806,40 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 	return true;
 }
 
-void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
+const char* TextureCache::TryDirectReinterpret(Image& destination, Image& source) {
+	if (!DirectImageCopyEnabled() || source.backing.samples != destination.backing.samples) {
+		return nullptr;
+	}
+	const bool source_depth = source.info.IsDepth();
+	if (source_depth == destination.info.IsDepth()) {
+		return nullptr;
+	}
+	const auto& depth = source_depth ? source : destination;
+	const auto& color = source_depth ? destination : source;
+	if (m_graphics.maintenance8_enabled && depth.backing.image_type == vk::ImageType::e2D &&
+	    color.backing.image_type == vk::ImageType::e2D &&
+	    Maintenance8CopyCompatible(depth.backing.format, color.backing.format)) {
+		destination.CopyDepthColorImage(source);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageCopyMaintenance8);
+		return "maintenance8";
+	}
+	if (!DirectImageCopyShaderEnabled()) {
+		return nullptr;
+	}
+	if (source_depth && m_blit_helper.SupportsDepthToColor32(source, destination)) {
+		m_blit_helper.CopyDepthToColor32(source, destination);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageCopyShaderDepthToColor);
+		return "shader-depth-to-color";
+	}
+	if (!source_depth && m_blit_helper.SupportsColor32ToDepth(source, destination)) {
+		m_blit_helper.CopyColor32ToDepth(source, destination);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageCopyShaderColorToDepth);
+		return "shader-color-to-depth";
+	}
+	return nullptr;
+}
+
+bool TextureCache::CopyImage(ImageId destination_id, ImageId source_id, const char* context) {
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
@@ -767,7 +852,12 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		if (source.info.data == destination.info.data) {
 			destination.MarkBufferModified();
 		}
-		return;
+		HangTrace::RecordTransfer(HangTrace::TransferKind::ImageCopy, "skipped-buffer-owned",
+		                          context, destination.info.data.address,
+		                          static_cast<uint32_t>(destination.backing.format),
+		                          destination.info.extent.width, destination.info.extent.height,
+		                          0, 0);
+		return false;
 	}
 	const bool source_depth = source.info.IsDepth();
 	const bool dest_depth   = destination.info.IsDepth();
@@ -775,19 +865,47 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	    source.backing.format == destination.backing.format ||
 	    (!source_depth && !dest_depth &&
 	     vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format));
+	// Lossless paths copy raw texel bits; the D16 path converts through unorm16.
+	bool        lossless = true;
+	const char* path     = nullptr;
 	if (direct_copy) {
 		destination.CopyImage(source);
-	} else if (!CopyD16(destination, source)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageCopyDirect);
+		path = "direct";
+	} else if ((path = TryDirectReinterpret(destination, source)) != nullptr) {
+	} else if (CopyD16(destination, source)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageCopyD16);
+		lossless = false;
+		path     = "d16-convert";
+	} else {
 		if (source.backing.samples != 1 || destination.backing.samples != 1) {
 			EXIT("TextureCache: cross-format multisample image copy is unsupported\n");
 		}
 		auto& copy_buffer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
 		destination.CopyImageWithBuffer(source, copy_buffer);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageCopyViaBuffer);
+		path = "via-buffer";
 	}
+	HangTrace::RecordTransfer(HangTrace::TransferKind::ImageCopy, path, context,
+	                          destination.info.data.address,
+	                          static_cast<uint32_t>(destination.backing.format),
+	                          destination.info.extent.width, destination.info.extent.height,
+	                          destination.info.data.size, 0);
 	if (source.IsGpuModified()) {
 		MarkImageGpuModified(destination);
 	}
 	destination.ClearBufferModified();
+	// Copies never include a stencil aspect, so combined depth/stencil images never compare equal.
+	const auto has_stencil = [](vk::Format format) {
+		return format == vk::Format::eD16UnormS8Uint || format == vk::Format::eD24UnormS8Uint ||
+		       format == vk::Format::eD32SfloatS8Uint || format == vk::Format::eS8Uint;
+	};
+	return lossless && !has_stencil(source.backing.format) &&
+	       !has_stencil(destination.backing.format) &&
+	       source.backing.extent == destination.backing.extent &&
+	       source.backing.image_type == destination.backing.image_type &&
+	       source.backing.mip_levels == destination.backing.mip_levels &&
+	       source.backing.layers == destination.backing.layers;
 }
 
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
@@ -901,7 +1019,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		    (!cached.info.IsDepth() && !replacement.info.IsDepth() &&
 		     ImageViewOps::FormatsCompatible(cached.backing.format, replacement.backing.format));
 		if (copy_supported) {
-			CopyImage(replacement_id, cached_id);
+			(void)CopyImage(replacement_id, cached_id, "depth-overlap");
 		} else {
 			LOGF_COLOR(Log::Color::BrightYellow,
 			           "TextureCache: unsupported cross-format multisample depth copy\n");
@@ -1052,7 +1170,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 		CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
 	} else {
-		CopyImage(expanded_id, source_id);
+		(void)CopyImage(expanded_id, source_id, "expand");
 	}
 	FreeImage(source_id, HangTrace::ImageFreeReason::Expand);
 	return expanded_id;
@@ -1268,6 +1386,20 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		// Attribution only: why this refresh happens and how much of the image was dirtied.
+		const bool  first  = !image.WasEverUploaded();
+		const char* reason = image.IsBufferModified()
+		                         ? (first ? "first-use-gpu-buffer" : "gpu-buffer-write")
+		                     : first                     ? "first-use"
+		                     : image.DirtyFromEdgeHash() ? "cpu-edge-hash"
+		                                                 : "cpu-write";
+		const auto span = image.DirtySpanBytes();
+		// For GPU buffer writes: which kind of recorded write last touched the dirty bytes.
+		const char* writer =
+		    HangTrace::Enabled() && image.IsBufferModified()
+		        ? HangTrace::LastGpuWriteKind(span != 0 ? image.DirtySpanBegin()
+		                                                : image.info.data.address)
+		        : nullptr;
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
@@ -1275,6 +1407,22 @@ void TextureCache::InitializeImage(ImageId id) {
 		}
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
+		image.NoteUpload();
+		image.ClearDirtySpan();
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageUploads);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageUploadBytes, image.info.data.size);
+		if (HangTrace::Enabled()) {
+			const auto binding =
+			    image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
+			HangTrace::RecordTransfer(HangTrace::TransferKind::ImageUpload, reason,
+			                          writer != nullptr ? writer
+			                          : image.depth_id  ? "stencil-plane"
+			                                            : UploadBindingName(binding),
+			                          image.info.data.address,
+			                          static_cast<uint32_t>(image.backing.format),
+			                          image.info.extent.width, image.info.extent.height,
+			                          image.info.data.size, span);
+		}
 	}
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
@@ -1878,8 +2026,40 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 		    other->backing.samples != image.backing.samples) {
 			continue;
 		}
-		CopyImage(id, other_id);
+		const auto trace_sync = [&](const char* reason, uint64_t bytes) {
+			HangTrace::RecordTransfer(HangTrace::TransferKind::AliasSync, reason, "",
+			                          image.info.data.address,
+			                          static_cast<uint32_t>(image.backing.format),
+			                          image.info.extent.width, image.info.extent.height, bytes, 0);
+		};
+		// Skip the copy when this alias already holds exactly the owner's native bits: its last
+		// contents came from a lossless full copy of the owner (or the other way round) and
+		// neither image has been written since. Ownership moves exactly as after a copy.
+		if (AliasSyncSkipEnabled() && image.ContentSerial() != 0 &&
+		    image.ContentSerial() == other->ContentSerial() && !image.IsCpuDirty() &&
+		    !image.IsBufferModified()) {
+			// A CPU-dirty owner is refreshed first, exactly as CopyImage would; that upload is
+			// a write and gives it a new serial.
+			RefreshCopySource(other_id);
+			const auto& owner = m_slot_images[other_id];
+			if (image.ContentSerial() == owner.ContentSerial() && owner.IsGpuModified() &&
+			    !owner.IsBufferModified() && !image.IsCpuDirty() && !image.IsBufferModified()) {
+				const auto serial = owner.ContentSerial();
+				TrackImage(id);
+				CommitGpuWrite(image);
+				image.AdoptContentSerial(serial);
+				Profiler::CountFrameEvent(Profiler::FrameEvent::AliasSyncSkips);
+				trace_sync("skip-same-contents", 0);
+				return;
+			}
+		}
+		const bool lossless = CopyImage(id, other_id, "alias-sync");
 		CommitGpuWrite(image);
+		if (lossless && AliasSyncSkipEnabled()) {
+			image.AdoptContentSerial(m_slot_images[other_id].ContentSerial());
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::AliasSyncCopies);
+		trace_sync("copy", image.info.data.size);
 		return;
 	}
 }
@@ -2291,6 +2471,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 			image.ClearGpuModified();
 		}
 		image.MarkBufferModified();
+		image.NoteDirtySpan(address, size);
 	}
 }
 
@@ -2312,6 +2493,9 @@ void TextureCache::MarkImageGpuModified(Image& image) {
 		InvalidateCleanImageProofs();
 	}
 	image.MarkGpuModified();
+	// Every GPU writer (draw targets, storage bindings, clears, helper passes, copies) passes
+	// here before or right after recording its write: the native contents get a new identity.
+	image.NoteContentWrite();
 }
 
 bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {

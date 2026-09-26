@@ -174,6 +174,24 @@ enum class FrameEvent : uint32_t {
 	GpuPipelineBarriers,
 	GpuImageLayoutTransitions,
 	GpuGuestCommandBuffers,
+	// Texture-cache reinterpretation copies (TextureCache::CopyImage) by path: same-size color
+	// vkCmdCopyImage, VK_KHR_maintenance8 depth<->color vkCmdCopyImage, one-pass shader
+	// reinterpretation (depth->color compute, color->depth draw), the image->buffer->image
+	// fallback and the D16 download/convert/upload path. AliasSync*: SyncAliasFromOwner copies
+	// and copies skipped because both aliases already hold identical native contents.
+	ImageCopyDirect,
+	ImageCopyMaintenance8,
+	ImageCopyShaderDepthToColor,
+	ImageCopyShaderColorToDepth,
+	ImageCopyViaBuffer,
+	ImageCopyD16,
+	AliasSyncCopies,
+	AliasSyncSkips,
+	// Guest memory -> native image refreshes (TextureCache::InitializeImage) and bytes, and
+	// CPU-dirty bytes copied into device buffers (BufferCache::SynchronizeBuffer).
+	ImageUploads,
+	ImageUploadBytes,
+	BufferUploadBytes,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

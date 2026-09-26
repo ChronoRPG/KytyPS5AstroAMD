@@ -34,6 +34,9 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
+	// VK_KHR_maintenance8: vkCmdCopyImage between a depth aspect and a compatible color format
+	// (D32 <-> R32, D16 <-> R16). KYTY_DIRECT_IMAGE_COPY_M8=0 leaves the extension disabled.
+	bool                               maintenance8_enabled                  = false;
 	// Native indirect draws (vkCmdDraw*Indirect*). Each form is used only when enabled here.
 	bool                               draw_indirect_first_instance_enabled  = false;
 	bool                               multi_draw_indirect_enabled           = false;

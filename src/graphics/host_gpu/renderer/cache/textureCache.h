@@ -183,7 +183,12 @@ private:
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
-	void               CopyImage(ImageId destination, ImageId source);
+	// Depth <-> color reinterpretation without a staging buffer (VK_KHR_maintenance8 copy or a
+	// one-pass shader). Returns the path name, or nullptr when nothing was recorded.
+	[[nodiscard]] const char* TryDirectReinterpret(Image& destination, Image& source);
+	// Returns true when the destination's copied subresources now hold exactly the source's
+	// native bits for every subresource of both images (same shape, lossless path).
+	bool CopyImage(ImageId destination, ImageId source, const char* context = "other");
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;

@@ -178,6 +178,39 @@ struct NativeImageTotals {
 std::mutex               g_image_mutex;
 std::vector<std::string> g_pending_image_rows;
 uint64_t                 g_image_rows_total = 0;
+
+constexpr const char* kTransferKindNames[] = {"image-upload", "buffer-upload", "image-copy",
+                                              "alias-sync"};
+static_assert(std::size(kTransferKindNames) == static_cast<size_t>(TransferKind::Count));
+// Distinct keys per published second; further keys fold into address 0 of the same reason.
+constexpr size_t kTransferKeyLimit = 8192;
+struct TransferKey {
+	TransferKind kind    = TransferKind::ImageUpload;
+	const char*  reason  = nullptr;
+	const char*  detail  = nullptr;
+	uint64_t     address = 0;
+	uint32_t     format  = 0;
+	uint32_t     width   = 0;
+	uint32_t     height  = 0;
+	bool         operator==(const TransferKey&) const = default;
+};
+struct TransferKeyHash {
+	size_t operator()(const TransferKey& k) const {
+		uint64_t h = k.address * 0x9E3779B97F4A7C15ull;
+		h ^= reinterpret_cast<uintptr_t>(k.reason) + (h << 6u) + (h >> 2u);
+		h ^= reinterpret_cast<uintptr_t>(k.detail) + (h << 6u) + (h >> 2u);
+		h ^= (static_cast<uint64_t>(k.format) << 40u) ^ (static_cast<uint64_t>(k.width) << 20u) ^
+		     k.height ^ (static_cast<uint64_t>(k.kind) << 60u);
+		return static_cast<size_t>(h * 0x94D049BB133111EBull);
+	}
+};
+struct TransferTotals {
+	uint64_t count      = 0;
+	uint64_t bytes      = 0;
+	uint64_t span_bytes = 0;
+};
+std::mutex                                                          g_transfer_mutex;
+std::unordered_map<TransferKey, TransferTotals, TransferKeyHash>    g_transfers;
 std::unordered_map<NativeImageKey, NativeImageTotals, NativeImageKeyHash> g_native_images;
 
 // LOD report watch state.
@@ -234,6 +267,8 @@ struct Totals {
 	std::atomic<uint64_t> gpu_barriers {0};
 	std::atomic<uint64_t> gpu_layout_transitions {0};
 	std::atomic<uint64_t> gpu_guest_cmdbufs {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(TransferKind::Count)> transfer_count {};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(TransferKind::Count)> transfer_bytes {};
 };
 Totals g_totals;
 
@@ -256,6 +291,7 @@ struct Files {
 	std::FILE* lodwatch      = nullptr;
 	std::FILE* occlusion     = nullptr;
 	std::FILE* lodreports    = nullptr;
+	std::FILE* transfers     = nullptr;
 };
 Files g_files;
 
@@ -522,6 +558,19 @@ void Publish() {
 	}
 	WriteRows(g_files.images, rows);
 
+	{
+		std::scoped_lock lock(g_transfer_mutex);
+		for (const auto& [key, totals]: g_transfers) {
+			rows.push_back(fmt::format(
+			    "{},{},{},{},0x{:x},{},{},{},{},{},{}", t_ms,
+			    kTransferKindNames[static_cast<uint32_t>(key.kind)], key.reason, key.detail,
+			    key.address, key.format, key.width, key.height, totals.count, totals.bytes,
+			    totals.span_bytes));
+		}
+		g_transfers.clear();
+	}
+	WriteRows(g_files.transfers, rows);
+
 	if (g_files.tex != nullptr) {
 		for (uint32_t id = 0; id < 256; id++) {
 			const auto count = g_tex_count[id].exchange(0, std::memory_order_relaxed);
@@ -612,13 +661,17 @@ void Publish() {
 		line += fmt::format(",{},{},{},{}", take(g_totals.gpu_render_passes),
 		                    take(g_totals.gpu_barriers), take(g_totals.gpu_layout_transitions),
 		                    take(g_totals.gpu_guest_cmdbufs));
+		for (size_t kind = 0; kind < static_cast<size_t>(TransferKind::Count); kind++) {
+			line += fmt::format(",{},{}", take(g_totals.transfer_count[kind]),
+			                    take(g_totals.transfer_bytes[kind]));
+		}
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
 
 	for (auto* file: {g_files.summary, g_files.apr, g_files.imports, g_files.imports_index,
 	                  g_files.lod, g_files.tex, g_files.modules, g_files.queues, g_files.readbacks,
-	                  g_files.images, g_files.lodwatch}) {
+	                  g_files.images, g_files.lodwatch, g_files.transfers}) {
 		if (file != nullptr) {
 			std::fflush(file);
 		}
@@ -683,7 +736,13 @@ void Initialize() {
 	summary_header += ",gpu_busy_us,gpu_cmdbufs,gpu_latency_avg_us,gpu_idle_us,gpu_max_gap_us,"
 	                  "gpu_starved_us,gpu_dispatch_latency_avg_us,gpu_dropped";
 	summary_header += ",gpu_render_passes,gpu_barriers,gpu_layout_transitions,gpu_guest_cmdbufs";
+	summary_header += ",xfer_image_uploads,xfer_image_upload_bytes,xfer_buffer_uploads,"
+	                  "xfer_buffer_upload_bytes,xfer_image_copies,xfer_image_copy_bytes,"
+	                  "xfer_alias_syncs,xfer_alias_sync_bytes";
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
+	g_files.transfers = OpenFile("transfers.csv",
+	                             "t_ms,kind,reason,detail,address,format,width,height,count,bytes,"
+	                             "span_bytes");
 	g_files.readbacks = OpenFile("readbacks.csv",
 	                             "t_ms,kind,vaddr,size,window_begin,window_size,downloaded,"
 	                             "duration_us,host_tid,thread,pc,stack_callers,last_gpu_writer,"
@@ -747,7 +806,8 @@ void Shutdown() {
 	}
 	for (auto** file: {&g_files.summary, &g_files.apr, &g_files.imports, &g_files.imports_index,
 	                   &g_files.lod, &g_files.tex, &g_files.modules, &g_files.queues,
-	                   &g_files.readbacks, &g_files.images, &g_files.lodwatch}) {
+	                   &g_files.readbacks, &g_files.images, &g_files.lodwatch,
+	                   &g_files.transfers}) {
 		if (*file != nullptr) {
 			std::fclose(*file);
 			*file = nullptr;
@@ -1177,6 +1237,16 @@ void NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+const char* LastGpuWriteKind(uint64_t vaddr) {
+	if (!Enabled()) {
+		return "unknown";
+	}
+	std::scoped_lock lock(g_page_writer_mutex);
+	const auto it = g_page_writers.find(vaddr >> 12u);
+	return it != g_page_writers.end() ? kGpuWriteKindNames[static_cast<uint32_t>(it->second.kind)]
+	                                  : "unknown";
+}
+
 void SetImageFreeReason(ImageFreeReason reason) {
 	g_image_free_reason = reason;
 }
@@ -1212,6 +1282,29 @@ void RecordNativeImage(bool create, bool pool_hit, uint32_t format, uint32_t wid
 	auto& totals = g_native_images[NativeImageKey {create, pool_hit, format, width, height, levels, usage}];
 	totals.count++;
 	totals.bytes += bytes;
+}
+
+void RecordTransfer(TransferKind kind, const char* reason, const char* detail, uint64_t address,
+                    uint32_t format, uint32_t width, uint32_t height, uint64_t bytes,
+                    uint64_t span_bytes) {
+	if (!Enabled() || kind >= TransferKind::Count) {
+		return;
+	}
+	g_totals.transfer_count[static_cast<size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+	g_totals.transfer_bytes[static_cast<size_t>(kind)].fetch_add(bytes, std::memory_order_relaxed);
+	TransferKey key {kind,   reason != nullptr ? reason : "", detail != nullptr ? detail : "",
+	                 address, format, width, height};
+	std::scoped_lock lock(g_transfer_mutex);
+	if (g_transfers.size() >= kTransferKeyLimit && !g_transfers.contains(key)) {
+		key.address = 0;
+		key.format  = 0;
+		key.width   = 0;
+		key.height  = 0;
+	}
+	auto& totals = g_transfers[key];
+	totals.count++;
+	totals.bytes += bytes;
+	totals.span_bytes += span_bytes;
 }
 
 void RecordQueueWait(uint32_t queue, uint64_t wait_ns) {

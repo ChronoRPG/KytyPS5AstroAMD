@@ -141,6 +141,17 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.GpuPipelineBarriers.Cumulative",
     "FrameEvent.GpuImageLayoutTransitions.Cumulative",
     "FrameEvent.GpuGuestCommandBuffers.Cumulative",
+    "FrameEvent.ImageCopyDirect.Cumulative",
+    "FrameEvent.ImageCopyMaintenance8.Cumulative",
+    "FrameEvent.ImageCopyShaderDepthToColor.Cumulative",
+    "FrameEvent.ImageCopyShaderColorToDepth.Cumulative",
+    "FrameEvent.ImageCopyViaBuffer.Cumulative",
+    "FrameEvent.ImageCopyD16.Cumulative",
+    "FrameEvent.AliasSyncCopies.Cumulative",
+    "FrameEvent.AliasSyncSkips.Cumulative",
+    "FrameEvent.ImageUploads.Cumulative",
+    "FrameEvent.ImageUploadBytes.Cumulative",
+    "FrameEvent.BufferUploadBytes.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 

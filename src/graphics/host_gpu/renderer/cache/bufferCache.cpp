@@ -903,7 +903,8 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
-                                    bool is_texel_buffer, BdaSyncStats* stats) {
+                                    bool is_texel_buffer, BdaSyncStats* stats,
+                                    const char* upload_reason) {
 	KYTY_GPU_OP_SITE("buffercache.upload");
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
@@ -950,6 +951,21 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		if (stats != nullptr) {
 			stats->upload_bytes += total_size;
 			stats->upload_copies += copies.size();
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BufferUploadBytes, total_size);
+		if (HangTrace::Enabled()) {
+			const char* reason = upload_reason;
+			if (reason == nullptr) {
+				reason = stats != nullptr    ? "bda-sync"
+				         : is_written        ? "written-binding"
+				         : is_texel_buffer   ? "texel-read"
+				                             : "read-binding";
+			}
+			// Address is the first uploaded page run; span_bytes the requested range.
+			HangTrace::RecordTransfer(HangTrace::TransferKind::BufferUpload, reason, "",
+			                          copies.empty() ? vaddr
+			                                         : buffer.CpuAddress() + copies.front().dstOffset,
+			                          0, static_cast<uint32_t>(copies.size()), 0, total_size, size);
 		}
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -1065,7 +1081,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
 			TouchBuffer(buffer);
-			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+			(void)SynchronizeBuffer(buffer, vaddr, size, false, false, nullptr, "image-source");
 			return {&buffer, buffer.Offset(vaddr)};
 		}
 	}

@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <algorithm>
 #include <compare>
 #include <limits>
 #include <optional>
@@ -64,20 +65,56 @@ public:
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	              uint64_t size);
 	void CopyImage(Image& source);
+	// vkCmdCopyImage between a depth aspect and a compatible color format (VK_KHR_maintenance8).
+	void CopyDepthColorImage(Image& source);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
+
+	// Native contents identity. Every recorded write to this image gives it a fresh serial
+	// (Image copy/upload/resolve methods here, TextureCache::MarkImageGpuModified for draws,
+	// dispatches, clears and helper passes). A bit-exact copy from another image may adopt
+	// the source's serial afterwards: equal nonzero serials then prove equal native bits.
+	[[nodiscard]] uint64_t ContentSerial() const noexcept { return m_content_serial; }
+	void                   NoteContentWrite() noexcept;
+	void AdoptContentSerial(uint64_t serial) noexcept { m_content_serial = serial; }
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
 			m_cpu_dirty        = true;
 			m_maybe_cpu_dirty  = false;
 			m_maybe_hash_valid = false;
+			NoteDirtySpan(vaddr, size);
 		} else if (ImagePageRangesOverlap(info.data.address, info.data.size, vaddr, size)) {
 			m_maybe_cpu_dirty = true;
+			NoteDirtySpan(vaddr, size);
 		}
 	}
+
+	// Transfer attribution (diagnostics only): union of the guest ranges that dirtied this image
+	// since its last refresh, clipped to the image, and why it was last refreshed.
+	void NoteDirtySpan(uint64_t vaddr, uint64_t size) noexcept {
+		const auto begin = std::max(vaddr, info.data.address);
+		const auto end   = std::min(vaddr + size, info.data.End());
+		if (begin >= end) {
+			return;
+		}
+		if (m_dirty_begin == m_dirty_end) {
+			m_dirty_begin = begin;
+			m_dirty_end   = end;
+		} else {
+			m_dirty_begin = std::min(m_dirty_begin, begin);
+			m_dirty_end   = std::max(m_dirty_end, end);
+		}
+	}
+	[[nodiscard]] uint64_t DirtySpanBytes() const noexcept { return m_dirty_end - m_dirty_begin; }
+	[[nodiscard]] uint64_t DirtySpanBegin() const noexcept { return m_dirty_begin; }
+	void                   ClearDirtySpan() noexcept { m_dirty_begin = m_dirty_end = 0; }
+	// False until the first refresh (upload, or overwrite of the initial guest contents).
+	[[nodiscard]] bool     WasEverUploaded() const noexcept { return m_uploads != 0 || m_refreshed; }
+	void                   NoteUpload() noexcept { m_uploads++; }
+	[[nodiscard]] bool     DirtyFromEdgeHash() const noexcept { return m_dirty_from_hash; }
 
 	[[nodiscard]] bool IsCpuDirty() const { return m_cpu_dirty || m_maybe_cpu_dirty; }
 	[[nodiscard]] bool IsDefinitelyCpuDirty() const { return m_cpu_dirty; }
@@ -103,7 +140,11 @@ public:
 		}
 		m_maybe_cpu_dirty  = false;
 		m_maybe_hash_valid = false;
-		m_cpu_dirty |= hash != m_maybe_cpu_hash;
+		m_dirty_from_hash  = hash != m_maybe_cpu_hash;
+		m_cpu_dirty |= m_dirty_from_hash;
+		if (!m_cpu_dirty) {
+			ClearDirtySpan();
+		}
 		return m_cpu_dirty;
 	}
 
@@ -114,6 +155,9 @@ public:
 		m_cpu_dirty        = false;
 		m_maybe_cpu_dirty  = false;
 		m_maybe_hash_valid = false;
+		m_dirty_from_hash  = false;
+		m_refreshed        = true;
+		ClearDirtySpan();
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
@@ -158,6 +202,7 @@ private:
 	friend struct ImageTestAccess;
 
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
+	void                                      CopyImageRegions(Image& source);
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,
 	                                                   uint64_t capacity) noexcept;
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
@@ -171,6 +216,12 @@ private:
 	bool              m_maybe_hash_valid = false;
 	bool              m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
+	bool              m_dirty_from_hash  = false;
+	bool              m_refreshed        = false;
+	uint64_t          m_content_serial   = 0;
+	uint64_t          m_dirty_begin      = 0;
+	uint64_t          m_dirty_end        = 0;
+	uint32_t          m_uploads          = 0;
 };
 
 namespace ImageOps {

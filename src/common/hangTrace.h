@@ -22,6 +22,8 @@
 //   readbacks.csv      every GPU->CPU readback: cause, range, duration, guest thread and pc
 //   images.csv         texture-cache image deletions with reason, and per-second native image
 //                      create/destroy totals grouped by format, extent and usage
+//   transfers.csv      per-second image uploads, buffer uploads, reinterpretation copies and
+//                      alias synchronizations grouped by reason, address and shape (RecordTransfer)
 //
 // summary.csv ends with GPU timeline columns (KYTY_GPU_TIMING, default on with this trace), summed
 // over the guest flips published in that second: gpu_busy_us (union of command-buffer spans),
@@ -152,6 +154,8 @@ private:
 	GpuWriteKind m_previous;
 };
 void NoteGpuWrite(uint64_t vaddr, uint64_t size);
+// Kind name of the last recorded GPU buffer write to the page holding vaddr ("unknown" if none).
+[[nodiscard]] const char* LastGpuWriteKind(uint64_t vaddr);
 
 // Texture-cache image deletion reasons (set around FreeImage calls) and native image churn.
 enum class ImageFreeReason : uint8_t {
@@ -173,6 +177,22 @@ void RecordImageFree(uint64_t address, uint32_t width, uint32_t height, uint32_t
                      uint32_t layers, uint32_t format, uint64_t bytes, uint64_t age_ticks);
 void RecordNativeImage(bool create, bool pool_hit, uint32_t format, uint32_t width, uint32_t height,
                        uint32_t levels, uint32_t usage, uint64_t bytes);
+
+// Texture-cache / buffer-cache transfer attribution (transfers.csv), aggregated per second by
+// kind, reason, detail, guest address and image shape. reason/detail must be string literals.
+//   ImageUpload  guest memory -> native image refresh (reason: first-use, first-use-gpu-buffer,
+//                cpu-write, cpu-edge-hash, gpu-buffer-write; detail: upload binding, or for
+//                GPU buffer writes the kind of the last recorded write, see NoteGpuWrite)
+//   BufferUpload CPU-dirty pages -> device buffer (reason: caller; detail: empty; address: first
+//                uploaded byte; width: number of dirty page runs copied; format/height: 0)
+//   ImageCopy    texture-cache reinterpretation copy (reason: path; detail: caller)
+//   AliasSync    alias synchronization decision (reason: copy or skip)
+// bytes: bytes moved. span_bytes: dirty span inside the image that forced the refresh (image
+// uploads) or the requested range (buffer uploads).
+enum class TransferKind : uint8_t { ImageUpload, BufferUpload, ImageCopy, AliasSync, Count };
+void RecordTransfer(TransferKind kind, const char* reason, const char* detail, uint64_t address,
+                    uint32_t format, uint32_t width, uint32_t height, uint64_t bytes,
+                    uint64_t span_bytes);
 
 // Guest GPU scheduler.
 void RecordQueueWait(uint32_t queue, uint64_t wait_ns);
