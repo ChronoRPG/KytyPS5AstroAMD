@@ -120,6 +120,73 @@ struct QueueStats {
 };
 std::array<QueueStats, kMaxQueues> g_queues {};
 
+constexpr uint64_t kReadbackRowLimit = 2'000'000;
+constexpr uint64_t kImageRowLimit    = 2'000'000;
+
+struct FaultContext {
+	uint64_t pc = 0;
+	char     thread[32] {};
+};
+thread_local FaultContext g_fault_context {};
+thread_local ReadbackKind g_readback_kind = ReadbackKind::Invalidate;
+thread_local ImageFreeReason g_image_free_reason = ImageFreeReason::Other;
+
+std::mutex               g_readback_mutex;
+std::vector<std::string> g_pending_readback_rows;
+uint64_t                 g_readback_rows_total = 0;
+
+constexpr const char* kReadbackKindNames[] = {"invalidate", "fault-read", "fault-write", "gpu-sync"};
+constexpr const char* kImageFreeReasonNames[] = {
+    "other",           "depth-association", "depth-recreate", "overlap-layout",
+    "overlap-mip-merge", "overlap-stale",   "expand",         "smaller-resources",
+    "unmap",           "gc",                "pressure-gc"};
+static_assert(std::size(kImageFreeReasonNames) == static_cast<size_t>(ImageFreeReason::Count));
+
+struct NativeImageKey {
+	bool     create  = false;
+	bool     hit     = false;
+	uint32_t format  = 0;
+	uint32_t width   = 0;
+	uint32_t height  = 0;
+	uint32_t levels  = 0;
+	uint32_t usage   = 0;
+	bool     operator==(const NativeImageKey&) const = default;
+};
+struct NativeImageKeyHash {
+	size_t operator()(const NativeImageKey& k) const {
+		uint64_t h = (static_cast<uint64_t>(k.format) << 32u) ^ k.usage ^
+		             (static_cast<uint64_t>(k.create) << 63u) ^ (static_cast<uint64_t>(k.hit) << 62u);
+		h ^= (static_cast<uint64_t>(k.width) << 20u) ^ (static_cast<uint64_t>(k.height) << 4u) ^ k.levels;
+		return static_cast<size_t>(h * 0x9E3779B97F4A7C15ull);
+	}
+};
+struct NativeImageTotals {
+	uint64_t count = 0;
+	uint64_t bytes = 0;
+};
+std::mutex               g_image_mutex;
+std::vector<std::string> g_pending_image_rows;
+uint64_t                 g_image_rows_total = 0;
+std::unordered_map<NativeImageKey, NativeImageTotals, NativeImageKeyHash> g_native_images;
+
+// LOD report watch state.
+constexpr uint32_t kLodWatchMaxArms  = 96;   // total arming attempts per process
+constexpr uint32_t kLodWatchInterval = 32;   // arm on every Nth report
+constexpr uint32_t kLodWatchCodeHalf = 1024; // code bytes saved on each side of a new pc
+struct WatchedPage {
+	uint64_t page    = 0;
+	uint32_t protect = 0;
+};
+std::mutex               g_watch_mutex;
+std::vector<WatchedPage> g_watched_pages;
+uint64_t                 g_watch_report_begin = 0;
+uint64_t                 g_watch_report_end   = 0;
+uint64_t                 g_watch_report_seq   = 0;
+uint32_t                 g_watch_arms         = 0;
+uint64_t                 g_watch_calls        = 0;
+std::vector<uint64_t>    g_watch_seen_pcs;
+std::vector<std::string> g_pending_watch_rows;
+
 std::array<std::atomic<uint32_t>, 256> g_tex_count {};
 std::array<std::atomic<uint64_t>, 256> g_tex_base {};
 std::array<std::atomic<uint32_t>, 256> g_tex_info {};
@@ -137,6 +204,12 @@ struct Totals {
 	std::atomic<uint64_t> done_waits {0};
 	std::atomic<uint64_t> done_ns {0};
 	std::atomic<uint64_t> done_max_ns {0};
+	std::atomic<uint64_t> readbacks {0};
+	std::atomic<uint64_t> readback_ns {0};
+	std::atomic<uint64_t> readback_downloads {0};
+	std::atomic<uint64_t> image_frees {0};
+	std::atomic<uint64_t> native_creates {0};
+	std::atomic<uint64_t> native_create_bytes {0};
 };
 Totals g_totals;
 
@@ -154,6 +227,9 @@ struct Files {
 	std::FILE* tex           = nullptr;
 	std::FILE* modules       = nullptr;
 	std::FILE* queues        = nullptr;
+	std::FILE* readbacks     = nullptr;
+	std::FILE* images        = nullptr;
+	std::FILE* lodwatch      = nullptr;
 };
 Files g_files;
 
@@ -375,6 +451,32 @@ void Publish() {
 	}
 	WriteRows(g_files.lod, rows);
 
+	{
+		std::scoped_lock lock(g_watch_mutex);
+		rows.swap(g_pending_watch_rows);
+	}
+	WriteRows(g_files.lodwatch, rows);
+
+	{
+		std::scoped_lock lock(g_readback_mutex);
+		rows.swap(g_pending_readback_rows);
+	}
+	WriteRows(g_files.readbacks, rows);
+
+	{
+		std::scoped_lock lock(g_image_mutex);
+		rows.swap(g_pending_image_rows);
+		for (const auto& [key, totals]: g_native_images) {
+			rows.push_back(fmt::format("{},{},,,{},{},{},{},,{},0x{:x},{},{}", t_ms,
+			                           key.create ? (key.hit ? "native-create-pooled" : "native-create")
+			                                      : "native-destroy",
+			                           key.width, key.height, key.levels, 1, key.format, key.usage,
+			                           totals.count, totals.bytes));
+		}
+		g_native_images.clear();
+	}
+	WriteRows(g_files.images, rows);
+
 	if (g_files.tex != nullptr) {
 		for (uint32_t id = 0; id < 256; id++) {
 			const auto count = g_tex_count[id].exchange(0, std::memory_order_relaxed);
@@ -446,12 +548,17 @@ void Publish() {
 		line += fmt::format(",{},{},{},{},{},{}", c_starts,
 		                    c_starts != 0 ? c_wait / c_starts / 1000u : 0, c_wmax / 1000u,
 		                    c_busy / 1000u, c_slices, c_inc);
+		line += fmt::format(",{},{},{},{},{},{}", take(g_totals.readbacks),
+		                    take(g_totals.readback_ns) / 1000u, take(g_totals.readback_downloads),
+		                    take(g_totals.image_frees), take(g_totals.native_creates),
+		                    take(g_totals.native_create_bytes));
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
 
 	for (auto* file: {g_files.summary, g_files.apr, g_files.imports, g_files.imports_index,
-	                  g_files.lod, g_files.tex, g_files.modules, g_files.queues}) {
+	                  g_files.lod, g_files.tex, g_files.modules, g_files.queues, g_files.readbacks,
+	                  g_files.images, g_files.lodwatch}) {
 		if (file != nullptr) {
 			std::fflush(file);
 		}
@@ -511,7 +618,19 @@ void Initialize() {
 		                              "{0}_slices,{0}_incomplete",
 		                              q);
 	}
+	summary_header += ",readbacks,readback_us,readback_downloads,image_frees,native_creates,"
+	                  "native_create_bytes";
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
+	g_files.readbacks = OpenFile("readbacks.csv",
+	                             "t_ms,kind,vaddr,size,window_begin,window_size,downloaded,"
+	                             "duration_us,host_tid,thread,pc,stack_callers");
+	g_files.lodwatch  = OpenFile("lodwatch.csv",
+	                             "t_ms,report_seq,fault_vaddr,report_offset,access,pc,thread,"
+	                             "rax,rbx,rcx,rdx,rsi,rdi,rbp,rsp,r8,r9,r10,r11,r12,r13,r14,r15,"
+	                             "code_file,stack_callers");
+	g_files.images    = OpenFile("images.csv",
+	                             "t_ms,event,address,age_ticks,width,height,levels,layers,reason,"
+	                             "format,usage,count,bytes");
 	g_files.apr     = OpenFile("apr.csv",
 	                           "t_ms,host_tid,thread,file_id,offset,size,destination,bytes_read,"
 	                               "result,repeat_count,first_seen_ms,previous_destination,path,"
@@ -543,13 +662,15 @@ void Initialize() {
 }
 
 void Shutdown() {
+	DisarmLodReportWatch();
 	if (g_publisher.joinable()) {
 		g_publisher.request_stop();
 		g_publisher.join();
 		Publish();
 	}
 	for (auto** file: {&g_files.summary, &g_files.apr, &g_files.imports, &g_files.imports_index,
-	                   &g_files.lod, &g_files.tex, &g_files.modules, &g_files.queues}) {
+	                   &g_files.lod, &g_files.tex, &g_files.modules, &g_files.queues,
+	                   &g_files.readbacks, &g_files.images, &g_files.lodwatch}) {
 		if (*file != nullptr) {
 			std::fclose(*file);
 			*file = nullptr;
@@ -707,6 +828,126 @@ void RecordLodStats(const void* destination, uint32_t size, uint32_t control) {
 	g_pending_lod_rows.push_back(std::move(row));
 }
 
+namespace {
+
+bool LodWatchEnabled() {
+	static const bool enabled = Enabled() && EnvFlag("KYTY_HANG_TRACE_LOD_WATCH", true);
+	return enabled;
+}
+
+// Caller holds g_watch_mutex.
+void RestoreWatchedPagesLocked() {
+#ifdef _WIN32
+	for (const auto& watched: g_watched_pages) {
+		DWORD old = 0;
+		VirtualProtect(reinterpret_cast<void*>(watched.page), 0x1000, watched.protect, &old);
+	}
+#endif
+	g_watched_pages.clear();
+}
+
+} // namespace
+
+void DisarmLodReportWatch() {
+	if (!LodWatchEnabled()) {
+		return;
+	}
+	std::scoped_lock lock(g_watch_mutex);
+	RestoreWatchedPagesLocked();
+}
+
+void ArmLodReportWatch(const void* destination, uint32_t size) {
+#ifdef _WIN32
+	if (!LodWatchEnabled() || destination == nullptr || size == 0) {
+		return;
+	}
+	std::scoped_lock lock(g_watch_mutex);
+	const auto call = g_watch_calls++;
+	// Skip the first reports (boot/menu) and then sample sparsely.
+	if (call < 1024 || (call % kLodWatchInterval) != 0 || g_watch_arms >= kLodWatchMaxArms) {
+		return;
+	}
+	RestoreWatchedPagesLocked();
+	const auto begin = reinterpret_cast<uint64_t>(destination);
+	const auto end   = begin + size;
+	std::vector<WatchedPage> pages;
+	for (uint64_t page = begin & ~uint64_t {0xfff}; page < end; page += 0x1000) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(page), &info, sizeof(info)) == 0 ||
+		    info.State != MEM_COMMIT || info.Protect != PAGE_READWRITE) {
+			// GPU-tracked or unusual pages keep their protection untouched.
+			return;
+		}
+		pages.push_back({page, info.Protect});
+	}
+	for (const auto& watched: pages) {
+		DWORD old = 0;
+		if (VirtualProtect(reinterpret_cast<void*>(watched.page), 0x1000, PAGE_NOACCESS, &old) == 0) {
+			RestoreWatchedPagesLocked();
+			return;
+		}
+		g_watched_pages.push_back(watched);
+	}
+	g_watch_report_begin = begin;
+	g_watch_report_end   = end;
+	g_watch_report_seq   = call;
+	g_watch_arms++;
+#else
+	(void)destination;
+	(void)size;
+#endif
+}
+
+bool HandleLodWatchFault(uint64_t fault_vaddr, bool write, uint64_t pc, const uint64_t* gpr16,
+                         std::string_view thread_name) {
+#ifdef _WIN32
+	if (!LodWatchEnabled()) {
+		return false;
+	}
+	std::string code_file;
+	std::scoped_lock lock(g_watch_mutex);
+	const auto page = fault_vaddr & ~uint64_t {0xfff};
+	const bool hit  = std::any_of(g_watched_pages.begin(), g_watched_pages.end(),
+	                              [page](const WatchedPage& w) { return w.page == page; });
+	if (!hit) {
+		return false;
+	}
+	// One access is enough per arming: restore every page so the guest continues untouched.
+	RestoreWatchedPagesLocked();
+	if (std::find(g_watch_seen_pcs.begin(), g_watch_seen_pcs.end(), pc) == g_watch_seen_pcs.end() &&
+	    g_watch_seen_pcs.size() < 64) {
+		g_watch_seen_pcs.push_back(pc);
+		const auto code_begin = pc - kLodWatchCodeHalf;
+		if (IsExecutablePage(code_begin) && IsExecutablePage(pc) &&
+		    IsExecutablePage(pc + kLodWatchCodeHalf - 1)) {
+			code_file = fmt::format("lodwatch-code-{:x}.bin", pc);
+			if (auto* f = std::fopen((g_dir / code_file).string().c_str(), "wb"); f != nullptr) {
+				std::fwrite(reinterpret_cast<const void*>(code_begin), 1, 2 * kLodWatchCodeHalf, f);
+				std::fclose(f);
+			}
+		}
+	}
+	const bool in_report = fault_vaddr >= g_watch_report_begin && fault_vaddr < g_watch_report_end;
+	std::string regs;
+	for (int i = 0; i < 16; i++) {
+		regs += fmt::format(",0x{:x}", gpr16[i]);
+	}
+	g_pending_watch_rows.push_back(fmt::format(
+	    "{},{},0x{:x},{},{},{},{}{},{},{}", NowMs(), g_watch_report_seq, fault_vaddr,
+	    in_report ? static_cast<int64_t>(fault_vaddr - g_watch_report_begin) : int64_t {-1},
+	    write ? "write" : "read", FormatAddress(pc), CsvEscape(thread_name), regs, code_file,
+	    CsvEscape(CaptureGuestCallers())));
+	return true;
+#else
+	(void)fault_vaddr;
+	(void)write;
+	(void)pc;
+	(void)gpr16;
+	(void)thread_name;
+	return false;
+#endif
+}
+
 void RecordTexture(const uint32_t* fields) {
 	if (!Enabled()) {
 		return;
@@ -727,6 +968,88 @@ void RecordTexture(const uint32_t* fields) {
 	g_tex_base[id].store(base, std::memory_order_relaxed);
 	g_tex_info[id].store(min_lod | (min_lod_warn << 12u) | (base_level << 24u) | (last_level << 28u),
 	                     std::memory_order_relaxed);
+}
+
+void SetFaultContext(uint64_t pc, std::string_view thread_name) {
+	g_fault_context.pc = pc;
+	const auto n       = std::min(thread_name.size(), sizeof(g_fault_context.thread) - 1);
+	std::memcpy(g_fault_context.thread, thread_name.data(), n);
+	g_fault_context.thread[n] = '\0';
+}
+
+void ClearFaultContext() {
+	g_fault_context.pc        = 0;
+	g_fault_context.thread[0] = '\0';
+	g_readback_kind           = ReadbackKind::Invalidate;
+}
+
+void SetReadbackKind(ReadbackKind kind) {
+	g_readback_kind = kind;
+}
+
+void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64_t window_size,
+                    bool downloaded, uint64_t duration_ns) {
+	if (!Enabled()) {
+		return;
+	}
+	g_totals.readbacks.fetch_add(1, std::memory_order_relaxed);
+	g_totals.readback_ns.fetch_add(duration_ns, std::memory_order_relaxed);
+	if (downloaded) {
+		g_totals.readback_downloads.fetch_add(1, std::memory_order_relaxed);
+	}
+	const auto kind   = g_readback_kind;
+	const bool fault  = kind == ReadbackKind::FaultRead || kind == ReadbackKind::FaultWrite;
+	const auto pc     = fault && g_fault_context.pc != 0 ? FormatAddress(g_fault_context.pc) : std::string();
+	const auto thread = fault ? std::string_view(g_fault_context.thread) : std::string_view();
+	// Stack scanning only helps when a guest thread is on this stack (CPU faults).
+	const auto callers = fault ? CaptureGuestCallers() : std::string();
+	auto row = fmt::format("{},{},0x{:x},{},0x{:x},{},{},{},{},{},{},{}", NowMs(),
+	                       kReadbackKindNames[static_cast<uint32_t>(kind)], vaddr, size, window_begin,
+	                       window_size, downloaded ? 1 : 0, duration_ns / 1000u, OsThreadId(),
+	                       CsvEscape(thread), pc, CsvEscape(callers));
+	std::scoped_lock lock(g_readback_mutex);
+	if (g_readback_rows_total >= kReadbackRowLimit) {
+		return;
+	}
+	g_readback_rows_total++;
+	g_pending_readback_rows.push_back(std::move(row));
+}
+
+void SetImageFreeReason(ImageFreeReason reason) {
+	g_image_free_reason = reason;
+}
+
+void RecordImageFree(uint64_t address, uint32_t width, uint32_t height, uint32_t levels,
+                     uint32_t layers, uint32_t format, uint64_t bytes, uint64_t age_ticks) {
+	if (!Enabled()) {
+		return;
+	}
+	g_totals.image_frees.fetch_add(1, std::memory_order_relaxed);
+	const auto reason = g_image_free_reason;
+	auto row = fmt::format("{},free,0x{:x},{},{},{},{},{},{},{},,1,{}", NowMs(), address, age_ticks,
+	                       width, height, levels, layers,
+	                       kImageFreeReasonNames[static_cast<uint32_t>(reason)], format, bytes);
+	std::scoped_lock lock(g_image_mutex);
+	if (g_image_rows_total >= kImageRowLimit) {
+		return;
+	}
+	g_image_rows_total++;
+	g_pending_image_rows.push_back(std::move(row));
+}
+
+void RecordNativeImage(bool create, bool pool_hit, uint32_t format, uint32_t width, uint32_t height,
+                       uint32_t levels, uint32_t usage, uint64_t bytes) {
+	if (!Enabled()) {
+		return;
+	}
+	if (create) {
+		g_totals.native_creates.fetch_add(1, std::memory_order_relaxed);
+		g_totals.native_create_bytes.fetch_add(bytes, std::memory_order_relaxed);
+	}
+	std::scoped_lock lock(g_image_mutex);
+	auto& totals = g_native_images[NativeImageKey {create, pool_hit, format, width, height, levels, usage}];
+	totals.count++;
+	totals.bytes += bytes;
 }
 
 void RecordQueueWait(uint32_t queue, uint64_t wait_ns) {

@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/hangTrace.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -380,6 +381,15 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
+	if (HangTrace::Enabled()) {
+		const auto tick = m_scheduler.CurrentTick();
+		HangTrace::RecordImageFree(image->info.data.address, image->info.extent.width,
+		                           image->info.extent.height, image->info.resources.levels,
+		                           image->info.resources.layers,
+		                           static_cast<uint32_t>(image->backing.format), image->info.data.size,
+		                           tick - std::min(tick, image->tick_accessed_last));
+		HangTrace::SetImageFreeReason(HangTrace::ImageFreeReason::Other);
+	}
 	if (!image->depth_id) {
 		std::vector<ImageId> associations;
 		m_slot_images.ForEach([&](ImageId candidate, const Image& associated) {
@@ -388,7 +398,7 @@ void TextureCache::DeleteImage(ImageId id) {
 			}
 		});
 		for (const auto association: associations) {
-			FreeImage(association);
+			FreeImage(association, HangTrace::ImageFreeReason::DepthAssociation);
 		}
 	}
 	if (image->IsGpuModified()) {
@@ -423,7 +433,8 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 }
 
-void TextureCache::FreeImage(ImageId id) {
+void TextureCache::FreeImage(ImageId id, HangTrace::ImageFreeReason reason) {
+	HangTrace::SetImageFreeReason(reason);
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
@@ -904,7 +915,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
 	}
-	FreeImage(cached_id);
+	FreeImage(cached_id, HangTrace::ImageFreeReason::DepthRecreate);
 	return replacement_id;
 }
 
@@ -940,7 +951,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		    (requested.resources == cached.info.resources &&
 		     requested.mip_layout != cached.info.mip_layout)) {
 			if (safe_to_delete) {
-				FreeImage(cached_id);
+				FreeImage(cached_id, HangTrace::ImageFreeReason::OverlapLayout);
 			}
 			return {merged_id};
 		}
@@ -999,11 +1010,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
-		FreeImage(cached_id);
+		FreeImage(cached_id, HangTrace::ImageFreeReason::OverlapMipMerge);
 		return {merged_id};
 	}
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
-		FreeImage(cached_id);
+		FreeImage(cached_id, HangTrace::ImageFreeReason::OverlapStale);
 	}
 	return {merged_id};
 }
@@ -1026,7 +1037,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	} else {
 		CopyImage(expanded_id, source_id);
 	}
-	FreeImage(source_id);
+	FreeImage(source_id, HangTrace::ImageFreeReason::Expand);
 	return expanded_id;
 }
 
@@ -1615,7 +1626,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
-				FreeImage(result);
+				FreeImage(result, HangTrace::ImageFreeReason::SmallerResources);
 				result = {};
 			}
 		}
@@ -2364,7 +2375,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
-		FreeImage(id);
+		FreeImage(id, HangTrace::ImageFreeReason::Unmap);
 	}
 }
 
@@ -2422,7 +2433,7 @@ void TextureCache::RunGarbageCollector() {
 					continue;
 				}
 			}
-			FreeImage(id);
+			FreeImage(id, HangTrace::ImageFreeReason::GarbageCollect);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
@@ -2486,7 +2497,7 @@ void TextureCache::RunPressureGarbageCollector(uint64_t tick) {
 			}
 		}
 		const auto before = m_total_used_memory;
-		FreeImage(id);
+		FreeImage(id, HangTrace::ImageFreeReason::PressureCollect);
 		const auto accounted = before - m_total_used_memory;
 		reclaimed_bytes += accounted;
 		++deletions;

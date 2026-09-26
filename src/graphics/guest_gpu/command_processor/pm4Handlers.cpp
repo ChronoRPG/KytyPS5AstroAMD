@@ -1374,6 +1374,7 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	auto*      dst         = reinterpret_cast<void*>((buffer[1] & 0xffffffc0u) |
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
+	HangTrace::DisarmLodReportWatch();
 	HangTrace::RecordLodStats(dst, buffer_size, buffer[3]);
 
 	// KYTY_LOD_STATS_MODE (diagnostic A/B switch, read once):
@@ -1406,6 +1407,7 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 			*label      = 1;
 		}
 	}
+	HangTrace::ArmLodReportWatch(dst, buffer_size);
 
 	return 4;
 }

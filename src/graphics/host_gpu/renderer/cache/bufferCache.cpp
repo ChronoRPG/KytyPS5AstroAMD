@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
@@ -254,7 +255,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	const auto trace_start    = HangTrace::Enabled() ? HangTrace::NowNs() : 0;
+	bool       trace_download = false;
+	uint64_t   trace_begin    = 0;
+	uint64_t   trace_size     = 0;
+	m_scheduler.Context().GetGpu().SendCommandSync([&, this, vaddr, size, is_write] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -267,7 +272,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
+		trace_begin = window_begin;
+		trace_size  = window_end - window_begin;
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+			trace_download  = true;
 			const auto tick = m_scheduler.CurrentTick();
 			m_scheduler.Wait(tick);
 			m_scheduler.WaitPriorityOperations(tick);
@@ -277,6 +285,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
 	});
+	if (HangTrace::Enabled()) {
+		HangTrace::RecordReadback(vaddr, size, trace_begin, trace_size, trace_download,
+		                          HangTrace::NowNs() - trace_start);
+	}
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {

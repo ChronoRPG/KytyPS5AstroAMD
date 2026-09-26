@@ -867,7 +867,30 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+		if (HangTrace::Enabled()) {
+			char fault_thread[32] = "(host thread)";
+			if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+				char name[64] {};
+				if (Libs::LibKernel::PthreadGetname(self, name) == 0) {
+					std::snprintf(fault_thread, sizeof(fault_thread), "%s", name);
+				}
+			}
+			const uint64_t gpr[16] = {info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi,
+			                          info->rbp, info->rsp, info->r8,  info->r9,  info->r10, info->r11,
+			                          info->r12, info->r13, info->r14, info->r15};
+			if (HangTrace::HandleLodWatchFault(info->access_violation_vaddr, access == GpuAccess::Write,
+			                                   info->exception_address, gpr, fault_thread)) {
+				return true;
+			}
+			HangTrace::SetFaultContext(info->exception_address, fault_thread);
+			HangTrace::SetReadbackKind(access == GpuAccess::Write ? HangTrace::ReadbackKind::FaultWrite
+			                                                      : HangTrace::ReadbackKind::FaultRead);
+		}
+		const bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+		if (HangTrace::Enabled()) {
+			HangTrace::ClearFaultContext();
+		}
+		if (handled) {
 			return true;
 		}
 	}

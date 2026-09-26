@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
@@ -105,7 +106,9 @@ bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) 
 	if (m_buffer_cache.HasGpuDirtyBytes(vaddr, size)) {
 		// Retain the CPU fault path's canonical-buffer discovery, clipped readback window,
 		// actual backing copy, and dirty-page ownership transition.
+		HangTrace::SetReadbackKind(HangTrace::ReadbackKind::GpuSync);
 		m_buffer_cache.ReadMemory(vaddr, size);
+		HangTrace::SetReadbackKind(HangTrace::ReadbackKind::Invalidate);
 	}
 	// A publication may already have finished since the failed strict read. Such a range is
 	// ready too; callers still retry the actual read and bound their preparation retries.

@@ -15,6 +15,7 @@
 #endif
 
 #include "common/assert.h"
+#include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -198,6 +199,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		Profiler::CountFrameEvent(image.image != nullptr ? Profiler::FrameEvent::NativeImagePoolHits
 		                                                 : Profiler::FrameEvent::NativeImagePoolMisses);
 	}
+	const bool pool_hit = image.image != nullptr;
 	if (image.image == nullptr) {
 		VmaAllocationCreateInfo alloc_info {};
 		alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -226,6 +228,15 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		}
 	}
 
+	if (HangTrace::Enabled()) {
+		VmaAllocationInfo allocation_info {};
+		vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
+		HangTrace::RecordNativeImage(true, pool_hit, static_cast<uint32_t>(image_info.format),
+		                             image_info.extent.width, image_info.extent.height,
+		                             image_info.mipLevels, static_cast<uint32_t>(image_info.usage),
+		                             static_cast<uint64_t>(allocation_info.size));
+	}
+
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
 	image.extent     = image_info.extent;
@@ -249,6 +260,14 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	// This is the existing destruction boundary: Image's views are already destroyed,
 	// and TextureCache's deferred callback has waited for native completion/publication.
 	// Only native storage is retained; no guest address, content-validity or view survives.
+	if (HangTrace::Enabled()) {
+		VmaAllocationInfo allocation_info {};
+		vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
+		HangTrace::RecordNativeImage(false, false, static_cast<uint32_t>(image.format),
+		                             image.extent.width, image.extent.height, image.mip_levels,
+		                             static_cast<uint32_t>(image.usage),
+		                             static_cast<uint64_t>(allocation_info.size));
+	}
 	bool retained = false;
 	if (image.pool_eligible && NativeImagePoolEnabled()) {
 		const bool pressure = CanReportMemoryUsage() && GetDeviceMemoryUsage() >= GetTotalMemoryBudget();
