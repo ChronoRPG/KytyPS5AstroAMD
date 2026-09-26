@@ -29,6 +29,17 @@ bool LodStatsCounter::Enabled() {
 	return enabled;
 }
 
+// After a report's GPU copy completes, rewrite its guest slot with that packet's own interval
+// (hardware semantics) when the guest has not touched it yet. KYTY_LOD_REPORT_COMPLETION_WRITE=0
+// keeps only the record-time write of older statistics (U26-U32 behaviour).
+bool LodStatsCounter::CompletionWriteEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LOD_REPORT_COMPLETION_WRITE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 LodStatsCounter::LodStatsCounter(RenderContext& context): m_context(context) {}
 
 LodStatsCounter::~LodStatsCounter() = default;
@@ -61,9 +72,11 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 	// The guest may read this report as soon as the packet is recorded (EOP labels are written at
 	// record time). Write the newest completed statistics now; until the first GPU copy has
 	// completed, write an unready report ("no data yet").
-	if (destination != 0 && size >= ReportSize) {
-		std::array<uint8_t, ReportSize> report {};
-		HangTrace::LodReportEvent       event;
+	const bool writes_report = destination != 0 && size >= ReportSize;
+	auto       record_time_report = std::make_shared<std::array<uint8_t, ReportSize>>();
+	if (writes_report) {
+		auto&                     report = *record_time_report;
+		HangTrace::LodReportEvent event;
 		{
 			std::scoped_lock lock(m_latest_mutex);
 			if (m_has_latest) {
@@ -124,12 +137,47 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 	}
 	m_slot_ticks[m_issued % PublishSlots] = scheduler.CurrentTick();
 	++m_issued;
-	scheduler.DeferOperation([this, slot_offset] {
+	const bool completion_write = writes_report && CompletionWriteEnabled();
+	scheduler.DeferOperation([this, slot_offset, destination, completion_write,
+	                          record_time_report, control] {
 		m_publish->Invalidate(slot_offset, CounterBytes);
 		const auto* words = reinterpret_cast<const uint32_t*>(m_publish->Mapped().data() + slot_offset);
 		std::array<uint8_t, ReportSize> report {};
 		const uint32_t valid = 1;
 		std::memcpy(report.data(), &valid, sizeof(valid));
+		if (completion_write) {
+			// This packet's own interval is now known. The record-time write had to use older
+			// statistics; replace them with what hardware writes at this packet, unless the guest
+			// has already consumed or rewritten the slot (then a late write would look new).
+			std::array<uint8_t, ReportSize> exact = report;
+			uint32_t                        exact_sampled = 0;
+			for (uint32_t counter = 0; counter < Counters; counter++) {
+				const auto count = words[Entries + counter];
+				uint64_t   entry = NoData;
+				if (count != 0) {
+					entry = (uint64_t {std::min<uint32_t>(words[counter], 14u)} << 56u) |
+					        std::min<uint32_t>(count, 0xffffffu);
+					exact_sampled++;
+				}
+				std::memcpy(exact.data() + 64 + counter * sizeof(uint64_t), &entry, sizeof(entry));
+			}
+			std::array<uint8_t, ReportSize> current {};
+			const bool unchanged =
+			    LibKernel::Memory::TryReadBacking(destination, current.data(), current.size()) &&
+			    current == *record_time_report;
+			if (unchanged) {
+				(void)LibKernel::Memory::TryWriteBacking(destination, exact.data(), exact.size());
+			}
+			if (HangTrace::Enabled()) {
+				HangTrace::LodReportEvent event;
+				event.destination      = destination;
+				event.control          = control;
+				event.has_latest       = unchanged; // completion rows: 1 = slot rewritten
+				event.sampled_counters = exact_sampled;
+				event.pending_copies   = ~0ull;     // marks a completion row
+				HangTrace::RecordLodReport(event);
+			}
+		}
 		std::scoped_lock lock(m_latest_mutex);
 		uint32_t sampled      = 0;
 		uint64_t samples      = 0;

@@ -690,7 +690,7 @@ void Initialize() {
 	                             "last_gpu_write_age_ms,last_gpu_write_size");
 	g_files.occlusion = OpenFile("occlusion.csv",
 	                             "t_ms,event,address,value,scopes,width,height,colors,has_depth,"
-	                             "depth_format,depth_address,condition,skip");
+	                             "depth_format,depth_address,condition,skip,detail");
 	g_files.lodreports = OpenFile("lodreports.csv",
 	                              "t_ms,destination,control,has_latest,sampled_counters,"
 	                              "total_samples,mean_finest_mip,pending_copies");
@@ -1120,10 +1120,11 @@ void RecordOcclusion(const OcclusionEvent& event) {
 	if (!Enabled()) {
 		return;
 	}
-	auto row = fmt::format("{},{},0x{:x},{},{},{},{},{},{},{},0x{:x},{},{}", NowMs(), event.event,
+	auto row = fmt::format("{},{},0x{:x},{},{},{},{},{},{},{},0x{:x},{},{},{}", NowMs(), event.event,
 	                       event.address, event.value, event.scopes, event.width, event.height,
 	                       event.colors, event.has_depth ? 1 : 0, event.depth_format,
-	                       event.depth_address, event.condition, event.skip ? 1 : 0);
+	                       event.depth_address, event.condition, event.skip ? 1 : 0,
+	                       CsvEscape(event.detail));
 	std::scoped_lock lock(g_occlusion_mutex);
 	if (g_occlusion_rows_total >= kOcclusionRowLimit) {
 		return;

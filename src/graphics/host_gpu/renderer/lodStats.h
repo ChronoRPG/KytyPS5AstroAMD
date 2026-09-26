@@ -35,6 +35,7 @@ public:
 	~LodStatsCounter();
 
 	[[nodiscard]] static bool Enabled();
+	[[nodiscard]] static bool CompletionWriteEnabled();
 	// The device-local counter buffer bound to instrumented shaders.
 	[[nodiscard]] Buffer& CounterBuffer();
 	// Records a report at the current command position. Must be outside rendering.

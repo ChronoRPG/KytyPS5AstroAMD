@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -40,6 +41,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1399,6 +1401,34 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		EmitIndirectDraw(vk_buffer, *indirect, indirect_buffers);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+	}
+	static const bool occlusion_draw_rows = [] {
+		const char* value = std::getenv("KYTY_HANG_TRACE_OCCLUSION_DRAWS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (occlusion_draw_rows && HangTrace::Enabled() && m_context.GetOcclusionCounter().Active()) {
+		// Occlusion diagnostics: the state deciding whether this draw's samples pass.
+		const auto&               regs = buffer.GetRegisters();
+		const auto&               vp   = regs.GetScreenViewport().viewports[0];
+		const auto&               mc   = regs.GetModeControl();
+		const auto&               di   = state.depth_info;
+		HangTrace::OcclusionEvent event;
+		event.event  = "draw";
+		event.value  = draw.index_count;
+		event.scopes = draw.instance_count;
+		event.colors = state.color_count;
+		event.has_depth = static_cast<bool>(di.image_id);
+		event.detail = fmt::format(
+		    "prim={} indexed={} mesh={} indirect={} ps={} zt={} zw={} zop={} db={}[{:g},{:g}] "
+		    "st={} cull={}{} face={} vp=[{:g},{:g}] zs={:g} zo={:g} vpxy={:g}x{:g}",
+		    static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed() ? 1 : 0,
+		    mesh_active ? 1 : 0, indirect != nullptr ? 1 : 0, state.ps_active ? 1 : 0,
+		    di.depth_test_enable ? 1 : 0, di.depth_write_enable ? 1 : 0,
+		    static_cast<uint32_t>(di.depth_compare_op), di.depth_bounds_test_enable ? 1 : 0,
+		    di.depth_min_bounds, di.depth_max_bounds, di.stencil_test_enable ? 1 : 0,
+		    mc.cull_front ? "F" : "", mc.cull_back ? "B" : "", mc.face ? 1 : 0, vp.zmin,
+		    vp.zmax, vp.zscale, vp.zoffset, vp.xscale, vp.yscale);
+		HangTrace::RecordOcclusion(event);
 	}
 
 	if (!draw.IsIndexed()) {

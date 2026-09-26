@@ -122,6 +122,7 @@ struct OcclusionEvent {
 	uint64_t    depth_address = 0;
 	uint32_t    condition    = 0;
 	bool        skip         = false;
+	std::string detail; // "draw" rows: state of a draw recorded inside a counted scope
 };
 void RecordOcclusion(const OcclusionEvent& event);
 
