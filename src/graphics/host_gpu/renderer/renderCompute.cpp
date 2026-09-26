@@ -399,6 +399,24 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// A proven uniform buffer fill leaves a known value (e.g. DCC fast-clear codes). Recording
+	// it lets consumers skip reading the range back while nothing else writes it.
+	{
+		ShaderBufferResource known_descriptor;
+		uint32_t             known_value = 0;
+		uint64_t             known_size  = 0;
+		const auto groups_x = use_thread_dimensions ? input_info.dispatch_threads_num[0]
+		                                           : thread_group_x;
+		if (ResolveComputeBufferFill(input_info, groups_x,
+		                             use_thread_dimensions ? input_info.dispatch_threads_num[1]
+		                                                   : thread_group_y,
+		                             use_thread_dimensions ? input_info.dispatch_threads_num[2]
+		                                                   : thread_group_z,
+		                             mode, known_descriptor, known_value, known_size)) {
+			m_context.GetBufferCache().RecordKnownFill(known_descriptor.Base48(), known_size,
+			                                           known_value);
+		}
+	}
 	// Observe only dispatches that actually reached the native path. This reuses the
 	// already materialized descriptor/value proof and performs no guest-memory reads.
 	if (Profiler::DetailedEnabled() && TracyIsConnected) {

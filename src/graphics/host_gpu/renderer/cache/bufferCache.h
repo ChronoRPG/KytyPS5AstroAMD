@@ -72,6 +72,12 @@ public:
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
+
+	// Recorded GPU fills whose result has not been overwritten since: a range written by a
+	// uniform-fill dispatch or FillBuffer, forgotten on any later GPU or CPU write to it. Lets
+	// consumers learn a fill value (e.g. a DCC clear code) without reading GPU memory back.
+	void RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value);
+	[[nodiscard]] std::optional<uint32_t> KnownFill(uint64_t vaddr, uint64_t size) const;
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
@@ -162,6 +168,15 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	struct KnownFillRange {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint32_t value   = 0;
+	};
+	void                                              ForgetKnownFills(uint64_t vaddr, uint64_t size);
+	void                                              ForgetKnownFillsLocked(uint64_t vaddr, uint64_t size);
+	mutable std::mutex                                m_known_fill_mutex;
+	std::vector<KnownFillRange>                       m_known_fills;
 	const bool                                        m_bda_incremental_sync;
 	MemoryTracker                                     m_memory_tracker;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};

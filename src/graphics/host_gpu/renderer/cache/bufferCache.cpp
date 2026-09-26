@@ -244,6 +244,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	ForgetKnownFills(vaddr, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
@@ -530,6 +531,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		// Writable descriptors reserve a new version before recording their shader commands.
 		buffer.MarkContentWritten();
 		m_gpu_modified_ranges.Add(vaddr, size);
+		ForgetKnownFills(vaddr, size);
 		HangTrace::NoteGpuWrite(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
@@ -587,6 +589,66 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	HangTrace::ScopedGpuWriteKind trace_kind(HangTrace::GpuWriteKind::Fill);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
+	RecordKnownFill(vaddr, size, value);
+}
+
+void BufferCache::RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value) {
+	if (size == 0) {
+		return;
+	}
+	std::scoped_lock lock(m_known_fill_mutex);
+	ForgetKnownFillsLocked(vaddr, size);
+	if (m_known_fills.size() >= 64) {
+		m_known_fills.erase(m_known_fills.begin());
+	}
+	m_known_fills.push_back({vaddr, size, value});
+}
+
+std::optional<uint32_t> BufferCache::KnownFill(uint64_t vaddr, uint64_t size) const {
+	// The range may be covered by several adjacent fills (e.g. per-slice consumption); all of
+	// them must carry the same value.
+	std::scoped_lock        lock(m_known_fill_mutex);
+	const uint64_t          end    = vaddr + size;
+	uint64_t                cursor = vaddr;
+	std::optional<uint32_t> value;
+	while (cursor < end) {
+		const auto covering =
+		    std::find_if(m_known_fills.begin(), m_known_fills.end(), [cursor](const KnownFillRange& fill) {
+			    return cursor >= fill.address && cursor < fill.address + fill.size;
+		    });
+		if (covering == m_known_fills.end() || (value && *value != covering->value)) {
+			return std::nullopt;
+		}
+		value  = covering->value;
+		cursor = covering->address + covering->size;
+	}
+	return value;
+}
+
+void BufferCache::ForgetKnownFills(uint64_t vaddr, uint64_t size) {
+	std::scoped_lock lock(m_known_fill_mutex);
+	ForgetKnownFillsLocked(vaddr, size);
+}
+
+void BufferCache::ForgetKnownFillsLocked(uint64_t vaddr, uint64_t size) {
+	// Keep the parts of each fill outside the written range.
+	const uint64_t              end = vaddr + size;
+	std::vector<KnownFillRange> kept;
+	kept.reserve(m_known_fills.size() + 1);
+	for (const auto& fill: m_known_fills) {
+		const uint64_t fill_end = fill.address + fill.size;
+		if (end <= fill.address || fill_end <= vaddr) {
+			kept.push_back(fill);
+			continue;
+		}
+		if (fill.address < vaddr) {
+			kept.push_back({fill.address, vaddr - fill.address, fill.value});
+		}
+		if (end < fill_end) {
+			kept.push_back({end, fill_end - end, fill.value});
+		}
+	}
+	m_known_fills.swap(kept);
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,

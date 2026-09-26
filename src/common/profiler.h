@@ -106,6 +106,7 @@ enum class FrameEvent : uint32_t {
 	NativeImagePoolMisses,
 	NativeImagePoolRetires,
 	NativeImagePoolAddedBytes,
+	DccKnownFillClears,
 	NativeImagePoolRemovedBytes,
 	TextureCleanProofHits,
 	TextureCleanProofMisses,

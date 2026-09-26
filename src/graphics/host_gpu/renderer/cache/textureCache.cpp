@@ -1365,6 +1365,37 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	uint64_t diagnostic_readback = 0;
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		// The guest's DCC fast clear is a uniform fill of the metadata. When the whole range still
+		// holds a recorded fill (nothing wrote it since), every slice's code is that byte: no
+		// GPU readback is needed to decide the clear.
+		const auto known = m_buffer_cache.KnownFill(range.address, range.size);
+		bool       unaliased = false;
+		if (known) {
+			std::scoped_lock lock {m_lock};
+			unaliased = FindImagesInRegion(range.address, range.size, false).empty();
+		}
+		const uint32_t known_byte = known ? (*known & 0xffu) : 0u;
+		if (known && unaliased && *known == known_byte * 0x01010101u) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DccKnownFillClears);
+			vk::ClearValue clear {};
+			if (!DecodeDccClear(desc, static_cast<uint8_t>(known_byte), clear.color)) {
+				return; // e.g. 0xFF: not a clear code, nothing to materialize
+			}
+			const auto slice_size = range.size / layers;
+			for (uint32_t slice = 0; slice < count; slice++) {
+				{
+					std::scoped_lock lock {m_lock};
+					ClearImage(m_scheduler.Current(), id, view.format,
+					           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
+					            image_first + slice, 1}, clear);
+				}
+				if (desc.type != BindingType::VideoOut) {
+					m_buffer_cache.FillBuffer(range.address + slice_size * (first + slice),
+					                          slice_size, UINT32_MAX, false);
+				}
+			}
+			return;
+		}
 		if (m_dcc_clear) {
 			++m_gpu_dcc_attempts;
 			const bool native = TryMaterializeGpuDccClear(id, desc, metadata_base_layer);

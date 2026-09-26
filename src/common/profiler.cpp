@@ -91,6 +91,7 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.NativeImagePoolMisses.Cumulative",
     "FrameEvent.NativeImagePoolRetires.Cumulative",
     "FrameEvent.NativeImagePoolAddedBytes.Cumulative",
+    "FrameEvent.DccKnownFillClears.Cumulative",
     "FrameEvent.NativeImagePoolRemovedBytes.Cumulative",
     "FrameEvent.TextureCleanProofHits.Cumulative",
     "FrameEvent.TextureCleanProofMisses.Cumulative",
