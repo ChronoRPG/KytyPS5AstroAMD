@@ -309,6 +309,7 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x311u, Opcode::V_PACK_B32_F16},
     {0x314u, Opcode::V_LSHLREV_B16},
     {0x319u, Opcode::V_SUBREV_I32},
+    {0x344u, Opcode::V_PERM_B32},
     {0x345u, Opcode::V_XAD_U32},
     {0x346u, Opcode::V_LSHL_ADD_U32},
     {0x347u, Opcode::V_ADD_LSHL_U32},

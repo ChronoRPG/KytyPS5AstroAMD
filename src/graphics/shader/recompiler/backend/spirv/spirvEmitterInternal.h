@@ -518,6 +518,23 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 	                                     std::forward<Fn>(fn));
 }
 
+// DS/BUFFER/IMAGE_ATOMIC_INC and _DEC replacement values.
+inline uint32_t AtomicIncrement(EmitterState& state, uint32_t old, uint32_t limit) {
+	// old >= limit ? 0 : old + 1 (unsigned).
+	const auto wrap = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), old, limit);
+	const auto next = Binary(state, spv::OpIAdd, TypeU32(state), old, ConstantU32(state, 1));
+	return Select(state, TypeU32(state), wrap, ConstantU32(state, 0), next);
+}
+
+inline uint32_t AtomicDecrement(EmitterState& state, uint32_t old, uint32_t limit) {
+	// old == 0 || old > limit ? limit : old - 1 (unsigned).
+	const auto zero  = Binary(state, spv::OpIEqual, TypeBool(state), old, ConstantU32(state, 0));
+	const auto above = Binary(state, spv::OpUGreaterThan, TypeBool(state), old, limit);
+	const auto wrap  = Binary(state, spv::OpLogicalOr, TypeBool(state), zero, above);
+	const auto next  = Binary(state, spv::OpISub, TypeU32(state), old, ConstantU32(state, 1));
+	return Select(state, TypeU32(state), wrap, limit, next);
+}
+
 template <typename Fn>
 uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
 	const auto scope  = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;

@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+
 #include <algorithm>
 #include <bit>
 
@@ -682,6 +684,23 @@ void DefineModule(EmitterState& state) {
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 	                               32u);
+	// FLOAT_MODE 0xC0 flushes f32 denormals (inputs and outputs) and keeps f16/f64 ones.
+	// Declare only what the device supports; otherwise host defaults stay in effect.
+	const auto float_controls = GetHostFloatControls();
+	const auto denorm_mode = [&](spv::ExecutionMode mode, spv::Capability capability,
+	                             uint32_t width) {
+		state.builder.RequireCapability(capability);
+		state.builder.AddExecutionMode(state.main_func, mode, width);
+	};
+	if (float_controls.denorm_flush_f32) {
+		denorm_mode(spv::ExecutionModeDenormFlushToZero, spv::CapabilityDenormFlushToZero, 32u);
+	}
+	if (float_controls.denorm_preserve_f16) {
+		denorm_mode(spv::ExecutionModeDenormPreserve, spv::CapabilityDenormPreserve, 16u);
+	}
+	if (float_controls.denorm_preserve_f64) {
+		denorm_mode(spv::ExecutionModeDenormPreserve, spv::CapabilityDenormPreserve, 64u);
+	}
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
 		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
 		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;

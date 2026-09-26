@@ -1,8 +1,24 @@
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 namespace {
+
+// KYTY_LDS_WAITCNT_BARRIER=0 restores the old behavior where S_WAITCNT never orders LDS.
+bool LdsWaitcntBarrierEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_LDS_WAITCNT_BARRIER");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+std::atomic_uint32_t g_lds_waitcnt_barriers {0};
 
 bool IsExecOrVcc(const Decoder::Operand& operand) {
 	switch (operand.kind) {
@@ -50,7 +66,8 @@ void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) 
 }
 
 void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation,
-                            bool negate_exec, bool negate_source, bool write_64) {
+                            bool negate_exec, bool negate_source, bool write_64,
+                            bool negate_result) {
 	if (!write_64) {
 		// Read the encoded scalar word and preserve EXEC_HI, including in wave32.
 		const auto old = ir.GetExecLo();
@@ -61,7 +78,11 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 		switch (operation) {
 			case IR::ValueOpcode::LogicalAnd: result = ir.BitwiseAnd(lhs, rhs); break;
 			case IR::ValueOpcode::LogicalOr: result = ir.BitwiseOr(lhs, rhs); break;
+			case IR::ValueOpcode::LogicalXor: result = ir.BitwiseXor(lhs, rhs); break;
 			default: EXIT("unsupported SAVEEXEC operation");
+		}
+		if (negate_result) {
+			result = ir.BitwiseNot(result);
 		}
 		WriteRawU32(inst.dst, old);
 		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecLo), result);
@@ -72,7 +93,10 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 	const auto src    = ReadMask(inst.src0);
 	const auto lhs    = negate_exec ? ir.LogicalNot(old) : old;
 	const auto rhs    = negate_source ? ir.LogicalNot(src) : src;
-	const auto result = IR::U1(ir.Emit(operation, {lhs, rhs}));
+	auto       result = IR::U1(ir.Emit(operation, {lhs, rhs}));
+	if (negate_result) {
+		result = ir.LogicalNot(result);
+	}
 	WriteMask(inst.dst, old, true);
 	const auto mask = BallotMask(result);
 	ir.SetExec(result);
@@ -185,8 +209,52 @@ void Translator::EmitWaitcnt() {
 	ir.Emit(IR::ValueOpcode::Waitcnt);
 }
 
+void Translator::S_WAITCNT(const Decoder::Instruction& inst) {
+	EmitWaitcnt();
+	if (!lds_write_pending || !LdsWaitcntBarrierEnabled()) {
+		return;
+	}
+	// LGKM_CNT is SIMM16[13:8] for S_WAITCNT; S_WAITCNT_LGKMCNT (SOPK 0x1a) waits for
+	// SGPR[SDST] + SIMM16[5:0], and compilers pass the NULL SGPR there.
+	bool lgkm_zero = false;
+	if (inst.family == Decoder::Family::SOPP) {
+		lgkm_zero = ((inst.src0.value >> 8u) & 0x3fu) == 0u;
+	} else if (inst.family == Decoder::Family::SOPK && inst.opcode_id == 0x1au) {
+		lgkm_zero = (inst.src0.value & 0x3fu) == 0u;
+	}
+	if (!lgkm_zero) {
+		return;
+	}
+	// On hardware the wave's LDS operations complete in order, so data written by one lane
+	// is visible to every lane after lgkmcnt(0). Host lanes of one guest wave may be separate
+	// invocations or subgroups; a workgroup memory barrier makes the writes visible.
+	ir.Emit(IR::ValueOpcode::SharedMemoryBarrier);
+	lds_write_pending = false;
+	if (g_lds_waitcnt_barriers.fetch_add(1u, std::memory_order_relaxed) == 0u) {
+		LOGF("Shader recompiler: ordering LDS writes at S_WAITCNT lgkmcnt(0) (shader 0x%016" PRIx64
+		     ", pc 0x%08x); KYTY_LDS_WAITCNT_BARRIER=0 disables\n",
+		     program.shader_hash, inst.pc);
+	}
+}
+
 void Translator::S_BARRIER() {
 	ir.Emit(IR::ValueOpcode::Barrier);
+	lds_write_pending = false;
+}
+
+void Translator::S_CMOV_B32(const Decoder::Instruction& inst) {
+	// S_CMOV_B32 / S_CMOVK_I32: D = SCC ? S0 : D. SCC is unchanged.
+	if (inst.dst.kind == Decoder::OperandKind::Null) {
+		return;
+	}
+	const auto value = ReadU32(inst.src0);
+	WriteOperand(inst.dst, ir.Select(ir.GetScc(), value, ReadU32(inst.dst)));
+}
+
+void Translator::S_SEXT_I32(const Decoder::Instruction& inst, uint32_t bits) {
+	const auto value = IR::U32(ir.Emit(IR::ValueOpcode::BitFieldSExtract,
+	                                   {ReadU32(inst.src0), IR::Value(0u), IR::Value(bits)}));
+	WriteOperand(inst.dst, value);
 }
 
 void Translator::S_SENDMSG(const Decoder::Instruction& inst) {

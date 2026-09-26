@@ -192,12 +192,18 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
 
 constexpr Detail::OpcodeMap MIMG_ATOMIC_OPCODE_LIST[] = {
     {0x0fu, Opcode::IMAGE_ATOMIC_SWAP},
+    {0x10u, Opcode::IMAGE_ATOMIC_CMPSWAP},
     {0x11u, Opcode::IMAGE_ATOMIC_ADD},
+    {0x12u, Opcode::IMAGE_ATOMIC_SUB},
+    {0x14u, Opcode::IMAGE_ATOMIC_SMIN},
     {0x15u, Opcode::IMAGE_ATOMIC_UMIN},
+    {0x16u, Opcode::IMAGE_ATOMIC_SMAX},
     {0x17u, Opcode::IMAGE_ATOMIC_UMAX},
     {0x18u, Opcode::IMAGE_ATOMIC_AND},
     {0x19u, Opcode::IMAGE_ATOMIC_OR},
     {0x1au, Opcode::IMAGE_ATOMIC_XOR},
+    {0x1bu, Opcode::IMAGE_ATOMIC_INC},
+    {0x1cu, Opcode::IMAGE_ATOMIC_DEC},
 };
 
 constexpr auto MIMG_SAMPLE_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_SAMPLE_OPCODE_LIST);
@@ -332,6 +338,8 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.data_dwords        = d16 ? (inst.data_components + 1u) / 2u : inst.data_components;
 	inst.glc                = ((word0 >> 13u) & 1u) != 0;
 	inst.slc                = ((word0 >> 25u) & 1u) != 0;
+	inst.tfe                = ((word0 >> 16u) & 1u) != 0;
+	inst.lwe                = ((word0 >> 17u) & 1u) != 0;
 	inst.image_sample_flags = DecodeMimgSampleFlags(sample, gather);
 	if (a16) {
 		inst.image_sample_flags |= ImageSampleFlagA16;

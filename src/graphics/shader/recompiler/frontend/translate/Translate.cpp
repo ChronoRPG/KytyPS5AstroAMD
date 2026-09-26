@@ -836,7 +836,8 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 	    inst.family == Decoder::Family::MUBUF || inst.family == Decoder::Family::MTBUF ||
 	    inst.family == Decoder::Family::FLAT || inst.family == Decoder::Family::DS ||
 	    inst.family == Decoder::Family::MIMG;
-	include_vector(inst.dst, memory_family ? std::max(inst.data_dwords, 1u) : 1u);
+	const uint32_t status_dwords = inst.tfe || inst.lwe ? 1u : 0u;
+	include_vector(inst.dst, memory_family ? std::max(inst.data_dwords, 1u) + status_dwords : 1u);
 	include_vector(inst.dst2);
 	include_vector(inst.src0);
 	include_vector(inst.src1);
@@ -1240,9 +1241,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                      builtin(IR::StageInputKind::InstanceIndex));
 		}
 	}
+	bool lds_write_pending = false;
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit);
+		// Blocks are visited in address order; keep unordered LDS writes pending across
+		// fallthrough splits so a later S_WAITCNT lgkmcnt(0) still orders them.
+		translator.SetLdsWritePending(lds_write_pending);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {
@@ -1266,6 +1271,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			translator.TranslateInstruction(instruction);
 		}
 		translator.AddBranchCondition(cfg_block, result.block_info[typed_index]);
+		lds_write_pending = translator.LdsWritePending();
 	}
 	IR::ValidateProgram(result, false);
 	return result;

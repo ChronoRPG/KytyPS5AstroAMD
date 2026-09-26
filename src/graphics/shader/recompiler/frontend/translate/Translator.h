@@ -16,6 +16,9 @@ public:
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	void AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info);
+	// LDS writes not yet ordered by a barrier; carried across blocks in program order.
+	[[nodiscard]] bool LdsWritePending() const { return lds_write_pending; }
+	void               SetLdsWritePending(bool pending) { lds_write_pending = pending; }
 
 private:
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);
@@ -94,6 +97,7 @@ private:
 	bool IMAGE_STORE(const Decoder::Instruction& inst);
 	bool IMAGE_SAMPLE(const Decoder::Instruction& inst);
 	bool IMAGE_GATHER(const Decoder::Instruction& inst);
+	void WriteFetchStatus(const Decoder::Instruction& inst, const IR::MemoryInfo& memory);
 	IR::Value LoadSharedU32(uint32_t width, IR::U32 address, const IR::MemoryInfo& memory,
 	                        uint32_t pc);
 	IR::Value ExtractSharedU32(IR::Value value, uint32_t width, uint32_t index);
@@ -211,13 +215,16 @@ private:
 	bool    V_LSHL_ADD_U32(const Decoder::Instruction& inst);
 	bool    V_ADD_LSHL_U32(const Decoder::Instruction& inst);
 	bool    V_XAD_U32(const Decoder::Instruction& inst);
+	bool    V_PERM_B32(const Decoder::Instruction& inst);
 	bool    V_LSHL_OR_B32(const Decoder::Instruction& inst);
 	bool    V_CNDMASK_B32(const Decoder::Instruction& inst);
 	bool    PackB16(const Decoder::Instruction& inst, bool high0, bool high1);
 
 	void S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin);
 	void S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation, bool negate_exec,
-	                bool negate_source, bool write_64);
+	                bool negate_source, bool write_64, bool negate_result = false);
+	void S_CMOV_B32(const Decoder::Instruction& inst);
+	void S_SEXT_I32(const Decoder::Instruction& inst, uint32_t bits);
 	void ADD_U32(const Decoder::Instruction& inst, bool vector, bool use_carry_in);
 	void SUB_U32(const Decoder::Instruction& inst, bool vector, bool reverse);
 	void SUBB_U32(const Decoder::Instruction& inst, bool vector, bool reverse);
@@ -228,6 +235,7 @@ private:
 	                    IR::ValueOpcode compare_opcode);
 	void EmitControlNop();
 	void EmitWaitcnt();
+	void S_WAITCNT(const Decoder::Instruction& inst);
 	void S_BARRIER();
 	void S_SENDMSG(const Decoder::Instruction& inst);
 	void S_TTRACEDATA();
@@ -260,6 +268,7 @@ private:
 	Decoder::Opcode current_opcode       = Decoder::Opcode::UNKNOWN;
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
+	bool            lds_write_pending    = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

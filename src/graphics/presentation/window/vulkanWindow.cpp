@@ -21,12 +21,14 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -490,6 +492,36 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	}
 }
 
+// Guest shaders flush f32 denormals and keep f16/f64 ones (FLOAT_MODE 0xC0). Tell the SPIR-V
+// emitter which float-control execution modes this device accepts. With independence NONE all
+// widths must share one mode, so nothing is declared there. KYTY_SHADER_FLOAT_CONTROLS=0
+// keeps the host defaults.
+static void ConfigureShaderFloatControls(const vk::PhysicalDeviceVulkan12Properties& properties) {
+	namespace Spirv = ShaderRecompiler::Spirv;
+	Spirv::HostFloatControls controls {};
+	const auto*              env     = std::getenv("KYTY_SHADER_FLOAT_CONTROLS");
+	const bool               enabled = env == nullptr || std::strcmp(env, "0") != 0;
+	const auto independence          = properties.denormBehaviorIndependence;
+	if (enabled && independence != vk::ShaderFloatControlsIndependence::eNone) {
+		controls.denorm_flush_f32 = properties.shaderDenormFlushToZeroFloat32 == VK_TRUE;
+		const bool preserve16     = properties.shaderDenormPreserveFloat16 == VK_TRUE;
+		const bool preserve64     = properties.shaderDenormPreserveFloat64 == VK_TRUE;
+		if (independence == vk::ShaderFloatControlsIndependence::eAll) {
+			controls.denorm_preserve_f16 = preserve16;
+			controls.denorm_preserve_f64 = preserve64;
+		} else {
+			// 32_BIT_ONLY: 16- and 64-bit types must share a mode.
+			controls.denorm_preserve_f16 = preserve16 && preserve64;
+			controls.denorm_preserve_f64 = preserve16 && preserve64;
+		}
+	}
+	Spirv::SetHostFloatControls(controls);
+	LOGF("Vulkan float controls: independence=%s ftz32=%s preserve16=%s preserve64=%s%s\n",
+	     vk::to_string(independence).c_str(), controls.denorm_flush_f32 ? "true" : "false",
+	     controls.denorm_preserve_f16 ? "true" : "false",
+	     controls.denorm_preserve_f64 ? "true" : "false", enabled ? "" : " (disabled by env)");
+}
+
 static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                 const std::vector<const char*>& device_extensions) {
 	const auto physical_device = graphics.physical_device;
@@ -591,13 +623,17 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceVulkan11Properties properties11 {};
 	properties11.pNext = &subgroup_size_control;
 
+	vk::PhysicalDeviceVulkan12Properties properties12 {};
+	properties12.pNext = &properties11;
+
 	vk::PhysicalDeviceProperties2 properties2 {};
-	properties2.pNext = &properties11;
+	properties2.pNext = &properties12;
 
 	if (graphics.mesh_shader_enabled) {
 		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
 	}
 	physical_device.getProperties2(&properties2);
+	ConfigureShaderFloatControls(properties12);
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;

@@ -7,10 +7,19 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 namespace {
+
+enum HostFloatControlBits : uint32_t {
+	DenormFlushF32    = 1u << 0u,
+	DenormPreserveF16 = 1u << 1u,
+	DenormPreserveF64 = 1u << 2u,
+};
+
+std::atomic_uint32_t g_host_float_controls {0};
 
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
@@ -321,6 +330,23 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 		}
 	}
 	return requirements;
+}
+
+void SetHostFloatControls(const HostFloatControls& controls) {
+	uint32_t bits = 0;
+	bits |= controls.denorm_flush_f32 ? DenormFlushF32 : 0u;
+	bits |= controls.denorm_preserve_f16 ? DenormPreserveF16 : 0u;
+	bits |= controls.denorm_preserve_f64 ? DenormPreserveF64 : 0u;
+	g_host_float_controls.store(bits, std::memory_order_relaxed);
+}
+
+HostFloatControls GetHostFloatControls() {
+	const auto bits = g_host_float_controls.load(std::memory_order_relaxed);
+	return {
+	    .denorm_flush_f32    = (bits & DenormFlushF32) != 0u,
+	    .denorm_preserve_f16 = (bits & DenormPreserveF16) != 0u,
+	    .denorm_preserve_f64 = (bits & DenormPreserveF64) != 0u,
+	};
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,

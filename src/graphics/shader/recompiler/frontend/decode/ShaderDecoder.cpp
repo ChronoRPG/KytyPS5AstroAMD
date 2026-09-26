@@ -79,6 +79,9 @@ std::string FormatMemory(const Instruction& inst) {
 	                    inst.typed ? 1u : 0u, inst.formatted ? 1u : 0u, inst.memory_segment,
 	                    inst.glc ? 1u : 0u, inst.dlc ? 1u : 0u, inst.slc ? 1u : 0u, inst.idxen ? 1u : 0u,
 	                    inst.offen ? 1u : 0u);
+	if (inst.tfe) {
+		text += " tfe=1";
+	}
 	return text;
 }
 
@@ -137,6 +140,12 @@ std::string FormatMimg(const Instruction& inst) {
 	}
 	if (inst.image_r128) {
 		text += " r128=1";
+	}
+	if (inst.tfe) {
+		text += " tfe=1";
+	}
+	if (inst.lwe) {
+		text += " lwe=1";
 	}
 	switch (inst.opcode) {
 		case Opcode::IMAGE_SAMPLE:
@@ -498,6 +507,10 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_MOV_B32:
 		case Opcode::S_MOV_B64:
 		case Opcode::S_CMOV_B64:
+		case Opcode::S_CMOV_B32:
+		case Opcode::S_CMOVK_I32:
+		case Opcode::S_SEXT_I32_I8:
+		case Opcode::S_SEXT_I32_I16:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, {}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               OperandToString(inst.dst).c_str(),
@@ -520,6 +533,20 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_AND_SAVEEXEC_B64:
 		case Opcode::S_ORN2_SAVEEXEC_B64:
 		case Opcode::S_ANDN1_SAVEEXEC_B64:
+		case Opcode::S_OR_SAVEEXEC_B32:
+		case Opcode::S_XOR_SAVEEXEC_B32:
+		case Opcode::S_ANDN2_SAVEEXEC_B32:
+		case Opcode::S_ORN1_SAVEEXEC_B32:
+		case Opcode::S_NAND_SAVEEXEC_B32:
+		case Opcode::S_NOR_SAVEEXEC_B32:
+		case Opcode::S_XNOR_SAVEEXEC_B32:
+		case Opcode::S_OR_SAVEEXEC_B64:
+		case Opcode::S_XOR_SAVEEXEC_B64:
+		case Opcode::S_ANDN2_SAVEEXEC_B64:
+		case Opcode::S_ORN1_SAVEEXEC_B64:
+		case Opcode::S_NAND_SAVEEXEC_B64:
+		case Opcode::S_NOR_SAVEEXEC_B64:
+		case Opcode::S_XNOR_SAVEEXEC_B64:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, {}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               OperandToString(inst.dst).c_str(),
@@ -543,6 +570,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_SENDMSG:
 		case Opcode::S_TTRACEDATA:
 		case Opcode::S_INST_PREFETCH:
+		case Opcode::S_CLAUSE:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               OperandToString(inst.src0).c_str()));
@@ -573,6 +601,12 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_STORE:
 		case Opcode::IMAGE_STORE_MIP:
 		case Opcode::IMAGE_ATOMIC_SWAP:
+		case Opcode::IMAGE_ATOMIC_CMPSWAP:
+		case Opcode::IMAGE_ATOMIC_SUB:
+		case Opcode::IMAGE_ATOMIC_SMIN:
+		case Opcode::IMAGE_ATOMIC_SMAX:
+		case Opcode::IMAGE_ATOMIC_INC:
+		case Opcode::IMAGE_ATOMIC_DEC:
 		case Opcode::IMAGE_ATOMIC_ADD:
 		case Opcode::IMAGE_ATOMIC_UMIN:
 		case Opcode::IMAGE_ATOMIC_UMAX:
@@ -644,6 +678,17 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_XOR:
 		case Opcode::BUFFER_ATOMIC_FMIN:
 		case Opcode::BUFFER_ATOMIC_FMAX:
+		case Opcode::BUFFER_ATOMIC_INC:
+		case Opcode::BUFFER_ATOMIC_DEC:
+		case Opcode::BUFFER_ATOMIC_CMPSWAP_X2:
+		case Opcode::BUFFER_ATOMIC_ADD_X2:
+		case Opcode::BUFFER_ATOMIC_SUB_X2:
+		case Opcode::BUFFER_ATOMIC_SMIN_X2:
+		case Opcode::BUFFER_ATOMIC_UMIN_X2:
+		case Opcode::BUFFER_ATOMIC_SMAX_X2:
+		case Opcode::BUFFER_ATOMIC_UMAX_X2:
+		case Opcode::BUFFER_ATOMIC_AND_X2:
+		case Opcode::BUFFER_ATOMIC_XOR_X2:
 		case Opcode::BUFFER_LOAD_SBYTE:
 		case Opcode::BUFFER_LOAD_SSHORT:
 		case Opcode::FLAT_LOAD_UBYTE:
