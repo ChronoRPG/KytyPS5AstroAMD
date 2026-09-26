@@ -483,6 +483,9 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 	       db.shader_dual_export_enable || db.shader_execute_on_noop;
 }
 
+// One per RenderExecutor, reused by every draw instead of being value-initialised (tens of KB)
+// each time. Reset() returns it to the value-initialised state for every field a draw reads
+// before writing: the fields below `programs` are bookkeeping for that.
 struct DrawRenderState {
 	RenderDepthInfo       depth_info;
 	RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
@@ -491,7 +494,36 @@ struct DrawRenderState {
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo  ps_input_info;
 	PipelineCache::GraphicsPrograms programs;
+	// Per-draw program preparation. The vertex_info/ps_input_info stage runtimes point into it;
+	// it is overwritten by the next preparation, and its vectors keep their capacity.
+	PipelineCache::GraphicsStagePreps stage_preps;
+	// color_info entries and vertex_info stages the current draw may have written.
+	uint32_t color_slots_written   = 0;
+	uint32_t vertex_stages_written = 0;
+
+	void Reset() {
+		depth_info = {};
+		for (uint32_t slot = 0; slot < color_slots_written; slot++) {
+			color_info[slot] = {};
+		}
+		color_slots_written = 0;
+		color_count         = 0;
+		ps_active           = true;
+		// PrepareProgram/PrepareTessellationPrograms value-initialise every stage they prepare,
+		// and a draw always prepares vertex_info[0]. Only the tessellation stages of an earlier
+		// draw can be left behind.
+		for (uint32_t stage = 1; stage < vertex_stages_written; stage++) {
+			vertex_info[stage] = {};
+		}
+		vertex_stages_written = 0;
+		// RefreshShaders resets ps_input_info and programs itself.
+	}
 };
+
+RenderExecutor::RenderExecutor(RenderContext& context)
+    : m_context(context), m_draw_state(std::make_unique<DrawRenderState>()) {}
+
+RenderExecutor::~RenderExecutor() = default;
 
 struct DrawCallInfo {
 	CommandBufferDebugOp debug_op       = CommandBufferDebugOp::DrawIndex;
@@ -926,9 +958,11 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
+	state.vertex_stages_written = PipelineCache::TessellationActive(buffer.GetUserConfig()) ? 3u : 1u;
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
+	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,
+	    state.stage_preps);
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -950,6 +984,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((mrt_mask & (1u << slot)) != 0) {
+			state.color_slots_written = std::max(state.color_slots_written, state.color_count + 1u);
 			ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
 			                         render_target_slice_offset, slot);
 			if (state.color_info[state.color_count].image_id) {
@@ -1326,7 +1361,9 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
-	DrawRenderState state {};
+	// The member state is reused; the render mutex held above makes it exclusive to this draw.
+	auto& state = *m_draw_state;
+	state.Reset();
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
@@ -1423,7 +1460,9 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		ResetBindings();
 		return;
 	}
-	DrawRenderState state {};
+	// The member state is reused; the render mutex held above makes it exclusive to this draw.
+	auto& state = *m_draw_state;
+	state.Reset();
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;

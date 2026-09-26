@@ -28,7 +28,10 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <nlohmann/json.hpp>
+#include <shared_mutex>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -643,7 +646,28 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 
 } // namespace
 
+struct PipelineCache::Permutation {
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	ShaderRecompiler::IR::CompiledShaderInfo     program;
+	ShaderProgram                                handle;
+	// Position in the owning source's PermutationList, fixed when it is published.
+	uint32_t                                     index = 0;
+};
+
+// Program preparation is split into a shared lookup (FindSource), a pure per-draw
+// materialization into caller-owned StagePrep (MaterializeStage), a lock-free permutation
+// lookup (FindPermutation) and an exclusive compile path (CompileAndPublish). Get composes them
+// serially. Invariants:
+// - `programs` nodes are never erased or moved, so a SourceEntry* stays valid for the cache
+//   lifetime. Finds take m_programs_mutex shared; inserts take it exclusively.
+// - A SourceEntry's plan, key and dependency list are immutable once inserted.
+// - Permutations are append-only with stable addresses (PermutationList).
+// - Only the O15 reuse state (KYTY_RESOURCE_REUSE) mutates an entry after insertion; it is
+//   guarded by m_reuse_mutex, which is taken before m_programs_mutex when both are needed.
 struct PipelineCache::ProgramCache {
+	using Permutation = PipelineCache::Permutation;
+	using StagePrep   = PipelineCache::StagePrep;
+
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
 		uint64_t              hash            = 0;
@@ -654,12 +678,58 @@ struct PipelineCache::ProgramCache {
 		bool operator==(const ProgramKey&) const = default;
 	};
 
-	struct Permutation {
-		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		ShaderRecompiler::IR::CompiledShaderInfo     program;
-		ShaderProgram                                handle;
+	// Append-only permutation storage whose entries never move. The first InlineCapacity
+	// entries are published without a lock: the writer (holding m_programs_mutex exclusively)
+	// fills the next slot and then release-stores the count, so a reader that acquire-loads the
+	// count may use every slot below it. Beyond that a source keeps growing in `overflow`,
+	// which, like the previous vector, is only accessed under m_programs_mutex.
+	class PermutationList {
+	public:
+		static constexpr uint32_t InlineCapacity = 16;
+
+		[[nodiscard]] uint32_t PublishedInline() const {
+			return m_published.load(std::memory_order_acquire);
+		}
+		[[nodiscard]] const Permutation& Inline(uint32_t index) const { return *m_inline[index]; }
+		// Requires m_programs_mutex (shared or exclusive).
+		[[nodiscard]] const std::vector<std::unique_ptr<Permutation>>& Overflow() const {
+			return m_overflow;
+		}
+		// Requires m_programs_mutex (shared or exclusive).
+		[[nodiscard]] size_t Size() const { return PublishedInline() + m_overflow.size(); }
+
+		// Requires m_programs_mutex exclusively.
+		const Permutation& Append(Permutation permutation) {
+			const auto published = m_published.load(std::memory_order_relaxed);
+			auto       entry     = std::make_unique<Permutation>(std::move(permutation));
+			entry->index         = static_cast<uint32_t>(published + m_overflow.size());
+			if (published < InlineCapacity) {
+				m_inline[published] = std::move(entry);
+				m_published.store(published + 1u, std::memory_order_release);
+				return *m_inline[published];
+			}
+			m_overflow.push_back(std::move(entry));
+			return *m_overflow.back();
+		}
+
+		// Requires m_programs_mutex (shared or exclusive).
+		template <typename Visit>
+		void ForEach(Visit&& visit) const {
+			for (uint32_t i = 0; i < PublishedInline(); ++i) {
+				visit(*m_inline[i]);
+			}
+			for (const auto& permutation: m_overflow) {
+				visit(*permutation);
+			}
+		}
+
+	private:
+		std::array<std::unique_ptr<Permutation>, InlineCapacity> m_inline;
+		std::atomic<uint32_t>                                    m_published {0};
+		std::vector<std::unique_ptr<Permutation>>                m_overflow;
 	};
 
+	// O15 (KYTY_RESOURCE_REUSE): a certified output kept per source, plus a small history.
 	struct PreparedState {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
@@ -676,10 +746,15 @@ struct PipelineCache::ProgramCache {
 		}
 	};
 
-	struct SourceEntry: PreparedState {
+	struct ReuseState {
+		PreparedState                current;
+		std::array<PreparedState, 3> history;
+		size_t                       next_victim = 0;
+	};
+
+	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
 		    : resource_plan(std::move(plan)) {
-			permutations.reserve(8);
 			if (!ResourceDependencyCacheEnabled()) return;
 			using namespace ShaderRecompiler::IR;
 			// ExtractResourcePlan clones every descriptor, flat read, branch condition,
@@ -706,21 +781,47 @@ struct PipelineCache::ProgramCache {
 			                        user_dependencies.end());
 		}
 
-		ShaderRecompiler::IR::ResourcePlan           resource_plan;
-		std::vector<uint32_t>                       user_dependencies;
-		std::array<PreparedState, 3>                 history;
-		size_t                                      next_victim = 0;
-		bool                                        projected_key = false;
-		std::vector<Permutation>                    permutations;
-		bool                                        skip_dispatch = false;
+		// Sealed at extraction; evaluation never writes to it.
+		ShaderRecompiler::IR::ResourcePlan resource_plan;
+		std::vector<uint32_t>              user_dependencies;
+		bool                               projected_key = false;
+		PermutationList                    permutations;
+		// Set under the exclusive programs lock; may be set on an already published entry.
+		std::atomic<bool>                  skip_dispatch {false};
+		// Mutated in place by reuse-mode refreshes; only touched under m_reuse_mutex.
+		mutable ReuseState                 reuse;
 	};
+
+	// Per-caller lookup scratch (previously shared cache members). One instance must not be
+	// used by two threads at once.
+	struct ProgramScratch {
+		ProgramScratch() { key.static_state.reserve(MaxStaticKeyWords); }
+
+		std::span<uint8_t, PreparedResourceReads::MaxBytes> Validation() {
+			// Only reuse mode reads certificates; allocate its bounded buffer on first use.
+			if (validation.size() != PreparedResourceReads::MaxBytes) {
+				validation.resize(PreparedResourceReads::MaxBytes);
+			}
+			return std::span<uint8_t, PreparedResourceReads::MaxBytes>(validation.data(),
+			                                                           validation.size());
+		}
+
+		ProgramKey           key;
+		std::vector<uint8_t> validation;
+	};
+
+	static ProgramScratch& ThreadScratch() {
+		thread_local ProgramScratch scratch;
+		return scratch;
+	}
 
 	static constexpr size_t MaxHistoryBytes = 64u * 1024u * 1024u;
 	static constexpr size_t MaxHistoryEntryBytes = 256u * 1024u;
 
-	void ExchangeHistory(SourceEntry& source, size_t index) {
-		auto& current = static_cast<PreparedState&>(source);
-		auto& previous = source.history[index];
+	// Requires m_reuse_mutex.
+	void ExchangeHistory(ReuseState& state, size_t index) {
+		auto& current = state.current;
+		auto& previous = state.history[index];
 		const auto old_bytes = previous.CapacityBytes();
 		auto new_bytes = current.CapacityBytes();
 		// The current working output is mandatory; only the three extra states count
@@ -795,135 +896,228 @@ struct PipelineCache::ProgramCache {
 	}
 
 	template <typename InputInfo>
-	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor, ShaderReadAttempt& read_attempt) {
-		KYTY_PROFILER_DETAIL_BLOCK("ProgramCache::Get");
-		ShaderType stage;
+	static ShaderType StageOf(const InputInfo& input_info) {
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			stage = input_info.logical_stage;
+			return input_info.logical_stage;
 		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-			stage = ShaderType::Pixel;
+			return ShaderType::Pixel;
 		} else {
 			static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
-			stage = ShaderType::Compute;
+			return ShaderType::Compute;
 		}
+	}
 
-		const auto user_data = std::span(params.user_data).first(params.user_data_count);
-		lookup_key.stage           = stage;
-		lookup_key.hash            = params.hash;
-		lookup_key.user_data_count = params.user_data_count;
-		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
-		BuildStageStaticKey(input_info, lookup_key.static_state);
-		auto                                         entry = programs.find(lookup_key);
-		if (entry != programs.end() && entry->second.skip_dispatch) {
-			return {};
-		}
-		const ShaderRecompiler::IR::SrtRuntime       runtime {
-		    .user_data                  = user_data,
+	template <typename InputInfo>
+	static void BuildKey(const ShaderParams& params, const InputInfo& input_info, ProgramKey& key) {
+		key.stage           = StageOf(input_info);
+		key.hash            = params.hash;
+		key.user_data_count = params.user_data_count;
+		key.code_size       = static_cast<uint32_t>(params.code.size());
+		BuildStageStaticKey(input_info, key.static_state);
+	}
+
+	static ShaderRecompiler::IR::SrtRuntime MakeRuntime(const ShaderParams& params,
+	                                                    ShaderReadAttempt&  read_attempt) {
+		return {
+		    .user_data                  = std::span(params.user_data).first(params.user_data_count),
 		    .shader_base                = params.Base(),
 		    .userdata                   = NativeDccEnabled() ? &read_attempt : nullptr,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .try_read_clean_backing = SrtReadRunsEnabled() ? TryReadShaderCleanBacking : nullptr,
 		    .share_clean_values = SharedResourceEvaluationEnabled(),
 		};
-		const auto materialize = [&](SourceEntry& source) {
-			read_attempt.count = 0;
-			read_attempt.materialization_failed = false;
-			read_attempt.overflow = false;
-			const bool reuse = ResourceReuseEnabled();
-			const bool multi_state = reuse && ResourceDependencyCacheEnabled();
-			const auto validate = [&](PreparedResourceReads& reads) {
-				if (!reads.Matches(user_data, runtime.shader_base, source.user_dependencies,
-				                   multi_state && source.projected_key)) return false;
-				Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceCacheKeyMatches);
-				if (reads.Validate(validation_scratch)) return true;
-				// Matching registers with stale/dirty backing must never become a hit.
-				reads.Invalidate();
-				Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceCacheBackingRejects);
-				return false;
-			};
-			const auto hit = [&] {
-				// These registers also supply shader constants and vertex/instance offsets.
-				// Only descriptor evaluation uses the projected key; passthrough stays live.
-				source.resources.user_data.assign(user_data.begin(), user_data.end());
-				Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceReuseHits);
-				return true;
-			};
-			if (reuse && validate(source.prepared_reads)) return hit();
-			if (multi_state) {
-				for (size_t index = 0; index < source.history.size(); ++index) {
-					if (!validate(source.history[index].prepared_reads)) continue;
-					ExchangeHistory(source, index);
-					Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceCacheHistoryHits);
-					return hit();
-				}
-				if (source.prepared_reads.Valid()) {
-					auto victim = source.next_victim;
-					for (size_t index = 0; index < source.history.size(); ++index) {
-						if (!source.history[index].prepared_reads.Valid()) { victim = index; break; }
-					}
-					ExchangeHistory(source, victim);
-					source.next_victim = (victim + 1u) % source.history.size();
-				}
-			}
-			// SourceEntry owns the final successful outputs. Clear their certificate
-			// before any refresh can partially overwrite either output object.
-			source.prepared_reads.Invalidate();
-			source.permutation_index = std::numeric_limits<size_t>::max();
-			auto observed_runtime = runtime;
-			if (reuse) {
-				Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceReuseMisses);
-				source.prepared_reads.Begin(user_data, runtime.shader_base, validation_scratch);
-				observed_runtime.observe_read = PreparedResourceReads::Observe;
-				observed_runtime.observer_userdata = &source.prepared_reads;
-			}
-			if (ShaderRecompiler::IR::MaterializeResources(
-			        source.resource_plan, observed_runtime, source.resources, source.specialization)) {
-				if (reuse) source.prepared_reads.Finish(true);
-				return true;
-			}
-			if (reuse) source.prepared_reads.Finish(false);
-			// An unsuccessful optional uniform-fill/active-source probe is harmless if the
-			// complete refresh succeeded. Only a failed refresh requests a retry.
-			EXIT_IF(!NativeDccEnabled() || read_attempt.count == 0);
-			read_attempt.materialization_failed = true;
+	}
+
+	// Shared lookup. The returned entry stays valid for the cache lifetime.
+	const SourceEntry* FindSource(const ProgramKey& key) const {
+		std::shared_lock lock(m_programs_mutex);
+		const auto entry = programs.find(key);
+		return entry != programs.end() ? &entry->second : nullptr;
+	}
+
+	// Pure: reads the sealed plan and guest memory through `runtime` and writes only `scratch`
+	// and `prep`, so any number of threads may prepare one source with their own scratch/prep.
+	// A failed refresh leaves `prep` partially written; it must not be used.
+	static bool MaterializeStage(const SourceEntry& source,
+	                             const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                             ShaderRecompiler::IR::EvaluationScratch& scratch, StagePrep& prep) {
+		prep.permutation = nullptr;
+		return ShaderRecompiler::IR::MaterializeResources(source.resource_plan, runtime, scratch,
+		                                                  prep.resources, prep.specialization);
+	}
+
+	// O15 reuse mode: refresh or reuse the certified output in the entry, then copy it into
+	// `prep`. Requires m_reuse_mutex.
+	bool MaterializeReusing(const SourceEntry& source, const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                        ShaderRecompiler::IR::EvaluationScratch& evaluation,
+	                        ProgramScratch& scratch, StagePrep& prep) {
+		auto&      state       = source.reuse;
+		const auto user_data   = runtime.user_data;
+		const bool multi_state = ResourceDependencyCacheEnabled();
+		const auto validate = [&](PreparedResourceReads& reads) {
+			if (!reads.Matches(user_data, runtime.shader_base, source.user_dependencies,
+			                   multi_state && source.projected_key)) return false;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceCacheKeyMatches);
+			if (reads.Validate(scratch.Validation())) return true;
+			// Matching registers with stale/dirty backing must never become a hit.
+			reads.Invalidate();
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceCacheBackingRejects);
 			return false;
 		};
-		if (entry != programs.end()) {
-			if (!materialize(entry->second)) return {};
-			auto& source = entry->second;
-			if (ResourceDependencyCacheEnabled() && source.prepared_reads.Valid() &&
-			    source.permutation_index < source.permutations.size()) {
-				auto& cached = source.permutations[source.permutation_index];
-				const auto& layout = cached.program.bindings;
-				if (layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
-				        push_data_cursor, layout.ShaderDataDwords())) {
-					input_info.stage = {.program = &cached.program, .resources = &source.resources};
-					layout.AdvancePushData(push_data_cursor);
-					Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceCachePermutationHits);
-					return cached.handle;
-				}
+		const auto publish = [&] {
+			prep.resources      = state.current.resources;
+			prep.specialization = state.current.specialization;
+			prep.permutation    = nullptr;
+			return true;
+		};
+		const auto hit = [&] {
+			// These registers also supply shader constants and vertex/instance offsets.
+			// Only descriptor evaluation uses the projected key; passthrough stays live.
+			state.current.resources.user_data.assign(user_data.begin(), user_data.end());
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceReuseHits);
+			return publish();
+		};
+		if (validate(state.current.prepared_reads)) return hit();
+		if (multi_state) {
+			for (size_t index = 0; index < state.history.size(); ++index) {
+				if (!validate(state.history[index].prepared_reads)) continue;
+				ExchangeHistory(state, index);
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceCacheHistoryHits);
+				return hit();
 			}
-			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
-				        const auto& layout = candidate.program.bindings;
-				        return layout.push_data_start_dword ==
-				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == entry->second.specialization;
-			        });
-			    permutation != entry->second.permutations.end()) {
-				entry->second.permutation_index = static_cast<size_t>(permutation - entry->second.permutations.begin());
-				input_info.stage = {.program   = &permutation->program,
-				                    .resources = &entry->second.resources};
-				permutation->program.bindings.AdvancePushData(push_data_cursor);
-				return permutation->handle;
+			if (state.current.prepared_reads.Valid()) {
+				auto victim = state.next_victim;
+				for (size_t index = 0; index < state.history.size(); ++index) {
+					if (!state.history[index].prepared_reads.Valid()) { victim = index; break; }
+				}
+				ExchangeHistory(state, victim);
+				state.next_victim = (victim + 1u) % state.history.size();
+			}
+		}
+		// The entry owns the final successful outputs. Clear their certificate
+		// before any refresh can partially overwrite either output object.
+		state.current.prepared_reads.Invalidate();
+		state.current.permutation_index = std::numeric_limits<size_t>::max();
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceReuseMisses);
+		state.current.prepared_reads.Begin(user_data, runtime.shader_base, scratch.Validation());
+		auto observed_runtime              = runtime;
+		observed_runtime.observe_read      = PreparedResourceReads::Observe;
+		observed_runtime.observer_userdata = &state.current.prepared_reads;
+		if (ShaderRecompiler::IR::MaterializeResources(source.resource_plan, observed_runtime,
+		                                               evaluation, state.current.resources,
+		                                               state.current.specialization)) {
+			state.current.prepared_reads.Finish(true);
+			return publish();
+		}
+		state.current.prepared_reads.Finish(false);
+		return false;
+	}
+
+	// Materializes one stage and records a readiness failure for the retry loop.
+	bool Materialize(const SourceEntry& source, const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                 ShaderRecompiler::IR::EvaluationScratch& evaluation, ProgramScratch& scratch,
+	                 StagePrep& prep, ShaderReadAttempt& read_attempt) {
+		read_attempt.count = 0;
+		read_attempt.materialization_failed = false;
+		read_attempt.overflow = false;
+		if (ResourceReuseEnabled() ? MaterializeReusing(source, runtime, evaluation, scratch, prep)
+		                           : MaterializeStage(source, runtime, evaluation, prep)) {
+			return true;
+		}
+		// An unsuccessful optional uniform-fill/active-source probe is harmless if the
+		// complete refresh succeeded. Only a failed refresh requests a retry.
+		EXIT_IF(!NativeDccEnabled() || read_attempt.count == 0);
+		read_attempt.materialization_failed = true;
+		return false;
+	}
+
+	static bool PermutationMatches(const Permutation& candidate,
+	                               const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                               uint32_t push_data_cursor) {
+		const auto& layout = candidate.program.bindings;
+		return layout.push_data_start_dword ==
+		           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+		                                                    layout.ShaderDataDwords()) &&
+		       candidate.specialization == specialization;
+	}
+
+	// Searches in publication order. Inline entries need no lock; overflow entries need
+	// m_programs_mutex, which is taken here unless the caller already holds it.
+	const Permutation* FindPermutation(const SourceEntry& source,
+	                                   const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                   uint32_t push_data_cursor, bool programs_locked = false) const {
+		const auto& list      = source.permutations;
+		const auto  published = list.PublishedInline();
+		for (uint32_t i = 0; i < published; ++i) {
+			if (PermutationMatches(list.Inline(i), specialization, push_data_cursor)) {
+				return &list.Inline(i);
+			}
+		}
+		if (published < PermutationList::InlineCapacity) return nullptr;
+		std::shared_lock lock(m_programs_mutex, std::defer_lock);
+		if (!programs_locked) lock.lock();
+		for (const auto& candidate: list.Overflow()) {
+			if (PermutationMatches(*candidate, specialization, push_data_cursor)) {
+				return candidate.get();
+			}
+		}
+		return nullptr;
+	}
+
+	const Permutation* PermutationAt(const SourceEntry& source, size_t index) const {
+		const auto& list      = source.permutations;
+		const auto  published = list.PublishedInline();
+		if (index < published) return &list.Inline(static_cast<uint32_t>(index));
+		if (published < PermutationList::InlineCapacity) return nullptr;
+		std::shared_lock lock(m_programs_mutex);
+		const auto overflow = index - PermutationList::InlineCapacity;
+		return overflow < list.Overflow().size() ? list.Overflow()[overflow].get() : nullptr;
+	}
+
+	template <typename InputInfo>
+	static ShaderProgram Bind(const Permutation& permutation, InputInfo& input_info,
+	                          StagePrep& prep, uint32_t& push_data_cursor) {
+		prep.permutation = &permutation;
+		input_info.stage = {.program = &permutation.program, .resources = &prep.resources};
+		permutation.program.bindings.AdvancePushData(push_data_cursor);
+		return permutation.handle;
+	}
+
+	// The compile path: translates, inserts a new source, materializes it into `prep` when
+	// `prep` was not prepared from an existing entry, compiles and publishes the permutation.
+	// Holds m_programs_mutex exclusively throughout, which serializes all compiles. Returns
+	// null for skip-dispatch shaders and for a failed materialization.
+	template <typename InputInfo>
+	const Permutation* CompileAndPublish(const ShaderParams& params, InputInfo& input_info,
+	                                     uint32_t push_data_cursor, const ProgramKey& key,
+	                                     const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                                     ShaderRecompiler::IR::EvaluationScratch& evaluation,
+	                                     ProgramScratch& scratch, StagePrep& prep,
+	                                     ShaderReadAttempt& read_attempt, bool prep_materialized) {
+		// Cache hits returned before this. This covers translation through native shader-module
+		// creation; readiness failures can retry, so count successful creations separately.
+		Profiler::ScopedFrameWait shader_miss(Profiler::FrameWait::ShaderProgramMiss);
+		std::unique_lock lock(m_programs_mutex);
+		const auto publish_index = [&](const SourceEntry& source, const Permutation& permutation) {
+			if (ResourceReuseEnabled()) source.reuse.current.permutation_index = permutation.index;
+			return &permutation;
+		};
+		// Another preparer may have inserted or compiled this source since the shared lookup.
+		auto entry = programs.find(key);
+		if (entry != programs.end()) {
+			if (entry->second.skip_dispatch.load(std::memory_order_relaxed)) return nullptr;
+			if (!prep_materialized &&
+			    !Materialize(entry->second, runtime, evaluation, scratch, prep, read_attempt)) {
+				return nullptr;
+			}
+			prep_materialized = true;
+			if (const auto* published = FindPermutation(entry->second, prep.specialization,
+			                                            push_data_cursor, true)) {
+				return publish_index(entry->second, *published);
 			}
 		}
 
-		// Cache hits returned above. This covers translation through native shader-module
-		// creation; readiness failures can retry, so count successful creations separately.
-		Profiler::ScopedFrameWait shader_miss(Profiler::FrameWait::ShaderProgramMiss);
+		const auto stage = key.stage;
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage_input.vertex = &input_info;
@@ -946,7 +1140,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
 		options.shader_hash = params.hash;
-		options.user_data   = user_data;
+		options.user_data   = runtime.user_data;
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
@@ -965,27 +1159,25 @@ struct PipelineCache::ProgramCache {
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (translated.skip_dispatch) {
-			entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}).first;
-			entry->second.skip_dispatch = true;
-			return {};
+			entry = programs.try_emplace(key, ShaderRecompiler::IR::ResourcePlan {}).first;
+			entry->second.skip_dispatch.store(true, std::memory_order_relaxed);
+			return nullptr;
 		}
 		if (entry == programs.end()) {
-			entry = programs.try_emplace(lookup_key,
+			entry = programs.try_emplace(key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			if (!materialize(entry->second)) return {};
+			if (!Materialize(entry->second, runtime, evaluation, scratch, prep, read_attempt)) {
+				return nullptr;
+			}
 		}
-		entry->second.permutations.push_back(CompilePermutation(
-		    params, options, std::move(translated), entry->second.specialization, push_data_cursor,
+		const auto& permutation = entry->second.permutations.Append(CompilePermutation(
+		    params, options, std::move(translated), prep.specialization, push_data_cursor,
 		    entry->first.static_state));
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderProgramsCreated);
-		entry->second.permutation_index = entry->second.permutations.size() - 1u;
-		const auto& permutation = entry->second.permutations.back();
-		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
-		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
-		for (const auto& [key, source]: programs) {
-			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+		for (const auto& [program_key, source]: programs) {
+			counts[static_cast<size_t>(program_key.stage)] += source.permutations.Size();
 		}
 		// Guest geometry shaders are compiled through the host mesh stage.
 		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
@@ -996,27 +1188,71 @@ struct PipelineCache::ProgramCache {
 		            counts[static_cast<size_t>(ShaderType::Local)],
 		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
 		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
-		return permutation.handle;
+		return publish_index(entry->second, permutation);
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
-		lookup_key.static_state.reserve(MaxStaticKeyWords);
+	// Serial composition of the pieces above for one stage. On success `input_info.stage`
+	// points at the permutation and into `prep`.
+	template <typename InputInfo>
+	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info, StagePrep& prep,
+	                  uint32_t& push_data_cursor, ShaderReadAttempt& read_attempt,
+	                  ProgramScratch& scratch, ShaderRecompiler::IR::EvaluationScratch& evaluation) {
+		KYTY_PROFILER_DETAIL_BLOCK("ProgramCache::Get");
+		std::unique_lock<std::mutex> reuse_lock;
+		if (ResourceReuseEnabled()) reuse_lock = std::unique_lock(m_reuse_mutex);
+
+		auto& key = scratch.key;
+		BuildKey(params, input_info, key);
+		const auto* source = FindSource(key);
+		if (source != nullptr && source->skip_dispatch.load(std::memory_order_relaxed)) {
+			return {};
+		}
+		const auto runtime = MakeRuntime(params, read_attempt);
+		if (source != nullptr) {
+			if (!Materialize(*source, runtime, evaluation, scratch, prep, read_attempt)) return {};
+			if (ResourceReuseEnabled() && ResourceDependencyCacheEnabled() &&
+			    source->reuse.current.prepared_reads.Valid()) {
+				const auto* cached = PermutationAt(*source, source->reuse.current.permutation_index);
+				if (cached != nullptr &&
+				    cached->program.bindings.push_data_start_dword ==
+				        ShaderRecompiler::IR::PushData::StartFor(
+				            push_data_cursor, cached->program.bindings.ShaderDataDwords())) {
+					Profiler::CountFrameEvent(Profiler::FrameEvent::ResourceCachePermutationHits);
+					return Bind(*cached, input_info, prep, push_data_cursor);
+				}
+			}
+			if (const auto* permutation =
+			        FindPermutation(*source, prep.specialization, push_data_cursor)) {
+				if (ResourceReuseEnabled()) {
+					source->reuse.current.permutation_index = permutation->index;
+				}
+				return Bind(*permutation, input_info, prep, push_data_cursor);
+			}
+		}
+		const auto* permutation =
+		    CompileAndPublish(params, input_info, push_data_cursor, key, runtime, evaluation,
+		                      scratch, prep, read_attempt, source != nullptr);
+		if (permutation == nullptr) return {};
+		return Bind(*permutation, input_info, prep, push_data_cursor);
 	}
+
+	explicit ProgramCache(vk::Device device): device(device) {}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
-			for (const auto& permutation: entry.permutations) {
+			entry.permutations.ForEach([&](const Permutation& permutation) {
 				device.destroyShaderModule(permutation.handle.module, nullptr);
-			}
+			});
 		}
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
-	ProgramKey                                                  lookup_key;
-	std::array<uint8_t, PreparedResourceReads::MaxBytes>          validation_scratch;
-	size_t history_bytes = 0;
+	mutable std::shared_mutex                                   m_programs_mutex;
+	// Serializes O15 reuse-mode preparation; ordered before m_programs_mutex.
+	std::mutex                                                  m_reuse_mutex;
+	size_t history_bytes = 0; // Guarded by m_reuse_mutex.
 	vk::Device                                                  device;
-	uint64_t                                                    next_shader_id = 0;
+	uint64_t next_shader_id = 0; // Guarded by the exclusive m_programs_mutex.
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -1176,13 +1412,18 @@ void PipelineCache::Save() {
 	m_driver_cache = nullptr;
 }
 
+bool PipelineCache::TessellationActive(const HW::UserConfig& user_config) {
+	return user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
+}
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+    GraphicsStagePreps& stage_preps) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
-	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
+	const bool tess_active = TessellationActive(user_config);
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
@@ -1241,24 +1482,25 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
+	// The program cache locks internally, so no pipeline lock is held across materialization.
+	auto& scratch    = ProgramCache::ThreadScratch();
+	auto& evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
 	for (uint32_t attempt = 0; attempt < 64; ++attempt) {
 		ShaderReadAttempt read_attempt;
-		{
-			Common::LockGuard lock(m_mutex);
-			uint32_t push_data_cursor =
-			    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
-			GraphicsPrograms result;
-			if (pixel_active) {
-				result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor,
-				                                   read_attempt);
-			}
-			for (uint32_t i = 0; i < (tess_active ? 3u : 1u) &&
-			                     !read_attempt.materialization_failed; ++i) {
-				result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i],
-				                                      push_data_cursor, read_attempt);
-			}
-			if (!read_attempt.materialization_failed) return result;
+		uint32_t push_data_cursor =
+		    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+		GraphicsPrograms result;
+		if (pixel_active) {
+			result.pixel = m_program_cache->Get(pixel_params, pixel_info, stage_preps.pixel,
+			                                   push_data_cursor, read_attempt, scratch, evaluation);
 		}
+		for (uint32_t i = 0; i < (tess_active ? 3u : 1u) &&
+		                     !read_attempt.materialization_failed; ++i) {
+			result.vertex[i] =
+			    m_program_cache->Get(vertex_params[i], vertex_info[i], stage_preps.vertex[i],
+			                         push_data_cursor, read_attempt, scratch, evaluation);
+		}
+		if (!read_attempt.materialization_failed) return result;
 		// No pipeline or texture-cache lock is held while the scheduler publishes bytes.
 		// Restart all stages before final bindings/uploads, including their SRT refresh.
 		EXIT_IF(!read_attempt.Synchronize());
@@ -1268,18 +1510,18 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
-                                               ShaderComputeInputInfo&      input_info) {
+                                               ShaderComputeInputInfo&      input_info,
+                                               StagePrep&                   stage_prep) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
+	auto& scratch    = ProgramCache::ThreadScratch();
+	auto& evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
 	for (uint32_t attempt = 0; attempt < 64; ++attempt) {
 		ShaderReadAttempt read_attempt;
-		{
-			Common::LockGuard lock(m_mutex);
-			uint32_t push_data_cursor = 0;
-			const auto result = m_program_cache->Get(params, input_info, push_data_cursor,
-			                                         read_attempt);
-			if (!read_attempt.materialization_failed) return result;
-		}
+		uint32_t push_data_cursor = 0;
+		const auto result = m_program_cache->Get(params, input_info, stage_prep, push_data_cursor,
+		                                         read_attempt, scratch, evaluation);
+		if (!read_attempt.materialization_failed) return result;
 		EXIT_IF(!read_attempt.Synchronize());
 	}
 	EXIT("compute resource readiness did not converge after 64 attempts\n");

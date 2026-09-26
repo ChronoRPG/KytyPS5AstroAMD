@@ -7,8 +7,11 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
+#include <array>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
@@ -124,16 +127,38 @@ public:
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};
 
+	// One compiled module of a shader source; owned by the program cache and never moved or
+	// freed before the cache is destroyed.
+	struct Permutation;
+
+	// Output of one stage's program preparation, owned by the draw (or dispatch) rather than by
+	// the shared cache entry. The stage runtime's `resources` points into it, so it must outlive
+	// the draw's binding and commit. Reusing one object keeps its vectors' capacity.
+	struct StagePrep {
+		ShaderRecompiler::IR::ResourceSnapshot       resources;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		const Permutation*                           permutation = nullptr;
+	};
+
+	struct GraphicsStagePreps {
+		std::array<StagePrep, 3> vertex;
+		StagePrep                pixel;
+	};
+
+	// GetGraphicsPrograms prepares LS/HS/TES (all three vertex_info entries) exactly when this
+	// holds; otherwise it only writes vertex_info[0].
+	[[nodiscard]] static bool TessellationActive(const HW::UserConfig& user_config);
+
 	GraphicsPrograms
 	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
 	                    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
 	                    const HW::Context& context, const HW::UserConfig& user_config,
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info);
+	                    ShaderPixelInputInfo& pixel_info, GraphicsStagePreps& stage_preps);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
-	                                ShaderComputeInputInfo&      input_info);
+	                                ShaderComputeInputInfo& input_info, StagePrep& stage_prep);
 
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
@@ -209,6 +234,7 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// Guards the pipeline maps and the driver cache. ProgramCache has its own locks.
 	Common::Mutex m_mutex;
 
 	void InitializeDriverCache();
