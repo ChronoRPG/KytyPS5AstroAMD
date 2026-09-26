@@ -120,7 +120,9 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.NativeOcclusionReductions.Cumulative",
     "FrameEvent.MeshRestartMarkers.Cumulative",
     "FrameEvent.MeshRestartSegments.Cumulative",
+    "FrameEvent.GpuTimingDropped.Cumulative",
 };
+static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
 constexpr size_t kFrameWaitCount = static_cast<size_t>(Profiler::FrameWait::Count);
 struct FrameWaitTotals {
@@ -139,7 +141,14 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.ResourceReuseValidation.Calls.Cumulative",
     "FrameWait.NativeImageCreate.Calls.Cumulative",
     "FrameWait.NativeImageDestroy.Calls.Cumulative",
+    "FrameWait.GpuBusy.Calls.Cumulative",
+    "FrameWait.GpuIdle.Calls.Cumulative",
+    "FrameWait.GpuStarved.Calls.Cumulative",
+    "FrameWait.GpuRecordToStart.Calls.Cumulative",
+    "FrameWait.GpuDispatchToStart.Calls.Cumulative",
+    "FrameWait.GpuEndToObserved.Calls.Cumulative",
 };
+static_assert(kFrameWaitCallNames.back() != nullptr, "FrameWait names must match the enum");
 constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.ReadMemory.Nanoseconds.Cumulative",
     "FrameWait.ShaderReadiness.Nanoseconds.Cumulative",
@@ -151,7 +160,14 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.ResourceReuseValidation.Nanoseconds.Cumulative",
     "FrameWait.NativeImageCreate.Nanoseconds.Cumulative",
     "FrameWait.NativeImageDestroy.Nanoseconds.Cumulative",
+    "FrameWait.GpuBusy.Nanoseconds.Cumulative",
+    "FrameWait.GpuIdle.Nanoseconds.Cumulative",
+    "FrameWait.GpuStarved.Nanoseconds.Cumulative",
+    "FrameWait.GpuRecordToStart.Nanoseconds.Cumulative",
+    "FrameWait.GpuDispatchToStart.Nanoseconds.Cumulative",
+    "FrameWait.GpuEndToObserved.Nanoseconds.Cumulative",
 };
+static_assert(kFrameWaitTimeNames.back() != nullptr, "FrameWait names must match the enum");
 
 uint64_t FrameWaitClockNs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -518,6 +534,15 @@ ScopedFrameWait::~ScopedFrameWait() {
 	auto& totals = g_frame_waits[static_cast<size_t>(m_kind)];
 	totals.nanoseconds.fetch_add(elapsed, std::memory_order_relaxed);
 	totals.calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+void AddFrameWait(FrameWait kind, uint64_t calls, uint64_t nanoseconds) {
+	if (!AggregateEnabled() || !tracy::ProfilerAvailable() || !TracyIsConnected) {
+		return;
+	}
+	auto& totals = g_frame_waits[static_cast<size_t>(kind)];
+	totals.nanoseconds.fetch_add(nanoseconds, std::memory_order_relaxed);
+	totals.calls.fetch_add(calls, std::memory_order_relaxed);
 }
 
 void PublishFrameWork() {

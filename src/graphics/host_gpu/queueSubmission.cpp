@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -196,6 +197,18 @@ void QueueSubmissionBroker::SubmitBatch(const QueuedSubmission* records, size_t 
 		std::fflush(stdout);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	uint64_t dispatch_ns = 0;
+	for (size_t i = 0; i < count; ++i) {
+		if (records[i].dispatch_ns != nullptr) {
+			if (dispatch_ns == 0) {
+				dispatch_ns = static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::nanoseconds>(
+				        std::chrono::steady_clock::now().time_since_epoch())
+				        .count());
+			}
+			*records[i].dispatch_ns = dispatch_ns;
+		}
+	}
 	// Publish only after the entire native call has returned. This preserves
 	// command-buffer, descriptor, and semaphore lifetime even if the GPU finished
 	// a submission before the driver's host call returned.

@@ -62,6 +62,10 @@ struct QueuedSubmission {
 	// This tick has a callback or an explicit CPU wait. It may terminate a
 	// coalesced group, but its signal must not move past a later command buffer.
 	bool              preserve_completion = false;
+	// Optional KYTY_GPU_TIMING slot field: steady_clock nanoseconds when the native vkQueueSubmit
+	// containing this record returned. Written before dispatched_tick is published (release), and
+	// read only after KnownGpuTick() covers this tick, so the slot outlives the write.
+	uint64_t*         dispatch_ns = nullptr;
 	uint32_t          debug_op = 0;
 	uint64_t          debug_submit = 0;
 	uint32_t          debug_arg0 = 0;

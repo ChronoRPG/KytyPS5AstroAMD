@@ -22,6 +22,13 @@
 //   readbacks.csv      every GPU->CPU readback: cause, range, duration, guest thread and pc
 //   images.csv         texture-cache image deletions with reason, and per-second native image
 //                      create/destroy totals grouped by format, extent and usage
+//
+// summary.csv ends with GPU timeline columns (KYTY_GPU_TIMING, default on with this trace), summed
+// over the guest flips published in that second: gpu_busy_us (union of command-buffer spans),
+// gpu_cmdbufs, gpu_latency_avg_us (recording start -> GPU start), gpu_idle_us, gpu_max_gap_us,
+// gpu_starved_us (idle before the next buffer reached vkQueueSubmit), gpu_dispatch_latency_avg_us
+// (vkQueueSubmit return -> GPU start) and gpu_dropped. Latency/starved columns are 0 without
+// calibrated timestamps. New columns are only ever appended.
 
 #include <cstdint>
 #include <string_view>
@@ -118,6 +125,20 @@ void RecordQueueWait(uint32_t queue, uint64_t wait_ns);
 void RecordQueueBusy(uint32_t queue, uint64_t busy_ns, bool complete);
 void RecordDoneWait(uint64_t wait_ns);
 void RecordFlip();
+
+// GPU execution timing for one guest flip (see graphics/host_gpu/renderer/gpuTiming.h).
+struct GpuFrame {
+	uint64_t busy_ns             = 0;
+	uint64_t idle_ns             = 0;
+	uint64_t max_gap_ns          = 0;
+	uint64_t starved_ns          = 0;
+	uint64_t command_buffers     = 0;
+	uint64_t latency_samples     = 0;
+	uint64_t record_latency_ns   = 0; // summed over latency_samples
+	uint64_t dispatch_latency_ns = 0; // summed over latency_samples
+	uint64_t dropped             = 0;
+};
+void RecordGpuFrame(const GpuFrame& frame);
 
 } // namespace HangTrace
 
