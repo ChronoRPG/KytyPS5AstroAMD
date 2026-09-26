@@ -1598,6 +1598,18 @@ void CommandProcessor::EmitGlobalBarrier() {
 	// Keep renderer-lock contention in the parent zone's self time.
 	KYTY_PROFILER_DETAIL_BLOCK("CommandProcessor::RecordGlobalBarrier");
 
+	if (BarrierBatchEnabled()) {
+		// Queued: merged with adjacent requests, elided when the previous barrier already covers
+		// it with nothing recorded since, recorded before the next memory-accessing command.
+		// The rendering instance ends only if the barrier is recorded (see render.h).
+		CurrentBuffer().RequestMemoryBarrier(
+		    vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite,
+		    vk::PipelineStageFlagBits2::eAllCommands,
+		    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+		    BarrierOrigin::Guest);
+		return;
+	}
+
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;

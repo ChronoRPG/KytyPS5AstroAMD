@@ -31,8 +31,12 @@
 // calibrated timestamps. After them come GPU recording counters (KYTY_GPU_OP_COUNTERS, default on
 // with this trace; see graphics/host_gpu/renderer/gpuOpProfiler.h): gpu_render_passes (guest
 // dynamic-rendering begins), gpu_barriers (guest pipeline barrier calls), gpu_layout_transitions
-// (image barriers changing layout) and gpu_guest_cmdbufs (guest command buffers begun).
-// New columns are only ever appended.
+// (image barriers changing layout) and gpu_guest_cmdbufs (guest command buffers begun). Then the
+// barrier batcher (KYTY_BARRIER_BATCH, graphics/host_gpu/renderer/render.h): gpu_barrier_requests,
+// gpu_barriers_merged (joined an already pending batch), gpu_barriers_elided (covered by the
+// previous barrier with nothing recorded since), gpu_barriers_sunk (a pending batch kept across a
+// draw in the same rendering instance) and gpu_barrier_rp_splits (barrier flushes that ended an
+// active rendering instance). New columns are only ever appended.
 
 #include <cstdint>
 #include <string>
@@ -201,6 +205,12 @@ struct GpuOpCounts {
 	uint64_t barriers           = 0;
 	uint64_t layout_transitions = 0;
 	uint64_t command_buffers    = 0;
+	// Barrier batcher (KYTY_BARRIER_BATCH); zero when it is disabled.
+	uint64_t barrier_requests      = 0;
+	uint64_t barriers_merged       = 0;
+	uint64_t barriers_elided       = 0;
+	uint64_t barriers_sunk         = 0;
+	uint64_t barrier_render_splits = 0;
 };
 void RecordGpuOpCounts(const GpuOpCounts& counts);
 

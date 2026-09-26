@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -16,8 +17,117 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 namespace Libs::Graphics {
+
+// ------------------------------------------------------------------------------------------------
+// Barrier batcher
+
+static bool EnvSwitch(const char* name, bool default_value) {
+	const auto* value = std::getenv(name);
+	if (value == nullptr || value[0] == '\0') {
+		return default_value;
+	}
+	return !(std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
+	         std::strcmp(value, "off") == 0);
+}
+
+bool BarrierBatchEnabled() {
+	static const bool enabled = EnvSwitch("KYTY_BARRIER_BATCH", true);
+	return enabled;
+}
+
+bool BarrierSinkEnabled() {
+	static const bool enabled = BarrierBatchEnabled() && EnvSwitch("KYTY_BARRIER_SINK", true);
+	return enabled;
+}
+
+namespace {
+
+using Stage2  = vk::PipelineStageFlagBits2;
+using Access2 = vk::AccessFlagBits2;
+
+// Access bits that MEMORY_READ / MEMORY_WRITE stand for in a queue (non-host) dependency. Host
+// accesses and every unlisted bit must be matched literally.
+constexpr vk::AccessFlags2 KnownDeviceReads =
+    Access2::eIndirectCommandRead | Access2::eIndexRead | Access2::eVertexAttributeRead |
+    Access2::eUniformRead | Access2::eInputAttachmentRead | Access2::eShaderRead |
+    Access2::eColorAttachmentRead | Access2::eDepthStencilAttachmentRead |
+    Access2::eTransferRead | Access2::eMemoryRead | Access2::eShaderSampledRead |
+    Access2::eShaderStorageRead;
+constexpr vk::AccessFlags2 KnownDeviceWrites =
+    Access2::eShaderWrite | Access2::eColorAttachmentWrite |
+    Access2::eDepthStencilAttachmentWrite | Access2::eTransferWrite | Access2::eMemoryWrite |
+    Access2::eShaderStorageWrite;
+
+// True when a dependency on `have` stages includes every stage in `want`. ALL_COMMANDS covers
+// every queue stage; HOST is not a queue stage and must be present literally.
+bool StagesCover(vk::PipelineStageFlags2 have, vk::PipelineStageFlags2 want) {
+	if ((want & Stage2::eHost) && !(have & Stage2::eHost)) {
+		return false;
+	}
+	want &= ~vk::PipelineStageFlags2 {Stage2::eHost};
+	if (have & Stage2::eAllCommands) {
+		return true;
+	}
+	return !(want & ~have);
+}
+
+bool AccessCovers(vk::AccessFlags2 have, vk::AccessFlags2 want) {
+	if (have & Access2::eMemoryRead) {
+		want &= ~KnownDeviceReads;
+	}
+	if (have & Access2::eMemoryWrite) {
+		want &= ~KnownDeviceWrites;
+	}
+	return !(want & ~have);
+}
+
+bool MemoryCovers(const vk::MemoryBarrier2& have, const vk::MemoryBarrier2& want) {
+	return StagesCover(have.srcStageMask, want.srcStageMask) &&
+	       StagesCover(have.dstStageMask, want.dstStageMask) &&
+	       AccessCovers(have.srcAccessMask, want.srcAccessMask) &&
+	       AccessCovers(have.dstAccessMask, want.dstAccessMask);
+}
+
+// Orders every earlier command (all stages, all writes made available) before every later
+// command (all stages, all reads and writes made visible) - what the guest global barrier is.
+bool IsFullBarrier(const vk::MemoryBarrier2& barrier) {
+	return (barrier.srcStageMask & Stage2::eAllCommands) &&
+	       (barrier.dstStageMask & Stage2::eAllCommands) &&
+	       (barrier.srcAccessMask & Access2::eMemoryWrite) &&
+	       (barrier.dstAccessMask & Access2::eMemoryRead) &&
+	       (barrier.dstAccessMask & Access2::eMemoryWrite);
+}
+
+void CountBatch(GpuOpProfiler::BarrierBatchEvent event, uint64_t amount = 1) {
+	GpuOpProfiler::CountBarrierBatch(event, amount);
+}
+
+// gpuOpProfiler sites of recorded batches: the single origin, or "mixed".
+constinit GpuOpProfiler::Site g_batch_sites[static_cast<size_t>(BarrierOrigin::Count) + 1] = {
+    GpuOpProfiler::Site {"batch.guest_global"},  GpuOpProfiler::Site {"batch.shader_access"},
+    GpuOpProfiler::Site {"batch.shader_write"},  GpuOpProfiler::Site {"batch.shader_hazard"},
+    GpuOpProfiler::Site {"batch.indirect_args"}, GpuOpProfiler::Site {"batch.gds"},
+    GpuOpProfiler::Site {"batch.image"},         GpuOpProfiler::Site {"batch.mixed"},
+};
+
+GpuOpProfiler::Site& BatchSite(uint32_t origins) {
+	if (origins != 0 && std::has_single_bit(origins)) {
+		const auto index = static_cast<size_t>(std::countr_zero(origins));
+		if (index < static_cast<size_t>(BarrierOrigin::Count)) {
+			return g_batch_sites[index];
+		}
+	}
+	return g_batch_sites[static_cast<size_t>(BarrierOrigin::Count)];
+}
+
+constexpr uint32_t OriginBit(BarrierOrigin origin) {
+	return 1u << static_cast<uint32_t>(origin);
+}
+
+} // namespace
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
     : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
@@ -28,14 +138,203 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	if (m_internal_recording == 0 && BarrierBatchEnabled()) {
+		// The caller may record anything through the returned handle.
+		FlushBarriers();
+		NoteForeignCommand();
+	}
 	return m_buffer;
+}
+
+vk::CommandBuffer CommandBuffer::StateHandle() const {
+	EXIT_IF(IsInvalid());
+	return m_buffer;
+}
+
+void CommandBuffer::ResetBarrierState() const {
+	m_pending.Clear();
+	m_last_memory_valid    = false;
+	m_recorded_since_flush = true;
+	m_epoch_clean          = false;
+	m_epoch_instance       = 0;
+	m_internal_recording   = 0;
+}
+
+void CommandBuffer::RequestMemoryBarrier(vk::PipelineStageFlags2 src_stages,
+                                         vk::AccessFlags2        src_access,
+                                         vk::PipelineStageFlags2 dst_stages,
+                                         vk::AccessFlags2 dst_access, BarrierOrigin origin) const {
+	EXIT_IF(IsInvalid() || !src_stages || !dst_stages);
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = src_stages;
+	barrier.srcAccessMask = src_access;
+	barrier.dstStageMask  = dst_stages;
+	barrier.dstAccessMask = dst_access;
+	if (!BarrierBatchEnabled()) {
+		// Callers keep their own legacy paths; this is only a safe fallback.
+		EndRendering();
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		m_buffer.pipelineBarrier2(dependency);
+		return;
+	}
+	CountBatch(GpuOpProfiler::BarrierBatchEvent::Requests);
+	if (!m_pending.Empty()) {
+		// Nothing was recorded since the pending requests: one barrier with the union of the
+		// scopes orders everything each of them (and their chain) ordered.
+		CountBatch(GpuOpProfiler::BarrierBatchEvent::Merged);
+	} else if (!m_recorded_since_flush && m_last_memory_valid &&
+	           MemoryCovers(m_last_memory, barrier)) {
+		// Nothing was recorded since the last batch, whose memory dependency already orders
+		// every earlier command against every later one in these scopes.
+		CountBatch(GpuOpProfiler::BarrierBatchEvent::Elided);
+		return;
+	}
+	if (m_pending.has_memory) {
+		auto& memory = m_pending.memory;
+		memory.srcStageMask |= barrier.srcStageMask;
+		memory.srcAccessMask |= barrier.srcAccessMask;
+		memory.dstStageMask |= barrier.dstStageMask;
+		memory.dstAccessMask |= barrier.dstAccessMask;
+	} else {
+		m_pending.memory     = barrier;
+		m_pending.has_memory = true;
+	}
+	m_pending.origins |= OriginBit(origin);
+}
+
+void CommandBuffer::RequestBufferBarrier(const vk::BufferMemoryBarrier2& barrier,
+                                         BarrierOrigin                   origin) const {
+	EXIT_IF(IsInvalid());
+	if (!BarrierBatchEnabled()) {
+		EndRendering();
+		vk::DependencyInfo dependency {};
+		dependency.bufferMemoryBarrierCount = 1;
+		dependency.pBufferMemoryBarriers    = &barrier;
+		m_buffer.pipelineBarrier2(dependency);
+		return;
+	}
+	CountBatch(GpuOpProfiler::BarrierBatchEvent::Requests);
+	if (!m_pending.Empty()) {
+		CountBatch(GpuOpProfiler::BarrierBatchEvent::Merged);
+	}
+	m_pending.buffers.push_back(barrier);
+	m_pending.origins |= OriginBit(origin);
+}
+
+bool CommandBuffer::BatchImageBarriers(std::span<const vk::ImageMemoryBarrier2> barriers,
+                                       vk::CommandBuffer target, bool deferrable) const {
+	if (!BarrierBatchEnabled() || IsInvalid() || target != m_buffer) {
+		return false;
+	}
+	if (barriers.empty()) {
+		return true;
+	}
+	CountBatch(GpuOpProfiler::BarrierBatchEvent::Requests);
+	if (!m_pending.Empty()) {
+		CountBatch(GpuOpProfiler::BarrierBatchEvent::Merged);
+	}
+	for (const auto& barrier: barriers) {
+		// Layout transitions of one image stay in separate, ordered barrier commands.
+		if (std::ranges::any_of(m_pending.images, [&barrier](const auto& pending) {
+			    return pending.image == barrier.image;
+		    })) {
+			FlushBarriers();
+		}
+		m_pending.images.push_back(barrier);
+		m_pending.origins |= OriginBit(BarrierOrigin::Image);
+	}
+	if (!deferrable) {
+		FlushBarriers();
+	}
+	return true;
+}
+
+void CommandBuffer::FlushBarriers() const {
+	if (m_pending.Empty()) {
+		return;
+	}
+	EXIT_IF(IsInvalid());
+	const GpuOpProfiler::ScopedSite site(BatchSite(m_pending.origins));
+	++m_internal_recording;
+	if (m_rendering) {
+		// Pipeline barriers cannot be recorded inside dynamic rendering. (A command recorded
+		// through Handle() mostly ends rendering anyway; only a draw that has to restart its own
+		// instance counts as a barrier split, in BeginRendering().)
+		EndRendering();
+	}
+	if (m_pending.has_memory) {
+		// The requests were issued in some order with nothing recorded between them. Widening
+		// every buffer/image barrier by the global dependency reproduces the execution and
+		// memory dependency chains the separate barrier commands formed through each other.
+		const auto& memory = m_pending.memory;
+		for (auto& image: m_pending.images) {
+			image.srcStageMask |= memory.srcStageMask;
+			image.srcAccessMask |= memory.srcAccessMask;
+			image.dstStageMask |= memory.dstStageMask;
+			image.dstAccessMask |= memory.dstAccessMask;
+		}
+		for (auto& buffer: m_pending.buffers) {
+			buffer.srcStageMask |= memory.srcStageMask;
+			buffer.srcAccessMask |= memory.srcAccessMask;
+			buffer.dstStageMask |= memory.dstStageMask;
+			buffer.dstAccessMask |= memory.dstAccessMask;
+		}
+	}
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount       = m_pending.has_memory ? 1u : 0u;
+	dependency.pMemoryBarriers          = m_pending.has_memory ? &m_pending.memory : nullptr;
+	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(m_pending.buffers.size());
+	dependency.pBufferMemoryBarriers    = m_pending.buffers.data();
+	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(m_pending.images.size());
+	dependency.pImageMemoryBarriers     = m_pending.images.data();
+	m_buffer.pipelineBarrier2(dependency);
+	--m_internal_recording;
+
+	m_last_memory_valid = m_pending.has_memory;
+	if (m_pending.has_memory) {
+		m_last_memory = m_pending.memory;
+	}
+	m_recorded_since_flush = false;
+	// A full batch orders everything before it against everything after it; its buffer/image
+	// barriers were widened by the same scopes above.
+	m_epoch_clean    = m_pending.has_memory && IsFullBarrier(m_pending.memory);
+	m_epoch_instance = 0;
+	m_pending.Clear();
+}
+
+bool CommandBuffer::CanSinkPending() const {
+	// Sinking records the pending barrier B after the draw D2 that follows it instead of before.
+	// Everything recorded after the flush point still sees B (it covers all earlier commands), so
+	// only the P -> D2 orderings for commands P before B are lost. They are not needed when:
+	//  - commands before the epoch's full barrier F are ordered against D2 by F itself;
+	//  - everything since F is state commands, the begin of this rendering instance and safe
+	//    draws in it (m_epoch_clean / m_epoch_instance): their only writes are this instance's
+	//    attachments, which D2 accesses only as attachments, and attachment accesses of draws in
+	//    one rendering instance are ordered by rasterization order without barriers;
+	//  - D2 is safe: it writes only this instance's attachments (no WAR against reads of P) and
+	//    samples none of them (no RAW against P's attachment writes);
+	//  - the batch has no buffer/image barriers: layout transitions must precede D2.
+	return BarrierSinkEnabled() && m_draw_scope && m_draw_safe && m_rendering && m_epoch_clean &&
+	       m_epoch_instance != 0 && m_epoch_instance == m_rendering_serial &&
+	       m_pending.has_memory && m_pending.images.empty() && m_pending.buffers.empty();
+}
+
+void CommandBuffer::NoteDrawRecorded() const {
+	m_recorded_since_flush = true;
+	if (!(m_draw_scope && m_draw_safe && m_rendering && m_epoch_instance == m_rendering_serial)) {
+		m_epoch_clean = false;
+	}
 }
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
 	m_bound_pipelines = {};
 	for (auto& state: m_descriptor_states) state.layout = nullptr;
-	auto buffer = Handle();
+	// Commands of other submissions can precede this buffer on the queue: no epoch, no elision.
+	ResetBarrierState();
+	auto buffer = StateHandle();
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -47,7 +346,8 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
-	auto buffer = Handle();
+	FlushBarriers();
+	auto buffer = StateHandle();
 
 	auto result = buffer.end();
 
@@ -65,7 +365,8 @@ void CommandBuffer::BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipel
 		Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineBindsAvoided);
 		return;
 	}
-	Handle().bindPipeline(point, pipeline);
+	// State commands: not ordered by barriers, so not a batch flush point (render.h).
+	StateHandle().bindPipeline(point, pipeline);
 	current = pipeline;
 }
 
@@ -112,7 +413,7 @@ void CommandBuffer::PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLay
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushesAvoided);
 		return;
 	}
-	Handle().pushDescriptorSetKHR(point, layout, set, count, writes);
+	StateHandle().pushDescriptorSetKHR(point, layout, set, count, writes);
 	state.layout = nullptr;
 	if (!supported) return;
 	state.writes.assign(writes, writes + count);
@@ -146,12 +447,34 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {
 	const auto count_control = GetRegisters().GetDepthCountControl();
-	if (m_rendering && m_render_state == state && m_occlusion_control == count_control) {
-		return;
+	const bool same_instance =
+	    m_rendering && m_render_state == state && m_occlusion_control == count_control;
+	if (!BarrierBatchEnabled()) {
+		if (same_instance) {
+			return;
+		}
+	} else if (same_instance) {
+		if (m_pending.Empty()) {
+			NoteDrawRecorded();
+			return;
+		}
+		if (CanSinkPending()) {
+			CountBatch(GpuOpProfiler::BarrierBatchEvent::Sunk);
+			NoteDrawRecorded();
+			return;
+		}
+		// The pending barrier cannot move past this draw: end the instance to record it.
+		CountBatch(GpuOpProfiler::BarrierBatchEvent::RenderSplits);
 	}
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
+	if (BarrierBatchEnabled()) {
+		FlushBarriers();
+	}
+	// Query bookkeeping recorded by the occlusion counter below does not access memory that
+	// draws access; it is neither a flush point nor a foreign command.
+	++m_internal_recording;
 	m_context.GetOcclusionCounter().Prepare(count_control);
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
@@ -189,8 +512,9 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	Handle().beginRendering(rendering);
+	StateHandle().beginRendering(rendering);
 	m_context.GetOcclusionCounter().Begin();
+	--m_internal_recording;
 	if (m_context.GetOcclusionCounter().Active() && HangTrace::Enabled()) {
 		const auto& db = GetRegisters().GetDepthRenderTarget();
 		m_context.GetOcclusionCounter().NoteScope(db.z_read_base_addr, state.width, state.height,
@@ -202,17 +526,34 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	m_rendering    = true;
 	++m_rendering_serial;
 	m_occlusion_control = count_control;
+	if (BarrierBatchEnabled()) {
+		// The attachment load operations of the first instance begun after a full barrier belong
+		// to the sinking epoch; a second instance does not (its loads may read what the first
+		// one stored).
+		if (m_epoch_clean && m_epoch_instance == 0 && m_draw_scope) {
+			m_epoch_instance = m_rendering_serial;
+		} else {
+			m_epoch_clean = false;
+		}
+		NoteDrawRecorded();
+	}
 }
 
 void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
+	// The occlusion counter may also record a query reduction here (Accumulate): foreign work.
+	++m_internal_recording;
 	m_context.GetOcclusionCounter().End();
-	Handle().endRendering();
+	StateHandle().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
 	m_context.GetOcclusionCounter().Accumulate();
+	--m_internal_recording;
+	if (BarrierBatchEnabled()) {
+		NoteForeignCommand();
+	}
 }
 
 } // namespace Libs::Graphics

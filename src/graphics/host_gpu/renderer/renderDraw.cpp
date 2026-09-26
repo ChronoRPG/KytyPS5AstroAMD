@@ -571,7 +571,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		image.Transit(layout, image.binding.attachment_access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
-		              buffer.Handle());
+		              buffer.StateHandle(), true);
 		const auto extent       = target.Extent();
 		state.width             = std::min(state.width, extent.width);
 		state.height            = std::min(state.height, extent.height);
@@ -634,7 +634,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		image.Transit(layout, access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
-		              buffer.Handle());
+		              buffer.StateHandle(), true);
 		state.width               = std::min(state.width, depth.desc.info.extent.width);
 		state.height              = std::min(state.height, depth.desc.info.extent.height);
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
@@ -789,7 +789,19 @@ static PreparedIndirectBuffers ObtainIndirectBuffers(CommandBuffer&            b
 
 // Shader and transfer writes (compute culling, DMA, cache uploads) -> indirect command fetch.
 // Must be recorded outside a rendering instance.
-static void IndirectArgumentsBarrier(vk::CommandBuffer vk_buffer) {
+static void IndirectArgumentsBarrier(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer) {
+	if (BarrierBatchEnabled()) {
+		// Recorded (outside rendering) by the BeginRendering() that precedes the draw.
+		buffer.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eAllGraphics |
+		                                vk::PipelineStageFlagBits2::eComputeShader |
+		                                vk::PipelineStageFlagBits2::eTransfer,
+		                            vk::AccessFlagBits2::eShaderWrite |
+		                                vk::AccessFlagBits2::eTransferWrite,
+		                            vk::PipelineStageFlagBits2::eDrawIndirect,
+		                            vk::AccessFlagBits2::eIndirectCommandRead,
+		                            BarrierOrigin::IndirectArgs);
+		return;
+	}
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
@@ -1218,6 +1230,56 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
+// CommandBuffer::DrawScope: the draw's only memory writes are its own color/depth attachments,
+// and it samples none of them. Conservative: any shader write path (storage buffers/images,
+// atomics, address writes, GDS, fault/LOD counters), indirect arguments or a feedback loop makes
+// the draw unsafe for sinking a pending barrier past it.
+static bool DrawIsBarrierSafe(std::span<PreparedBindings* const> stages,
+                              const RenderColorInfo* colors, uint32_t color_count,
+                              const RenderDepthInfo& depth, vk::ImageAspectFlags feedback_aspects,
+                              bool indirect) {
+	if (indirect || feedback_aspects || !BarrierSinkEnabled()) {
+		return false;
+	}
+	using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
+	for (const auto* stage: stages) {
+		if (stage == nullptr || stage->runtime == nullptr || !*stage->runtime) {
+			return false;
+		}
+		const auto& program = *stage->runtime->program;
+		if (program.has_address_writes || stage->gds.buffer != nullptr) {
+			return false;
+		}
+		for (const auto& resource: program.info.buffers) {
+			if (resource.written || resource.atomic) {
+				return false;
+			}
+		}
+		for (const auto& resource: program.info.images) {
+			if (resource.written || resource.atomic) {
+				return false;
+			}
+		}
+		for (const auto& binding: program.bindings.descriptors) {
+			if (binding.kind == Kind::Gds || binding.kind == Kind::FaultBuffer ||
+			    binding.kind == Kind::MipStats) {
+				return false;
+			}
+		}
+		for (const auto& image: stage->images) {
+			if (depth.image_id && image.image_id == depth.image_id) {
+				return false;
+			}
+			for (uint32_t i = 0; i < color_count; i++) {
+				if (image.image_id == colors[i].image_id) {
+					return false;
+				}
+			}
+		}
+	}
+	return true;
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1342,8 +1404,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
-	// memory.
-	auto vk_buffer = buffer.Handle();
+	// memory. Until BeginRendering() only state commands are recorded through vk_buffer; image
+	// transitions and dependencies go through the barrier batcher, which BeginRendering() flushes
+	// (or, for a safe draw continuing the same rendering instance, may sink past the draw).
+	const CommandBuffer::DrawScope draw_scope(
+	    buffer, DrawIsBarrierSafe(stages, state.color_info, state.color_count, state.depth_info,
+	                              feedback_aspects, indirect != nullptr));
+	auto vk_buffer = buffer.StateHandle();
 	SetDrawDebugPhase(buffer, submit_id, draw, emit, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
@@ -1370,7 +1437,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		const auto active = buffer.ActiveRenderingSerial();
 		if (active == 0 || active != m_indirect_barrier_rendering) {
 			m_context.GetCommandScheduler().EndRendering();
-			IndirectArgumentsBarrier(vk_buffer);
+			IndirectArgumentsBarrier(buffer, vk_buffer);
 		}
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
@@ -1445,7 +1512,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();
-		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+		ShaderWriteBarrier(buffer, shader_write_stages);
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {

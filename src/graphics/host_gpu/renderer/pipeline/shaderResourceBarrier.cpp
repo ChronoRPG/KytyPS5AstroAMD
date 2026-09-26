@@ -4,6 +4,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
+#include "graphics/host_gpu/renderer/render.h"
 
 #include <cstring>
 
@@ -109,32 +110,52 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	return has_writes;
 }
 
-void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
-	KYTY_GPU_OP_SITE("shader.access_barrier");
-	EXIT_IF(vk_buffer == nullptr || !source_stages);
-	const auto barrier = MakeShaderAccessDependency();
-	vk_buffer.pipelineBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
-	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+// Sync1 masks share their bit values with the synchronization2 ones.
+static vk::PipelineStageFlags2 Stages2(vk::PipelineStageFlags stages) {
+	return vk::PipelineStageFlags2(static_cast<VkPipelineStageFlags2>(
+	    static_cast<VkPipelineStageFlags>(stages)));
 }
 
-void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
+static vk::AccessFlags2 Access2(vk::AccessFlags access) {
+	return vk::AccessFlags2(static_cast<VkAccessFlags2>(static_cast<VkAccessFlags>(access)));
+}
+
+static void RecordShaderBarrier(const CommandBuffer& buffer, vk::PipelineStageFlags source_stages,
+                                vk::PipelineStageFlags destination_stages,
+                                const vk::MemoryBarrier& barrier, BarrierOrigin origin) {
+	if (BarrierBatchEnabled()) {
+		buffer.RequestMemoryBarrier(Stages2(source_stages), Access2(barrier.srcAccessMask),
+		                            Stages2(destination_stages), Access2(barrier.dstAccessMask),
+		                            origin);
+		return;
+	}
+	buffer.Handle().pipelineBarrier(source_stages, destination_stages, vk::DependencyFlags {}, 1,
+	                                &barrier, 0, nullptr, 0, nullptr);
+}
+
+void ShaderAccessBarrier(const CommandBuffer& buffer, vk::PipelineStageFlags source_stages) {
+	KYTY_GPU_OP_SITE("shader.access_barrier");
+	EXIT_IF(buffer.IsInvalid() || !source_stages);
+	RecordShaderBarrier(buffer, source_stages, vk::PipelineStageFlagBits::eAllCommands,
+	                    MakeShaderAccessDependency(), BarrierOrigin::ShaderAccess);
+}
+
+void ShaderWriteHazardBarrier(const CommandBuffer&   buffer,
                               vk::PipelineStageFlags destination_stages) {
 	KYTY_GPU_OP_SITE("shader.write_hazard_barrier");
-	EXIT_IF(vk_buffer == nullptr || !destination_stages);
-	const auto barrier = MakeShaderWriteHazardDependency();
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, destination_stages,
-	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	EXIT_IF(buffer.IsInvalid() || !destination_stages);
+	RecordShaderBarrier(buffer, vk::PipelineStageFlagBits::eAllCommands, destination_stages,
+	                    MakeShaderWriteHazardDependency(), BarrierOrigin::ShaderWriteHazard);
 }
 
-void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
+void ShaderWriteBarrier(const CommandBuffer& buffer, vk::PipelineStageFlags source_stages) {
 	KYTY_GPU_OP_SITE("shader.write_barrier");
-	EXIT_IF(vk_buffer == nullptr || !source_stages);
-	const auto barrier = MakeShaderWriteDependency();
-	vk_buffer.pipelineBarrier(source_stages,
-	                          vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	EXIT_IF(buffer.IsInvalid() || !source_stages);
+	RecordShaderBarrier(buffer, source_stages,
+	                    vk::PipelineStageFlagBits::eComputeShader |
+	                        vk::PipelineStageFlagBits::eAllGraphics |
+	                        vk::PipelineStageFlagBits::eTransfer,
+	                    MakeShaderWriteDependency(), BarrierOrigin::ShaderWrite);
 }
 
 } // namespace Libs::Graphics
