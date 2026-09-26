@@ -120,6 +120,11 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.NativeOcclusionReductions.Cumulative",
     "FrameEvent.MeshRestartMarkers.Cumulative",
     "FrameEvent.MeshRestartSegments.Cumulative",
+    "FrameEvent.CleanVerdictHits.Cumulative",
+    "FrameEvent.CleanVerdictMisses.Cumulative",
+    "FrameEvent.CleanVerdictStores.Cumulative",
+    "FrameEvent.BackingMapCacheHits.Cumulative",
+    "FrameEvent.BackingMapCacheMisses.Cumulative",
 };
 
 constexpr size_t kFrameWaitCount = static_cast<size_t>(Profiler::FrameWait::Count);

@@ -29,6 +29,24 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 }
 #endif
 
+// Per-thread copies of recent GuestBackingStore mapping records, never guest bytes. An entry
+// is usable only while the store's map generation still equals its tag: every m_maps mutation
+// bumps that generation under m_mutex first (InvalidateMapHints). The backing view stays
+// mapped for the store's lifetime and the destructor bumps too, so even a stale entry never
+// dereferences unmapped host memory; the tag check keeps it from using a changed mapping.
+struct GuestBackingMappingCache {
+	struct Entry {
+		const void* owner          = nullptr;
+		uint64_t    generation     = 0;
+		uint64_t    vaddr          = 0;
+		uint64_t    size           = 0;
+		uint64_t    backing_offset = 0;
+	};
+	std::array<Entry, 4> entries {};
+	uint32_t             next = 0;
+};
+static thread_local GuestBackingMappingCache t_backing_mapping_cache;
+
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -183,11 +201,22 @@ public:
 		if (data == nullptr) {
 			return false;
 		}
+		const bool cache_mappings =
+		    size <= MAX_CACHED_MAPPING_READ && Libs::Graphics::CleanVerdict::Enabled();
+		if (cache_mappings) {
+			if (TryReadCachedMapping(vaddr, data, size)) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::BackingMapCacheHits);
+				return true;
+			}
+			Profiler::CountFrameEvent(Profiler::FrameEvent::BackingMapCacheMisses);
+		}
 		auto* destination = static_cast<uint8_t*>(data);
 		return TryTransferBacking(
-		    vaddr, size, [destination](uint8_t* backing, uint64_t data_offset, size_t bytes) {
+		    vaddr, size,
+		    [destination](uint8_t* backing, uint64_t data_offset, size_t bytes) {
 			    std::memcpy(destination + data_offset, backing, bytes);
-		    });
+		    },
+		    cache_mappings);
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -480,8 +509,55 @@ public:
 	}
 
 private:
+	// Starts at 1 so zero-initialized GuestBackingMappingCache entries never match.
+	inline static std::atomic<uint64_t> s_map_generation {1};
+
+	// Small reads only: the lock matters for descriptor-sized probes, and they go through a
+	// bounce buffer so a failed read never modifies the destination (as on the locked path).
+	// Reads only: a write through a mapping being removed concurrently could not be undone.
+	static constexpr uint64_t MAX_CACHED_MAPPING_READ = 256;
+
+	bool TryReadCachedMapping(uint64_t vaddr, void* data, uint64_t size) {
+		if (!IsAvailable() || size == 0 || size > MAX_CACHED_MAPPING_READ ||
+		    UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		const auto generation = s_map_generation.load(std::memory_order_acquire);
+		for (const auto& entry: t_backing_mapping_cache.entries) {
+			if (entry.owner != this || entry.generation != generation || vaddr < entry.vaddr ||
+			    vaddr - entry.vaddr >= entry.size || size > entry.size - (vaddr - entry.vaddr)) {
+				continue;
+			}
+			// RangeOk held for the whole record when it was cached under m_mutex.
+			std::array<uint8_t, MAX_CACHED_MAPPING_READ> bounce;
+			std::memcpy(bounce.data(),
+			            m_backing_base + entry.backing_offset + (vaddr - entry.vaddr),
+			            static_cast<size_t>(size));
+			// Seqlock-style validation: if a map mutation started during the copy, the caller
+			// redoes the read under m_mutex so it is ordered before or after that mutation.
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (s_map_generation.load(std::memory_order_relaxed) != generation) {
+				return false;
+			}
+			std::memcpy(data, bounce.data(), static_cast<size_t>(size));
+			return true;
+		}
+		return false;
+	}
+
+	// Caller holds m_mutex, so the generation cannot change while it is sampled.
+	void RememberMappingUnlocked(uint64_t vaddr, uint64_t size, uint64_t backing_offset) const {
+		if (!RangeOk(backing_offset, size)) {
+			return;
+		}
+		auto& cache = t_backing_mapping_cache;
+		cache.entries[cache.next++ % cache.entries.size()] = {
+		    this, s_map_generation.load(std::memory_order_relaxed), vaddr, size, backing_offset};
+	}
+
 	template <typename Transfer>
-	bool TryTransferBacking(uint64_t vaddr, uint64_t size, Transfer transfer) {
+	bool TryTransferBacking(uint64_t vaddr, uint64_t size, Transfer transfer,
+	                        bool remember_mapping = false) {
 		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
@@ -505,6 +581,9 @@ private:
 				if (!RangeOk(offset, size)) {
 					return false;
 				}
+				if (remember_mapping) {
+					RememberMappingUnlocked(entry.vaddr, entry.size, entry.backing_offset);
+				}
 				transfer(m_backing_base + offset, 0, static_cast<size_t>(size));
 				return true;
 			}
@@ -518,6 +597,10 @@ private:
 			const auto bytes = std::min(end, entry.vaddr + entry.size) - current;
 			if (!RangeOk(entry.backing_offset + current - entry.vaddr, bytes)) {
 				return false;
+			}
+			if (remember_mapping && bytes == size) {
+				// One mapping covers the whole read; later reads may translate it lock-free.
+				RememberMappingUnlocked(entry.vaddr, entry.size, entry.backing_offset);
 			}
 			current += bytes;
 		}
@@ -575,7 +658,12 @@ private:
 		return false;
 	}
 
-	void InvalidateMapHints() { m_map_hints = {}; }
+	// Called under m_mutex before every m_maps mutation. The generation bump also retires all
+	// per-thread GuestBackingMappingCache entries, which are read without m_mutex.
+	void InvalidateMapHints() {
+		m_map_hints = {};
+		s_map_generation.fetch_add(1, std::memory_order_seq_cst);
+	}
 
 	[[nodiscard]] bool RangeOk(uint64_t backing_offset, uint64_t size) const {
 		return size != 0 && backing_offset < m_size && size <= m_size - backing_offset;

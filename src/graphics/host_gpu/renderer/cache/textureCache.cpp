@@ -8,6 +8,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -420,6 +421,7 @@ void TextureCache::FreeImage(ImageId id, HangTrace::ImageFreeReason reason) {
 	HangTrace::SetImageFreeReason(reason);
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
+		CleanVerdict::Invalidate();
 		image.ClearGpuModified();
 	}
 	DeleteImage(id);
@@ -2228,6 +2230,8 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 			continue;
 		}
 		if (image.IsGpuModified()) {
+			// The buffer cache takes ownership of these bytes; its Add bumps as well.
+			CleanVerdict::Invalidate();
 			image.ClearGpuModified();
 		}
 		image.MarkBufferModified();
@@ -2235,6 +2239,9 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::InvalidateCleanImageProofs() {
+	// Every image register/unregister and GPU-modified transition passes here, before the
+	// change is made under m_lock. Global clean-read verdicts depend on the same state.
+	CleanVerdict::Invalidate();
 	if (!m_clean_image_proofs) {
 		return;
 	}

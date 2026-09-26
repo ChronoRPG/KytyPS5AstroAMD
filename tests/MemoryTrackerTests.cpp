@@ -780,6 +780,147 @@ void TestFullRegionGpuUnmarkBatching() {
   Release(memory);
 }
 
+namespace CleanVerdict = Libs::Graphics::CleanVerdict;
+
+void TestCleanVerdictQuery() {
+  constexpr uint64_t page = 0x0000000200010000ull;
+  constexpr uint64_t page_size = CleanVerdict::PAGE_SIZE;
+  CleanVerdict::Table table;
+  RangeSet dirty;
+  uint32_t probes = 0;
+  const auto is_clean = [&](uint64_t vaddr, uint64_t size) {
+    probes++;
+    return !dirty.Intersects(vaddr, size);
+  };
+
+  auto result = CleanVerdict::Query(table, page + 0x40, 16, is_clean);
+  Check(result.clean && !result.hit && result.stores == 1 && probes == 1,
+        "first clean read did not prove its whole page");
+  result = CleanVerdict::Query(table, page + page_size - 16, 16, is_clean);
+  Check(result.clean && result.hit && probes == 1,
+        "second read in a proven page was not answered from the table");
+
+  // Dirtying transitions bump before the state changes.
+  CleanVerdict::Invalidate();
+  dirty.Add(page + 0x800, 4);
+  result = CleanVerdict::Query(table, page + 0x800, 4, is_clean);
+  Check(!result.clean && !result.hit,
+        "a cached clean verdict survived a generation bump");
+  probes = 0;
+  result = CleanVerdict::Query(table, page + 0x40, 16, is_clean);
+  Check(result.clean && !result.hit && result.stores == 0 && probes == 1,
+        "clean bytes of a partially dirty page did not use one exact query");
+
+  // Dirty-to-clean needs no bump: a stale Dirty verdict only forces exact
+  // queries until the next bump.
+  dirty.Subtract(page + 0x800, 4);
+  result = CleanVerdict::Query(table, page + 0x800, 4, is_clean);
+  Check(result.clean && !result.hit && result.stores == 0,
+        "a stale Dirty verdict hid clean bytes");
+  CleanVerdict::Invalidate();
+  result = CleanVerdict::Query(table, page + 0x800, 4, is_clean);
+  Check(result.clean && result.stores == 1, "a cleaned page was not reproven");
+
+  // A read crossing into a partially dirty page falls back to its exact range.
+  CleanVerdict::Invalidate();
+  dirty.Add(page + page_size + 0x100, 4);
+  result = CleanVerdict::Query(table, page + page_size - 8, 16, is_clean);
+  Check(result.clean && !result.hit && result.stores == 1,
+        "cross-page read did not combine page and exact verdicts");
+  result = CleanVerdict::Query(table, page + page_size + 0xfc, 8, is_clean);
+  Check(!result.clean, "cross-page dirty bytes were reported clean");
+
+  // Page 0 and long reads keep exact queries and never populate the table.
+  probes = 0;
+  result = CleanVerdict::Query(table, 0x100, 16, is_clean);
+  Check(result.clean && result.stores == 0 && probes == 1,
+        "page 0 used the verdict table");
+  result = CleanVerdict::Query(
+      table, page + page_size * 8,
+      page_size * CleanVerdict::MAX_CACHED_PAGES + 1, is_clean);
+  Check(result.clean && result.stores == 0 && probes == 2,
+        "long read used the verdict table");
+  dirty.Clear();
+}
+
+void TestCleanVerdictTrackerTransitionsBump() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 1);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  // New regions start CPU dirty; upload them before marking GPU ownership.
+  tracker.ForEachUploadRange(
+      address, page_size, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  auto generation = CleanVerdict::Generation();
+  tracker.MarkRegionAsGpuModified(address, page_size);
+  Check(CleanVerdict::Generation() > generation,
+        "tracker GPU marking did not retire clean verdicts");
+  generation = CleanVerdict::Generation();
+  tracker.UnmarkRegionAsGpuModified(address, page_size);
+  Check(CleanVerdict::Generation() > generation,
+        "tracker GPU unmarking did not retire clean verdicts");
+  generation = CleanVerdict::Generation();
+  tracker.ForEachDownloadRange<true>(address, page_size,
+                                     [](uint64_t, uint64_t) noexcept {});
+  Check(CleanVerdict::Generation() > generation,
+        "clearing GPU download ranges did not retire clean verdicts");
+
+  tracker.UntrackMemory(address, page_size);
+  Release(memory);
+}
+
+// Protocol check: a writer bumps, dirties the page, then publishes that fact.
+// A reader that observes the publication must never answer "clean" from its
+// table, even though it proved the page clean earlier on its own thread.
+void TestCleanVerdictCrossThreadInvalidation() {
+  constexpr uint64_t page = 0x0000000200020000ull;
+  constexpr uint32_t rounds = 2000;
+  std::atomic<bool> dirty{false};
+  std::atomic<uint32_t> published{0};
+  std::atomic<uint32_t> consumed{0};
+  std::atomic<uint32_t> failures{0};
+  const auto is_clean = [&](uint64_t, uint64_t) {
+    return !dirty.load(std::memory_order_acquire);
+  };
+
+  std::jthread reader([&] {
+    CleanVerdict::Table table;
+    for (uint32_t round = 1; round <= rounds; round++) {
+      while (!CleanVerdict::Query(table, page, 16, is_clean).clean) {
+        std::this_thread::yield();
+      }
+      consumed.store(round, std::memory_order_release);
+      while (published.load(std::memory_order_acquire) != round) {
+        std::this_thread::yield();
+      }
+      if (CleanVerdict::Query(table, page + 0x80, 16, is_clean).clean) {
+        failures.fetch_add(1, std::memory_order_relaxed);
+      }
+      consumed.store(round + rounds, std::memory_order_release);
+    }
+  });
+  for (uint32_t round = 1; round <= rounds; round++) {
+    while (consumed.load(std::memory_order_acquire) != round) {
+      std::this_thread::yield();
+    }
+    CleanVerdict::Invalidate();
+    dirty.store(true, std::memory_order_release);
+    published.store(round, std::memory_order_release);
+    while (consumed.load(std::memory_order_acquire) != round + rounds) {
+      std::this_thread::yield();
+    }
+    dirty.store(false, std::memory_order_release);
+    CleanVerdict::Invalidate();
+  }
+  reader.join();
+  Check(failures.load() == 0,
+        "a published dirtying transition was hidden by a cached verdict");
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -939,6 +1080,9 @@ int main(int argc, char **argv) {
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
+  TestCleanVerdictQuery();
+  TestCleanVerdictTrackerTransitionsBump();
+  TestCleanVerdictCrossThreadInvalidation();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();

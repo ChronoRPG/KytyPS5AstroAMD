@@ -4,6 +4,7 @@
 #include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -119,6 +120,9 @@ bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) 
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
+	// GPU mapping changes retire clean-read verdicts (the backing translation has its own
+	// generation in the guest address space).
+	CleanVerdict::Invalidate();
 	m_mapped_ranges.Add(vaddr, size);
 	m_buffer_cache.InvalidateBdaSynchronization();
 }
@@ -147,6 +151,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
+		CleanVerdict::Invalidate();
 		m_mapped_ranges.Subtract(vaddr, size);
 		m_buffer_cache.InvalidateBdaSynchronization();
 	};

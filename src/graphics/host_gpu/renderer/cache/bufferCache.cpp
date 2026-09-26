@@ -7,6 +7,7 @@
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -131,6 +132,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
+		    // Ownership moves to the backing publication registered below (which bumps again).
+		    CleanVerdict::Invalidate();
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
 	if (copies.empty()) {
@@ -530,6 +533,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		// Writable descriptors reserve a new version before recording their shader commands.
 		buffer.MarkContentWritten();
+		// An Add that changes nothing cannot stale a cached clean page, because pages with
+		// dirty bytes are never cached clean. The tracker GPU bits that SynchronizeBuffer just
+		// set are only ever set together with this Add; clean-read verdicts never read them.
+		if (!m_gpu_modified_ranges.Contains(vaddr, size)) {
+			CleanVerdict::Invalidate();
+		}
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetKnownFills(vaddr, size);
 		HangTrace::NoteGpuWrite(vaddr, size);
@@ -728,6 +737,8 @@ std::optional<BufferContentRevision> BufferCache::GetContentRevision(uint64_t va
 
 void BufferCache::InvalidateContentRevisions() {
 	EXIT_IF(!GuestGpu::IsGpuThread() || m_content_revision_epoch == UINT64_MAX);
+	// Unbounded GPU writes follow; retire clean-read verdicts along with the revisions.
+	CleanVerdict::Invalidate();
 	++m_content_revision_epoch;
 }
 
@@ -739,6 +750,8 @@ uint64_t BufferCache::BeginBackingPublication(std::span<const GuestRange> ranges
 	std::lock_guard lock(m_backing_publication_mutex);
 	const auto token = ++m_next_backing_publication_token;
 	EXIT_IF(token == 0);
+	// Pending ranges are not clean for backing reads; retire verdicts before publishing them.
+	CleanVerdict::Invalidate();
 	m_backing_publications.push_back({token, tick, {ranges.begin(), ranges.end()}});
 	m_backing_publication_count.store(m_backing_publications.size(), std::memory_order_release);
 	return token;
@@ -749,6 +762,9 @@ void BufferCache::EndBackingPublication(uint64_t token) {
 	const auto found = std::find_if(m_backing_publications.begin(), m_backing_publications.end(),
 	                                [token](const auto& entry) { return entry.token == token; });
 	EXIT_IF(found == m_backing_publications.end());
+	// Backing authority changes here (runs on the priority worker). Bump before the entry is
+	// erased so a verdict evaluated after the erase is tagged with the new generation.
+	CleanVerdict::Invalidate();
 	m_backing_publications.erase(found);
 	// Publish completion only after the callback has written every registered backing range.
 	m_backing_publication_count.store(m_backing_publications.size(), std::memory_order_release);
