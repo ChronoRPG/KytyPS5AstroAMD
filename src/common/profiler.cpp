@@ -126,6 +126,14 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.CleanVerdictStores.Cumulative",
     "FrameEvent.BackingMapCacheHits.Cumulative",
     "FrameEvent.BackingMapCacheMisses.Cumulative",
+    "FrameEvent.ReadbackSideCopies.Cumulative",
+    "FrameEvent.ReadbackSideCopyBytes.Cumulative",
+    "FrameEvent.ReadbackSideDuplicateWaits.Cumulative",
+    "FrameEvent.ReadbackSideFallbackCurrentWriter.Cumulative",
+    "FrameEvent.ReadbackSideFallbackUnbounded.Cumulative",
+    "FrameEvent.ReadbackSideFallbackOther.Cumulative",
+    "FrameEvent.ReadbackSidePagesUnmarked.Cumulative",
+    "FrameEvent.ReadbackSidePagesRetained.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
@@ -152,6 +160,7 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.GpuRecordToStart.Calls.Cumulative",
     "FrameWait.GpuDispatchToStart.Calls.Cumulative",
     "FrameWait.GpuEndToObserved.Calls.Cumulative",
+    "FrameWait.ReadbackSideWait.Calls.Cumulative",
 };
 static_assert(kFrameWaitCallNames.back() != nullptr, "FrameWait names must match the enum");
 constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
@@ -171,6 +180,7 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.GpuRecordToStart.Nanoseconds.Cumulative",
     "FrameWait.GpuDispatchToStart.Nanoseconds.Cumulative",
     "FrameWait.GpuEndToObserved.Nanoseconds.Cumulative",
+    "FrameWait.ReadbackSideWait.Nanoseconds.Cumulative",
 };
 static_assert(kFrameWaitTimeNames.back() != nullptr, "FrameWait names must match the enum");
 

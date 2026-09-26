@@ -101,6 +101,9 @@ bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) 
 	// Exact dirty ranges are removed when a download is queued, before its backing publication.
 	// Retired images can likewise have an outstanding publication without a live image owner.
 	// Never hold the registry, mapping, texture-cache, or tracker locks over these waits.
+	// Side readbacks are published by their faulting guest thread; finish any overlapping one
+	// here (already submitted, so this never waits for the current recording).
+	m_buffer_cache.CompleteSideReadbacks(vaddr, size);
 	if (const auto tick = m_buffer_cache.PendingBackingPublicationTick(vaddr, size)) {
 		m_command_scheduler.Wait(*tick);
 		m_command_scheduler.WaitPriorityOperations(*tick);

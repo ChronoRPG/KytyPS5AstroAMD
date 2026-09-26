@@ -145,7 +145,8 @@ std::mutex               g_readback_mutex;
 std::vector<std::string> g_pending_readback_rows;
 uint64_t                 g_readback_rows_total = 0;
 
-constexpr const char* kReadbackKindNames[] = {"invalidate", "fault-read", "fault-write", "gpu-sync"};
+constexpr const char* kReadbackKindNames[] = {"invalidate", "fault-read", "fault-write",
+                                              "gpu-sync",   "fault-read-side", "fault-read-dup"};
 constexpr const char* kImageFreeReasonNames[] = {
     "other",           "depth-association", "depth-recreate", "overlap-layout",
     "overlap-mip-merge", "overlap-stale",   "expand",         "smaller-resources",
@@ -1028,6 +1029,10 @@ void SetReadbackKind(ReadbackKind kind) {
 	g_readback_kind = kind;
 }
 
+ReadbackKind GetReadbackKind() {
+	return g_readback_kind;
+}
+
 void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64_t window_size,
                     bool downloaded, uint64_t duration_ns) {
 	if (!Enabled()) {
@@ -1039,7 +1044,8 @@ void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64
 		g_totals.readback_downloads.fetch_add(1, std::memory_order_relaxed);
 	}
 	const auto kind   = g_readback_kind;
-	const bool fault  = kind == ReadbackKind::FaultRead || kind == ReadbackKind::FaultWrite;
+	const bool fault  = kind == ReadbackKind::FaultRead || kind == ReadbackKind::FaultWrite ||
+	                   kind == ReadbackKind::FaultReadSide || kind == ReadbackKind::FaultReadDuplicate;
 	const auto pc     = fault && g_fault_context.pc != 0 ? FormatAddress(g_fault_context.pc) : std::string();
 	const auto thread = fault ? std::string_view(g_fault_context.thread) : std::string_view();
 	// Stack scanning only helps when a guest thread is on this stack (CPU faults). It costs a dozen
