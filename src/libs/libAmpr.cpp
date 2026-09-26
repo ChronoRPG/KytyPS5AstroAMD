@@ -9,6 +9,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "libs/amprCounterBank.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
@@ -16,6 +17,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -799,10 +802,32 @@ struct CommandBufferState {
 		int32_t        prot          = 0;
 		uint8_t        gpu_mask_id   = 0;
 	};
+	// Counter-bank, timestamp and wait commands. Executed in record order together
+	// with every other command kind; see ExecuteSyncCommand().
+	enum class SyncKind : uint32_t {
+		WriteCounter,
+		WaitOnCounter,
+		WaitOnAddress,
+		WriteAddressFromCounter,
+		WriteAddressFromCounterPair,
+		WriteAddressFromTimeCounter,
+	};
+	struct SyncCommand {
+		uint64_t record_offset = 0;
+		SyncKind kind          = SyncKind::WriteCounter;
+		uint8_t  counter_index = 0;
+		uint8_t  access        = 0; // CounterBank::ACCESS_*
+		uint8_t  op            = 0; // CounterBank::WRITE_* or CounterBank::COMPARE_*
+		uint8_t  mask_op       = 0; // CounterBank::MASK_*
+		uint64_t value         = 0; // write operand or wait reference
+		uint64_t mask          = 0; // wait-on-counter AND mask
+		uint64_t address       = 0; // guest address read (wait) or written (write-address)
+	};
 	std::vector<ReadFileCommand>     read_file_commands;
 	std::vector<KernelEventCommand>  kernel_event_commands;
 	std::vector<WriteAddressCommand> write_address_commands;
 	std::vector<AmmMapCommand>       amm_map_commands;
+	std::vector<SyncCommand>         sync_commands;
 	bool                             gather_scatter_valid       = false;
 	uint32_t                         gather_scatter_file_id     = 0;
 	uint64_t                         gather_scatter_destination = 0;
@@ -848,7 +873,8 @@ static uint64_t NewDiagnosticGeneration() {
 
 static bool HasQueuedCommands(const CommandBufferState& state) {
 	return !state.read_file_commands.empty() || !state.kernel_event_commands.empty() ||
-	       !state.write_address_commands.empty() || !state.amm_map_commands.empty();
+	       !state.write_address_commands.empty() || !state.amm_map_commands.empty() ||
+	       !state.sync_commands.empty();
 }
 
 static void RegisterCommandBufferAliasLocked(uint64_t command_buffer, uint64_t buffer) {
@@ -1099,6 +1125,7 @@ static bool WriteCommandBufferPointers(uint64_t command_buffer, uint64_t buffer,
 	state.kernel_event_commands.clear();
 	state.write_address_commands.clear();
 	state.amm_map_commands.clear();
+	state.sync_commands.clear();
 	state.gather_scatter_valid       = false;
 	state.gather_scatter_file_id     = 0;
 	state.gather_scatter_destination = 0;
@@ -1286,6 +1313,241 @@ static bool AppendWriteAddressRecord(uint64_t command_buffer, uint64_t address, 
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
+// All counter, timestamp and wait records are 0x20 bytes, matching the
+// sceAmprMeasureCommandSize* results for these commands.
+constexpr uint64_t SYNC_RECORD_SIZE = 0x20;
+
+static bool AppendSyncRecord(uint64_t command_buffer, const CommandBufferState::SyncCommand& cmd) {
+	std::scoped_lock      lock(g_command_buffer_mutex);
+	CommandBufferIterator it;
+	if (!GetOrCreateCommandBufferStateLocked(command_buffer, &it)) {
+		return false;
+	}
+
+	auto& state = it->second;
+	if (!EnsureCommandBufferRecordSpace(command_buffer, &state, SYNC_RECORD_SIZE)) {
+		return false;
+	}
+
+	auto record          = cmd;
+	record.record_offset = state.write_offset;
+	std::memset(reinterpret_cast<void*>(state.buffer + state.write_offset), 0,
+	            static_cast<size_t>(SYNC_RECORD_SIZE));
+	state.sync_commands.push_back(record);
+	return CommitCommandBufferRecord(command_buffer, &state, SYNC_RECORD_SIZE);
+}
+
+// Process-wide AMPR counter bank and wait machinery.
+//
+// Execution model: every submission runs synchronously on the submitting guest
+// thread (ExecuteAprCommandBuffer), one record at a time, in record order. A
+// command therefore only starts after every earlier command in the same buffer
+// has fully completed, so the "OnCompletion" variants (which on hardware wait for
+// all earlier reads to land before they take effect) and the immediate variants
+// behave identically here, and both are exact with respect to the buffer's own
+// reads.
+//
+// Waits: other guest threads submit their own buffers concurrently, and guest CPU
+// code may store to a waited address, so an unsatisfied wait can legitimately be
+// satisfied later. It is re-evaluated whenever any AMPR submission writes a counter
+// or an address (condition variable + epoch), and polled with a backoff capped at
+// AMPR_WAIT_MAX_SLICE to observe plain CPU stores. What a synchronous executor
+// cannot do is let the *submitting* thread run ahead: on hardware the submit call
+// returns at once, so a buffer may wait on a value that the same thread produces
+// only after the submit returns (a later submission or a CPU store). Here that
+// dependency can never resolve, so each wait is bounded by AMPR_WAIT_TIMEOUT;
+// on expiry the wait is logged (rate-limited) and treated as satisfied so the
+// buffer completes. Continuing is preferred to failing the submission: hardware
+// never reports a wait as an error, and an error result would make streaming code
+// retry or abandon the request, whereas a late-satisfied wait only reorders the
+// following records relative to a producer that, on this thread, cannot run until
+// the submit returns anyway.
+constexpr auto AMPR_WAIT_TIMEOUT     = std::chrono::milliseconds(1000);
+constexpr auto AMPR_WAIT_FIRST_SLICE = std::chrono::microseconds(50);
+constexpr auto AMPR_WAIT_MAX_SLICE   = std::chrono::milliseconds(2);
+
+static std::mutex              g_sync_mutex; // guards g_counter_bank and g_sync_epoch
+static std::condition_variable g_sync_cv;
+static CounterBank::Bank       g_counter_bank;
+static uint64_t                g_sync_epoch = 0;
+static std::atomic<uint64_t>   g_sync_wait_timeouts {0};
+static std::atomic<uint64_t>   g_sync_unsupported_logged {0};
+
+static void NotifySyncWaiters() {
+	{
+		std::scoped_lock lock(g_sync_mutex);
+		++g_sync_epoch;
+	}
+	g_sync_cv.notify_all();
+}
+
+static uint64_t ReadCounter(const CounterBank::Lane& lane) {
+	std::scoped_lock lock(g_sync_mutex);
+	return g_counter_bank.Read(lane);
+}
+
+static void ApplyCounterWrite(const CounterBank::Lane& lane, uint64_t operand, uint8_t op) {
+	{
+		std::scoped_lock lock(g_sync_mutex);
+		g_counter_bank.Apply(lane, operand, op);
+		++g_sync_epoch;
+	}
+	g_sync_cv.notify_all();
+}
+
+static bool ReadGuestWaitValue(uint64_t address, uint64_t* out) {
+	if (address != 0 && (address & (sizeof(uint64_t) - 1u)) == 0) {
+		*out = std::atomic_ref<uint64_t>(*reinterpret_cast<uint64_t*>(address))
+		           .load(std::memory_order_acquire);
+		return true;
+	}
+	return AprShared::ReadGuest(address, out);
+}
+
+// Evaluates `satisfied` (called without g_sync_mutex held) until it returns true
+// or AMPR_WAIT_TIMEOUT elapses. Returns whether it was satisfied.
+template <typename Satisfied>
+static bool WaitBounded(Satisfied&& satisfied, uint64_t* waited_us) {
+	using Clock = std::chrono::steady_clock;
+
+	uint64_t seen = 0;
+	{
+		std::scoped_lock lock(g_sync_mutex);
+		seen = g_sync_epoch;
+	}
+	*waited_us = 0;
+	if (satisfied()) {
+		return true;
+	}
+
+	const auto        start    = Clock::now();
+	const auto        deadline = start + AMPR_WAIT_TIMEOUT;
+	Clock::duration   slice    = AMPR_WAIT_FIRST_SLICE;
+	bool              ok       = false;
+	for (;;) {
+		const auto now = Clock::now();
+		if (now >= deadline) {
+			break;
+		}
+		{
+			std::unique_lock lock(g_sync_mutex);
+			g_sync_cv.wait_for(lock, std::min<Clock::duration>(slice, deadline - now),
+			                   [&] { return g_sync_epoch != seen; });
+			seen = g_sync_epoch;
+		}
+		if (satisfied()) {
+			ok = true;
+			break;
+		}
+		slice = std::min<Clock::duration>(slice * 2, AMPR_WAIT_MAX_SLICE);
+	}
+	*waited_us = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count());
+	return ok;
+}
+
+static void ReportWaitTimeout(uint64_t command_buffer, const CommandBufferState::SyncCommand& command,
+                              uint64_t observed, uint64_t waited_us) {
+	const auto count = g_sync_wait_timeouts.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (count > 16 && (count & 255u) != 0) {
+		return;
+	}
+	if (command.kind == CommandBufferState::SyncKind::WaitOnAddress) {
+		LOGF("\tAMPR wait-on-address not satisfied after %" PRIu64
+		     " us, continuing (synchronous executor; timeout #%" PRIu64 "): cb=0x%016" PRIx64
+		     " record=0x%" PRIx64 " address=0x%016" PRIx64 " compare=%u ref=0x%016" PRIx64
+		     " observed=0x%016" PRIx64 "\n",
+		     waited_us, count, command_buffer, command.record_offset, command.address,
+		     static_cast<uint32_t>(command.op), command.value, observed);
+	} else {
+		LOGF("\tAMPR wait-on-counter not satisfied after %" PRIu64
+		     " us, continuing (synchronous executor; timeout #%" PRIu64 "): cb=0x%016" PRIx64
+		     " record=0x%" PRIx64 " index=%u access=%u compare=%u mask_op=%u mask=0x%016" PRIx64
+		     " ref=0x%016" PRIx64 " observed=0x%016" PRIx64 "\n",
+		     waited_us, count, command_buffer, command.record_offset,
+		     static_cast<uint32_t>(command.counter_index), static_cast<uint32_t>(command.access),
+		     static_cast<uint32_t>(command.op), static_cast<uint32_t>(command.mask_op), command.mask,
+		     command.value, observed);
+	}
+}
+
+// Executes one counter/timestamp/wait record. Returns OK or the execution error
+// to report for this record.
+static int ExecuteSyncCommand(uint64_t command_buffer, const CommandBufferState::SyncCommand& command) {
+	using Kind = CommandBufferState::SyncKind;
+
+	CounterBank::Lane lane {};
+	const bool        uses_counter = command.kind != Kind::WaitOnAddress &&
+	                          command.kind != Kind::WriteAddressFromTimeCounter;
+	if (uses_counter && !CounterBank::DecodeLane(command.counter_index, command.access, &lane)) {
+		// Validated when the record was appended; unreachable unless state is corrupt.
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	switch (command.kind) {
+		case Kind::WriteCounter: ApplyCounterWrite(lane, command.value, command.op); return OK;
+
+		case Kind::WriteAddressFromCounter:
+		case Kind::WriteAddressFromCounterPair:
+		case Kind::WriteAddressFromTimeCounter: {
+			// The time counter is the process time counter the guest reads through
+			// sceKernelGetProcessTimeCounter(), sampled when the record executes.
+			const uint64_t value = command.kind == Kind::WriteAddressFromTimeCounter
+			                           ? LibKernel::KernelGetProcessTimeCounter()
+			                           : ReadCounter(lane);
+			if (!AprShared::WriteGuest(command.address, value)) {
+				LOGF("\tAMPR submit write-address-from-counter failed: kind=%u address=0x%016" PRIx64
+				     " index=%u\n",
+				     static_cast<uint32_t>(command.kind), command.address,
+				     static_cast<uint32_t>(command.counter_index));
+				return LibKernel::KERNEL_ERROR_EFAULT;
+			}
+			NotifySyncWaiters();
+			return OK;
+		}
+
+		case Kind::WaitOnCounter: {
+			uint64_t   observed  = 0;
+			const auto satisfied = [&]() {
+				observed = ReadCounter(lane);
+				if (command.mask_op == CounterBank::MASK_AND) {
+					observed &= command.mask;
+				}
+				return CounterBank::CompareSatisfied(observed, command.value, command.op, lane.bytes);
+			};
+			uint64_t waited_us = 0;
+			if (!WaitBounded(satisfied, &waited_us)) {
+				ReportWaitTimeout(command_buffer, command, observed, waited_us);
+			}
+			return OK;
+		}
+
+		case Kind::WaitOnAddress: {
+			uint64_t   observed  = 0;
+			bool       readable  = true;
+			const auto satisfied = [&]() {
+				if (!ReadGuestWaitValue(command.address, &observed)) {
+					readable = false;
+					return true;
+				}
+				return CounterBank::CompareSatisfied(observed, command.value, command.op,
+				                                     sizeof(uint64_t));
+			};
+			uint64_t waited_us = 0;
+			if (!WaitBounded(satisfied, &waited_us)) {
+				ReportWaitTimeout(command_buffer, command, observed, waited_us);
+			}
+			if (!readable) {
+				LOGF("\tAMPR wait-on-address read failed: address=0x%016" PRIx64 "\n",
+				     command.address);
+				return LibKernel::KERNEL_ERROR_EFAULT;
+			}
+			return OK;
+		}
+	}
+	return LibKernel::KERNEL_ERROR_EINVAL;
+}
+
 static bool ValidateAmmMapArgs(uint64_t va, uint64_t size) {
 	return va != 0 && size != 0 && (va & (AMM_PAGE_SIZE - 1u)) == 0 &&
 	       (size & (AMM_PAGE_SIZE - 1u)) == 0 && va + size >= va;
@@ -1449,6 +1711,7 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 		KernelEvent,
 		WriteAddress,
 		AmmMap,
+		Sync,
 	};
 
 	struct OrderedCommand {
@@ -1459,7 +1722,8 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 
 	std::vector<OrderedCommand> ordered;
 	ordered.reserve(state.read_file_commands.size() + state.kernel_event_commands.size() +
-	                state.write_address_commands.size() + state.amm_map_commands.size());
+	                state.write_address_commands.size() + state.amm_map_commands.size() +
+	                state.sync_commands.size());
 	for (size_t i = 0; i < state.read_file_commands.size(); i++) {
 		if (state.read_file_commands[i].record_offset < state.write_offset) {
 			ordered.push_back(
@@ -1481,6 +1745,11 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 	for (size_t i = 0; i < state.amm_map_commands.size(); i++) {
 		if (state.amm_map_commands[i].record_offset < state.write_offset) {
 			ordered.push_back({state.amm_map_commands[i].record_offset, CommandKind::AmmMap, i});
+		}
+	}
+	for (size_t i = 0; i < state.sync_commands.size(); i++) {
+		if (state.sync_commands[i].record_offset < state.write_offset) {
+			ordered.push_back({state.sync_commands[i].record_offset, CommandKind::Sync, i});
 		}
 	}
 
@@ -1528,6 +1797,19 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 					hash(static_cast<uint32_t>(command.kind)); hash(command.va); hash(command.dmem_offset);
 					hash(command.size); hash(static_cast<uint32_t>(command.type));
 					hash(static_cast<uint32_t>(command.prot)); hash(command.gpu_mask_id);
+					break;
+				}
+				case CommandKind::Sync: {
+					const auto& command = state.sync_commands[entry.index];
+					if (command.kind == CommandBufferState::SyncKind::WriteAddressFromCounter ||
+					    command.kind == CommandBufferState::SyncKind::WriteAddressFromCounterPair ||
+					    command.kind == CommandBufferState::SyncKind::WriteAddressFromTimeCounter) {
+						++diagnostic->write_count;
+					}
+					hash(static_cast<uint32_t>(command.kind));
+					hash(command.counter_index | (uint32_t {command.access} << 8u) |
+					     (uint32_t {command.op} << 16u) | (uint32_t {command.mask_op} << 24u));
+					hash(command.value); hash(command.mask); hash(command.address);
 					break;
 				}
 			}
@@ -1597,6 +1879,17 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 					     " value=0x%016" PRIx64 "\n",
 					     command.address, command.value);
 					*execution_result = LibKernel::KERNEL_ERROR_EFAULT;
+					*error_offset     = static_cast<uint32_t>(command.record_offset);
+					return finish(OK);
+				}
+				NotifySyncWaiters();
+			} break;
+			case CommandKind::Sync: {
+				const auto& command = state.sync_commands[entry.index];
+				const auto  result  = ExecuteSyncCommand(command_buffer, command);
+				if (result != OK) {
+					Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprErrors);
+					*execution_result = result;
 					*error_offset     = static_cast<uint32_t>(command.record_offset);
 					return finish(OK);
 				}
@@ -2200,20 +2493,152 @@ static int KYTY_SYSV_ABI CommandBufferPopMarker(void* command_buffer) {
 	return AppendNoOpCommand(command_buffer, sizeof(uint32_t));
 }
 
-static int KYTY_SYSV_ABI CommandBufferWaitOnAddress(void* command_buffer, volatile uint64_t*,
-                                                    uint64_t, uint8_t, uint8_t) {
-	PRINT_NAME();
-	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprUnsupportedWaitCommands);
-
-	return AppendNoOpCommand(command_buffer, 0x20);
+// A counter/wait command whose operand encoding is outside the decoded tables in
+// amprCounterBank.h. It keeps the historical behaviour (a 0x20-byte no-op record)
+// so an unknown encoding never turns into a new guest-visible error, and is
+// counted in AprUnsupportedWaitCommands / AprUnsupportedCounterCommands, which
+// therefore only count encodings that are still not implemented.
+static int AppendUnsupportedSyncCommand(void* command_buffer, bool is_wait, const char* name,
+                                        uint32_t index, uint32_t access, uint32_t op,
+                                        uint32_t mask_op) {
+	Profiler::CountLoadingEvent(is_wait ? Profiler::LoadingEvent::AprUnsupportedWaitCommands
+	                                    : Profiler::LoadingEvent::AprUnsupportedCounterCommands);
+	if (g_sync_unsupported_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		LOGF("\tAMPR %s: unsupported encoding index=%u access=%u op=%u mask_op=%u; recorded as a "
+		     "no-op\n",
+		     name, index, access, op, mask_op);
+	}
+	return AppendNoOpCommand(command_buffer, SYNC_RECORD_SIZE);
 }
 
-static int KYTY_SYSV_ABI CommandBufferWaitOnCounter(void* command_buffer, uint8_t, uint8_t,
-                                                    uint64_t, uint8_t, uint8_t, uint64_t, uint8_t) {
-	PRINT_NAME();
-	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprUnsupportedWaitCommands);
+static const char* SyncKindName(CommandBufferState::SyncKind kind) {
+	switch (kind) {
+		case CommandBufferState::SyncKind::WriteCounter: return "WriteCounter";
+		case CommandBufferState::SyncKind::WaitOnCounter: return "WaitOnCounter";
+		case CommandBufferState::SyncKind::WaitOnAddress: return "WaitOnAddress";
+		case CommandBufferState::SyncKind::WriteAddressFromCounter: return "WriteAddressFromCounter";
+		case CommandBufferState::SyncKind::WriteAddressFromCounterPair:
+			return "WriteAddressFromCounterPair";
+		case CommandBufferState::SyncKind::WriteAddressFromTimeCounter:
+			return "WriteAddressFromTimeCounter";
+	}
+	return "?";
+}
 
-	return AppendNoOpCommand(command_buffer, 0x20);
+// Implemented (decoded) counter/wait commands are not CSV columns (that would
+// need new Profiler::LoadingEvent entries); the first recording of each kind is
+// logged so a run's log shows which of them a title actually uses.
+static std::array<std::atomic<uint64_t>, 6> g_sync_recorded {};
+
+static int AppendSyncCommand(void* command_buffer, const CommandBufferState::SyncCommand& command,
+                             int append_error) {
+	if (!AppendSyncRecord(reinterpret_cast<uint64_t>(command_buffer), command)) {
+		return append_error;
+	}
+	const auto kind = static_cast<size_t>(command.kind);
+	if (kind < g_sync_recorded.size() &&
+	    g_sync_recorded[kind].fetch_add(1, std::memory_order_relaxed) == 0) {
+		LOGF("\tAMPR first %s command recorded: cb=%p index=%u access=%u op=%u mask_op=%u "
+		     "address=0x%016" PRIx64 "\n",
+		     SyncKindName(command.kind), command_buffer,
+		     static_cast<uint32_t>(command.counter_index), static_cast<uint32_t>(command.access),
+		     static_cast<uint32_t>(command.op), static_cast<uint32_t>(command.mask_op),
+		     command.address);
+	}
+	return OK;
+}
+
+static int KYTY_SYSV_ABI CommandBufferWaitOnAddress(void*              command_buffer,
+                                                    volatile uint64_t* address, uint64_t reference,
+                                                    uint8_t compare, uint8_t /*flush*/) {
+	PRINT_NAME();
+
+	if (command_buffer == nullptr || address == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	if (!CounterBank::IsValidCompare(compare)) {
+		return AppendUnsupportedSyncCommand(command_buffer, true, "WaitOnAddress", 0, 0, compare, 0);
+	}
+
+	CommandBufferState::SyncCommand command {};
+	command.kind    = CommandBufferState::SyncKind::WaitOnAddress;
+	command.op      = compare;
+	command.value   = reference;
+	command.address = reinterpret_cast<uint64_t>(address);
+	return AppendSyncCommand(command_buffer, command, LibKernel::KERNEL_ERROR_EFAULT);
+}
+
+static int KYTY_SYSV_ABI CommandBufferWaitOnCounter(void* command_buffer, uint8_t counter_index,
+                                                    uint8_t access, uint64_t reference,
+                                                    uint8_t compare, uint8_t mask_op, uint64_t mask,
+                                                    uint8_t /*flush*/) {
+	PRINT_NAME();
+
+	if (command_buffer == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	if (!CounterBank::DecodeLane(counter_index, access, nullptr) ||
+	    !CounterBank::IsValidCompare(compare) || !CounterBank::IsValidMaskOp(mask_op)) {
+		return AppendUnsupportedSyncCommand(command_buffer, true, "WaitOnCounter", counter_index,
+		                                    access, compare, mask_op);
+	}
+
+	CommandBufferState::SyncCommand command {};
+	command.kind          = CommandBufferState::SyncKind::WaitOnCounter;
+	command.counter_index = counter_index;
+	command.access        = access;
+	command.op            = compare;
+	command.mask_op       = mask_op;
+	command.value         = reference;
+	command.mask          = mask;
+	return AppendSyncCommand(command_buffer, command, LibKernel::KERNEL_ERROR_EFAULT);
+}
+
+static int AppendWriteCounterCommand(void* command_buffer, const char* name, uint8_t counter_index,
+                                     uint8_t access, uint64_t value, uint8_t op) {
+	if (command_buffer == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	if (!CounterBank::DecodeLane(counter_index, access, nullptr) ||
+	    !CounterBank::IsValidWriteOp(op)) {
+		return AppendUnsupportedSyncCommand(command_buffer, false, name, counter_index, access, op,
+		                                    0);
+	}
+
+	CommandBufferState::SyncCommand command {};
+	command.kind          = CommandBufferState::SyncKind::WriteCounter;
+	command.counter_index = counter_index;
+	command.access        = access;
+	command.op            = op;
+	command.value         = value;
+	return AppendSyncCommand(command_buffer, command, LibKernel::KERNEL_ERROR_EFAULT);
+}
+
+// WriteAddressFromCounter writes the 32-bit counter zero-extended to 64 bits;
+// the Pair form writes counter N in the low word and counter N+1 in the high word;
+// the time-counter form writes the process time counter at execution time.
+static int AppendWriteAddressFromSyncCommand(void* command_buffer, const char* name,
+                                             volatile uint64_t* address,
+                                             CommandBufferState::SyncKind kind,
+                                             uint8_t counter_index) {
+	if (command_buffer == nullptr || address == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	CommandBufferState::SyncCommand command {};
+	command.kind          = kind;
+	command.counter_index = counter_index;
+	command.address       = reinterpret_cast<uint64_t>(address);
+	if (kind != CommandBufferState::SyncKind::WriteAddressFromTimeCounter) {
+		command.access = kind == CommandBufferState::SyncKind::WriteAddressFromCounterPair
+		                     ? CounterBank::ACCESS_PAIR_64
+		                     : CounterBank::ACCESS_32;
+		if (!CounterBank::DecodeLane(counter_index, command.access, nullptr)) {
+			return AppendUnsupportedSyncCommand(command_buffer, false, name, counter_index,
+			                                    command.access, 0, 0);
+		}
+	}
+	return AppendSyncCommand(command_buffer, command, LibKernel::KERNEL_ERROR_EBUSY);
 }
 
 static int AppendWriteAddressCommand(void* command_buffer, volatile uint64_t* address,
@@ -2242,71 +2667,85 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressOnCompletion(void*            
 	return AppendWriteAddressCommand(command_buffer, address, value);
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t, uint8_t, uint64_t,
-                                                   uint8_t, uint32_t) {
+static int KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t counter_index,
+                                                   uint8_t access, uint64_t value, uint8_t op,
+                                                   uint32_t /*flags*/) {
 	PRINT_NAME();
-	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprUnsupportedCounterCommands);
 
-	return AppendNoOpCommand(command_buffer, 0x20);
+	return AppendWriteCounterCommand(command_buffer, "WriteCounter", counter_index, access, value,
+	                                 op);
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteCounterOnCompletion(void* command_buffer, uint8_t,
-                                                               uint8_t, uint64_t, uint8_t) {
+// Takes effect after every earlier record in the buffer has completed, which is
+// what the synchronous executor does for every record (see the execution-model
+// note above ExecuteSyncCommand).
+static int KYTY_SYSV_ABI CommandBufferWriteCounterOnCompletion(void*    command_buffer,
+                                                               uint8_t  counter_index,
+                                                               uint8_t  access, uint64_t value,
+                                                               uint8_t  op) {
 	PRINT_NAME();
-	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprUnsupportedCounterCommands);
 
-	return AppendNoOpCommand(command_buffer, 0x20);
+	return AppendWriteCounterCommand(command_buffer, "WriteCounterOnCompletion", counter_index,
+	                                 access, value, op);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounter(void*              command_buffer,
                                                                   volatile uint64_t* address,
-                                                                  uint32_t) {
+                                                                  uint32_t /*flags*/) {
 	PRINT_NAME();
-	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprUnsupportedCounterCommands);
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressFromSyncCommand(
+	    command_buffer, "WriteAddressFromTimeCounter", address,
+	    CommandBufferState::SyncKind::WriteAddressFromTimeCounter, 0);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounterOnCompletion(
     void* command_buffer, volatile uint64_t* address) {
 	PRINT_NAME();
-	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprUnsupportedCounterCommands);
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressFromSyncCommand(
+	    command_buffer, "WriteAddressFromTimeCounterOnCompletion", address,
+	    CommandBufferState::SyncKind::WriteAddressFromTimeCounter, 0);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounter(void*              command_buffer,
-                                                              volatile uint64_t* address, uint8_t,
-                                                              uint32_t) {
+                                                              volatile uint64_t* address,
+                                                              uint8_t            counter_index,
+                                                              uint32_t /*flags*/) {
 	PRINT_NAME();
-	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprUnsupportedCounterCommands);
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressFromSyncCommand(command_buffer, "WriteAddressFromCounter", address,
+	                                         CommandBufferState::SyncKind::WriteAddressFromCounter,
+	                                         counter_index);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterOnCompletion(
-    void* command_buffer, volatile uint64_t* address, uint8_t) {
+    void* command_buffer, volatile uint64_t* address, uint8_t counter_index) {
 	PRINT_NAME();
-	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprUnsupportedCounterCommands);
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressFromSyncCommand(
+	    command_buffer, "WriteAddressFromCounterOnCompletion", address,
+	    CommandBufferState::SyncKind::WriteAddressFromCounter, counter_index);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPair(void*              command_buffer,
                                                                   volatile uint64_t* address,
-                                                                  uint8_t, uint32_t) {
+                                                                  uint8_t            counter_index,
+                                                                  uint32_t /*flags*/) {
 	PRINT_NAME();
-	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprUnsupportedCounterCommands);
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressFromSyncCommand(
+	    command_buffer, "WriteAddressFromCounterPair", address,
+	    CommandBufferState::SyncKind::WriteAddressFromCounterPair, counter_index);
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPairOnCompletion(
-    void* command_buffer, volatile uint64_t* address, uint8_t) {
+    void* command_buffer, volatile uint64_t* address, uint8_t counter_index) {
 	PRINT_NAME();
-	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprUnsupportedCounterCommands);
 
-	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0});
+	return AppendWriteAddressFromSyncCommand(
+	    command_buffer, "WriteAddressFromCounterPairOnCompletion", address,
+	    CommandBufferState::SyncKind::WriteAddressFromCounterPair, counter_index);
 }
 
 static int KYTY_SYSV_ABI AprCommandBufferReadFileGather(void*    command_buffer, uint64_t, uint64_t,
