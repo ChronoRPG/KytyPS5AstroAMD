@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -917,11 +918,17 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	// GET_LOD_STATS counter per image, 16 bits: MipStatsCntId (T# dword 6 bits 0..7) in bits 0..7,
 	// BASE_LEVEL (dword 3 bits 12..15) in bits 8..11 so the shader reports absolute mip levels,
 	// and bit 15 set when MipStatsCntEn (dword 5 bit 25) is clear.
+	// KYTY_MIP_STATS_BASE_LEVEL=0 reports levels relative to BASE_LEVEL (the U27 behaviour).
+	static const uint32_t base_level_mask = [] {
+		const char* value = std::getenv("KYTY_MIP_STATS_BASE_LEVEL");
+		return value != nullptr && value[0] == '0' ? 0u : 0xfu;
+	}();
 	for (uint32_t i = 0; i < layout.mip_stats_count; i++) {
 		const auto& words = snapshot.images.at(i).dwords;
-		const uint32_t id = ((words[5] >> 25u) & 1u) != 0u
-		                        ? (words[6] & 0xffu) | (((words[3] >> 12u) & 0xfu) << 8u)
-		                        : 0x8000u;
+		const uint32_t id =
+		    ((words[5] >> 25u) & 1u) != 0u
+		        ? (words[6] & 0xffu) | (((words[3] >> 12u) & base_level_mask) << 8u)
+		        : 0x8000u;
 		prepared.shader_data[layout.MipStatsOffsetDword() + i / 2u] |= id << ((i & 1u) * 16u);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
