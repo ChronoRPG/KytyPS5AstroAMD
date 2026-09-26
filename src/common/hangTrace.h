@@ -78,6 +78,20 @@ void SetReadbackKind(ReadbackKind kind);
 void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64_t window_size,
                     bool downloaded, uint64_t duration_ns);
 
+// Which kind of recorded GPU write last marked a guest page GPU-owned (reported per readback).
+enum class GpuWriteKind : uint8_t { ShaderStorage, OcclusionDump, Fill, Copy };
+class ScopedGpuWriteKind {
+public:
+	explicit ScopedGpuWriteKind(GpuWriteKind kind);
+	~ScopedGpuWriteKind();
+	ScopedGpuWriteKind(const ScopedGpuWriteKind&)            = delete;
+	ScopedGpuWriteKind& operator=(const ScopedGpuWriteKind&) = delete;
+
+private:
+	GpuWriteKind m_previous;
+};
+void NoteGpuWrite(uint64_t vaddr, uint64_t size);
+
 // Texture-cache image deletion reasons (set around FreeImage calls) and native image churn.
 enum class ImageFreeReason : uint8_t {
 	Other,

@@ -129,6 +129,15 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	// The kernel unmaps every free range it is about to (re)map, most of which were never GPU
+	// mapped. Buffers, images and GPU-dirty pages only exist inside GPU-mapped ranges, so such an
+	// unmap has nothing to invalidate; skip the GPU round trip and full drain it would force.
+	if (GuestRange {vaddr, size}.Valid()) {
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		if (!m_mapped_ranges.Intersects(vaddr, size)) {
+			return;
+		}
+	}
 	const auto unmap = [this, vaddr, size] {
 		if (m_command_scheduler.Active()) {
 			const auto tick = m_command_scheduler.CurrentTick();

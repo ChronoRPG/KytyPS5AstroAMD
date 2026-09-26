@@ -38,6 +38,19 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+// Overlapping aliases (transient render targets sharing a heap) stay registered until unused
+// for this many presented guest frames; see AliasAgeByFrames.
+constexpr uint64_t AliasFramesBeforeRemoval = 4;
+
+// KYTY_IMAGE_ALIAS_AGE=ticks restores the previous rule that frees an overlapped alias after
+// NumFramesBeforeRemoval scheduler ticks, which is usually within the same guest frame.
+static bool AliasAgeByFrames() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_IMAGE_ALIAS_AGE");
+		return value == nullptr || std::strcmp(value, "ticks") != 0;
+	}();
+	return enabled;
+}
 
 // The stock Tracy CSV exporter supports -m. Keep messages free of commas/newlines,
 // and bound diagnostics independently of how long a detailed capture stays connected.
@@ -413,6 +426,7 @@ void TextureCache::FreeImage(ImageId id, HangTrace::ImageFreeReason reason) {
 }
 
 void TextureCache::TouchImage(Image& image) {
+	image.frame_accessed_last = m_frame.load(std::memory_order_relaxed);
 	if (image.registered) {
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
 	}
@@ -898,8 +912,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	}
 	auto&      cached       = *owner;
 	const auto current_tick = m_scheduler.CurrentTick();
+	const auto current_frame = m_frame.load(std::memory_order_relaxed);
 	const bool safe_to_delete =
-	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
+	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval &&
+	    (!AliasAgeByFrames() || current_frame - std::min(current_frame, cached.frame_accessed_last) >
+	                                AliasFramesBeforeRemoval);
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
@@ -1789,6 +1806,25 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	image.ClearBufferModified();
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
+	}
+	// Single owner among live aliases: this write supersedes the bytes of every other image
+	// overlapping it, so none of them may later be downloaded over it. Their native contents
+	// stay as they are (the previous rule freed them without a download). Scanned only when
+	// ownership changes, not on every bind.
+	if (AliasAgeByFrames() && !image.alias_owner && !image.depth_id && !image.info.data.Empty()) {
+		for (const auto id: FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
+			auto* other = m_slot_images.try_get(id);
+			if (other == nullptr || other == &image || other->depth_id || !other->registered ||
+			    !other->Overlaps(image.info.data.address, image.info.data.size, false)) {
+				continue;
+			}
+			other->alias_owner = false;
+			if (other->IsGpuModified()) {
+				other->ClearGpuModified();
+				InvalidateCleanImageProofs();
+			}
+		}
+		image.alias_owner = true;
 	}
 	MarkImageGpuModified(image);
 }

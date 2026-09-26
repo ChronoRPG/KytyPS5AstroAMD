@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/occlusion.h"
+#include "common/hangTrace.h"
 #include "common/alignment.h"
 #include "common/profiler.h"
 #include "gpu_dcc_shaders/gpu_dcc_occlusion_spv.h"
@@ -154,6 +155,7 @@ void OcclusionCounter::Dump(uint64_t address) {
 	Initialize();
 	FlushPending();
 	// Last qword is at +240. Track precisely the 248 bytes touched or preserved.
+	HangTrace::ScopedGpuWriteKind trace_kind(HangTrace::GpuWriteKind::OcclusionDump);
 	auto [buffer, offset] = m_context.GetBufferCache().ObtainBuffer(address, 248, true);
 	m_context.GetTextureCache().InvalidateMemoryFromGPU(address, 248);
 	scheduler.EndRendering();

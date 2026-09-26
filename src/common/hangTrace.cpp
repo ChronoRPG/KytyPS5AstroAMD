@@ -131,6 +131,16 @@ thread_local FaultContext g_fault_context {};
 thread_local ReadbackKind g_readback_kind = ReadbackKind::Invalidate;
 thread_local ImageFreeReason g_image_free_reason = ImageFreeReason::Other;
 
+thread_local GpuWriteKind g_gpu_write_kind = GpuWriteKind::ShaderStorage;
+struct PageWriter {
+	uint64_t t_ms = 0;
+	uint64_t size = 0;
+	GpuWriteKind kind = GpuWriteKind::ShaderStorage;
+};
+constexpr const char* kGpuWriteKindNames[] = {"shader-storage", "occlusion-dump", "fill", "copy"};
+std::mutex                                  g_page_writer_mutex;
+std::unordered_map<uint64_t, PageWriter>    g_page_writers;
+
 std::mutex               g_readback_mutex;
 std::vector<std::string> g_pending_readback_rows;
 uint64_t                 g_readback_rows_total = 0;
@@ -623,7 +633,8 @@ void Initialize() {
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.readbacks = OpenFile("readbacks.csv",
 	                             "t_ms,kind,vaddr,size,window_begin,window_size,downloaded,"
-	                             "duration_us,host_tid,thread,pc,stack_callers");
+	                             "duration_us,host_tid,thread,pc,stack_callers,last_gpu_writer,"
+	                             "last_gpu_write_age_ms,last_gpu_write_size");
 	g_files.lodwatch  = OpenFile("lodwatch.csv",
 	                             "t_ms,report_seq,fault_vaddr,report_offset,access,pc,thread,"
 	                             "rax,rbx,rcx,rdx,rsi,rdi,rbp,rsp,r8,r9,r10,r11,r12,r13,r14,r15,"
@@ -1006,16 +1017,55 @@ void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64
 	thread_local std::unordered_map<uint64_t, uint32_t> scanned_pcs;
 	const bool scan    = fault && scanned_pcs.size() < 4096 && scanned_pcs[g_fault_context.pc]++ < 4;
 	const auto callers = scan ? CaptureGuestCallers() : std::string();
-	auto row = fmt::format("{},{},0x{:x},{},0x{:x},{},{},{},{},{},{},{}", NowMs(),
+	const auto now_ms  = NowMs();
+	std::string writer = ",,";
+	{
+		std::scoped_lock lock(g_page_writer_mutex);
+		if (auto it = g_page_writers.find(vaddr >> 12u); it != g_page_writers.end()) {
+			writer = fmt::format("{},{},{}", kGpuWriteKindNames[static_cast<uint32_t>(it->second.kind)],
+			                     now_ms - std::min(now_ms, it->second.t_ms), it->second.size);
+		}
+	}
+	auto row = fmt::format("{},{},0x{:x},{},0x{:x},{},{},{},{},{},{},{},{}", now_ms,
 	                       kReadbackKindNames[static_cast<uint32_t>(kind)], vaddr, size, window_begin,
 	                       window_size, downloaded ? 1 : 0, duration_ns / 1000u, OsThreadId(),
-	                       CsvEscape(thread), pc, CsvEscape(callers));
+	                       CsvEscape(thread), pc, CsvEscape(callers), writer);
 	std::scoped_lock lock(g_readback_mutex);
 	if (g_readback_rows_total >= kReadbackRowLimit) {
 		return;
 	}
 	g_readback_rows_total++;
 	g_pending_readback_rows.push_back(std::move(row));
+}
+
+ScopedGpuWriteKind::ScopedGpuWriteKind(GpuWriteKind kind) : m_previous(g_gpu_write_kind) {
+	g_gpu_write_kind = kind;
+}
+
+ScopedGpuWriteKind::~ScopedGpuWriteKind() {
+	g_gpu_write_kind = m_previous;
+}
+
+void NoteGpuWrite(uint64_t vaddr, uint64_t size) {
+	if (!Enabled() || size == 0) {
+		return;
+	}
+	const PageWriter writer {NowMs(), size, g_gpu_write_kind};
+	const auto       first = vaddr >> 12u;
+	const auto       last  = (vaddr + size - 1) >> 12u;
+	std::scoped_lock lock(g_page_writer_mutex);
+	if (g_page_writers.size() > 1'000'000) {
+		g_page_writers.clear();
+	}
+	// Large writable bindings: note only their first and last pages (sync pages are small).
+	if (last - first > 64) {
+		g_page_writers[first] = writer;
+		g_page_writers[last]  = writer;
+		return;
+	}
+	for (auto page = first; page <= last; page++) {
+		g_page_writers[page] = writer;
+	}
 }
 
 void SetImageFreeReason(ImageFreeReason reason) {

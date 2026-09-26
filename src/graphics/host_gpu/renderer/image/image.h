@@ -148,8 +148,11 @@ public:
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
-	uint64_t         tick_accessed_last = 0;
-	size_t           lru_id             = 0;
+	uint64_t         tick_accessed_last  = 0;
+	uint64_t         frame_accessed_last = 0; // presented guest frames, see TextureCache::AdvanceFrame
+	size_t           lru_id              = 0;
+	// Last GPU writer among overlapping aliases; cleared when another alias takes the bytes.
+	bool             alias_owner         = false;
 
 private:
 	friend struct ImageTestAccess;

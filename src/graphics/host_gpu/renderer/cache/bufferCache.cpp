@@ -530,6 +530,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		// Writable descriptors reserve a new version before recording their shader commands.
 		buffer.MarkContentWritten();
 		m_gpu_modified_ranges.Add(vaddr, size);
+		HangTrace::NoteGpuWrite(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -583,6 +584,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	HangTrace::ScopedGpuWriteKind trace_kind(HangTrace::GpuWriteKind::Fill);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
 }
@@ -615,6 +617,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	const auto dst_id      = dst_memory ? FindBuffer(dst_vaddr, size) : BufferId {};
 	auto [src, src_offset] = src_memory ? ObtainBuffer(src_vaddr, size, false, true, src_id)
 	                                    : std::pair {&m_gds_buffer, src_vaddr};
+	HangTrace::ScopedGpuWriteKind trace_kind(HangTrace::GpuWriteKind::Copy);
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);

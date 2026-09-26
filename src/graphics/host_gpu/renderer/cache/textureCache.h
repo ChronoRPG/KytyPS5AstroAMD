@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <array>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <type_traits>
@@ -76,6 +77,10 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// Called once per completed guest flip. Alias lifetimes are measured in presented frames:
+	// a frame spans hundreds of scheduler ticks, so tick age alone treats every alias used
+	// earlier in the same frame as stale.
+	void AdvanceFrame() noexcept { m_frame.fetch_add(1, std::memory_order_relaxed); }
 	void RunGarbageCollector();
 
 private:
@@ -204,6 +209,7 @@ private:
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	std::atomic<uint64_t>                             m_frame {0};
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_registered_image_memory = 0;
