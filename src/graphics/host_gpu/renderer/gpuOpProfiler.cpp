@@ -149,6 +149,7 @@ struct Counters {
 	std::atomic<uint64_t> barriers {0};
 	std::atomic<uint64_t> transitions {0};
 	std::atomic<uint64_t> command_buffers {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(BarrierBatchEvent::Count)> batch {};
 };
 Counters g_counters;
 
@@ -1731,6 +1732,13 @@ void LeaveSite(Site* previous, bool scope_owner) noexcept {
 	}
 }
 
+void CountBarrierBatch(BarrierBatchEvent event, uint64_t amount) noexcept {
+	const auto index = static_cast<size_t>(event);
+	if (index < g_counters.batch.size() && amount != 0) {
+		g_counters.batch[index].fetch_add(amount, std::memory_order_relaxed);
+	}
+}
+
 } // namespace Detail
 
 bool Enabled() {
@@ -1890,7 +1898,21 @@ void OnGuestFlip() {
 	counts.barriers           = g_counters.barriers.exchange(0, std::memory_order_relaxed);
 	counts.layout_transitions = g_counters.transitions.exchange(0, std::memory_order_relaxed);
 	counts.command_buffers    = g_counters.command_buffers.exchange(0, std::memory_order_relaxed);
+	const auto take_batch     = [](BarrierBatchEvent event) {
+		return g_counters.batch[static_cast<size_t>(event)].exchange(0, std::memory_order_relaxed);
+	};
+	counts.barrier_requests      = take_batch(BarrierBatchEvent::Requests);
+	counts.barriers_merged       = take_batch(BarrierBatchEvent::Merged);
+	counts.barriers_elided       = take_batch(BarrierBatchEvent::Elided);
+	counts.barriers_sunk         = take_batch(BarrierBatchEvent::Sunk);
+	counts.barrier_render_splits = take_batch(BarrierBatchEvent::RenderSplits);
 	HangTrace::RecordGpuOpCounts(counts);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuBarrierRequests, counts.barrier_requests);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuBarriersMerged, counts.barriers_merged);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuBarriersElided, counts.barriers_elided);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuBarriersSunk, counts.barriers_sunk);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuBarrierRenderSplits,
+	                          counts.barrier_render_splits);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuRenderPassBegins, counts.render_passes);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuPipelineBarriers, counts.barriers);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuImageLayoutTransitions,

@@ -432,6 +432,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		if (m_gpu_timing) {
 			// End's own EndRendering becomes a no-op; the end stamp follows the final store ops.
 			m_command.EndRendering();
+			// Pending batched barriers belong before the end stamp, as when recorded directly.
+			m_command.FlushBarriers();
 			m_gpu_timing->EndCommand(m_command.m_buffer);
 		}
 		m_command.End();

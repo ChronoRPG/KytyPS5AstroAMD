@@ -174,6 +174,15 @@ enum class FrameEvent : uint32_t {
 	GpuPipelineBarriers,
 	GpuImageLayoutTransitions,
 	GpuGuestCommandBuffers,
+	// Barrier batcher (KYTY_BARRIER_BATCH, render.h), added per guest flip with the counters
+	// above: barrier requests, requests merged into an already pending batch, requests elided
+	// as covered by the previous barrier, pending batches kept across a same-instance draw
+	// (sunk), and barrier flushes that had to end an active rendering instance.
+	GpuBarrierRequests,
+	GpuBarriersMerged,
+	GpuBarriersElided,
+	GpuBarriersSunk,
+	GpuBarrierRenderSplits,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

@@ -7,6 +7,7 @@
 namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
+class CommandBuffer;
 
 vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage);
 vk::PipelineStageFlags  ShaderPipelineStages(vk::ShaderStageFlags stages);
@@ -15,10 +16,13 @@ vk::MemoryBarrier       MakeShaderWriteHazardDependency();
 vk::MemoryBarrier       MakeShaderWriteDependency();
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer);
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime);
-void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
-void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
+// With the barrier batcher (render.h) these queue the dependency on the command buffer; it is
+// recorded before the next memory-accessing command. Otherwise they record it immediately, and
+// the caller must be outside a rendering instance.
+void ShaderAccessBarrier(const CommandBuffer& buffer, vk::PipelineStageFlags source_stages);
+void ShaderWriteHazardBarrier(const CommandBuffer&   buffer,
                               vk::PipelineStageFlags destination_stages);
-void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
+void ShaderWriteBarrier(const CommandBuffer& buffer, vk::PipelineStageFlags source_stages);
 
 } // namespace Libs::Graphics
 

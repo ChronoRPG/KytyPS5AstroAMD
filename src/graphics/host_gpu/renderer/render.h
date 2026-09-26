@@ -98,6 +98,38 @@ struct DrawAutoArgs {
 	uint32_t         render_target_slice_offset = 0;
 };
 
+// Barrier batcher (KYTY_BARRIER_BATCH, default on; KYTY_BARRIER_BATCH=0 restores the direct
+// per-site barriers). Global memory dependencies, buffer barriers and image layout transitions
+// requested through CommandBuffer are accumulated and recorded as ONE vkCmdPipelineBarrier2
+// directly before the next command that may access memory:
+//   - Handle(): every native recording site obtains the handle through it, so the pending
+//     batch is recorded (ending an active rendering instance first) before anything the caller
+//     records. StateHandle() is the exception for state-only commands (binds, dynamic state,
+//     push constants/descriptors), which barriers do not order.
+//   - BeginRendering(): the draw path records its draw right after it.
+//   - End() / scheduler submission.
+// Consecutive requests with nothing recorded between them are merged (the union of their
+// scopes is at least as strong as the sequence). A memory request is elided when nothing was
+// recorded since the previous flushed barrier and that barrier's memory dependency covers it.
+// KYTY_BARRIER_SINK (default on, needs the batcher) additionally keeps a pending memory-only
+// batch across a draw that continues the same rendering instance when the draw is proven
+// hazard-free with respect to everything since the last full barrier; see
+// CommandBuffer::CanSinkPending() for the exact conditions.
+[[nodiscard]] bool BarrierBatchEnabled();
+[[nodiscard]] bool BarrierSinkEnabled();
+
+// Attribution of batched barrier requests (gpuOpProfiler site of the recorded batch).
+enum class BarrierOrigin : uint32_t {
+	Guest,             // CP EmitGlobalBarrier: guest RELEASE_MEM / EVENT_WRITE flushes
+	ShaderAccess,      // after a dispatch: shader accesses -> everything later
+	ShaderWrite,       // after a draw with shader buffer writes
+	ShaderWriteHazard, // before a dispatch with shader writes: everything earlier -> it
+	IndirectArgs,      // shader/transfer writes -> indirect command fetch
+	Gds,               // GDS buffer -> shader stages
+	Image,             // Image::Transit layout/access transitions
+	Count,
+};
+
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
@@ -108,8 +140,48 @@ public:
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
+	// Begins (or continues) the rendering instance for the draw recorded next. Pending batched
+	// barriers are recorded outside rendering first, unless they can be sunk (see above).
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+
+	// Queues a global memory dependency (synchronization2 masks).
+	void RequestMemoryBarrier(vk::PipelineStageFlags2 src_stages, vk::AccessFlags2 src_access,
+	                          vk::PipelineStageFlags2 dst_stages, vk::AccessFlags2 dst_access,
+	                          BarrierOrigin origin) const;
+	// Queues a buffer memory barrier.
+	void RequestBufferBarrier(const vk::BufferMemoryBarrier2& barrier, BarrierOrigin origin) const;
+	// Routes image barriers built for `target` into the batch. Returns false (nothing done) when
+	// the batcher is disabled or `target` is not this buffer; the caller then records them
+	// itself. deferrable: the caller guarantees that it records no memory-accessing command
+	// through a previously obtained native handle before the next flush point; otherwise the
+	// batch (with these barriers) is recorded immediately.
+	[[nodiscard]] bool BatchImageBarriers(std::span<const vk::ImageMemoryBarrier2> barriers,
+	                                      vk::CommandBuffer target, bool deferrable) const;
+	// Records the pending batch now (no-op when empty).
+	void FlushBarriers() const;
+
+	// Brackets the draw recording path from the state commands through the draw itself. The
+	// draw must be recorded right after BeginRendering(). safe: the draw writes only its own
+	// color/depth attachments (no storage buffer/image writes, atomics, address writes, GDS,
+	// fault/LOD counters, indirect arguments) and samples none of its attachments.
+	class DrawScope {
+	public:
+		DrawScope(const CommandBuffer& buffer, bool safe) noexcept: m_buffer(buffer) {
+			m_buffer.m_draw_scope = true;
+			m_buffer.m_draw_safe  = safe;
+		}
+		~DrawScope() {
+			m_buffer.m_draw_scope = false;
+			m_buffer.m_draw_safe  = false;
+		}
+		DrawScope(const DrawScope&)            = delete;
+		DrawScope& operator=(const DrawScope&) = delete;
+
+	private:
+		const CommandBuffer& m_buffer;
+	};
+
 	// Identifies the active rendering instance; 0 while no instance is active.
 	[[nodiscard]] uint64_t ActiveRenderingSerial() const {
 		return m_rendering ? m_rendering_serial : 0;
@@ -119,7 +191,12 @@ public:
 	                     uint32_t count, const vk::WriteDescriptorSet* writes);
 	void InvalidateDescriptors(vk::PipelineBindPoint point);
 
+	// Native handle for recording any command. Records pending batched barriers first.
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// Native handle for state-only commands (binds, dynamic state, push constants/descriptors).
+	// Never records pending barriers; nothing that accesses memory may be recorded through it
+	// before the next flush point (Handle(), BeginRendering(), End()).
+	[[nodiscard]] vk::CommandBuffer StateHandle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -136,6 +213,33 @@ private:
 
 	void Begin();
 	void End() const;
+
+	struct PendingBarriers {
+		vk::MemoryBarrier2                    memory;
+		bool                                  has_memory = false;
+		std::vector<vk::ImageMemoryBarrier2>  images;
+		std::vector<vk::BufferMemoryBarrier2> buffers;
+		uint32_t                              origins = 0; // bit per BarrierOrigin
+
+		[[nodiscard]] bool Empty() const {
+			return !has_memory && images.empty() && buffers.empty();
+		}
+		void Clear() {
+			has_memory = false;
+			memory     = vk::MemoryBarrier2 {};
+			images.clear();
+			buffers.clear();
+			origins = 0;
+		}
+	};
+	// Every native command other than the batch itself and the rendering bookkeeping below.
+	void NoteForeignCommand() const {
+		m_recorded_since_flush = true;
+		m_epoch_clean          = false;
+	}
+	[[nodiscard]] bool CanSinkPending() const;
+	void               NoteDrawRecorded() const;
+	void               ResetBarrierState() const;
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
@@ -162,6 +266,23 @@ private:
 		std::vector<vk::DescriptorImageInfo> images;
 	};
 	std::array<DescriptorState, 2> m_descriptor_states;
+
+	// Barrier batcher state (see BarrierBatchEnabled()). Owned by the recording producer.
+	mutable PendingBarriers m_pending;
+	// Memory dependency of the last recorded batch in this command buffer, for elision.
+	mutable vk::MemoryBarrier2 m_last_memory;
+	mutable bool               m_last_memory_valid = false;
+	// A command was recorded (or may have been) since the last recorded batch.
+	mutable bool m_recorded_since_flush = true;
+	// Sinking epoch: a full ALL_COMMANDS/MEMORY_WRITE -> ALL_COMMANDS/MEMORY_READ|WRITE batch
+	// was recorded in this command buffer, and everything recorded since is state commands, the
+	// begin of at most one rendering instance (m_epoch_instance) and safe draws inside it.
+	mutable bool     m_epoch_clean    = false;
+	mutable uint64_t m_epoch_instance = 0;
+	// Nonzero while the batcher or the rendering bookkeeping records through Handle().
+	mutable uint32_t m_internal_recording = 0;
+	mutable bool     m_draw_scope         = false;
+	mutable bool     m_draw_safe          = false;
 
 	friend class CommandScheduler;
 };

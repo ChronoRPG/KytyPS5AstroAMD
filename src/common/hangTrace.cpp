@@ -234,6 +234,11 @@ struct Totals {
 	std::atomic<uint64_t> gpu_barriers {0};
 	std::atomic<uint64_t> gpu_layout_transitions {0};
 	std::atomic<uint64_t> gpu_guest_cmdbufs {0};
+	std::atomic<uint64_t> gpu_barrier_requests {0};
+	std::atomic<uint64_t> gpu_barriers_merged {0};
+	std::atomic<uint64_t> gpu_barriers_elided {0};
+	std::atomic<uint64_t> gpu_barriers_sunk {0};
+	std::atomic<uint64_t> gpu_barrier_rp_splits {0};
 };
 Totals g_totals;
 
@@ -612,6 +617,9 @@ void Publish() {
 		line += fmt::format(",{},{},{},{}", take(g_totals.gpu_render_passes),
 		                    take(g_totals.gpu_barriers), take(g_totals.gpu_layout_transitions),
 		                    take(g_totals.gpu_guest_cmdbufs));
+		line += fmt::format(",{},{},{},{},{}", take(g_totals.gpu_barrier_requests),
+		                    take(g_totals.gpu_barriers_merged), take(g_totals.gpu_barriers_elided),
+		                    take(g_totals.gpu_barriers_sunk), take(g_totals.gpu_barrier_rp_splits));
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
@@ -683,6 +691,8 @@ void Initialize() {
 	summary_header += ",gpu_busy_us,gpu_cmdbufs,gpu_latency_avg_us,gpu_idle_us,gpu_max_gap_us,"
 	                  "gpu_starved_us,gpu_dispatch_latency_avg_us,gpu_dropped";
 	summary_header += ",gpu_render_passes,gpu_barriers,gpu_layout_transitions,gpu_guest_cmdbufs";
+	summary_header += ",gpu_barrier_requests,gpu_barriers_merged,gpu_barriers_elided,"
+	                  "gpu_barriers_sunk,gpu_barrier_rp_splits";
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.readbacks = OpenFile("readbacks.csv",
 	                             "t_ms,kind,vaddr,size,window_begin,window_size,downloaded,"
@@ -1277,6 +1287,12 @@ void RecordGpuOpCounts(const GpuOpCounts& counts) {
 	g_totals.gpu_layout_transitions.fetch_add(counts.layout_transitions,
 	                                          std::memory_order_relaxed);
 	g_totals.gpu_guest_cmdbufs.fetch_add(counts.command_buffers, std::memory_order_relaxed);
+	g_totals.gpu_barrier_requests.fetch_add(counts.barrier_requests, std::memory_order_relaxed);
+	g_totals.gpu_barriers_merged.fetch_add(counts.barriers_merged, std::memory_order_relaxed);
+	g_totals.gpu_barriers_elided.fetch_add(counts.barriers_elided, std::memory_order_relaxed);
+	g_totals.gpu_barriers_sunk.fetch_add(counts.barriers_sunk, std::memory_order_relaxed);
+	g_totals.gpu_barrier_rp_splits.fetch_add(counts.barrier_render_splits,
+	                                         std::memory_order_relaxed);
 }
 
 } // namespace HangTrace

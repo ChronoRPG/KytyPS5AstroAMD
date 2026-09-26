@@ -141,6 +141,11 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.GpuPipelineBarriers.Cumulative",
     "FrameEvent.GpuImageLayoutTransitions.Cumulative",
     "FrameEvent.GpuGuestCommandBuffers.Cumulative",
+    "FrameEvent.GpuBarrierRequests.Cumulative",
+    "FrameEvent.GpuBarriersMerged.Cumulative",
+    "FrameEvent.GpuBarriersElided.Cumulative",
+    "FrameEvent.GpuBarriersSunk.Cumulative",
+    "FrameEvent.GpuBarrierRenderSplits.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 

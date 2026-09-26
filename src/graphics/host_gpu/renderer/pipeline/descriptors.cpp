@@ -1036,7 +1036,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	    })) {
 		m_context.GetBufferCache().InvalidateContentRevisions();
 	}
-	auto   vk_buffer        = buffer.Handle();
+	// State commands only: image transitions and the GDS dependency below go through the barrier
+	// batcher and are recorded at the caller's next flush point (the draw's BeginRendering, the
+	// dispatch's Handle()), before any command that accesses the resources.
+	auto   vk_buffer        = buffer.StateHandle();
 	size_t descriptor_count = 0;
 	size_t write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
@@ -1076,13 +1079,32 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		const auto  shader_stages = ShaderPipelineStages(shader_stage);
 		if (descriptors.gds.buffer != nullptr) {
 			KYTY_GPU_OP_SITE("descriptors.gds_barrier");
-			buffer.EndRendering();
 			const auto barrier = MakeGdsDependency(descriptors.gds.buffer);
-			vk_buffer.pipelineBarrier(
+			constexpr auto source_stages =
 			    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
-			        vk::PipelineStageFlagBits::eAllGraphics |
-			        vk::PipelineStageFlagBits::eComputeShader,
-			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
+			    vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader;
+			if (BarrierBatchEnabled()) {
+				// Sync1 masks share their bit values with the synchronization2 ones.
+				vk::BufferMemoryBarrier2 barrier2 {};
+				barrier2.srcStageMask = vk::PipelineStageFlags2(
+				    static_cast<VkPipelineStageFlags2>(VkPipelineStageFlags(source_stages)));
+				barrier2.srcAccessMask = vk::AccessFlags2(
+				    static_cast<VkAccessFlags2>(VkAccessFlags(barrier.srcAccessMask)));
+				barrier2.dstStageMask = vk::PipelineStageFlags2(
+				    static_cast<VkPipelineStageFlags2>(VkPipelineStageFlags(shader_stages)));
+				barrier2.dstAccessMask = vk::AccessFlags2(
+				    static_cast<VkAccessFlags2>(VkAccessFlags(barrier.dstAccessMask)));
+				barrier2.srcQueueFamilyIndex = barrier.srcQueueFamilyIndex;
+				barrier2.dstQueueFamilyIndex = barrier.dstQueueFamilyIndex;
+				barrier2.buffer              = barrier.buffer;
+				barrier2.offset              = barrier.offset;
+				barrier2.size                = barrier.size;
+				buffer.RequestBufferBarrier(barrier2, BarrierOrigin::Gds);
+			} else {
+				buffer.EndRendering();
+				vk_buffer.pipelineBarrier(source_stages, shader_stages, vk::DependencyFlags {}, 0,
+				                          nullptr, 1, &barrier, 0, nullptr);
+			}
 		}
 
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -1097,7 +1119,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				              storage ? vk::AccessFlagBits2::eShaderRead |
 				                            vk::AccessFlagBits2::eShaderWrite
 				                      : vk::AccessFlagBits2::eShaderRead,
-				              range, vk_buffer);
+				              range, vk_buffer, true);
 			} else if (image.binding.is_target) {
 				const auto layout = image.binding.attachment_layout;
 				EXIT_IF(layout == vk::ImageLayout::eUndefined);
@@ -1114,21 +1136,21 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				              image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
 				                  (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
 				                                              : vk::AccessFlags2 {}),
-				              {}, vk_buffer);
+				              {}, vk_buffer, true);
 			} else if (image.binding.force_general && !image.info.IsDepth()) {
 				const vk::AccessFlags2 storage_access = image.binding.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite
 				                                            : vk::AccessFlags2 {};
 				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer);
+				              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer, true);
 			} else if (storage) {
 				image.Transit(vk::ImageLayout::eGeneral,
 				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-				              range, vk_buffer);
+				              range, vk_buffer, true);
 			} else {
 				image.Transit(image.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 				                                   : vk::ImageLayout::eShaderReadOnlyOptimal,
-				              vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
+				              vk::AccessFlagBits2::eShaderRead, range, vk_buffer, true);
 			}
 			binding.layout = image.backing.state.layout;
 		}

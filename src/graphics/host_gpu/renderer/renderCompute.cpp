@@ -379,8 +379,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindImages(bindings);
 	RebindBuffers(bindings);
 
-	auto              vk_buffer        = buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;
+	// Binding commits and the barrier requests below record state commands only (image
+	// transitions and dependencies are batched); the dispatch obtains the handle through
+	// Handle(), which records them first as one barrier.
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
@@ -395,13 +397,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (has_storage_writes) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		ShaderWriteHazardBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	buffer.Handle().dispatch(thread_group_x, thread_group_y, thread_group_z);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	// A proven uniform buffer fill leaves a known value (e.g. DCC fast-clear codes). Recording
 	// it lets consumers skip reading the range back while nothing else writes it.
 	{
@@ -498,26 +500,37 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	const auto vk_buffer = buffer.Handle();
 	const bool has_storage_writes = HasShaderBufferWrites(input_info.stage) ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 		    return image.written && image.resource_class ==
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
 	if (has_storage_writes) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		ShaderWriteHazardBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
-	vk::MemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr);
+	if (BarrierBatchEnabled()) {
+		buffer.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eAllGraphics |
+		                                vk::PipelineStageFlagBits2::eComputeShader |
+		                                vk::PipelineStageFlagBits2::eTransfer,
+		                            vk::AccessFlagBits2::eShaderWrite |
+		                                vk::AccessFlagBits2::eTransferWrite,
+		                            vk::PipelineStageFlagBits2::eDrawIndirect,
+		                            vk::AccessFlagBits2::eIndirectCommandRead,
+		                            BarrierOrigin::IndirectArgs);
+	} else {
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask =
+		    vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+		buffer.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+		                                    vk::PipelineStageFlagBits::eComputeShader |
+		                                    vk::PipelineStageFlagBits::eTransfer,
+		                                vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier,
+		                                0, nullptr, 0, nullptr);
+	}
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	buffer.Handle().dispatchIndirect(args_buffer->Handle(), args_offset);
+	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }
 

@@ -48,7 +48,10 @@
 //                                      begins, pipeline barrier calls (total and per site),
 //                                      image layout transitions and guest command buffers,
 //                                      published per guest flip to HangTrace summary.csv and
-//                                      Profiler FrameEvents / Tracy plots.
+//                                      Profiler FrameEvents / Tracy plots. With the barrier
+//                                      batcher (KYTY_BARRIER_BATCH, render.h) also its request,
+//                                      merge, elision, sink and render-split counts; recorded
+//                                      batches are attributed to the batch.<origin> sites.
 //
 // With everything unset no hook is installed and each KYTY_GPU_OP_SITE scope costs one
 // predictable branch on a global flag.
@@ -132,6 +135,25 @@ void OnSchedulerShutdown(GraphicContext& graphics);
 
 // Once per completed guest flip (any thread): frame boundary and counter publication.
 void OnGuestFlip();
+
+// Barrier batcher statistics (CommandBuffer, render.h). Published per guest flip with the
+// counters above; one predictable branch when the profiler is inactive.
+enum class BarrierBatchEvent : uint32_t {
+	Requests,     // barrier requests routed through the batcher
+	Merged,       // requests joined to an already pending batch (no extra barrier call)
+	Elided,       // requests dropped: covered by the previous flushed barrier, nothing since
+	Sunk,         // pending batch kept across a draw continuing the same rendering instance
+	RenderSplits, // flushes that had to end an active rendering instance
+	Count,
+};
+namespace Detail {
+void CountBarrierBatch(BarrierBatchEvent event, uint64_t amount) noexcept;
+} // namespace Detail
+inline void CountBarrierBatch(BarrierBatchEvent event, uint64_t amount = 1) noexcept {
+	if (Detail::g_active) [[unlikely]] {
+		Detail::CountBarrierBatch(event, amount);
+	}
+}
 
 // Shader/pipeline identity for per-pipeline attribution. Cheap no-ops unless CaptureEnabled().
 void RegisterShader(uint64_t program_id, const char* stage, uint64_t guest_hash);

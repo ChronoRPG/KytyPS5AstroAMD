@@ -194,7 +194,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
+                    bool deferrable) {
 	KYTY_GPU_OP_SITE("image.transition");
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
@@ -210,6 +211,12 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	const auto barriers =
 	    GetBarriers(destination_layout, destination_access, destination_stage, range);
 	if (barriers.empty()) {
+		return;
+	}
+	// Barrier batcher (render.h): merged with pending requests, recorded now or (deferrable) at
+	// the next flush point, ending an active rendering instance only when recorded.
+	if (m_scheduler.Active() && m_scheduler.Current().BatchImageBarriers(barriers, command_buffer,
+	                                                                     deferrable)) {
 		return;
 	}
 	m_scheduler.EndRendering();
