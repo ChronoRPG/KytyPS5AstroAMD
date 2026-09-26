@@ -181,17 +181,33 @@ void OcclusionCounter::Dump(uint64_t address) {
 			(void)LibKernel::Memory::TryWriteBacking(address + db * 16u, source + db * 16u,
 			                                         sizeof(uint64_t));
 		}
+		if (HangTrace::Enabled()) {
+			uint64_t db0 = 0;
+			std::memcpy(&db0, source, sizeof(db0));
+			HangTrace::OcclusionEvent event;
+			event.event   = "publish";
+			event.address = address;
+			event.value   = db0 & ~(1ull << 63u);
+			HangTrace::RecordOcclusion(event);
+		}
 		m_published.fetch_add(1, std::memory_order_release);
 	});
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionDumps);
 	if (HangTrace::Enabled()) {
 		HangTrace::OcclusionEvent event;
-		event.event   = "dump";
-		event.address = address;
-		event.value   = m_issued;
-		event.scopes  = m_scopes_since_dump;
+		event.event         = "dump";
+		event.address       = address;
+		event.value         = m_issued;
+		event.scopes        = m_scopes_since_dump;
+		event.width         = m_last_scope.width;
+		event.height        = m_last_scope.height;
+		event.colors        = m_last_scope.colors;
+		event.has_depth     = m_last_scope.has_depth;
+		event.depth_format  = m_last_scope.depth_format;
+		event.depth_address = m_last_scope.depth_address;
 		HangTrace::RecordOcclusion(event);
 	}
 	m_scopes_since_dump = 0;
+	m_last_scope        = {};
 }
 }

@@ -103,11 +103,12 @@ void SetReadbackKind(ReadbackKind kind);
 void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64_t window_size,
                     bool downloaded, uint64_t duration_ns);
 
-// occlusion.csv (KYTY_GPU_OCCLUSION=1): "scope" rows for each counted rendering scope (target
-// size, colour count, depth format), "dump" rows for each ZPASS_DONE dump (scopes counted since
-// the previous dump) and "predicate" rows for each SET_PREDICATION op 1 (sample delta, condition,
-// resulting skip). A predicate with value 0 whose dumps bracket counted scopes means the samples
-// were rejected; one bracketing no scopes means the draws never reached a counted scope.
+// occlusion.csv (KYTY_GPU_OCCLUSION=1): "dump" rows for each ZPASS_DONE dump (scopes counted since
+// the previous dump, plus the latest scope's target size, colour count, depth format and depth
+// address), "publish" rows with the cumulative DB 0 sample count written to the guest for that
+// dump, and "predicate" rows for each SET_PREDICATION op 1 (sample delta, condition, resulting
+// skip). A begin/end pair whose published counts are equal although the pair brackets counted
+// scopes means the samples were rejected; one bracketing no scopes never reached a counted scope.
 struct OcclusionEvent {
 	const char* event        = "";
 	uint64_t    address      = 0;
@@ -118,10 +119,25 @@ struct OcclusionEvent {
 	uint32_t    colors       = 0;
 	bool        has_depth    = false;
 	uint32_t    depth_format = 0;
+	uint64_t    depth_address = 0;
 	uint32_t    condition    = 0;
 	bool        skip         = false;
 };
 void RecordOcclusion(const OcclusionEvent& event);
+
+// lodreports.csv (KYTY_LOD_STATS_MODE=gpu): one row per GET_LOD_STATS report written to the
+// guest: counters reported as sampled, their summed sample counts and mean finest mip, whether
+// any completed statistics existed yet, and GPU copies issued but not yet completed (report age).
+struct LodReportEvent {
+	uint64_t destination      = 0;
+	uint32_t control          = 0;
+	bool     has_latest       = false;
+	uint32_t sampled_counters = 0;
+	uint64_t total_samples    = 0;
+	double   mean_finest_mip  = 0.0;
+	uint64_t pending_copies   = 0;
+};
+void RecordLodReport(const LodReportEvent& event);
 
 // Which kind of recorded GPU write last marked a guest page GPU-owned (reported per readback).
 enum class GpuWriteKind : uint8_t { ShaderStorage, OcclusionDump, Fill, Copy };

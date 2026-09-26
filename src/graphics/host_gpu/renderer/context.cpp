@@ -192,16 +192,11 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	Handle().beginRendering(rendering);
 	m_context.GetOcclusionCounter().Begin();
 	if (m_context.GetOcclusionCounter().Active() && HangTrace::Enabled()) {
-		const auto&               db = GetRegisters().GetDepthRenderTarget();
-		HangTrace::OcclusionEvent event;
-		event.event        = "scope";
-		event.address      = db.z_read_base_addr;
-		event.width        = state.width;
-		event.height       = state.height;
-		event.colors       = state.num_color_attachments;
-		event.has_depth    = depth_stencil.has_depth;
-		event.depth_format = static_cast<uint32_t>(db.z_info.format);
-		HangTrace::RecordOcclusion(event);
+		const auto& db = GetRegisters().GetDepthRenderTarget();
+		m_context.GetOcclusionCounter().NoteScope(db.z_read_base_addr, state.width, state.height,
+		                                          state.num_color_attachments,
+		                                          depth_stencil.has_depth,
+		                                          static_cast<uint32_t>(db.z_info.format));
 	}
 	m_render_state = state;
 	m_rendering    = true;

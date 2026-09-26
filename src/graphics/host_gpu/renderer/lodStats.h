@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -61,6 +62,11 @@ private:
 		return values;
 	}();
 	std::array<uint32_t, Counters>         m_previous_count {};
+	// Hang-trace diagnostics (lodreports.csv): summary of m_latest and completed copies.
+	uint32_t                               m_latest_sampled     = 0;
+	uint64_t                               m_latest_samples     = 0;
+	double                                 m_latest_mean_finest = 0.0;
+	std::atomic<uint64_t>                  m_completed {0};
 };
 
 } // namespace Libs::Graphics

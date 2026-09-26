@@ -255,6 +255,7 @@ struct Files {
 	std::FILE* images        = nullptr;
 	std::FILE* lodwatch      = nullptr;
 	std::FILE* occlusion     = nullptr;
+	std::FILE* lodreports    = nullptr;
 };
 Files g_files;
 
@@ -262,6 +263,8 @@ constexpr uint64_t       kOcclusionRowLimit = 2'000'000;
 std::mutex               g_occlusion_mutex;
 std::vector<std::string> g_pending_occlusion_rows;
 uint64_t                 g_occlusion_rows_total = 0;
+std::vector<std::string> g_pending_lodreport_rows; // guarded by g_occlusion_mutex
+uint64_t                 g_lodreport_rows_total = 0;
 
 void UpdateMax(std::atomic<uint64_t>& target, uint64_t value) {
 	auto current = target.load(std::memory_order_relaxed);
@@ -500,6 +503,12 @@ void Publish() {
 	WriteRows(g_files.occlusion, rows);
 
 	{
+		std::scoped_lock lock(g_occlusion_mutex);
+		rows.swap(g_pending_lodreport_rows);
+	}
+	WriteRows(g_files.lodreports, rows);
+
+	{
 		std::scoped_lock lock(g_image_mutex);
 		rows.swap(g_pending_image_rows);
 		for (const auto& [key, totals]: g_native_images) {
@@ -681,7 +690,10 @@ void Initialize() {
 	                             "last_gpu_write_age_ms,last_gpu_write_size");
 	g_files.occlusion = OpenFile("occlusion.csv",
 	                             "t_ms,event,address,value,scopes,width,height,colors,has_depth,"
-	                             "depth_format,condition,skip");
+	                             "depth_format,depth_address,condition,skip");
+	g_files.lodreports = OpenFile("lodreports.csv",
+	                              "t_ms,destination,control,has_latest,sampled_counters,"
+	                              "total_samples,mean_finest_mip,pending_copies");
 	g_files.lodwatch  = OpenFile("lodwatch.csv",
 	                             "t_ms,report_seq,fault_vaddr,report_offset,access,pc,thread,"
 	                             "rax,rbx,rcx,rdx,rsi,rdi,rbp,rsp,r8,r9,r10,r11,r12,r13,r14,r15,"
@@ -1108,16 +1120,31 @@ void RecordOcclusion(const OcclusionEvent& event) {
 	if (!Enabled()) {
 		return;
 	}
-	auto row = fmt::format("{},{},0x{:x},{},{},{},{},{},{},{},{},{}", NowMs(), event.event,
+	auto row = fmt::format("{},{},0x{:x},{},{},{},{},{},{},{},0x{:x},{},{}", NowMs(), event.event,
 	                       event.address, event.value, event.scopes, event.width, event.height,
 	                       event.colors, event.has_depth ? 1 : 0, event.depth_format,
-	                       event.condition, event.skip ? 1 : 0);
+	                       event.depth_address, event.condition, event.skip ? 1 : 0);
 	std::scoped_lock lock(g_occlusion_mutex);
 	if (g_occlusion_rows_total >= kOcclusionRowLimit) {
 		return;
 	}
 	g_occlusion_rows_total++;
 	g_pending_occlusion_rows.push_back(std::move(row));
+}
+
+void RecordLodReport(const LodReportEvent& event) {
+	if (!Enabled()) {
+		return;
+	}
+	auto row = fmt::format("{},0x{:x},0x{:x},{},{},{},{:.2f},{}", NowMs(), event.destination,
+	                       event.control, event.has_latest ? 1 : 0, event.sampled_counters,
+	                       event.total_samples, event.mean_finest_mip, event.pending_copies);
+	std::scoped_lock lock(g_occlusion_mutex);
+	if (g_lodreport_rows_total >= kOcclusionRowLimit) {
+		return;
+	}
+	g_lodreport_rows_total++;
+	g_pending_lodreport_rows.push_back(std::move(row));
 }
 
 ScopedGpuWriteKind::ScopedGpuWriteKind(GpuWriteKind kind) : m_previous(g_gpu_write_kind) {

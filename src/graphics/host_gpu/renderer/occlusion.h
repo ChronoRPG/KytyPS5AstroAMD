@@ -31,6 +31,12 @@ public:
 		return m_published.load(std::memory_order_acquire) != m_issued;
 	}
 	[[nodiscard]] bool Active() const noexcept { return m_active; }
+	// Hang-trace diagnostics: the depth target of the latest counted scope, reported with the
+	// next dump.
+	void NoteScope(uint64_t depth_address, uint32_t width, uint32_t height, uint32_t colors,
+	               bool has_depth, uint32_t depth_format) {
+		m_last_scope = {depth_address, width, height, colors, has_depth, depth_format};
+	}
 private:
 	static constexpr uint32_t PublishSlots    = 1024;
 	static constexpr uint64_t PublishSlotSize = 256;
@@ -53,6 +59,15 @@ private:
 	bool m_active = false;
 	uint32_t m_pending = 0;
 	uint32_t m_scopes_since_dump = 0; // hang-trace diagnostics only
+	struct ScopeInfo {
+		uint64_t depth_address = 0;
+		uint32_t width         = 0;
+		uint32_t height        = 0;
+		uint32_t colors        = 0;
+		bool     has_depth     = false;
+		uint32_t depth_format  = 0;
+	};
+	ScopeInfo m_last_scope {}; // hang-trace diagnostics only
 };
 }
 #endif

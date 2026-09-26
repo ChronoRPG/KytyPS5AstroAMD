@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/lodStats.h"
 
 #include "common/assert.h"
+#include "common/hangTrace.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -62,13 +63,24 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 	// completed, write an unready report ("no data yet").
 	if (destination != 0 && size >= ReportSize) {
 		std::array<uint8_t, ReportSize> report {};
+		HangTrace::LodReportEvent       event;
 		{
 			std::scoped_lock lock(m_latest_mutex);
 			if (m_has_latest) {
 				report = m_latest;
 			}
+			event.has_latest       = m_has_latest;
+			event.sampled_counters = m_latest_sampled;
+			event.total_samples    = m_latest_samples;
+			event.mean_finest_mip  = m_latest_mean_finest;
 		}
 		(void)LibKernel::Memory::TryWriteBacking(destination, report.data(), report.size());
+		if (HangTrace::Enabled()) {
+			event.destination    = destination;
+			event.control        = control;
+			event.pending_copies = m_issued - m_completed.load(std::memory_order_acquire);
+			HangTrace::RecordLodReport(event);
+		}
 	}
 
 	auto native = scheduler.Current().Handle();
@@ -119,6 +131,9 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 		const uint32_t valid = 1;
 		std::memcpy(report.data(), &valid, sizeof(valid));
 		std::scoped_lock lock(m_latest_mutex);
+		uint32_t sampled      = 0;
+		uint64_t samples      = 0;
+		uint64_t finest_total = 0;
 		for (uint32_t counter = 0; counter < Counters; counter++) {
 			// Guests issue several reports per frame, each covering part of it; combine the two
 			// newest intervals so a texture sampled in only one part is not reported unsampled.
@@ -130,11 +145,18 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 			if (count != 0) {
 				entry = (uint64_t {std::min<uint32_t>(finest, 14u)} << 56u) |
 				        std::min<uint32_t>(count, 0xffffffu);
+				sampled++;
+				samples += count;
+				finest_total += std::min<uint32_t>(finest, 14u);
 			}
 			std::memcpy(report.data() + 64 + counter * sizeof(uint64_t), &entry, sizeof(entry));
 		}
-		m_latest     = report;
-		m_has_latest = true;
+		m_latest             = report;
+		m_has_latest         = true;
+		m_latest_sampled     = sampled;
+		m_latest_samples     = samples;
+		m_latest_mean_finest = sampled != 0 ? static_cast<double>(finest_total) / sampled : 0.0;
+		m_completed.fetch_add(1, std::memory_order_release);
 	});
 }
 
