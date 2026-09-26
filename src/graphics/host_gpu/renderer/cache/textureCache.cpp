@@ -1454,7 +1454,7 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			    m_scheduler.CurrentTick());
 		}
 		// An odd period avoids repeatedly sampling the same member of an alternating pair.
-		const bool sample_fallback = m_dcc_clear && TracyIsConnected &&
+		const bool sample_fallback = m_dcc_clear && tracy::ProfilerAvailable() && TracyIsConnected &&
 		                             (m_gpu_dcc_fallbacks % 257u) == 0;
 		uint32_t ownership = 0;
 		if (sample_fallback) {
