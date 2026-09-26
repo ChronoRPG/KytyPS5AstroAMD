@@ -55,6 +55,20 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 		                                     MemoryUsage::Download, 0, usage,
 		                                     PublishSlots * PublishSlotSize);
 	}
+	// The guest may read this report as soon as the packet is recorded (EOP labels are written at
+	// record time). Write the newest completed statistics now; until the first GPU copy has
+	// completed, write an unready report ("no data yet").
+	if (destination != 0 && size >= ReportSize) {
+		std::array<uint8_t, ReportSize> report {};
+		{
+			std::scoped_lock lock(m_latest_mutex);
+			if (m_has_latest) {
+				report = m_latest;
+			}
+		}
+		(void)LibKernel::Memory::TryWriteBacking(destination, report.data(), report.size());
+	}
+
 	auto native = scheduler.Current().Handle();
 
 	vk::MemoryBarrier barrier {};
@@ -64,7 +78,7 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &barrier, 0, nullptr, 0,
 	                       nullptr);
 
-	const bool publish = m_initialized && destination != 0 && size >= ReportSize;
+	const bool publish = m_initialized;
 	uint64_t   slot_offset = 0;
 	if (publish) {
 		const auto slot = static_cast<uint32_t>(m_issued % PublishSlots);
@@ -96,15 +110,20 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 	}
 	m_slot_ticks[m_issued % PublishSlots] = scheduler.CurrentTick();
 	++m_issued;
-	scheduler.DeferOperation([this, destination, slot_offset] {
+	scheduler.DeferOperation([this, slot_offset] {
 		m_publish->Invalidate(slot_offset, CounterBytes);
 		const auto* words = reinterpret_cast<const uint32_t*>(m_publish->Mapped().data() + slot_offset);
 		std::array<uint8_t, ReportSize> report {};
 		const uint32_t valid = 1;
 		std::memcpy(report.data(), &valid, sizeof(valid));
+		std::scoped_lock lock(m_latest_mutex);
 		for (uint32_t counter = 0; counter < Counters; counter++) {
-			const auto finest = words[counter];
-			const auto count  = words[Entries + counter];
+			// Guests issue several reports per frame, each covering part of it; combine the two
+			// newest intervals so a texture sampled in only one part is not reported unsampled.
+			const auto finest = std::min(words[counter], m_previous_finest[counter]);
+			const auto count  = words[Entries + counter] + m_previous_count[counter];
+			m_previous_finest[counter] = words[counter];
+			m_previous_count[counter]  = words[Entries + counter];
 			uint64_t   entry  = NoData;
 			if (count != 0) {
 				entry = (uint64_t {std::min<uint32_t>(finest, 14u)} << 56u) |
@@ -112,7 +131,8 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 			}
 			std::memcpy(report.data() + 64 + counter * sizeof(uint64_t), &entry, sizeof(entry));
 		}
-		(void)LibKernel::Memory::TryWriteBacking(destination, report.data(), report.size());
+		m_latest     = report;
+		m_has_latest = true;
 	});
 }
 
