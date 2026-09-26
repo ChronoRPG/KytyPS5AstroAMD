@@ -174,6 +174,43 @@ enum class FrameEvent : uint32_t {
 	GpuPipelineBarriers,
 	GpuImageLayoutTransitions,
 	GpuGuestCommandBuffers,
+	// Draw-prep S3 (KYTY_STAGE_PREP_PARALLEL): draws whose PS and VS were materialized in
+	// parallel (PS on the DrawPrep helper), forks declined because the helper slept (it is woken
+	// for the next draw), and parallel attempts that fell back to the serial path because a
+	// speculative (probe-only) materialization failed, a source/permutation was missing, or the
+	// KYTY_STAGE_PREP_VERIFY oracle disagreed.
+	StagePrepParallelDraws,
+	StagePrepForkDeclined,
+	StagePrepSpeculativeFailures,
+	StagePrepLookupFallbacks,
+	StagePrepVerifyMismatches,
+	// Per-thread last-lookup memos (KYTY_PROGRAM_LOOKUP_MEMO): program source entry per stage,
+	// and the permutation last matched for that source.
+	ProgramSourceMemoHits,
+	ProgramSourceMemoMisses,
+	PermutationMemoHits,
+	PermutationMemoMisses,
+	// GetGraphicsPipeline last-key memo (KYTY_PIPELINE_MEMO).
+	PipelineMemoHits,
+	PipelineMemoMisses,
+	// RenderExecutor sampler memo keyed on the final sampler dwords (KYTY_SAMPLER_MEMO).
+	SamplerMemoHits,
+	SamplerMemoMisses,
+	// Color/depth target descriptions memoized on the raw target registers
+	// (KYTY_TARGET_DESC_MEMO).
+	TargetDescMemoHits,
+	TargetDescMemoMisses,
+	// Graphics dynamic-state commands recorded or elided by the per-command-buffer shadow
+	// (KYTY_DYNAMIC_STATE_SHADOW).
+	DynamicStateCommandsEmitted,
+	DynamicStateCommandsAvoided,
+	// Vertex attribute/V# table reads served by one batched probe per table, or falling back
+	// to per-attribute probes (KYTY_SHADER_METADATA_BATCH).
+	VertexTableBatchHits,
+	VertexTableBatchMisses,
+	// Shader map lookups answered by the per-thread memo (KYTY_SHADER_MAP_MEMO).
+	ShaderMapMemoHits,
+	ShaderMapMemoMisses,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
@@ -206,6 +243,10 @@ enum class FrameWait : uint32_t {
 	// Guest thread time waiting for a side-copy readback (its own or a duplicate) and publishing
 	// it to the backing. Nested inside ReadMemory; the GPU thread does not wait for these.
 	ReadbackSideWait,
+	// Draw-prep S3: GPU-thread time spent spinning in the join after its own stage finished
+	// (StagePrepJoin), and helper-thread job time (StagePrepHelper, not on the GPU thread).
+	StagePrepJoin,
+	StagePrepHelper,
 	Count,
 };
 

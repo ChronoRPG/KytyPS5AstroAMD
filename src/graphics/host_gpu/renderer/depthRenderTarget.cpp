@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -25,6 +26,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 
 namespace Libs::Graphics {
@@ -307,7 +309,23 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
 		DepthFatal("unsupported depth register state");
 	}
-	r.desc = MakeDepthTargetDesc(buffer, z);
+	// KYTY_TARGET_DESC_MEMO: MakeDepthTargetDesc is a pure function of the depth-target
+	// registers (and constant device format support), so equal register bytes give an equal
+	// description. FindImage below still runs for every draw.
+	auto& memo = m_depth_target_memo;
+	if (TargetDescMemoEnabled() && memo.valid &&
+	    std::memcmp(&memo.registers, &z, sizeof(z)) == 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TargetDescMemoHits);
+		r.desc = memo.desc;
+	} else {
+		r.desc = MakeDepthTargetDesc(buffer, z);
+		if (TargetDescMemoEnabled()) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TargetDescMemoMisses);
+			std::memcpy(&memo.registers, &z, sizeof(z));
+			memo.desc  = r.desc;
+			memo.valid = true;
+		}
+	}
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_load_clear_enable = r.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();

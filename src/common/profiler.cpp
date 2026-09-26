@@ -141,6 +141,27 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.GpuPipelineBarriers.Cumulative",
     "FrameEvent.GpuImageLayoutTransitions.Cumulative",
     "FrameEvent.GpuGuestCommandBuffers.Cumulative",
+    "FrameEvent.StagePrepParallelDraws.Cumulative",
+    "FrameEvent.StagePrepForkDeclined.Cumulative",
+    "FrameEvent.StagePrepSpeculativeFailures.Cumulative",
+    "FrameEvent.StagePrepLookupFallbacks.Cumulative",
+    "FrameEvent.StagePrepVerifyMismatches.Cumulative",
+    "FrameEvent.ProgramSourceMemoHits.Cumulative",
+    "FrameEvent.ProgramSourceMemoMisses.Cumulative",
+    "FrameEvent.PermutationMemoHits.Cumulative",
+    "FrameEvent.PermutationMemoMisses.Cumulative",
+    "FrameEvent.PipelineMemoHits.Cumulative",
+    "FrameEvent.PipelineMemoMisses.Cumulative",
+    "FrameEvent.SamplerMemoHits.Cumulative",
+    "FrameEvent.SamplerMemoMisses.Cumulative",
+    "FrameEvent.TargetDescMemoHits.Cumulative",
+    "FrameEvent.TargetDescMemoMisses.Cumulative",
+    "FrameEvent.DynamicStateCommandsEmitted.Cumulative",
+    "FrameEvent.DynamicStateCommandsAvoided.Cumulative",
+    "FrameEvent.VertexTableBatchHits.Cumulative",
+    "FrameEvent.VertexTableBatchMisses.Cumulative",
+    "FrameEvent.ShaderMapMemoHits.Cumulative",
+    "FrameEvent.ShaderMapMemoMisses.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
@@ -168,6 +189,8 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.GpuDispatchToStart.Calls.Cumulative",
     "FrameWait.GpuEndToObserved.Calls.Cumulative",
     "FrameWait.ReadbackSideWait.Calls.Cumulative",
+    "FrameWait.StagePrepJoin.Calls.Cumulative",
+    "FrameWait.StagePrepHelper.Calls.Cumulative",
 };
 static_assert(kFrameWaitCallNames.back() != nullptr, "FrameWait names must match the enum");
 constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
@@ -188,6 +211,8 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.GpuDispatchToStart.Nanoseconds.Cumulative",
     "FrameWait.GpuEndToObserved.Nanoseconds.Cumulative",
     "FrameWait.ReadbackSideWait.Nanoseconds.Cumulative",
+    "FrameWait.StagePrepJoin.Nanoseconds.Cumulative",
+    "FrameWait.StagePrepHelper.Nanoseconds.Cumulative",
 };
 static_assert(kFrameWaitTimeNames.back() != nullptr, "FrameWait names must match the enum");
 

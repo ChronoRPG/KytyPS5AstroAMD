@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/stagePrepWorker.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -793,10 +794,25 @@ struct PipelineCache::ProgramCache {
 		mutable ReuseState                 reuse;
 	};
 
+	// The last source found per stage by this thread and the permutation it last matched.
+	// Exact: programs entries are never erased or moved, so a remembered entry is the one
+	// FindSource returns for an equal key; and permutations are unique per (specialization,
+	// push-data start) because CompileAndPublish appends only after an exclusive failed search,
+	// so a remembered permutation that matches is the one FindPermutation would return.
+	struct LookupMemo {
+		ProgramKey         key;
+		const SourceEntry* source      = nullptr;
+		const Permutation* permutation = nullptr;
+	};
+	static constexpr size_t LookupMemoStages = 16;
+
 	// Per-caller lookup scratch (previously shared cache members). One instance must not be
 	// used by two threads at once.
 	struct ProgramScratch {
-		ProgramScratch() { key.static_state.reserve(MaxStaticKeyWords); }
+		ProgramScratch() {
+			key.static_state.reserve(MaxStaticKeyWords);
+			second_key.static_state.reserve(MaxStaticKeyWords);
+		}
 
 		std::span<uint8_t, PreparedResourceReads::MaxBytes> Validation() {
 			// Only reuse mode reads certificates; allocate its bounded buffer on first use.
@@ -807,9 +823,68 @@ struct PipelineCache::ProgramCache {
 			                                                           validation.size());
 		}
 
+		LookupMemo* Memo(ShaderType stage) {
+			const auto index = static_cast<size_t>(stage);
+			return index < memos.size() ? &memos[index] : nullptr;
+		}
+
 		ProgramKey           key;
+		// The parallel path keeps both stages' keys alive at once.
+		ProgramKey           second_key;
 		std::vector<uint8_t> validation;
+		std::array<LookupMemo, LookupMemoStages> memos;
 	};
+
+	static bool LookupMemoEnabled() {
+		static const bool enabled = [] {
+			const auto* value = std::getenv("KYTY_PROGRAM_LOOKUP_MEMO");
+			return value == nullptr || std::strcmp(value, "0") != 0;
+		}();
+		return enabled;
+	}
+
+	// FindSource through the per-thread memo of the key's stage.
+	const SourceEntry* FindSourceMemo(const ProgramKey& key, ProgramScratch& scratch) const {
+		auto* memo = LookupMemoEnabled() ? scratch.Memo(key.stage) : nullptr;
+		if (memo != nullptr && memo->source != nullptr && memo->key == key) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ProgramSourceMemoHits);
+			return memo->source;
+		}
+		const auto* source = FindSource(key);
+		if (memo != nullptr) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ProgramSourceMemoMisses);
+			if (source != nullptr) {
+				memo->key.stage           = key.stage;
+				memo->key.hash            = key.hash;
+				memo->key.user_data_count = key.user_data_count;
+				memo->key.code_size       = key.code_size;
+				memo->key.static_state.assign(key.static_state.begin(), key.static_state.end());
+				memo->source      = source;
+				memo->permutation = nullptr;
+			} else {
+				memo->source = nullptr;
+			}
+		}
+		return source;
+	}
+
+	// FindPermutation, trying the permutation last matched for this source first.
+	const Permutation* FindPermutationMemo(const SourceEntry& source, ShaderType stage,
+	                                       const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                       uint32_t push_data_cursor, ProgramScratch& scratch) const {
+		auto* memo = LookupMemoEnabled() ? scratch.Memo(stage) : nullptr;
+		if (memo != nullptr && memo->source == &source && memo->permutation != nullptr &&
+		    PermutationMatches(*memo->permutation, specialization, push_data_cursor)) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::PermutationMemoHits);
+			return memo->permutation;
+		}
+		const auto* permutation = FindPermutation(source, specialization, push_data_cursor);
+		if (memo != nullptr) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::PermutationMemoMisses);
+			if (memo->source == &source) memo->permutation = permutation;
+		}
+		return permutation;
+	}
 
 	static ProgramScratch& ThreadScratch() {
 		thread_local ProgramScratch scratch;
@@ -1206,7 +1281,7 @@ struct PipelineCache::ProgramCache {
 
 		auto& key = scratch.key;
 		BuildKey(params, input_info, key);
-		const auto* source = FindSource(key);
+		const auto* source = FindSourceMemo(key, scratch);
 		if (source != nullptr && source->skip_dispatch.load(std::memory_order_relaxed)) {
 			return {};
 		}
@@ -1224,8 +1299,8 @@ struct PipelineCache::ProgramCache {
 					return Bind(*cached, input_info, prep, push_data_cursor);
 				}
 			}
-			if (const auto* permutation =
-			        FindPermutation(*source, prep.specialization, push_data_cursor)) {
+			if (const auto* permutation = FindPermutationMemo(*source, key.stage, prep.specialization,
+			                                                  push_data_cursor, scratch)) {
 				if (ResourceReuseEnabled()) {
 					source->reuse.current.permutation_index = permutation->index;
 				}
@@ -1237,6 +1312,104 @@ struct PipelineCache::ProgramCache {
 		                      scratch, prep, read_attempt, source != nullptr);
 		if (permutation == nullptr) return {};
 		return Bind(*permutation, input_info, prep, push_data_cursor);
+	}
+
+	// Draw-prep S3: probe-only guest reads. A read that is not provably clean fails silently:
+	// no fault, readback, synchronization or missing-range record. It is the same predicate and
+	// the same bytes the serial path's strict reader and clean probe use, so a materialization
+	// that succeeds with it equals the serial one; any failure falls back to the serial path.
+	static bool SpeculativeRead(void*, uint64_t address, std::span<uint32_t> values) {
+		return !values.empty() &&
+		       LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+	}
+
+	static ShaderRecompiler::IR::SrtRuntime MakeSpeculativeRuntime(const ShaderParams& params) {
+		// read_memory == read_specialization_memory keeps batched flat-run probes enabled, and
+		// every read of both walkers goes through the silent reader. Clean-value sharing needs
+		// the ordinary fallback reader and stays off; it only avoids repeated evaluations.
+		return {
+		    .user_data                  = std::span(params.user_data).first(params.user_data_count),
+		    .shader_base                = params.Base(),
+		    .read_memory                = SpeculativeRead,
+		    .userdata                   = nullptr,
+		    .read_specialization_memory = SpeculativeRead,
+		    .try_read_clean_backing     = TryReadShaderCleanBacking,
+		    .share_clean_values         = false,
+		};
+	}
+
+	struct StageJob {
+		const SourceEntry*               source = nullptr;
+		ShaderRecompiler::IR::SrtRuntime runtime;
+		StagePrep*                       prep = nullptr;
+		bool                             ok   = false;
+
+		static void Run(void* context) {
+			auto& job = *static_cast<StageJob*>(context);
+			job.ok    = MaterializeStage(*job.source, job.runtime,
+			                             ShaderRecompiler::IR::ThreadEvaluationScratch(), *job.prep);
+		}
+	};
+
+	// Draw-prep S3: materializes the pixel stage on the DrawPrep helper while this (GPU) thread
+	// materializes the vertex stage, both with probe-only reads, then looks up and binds the
+	// permutations serially in the usual order (pixel first; push data follows that order).
+	// Until the join this thread performs only those read-only probes (gpuReadDelegate.h).
+	// Returns false, leaving outputs to be overwritten by the serial path, when the helper is
+	// unavailable, a source or permutation is not published yet (the serial path compiles it),
+	// or a read was not provably clean (the serial path reads it with fault/readback semantics).
+	bool TryGetParallel(const ShaderParams& ps_params, ShaderPixelInputInfo& ps_info,
+	                    StagePrep& ps_prep, const ShaderParams& vs_params,
+	                    ShaderVertexInputInfo& vs_info, StagePrep& vs_prep,
+	                    uint32_t push_data_cursor, ProgramScratch& scratch,
+	                    ShaderRecompiler::IR::EvaluationScratch& evaluation,
+	                    ShaderProgram& ps_program, ShaderProgram& vs_program) {
+		KYTY_PROFILER_DETAIL_BLOCK("ProgramCache::GetParallel");
+		auto* worker = StagePrepWorker::Get();
+		if (worker == nullptr) return false;
+		auto& ps_key = scratch.key;
+		auto& vs_key = scratch.second_key;
+		BuildKey(ps_params, ps_info, ps_key);
+		BuildKey(vs_params, vs_info, vs_key);
+		const auto* ps_source = FindSourceMemo(ps_key, scratch);
+		const auto* vs_source = FindSourceMemo(vs_key, scratch);
+		if (ps_source == nullptr || vs_source == nullptr ||
+		    ps_source->skip_dispatch.load(std::memory_order_relaxed) ||
+		    vs_source->skip_dispatch.load(std::memory_order_relaxed)) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::StagePrepLookupFallbacks);
+			return false;
+		}
+		StageJob job {.source = ps_source, .runtime = MakeSpeculativeRuntime(ps_params),
+		              .prep = &ps_prep};
+		if (!worker->TryFork(&StageJob::Run, &job)) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::StagePrepForkDeclined);
+			return false;
+		}
+		const bool vs_ok =
+		    MaterializeStage(*vs_source, MakeSpeculativeRuntime(vs_params), evaluation, vs_prep);
+		worker->Join();
+		if (!job.ok || !vs_ok) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::StagePrepSpeculativeFailures);
+			return false;
+		}
+		const auto* ps_permutation = FindPermutationMemo(*ps_source, ps_key.stage,
+		                                                 ps_prep.specialization, push_data_cursor,
+		                                                 scratch);
+		if (ps_permutation == nullptr) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::StagePrepLookupFallbacks);
+			return false;
+		}
+		ps_program = Bind(*ps_permutation, ps_info, ps_prep, push_data_cursor);
+		const auto* vs_permutation = FindPermutationMemo(*vs_source, vs_key.stage,
+		                                                 vs_prep.specialization, push_data_cursor,
+		                                                 scratch);
+		if (vs_permutation == nullptr) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::StagePrepLookupFallbacks);
+			return false;
+		}
+		vs_program = Bind(*vs_permutation, vs_info, vs_prep, push_data_cursor);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::StagePrepParallelDraws);
+		return true;
 	}
 
 	explicit ProgramCache(vk::Device device): device(device) {}
@@ -1415,6 +1588,67 @@ void PipelineCache::Save() {
 	m_driver_cache = nullptr;
 }
 
+namespace {
+
+// KYTY_STAGE_PREP_VERIFY: 0 (default) off; 1 reruns the serial preparation after every parallel
+// one and logs and counts differences; "exit" also stops the emulator on the first difference.
+int StagePrepVerifyMode() {
+	static const int mode = [] {
+		const auto* value = std::getenv("KYTY_STAGE_PREP_VERIFY");
+		if (value == nullptr || std::strcmp(value, "0") == 0 || *value == '\0') return 0;
+		return std::strcmp(value, "exit") == 0 ? 2 : 1;
+	}();
+	return mode;
+}
+
+bool SameSnapshot(const ShaderRecompiler::IR::ResourceSnapshot& a,
+                  const ShaderRecompiler::IR::ResourceSnapshot& b) {
+	return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers &&
+	       a.flattened_srt == b.flattened_srt && a.user_data == b.user_data &&
+	       a.uniform_fill == b.uniform_fill;
+}
+
+// The oracle prepares copies of the stage inputs serially and compares every output that the
+// draw consumes. It only reads clean memory (the parallel preparation proved it clean), so it
+// cannot synchronize; a difference means a concurrent guest write or a bug.
+template <typename Serial>
+void VerifyParallelPrograms(const PipelineCache::GraphicsPrograms&      parallel,
+                            const std::array<ShaderVertexInputInfo, 3>& vertex_info,
+                            const ShaderPixelInputInfo&                 pixel_info,
+                            const PipelineCache::GraphicsStagePreps&    preps,
+                            const Serial&                               serial) {
+	auto vertex_copy = std::make_unique<std::array<ShaderVertexInputInfo, 3>>(vertex_info);
+	auto pixel_copy  = std::make_unique<ShaderPixelInputInfo>(pixel_info);
+	auto prep_copy   = std::make_unique<PipelineCache::GraphicsStagePreps>();
+	const auto expected = serial(*vertex_copy, *pixel_copy, *prep_copy);
+	const bool programs_equal = expected.pixel.id == parallel.pixel.id &&
+	                            expected.vertex[0].id == parallel.vertex[0].id;
+	const bool pixel_equal  = SameSnapshot(prep_copy->pixel.resources, preps.pixel.resources) &&
+	                          prep_copy->pixel.specialization == preps.pixel.specialization &&
+	                          prep_copy->pixel.permutation == preps.pixel.permutation;
+	const bool vertex_equal = SameSnapshot(prep_copy->vertex[0].resources,
+	                                       preps.vertex[0].resources) &&
+	                          prep_copy->vertex[0].specialization ==
+	                              preps.vertex[0].specialization &&
+	                          prep_copy->vertex[0].permutation == preps.vertex[0].permutation;
+	if (programs_equal && pixel_equal && vertex_equal) {
+		return;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::StagePrepVerifyMismatches);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		LOGF("StagePrepVerify: parallel preparation differs: programs=%d pixel=%d vertex=%d "
+		     "ps=%" PRIu64 "/%" PRIu64 " vs=%" PRIu64 "/%" PRIu64 "\n",
+		     programs_equal, pixel_equal, vertex_equal, parallel.pixel.id, expected.pixel.id,
+		     parallel.vertex[0].id, expected.vertex[0].id);
+	}
+	if (StagePrepVerifyMode() == 2) {
+		EXIT("StagePrepVerify: parallel preparation differs from the serial path\n");
+	}
+}
+
+} // namespace
+
 bool PipelineCache::TessellationActive(const HW::UserConfig& user_config) {
 	return user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 }
@@ -1428,6 +1662,11 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	const bool tess_active = TessellationActive(user_config);
 	std::array<ShaderParams, 3> vertex_params;
+	// Static stage information (shader map, headers, vertex tables); ended before
+	// materialization.
+	static constexpr tracy::SourceLocationData prepare_static_location {
+	    "Programs::PrepareStatic", TracyFunction, TracyFile, static_cast<uint32_t>(__LINE__), 0};
+	Profiler::ScopedBlock static_zone(&prepare_static_location, Profiler::DetailedEnabled());
 	if (tess_active) {
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
 	} else {
@@ -1485,30 +1724,52 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
+	static_zone.End();
 	// The program cache locks internally, so no pipeline lock is held across materialization.
 	auto& scratch    = ProgramCache::ThreadScratch();
 	auto& evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
-	for (uint32_t attempt = 0; attempt < 64; ++attempt) {
-		ShaderReadAttempt read_attempt;
-		uint32_t push_data_cursor =
-		    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+	const uint32_t push_data_start =
+	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+	const auto serial = [&](std::array<ShaderVertexInputInfo, 3>& vertex_inputs,
+	                        ShaderPixelInputInfo& pixel_input,
+	                        GraphicsStagePreps& preps) -> GraphicsPrograms {
+		for (uint32_t attempt = 0; attempt < 64; ++attempt) {
+			ShaderReadAttempt read_attempt;
+			uint32_t          push_data_cursor = push_data_start;
+			GraphicsPrograms  result;
+			if (pixel_active) {
+				result.pixel = m_program_cache->Get(pixel_params, pixel_input, preps.pixel,
+				                                   push_data_cursor, read_attempt, scratch,
+				                                   evaluation);
+			}
+			for (uint32_t i = 0; i < (tess_active ? 3u : 1u) &&
+			                     !read_attempt.materialization_failed; ++i) {
+				result.vertex[i] =
+				    m_program_cache->Get(vertex_params[i], vertex_inputs[i], preps.vertex[i],
+				                         push_data_cursor, read_attempt, scratch, evaluation);
+			}
+			if (!read_attempt.materialization_failed) return result;
+			// No pipeline or texture-cache lock is held while the scheduler publishes bytes.
+			// Restart all stages before final bindings/uploads, including their SRT refresh.
+			EXIT_IF(!read_attempt.Synchronize());
+		}
+		EXIT("graphics resource readiness did not converge after 64 attempts\n");
+	};
+	// Draw-prep S3: PS and VS materialized concurrently. The O15 reuse mode keeps shared
+	// per-entry state and tessellation has three vertex stages; both stay serial.
+	if (pixel_active && !tess_active && !ResourceReuseEnabled()) {
 		GraphicsPrograms result;
-		if (pixel_active) {
-			result.pixel = m_program_cache->Get(pixel_params, pixel_info, stage_preps.pixel,
-			                                   push_data_cursor, read_attempt, scratch, evaluation);
+		if (m_program_cache->TryGetParallel(pixel_params, pixel_info, stage_preps.pixel,
+		                                    vertex_params[0], vertex_info[0], stage_preps.vertex[0],
+		                                    push_data_start, scratch, evaluation, result.pixel,
+		                                    result.vertex[0])) {
+			if (StagePrepVerifyMode() != 0) {
+				VerifyParallelPrograms(result, vertex_info, pixel_info, stage_preps, serial);
+			}
+			return result;
 		}
-		for (uint32_t i = 0; i < (tess_active ? 3u : 1u) &&
-		                     !read_attempt.materialization_failed; ++i) {
-			result.vertex[i] =
-			    m_program_cache->Get(vertex_params[i], vertex_info[i], stage_preps.vertex[i],
-			                         push_data_cursor, read_attempt, scratch, evaluation);
-		}
-		if (!read_attempt.materialization_failed) return result;
-		// No pipeline or texture-cache lock is held while the scheduler publishes bytes.
-		// Restart all stages before final bindings/uploads, including their SRT refresh.
-		EXIT_IF(!read_attempt.Synchronize());
 	}
-	EXIT("graphics resource readiness did not converge after 64 attempts\n");
+	return serial(vertex_info, pixel_info, stage_preps);
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
@@ -1561,8 +1822,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_IF(ps_active && !pixel_program);
 	const auto color_count = static_cast<uint32_t>(colors.size());
 
-	Common::LockGuard lock(m_mutex);
-	auto&             ctx = command.GetRegisters();
+	// The key is built from the draw's registers and inputs only; m_mutex guards the map below.
+	auto& ctx = command.GetRegisters();
 
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
@@ -1685,8 +1946,38 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 	}
 
+	// Last-key memo (KYTY_PIPELINE_MEMO): most draws use their predecessor's pipeline. Exact:
+	// the comparison is the map's own key equality, and pipelines are never erased or moved
+	// before the cache is destroyed.
+	static const bool memo_enabled = [] {
+		const auto* value = std::getenv("KYTY_PIPELINE_MEMO");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	struct LastPipeline {
+		const PipelineCache* cache    = nullptr;
+		Pipeline*            pipeline = nullptr;
+		GraphicsPipelineKey  key {};
+	};
+	static thread_local LastPipeline last;
+	if (memo_enabled) {
+		if (last.cache == this && last.pipeline != nullptr && last.key == key) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineMemoHits);
+			return *last.pipeline;
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineMemoMisses);
+	}
+	const auto remember = [&](Pipeline& pipeline) -> Pipeline& {
+		if (memo_enabled) {
+			last.cache    = this;
+			last.pipeline = &pipeline;
+			last.key      = key;
+		}
+		return pipeline;
+	};
+
+	Common::LockGuard lock(m_mutex);
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return *iter->second;
+		return remember(*iter->second);
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1715,10 +2006,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	                                        static_cast<uint32_t>(key.vertex_shader_ids.size()),
 	                                        ps_id);
 
-	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+	auto [iter, inserted] = m_graphics_pipelines.emplace(key, std::move(cached));
 	EXIT_IF(!inserted);
 
-	return *iter->second;
+	return remember(*iter->second);
 }
 
 PipelineCache::Pipeline&

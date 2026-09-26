@@ -17,10 +17,20 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics {
 
 static std::atomic<uint32_t> g_render_color_log_count = 0;
+
+bool TargetDescMemoEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_TARGET_DESC_MEMO");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
 
 static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 	switch (info.format) {
@@ -71,6 +81,28 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		}
 
 		return;
+	}
+	// KYTY_TARGET_DESC_MEMO: the description below is a pure function of these register bytes,
+	// the effective mask and the slice offset. It is bypassed while decision logging is still
+	// active so that the first logged decisions stay identical.
+	auto* memo = rt_slot < m_color_target_memo.size() && TargetDescMemoEnabled() &&
+	                     !graphics_debug_dump_enabled() &&
+	                     g_render_color_log_count.load(std::memory_order_relaxed) >= 128
+	                 ? &m_color_target_memo[rt_slot]
+	                 : nullptr;
+	if (memo != nullptr) {
+		if (memo->valid && memo->mask == mask && memo->slice_offset == render_target_slice_offset &&
+		    std::memcmp(&memo->registers, &rt, sizeof(rt)) == 0) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TargetDescMemoHits);
+			r.desc              = memo->desc;
+			r.guest_mip_level   = memo->guest_mip_level;
+			r.guest_array_layer = memo->guest_array_layer;
+			r.export_mapping    = memo->export_mapping;
+			r.image_id          = m_context.GetTextureCache().FindImage(r.desc, exact_format);
+			BindRenderTarget(r.image_id);
+			return;
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TargetDescMemoMisses);
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
@@ -280,7 +312,10 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	const vk::Extent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
 	                                  std::max(height >> rt.view.current_mip_level, 1u)};
 
-	auto decision_log_id = g_render_color_log_count.fetch_add(1);
+	// Only the first 128 decisions are logged; skip the atomic increment afterwards.
+	const auto decision_log_id = g_render_color_log_count.load(std::memory_order_relaxed) < 128
+	                                 ? g_render_color_log_count.fetch_add(1)
+	                                 : 128u;
 	if (decision_log_id < 128) {
 		LOGF("RenderColorTarget: slot=%" PRIu32 " addr=0x%010" PRIx64 " size=0x%016" PRIx64
 		     " extent=%ux%ux%u view_mip=%u view_extent=%ux%u levels=%u pitch=%u"
@@ -353,6 +388,16 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
 	auto& texture_cache        = m_context.GetTextureCache();
+	if (memo != nullptr) {
+		std::memcpy(&memo->registers, &rt, sizeof(rt));
+		memo->mask              = mask;
+		memo->slice_offset      = render_target_slice_offset;
+		memo->desc              = desc;
+		memo->guest_mip_level   = rt.view.current_mip_level;
+		memo->guest_array_layer = view.base_layer;
+		memo->export_mapping    = target_format.export_mapping;
+		memo->valid             = true;
+	}
 	r.desc                     = std::move(desc);
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;

@@ -11,6 +11,9 @@
 
 namespace Libs::Graphics {
 
+// KYTY_TARGET_DESC_MEMO=0 disables the color/depth target description memos (render.h).
+[[nodiscard]] bool TargetDescMemoEnabled();
+
 struct RenderColorInfo {
 	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc         desc;

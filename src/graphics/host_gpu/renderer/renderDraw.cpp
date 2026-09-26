@@ -45,6 +45,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -64,11 +65,11 @@ struct MeshDrawSegment {
 	uint32_t groups;
 };
 
-static std::vector<MeshDrawSegment> SplitMeshRestartIndices(
-    uint64_t address, uint32_t count, uint32_t element_size, uint32_t marker,
-    const ShaderMeshInputInfo& mesh) {
+static void SplitMeshRestartIndices(uint64_t address, uint32_t count, uint32_t element_size,
+                                    uint32_t marker, const ShaderMeshInputInfo& mesh,
+                                    std::vector<MeshDrawSegment>& segments) {
 	EXIT_IF(address == 0 || (element_size != 1 && element_size != 2 && element_size != 4));
-	std::vector<MeshDrawSegment> segments;
+	segments.clear();
 	std::array<uint8_t, 4096> bytes;
 	uint32_t start = 0;
 	uint64_t markers = 0;
@@ -99,7 +100,6 @@ static std::vector<MeshDrawSegment> SplitMeshRestartIndices(
 	add(count);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::MeshRestartMarkers, markers);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::MeshRestartSegments, segments.size());
-	return segments;
 }
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
@@ -361,10 +361,73 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
+static bool DynamicStateShadowEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DYNAMIC_STATE_SHADOW");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// Records one dynamic-state group unless the shadow proves the command buffer already holds
+// exactly these values (see GraphicsDynamicStateShadow for when that holds).
+class DynamicStateRecorder {
+public:
+	DynamicStateRecorder(GraphicsDynamicStateShadow& shadow, const CommandBuffer& buffer,
+	                     vk::CommandBuffer vk_buffer)
+	    : m_shadow(shadow) {
+		m_reuse = DynamicStateShadowEnabled() && shadow.valid && shadow.command == vk_buffer &&
+		          shadow.pipeline != nullptr &&
+		          buffer.BoundPipeline(vk::PipelineBindPoint::eGraphics) == shadow.pipeline;
+		if (!m_reuse) {
+			shadow         = {};
+			shadow.command = vk_buffer;
+		}
+	}
+	~DynamicStateRecorder() {
+		m_shadow.valid = DynamicStateShadowEnabled();
+		if (m_emitted != 0) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DynamicStateCommandsEmitted, m_emitted);
+		}
+		if (m_avoided != 0) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DynamicStateCommandsAvoided, m_avoided);
+		}
+	}
+	DynamicStateRecorder(const DynamicStateRecorder&)            = delete;
+	DynamicStateRecorder& operator=(const DynamicStateRecorder&) = delete;
+
+	// Whether the group must be recorded; `current` is the shadow's value for the group and
+	// `valid` whether the shadow holds it at all. Stores the new value when recording. Values
+	// are compared bitwise (types without padding), so a skipped command would have set
+	// bit-identical state.
+	template <typename T>
+	bool Update(T& current, const T& value, bool valid = true) {
+		static_assert(std::is_trivially_copyable_v<T>);
+		if (m_reuse && valid && std::memcmp(&current, &value, sizeof(T)) == 0) {
+			++m_avoided;
+			return false;
+		}
+		current = value;
+		++m_emitted;
+		return true;
+	}
+	[[nodiscard]] bool Reuse() const { return m_reuse; }
+	void Emitted(uint64_t count) { m_emitted += count; }
+	void Avoided(uint64_t count) { m_avoided += count; }
+
+private:
+	GraphicsDynamicStateShadow& m_shadow;
+	bool                        m_reuse   = false;
+	uint64_t                    m_emitted = 0;
+	uint64_t                    m_avoided = 0;
+};
+
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
-                                     const RenderDepthInfo& depth, const RenderState& rendering) {
+                                     const RenderDepthInfo& depth, const RenderState& rendering,
+                                     GraphicsDynamicStateShadow& shadow) {
 	KYTY_PROFILER_FUNCTION();
+	DynamicStateRecorder recorder(shadow, buffer, vk_buffer);
 
 	const auto& ctx = buffer.GetRegisters();
 	const auto&        vp  = ctx.GetScreenViewport();
@@ -407,8 +470,26 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			scissor.extent = {0, 0};
 		}
 	}
-	vk_buffer.setViewportWithCount(viewport_count, viewports.data());
-	vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+	static_assert(viewport_slots <= GraphicsDynamicStateShadow::MaxViewports);
+	// Bitwise comparisons: a skipped command must leave bit-identical state.
+	const bool same_count = recorder.Reuse() && shadow.viewport_count == viewport_count;
+	if (same_count && std::memcmp(shadow.viewports.data(), viewports.data(),
+	                              sizeof(vk::Viewport) * viewport_count) == 0) {
+		recorder.Avoided(1);
+	} else {
+		vk_buffer.setViewportWithCount(viewport_count, viewports.data());
+		std::copy_n(viewports.begin(), viewport_count, shadow.viewports.begin());
+		recorder.Emitted(1);
+	}
+	if (same_count && std::memcmp(shadow.scissors.data(), scissors.data(),
+	                              sizeof(vk::Rect2D) * viewport_count) == 0) {
+		recorder.Avoided(1);
+	} else {
+		vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+		std::copy_n(scissors.begin(), viewport_count, shadow.scissors.begin());
+		recorder.Emitted(1);
+	}
+	shadow.viewport_count = viewport_count;
 
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
@@ -421,20 +502,35 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		}
 		line_width = 1.0f;
 	}
-	vk_buffer.setLineWidth(line_width);
+	if (recorder.Update(shadow.line_width, line_width)) {
+		vk_buffer.setLineWidth(line_width);
+	}
 	const auto&      blend = ctx.GetBlendColor();
 	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
-	vk_buffer.setBlendConstants(blend_constants.data());
-	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	if (recorder.Update(shadow.blend_constants, blend_constants)) {
+		vk_buffer.setBlendConstants(blend_constants.data());
+	}
+	const vk::Bool32 depth_test_enable  = depth.depth_test_enable ? VK_TRUE : VK_FALSE;
+	const vk::Bool32 depth_write_enable = depth.depth_write_enable ? VK_TRUE : VK_FALSE;
+	if (recorder.Update(shadow.depth_test_enable, depth_test_enable)) {
+		vk_buffer.setDepthTestEnable(depth_test_enable);
+	}
+	if (recorder.Update(shadow.depth_write_enable, depth_write_enable)) {
+		vk_buffer.setDepthWriteEnable(depth_write_enable);
+	}
+	if (recorder.Update(shadow.depth_compare_op, depth.depth_compare_op)) {
+		vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	}
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
-	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
+	const vk::Bool32 depth_bias_flag = depth_bias_enable ? VK_TRUE : VK_FALSE;
+	if (recorder.Update(shadow.depth_bias_enable, depth_bias_flag)) {
+		vk_buffer.setDepthBiasEnable(depth_bias_flag);
+	}
 	if (depth_bias_enable) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
@@ -443,10 +539,17 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		    guest_constant_factor, poly_offset, depth.desc.view_info.format);
 		const float slope_factor =
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
-		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+		const std::array<float, 3> bias {constant_factor, poly_offset.clamp, slope_factor};
+		if (recorder.Update(shadow.depth_bias, bias, shadow.depth_bias_valid)) {
+			vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+			shadow.depth_bias_valid = true;
+		}
 	}
 
-	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
+	const vk::Bool32 stencil_test_enable = depth.stencil_test_enable ? VK_TRUE : VK_FALSE;
+	if (recorder.Update(shadow.stencil_test_enable, stencil_test_enable)) {
+		vk_buffer.setStencilTestEnable(stencil_test_enable);
+	}
 	if (depth.stencil_test_enable) {
 		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
 			vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
@@ -454,20 +557,39 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			vk_buffer.setStencilWriteMask(face, state.writeMask);
 			vk_buffer.setStencilReference(face, state.reference);
 		};
-		set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
-		set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
+		// Each face is recorded as its group of four commands.
+		const bool valid = shadow.stencil_valid;
+		if (recorder.Update(shadow.stencil_front, depth.stencil_front, valid)) {
+			set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
+		}
+		if (recorder.Update(shadow.stencil_back, depth.stencil_back, valid)) {
+			set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
+		}
+		shadow.stencil_valid = true;
 	}
 
 #if defined(__APPLE__)
 	// MoltenVK has no VK_EXT_color_write_enable; the pipeline is created without the
 	// eColorWriteEnableEXT dynamic state and relies on the static colorWriteMask instead.
 #else
-	vk::Bool32 enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> enable {};
 	for (uint32_t slot = 0; slot < rendering.num_color_attachments; slot++) {
 		enable[slot] = rendering.color_attachments[slot].image_view != nullptr;
 	}
 	if (rendering.num_color_attachments != 0) {
-		vk_buffer.setColorWriteEnableEXT(rendering.num_color_attachments, enable);
+		const bool same = recorder.Reuse() && shadow.color_write_valid &&
+		                  shadow.color_write_count == rendering.num_color_attachments &&
+		                  std::memcmp(shadow.color_write.data(), enable.data(),
+		                              sizeof(vk::Bool32) * rendering.num_color_attachments) == 0;
+		if (same) {
+			recorder.Avoided(1);
+		} else {
+			vk_buffer.setColorWriteEnableEXT(rendering.num_color_attachments, enable.data());
+			shadow.color_write       = enable;
+			shadow.color_write_count = rendering.num_color_attachments;
+			shadow.color_write_valid = true;
+			recorder.Emitted(1);
+		}
 	}
 #endif
 }
@@ -1079,7 +1201,11 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                                        DrawRenderState& state) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	state.ps_active = DrawHasActivePixelShader(buffer);
-	RefreshShaders(buffer, draw, state);
+	{
+		KYTY_PROFILER_DETAIL_BLOCK("Draw::RefreshShaders");
+		RefreshShaders(buffer, draw, state);
+	}
+	KYTY_PROFILER_DETAIL_BLOCK("Draw::ResolveTargets");
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
@@ -1228,7 +1354,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	uint32_t   mesh_groups = 0;
-	std::vector<MeshDrawSegment> mesh_segments;
+	// Reused per thread (draws run on the GPU thread under the render mutex).
+	static thread_local std::vector<MeshDrawSegment> mesh_segments;
+	mesh_segments.clear();
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		static std::atomic_bool restart_warned = false;
@@ -1248,8 +1376,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
 		if (primitive_restart_enable && draw.IsIndexed() && MeshRestartEnabled()) {
 			const auto mask = UINT32_MAX >> ((4u - index_source.guest_element_size) * 8u);
-			mesh_segments = SplitMeshRestartIndices(index_source.address, draw.index_count,
-			    index_source.guest_element_size, buffer.GetRegisters().GetPrimitiveResetIndex() & mask, mesh);
+			SplitMeshRestartIndices(index_source.address, draw.index_count,
+			    index_source.guest_element_size, buffer.GetRegisters().GetPrimitiveResetIndex() & mask, mesh,
+			    mesh_segments);
 			if (mesh_segments.empty()) return;
 		} else {
 			mesh_segments.push_back({0, draw.index_count, mesh_groups});
@@ -1304,17 +1433,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
-	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
-		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
-		descriptor_stages[stage_count++] = &bindings.vertex[i];
-	}
-	if (state.ps_active) {
-		if (!bindings.pixel) bindings.pixel.emplace();
-		PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
-		descriptor_stages[stage_count++] = &*bindings.pixel;
+	{
+		KYTY_PROFILER_DETAIL_BLOCK("Draw::PrepareBindings");
+		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
+			descriptor_stages[stage_count++] = &bindings.vertex[i];
+		}
+		if (state.ps_active) {
+			if (!bindings.pixel) bindings.pixel.emplace();
+			PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
+			descriptor_stages[stage_count++] = &*bindings.pixel;
+		}
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	{
+		KYTY_PROFILER_DETAIL_BLOCK("Draw::PrepareGraphicsBindings");
+		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1349,12 +1484,30 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x300u);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	{
+		KYTY_PROFILER_DETAIL_BLOCK("Draw::CommitBindings");
+		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	}
 	if (!mesh_active) CommitIndexBuffer(vk_buffer, index_binding);
 
-	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
-	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
-		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+	{
+		KYTY_PROFILER_DETAIL_BLOCK("Draw::DynamicState");
+		SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info,
+		                         rendering, m_dynamic_state);
+		if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
+			// Declared dynamic by every renderer pipeline; the shadow (valid for this command
+			// buffer and bound pipeline, established just above) covers it too.
+			auto& shadow = m_dynamic_state;
+			if (DynamicStateShadowEnabled() && shadow.feedback_valid &&
+			    shadow.feedback == feedback_aspects) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::DynamicStateCommandsAvoided);
+			} else {
+				vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+				shadow.feedback       = feedback_aspects;
+				shadow.feedback_valid = true;
+				Profiler::CountFrameEvent(Profiler::FrameEvent::DynamicStateCommandsEmitted);
+			}
+		}
 	}
 
 	LogDrawPhase(draw.Name(), "BeginRendering");
@@ -1377,6 +1530,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		m_indirect_barrier_rendering = buffer.ActiveRenderingSerial();
 	}
 	buffer.BindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	// The shadow now describes this command buffer with this pipeline bound. A pipeline without
+	// color attachments declares no dynamic color-write enable, so binding it invalidated that
+	// state for later pipelines.
+	m_dynamic_state.command  = vk_buffer;
+	m_dynamic_state.pipeline = pipeline.pipeline;
+	if (state.color_count == 0) {
+		m_dynamic_state.color_write_valid = false;
+	}
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x500u);
 	}
@@ -1764,7 +1925,10 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 	}
 
 	const DrawCallInfo draw {debug_op, UINT32_MAX, UINT32_MAX, 0};
-	DrawRenderState state {};
+	// The member state is reused (as in DrawIndex/DrawAuto) instead of value-initialising about
+	// 37 KB and allocating fresh preparation vectors; the render mutex makes it exclusive.
+	auto& state = *m_draw_state;
+	state.Reset();
 	if (!PrepareDrawRenderState(buffer, draw, 0, state)) {
 		ResetBindings();
 		return true;
