@@ -1586,8 +1586,10 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	auto&      gpu     = m_renderer.GetGpu();
 	const bool proxy   = m_defer_next_label;
 	const bool all     = LabelCompletionMode();
-	// A later label to an address whose older label is still deferred must not overtake it.
-	const bool ordered = !proxy && !all && gpu.DeferredLabelTick(address, size) != 0;
+	// End-of-pipe writes become visible in order on hardware: while any older deferred write
+	// (label or GDS snapshot) is pending, a later label must not overtake it.
+	(void)address;
+	const bool ordered = !proxy && !all && gpu.HasDeferredLabels();
 	if (!proxy && !all && !ordered) {
 		return false;
 	}
@@ -1627,6 +1629,100 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 			    if (interrupt) {
 				    renderer->TriggerInterrupt(event_id, interrupt_context_id);
 			    }
+		    }
+	    },
+	    interrupt ? CommandScheduler::PriorityOperationKind::EopInterrupt
+	              : CommandScheduler::PriorityOperationKind::Generic);
+	return true;
+}
+
+// KYTY_GDS_EOP_MODE=defer snapshots the GDS range with a copy recorded at the packet's position
+// and writes it to guest memory once that tick has completed (as a deferred label), instead of
+// draining the GPU (SynchronizeGpu) and reading GDS at record time. Default "sync" until the
+// counters show this path is frequent enough to matter (FrameEvent.GdsEopReads).
+static bool GdsEopDeferEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_GDS_EOP_MODE");
+		return value != nullptr && std::strcmp(value, "defer") == 0;
+	}();
+	return enabled;
+}
+
+bool CommandProcessor::TryDeferGdsRead(uint32_t* dst, uint32_t dw_offset, uint32_t dw_size,
+                                       bool interrupt, uint32_t interrupt_context_id) {
+	if (!GdsEopDeferEnabled() || dst == nullptr || dw_size == 0) {
+		return false;
+	}
+	const auto* gds    = m_renderer.GetBufferCache().GetGdsBuffer();
+	const auto  offset = uint64_t {dw_offset} * sizeof(uint32_t);
+	const auto  size   = uint64_t {dw_size} * sizeof(uint32_t);
+	if (offset > gds->Size() || size > gds->Size() - offset) {
+		return false;
+	}
+	auto& download         = m_renderer.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
+	const auto [mapped, staged] = download.Map(size, 16);
+	if (mapped == nullptr) {
+		return false;
+	}
+	download.Commit();
+
+	// Snapshot at this point of the GPU timeline: later work may change GDS before completion.
+	auto& scheduler = GetScheduler();
+	auto& buffer    = CurrentBuffer();
+	buffer.EndRendering();
+	const auto              native = buffer.Handle();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = gds->Handle();
+	before.offset              = offset;
+	before.size                = size;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+	                       nullptr);
+	const vk::BufferCopy copy {offset, staged, size};
+	native.copyBuffer(gds->Handle(), download.Handle(), 1, &copy);
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	after.buffer        = download.Handle();
+	after.offset        = staged;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &after, 0,
+	                       nullptr);
+	// The GDS buffer's own shader accesses after this copy are ordered by their own barriers
+	// (it is written only by recorded GPU work), exactly as for any other transfer read.
+
+	const auto address = reinterpret_cast<uint64_t>(dst);
+	const auto tick    = scheduler.CurrentTick();
+	auto&      gpu     = m_renderer.GetGpu();
+	gpu.AddDeferredLabel(address, static_cast<uint32_t>(size), tick);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GdsEopReadsDeferred);
+	auto*     renderer = &m_renderer;
+	const int event_id = m_interrupt_event_id;
+	scheduler.DeferPriorityOperation(
+	    [renderer, &gpu, &download, mapped, staged, address, size, tick, interrupt, event_id,
+	     interrupt_context_id] {
+		    // The download ring slot stays reserved until this tick's priority operations ran.
+		    download.Invalidate(staged, size);
+		    std::vector<uint8_t> bytes(mapped, mapped + size);
+		    auto write = [renderer, &gpu, bytes = std::move(bytes), address, tick, interrupt,
+		                  event_id, interrupt_context_id](bool on_gpu_thread) {
+			    if (on_gpu_thread) {
+				    std::memcpy(reinterpret_cast<void*>(address), bytes.data(), bytes.size());
+			    } else {
+				    (void)LibKernel::Memory::TryWriteBacking(address, bytes.data(), bytes.size());
+			    }
+			    gpu.RemoveDeferredLabel(address, tick);
+			    if (interrupt) {
+				    renderer->TriggerInterrupt(event_id, interrupt_context_id);
+			    }
+		    };
+		    auto shared = std::make_shared<decltype(write)>(std::move(write));
+		    if (!gpu.TrySendCommand([shared] { (*shared)(true); })) {
+			    (*shared)(false);
 		    }
 	    },
 	    interrupt ? CommandScheduler::PriorityOperationKind::EopInterrupt
@@ -1723,6 +1819,13 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			if constexpr (sizeof(T) == sizeof(uint32_t)) {
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
+					Profiler::CountFrameEvent(Profiler::FrameEvent::GdsEopReads);
+					if (TryDeferGdsRead(dst, value & 0xffffu, value >> 16u, with_interrupt,
+					                    interrupt_context_id)) {
+						Sync::WriteAtEndOfPipeGds32(m_submit_id, command, dst, value & 0xffffu,
+						                            value >> 16u);
+						return;
+					}
 					Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitGds);
 					SynchronizeGpu();
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,

@@ -172,6 +172,10 @@ private:
 	// still pending (write order). Returns false when the label must be written now.
 	[[nodiscard]] bool TryDeferLabel(void* dst, uint64_t value, uint32_t size, bool interrupt,
 	                                 uint32_t interrupt_context_id);
+	// KYTY_GDS_EOP_MODE=defer: snapshot a GDS range at this packet and write it to `dst` at the
+	// tick's completion instead of draining the GPU. Returns false for the synchronous path.
+	[[nodiscard]] bool TryDeferGdsRead(uint32_t* dst, uint32_t dw_offset, uint32_t dw_size,
+	                                   bool interrupt, uint32_t interrupt_context_id);
 	[[nodiscard]] bool  TryDrawIndirectNative(DrawIndirectSource source);
 	void                ValidateIndirectSource(const DrawIndirectSource& source);
 	[[nodiscard]] uint32_t NumInstances();

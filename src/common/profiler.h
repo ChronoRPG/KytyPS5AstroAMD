@@ -301,6 +301,10 @@ enum class FrameEvent : uint32_t {
 	// the GPU thread (=block).
 	FlipWaitSuspends,
 	FlipWaitBlocking,
+	// GDS end-of-pipe reads (RELEASE_MEM data_sel=5 / event source 1), and those snapshotted and
+	// written at completion instead of draining the GPU (KYTY_GDS_EOP_MODE=defer).
+	GdsEopReads,
+	GdsEopReadsDeferred,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
