@@ -10226,12 +10226,20 @@ public:
       Require(name, "certified hash",
               !reads.Failed() && speculative.hash == expected && reads.Finish(),
               "the speculative preparation failed or hashed other bytes");
+      // By its bytes, or by its digest (KYTY_DRAW_PREP_CODE_DIGEST, default on).
       bool covered = false;
-      for (const auto &range : reads.Ranges()) {
-        covered |= range.begin <= code_address && range.end >= code_address + code_bytes;
+      for (const auto ranges : {reads.Ranges(), reads.DigestRanges()}) {
+        for (const auto &range : ranges) {
+          covered |= range.begin <= code_address && range.end >= code_address + code_bytes;
+        }
       }
-      Require(name, "certificate covers the code", covered,
-              "no certified range covers every code byte");
+      const auto *digest_setting = std::getenv("KYTY_DRAW_PREP_CODE_DIGEST");
+      const bool digest = digest_setting == nullptr || std::strcmp(digest_setting, "0") != 0;
+      Require(name, "certificate covers the code",
+              covered && (reads.DigestRanges().empty() != digest) &&
+                  (!digest || reads.ByteCount() < code_bytes),
+              "no certified range covers every code byte, or the code was certified the wrong "
+              "way (bytes recorded with digests on, or no digest)");
       std::vector<uint8_t> scratch;
       Require(name, "unchanged certificate",
               reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==

@@ -310,12 +310,26 @@ static bool DrawPrepCodeCertEnabled() {
 	return enabled;
 }
 
+// KYTY_DRAW_PREP_CODE_DIGEST=0 certifies the code of headerless shaders by its bytes, as before,
+// instead of by the digest the preparation computes from them (readSet.h, digest reads).
+static bool DrawPrepCodeDigestEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DRAW_PREP_CODE_DIGEST");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 // Draw-prep: the hash of shader code without an AGC header hash (every Astro Bot shader), taken
 // over bytes read through the preparation's recorder, so they become part of its certificate
 // (readSet.h). At commit every certified range must be clean for a backing read and hold exactly
 // the recorded bytes; the serial path would then read those same bytes (HashShaderCode takes its
 // clean-backing branch, and a clean range's mapping holds the backing bytes) and compute the same
 // hash. A read that cannot be served fails the preparation (the serial path runs at commit).
+// KYTY_DRAW_PREP_CODE_DIGEST (default on): the code is certified by this hash itself, the only
+// value the preparation derives from those bytes and the key the serial path would look the
+// program up by. The commit re-reads the code (same clean read) and re-hashes it instead of
+// comparing it with a recorded copy, and the recorder keeps no copy of it.
 static uint64_t HashShaderCodeCertified(std::span<const uint32_t> code) {
 	if (!DrawPrepCodeCertEnabled()) {
 		DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
@@ -323,8 +337,17 @@ static uint64_t HashShaderCodeCertified(std::span<const uint32_t> code) {
 	}
 	static thread_local std::vector<uint32_t> scratch;
 	scratch.resize(code.size());
-	if (!LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(code.data()),
-	                                              scratch.data(), code.size_bytes())) {
+	const auto address = reinterpret_cast<uint64_t>(code.data());
+	if (DrawPrepCodeDigestEnabled()) {
+		uint64_t digest = 0;
+		if (!LibKernel::Memory::TryReadGpuCleanBackingDigest(address, scratch.data(),
+		                                                    code.size_bytes(), digest)) {
+			return 0; // the recorder has failed the preparation
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderCodeHashCertified);
+		return digest;
+	}
+	if (!LibKernel::Memory::TryReadGpuCleanBacking(address, scratch.data(), code.size_bytes())) {
 		return 0; // the recorder has failed the preparation
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderCodeHashCertified);

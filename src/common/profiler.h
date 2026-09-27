@@ -668,6 +668,9 @@ enum class FrameEvent : uint32_t {
 	// KYTY_HOT_PAGE_CHECK_LIMIT: hot pages returned to normal tracking (settled clean) after that
 	// many consecutive uploads found them unchanged.
 	HotPageCheckSettles,
+	// Bytes committed draw-prep certificates covered by digest (KYTY_DRAW_PREP_CODE_DIGEST: the
+	// code of headerless shaders; DrawPrepCertBytes counts the byte-compared ranges).
+	DrawPrepCertDigestBytes,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

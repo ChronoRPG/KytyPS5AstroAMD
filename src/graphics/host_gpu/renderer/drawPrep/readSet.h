@@ -10,6 +10,7 @@
 #include <span>
 #include <type_traits>
 #include <vector>
+#include <xxhash.h>
 
 // Draw-prep S4: the read set of one speculative draw preparation, and its certificate check.
 //
@@ -26,6 +27,12 @@
 // first read (same registers), get the same value, and by induction issue the same reads in the
 // same order and compute the same outputs. Guest bytes that changed and changed back in between
 // are indistinguishable from unchanged ones, which is exactly what the serial path would observe.
+//
+// Digest reads (RecordDigest): a read whose bytes the preparation only hashes, with the XXH3-64
+// the serial path uses as the identity of those bytes (headerless shader code: the program key).
+// It is certified by that digest instead of its bytes: Validate() re-reads the range with the same
+// clean read and compares digests. Equal digests make the serial path compute the same identity
+// from the bytes it would read now, and nothing else of the preparation depends on those bytes.
 namespace Libs::Graphics::DrawPrep {
 
 enum class ReadFailure : uint8_t {
@@ -49,6 +56,7 @@ public:
 	// Room for the code of both stages (headerless shaders are hashed through the recorder, see
 	// shader.cpp) besides the metadata and resource reads.
 	static constexpr uint32_t MaxBytes = 256u * 1024u;
+	static constexpr uint32_t MaxDigests = 64;
 	static constexpr uint64_t PageSize = 4096;
 
 	void Reset() noexcept {
@@ -57,8 +65,32 @@ public:
 		m_ranges.clear();
 		m_range_offsets.clear();
 		m_merged.clear();
+		m_digests.clear();
+		m_digest_ranges.clear();
 		m_failure  = ReadFailure::None;
 		m_finished = false;
+	}
+
+	// Records that the `size` bytes read at `address` have the XXH3-64 digest `digest` (see the
+	// header comment). False (and a failure) when over the limits.
+	bool RecordDigest(uint64_t address, uint64_t size, uint64_t digest) {
+		if (m_failure != ReadFailure::None) {
+			return false;
+		}
+		if (size == 0) {
+			return true;
+		}
+		if (m_digests.size() >= MaxDigests || address > UINT64_MAX - size) {
+			Fail(ReadFailure::Overflow);
+			return false;
+		}
+		m_digests.push_back({address, size, digest});
+		m_digest_ranges.push_back({address, address + size});
+		return true;
+	}
+	// The ranges certified by digest (in record order; they may overlap byte ranges).
+	[[nodiscard]] std::span<const Coherence::Range> DigestRanges() const noexcept {
+		return m_digest_ranges;
 	}
 
 	// Records `size` bytes read at `address`. False (and a failure) when over the limits.
@@ -163,6 +195,15 @@ public:
 				return ValidateResult::Changed;
 			}
 		}
+		for (const auto& digest: m_digests) {
+			scratch.resize(digest.size);
+			if (!read(digest.address, scratch.data(), digest.size)) {
+				return ValidateResult::Unclean;
+			}
+			if (XXH3_64bits(scratch.data(), digest.size) != digest.digest) {
+				return ValidateResult::Changed;
+			}
+		}
 		return ValidateResult::Ok;
 	}
 
@@ -171,6 +212,11 @@ public:
 	[[nodiscard]] bool AllClean(IsClean&& is_clean) const {
 		static_assert(std::is_invocable_r_v<bool, IsClean&, uint64_t, uint64_t>);
 		for (const auto& range: m_ranges) {
+			if (!is_clean(range.begin, range.end - range.begin)) {
+				return false;
+			}
+		}
+		for (const auto& range: m_digest_ranges) {
 			if (!is_clean(range.begin, range.end - range.begin)) {
 				return false;
 			}
@@ -184,6 +230,11 @@ private:
 		uint32_t size    = 0;
 		uint32_t offset  = 0;
 	};
+	struct Digest {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint64_t digest  = 0;
+	};
 
 	std::vector<Read>             m_reads;
 	std::vector<uint8_t>          m_bytes;
@@ -191,6 +242,8 @@ private:
 	std::vector<Coherence::Range> m_ranges;
 	std::vector<uint32_t>         m_range_offsets;
 	std::vector<uint8_t>          m_merged;
+	std::vector<Digest>           m_digests;
+	std::vector<Coherence::Range> m_digest_ranges;
 	ReadFailure                   m_failure  = ReadFailure::None;
 	bool                          m_finished = false;
 };

@@ -925,8 +925,10 @@ static bool TryReadGpuCleanBackingExact(uint64_t vaddr, void* data, uint64_t siz
 // publications) so that they rarely compute on stale bytes, and the commit re-validates every
 // range with the exact predicate. The hint does not consult the texture cache: a range owned by
 // a GPU-modified image is caught at commit.
-static bool TryReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, void* data,
-                               uint64_t size) {
+// The gated read of TryReadForDrawPrep, without recording it. False (and a failed read set) when
+// it cannot be served.
+static bool ReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, void* data,
+                            uint64_t size) {
 	using Graphics::DrawPrep::ReadFailure;
 	auto& reads = *recorder.reads;
 	if (reads.Failed()) {
@@ -951,7 +953,13 @@ static bool TryReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t 
 			return false;
 		}
 	}
-	return reads.Record(vaddr, data, size);
+	return true;
+}
+
+static bool TryReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, void* data,
+                               uint64_t size) {
+	return ReadForDrawPrep(recorder, vaddr, data, size) &&
+	       recorder.reads->Record(vaddr, data, size);
 }
 
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -959,6 +967,22 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return TryReadForDrawPrep(*recorder, vaddr, data, size);
 	}
 	return TryReadGpuCleanBackingExact(vaddr, data, size);
+}
+
+bool TryReadGpuCleanBackingDigest(uint64_t vaddr, void* data, uint64_t size, uint64_t& digest) {
+	auto* recorder = Graphics::DrawPrep::ActiveRecorder();
+	if (recorder == nullptr) {
+		if (!TryReadGpuCleanBackingExact(vaddr, data, size)) {
+			return false;
+		}
+		digest = XXH3_64bits(data, size);
+		return true;
+	}
+	if (!ReadForDrawPrep(*recorder, vaddr, data, size)) {
+		return false;
+	}
+	digest = XXH3_64bits(data, size);
+	return recorder->reads->RecordDigest(vaddr, size, digest);
 }
 
 bool IsGpuCleanForRead(uint64_t vaddr, uint64_t size) {

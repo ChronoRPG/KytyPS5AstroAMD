@@ -105,6 +105,30 @@ bool SameMapping(std::span<const Prospero::ColorComponentMapping, 8> a,
 	return true;
 }
 
+// Every range a certificate covers (bytes and digests), sorted and merged, as the coherence log
+// check requires.
+std::span<const Coherence::Range> CertificateRanges(const ReadSet&                  reads,
+                                                    std::vector<Coherence::Range>& scratch) {
+	const auto digests = reads.DigestRanges();
+	if (digests.empty()) {
+		return reads.Ranges();
+	}
+	scratch.assign(reads.Ranges().begin(), reads.Ranges().end());
+	scratch.insert(scratch.end(), digests.begin(), digests.end());
+	std::sort(scratch.begin(), scratch.end(),
+	          [](const Coherence::Range& a, const Coherence::Range& b) { return a.begin < b.begin; });
+	size_t merged = 0;
+	for (const auto& range: scratch) {
+		if (merged != 0 && range.begin <= scratch[merged - 1].end) {
+			scratch[merged - 1].end = std::max(scratch[merged - 1].end, range.end);
+		} else {
+			scratch[merged++] = range;
+		}
+	}
+	scratch.resize(merged);
+	return scratch;
+}
+
 Totals g_totals;
 
 } // namespace
@@ -268,9 +292,11 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 	}
 	Profiler::ScopedFrameWait wait(Profiler::FrameWait::DrawPrepValidate);
 	const auto ranges = prepared.reads.Ranges();
+	static thread_local std::vector<Coherence::Range> log_scratch;
 	if (GetCertMode() == CertMode::Log) {
 		const auto outcome =
-		    Coherence::g_log.Check(prepared.coherence_generation, Coherence::Generation(), ranges);
+		    Coherence::g_log.Check(prepared.coherence_generation, Coherence::Generation(),
+		                           CertificateRanges(prepared.reads, log_scratch));
 		if (outcome.result != Coherence::CheckResult::Clean) {
 			return fail(Failure::CoherenceLog);
 		}
@@ -284,7 +310,8 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 			// Would the log-mode certificate have decided the same? (Unclean ranges fail both.)
 			const bool log_clean = Coherence::g_log
 			                           .Check(prepared.coherence_generation,
-			                                  Coherence::Generation(), ranges)
+			                                  Coherence::Generation(),
+			                                  CertificateRanges(prepared.reads, log_scratch))
 			                           .result == Coherence::CheckResult::Clean;
 			if (log_clean && result == ValidateResult::Changed) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepLogMissed);
@@ -306,6 +333,13 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 		bytes += range.end - range.begin;
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCertBytes, bytes);
+	uint64_t digest_bytes = 0;
+	for (const auto& range: prepared.reads.DigestRanges()) {
+		digest_bytes += range.end - range.begin;
+	}
+	if (digest_bytes != 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCertDigestBytes, digest_bytes);
+	}
 	return true;
 }
 

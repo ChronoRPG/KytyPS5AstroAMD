@@ -571,6 +571,8 @@ add_executable(draw_prep_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DrawPrepTests.cpp"
 )
 target_include_directories(draw_prep_tests PRIVATE ${inc_headers})
+# ReadSet digest certificates hash with XXH3.
+target_link_libraries(draw_prep_tests xxhash)
 if(LINUX)
 	target_link_libraries(draw_prep_tests Threads::Threads)
 endif()
@@ -701,6 +703,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	add_test(NAME draw_prep_code_cert
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-code-cert-only)
+	add_test(NAME draw_prep_code_cert_bytes
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-code-cert-only)
+	set_tests_properties(draw_prep_code_cert_bytes PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP_CODE_DIGEST=0")
 	# KYTY_BUFFER_RANGE_MEMO and KYTY_HOT_PAGE_CHECK_LIMIT: default, verify mode, both off.
 	add_test(NAME buffer_range_memo
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)

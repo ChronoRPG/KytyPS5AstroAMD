@@ -398,6 +398,59 @@ void TestReadSetLimits() {
 	      "an empty set validates without reading");
 }
 
+// Digest reads (KYTY_DRAW_PREP_CODE_DIGEST): certified by XXH3-64 instead of bytes, alongside byte
+// reads of the same memory.
+void TestReadSetDigests() {
+	FakeMemory memory;
+	for (size_t i = 0; i < memory.bytes.size(); i++) {
+		memory.bytes[i] = static_cast<uint8_t>(i * 11u + 5u);
+	}
+	const auto digest_of = [&](uint64_t address, uint64_t size) {
+		return XXH3_64bits(memory.bytes.data() + (address - memory.base), size);
+	};
+	DrawPrep::ReadSet set;
+	RecordFrom(set, memory, 0x10000, 8); // a header probe inside the digested code
+	Check(set.RecordDigest(0x10000, 0x900, digest_of(0x10000, 0x900)), "record a digest");
+	Check(set.RecordDigest(0x10000, 0, 0), "an empty digest read is ignored");
+	Check(set.Finish(), "byte and digest reads finish");
+	Check(set.Ranges().size() == 1 && set.DigestRanges().size() == 1 &&
+	          set.DigestRanges()[0] == Coherence::Range {0x10000, 0x10900} &&
+	          set.ByteCount() == 8,
+	      "a digest read keeps its range and no bytes");
+
+	std::vector<uint8_t> scratch;
+	const auto read = [&](uint64_t address, void* data, uint64_t size) {
+		return memory.Read(address, data, size);
+	};
+	Check(set.Validate(read, scratch) == DrawPrep::ValidateResult::Ok,
+	      "unchanged digested memory validates");
+	memory.bytes[0x800] ^= 0x40u; // inside the digest only
+	Check(set.Validate(read, scratch) == DrawPrep::ValidateResult::Changed,
+	      "a change inside a digest range fails validation");
+	memory.bytes[0x800] ^= 0x40u;
+	Check(set.Validate(read, scratch) == DrawPrep::ValidateResult::Ok,
+	      "restored digested memory validates");
+	memory.dirty_begin = 0x10880;
+	memory.dirty_end   = 0x10881;
+	Check(set.Validate(read, scratch) == DrawPrep::ValidateResult::Unclean,
+	      "an unclean byte in a digest range fails validation");
+	Check(!set.AllClean([&](uint64_t address, uint64_t size) {
+		      std::vector<uint8_t> tmp(size);
+		      return memory.Read(address, tmp.data(), size);
+	      }),
+	      "AllClean covers digest ranges");
+	memory.dirty_begin = memory.dirty_end = 0;
+
+	set.Reset();
+	Check(set.DigestRanges().empty(), "reset clears digests");
+	for (uint32_t i = 0; i < DrawPrep::ReadSet::MaxDigests; i++) {
+		Check(set.RecordDigest(0x10000 + uint64_t {i} * 16u, 16, 0), "digest count within limit");
+	}
+	Check(!set.RecordDigest(0x11000, 16, 0) &&
+	          set.Failure() == DrawPrep::ReadFailure::Overflow,
+	      "one digest over the limit is refused");
+}
+
 void TestRecordScopeNests() {
 	DrawPrep::ReadSet  outer_set;
 	DrawPrep::ReadSet  inner_set;
@@ -718,6 +771,7 @@ int main() {
 	TestReadSetPageBoundary();
 	TestReadSetInconsistent();
 	TestReadSetLimits();
+	TestReadSetDigests();
 	TestRecordScopeNests();
 	TestPacketClassification();
 	TestFenceKinds();

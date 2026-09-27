@@ -110,6 +110,10 @@ void                   SetFlexibleMemorySize(uint64_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// TryReadGpuCleanBacking that also returns the XXH3-64 digest of the bytes read. Inside a
+// draw-prep preparation the read is certified by that digest instead of its bytes
+// (DrawPrep::ReadSet::RecordDigest): only for bytes the preparation merely hashes.
+bool TryReadGpuCleanBackingDigest(uint64_t vaddr, void* data, uint64_t size, uint64_t& digest);
 // The clean verdict of TryReadGpuCleanBacking without reading bytes (GPU thread; true for
 // ranges outside GPU memory).
 [[nodiscard]] bool     IsGpuCleanForRead(uint64_t vaddr, uint64_t size);
