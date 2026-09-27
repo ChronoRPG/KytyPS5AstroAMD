@@ -1922,6 +1922,37 @@ public:
     EnsureRuntimeContext();
     return Renderer();
   }
+  // A private RenderContext for one check. It is several MiB (the RenderExecutor keeps its
+  // 4096-entry texture-description memo inline), so it must not live on the 1 MiB main-thread
+  // stack.
+  [[nodiscard]] std::unique_ptr<RenderContext> MakeRenderContext() {
+    EnsureRuntimeContext();
+    return std::make_unique<RenderContext>(m_runtime_context);
+  }
+  // Runs `work` on the context's guest GPU thread (RenderContext::InitializeGpu) and returns
+  // its result. Garbage collection and image downloads begin backing publications, which the
+  // product issues only from that thread (BufferCache::BeginBackingPublication asserts it):
+  // RenderContext::RunGarbageCollector runs from GuestGpu::Process. The calling thread
+  // blocks, so the check's other direct scheduler use never overlaps the work.
+  template <typename Work>
+  static auto OnGpuThread(RenderContext &context, Work &&work) {
+    using Result = std::invoke_result_t<Work &>;
+    if constexpr (std::is_void_v<Result>) {
+      context.GetGpu().SendCommandSync([&work] { work(); });
+    } else {
+      std::optional<Result> result;
+      context.GetGpu().SendCommandSync(
+          [&work, &result] { result.emplace(work()); });
+      return std::move(*result);
+    }
+  }
+  // TextureCache::DownloadImageMemory as the product calls it (GC, pressure collection and
+  // ProcessDownloadImages, all on the GPU thread).
+  static bool DownloadOnGpuThread(RenderContext &context, ImageId id) {
+    return OnGpuThread(context, [&] {
+      return TextureCacheTestAccess::TryDownload(context.GetTextureCache(), id);
+    });
+  }
 
   void CheckHostImageAllocation() {
     constexpr const char *name = "HostImageAllocation";
@@ -2024,7 +2055,8 @@ public:
               "vkCreatePipelineLayout");
 
     {
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -2057,7 +2089,8 @@ public:
   void CheckGraphicsPushConstantBank() {
     constexpr const char *name = "GraphicsPushConstantStages";
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -2292,7 +2325,8 @@ public:
 
   void CheckGpuMappedRangeLifecycle() {
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -2345,7 +2379,8 @@ public:
 
   void CheckStreamBufferRing() {
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -2486,6 +2521,34 @@ public:
     context.InitializeGpu(nullptr);
     auto &gpu = context.GetGpu();
 
+    // GuestGpu::Done (sceAgcSuspendPoint) is bounded by default (KYTY_AGC_DONE_MODE): it
+    // waits only for the submissions admitted before the previous Done, so two guest frames
+    // stay in flight. A second Done therefore drains everything admitted before the first;
+    // that is this check's barrier for "the submitted PM4 work has executed". With
+    // KYTY_AGC_DONE_MODE=idle each Done drains by itself.
+    const auto drain_submissions = [&gpu] {
+      gpu.Done();
+      gpu.Done();
+    };
+    // RELEASE_MEM interrupts and data_sel 1 labels request a command-buffer flush, but only
+    // every KYTY_EOP_FLUSH_BATCH-th request submits (default 8, a33abe76); BufferFlush
+    // (slice ends) resets the count. Mirror that rule for the processor below, which only
+    // this check drives: the result is the tick advance one flush request causes.
+    const uint32_t eop_flush_batch = [] {
+      const char *value = std::getenv("KYTY_EOP_FLUSH_BATCH");
+      const auto parsed =
+          value != nullptr ? std::strtoul(value, nullptr, 10) : 8ul;
+      return static_cast<uint32_t>(std::clamp(parsed, 1ul, 1024ul));
+    }();
+    uint32_t pending_eop_flushes = 0;
+    const auto eop_flush_request = [&]() -> uint64_t {
+      if (++pending_eop_flushes < eop_flush_batch) {
+        return 0;
+      }
+      pending_eop_flushes = 0;
+      return 1;
+    };
+
     const auto caller_thread = std::this_thread::get_id();
     std::thread::id gpu_thread;
     std::thread::id nested_thread;
@@ -2594,17 +2657,20 @@ public:
                     "submitted extra GPU work");
           }
 
+          // An interrupt-only GDS release raises the interrupt without reading GDS, so it
+          // never waits: it only requests a (batched) flush.
           auto gds_interrupt_only =
               make_release_mem(5, 1, &interrupt_only_gds_label, 1ull << 16u);
           Pm4Execution gds_interrupt_execution;
           const auto interrupt_tick = gpu_scheduler.CurrentTick();
           const auto interrupt_result =
               processor->Process(gds_interrupt_execution, gds_interrupt_only);
+          const auto interrupt_advance = eop_flush_request();
           parser_kept_nonblocking_boundaries =
               cache_and_counter_did_not_submit &&
               cb_db_release_did_not_submit &&
               interrupt_result == Pm4ProcessResult::Complete &&
-              gpu_scheduler.CurrentTick() == interrupt_tick + 1 &&
+              gpu_scheduler.CurrentTick() == interrupt_tick + interrupt_advance &&
               interrupt_only_gds_label == UINT64_MAX;
         });
         parser_complete.release();
@@ -2643,13 +2709,16 @@ public:
                     release_label <= Sync::ReadReferenceClock(),
                 "clock write with writeback and interrupt lost its data");
 
+        // A data_sel 1 label and an interrupt-only release each request a batched flush;
+        // a GDS read waits for the GPU exactly once, with or without an interrupt.
         auto immediate = make_release_mem(1, 0, &release_label, 0x11223344u);
         Pm4Execution immediate_execution;
         const auto immediate_tick = gpu_scheduler.CurrentTick();
         const auto immediate_result =
             processor->Process(immediate_execution, immediate);
-        const bool immediate_split_once =
-            gpu_scheduler.CurrentTick() == immediate_tick + 1;
+        const auto immediate_advance = eop_flush_request();
+        const bool immediate_split_as_batched =
+            gpu_scheduler.CurrentTick() == immediate_tick + immediate_advance;
 
         auto gds = make_release_mem(5, 0, &gds_label, 1ull << 16u);
         Pm4Execution gds_execution;
@@ -2663,8 +2732,9 @@ public:
         const auto interrupt_tick = gpu_scheduler.CurrentTick();
         const auto interrupt_result =
             processor->Process(interrupt_execution, interrupt_only);
-        const bool interrupt_split_once =
-            gpu_scheduler.CurrentTick() == interrupt_tick + 1;
+        const auto interrupt_advance = eop_flush_request();
+        const bool interrupt_split_as_batched =
+            gpu_scheduler.CurrentTick() == interrupt_tick + interrupt_advance;
 
         auto gds_interrupt = make_release_mem(5, 2, &gds_label, 1ull << 16u);
         Pm4Execution gds_interrupt_execution;
@@ -2674,13 +2744,29 @@ public:
         const bool gds_interrupt_waited_once =
             gpu_scheduler.CurrentTick() == gds_interrupt_tick + 1;
 
+        // Up to the batch boundary interrupt requests leave the recording open; the
+        // boundary request submits it exactly once.
+        bool batch_boundary_submits = true;
+        for (uint64_t advance = 0; advance == 0;) {
+          auto boundary = make_release_mem(0, 4, nullptr, 0);
+          Pm4Execution boundary_execution;
+          const auto boundary_tick = gpu_scheduler.CurrentTick();
+          const auto boundary_result =
+              processor->Process(boundary_execution, boundary);
+          advance = eop_flush_request();
+          batch_boundary_submits &=
+              boundary_result == Pm4ProcessResult::Complete &&
+              gpu_scheduler.CurrentTick() == boundary_tick + advance;
+        }
+
         release_mem_submission_counts =
             immediate_result == Pm4ProcessResult::Complete &&
-            immediate_split_once && gds_result == Pm4ProcessResult::Complete &&
-            gds_waited_once && interrupt_result == Pm4ProcessResult::Complete &&
-            interrupt_split_once &&
+            immediate_split_as_batched &&
+            gds_result == Pm4ProcessResult::Complete && gds_waited_once &&
+            interrupt_result == Pm4ProcessResult::Complete &&
+            interrupt_split_as_batched &&
             gds_interrupt_result == Pm4ProcessResult::Complete &&
-            gds_interrupt_waited_once;
+            gds_interrupt_waited_once && batch_boundary_submits;
       });
       gpu.SendCommandSync([&] {
         gpu_scheduler.Finish();
@@ -2690,8 +2776,8 @@ public:
               release_mem_submission_counts &&
                   static_cast<uint32_t>(release_label) == 0x11223344u &&
                   static_cast<uint32_t>(gds_label) == 0,
-              "RELEASE_MEM lost its required split/readback or retained a "
-              "redundant GPU wait");
+              "RELEASE_MEM lost its batched flush or GDS readback wait, or "
+              "retained a redundant GPU wait");
     }
 
     alignas(uint32_t) uint32_t packet_marker_a = 0;
@@ -2719,7 +2805,7 @@ public:
     graphics_gate_entered.acquire();
     live_graphics_commands[4] = 22;
     graphics_gate_release.release();
-    gpu.Done();
+    drain_submissions();
     Require("GpuCommandLane", "borrowed graphics commands",
             live_graphics_value == 22,
             "graphics submission executed a copied PM4 stream");
@@ -2737,7 +2823,7 @@ public:
     compute_gate_entered.acquire();
     live_compute_commands[4] = 44;
     compute_gate_release.release();
-    gpu.Done();
+    drain_submissions();
     Require("GpuCommandLane", "borrowed compute commands",
             live_compute_value == 44,
             "compute submission executed a copied PM4 stream");
@@ -2793,7 +2879,7 @@ public:
     write_packet(no_interrupt_graphics_commands.data(),
                  &no_interrupt_graphics_value, 55);
     gpu.Submit(no_interrupt_graphics_commands, {});
-    gpu.Done();
+    drain_submissions();
     finish_gpu();
 
     LibKernel::EventQueue::KernelEvent interrupt_event{};
@@ -2817,7 +2903,7 @@ public:
     interrupt_gate_entered.acquire();
     live_interrupt_commands[2] = 0;
     interrupt_gate_release.release();
-    gpu.Done();
+    drain_submissions();
     finish_gpu();
 
     interrupt_count = 0;
@@ -2833,9 +2919,15 @@ public:
     auto graphics_interrupt_commands = make_interrupt_packet(
         1, 1, &graphics_interrupt_label, 0x11223344u, 0);
     gpu.Submit(graphics_interrupt_commands, {});
-    gpu.Done();
+    drain_submissions();
     finish_gpu();
 
+    // INT_SEL=1 (kOnly) selects the interrupt; it does not gate DATA_SEL on RDNA, so the
+    // graphics queue writes the label as compute queues do (8235d858,
+    // KYTY_EOP_DROPPED_LABELS=count restores the old interrupt-only behavior).
+    const char *dropped_labels = std::getenv("KYTY_EOP_DROPPED_LABELS");
+    const bool kOnly_writes_label =
+        dropped_labels == nullptr || std::strcmp(dropped_labels, "count") != 0;
     interrupt_count = 0;
     const auto graphics_interrupt_wait =
         wait_for_interrupt(interrupt_event, interrupt_count);
@@ -2843,8 +2935,9 @@ public:
             graphics_interrupt_wait == 0 && interrupt_count == 1 &&
                 interrupt_event.ident == 0 && interrupt_event.data == 0 &&
                 interrupt_event.udata == &graphics_interrupt_udata &&
-                graphics_interrupt_label == 0xa5a5a5a5u,
-            "graphics kOnly interrupt was misrouted or wrote its label");
+                graphics_interrupt_label ==
+                    (kOnly_writes_label ? 0x11223344u : 0xa5a5a5a5u),
+            "graphics kOnly interrupt was misrouted or mishandled its label data");
 
     uint32_t compute_interrupt_label = 0x5a5a5a5au;
     auto compute_interrupt_commands = make_interrupt_packet(
@@ -2859,7 +2952,7 @@ public:
     compute_interrupt_gate_entered.acquire();
     compute_interrupt_commands[2] |= 1u << 24u;
     compute_interrupt_gate_release.release();
-    gpu.Done();
+    drain_submissions();
     finish_gpu();
 
     interrupt_count = 0;
@@ -2875,7 +2968,7 @@ public:
     auto compute_clock_commands = make_interrupt_packet(
         3, 1, &compute_clock_label, 0, 0x567u);
     gpu.SubmitCompute(0x20, compute_clock_commands);
-    gpu.Done();
+    drain_submissions();
     finish_gpu();
 
     interrupt_count = 0;
@@ -2893,7 +2986,7 @@ public:
         2, 2, &compute_done_label, compute_done_value, 0x678u);
     compute_done_commands[1] = 0x62fu; // CS_DONE, shader-done index, no GCR action.
     gpu.SubmitCompute(0x20, compute_done_commands);
-    gpu.Done();
+    drain_submissions();
     finish_gpu();
 
     interrupt_count = 0;
@@ -2968,7 +3061,7 @@ public:
       });
       std::this_thread::yield();
     }
-    gpu.Done();
+    drain_submissions();
     Require("GpuCommandLane", "packet-boundary command polling",
             packet_marker_a_at_callback == 11 &&
                 packet_marker_b_at_callback == 0 && packet_marker_a == 11 &&
@@ -3006,7 +3099,7 @@ public:
     uint32_t ordered_suffix = 0;
     std::jthread ordered([&] {
       ordered_started.release();
-      gpu.Done();
+      drain_submissions();
       ordered_suffix = suffix;
       ordered_finished = true;
     });
@@ -3043,7 +3136,7 @@ public:
       unmap_complete.acquire();
     }
     unmap_thread.join();
-    gpu.Done();
+    drain_submissions();
     Require("GpuCommandLane", "unmap queue progress",
             unmap_returned &&
                 !resources.IsMapped(empty_unmap_base, empty_unmap_size) &&
@@ -3170,7 +3263,7 @@ public:
             dma_cursor == dma_commands.size(),
             "DMA_DATA packet stream has the wrong size");
     gpu.Submit(dma_commands, {});
-    gpu.Done();
+    drain_submissions();
     constexpr uint32_t clean_fill_value = 0xdecafbad;
     gpu.SendCommandSync([&] {
       auto &buffer_cache = resources.GetBufferCache();
@@ -3690,7 +3783,8 @@ public:
     constexpr uint32_t ring_fault_second_value = 0x4e5f6071u;
 
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -3725,6 +3819,10 @@ public:
         auto allocation = cache.ObtainBuffer(address, size, true, false);
         Require(name, "dirty allocation", allocation.first != nullptr,
                 "dirty-GC buffer allocation failed");
+      };
+      // One product GC pass: RenderContext::RunGarbageCollector runs on the GPU thread.
+      const auto collect_garbage = [&] {
+        OnGpuThread(context, [&] { cache.RunGarbageCollector(); });
       };
       const auto ReadNativeValue =
           [&](const Libs::Graphics::Buffer &buffer, uint64_t offset) {
@@ -4064,7 +4162,7 @@ public:
                        false);
 
       for (uint32_t tick = 0; tick < 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       Require(name, "age before pressure",
               cache.IsRegionRegistered(base, allocation_size),
@@ -4072,7 +4170,7 @@ public:
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
       const auto gc_submission_tick = scheduler.CurrentTick();
-      cache.RunGarbageCollector();
+      collect_garbage();
       uint32_t first_before_completion = 0;
       uint32_t second_before_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + first_offset,
@@ -4116,7 +4214,7 @@ public:
         }
         release_older_publication.release();
       });
-      cache.RunGarbageCollector();
+      collect_garbage();
       gc_returned = true;
       release_publication.join();
       scheduler.WaitPriorityOperations(older_publication_tick);
@@ -4158,7 +4256,7 @@ public:
                          false);
       }
       for (uint32_t tick = 0; tick < 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       constexpr uint64_t starvation_clean_offset =
           starvation_offset + starvation_count * starvation_stride;
@@ -4168,11 +4266,11 @@ public:
               static_cast<bool>(starvation_clean),
               "failed to create the clean starvation candidate");
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
-      cache.RunGarbageCollector();
+      collect_garbage();
       Require(
           name, "normal-GC dirty bypass",
           cache.IsRegionRegistered(base + starvation_offset,
@@ -4187,7 +4285,7 @@ public:
       BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
       const auto starvation_retired =
           BufferCacheTestAccess::PageOwner(cache, base + starvation_offset);
-      cache.RunGarbageCollector();
+      collect_garbage();
       Require(name, "critical-GC starvation cleanup",
               !cache.IsRegionRegistered(base + starvation_offset,
                                         sizeof(starvation_value)) &&
@@ -4211,7 +4309,7 @@ public:
       const auto obtained =
           cache.FindBuffer(base + obtained_offset, residency_size);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       Require(name, "lookup-only owner identity",
               cache.FindBuffer(base + lookup_only_offset, residency_size) ==
@@ -4221,7 +4319,7 @@ public:
           base + obtained_offset, residency_size, false, false, obtained);
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
-      cache.RunGarbageCollector();
+      collect_garbage();
       Require(name, "lookup versus acquisition residency",
               !cache.IsRegionRegistered(base + lookup_only_offset,
                                         residency_size) &&
@@ -4320,7 +4418,7 @@ public:
       cache.FillBuffer(base + large_offset, large_size, large_value, false);
       const auto large_submission_tick = scheduler.CurrentTick();
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       // Earlier dirty owners in this GC pass may require one ring-wrap drain
       // before the full-capacity download can reserve the stream.
@@ -4380,7 +4478,7 @@ public:
       cache.FillBuffer(base + grouped_second_offset, grouped_owner_size,
                        grouped_second_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       Require(name, "per-owner fixed-ring retirement",
               !cache.IsRegionRegistered(base + grouped_first_offset,
@@ -4482,7 +4580,7 @@ public:
               "sparse GC fixtures merged into one source owner");
       const auto sparse_gc_tick = scheduler.CurrentTick();
       for (uint32_t tick = 0; tick <= 160; ++tick) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       Require(name, "sparse multi-owner GC submission",
               scheduler.CurrentTick() == sparse_gc_tick + 1 &&
@@ -4510,7 +4608,7 @@ public:
       cache.FillBuffer(base + disjoint_dirty_offset, sizeof(disjoint_value),
                        disjoint_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       Require(name, "disjoint synchronized retirement",
               !cache.IsRegionRegistered(base + disjoint_owner_offset,
@@ -4572,7 +4670,7 @@ public:
       cache.FillBuffer(base + reacquire_dirty_offset, sizeof(reacquire_value),
                        reacquire_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       Require(name, "reacquire synchronized retirement",
               !cache.IsRegionRegistered(base + reacquire_owner_offset,
@@ -4624,7 +4722,8 @@ public:
     constexpr uint64_t read_write_meta = 0x0000000204202000ull;
     constexpr uint64_t write_only_meta = 0x0000000204202100ull;
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -4730,7 +4829,8 @@ public:
     constexpr uint64_t base = 0x0000000260000000ull;
     constexpr uint64_t page = 0x100000;
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &cache = context.GetTextureCache();
 
     // Ownership-only records exercise large guest ranges without requiring large
@@ -4828,7 +4928,8 @@ public:
   void CheckImagePressureRetirement() {
     constexpr const char *name = "ImagePressureRetirement";
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &cache = context.GetTextureCache();
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
@@ -4900,15 +5001,23 @@ public:
                 mapped == reinterpret_cast<void *>(base),
             "pressure test fixed mapping failed");
 
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &cache = context.GetTextureCache();
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
     context.MapMemory(base, allocation_size);
     TextureCacheTestAccess::ConfigurePressureCollection(cache, budget);
+    // Pressure collection downloads dirty images; it runs on the GPU thread in the product.
+    const auto collect = [&](uint64_t usage, uint64_t tick) {
+      OnGpuThread(context, [&] {
+        TextureCacheTestAccess::RunPressureCollection(cache, usage, tick);
+      });
+    };
     std::array<ImageId, 2> images{};
     for (size_t index = 0; index < images.size(); ++index) {
       const auto address = base + index * 0x10000;
@@ -4936,19 +5045,19 @@ public:
       LibKernel::Memory::WriteBacking(address, &stale[index], sizeof(uint32_t));
     }
     const auto batch_tick = scheduler.CurrentTick();
-    TextureCacheTestAccess::RunPressureCollection(cache, budget * 79 / 100, 100);
+    collect(budget * 79 / 100, 100);
     Require(name, "retain below pressure watermark",
             std::ranges::all_of(images, [&](ImageId id) {
               return TextureCacheTestAccess::Contains(cache, id);
             }) && scheduler.CurrentTick() == batch_tick,
             "B evicted or submitted while memory had headroom");
-    TextureCacheTestAccess::RunPressureCollection(cache, budget * 85 / 100, 101);
+    collect(budget * 85 / 100, 101);
     Require(name, "normal pressure preserves in-flight dirty images",
             std::ranges::all_of(images, [&](ImageId id) {
               return TextureCacheTestAccess::Contains(cache, id);
             }) && scheduler.CurrentTick() == batch_tick,
             "B forced dirty-image readback below critical pressure");
-    TextureCacheTestAccess::RunPressureCollection(cache, budget, 102);
+    collect(budget, 102);
     std::array<uint32_t, 2> before{};
     for (size_t index = 0; index < images.size(); ++index) {
       LibKernel::Memory::TryReadBacking(base + index * 0x10000, &before[index], sizeof(uint32_t));
@@ -4985,7 +5094,8 @@ public:
     constexpr uint64_t allocation_size = 0x2800000;
     constexpr uint64_t allocation_alignment = 0x200000;
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -5053,10 +5163,19 @@ public:
       compatible_desc.info.guest_format = Prospero::BufferFormat::k8_8_8_8UInt;
       compatible_desc.view_info.format = compatible_desc.info.pixel_format;
       const auto compatible = texture_cache.FindImage(compatible_desc);
+      // A first-page hit resolves without a region query. Every FindImage then runs
+      // SyncAliasFromOwner, which scans the region once for a stale-alias owner while
+      // aliases age by frames (5acad01d; KYTY_IMAGE_ALIAS_AGE=ticks disables it), so the
+      // two hits cost exactly that many scans and no lookup scans.
+      const char *alias_age = std::getenv("KYTY_IMAGE_ALIAS_AGE");
+      const bool aliases_age_by_frames =
+          alias_age == nullptr || std::strcmp(alias_age, "ticks") != 0;
+      const uint32_t alias_sync_scans = aliases_age_by_frames ? 1u : 0u;
       Require(name, "normalized FindImage",
               first && repeated == first && compatible == first &&
                   (!TextureCacheTestAccess::UsesFirstPageLookup(texture_cache) ||
-                   TextureCacheTestAccess::QueryEpoch(texture_cache) == exact_query_epoch) &&
+                   TextureCacheTestAccess::QueryEpoch(texture_cache) ==
+                       exact_query_epoch + 2u * alias_sync_scans) &&
                   TextureCacheTestAccess::LookupVerificationHealthy(texture_cache) &&
                   texture_cache.GetImage(first).info.pixel_format ==
                       vk::Format::eR8G8B8A8Srgb,
@@ -5736,10 +5855,16 @@ public:
       raw_d16_uint.view_info.aspect = vk::ImageAspectFlagBits::eColor;
       raw_d16_uint.view_info.usage = vk::ImageUsageFlagBits::eSampled;
       const auto raw_d16_uint_image = texture_cache.FindImage(raw_d16_uint);
+      // While aliases age by frames (5acad01d) a depth/color switch keeps the previous
+      // interpretation registered as a superseded, non-owner alias for the next switch
+      // back; KYTY_IMAGE_ALIAS_AGE=ticks frees it as before.
       Require(
           name, "raw D16 uint texture backing",
           raw_d16_uint_image && raw_d16_uint_image != raw_d16_image &&
-              !TextureCacheTestAccess::Contains(texture_cache, raw_d16_image) &&
+              TextureCacheTestAccess::Contains(texture_cache, raw_d16_image) ==
+                  aliases_age_by_frames &&
+              (!aliases_age_by_frames ||
+               !texture_cache.GetImage(raw_d16_image).IsGpuModified()) &&
               texture_cache.GetImage(raw_d16_uint_image).backing.format ==
                   vk::Format::eR16Uint,
           "D16 uint sampling did not recreate a true integer color backing");
@@ -5798,8 +5923,13 @@ public:
           texture_cache.GetImage(layered_raw_d16_depth_image);
       Require(name, "layered raw D16 owner layout",
               layered_raw_d16_depth_image != layered_d16_color_image &&
-                  !TextureCacheTestAccess::Contains(texture_cache,
-                                                    layered_d16_color_image) &&
+                  TextureCacheTestAccess::Contains(texture_cache,
+                                                   layered_d16_color_image) ==
+                      aliases_age_by_frames &&
+                  (!aliases_age_by_frames ||
+                   !texture_cache.GetImage(layered_d16_color_image)
+                        .IsGpuModified()) &&
+                  layered_depth_owner.IsGpuModified() &&
                   layered_depth_owner.info.resources.layers == 6 &&
                   layered_depth_owner.info.data.size ==
                       sizeof(layered_raw_d16_values) &&
@@ -5849,15 +5979,29 @@ public:
                   sizeof(layered_raw_d16_after));
       std::array<uint16_t, 12> layered_raw_d16_expected{};
       layered_raw_d16_expected.fill(UINT16_MAX);
+      // With kept aliases the original R16 UNORM color image is still registered. The
+      // (non-exact) UINT lookup reuses it as a format-compatible backing (MUTABLE_FORMAT,
+      // sampled through an R16 UINT view): SyncAliasFromOwner copies the depth owner's
+      // contents into it and it becomes the owner. Without kept aliases the depth switch
+      // freed that image and the lookup builds a new R16 UINT backing.
+      const auto reacquired_backing_format =
+          reacquired_layered_raw_d16_native.backing.format;
       Require(
           name, "layered raw D16 round trip",
           reacquired_layered_raw_d16_uint_image &&
               reacquired_layered_raw_d16_uint_image !=
                   layered_raw_d16_depth_image &&
-              !TextureCacheTestAccess::Contains(texture_cache,
-                                                layered_raw_d16_depth_image) &&
-              reacquired_layered_raw_d16_native.backing.format ==
-                  vk::Format::eR16Uint &&
+              TextureCacheTestAccess::Contains(texture_cache,
+                                               layered_raw_d16_depth_image) ==
+                  aliases_age_by_frames &&
+              (aliases_age_by_frames
+                   ? reacquired_layered_raw_d16_uint_image ==
+                             layered_d16_color_image &&
+                         reacquired_backing_format == vk::Format::eR16Unorm &&
+                         reacquired_layered_raw_d16_native.IsGpuModified() &&
+                         !texture_cache.GetImage(layered_raw_d16_depth_image)
+                              .IsGpuModified()
+                   : reacquired_backing_format == vk::Format::eR16Uint) &&
               reacquired_layered_raw_d16_uint_view != nullptr &&
               layered_raw_d16_after == layered_raw_d16_expected,
           "the partial depth view lost a layer or failed to restore raw UINT "
@@ -6001,7 +6145,7 @@ public:
       const auto ms_data_size = oversized_ms.info.data.size;
       oversized_ms.info.data.size = (32ull << 20) + 4;
       const bool oversized_ms_readback =
-          !TextureCacheTestAccess::TryDownload(texture_cache, ms_depth_image);
+          !DownloadOnGpuThread(context, ms_depth_image);
       oversized_ms.info.data.size = ms_data_size;
       Require(name, "oversized multisample download rejection",
               oversized_ms_readback && oversized_ms.IsGpuModified() &&
@@ -6056,8 +6200,7 @@ public:
           "stencil address did not create a lightweight depth association");
       Require(
           name, "stencil association download rejection",
-          !TextureCacheTestAccess::TryDownload(texture_cache,
-                                               first_stencil_association),
+          !DownloadOnGpuThread(context, first_stencil_association),
           "a lightweight stencil association entered image download planning");
 
       auto exact_ms_depth_alias = ms_depth_desc;
@@ -6244,16 +6387,23 @@ public:
       const auto exact_float_image =
           texture_cache.FindImage(exact_float_desc, true);
       (void)texture_cache.FindTexture(exact_float_image, exact_float_desc);
+      // Both interpretations stay registered and neither takes Buffer ownership. With kept
+      // aliases the new FLOAT alias copies the GPU owner's contents (SyncAliasFromOwner) and
+      // becomes the single owner, superseding the UINT record; without them the UINT image
+      // stays the owner and the FLOAT image is sourced from the synchronized Buffer.
       Require(
           name, "Buffer-superseded exact coexistence",
           exact_float_image != exact_buffer_image &&
               TextureCacheTestAccess::Contains(texture_cache,
                                                exact_buffer_image) &&
-              texture_cache.GetImage(exact_buffer_image).IsGpuModified() &&
+              texture_cache.GetImage(exact_buffer_image).IsGpuModified() ==
+                  !aliases_age_by_frames &&
+              texture_cache.GetImage(exact_float_image).IsGpuModified() ==
+                  aliases_age_by_frames &&
               !texture_cache.GetImage(exact_float_image).IsBufferModified() &&
-              !texture_cache.GetImage(exact_float_image).IsGpuModified(),
-          "exact-format lookup retired its old record or transferred Buffer "
-          "ownership");
+              !texture_cache.GetImage(exact_buffer_image).IsBufferModified(),
+          "exact-format lookup retired its old record, lost its single GPU "
+          "owner, or transferred Buffer ownership");
       auto exact_buffer_readback = CreateHostBuffer(
           name, sizeof(exact_buffer_value),
           vk::BufferUsageFlagBits::eTransferDst, std::vector<u32>{0});
@@ -7021,8 +7171,7 @@ public:
                   texture_cache.GetImage(compressed_image).IsGpuModified(),
               "compressed image incorrectly claimed a CPU read fault");
       Require(name, "compressed download rejection",
-              !TextureCacheTestAccess::TryDownload(texture_cache,
-                                                   compressed_image) &&
+              !DownloadOnGpuThread(context, compressed_image) &&
                   texture_cache.GetImage(compressed_image).IsGpuModified() &&
                   !texture_cache.GetImage(compressed_image).IsBufferModified(),
               "a compressed image escaped the unified download guard");
@@ -7705,7 +7854,7 @@ public:
       }
       TextureCacheTestAccess::ConfigureGarbageCollection(
           texture_cache, gc_images, 17, UINT64_MAX);
-      texture_cache.RunGarbageCollector();
+      OnGpuThread(context, [&] { texture_cache.RunGarbageCollector(); });
       Require(name, "downloadable image pre-pressure retention",
               std::ranges::all_of(gc_images,
                                   [&](ImageId image) {
@@ -7716,7 +7865,7 @@ public:
       const auto gc_batch_tick = scheduler.CurrentTick();
       TextureCacheTestAccess::ConfigureGarbageCollection(texture_cache,
                                                          gc_images, 81, 0);
-      texture_cache.RunGarbageCollector();
+      OnGpuThread(context, [&] { texture_cache.RunGarbageCollector(); });
       std::array<uint32_t, 2> gc_before_completion{};
       for (size_t index = 0; index < gc_image_offsets.size(); index++) {
         Libs::LibKernel::Memory::TryReadBacking(base + gc_image_offsets[index],
@@ -7796,7 +7945,7 @@ public:
           submit_readback_desc.info.data.address, &submit_readback_stale,
           sizeof(submit_readback_stale));
       const auto submit_readback_tick = scheduler.CurrentTick();
-      texture_cache.ProcessDownloadImages();
+      OnGpuThread(context, [&] { texture_cache.ProcessDownloadImages(); });
       TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
       uint32_t submit_before_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(
@@ -7866,7 +8015,7 @@ public:
       TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
       TextureCacheTestAccess::TrackDownload(texture_cache, linear_depth_image);
       const auto linear_depth_tick = scheduler.CurrentTick();
-      texture_cache.ProcessDownloadImages();
+      OnGpuThread(context, [&] { texture_cache.ProcessDownloadImages(); });
       TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
       std::array<uint32_t, linear_depth_words> linear_depth_before{};
       std::memcpy(linear_depth_before.data(), memory + linear_depth_offset,
@@ -7967,7 +8116,7 @@ public:
       const auto tiled_depth_tick = scheduler.CurrentTick();
       Require(
           name, "tiled depth download queue",
-          TextureCacheTestAccess::TryDownload(texture_cache, tiled_depth_image),
+          DownloadOnGpuThread(context, tiled_depth_image),
           "layered tiled depth readback was rejected");
       std::vector<uint32_t> tiled_depth_before(tiled_depth_guest.size());
       std::memcpy(tiled_depth_before.data(), memory + tiled_depth_offset,
@@ -8096,7 +8245,7 @@ public:
               "failed to clear a layered tiled D16 fallback image");
       Require(
           name, "tiled D16 download queue",
-          TextureCacheTestAccess::TryDownload(texture_cache, tiled_d16_image),
+          DownloadOnGpuThread(context, tiled_d16_image),
           "layered tiled D16 fallback readback was rejected");
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
@@ -8252,7 +8401,7 @@ public:
       const auto depth_gc_tick = scheduler.CurrentTick();
       TextureCacheTestAccess::ConfigureGarbageCollection(
           texture_cache, std::array{combined_destination_image}, 81, 0);
-      texture_cache.RunGarbageCollector();
+      OnGpuThread(context, [&] { texture_cache.RunGarbageCollector(); });
       float depth_before_completion = 0.0f;
       Libs::LibKernel::Memory::TryReadBacking(
           combined_destination.info.data.address, &depth_before_completion,
@@ -8320,7 +8469,7 @@ public:
           "failed to create six depth/stencil association pairs");
       TextureCacheTestAccess::ConfigureGarbageCollection(
           texture_cache, gc_depth_lru, 81, UINT64_MAX);
-      texture_cache.RunGarbageCollector();
+      OnGpuThread(context, [&] { texture_cache.RunGarbageCollector(); });
       bool gc_depth_budget = true;
       for (size_t index = 0; index < gc_depth_pair_count; index++) {
         const bool expected_live = index == gc_depth_pair_count - 1;
@@ -8362,7 +8511,7 @@ public:
         TextureCacheTestAccess::ConfigureGarbageCollection(
             texture_cache, std::array{image}, 81, 0);
         const auto tick = scheduler.CurrentTick();
-        texture_cache.RunGarbageCollector();
+        OnGpuThread(context, [&] { texture_cache.RunGarbageCollector(); });
         const auto handle =
             BufferCacheTestAccess::DownloadBuffer(resources.GetBufferCache())
                 .Handle();
@@ -8529,12 +8678,14 @@ public:
                 mapped == reinterpret_cast<void *>(base),
             "BGRA16 fixed mapping failed");
 
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
     {
       auto &resources = context;
       resources.MapMemory(base, allocation_size);
@@ -8585,7 +8736,7 @@ public:
           range);
       cache.MarkGpuWritten(id);
       Require(name, "guest readback queue",
-              TextureCacheTestAccess::TryDownload(cache, id),
+              DownloadOnGpuThread(context, id),
               "tiled BGRA16 guest readback was rejected");
       auto mirror = resources.GetBufferCache().ObtainBuffer(base, total.size,
                                                             false, true);
@@ -8691,7 +8842,8 @@ public:
       const auto width = target.width;
       const auto height = target.height;
       const bool is_1d = target.dimension == 0;
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -8824,7 +8976,8 @@ public:
     constexpr uint64_t slice_size = 0x10000;
 
     {
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       context.InitializeGpu(nullptr);
       LibKernel::Memory::InstallGpuResources(&context);
       auto &scheduler = context.GetCommandScheduler();
@@ -8955,7 +9108,7 @@ public:
 
       Require(
           name, "volume readback queue",
-          TextureCacheTestAccess::TryDownload(texture_cache, storage_id),
+          DownloadOnGpuThread(context, storage_id),
           "the 3D render target could not be queued for guest-layout readback");
       auto mirror = resources.GetBufferCache().ObtainBuffer(
           base, color_size, false, true);
@@ -9178,7 +9331,8 @@ public:
       std::memset(reinterpret_cast<void *>(argument_address(i)), 0, 12);
     }
 
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     context.InitializeGpu(nullptr);
     LibKernel::Memory::InstallGpuResources(&context);
     context.GetGpu().SendCommandSync([&] {
@@ -9360,7 +9514,8 @@ public:
     std::memset(mapped, 0, allocation_size);
 
     for (const auto &fill_case : cases) {
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       HW::Context registers{};
       HW::UserConfig user_config{};
       HW::Shader shaders{};
@@ -9602,7 +9757,8 @@ public:
     for (const auto initial_size : {metadata_size - 0x1000, metadata_size}) {
       std::memset(mapped, 0x5a, color_size);
       std::memset(reinterpret_cast<void *>(dcc_address), 0xff, metadata_size);
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       context.InitializeGpu(nullptr);
       LibKernel::Memory::InstallGpuResources(&context);
       auto &scheduler = context.GetCommandScheduler();
@@ -9737,7 +9893,8 @@ public:
     for (const auto &format : cases) {
       std::memset(mapped, 0, allocation_size);
       std::memcpy(mapped, format.words.data(), sizeof(format.words));
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -9853,12 +10010,14 @@ public:
         }
       }
 
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
       HW::Shader shaders{};
       scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
       auto &resources = context;
       auto &cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
@@ -9962,7 +10121,7 @@ public:
       }
       cache.MarkGpuWritten(binding.image_id);
       cache.MarkGpuWritten(ordinary.image_id);
-      Require(name, "depth readback", TextureCacheTestAccess::TryDownload(cache, binding.image_id),
+      Require(name, "depth readback", DownloadOnGpuThread(context, binding.image_id),
               "ordinary tiled depth readback did not use the shared transfer path");
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
@@ -10024,7 +10183,8 @@ public:
             "cube-face mapping failed");
     std::memset(mapped, 0, allocation_size);
     {
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -10166,7 +10326,8 @@ public:
 
       const auto target_address = base + tile_case.target_offset;
       const auto target_size = slice.size * 6ull;
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -10278,7 +10439,8 @@ public:
     std::memcpy(mapped, expected.data(), allocation_size);
 
     {
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -10294,6 +10456,7 @@ public:
                                     .metadata_pipe_aligned = true});
       registers.SetRenderTargetMask(0x0f);
       scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
 
       auto &resources = context;
       auto &texture_cache = resources.GetTextureCache();
@@ -10323,7 +10486,7 @@ public:
               "depth-tiled color backing could not be cleared");
       Require(
           name, "readback queue",
-          TextureCacheTestAccess::TryDownload(texture_cache, color.image_id),
+          DownloadOnGpuThread(context, color.image_id),
           "depth-tiled color target could not be queued for readback");
 
       RenderExecutorTestAccess::ResetBindings(executor);
@@ -10391,7 +10554,8 @@ public:
                 0x10000 / 4, tail_backing_value);
 
     {
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -10455,8 +10619,7 @@ public:
                                             raw_blocks_again.desc) != nullptr,
               "BC3 sampling replaced the GPU atlas on its next raw-block write");
       Require(name, "compressed atlas download",
-              TextureCacheTestAccess::TryDownload(texture_cache,
-                                                  raw_blocks_again.image_id),
+              DownloadOnGpuThread(context, raw_blocks_again.image_id),
               "the retained BC3 atlas could not publish its native contents");
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
@@ -11403,7 +11566,7 @@ public:
 
       Libs::LibKernel::Memory::WriteBacking(
           storage_address, &storage_stale_value, sizeof(storage_stale_value));
-      texture_cache.ProcessDownloadImages();
+      OnGpuThread(context, [&] { texture_cache.ProcessDownloadImages(); });
       Require(
           name, "storage acquisition download consumption",
           !TextureCacheTestAccess::PendingDownload(texture_cache, storage_id),
@@ -13864,7 +14027,8 @@ public:
     constexpr uint64_t allocation_size = 0x40000;
     constexpr uint64_t rect_address = depth_address + 0x8000;
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -15108,9 +15272,38 @@ public:
         Fail(name, stage, out.str());
       }
     };
+    // Detile leaves its linear scratch uncleared by default (KYTY_TILER_CLEAR_SCRATCH, see
+    // TileManager::Detile): only the width x height (x depth) elements of each tile are
+    // defined, and row, slice and level padding keeps whatever the pooled scratch held. Every
+    // consumer (buffer->image copies, D16 conversion) reads only those elements, so compare
+    // exactly the bytes the reference defines.
+    auto compare_defined = [&](const char *stage,
+                               const std::vector<uint8_t> &expected,
+                               const std::vector<uint8_t> &actual,
+                               const std::vector<uint8_t> &defined) {
+      Require(name, stage,
+              expected.size() == actual.size() &&
+                  expected.size() == defined.size(),
+              "detile comparison sizes differ");
+      size_t defined_bytes = 0;
+      for (size_t i = 0; i < expected.size(); i++) {
+        if (defined[i] == 0) {
+          continue;
+        }
+        ++defined_bytes;
+        if (expected[i] != actual[i]) {
+          std::ostringstream out;
+          out << "first mismatch at " << i << " of " << expected.size();
+          Fail(name, stage, out.str());
+        }
+      }
+      Require(name, stage, defined_bytes != 0,
+              "the reference defined no linear bytes");
+    };
     auto convert_reference = [&](bool to_tiled, std::vector<uint8_t> *dst,
                                  const std::vector<uint8_t> &src,
-                                 const GpuTileInfo &info) {
+                                 const GpuTileInfo &info,
+                                 std::vector<uint8_t> *defined = nullptr) {
       TileBlockLayout block{};
       Require(name, "reference layout",
               TileGetBlockLayout(info.family, info.bytes_per_element, block),
@@ -15159,6 +15352,10 @@ public:
                     "CPU reference address escaped storage");
             std::memcpy(dst->data() + dst_offset, src.data() + src_offset,
                         info.bytes_per_element);
+            if (defined != nullptr) {
+              std::fill_n(defined->begin() + static_cast<std::ptrdiff_t>(dst_offset),
+                          info.bytes_per_element, uint8_t{1});
+            }
           }
         }
       }
@@ -15239,12 +15436,14 @@ public:
       std::vector<uint8_t> tiled(tiled_size);
       std::vector<uint8_t> cpu(linear_size, 0);
       std::vector<uint8_t> gpu(linear_size, 0xab);
+      std::vector<uint8_t> defined(linear_size, 0);
       fill(&tiled, ++case_index);
       for (const auto &info : infos) {
-        convert_reference(false, &cpu, tiled, info);
+        convert_reference(false, &cpu, tiled, info, &defined);
       }
       gpu_detile(tiled, &gpu, tiled_size, linear_size, infos);
-      compare((std::string(stage) + " detile bytes").c_str(), cpu, gpu);
+      compare_defined((std::string(stage) + " detile bytes").c_str(), cpu, gpu,
+                      defined);
 
       std::vector<uint8_t> linear(linear_size);
       std::vector<uint8_t> cpu_tiled(tiled_size, 0xab);
@@ -15284,6 +15483,7 @@ public:
         std::vector<uint8_t> tiled(storage_size);
         std::vector<uint8_t> cpu(storage_size, 0);
         std::vector<uint8_t> gpu(storage_size, 0xab);
+        std::vector<uint8_t> defined(storage_size, 0);
         fill(&tiled, ++case_index);
 
         GpuTileInfo info{};
@@ -15300,7 +15500,7 @@ public:
                                  family.family == TileBlockFamily::Depth64KB
                              ? 3
                              : 0;
-        convert_reference(false, &cpu, tiled, info);
+        convert_reference(false, &cpu, tiled, info, &defined);
         gpu_detile(tiled, &gpu, storage_size, storage_size,
                    std::span<const GpuTileInfo>(&info, 1));
         const auto family_label = [&](const char *operation) {
@@ -15309,7 +15509,8 @@ public:
               << " bpe=" << bpe;
           return out.str();
         };
-        compare(family_label("detile bytes").c_str(), cpu, gpu);
+        compare_defined(family_label("detile bytes").c_str(), cpu, gpu,
+                        defined);
 
         {
           std::vector<uint8_t> linear(storage_size);
@@ -15425,10 +15626,11 @@ public:
         std::vector<uint8_t> tiled(total.size);
         std::vector<uint8_t> cpu(total.size, 0);
         std::vector<uint8_t> gpu(total.size, 0xab);
+        std::vector<uint8_t> defined(total.size, 0);
         fill(&tiled, ++case_index);
-        convert_reference(false, &cpu, tiled, infos[0]);
+        convert_reference(false, &cpu, tiled, infos[0], &defined);
         gpu_detile(tiled, &gpu, total.size, total.size, infos);
-        compare("format bytes", cpu, gpu);
+        compare_defined("format bytes", cpu, gpu, defined);
         ++format_cases;
       }
     }
@@ -15825,6 +16027,7 @@ public:
         std::vector<uint8_t> tiled(block.block_size);
         std::vector<uint8_t> cpu(linear_size, 0xcd);
         std::vector<uint8_t> gpu(linear_size, 0xab);
+        std::vector<uint8_t> defined(linear_size, 0);
         fill(&tiled, ++case_index);
         GpuTileInfo info{};
         info.family = block.family;
@@ -15841,10 +16044,10 @@ public:
                                  family == TileBlockFamily::Depth64KB
                              ? 2
                              : 0;
-        convert_reference(false, &cpu, tiled, info);
+        convert_reference(false, &cpu, tiled, info, &defined);
         gpu_detile(tiled, &gpu, block.block_size, linear_size,
                    std::span<const GpuTileInfo>(&info, 1));
-        compare("tail bytes", cpu, gpu);
+        compare_defined("tail bytes", cpu, gpu, defined);
 
         std::vector<uint8_t> linear(linear_size);
         std::vector<uint8_t> cpu_tiled(block.block_size, 0xab);
@@ -15864,6 +16067,7 @@ public:
     std::vector<uint8_t> small_input(small_block.block_size);
     std::vector<uint8_t> small_expected(small_block.block_size, 0);
     std::vector<uint8_t> small_output(small_block.block_size, 0xab);
+    std::vector<uint8_t> small_defined(small_block.block_size, 0);
     fill(&small_input, 0xee);
     GpuTileInfo small_info{};
     small_info.family = small_block.family;
@@ -15873,17 +16077,24 @@ public:
     small_info.width = 1;
     small_info.height = 1;
     small_info.pitch = small_block.block_width;
-    convert_reference(false, &small_expected, small_input, small_info);
+    convert_reference(false, &small_expected, small_input, small_info,
+                      &small_defined);
     gpu_detile(small_input, &small_output, small_input.size(),
                small_output.size(),
                std::span<const GpuTileInfo>(&small_info, 1));
-    compare("small detile", small_expected, small_output);
+    compare_defined("small detile", small_expected, small_output,
+                    small_defined);
 
+    // The second detile reuses the completed scratch of the first. New input
+    // makes an element the dispatch failed to write visible as a mismatch.
+    fill(&small_input, 0xef);
+    convert_reference(false, &small_expected, small_input, small_info);
     std::fill(small_output.begin(), small_output.end(), 0xab);
     gpu_detile(small_input, &small_output, small_input.size(),
                small_output.size(),
                std::span<const GpuTileInfo>(&small_info, 1));
-    compare("scheduler-owned reuse", small_expected, small_output);
+    compare_defined("scheduler-owned reuse", small_expected, small_output,
+                    small_defined);
 
     constexpr auto volume_format = Prospero::BufferFormat::k32UInt;
     constexpr auto volume_tile = Prospero::TileMode::kLinear;
@@ -32291,6 +32502,249 @@ void CheckStorageTextureVolumeMipRegions() {
           "Vulkan Z coordinates");
   std::printf("[host]    %-32s ok\n", "StorageTextureVolumeMipRegions");
 }
+
+// GpuTilerCpuParity compares the GPU tiler shaders with TileGetBlockOffset at every in-block
+// position, so both share any error in the per-family bit equations. Check the equations
+// themselves: one block's elements must map onto distinct, element-aligned offsets that fill
+// the block exactly, for every family and bytes-per-element the tiler admits.
+void CheckTileBlockBijection() {
+  constexpr const char *name = "TileBlockBijection";
+  uint32_t layouts = 0;
+  for (uint32_t family = 0;
+       family < static_cast<uint32_t>(TileBlockFamily::Count); ++family) {
+    for (uint32_t bpe = 1; bpe <= 16; bpe <<= 1u) {
+      TileBlockLayout block{};
+      if (!TileGetBlockLayout(static_cast<TileBlockFamily>(family), bpe,
+                              block)) {
+        continue;
+      }
+      std::vector<uint8_t> seen(block.block_size / bpe, 0);
+      for (uint32_t z = 0; z < block.block_depth; ++z) {
+        for (uint32_t y = 0; y < block.block_height; ++y) {
+          for (uint32_t x = 0; x < block.block_width; ++x) {
+            uint32_t offset = UINT32_MAX;
+            const bool valid = TileGetBlockOffset(block, x, y, z, offset) &&
+                               offset < block.block_size && offset % bpe == 0;
+            if (!valid || seen[offset / bpe] != 0) {
+              std::ostringstream out;
+              out << "family=" << family << " bpe=" << bpe << " element (" << x
+                  << "," << y << "," << z << ") -> 0x" << std::hex << offset
+                  << (valid ? " collides with another element"
+                            : " is outside the block or misaligned");
+              Fail(name, "in-block offset", out.str());
+            }
+            seen[offset / bpe] = 1;
+          }
+        }
+      }
+      ++layouts;
+    }
+  }
+  // Eight families admit 1..16 bytes per element; Depth64KB admits 1..8.
+  Require(name, "coverage", layouts == 8 * 5 + 4,
+          "a tile block family lost an admitted element size");
+  std::printf("[host]    %-32s ok (%u layouts)\n", name, layouts);
+}
+
+// TileManager::Detile does not clear its linear scratch (KYTY_TILER_CLEAR_SCRATCH), and
+// TileManager::TileImage never cleared the scratch it downloads the image into. Both rely on
+// one contract: the buffer<->image copies of a tiled transfer touch exactly the linear bytes
+// its tile dispatches touch. An upload copy reading a byte no dispatch writes would sample
+// stale scratch; a tile dispatch reading a byte no download copy writes would store it into
+// guest memory. Check the contract on the layouts TextureCache::BuildTextureTransfer builds,
+// for every tiled format/mode and for mip chains, mip tails, arrays, volumes and the
+// resident-level subsets that RestrictToResidentLevels uploads.
+void CheckDetileCopyCoverage() {
+  constexpr const char *name = "DetileCopyCoverage";
+  struct Span {
+    uint64_t begin = 0;
+    uint64_t end = 0;
+  };
+  const auto normalize = [](std::vector<Span> spans) {
+    std::sort(spans.begin(), spans.end(),
+              [](const Span &a, const Span &b) { return a.begin < b.begin; });
+    std::vector<Span> merged;
+    for (const auto &span : spans) {
+      if (span.begin == span.end) {
+        continue;
+      }
+      if (!merged.empty() && span.begin <= merged.back().end) {
+        merged.back().end = std::max(merged.back().end, span.end);
+      } else {
+        merged.push_back(span);
+      }
+    }
+    return merged;
+  };
+  const auto first_difference = [](const std::vector<Span> &a,
+                                   const std::vector<Span> &b) {
+    for (size_t i = 0; i < std::max(a.size(), b.size()); ++i) {
+      if (i >= a.size()) {
+        return b[i].begin;
+      }
+      if (i >= b.size()) {
+        return a[i].begin;
+      }
+      if (a[i].begin != b[i].begin) {
+        return std::min(a[i].begin, b[i].begin);
+      }
+      if (a[i].end != b[i].end) {
+        return std::min(a[i].end, b[i].end);
+      }
+    }
+    return UINT64_MAX;
+  };
+  // Bytes of the linear buffer each side touches: tile dispatches by element rows, copies by
+  // the Vulkan buffer addressing rules (texel blocks for block-compressed formats).
+  const auto check = [&](const char *stage, const std::string &label,
+                         const TextureUploadLayout &layout,
+                         std::span<const vk::BufferImageCopy> regions,
+                         std::span<const GpuTileInfo> tiles) {
+    std::vector<Span> dispatched;
+    for (const auto &tile : tiles) {
+      const uint64_t row =
+          static_cast<uint64_t>(tile.pitch) * tile.bytes_per_element;
+      const uint64_t slice = tile.linear_slice_stride != 0
+                                 ? tile.linear_slice_stride
+                                 : row * tile.height;
+      for (uint32_t z = 0; z < tile.depth; ++z) {
+        for (uint32_t y = 0; y < tile.height; ++y) {
+          const uint64_t begin = tile.linear_offset + z * slice + y * row;
+          dispatched.push_back(
+              {begin, begin + static_cast<uint64_t>(tile.width) *
+                                  tile.bytes_per_element});
+        }
+      }
+    }
+    const auto &texture = layout.surface.texture;
+    const uint32_t texel_width = texture.texel_width;
+    const uint32_t texel_height = texture.texel_height;
+    const uint32_t element = texture.block.bytes_per_element;
+    std::vector<Span> copied;
+    for (const auto &region : regions) {
+      const uint32_t row_length = region.bufferRowLength != 0
+                                      ? region.bufferRowLength
+                                      : region.imageExtent.width;
+      const uint32_t image_height = region.bufferImageHeight != 0
+                                        ? region.bufferImageHeight
+                                        : region.imageExtent.height;
+      const uint64_t row =
+          static_cast<uint64_t>((row_length + texel_width - 1u) / texel_width) *
+          element;
+      const uint64_t slice =
+          static_cast<uint64_t>((image_height + texel_height - 1u) /
+                                texel_height) *
+          row;
+      const uint32_t blocks_x =
+          (region.imageExtent.width + texel_width - 1u) / texel_width;
+      const uint32_t blocks_y =
+          (region.imageExtent.height + texel_height - 1u) / texel_height;
+      for (uint32_t z = 0; z < region.imageExtent.depth; ++z) {
+        for (uint32_t y = 0; y < blocks_y; ++y) {
+          const uint64_t begin = region.bufferOffset + z * slice + y * row;
+          copied.push_back(
+              {begin, begin + static_cast<uint64_t>(blocks_x) * element});
+        }
+      }
+    }
+    const auto dispatched_bytes = normalize(std::move(dispatched));
+    const auto copied_bytes = normalize(std::move(copied));
+    if (dispatched_bytes.empty() || copied_bytes.size() != dispatched_bytes.size() ||
+        first_difference(dispatched_bytes, copied_bytes) != UINT64_MAX) {
+      std::ostringstream out;
+      out << label << ": copies and tile dispatches cover different linear bytes, "
+          << "first difference at byte "
+          << first_difference(dispatched_bytes, copied_bytes);
+      Fail(name, stage, out.str());
+    }
+  };
+
+  struct Shape {
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth; // array layers, or volume depth
+    uint32_t levels;
+    bool volume;
+  };
+  constexpr Shape shapes[] = {
+      {67, 51, 1, 1, false},   {67, 51, 1, 7, false},  {1, 1, 1, 1, false},
+      {256, 256, 1, 9, false}, {129, 65, 3, 8, false}, {5, 300, 2, 9, false},
+      {65, 33, 37, 6, true},   {16, 8, 17, 5, true},
+  };
+  constexpr Prospero::TileMode modes[] = {
+      Prospero::TileMode::kStandard256B, Prospero::TileMode::kStandard4KB,
+      Prospero::TileMode::kStandard64KB, Prospero::TileMode::kPrt,
+      Prospero::TileMode::kRenderTarget, Prospero::TileMode::kDepth,
+  };
+  uint32_t transfers = 0;
+  uint32_t subsets = 0;
+  for (u32 raw_format = 1;
+       raw_format <= static_cast<uint32_t>(Prospero::BufferFormat::kBc7Srgb);
+       ++raw_format) {
+    const auto format = static_cast<Prospero::BufferFormat>(raw_format);
+    if (Prospero::IsFmaskTextureFormat(format)) {
+      continue;
+    }
+    for (const auto mode : modes) {
+      for (const auto &shape : shapes) {
+        TileTextureBlockLayout texture{};
+        if (!TileGetTextureBlockLayout(format, mode, shape.volume, texture)) {
+          continue;
+        }
+        TileSizeAlign total{};
+        TileGetTextureTotalSize(format, shape.width, shape.height, shape.depth,
+                                shape.levels, mode, shape.volume, total);
+        const auto layout = TextureCalcUploadLayout(
+            format, shape.width, shape.height, shape.levels, shape.depth, mode,
+            total.size, true, shape.volume, name);
+        const auto regions = TextureBuildImageCopies(layout);
+        std::vector<GpuTileInfo> tiles;
+        std::ostringstream label;
+        label << "format=" << raw_format << " tile=" << static_cast<u32>(mode)
+              << " extent=" << shape.width << "x" << shape.height << "x"
+              << shape.depth << " levels=" << shape.levels
+              << (shape.volume ? " volume" : "");
+        if (!TextureBuildGpuTileInfos(total.size, regions, layout, shape.levels,
+                                      tiles)) {
+          Fail(name, "tile infos", label.str());
+        }
+        check("full chain", label.str(), layout, regions, tiles);
+        ++transfers;
+
+        // RestrictToResidentLevels: 2D, single-layer chains upload a resident suffix of
+        // their levels, re-based to the start of the scratch.
+        if (shape.volume || shape.depth != 1 || tiles.size() != regions.size()) {
+          continue;
+        }
+        for (uint32_t first = 1; first < shape.levels; ++first) {
+          std::vector<vk::BufferImageCopy> kept_regions;
+          std::vector<GpuTileInfo> kept_tiles;
+          for (size_t index = 0; index < regions.size(); ++index) {
+            if (regions[index].imageSubresource.mipLevel >= first) {
+              kept_regions.push_back(regions[index]);
+              kept_tiles.push_back(tiles[index]);
+            }
+          }
+          uint64_t base = UINT64_MAX;
+          for (const auto &tile : kept_tiles) {
+            base = std::min(base, tile.linear_offset);
+          }
+          for (size_t index = 0; index < kept_tiles.size(); ++index) {
+            kept_tiles[index].linear_offset -= base;
+            kept_regions[index].bufferOffset -= base;
+          }
+          check("resident levels", label.str() + " first=" + std::to_string(first),
+                layout, kept_regions, kept_tiles);
+          ++subsets;
+        }
+      }
+    }
+  }
+  Require(name, "coverage", transfers != 0 && subsets != 0,
+          "no tiled transfer layouts were checked");
+  std::printf("[host]    %-32s ok (%u transfers, %u resident subsets)\n", name,
+              transfers, subsets);
+}
 void CheckStandard64RenderTargetTileRoundTrip() {
   constexpr auto format = Prospero::BufferFormat::k32Float;
   constexpr auto tile = Prospero::TileMode::kStandard64KB;
@@ -34617,7 +35071,15 @@ int main(int argc, char **argv) {
     vulkan.CheckStreamBufferRing();
     return 0;
   }
+  // Host-only tile layout checks; no Vulkan device.
+  if (argc == 2 && std::strcmp(argv[1], "--tile-layout-only") == 0) {
+    CheckTileBlockBijection();
+    CheckDetileCopyCoverage();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
+    CheckTileBlockBijection();
+    CheckDetileCopyCoverage();
     VulkanHarness vulkan;
     vulkan.CheckGpuTilerCpuParity();
     return 0;
@@ -34990,6 +35452,8 @@ int main(int argc, char **argv) {
   vulkan.CheckGraphicsPushConstantBank();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
+  CheckTileBlockBijection();
+  CheckDetileCopyCoverage();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
