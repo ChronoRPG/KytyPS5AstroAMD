@@ -589,6 +589,9 @@ void CommandProcessor::BufferFlush() {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	m_deferred_eop_flushes     = 0;
 	m_packets_since_eop_request = 0;
+	// Between packets: append eager readback copies of read-hot pages to this recording
+	// (KYTY_READBACK_EAGER), published when it completes.
+	m_renderer.GetBufferCache().IssueEagerReadbacks();
 	GetScheduler().Flush();
 }
 
@@ -629,6 +632,14 @@ static uint32_t IdleFlushMinDraws() {
 }
 
 void CommandProcessor::MaybeFlushIdleGpu() {
+	// A draw or dispatch just recorded writes a page the command processor reads back later (e.g.
+	// indirect arguments): submit it now, outside a rendering instance, so that read waits for
+	// this producer at most, not for everything recorded until then (KYTY_READBACK_EAGER).
+	if (m_renderer.GetBufferCache().TakeEagerFlushRequest(CurrentBuffer().ActiveRenderingSerial() !=
+	                                                     0)) {
+		BufferFlush();
+		return;
+	}
 	const auto min_draws = IdleFlushMinDraws();
 	if (min_draws == 0) {
 		return;

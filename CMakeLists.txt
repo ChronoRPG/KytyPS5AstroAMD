@@ -708,6 +708,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_fence PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_REG_INDIRECT_WINDOW=0")
+	add_test(NAME buffer_cache_eager_readback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --readback-eager-only)
 
 	if(WIN32)
 		# These tests still depend on the Windows multisample-depth path.

@@ -2170,6 +2170,7 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 	     (!graphics.draw_indirect_count_enabled || (source.count_addr & 3u) != 0)) ||
 	    !m_context.IsMapped(source.args_addr, source.ArgsSize()) ||
 	    (source.count_addr != 0 && !m_context.IsMapped(source.count_addr, sizeof(uint32_t)))) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectFallbackHost);
 		return false;
 	}
 
@@ -2187,6 +2188,7 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 			case Prospero::IndexType::kIndex8:
 				// The CPU path widens 8-bit indices to 16 bits on the host.
 				if (!graphics.index_type_uint8_enabled) {
+					Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectFallbackIndexBuffer);
 					return false;
 				}
 				index_source.type               = vk::IndexType::eUint8;
@@ -2201,6 +2203,7 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 		// no range to bind.
 		if (source.index_base_addr == 0 || source.index_buffer_size == 0 ||
 		    !m_context.IsMapped(source.index_base_addr, index_source.guest_element_size)) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectFallbackIndexBuffer);
 			return false;
 		}
 		index_source.address = source.index_base_addr;
@@ -2226,6 +2229,7 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 	KYTY_PROFILER_DETAIL_BLOCK("Draw::SetupAndExecution");
 	Common::LockGuard lock(m_context.GetMutex());
 	if (DrawMayRunTargetOperation(buffer)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectFallbackTargetOp);
 		return false;
 	}
 	if (!DrawHasValidVertexShader(sh_ctx)) {
@@ -2257,6 +2261,7 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 
 	// Legacy quads are split into per-quad host draws from the vertex count.
 	if (ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectFallbackQuadList);
 		return false;
 	}
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
@@ -2268,6 +2273,7 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 		const auto restart =
 		    ResolveNativePrimitiveRestart(buffer, index_source.guest_element_size);
 		if (!restart) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectFallbackRestart);
 			return false;
 		}
 		primitive_restart = *restart;
@@ -2284,6 +2290,7 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 	}
 	// Mesh draws derive group counts, restart segments and push data from the counts.
 	if (state.vertex_info[0].stage.program->stage == ShaderType::Mesh) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectFallbackMesh);
 		ResetBindings();
 		return false;
 	}

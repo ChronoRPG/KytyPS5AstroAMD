@@ -145,8 +145,13 @@ std::mutex               g_readback_mutex;
 std::vector<std::string> g_pending_readback_rows;
 uint64_t                 g_readback_rows_total = 0;
 
-constexpr const char* kReadbackKindNames[] = {"invalidate", "fault-read", "fault-write",
-                                              "gpu-sync",   "fault-read-side", "fault-read-dup"};
+constexpr const char* kReadbackKindNames[] = {"invalidate",      "fault-read",
+                                              "fault-write",     "gpu-sync",
+                                              "fault-read-side", "fault-read-dup",
+                                              "fault-read-eager", "eager-publish"};
+static_assert(std::size(kReadbackKindNames) ==
+                  static_cast<size_t>(ReadbackKind::EagerPublish) + 1,
+              "one name per ReadbackKind");
 constexpr const char* kImageFreeReasonNames[] = {
     "other",           "depth-association", "depth-recreate", "overlap-layout",
     "overlap-mip-merge", "overlap-stale",   "expand",         "smaller-resources",
@@ -1381,7 +1386,8 @@ void RecordReadback(uint64_t vaddr, uint64_t size, uint64_t window_begin, uint64
 	}
 	const auto kind   = g_readback_kind;
 	const bool fault  = kind == ReadbackKind::FaultRead || kind == ReadbackKind::FaultWrite ||
-	                   kind == ReadbackKind::FaultReadSide || kind == ReadbackKind::FaultReadDuplicate;
+	                   kind == ReadbackKind::FaultReadSide || kind == ReadbackKind::FaultReadDuplicate ||
+	                   kind == ReadbackKind::FaultReadEager;
 	const auto pc     = fault && g_fault_context.pc != 0 ? FormatAddress(g_fault_context.pc) : std::string();
 	const auto thread = fault ? std::string_view(g_fault_context.thread) : std::string_view();
 	// Stack scanning only helps when a guest thread is on this stack (CPU faults). It costs a dozen

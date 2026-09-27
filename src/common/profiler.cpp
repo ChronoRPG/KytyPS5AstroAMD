@@ -395,6 +395,20 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.DrawPrepRegIndirectKept.Cumulative",
     "FrameEvent.TilerImageBlockUploads.Cumulative",
     "FrameEvent.TilerImageBlockUploadBytes.Cumulative",
+    "FrameEvent.ReadbackEagerHotPages.Cumulative",
+    "FrameEvent.ReadbackEagerCopies.Cumulative",
+    "FrameEvent.ReadbackEagerCopyBytes.Cumulative",
+    "FrameEvent.ReadbackEagerRetries.Cumulative",
+    "FrameEvent.ReadbackEagerWaits.Cumulative",
+    "FrameEvent.ReadbackEagerPagesUnmarked.Cumulative",
+    "FrameEvent.ReadbackEagerPagesRetained.Cumulative",
+    "FrameEvent.ReadbackEagerFlushes.Cumulative",
+    "FrameEvent.DrawIndirectFallbackHost.Cumulative",
+    "FrameEvent.DrawIndirectFallbackIndexBuffer.Cumulative",
+    "FrameEvent.DrawIndirectFallbackTargetOp.Cumulative",
+    "FrameEvent.DrawIndirectFallbackQuadList.Cumulative",
+    "FrameEvent.DrawIndirectFallbackRestart.Cumulative",
+    "FrameEvent.DrawIndirectFallbackMesh.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
