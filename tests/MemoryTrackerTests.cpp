@@ -630,9 +630,18 @@ void UploadAll(MemoryTracker &tracker, uint64_t address, uint64_t size) {
 }
 
 // Write fault as RenderContext::HandleFault reports it (one byte).
-uint32_t WriteFault(MemoryTracker &tracker, uint64_t address) {
+uint32_t WriteFault(MemoryTracker &tracker, uint64_t address,
+                    std::vector<std::pair<uint64_t, uint64_t>> *ahead = nullptr) {
   uint32_t flushes = 0;
-  tracker.InvalidateRegion(address, 1, [&] { flushes++; }, true);
+  tracker.InvalidateRegionOnWriteFault(
+      address, 1, [&] { flushes++; },
+      [&](uint64_t run, uint64_t bytes) noexcept {
+        Check(!IsWritable(reinterpret_cast<const void *>(run)),
+              "fault-ahead run was reported after it became writable");
+        if (ahead != nullptr) {
+          ahead->push_back({run, bytes});
+        }
+      });
   return flushes;
 }
 
@@ -668,8 +677,16 @@ void TestFaultAheadWindow() {
         "fault-ahead setup did not protect the range");
 
   ResetProtectionLog();
-  Check(WriteFault(tracker, address + page_size * 2 + 16) == 0,
+  std::vector<std::pair<uint64_t, uint64_t>> ahead_runs;
+  Check(WriteFault(tracker, address + page_size * 2 + 16, &ahead_runs) == 0,
         "clean fault-ahead write fault requested a GPU flush");
+  Check(ahead_runs.size() == 3 && ahead_runs[0].first == address &&
+            ahead_runs[0].second == page_size * 2 &&
+            ahead_runs[1].first == address + page_size * 3 &&
+            ahead_runs[1].second == page_size * 2 &&
+            ahead_runs[2].first == address + page_size * 6 &&
+            ahead_runs[2].second == page_size * 2,
+        "fault-ahead did not report exactly the runs it opened");
   for (uint64_t page = 0; page < 16; page++) {
     const bool in_window = page < 8 && page != 5;
     Check(tracker.IsRegionCpuModified(address + page * page_size, page_size) ==
@@ -685,7 +702,7 @@ void TestFaultAheadWindow() {
   // A write fault on the GPU-owned page takes the flush path, without fault-ahead.
   UploadAll(tracker, address, page_size * 16);
   uint32_t flushes = 0;
-  tracker.InvalidateRegion(
+  tracker.InvalidateRegionOnWriteFault(
       address + page_size * 5, 1,
       [&] {
         flushes++;
@@ -693,7 +710,9 @@ void TestFaultAheadWindow() {
                                            [](uint64_t, uint64_t) noexcept {});
         tracker.MarkRegionAsCpuModified(address + page_size * 5, 1);
       },
-      true);
+      [](uint64_t, uint64_t) noexcept {
+        Check(false, "GPU-owned write fault reported fault-ahead pages");
+      });
   Check(flushes == 1 && IsWritable(memory + page_size * 5) &&
             !IsWritable(memory + page_size * 4) &&
             !tracker.IsRegionCpuModified(address + page_size * 4, page_size),
@@ -869,7 +888,8 @@ void TestWrittenUploadCopiesOutsideLock() {
               "main copy ran on an unprotected page");
         // Would deadlock if the region lock were held here.
         std::jthread racer([&] {
-          tracker.InvalidateRegion(address + page_size + 8, 1, [] {}, true);
+          tracker.InvalidateRegionOnWriteFault(address + page_size + 8, 1, [] {},
+                                               [](uint64_t, uint64_t) noexcept {});
           memory[page_size + 8] = 0x77;
           racer_done = true;
         });

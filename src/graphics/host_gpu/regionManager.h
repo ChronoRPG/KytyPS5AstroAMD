@@ -176,7 +176,9 @@ public:
 	//    bytes, never correctness; other page watchers (images) keep their own protection;
 	//  - hot pages: a page write-faulting in `policy.hot_frames` consecutive frames becomes hot
 	//    (sticky CPU-dirty, see CollectUpload) while `hot_count` stays below `policy.hot_max`.
-	// Returns the pages marked by fault-ahead and the pages promoted to hot.
+	// on_ahead(address, bytes) receives each run of fault-ahead pages before they become
+	// writable (still under the region lock). Returns the pages marked by fault-ahead and the
+	// pages promoted to hot.
 	struct FaultPolicy {
 		uint32_t ahead_pages = 1; // power of two dividing TRACKER_REGION_PAGES; 1 = off
 		uint32_t hot_frames  = 0; // 0 = hot pages off
@@ -188,8 +190,10 @@ public:
 		uint64_t ahead_pages = 0;
 		uint32_t promoted    = 0;
 	};
+	template <typename AheadFunc>
 	FaultResult MarkWriteFault(uint64_t vaddr, uint64_t size, const FaultPolicy& policy,
-	                           uint32_t frame, std::atomic_uint32_t& hot_count) {
+	                           uint32_t frame, std::atomic_uint32_t& hot_count,
+	                           AheadFunc&& on_ahead) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if (RegionBits(m_gpu_dirty, start, end).Any()) {
 			EXIT("CPU dirty state conflicts with GPU dirty state\n");
@@ -210,6 +214,9 @@ public:
 			                          ~m_cpu_dirty;
 			result.ahead_pages = window.Count();
 			m_cpu_dirty |= window;
+			for (const auto [first, last]: window) {
+				on_ahead(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+			}
 		}
 		UpdateProtection<false, false>();
 		if (policy.hot_frames == 0) {

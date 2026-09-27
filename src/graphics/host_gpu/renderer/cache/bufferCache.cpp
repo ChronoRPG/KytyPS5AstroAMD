@@ -451,17 +451,17 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool write_fau
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
-	const auto ahead = uint64_t {m_memory_tracker.GetFaultPolicy().ahead_pages} * TRACKER_PAGE_SIZE;
-	if (write_fault && ahead > TRACKER_PAGE_SIZE) {
-		// Fault-ahead can make the whole aligned window writable without further faults.
-		const auto begin = Common::AlignDown(vaddr, ahead);
-		const auto end   = std::min(Common::AlignUp(vaddr + size, ahead), TRACKER_ADDRESS_SIZE);
-		ForgetKnownFills(begin, end - begin);
-	} else {
-		ForgetKnownFills(vaddr, size);
+	ForgetKnownFills(vaddr, size);
+	const auto flush = [this, vaddr, size] { ReadMemory(vaddr, size, true); };
+	if (!write_fault) {
+		m_memory_tracker.InvalidateRegion(vaddr, size, flush);
+		return;
 	}
-	m_memory_tracker.InvalidateRegion(
-	    vaddr, size, [this, vaddr, size] { ReadMemory(vaddr, size, true); }, write_fault);
+	// Pages fault-ahead opens take writes without faulting: forget their fills first, exactly as
+	// for the faulting range (never GPU-dirty pages, so fills of GPU-owned ranges survive).
+	m_memory_tracker.InvalidateRegionOnWriteFault(
+	    vaddr, size, flush,
+	    [this](uint64_t address, uint64_t bytes) noexcept { ForgetKnownFills(address, bytes); });
 }
 
 BufferCache::UploadBatch::UploadBatch(BufferCache& cache): m_cache(cache) {
@@ -469,7 +469,7 @@ BufferCache::UploadBatch::UploadBatch(BufferCache& cache): m_cache(cache) {
 }
 
 BufferCache::UploadBatch::~UploadBatch() {
-	if (--m_cache.m_upload_batch_depth == 0) {
+	if (--m_cache.m_upload_batch_depth == 0 && m_cache.m_scheduler.Active()) {
 		auto& command = m_cache.m_scheduler.Current();
 		if (!command.IsInvalid()) {
 			command.FlushBarriers();

@@ -52,13 +52,27 @@ public:
 		}
 		return m_cpu_mutation_epoch.load(std::memory_order_acquire);
 	}
-	// Removes protection from a range and flushes GPU-owned data when required. write_fault: the
-	// range is a guest write fault; clean pages then take the fault policy (fault-ahead window,
-	// hot-page detection, RegionManager::MarkWriteFault).
+	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
-	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush,
-	                      bool write_fault = false) noexcept {
+	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
+		InvalidateRegion(vaddr, size, on_flush, false, [](uint64_t, uint64_t) noexcept {});
+	}
+	// As InvalidateRegion for a guest write fault: clean pages take the fault policy (fault-ahead
+	// window, hot-page detection, RegionManager::MarkWriteFault). on_ahead(address, bytes) sees
+	// every run of pages fault-ahead makes CPU-dirty, under the region lock, before they become
+	// writable: what the faulting range's caller does before a write can land applies to them.
+	template <typename Flush, typename AheadFunc>
+	void InvalidateRegionOnWriteFault(uint64_t vaddr, uint64_t size, Flush&& on_flush,
+	                                  AheadFunc&& on_ahead) noexcept {
+		InvalidateRegion(vaddr, size, on_flush, true, on_ahead);
+	}
+
+private:
+	template <typename Flush, typename AheadFunc>
+	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush& on_flush, bool write_fault,
+	                      AheadFunc&& on_ahead) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
+		static_assert(std::is_nothrow_invocable_v<AheadFunc&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
 
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -74,7 +88,8 @@ public:
 				NotifyCpuMutation();
 				if (write_fault) {
 					fault = manager->MarkWriteFault(manager->GetCpuAddr() + offset, bytes,
-					                                m_fault_policy, Frame(), m_hot_count);
+					                                m_fault_policy, Frame(), m_hot_count,
+					                                on_ahead);
 				} else {
 					manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 					                                             bytes);
@@ -89,6 +104,7 @@ public:
 		});
 	}
 
+public:
 	// Fault policy knobs (constant after construction).
 	[[nodiscard]] const FaultPolicy& GetFaultPolicy() const noexcept { return m_fault_policy; }
 	// Guest frame counter for hot-page detection (any thread, once per completed guest flip).
