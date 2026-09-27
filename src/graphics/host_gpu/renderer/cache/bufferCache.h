@@ -130,6 +130,12 @@ public:
 	[[nodiscard]] bool TryWriteDataGpu(uint64_t vaddr, const uint32_t* data, uint64_t size);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
+	// KYTY_ALIAS_BYTES (TextureCache::MaterializeOwnedBytes): the cache buffer that will own the
+	// image bytes `ranges` (`target` when it covers them). Each range is synchronized as for a
+	// writable binding: its CPU-dirty pages uploaded, its tracker pages GPU-owned. Then, once the
+	// bytes are recorded into it, CommitImageBytes makes them GPU-dirty buffer bytes.
+	[[nodiscard]] Buffer& PrepareImageBytes(const RangeSet& ranges, Buffer* target = nullptr);
+	void                  CommitImageBytes(Buffer& buffer, const RangeSet& ranges);
 
 	// Recorded GPU fills whose result has not been overwritten since: a range written by a
 	// uniform-fill dispatch or FillBuffer, forgotten on any later GPU or CPU write to it. Lets
@@ -370,6 +376,9 @@ private:
 	void SettleHotPages(uint64_t vaddr, uint64_t size);
 	void MaintainHotPages();
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// The texel-read download of one image that owns all of its bytes and starts at the read
+	// (SynchronizeBufferFromImage's image found by TextureCache::FindImageFromRange).
+	[[nodiscard]] bool SynchronizeBufferFromOwner(Buffer& buffer, Common::SlotId image_id);
 	// Records a download of a GPU-modified image into `buffer` at the image's own guest address
 	// (every mip level that fits). Caller holds the texture-cache lock and has checked that the
 	// image may be downloaded. Returns the bytes covered from the image start, 0 when nothing

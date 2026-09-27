@@ -5,11 +5,13 @@
 #include "common/assert.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
 #include <algorithm>
 #include <compare>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -290,7 +292,101 @@ public:
 		m_gpu_modified  = true;
 		m_partial_valid = false;
 	}
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	void ClearGpuModified() noexcept {
+		m_gpu_modified = false;
+		m_owned.reset();
+		claimed_rect_valid = false;
+	}
+
+	// Byte ownership of a GPU-modified image (TextureCache, KYTY_ALIAS_BYTES): the guest bytes of
+	// info.data whose current contents are this image's native contents. All of them unless an
+	// owned set is present: a write of another alias or a bounded buffer write took the others, or
+	// the image claimed only the blocks a draw's scissor covers. An empty set is transient: a
+	// binding marked the image before the write that claims bytes.
+	[[nodiscard]] bool OwnsAllBytes() const noexcept { return m_gpu_modified && !m_owned; }
+	[[nodiscard]] bool OwnsNoBytes() const noexcept {
+		return !m_gpu_modified || (m_owned && m_owned->Empty());
+	}
+	// The owned bytes when not all of them; nullptr when all (or none: not GPU-modified).
+	[[nodiscard]] const RangeSet* OwnedSet() const noexcept {
+		return m_gpu_modified ? m_owned.get() : nullptr;
+	}
+	[[nodiscard]] bool OwnsBytesIn(uint64_t address, uint64_t size) const noexcept {
+		if (!m_gpu_modified || size == 0 || !ImageRangeOverlaps(info.data.address, info.data.size,
+		                                                        address, size)) {
+			return false;
+		}
+		return !m_owned || m_owned->Intersects(address, size);
+	}
+	[[nodiscard]] bool OwnsBytes(uint64_t address, uint64_t size) const noexcept {
+		if (!m_gpu_modified || size == 0) {
+			return false;
+		}
+		const auto begin = std::max(address, info.data.address);
+		const auto end   = std::min(address + size, info.data.End());
+		if (begin >= end || begin != address || end != address + size) {
+			return false;
+		}
+		return !m_owned || m_owned->Contains(address, size);
+	}
+	// func(begin, end) for each owned byte range inside [address, address + size).
+	template <typename Func>
+	void ForEachOwnedRange(uint64_t address, uint64_t size, Func&& func) const {
+		if (!m_gpu_modified || size == 0) {
+			return;
+		}
+		const auto begin = std::max(address, info.data.address);
+		const auto end   = std::min(address + size, info.data.End());
+		if (begin >= end) {
+			return;
+		}
+		if (!m_owned) {
+			func(begin, end);
+			return;
+		}
+		m_owned->ForEachInRange(begin, end - begin, func);
+	}
+	// A binding that has not written yet: GPU-modified, owning no byte until its write claims some.
+	void OwnNoBytes() {
+		m_owned            = std::make_unique<RangeSet>();
+		claimed_rect_valid = false;
+	}
+	void OwnAllBytes() noexcept { m_owned.reset(); }
+	// Adds [address, address + size) (clipped to info.data) to the owned bytes.
+	void OwnBytes(uint64_t address, uint64_t size) {
+		const auto begin = std::max(address, info.data.address);
+		const auto end   = std::min(address + size, info.data.End());
+		if (!m_owned || begin >= end) {
+			return;
+		}
+		m_owned->Add(begin, end - begin);
+		if (m_owned->Contains(info.data.address, info.data.size)) {
+			m_owned.reset();
+		}
+	}
+	// Removes [address, address + size) from the owned bytes, and GPU ownership once none is left.
+	// Returns whether the image owned any of those bytes.
+	bool DisownBytes(uint64_t address, uint64_t size) {
+		if (!OwnsBytesIn(address, size)) {
+			return false;
+		}
+		const auto begin = std::max(address, info.data.address);
+		const auto end   = std::min(address + size, info.data.End());
+		if (!m_owned) {
+			if (begin == info.data.address && end == info.data.End()) {
+				ClearGpuModified();
+				return true;
+			}
+			m_owned = std::make_unique<RangeSet>();
+			m_owned->Add(info.data.address, info.data.size);
+		}
+		m_owned->Subtract(begin, end - begin);
+		claimed_rect_valid = false;
+		if (m_owned->Empty()) {
+			ClearGpuModified();
+		}
+		return true;
+	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept {
@@ -306,7 +402,7 @@ public:
 		             : ImageRangeOverlaps(live.address, live.size, address, size);
 	}
 	[[nodiscard]] bool SafeToDownload() const noexcept {
-		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
+		return OwnsAllBytes() && !IsBufferModified() && !IsCpuDirty();
 	}
 	[[nodiscard]] bool IsTracked() const noexcept { return track_addr != 0 && track_addr_end != 0; }
 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
@@ -337,6 +433,11 @@ public:
 	size_t           lru_id              = 0;
 	// Last GPU writer among overlapping aliases; cleared when another alias takes the bytes.
 	bool             alias_owner         = false;
+	// KYTY_ALIAS_BYTES: a level-0 texel rectangle whose 64 KiB blocks this image owns (bounded
+	// render-target claims skip the claim when a draw's scissor lies inside it). Dropped whenever
+	// the image loses owned bytes.
+	vk::Rect2D       claimed_rect {};
+	bool             claimed_rect_valid  = false;
 	ChunkState       chunks;
 	// Last download into a cache buffer for texel-buffer reads (SynchronizeBufferFromImage):
 	// the buffer revision it produced and this image's content serial at the time.
@@ -383,6 +484,8 @@ private:
 	bool              m_dirty_from_hash  = false;
 	bool              m_refreshed        = false;
 	bool              m_partial_valid    = false;
+	// See OwnedSet(): the owned bytes of a GPU-modified image, nullptr for all of them.
+	std::unique_ptr<RangeSet> m_owned;
 	uint64_t          m_content_serial   = 0;
 	uint64_t          m_definite_writes  = 0;
 	uint64_t          m_dirty_begin      = 0;

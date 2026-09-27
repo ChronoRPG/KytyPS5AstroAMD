@@ -22,6 +22,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <optional>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -73,7 +74,10 @@ public:
 	                                               bool ensure_valid = true,
 	                                               bool buffer_sync  = false);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
-	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
+	// written: the draw's scissor (framebuffer pixels, unclamped); the target then owns only the
+	// 64 KiB blocks under it (KYTY_ALIAS_BYTES). nullptr: the whole image may be written.
+	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc,
+	                                             const vk::Rect2D* written = nullptr);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
@@ -115,8 +119,28 @@ public:
 	void AdvanceFrame() noexcept { m_frame.fetch_add(1, std::memory_order_relaxed); }
 	void RunGarbageCollector();
 
+	// KYTY_ALIAS_BYTES (default on; =0 restores whole-image ownership). GPU ownership follows the
+	// bytes a write can reach: a write takes only those bytes from overlapping images (a draw only
+	// the 64 KiB blocks under its scissor), and every other image keeps the rest of its bytes.
+	// Bytes an image owns reach the buffer cache (the owner's contents are tiled into it) before
+	// a read goes through buffer bytes: a sampled or copied image's rebuild, a texel-buffer read,
+	// a buffer copy source; and before a GPU-modified image is freed (except by an unmap).
+	// Needs aliases aged by frames (KYTY_IMAGE_ALIAS_AGE).
+	[[nodiscard]] static bool AliasBytesEnabled();
+
 private:
 	enum class TransferDirection { Upload, Download };
+	// Why an image is refreshed: a read of its contents (sampling, copies, presentation) or a
+	// binding that writes it (render, depth and storage targets). With KYTY_ALIAS_BYTES a read
+	// rebuild first moves bytes other images own into the buffer; a write binding's does not
+	// (the write usually covers them; it costs a tile pass per aliased target and frame).
+	enum class RefreshIntent : uint8_t { Read, Write };
+	// The bytes a GPU write may write (KYTY_ALIAS_BYTES): ranges == nullptr means the whole
+	// image; rect is the level-0 texel rectangle behind bounded render-target claims.
+	struct WriteClaim {
+		const RangeSet*           ranges = nullptr;
+		std::optional<vk::Rect2D> rect;
+	};
 	enum class ImageLookupMode { FirstPage, Legacy, Verify };
 	struct TextureTransfer;
 	struct ImageDownload;
@@ -235,7 +259,8 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
-	void                        RefreshImage(ImageId id);
+	void                        RefreshImage(ImageId id,
+	                                         RefreshIntent intent = RefreshIntent::Read);
 	void                        MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	// A render-target binding whose CMASK marks every tile of a bound slice fast-cleared: clears
@@ -255,7 +280,27 @@ private:
 	    DccClearHelper& helper, ImageId id, const ImageDesc& desc, GuestRange range,
 	    uint32_t metadata_base_layer, const DccClearHelper::ClearValues& values, uint32_t decodable,
 	    bool cmask);
-	void                        InitializeImage(ImageId id);
+	void                        InitializeImage(ImageId id,
+	                                            RefreshIntent intent = RefreshIntent::Read);
+	// KYTY_ALIAS_BYTES. Moves the bytes of `range` that GPU-modified images own into the buffer
+	// cache: each owner is tiled into a scratch copy of its owned ranges' buffer bytes, which are
+	// copied back; the buffer then owns them (GPU-dirty) and the image no longer does. only:
+	// just that image's bytes, without the ones another image also owns (a copy's source and
+	// destination); except: every owner but that one. Returns the bytes moved. Caller holds
+	// m_lock; records GPU work.
+	// target: the cache buffer to move the bytes into, when it covers them (a texel read's).
+	uint64_t MaterializeOwnedBytes(GuestRange range, ImageId only, ImageId except,
+	                               const char* reason, Buffer* target = nullptr);
+	// Whether any GPU-modified image other than `except` owns a byte of `range`.
+	[[nodiscard]] bool OtherImagesOwnBytes(GuestRange range, ImageId except);
+	// False when no image is registered on the 1 MiB pages of the range (lock-free, any thread).
+	[[nodiscard]] bool MayOverlapImages(uint64_t address, uint64_t size) const;
+	// The 64 KiB blocks of a single-level, single-layer render target (64 KiB render-target
+	// tiling) under `rect` (level-0 texels, clamped to the extent). False: not such a target, or
+	// the rectangle covers the whole image (claim it all).
+	[[nodiscard]] bool BlocksUnderRect(const Image& image, vk::Rect2D& rect, RangeSet& blocks) const;
+	// The destination of a copy owns what the source owned there (and the source no longer).
+	void TakeOverOwnedBytes(Image& destination, Image& source);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
 	[[nodiscard]] static TextureTransfer BuildTextureTransfer(const ImageInfo& info,
@@ -268,8 +313,14 @@ private:
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, ImageDownload transfer);
-	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
+	// The same into any device buffer with `destination_capacity` bytes from destination_offset.
+	void DownloadImageTo(Image& image, vk::Buffer destination, uint64_t destination_offset,
+	                     uint64_t destination_capacity, uint64_t destination_size,
+	                     ImageDownload transfer);
+	void DownloadDepth(Image& image, vk::Buffer destination, uint64_t destination_offset,
+	                   uint64_t destination_capacity);
 	void CommitGpuWrite(Image& image);
+	void CommitGpuWrite(Image& image, const WriteClaim& claim);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);

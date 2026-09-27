@@ -822,6 +822,24 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_BACKING_INPLACE=0")
 	add_test(NAME buffer_cache_eager_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --readback-eager-only)
+	# KYTY_ALIAS_BYTES: byte ownership across partially overlapping writes (default), with image
+	# writebacks on, and off (whole-image ownership: the checks' failures are only reported).
+	add_test(NAME texture_cache_alias_bytes
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alias-bytes-only)
+	add_test(NAME texture_cache_alias_bytes_writeback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alias-bytes-only)
+	set_tests_properties(texture_cache_alias_bytes_writeback PROPERTIES
+		ENVIRONMENT "KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE=1")
+	add_test(NAME texture_cache_alias_bytes_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alias-bytes-only)
+	set_tests_properties(texture_cache_alias_bytes_off PROPERTIES
+		ENVIRONMENT "KYTY_ALIAS_BYTES=0")
+	add_test(NAME texture_cache_texel_sync_gpu_dirty
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texel-sync-gpu-dirty-only)
+	add_test(NAME texture_cache_texel_sync_gpu_dirty_whole_images
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texel-sync-gpu-dirty-only)
+	set_tests_properties(texture_cache_texel_sync_gpu_dirty_whole_images PROPERTIES
+		ENVIRONMENT "KYTY_ALIAS_BYTES=0")
 
 	if(WIN32)
 		# These tests still depend on the Windows multisample-depth path.
