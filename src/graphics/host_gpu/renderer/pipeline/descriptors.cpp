@@ -1579,8 +1579,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 	// State commands only: image transitions and the GDS dependency below go through the barrier
 	// batcher and are recorded at the caller's next flush point (the draw's BeginRendering, the
-	// dispatch's Handle()), before any command that accesses the resources.
-	auto   vk_buffer        = buffer.StateHandle();
+	// dispatch's Handle()), before any command that accesses the resources. Image::Transit takes
+	// this command buffer only as the batch target (identity; KYTY_CP_RECORDER records nothing
+	// through it).
+	const auto vk_buffer    = buffer.Identity();
 	size_t descriptor_count = 0;
 	size_t write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
@@ -1645,8 +1647,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				buffer.RequestBufferBarrier(barrier2, BarrierOrigin::Gds);
 			} else {
 				buffer.EndRendering();
-				vk_buffer.pipelineBarrier(source_stages, shader_stages, vk::DependencyFlags {}, 0,
-				                          nullptr, 1, &barrier, 0, nullptr);
+				buffer.StateHandle().pipelineBarrier(source_stages, shader_stages,
+				                                     vk::DependencyFlags {}, 0, nullptr, 1, &barrier,
+				                                     0, nullptr);
 			}
 		}
 

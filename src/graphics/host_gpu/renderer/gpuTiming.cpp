@@ -384,7 +384,7 @@ GpuTimestampRing::~GpuTimestampRing() {
 	m_graphics.device.destroyQueryPool(m_pool, nullptr);
 }
 
-void GpuTimestampRing::BeginCommand(vk::CommandBuffer buffer) {
+void GpuTimestampRing::BeginCommand(vk::CommandBuffer buffer, uint64_t record_ns) {
 	if (!Valid()) {
 		return;
 	}
@@ -402,7 +402,7 @@ void GpuTimestampRing::BeginCommand(vk::CommandBuffer buffer) {
 	EXIT_IF(slot.state != SlotState::Free);
 	slot           = {};
 	slot.tick      = std::numeric_limits<uint64_t>::max(); // never complete before Submitted()
-	slot.record_ns = GpuTiming::NowNs();
+	slot.record_ns = record_ns != 0 ? record_ns : GpuTiming::NowNs();
 	slot.state     = SlotState::Recording;
 	// Reset must precede the new writes in the same buffer and be outside rendering. The previous
 	// generation of this pair was collected, so its commands have completed.

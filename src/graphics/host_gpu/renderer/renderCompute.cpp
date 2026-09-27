@@ -383,9 +383,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindBuffers(bindings);
 
 	PreparedBindings* descriptor_stage = &bindings;
-	// Binding commits and the barrier requests below record state commands only (image
-	// transitions and dependencies are batched); the dispatch obtains the handle through
-	// Handle(), which records them first as one barrier.
+	// Emission safe point (KYTY_CP_RECORDER, render.h): no native handle from the preparation above
+	// is alive. Binding commits and the barrier requests below record state commands only (image
+	// transitions and dependencies are batched); the dispatch goes through Sink(), which records
+	// them first as one barrier, exactly as Handle() did.
+	buffer.BeginEmission();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
@@ -403,7 +405,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ShaderWriteHazardBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	buffer.Handle().dispatch(thread_group_x, thread_group_y, thread_group_z);
+	buffer.Sink().dispatch(thread_group_x, thread_group_y, thread_group_z);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -503,6 +505,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
 	PreparedBindings* descriptor_stage = &bindings;
+	// Emission safe point (see DispatchDirect).
+	buffer.BeginEmission();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const bool has_storage_writes = HasShaderBufferWrites(input_info.stage) ||
@@ -534,7 +538,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                                0, nullptr, 0, nullptr);
 	}
 	buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	buffer.Handle().dispatchIndirect(args_buffer->Handle(), args_offset);
+	buffer.Sink().dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }

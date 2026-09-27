@@ -98,6 +98,9 @@ void        LinkSite(Site& site) noexcept;
 // recording on behalf of another).
 void        EnterSite(Site& site, Site*& previous, bool& scope_owner) noexcept;
 void        LeaveSite(Site* previous, bool scope_owner) noexcept;
+// The calling thread's innermost site and outermost scope (nullptr outside any). The CP recorder
+// (commandRecorder.h) carries them with its packets and enters them on the recorder thread.
+void CurrentSites(const void** site, const void** scope) noexcept;
 } // namespace Detail
 
 // True once hooks are installed (counters and/or sampled capture).

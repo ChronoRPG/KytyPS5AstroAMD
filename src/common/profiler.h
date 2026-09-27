@@ -860,6 +860,22 @@ enum class FrameEvent : uint32_t {
 	EqueueCoalescedDataChanges,
 	// KYTY_DRAW_PREP_HOT: parked (cold) draw-prep workers woken because the unclaimed backlog grew.
 	DrawPrepColdWakes,
+	// KYTY_CP_RECORDER (commandRecorder.h): packets and bytes encoded, command buffers handed to
+	// the recorder, drains (CP waits until the recorder caught up, before native recording in a
+	// direct window), producer waits for ring space, wakes of a parked recorder, recorder parks,
+	// verify checks and mismatches (argument hash, sequence, digest, ownership), and placement
+	// samples (the recorder's processor against the CP's; SameCore: one physical core).
+	CpRecorderPackets,
+	CpRecorderBytes,
+	CpRecorderSubmits,
+	CpRecorderDrains,
+	CpRecorderRingFullWaits,
+	CpRecorderWakes,
+	CpRecorderParks,
+	CpRecorderVerifyChecks,
+	CpRecorderVerifyMismatches,
+	CpRecorderPlacementSamples,
+	CpRecorderSameCoreSamples,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip
@@ -938,6 +954,11 @@ enum class FrameWait : uint32_t {
 	ComputePipelineCreate,
 	// Background optimized compiles replacing fast-linked pipelines (not on the GPU thread).
 	PipelineOptimize,
+	// KYTY_CP_RECORDER: CP time in drains and waiting for ring space; recorder-thread time
+	// replaying packets (calls = batches).
+	CpRecorderDrain,
+	CpRecorderRingFull,
+	CpRecorderExecute,
 	Count,
 };
 

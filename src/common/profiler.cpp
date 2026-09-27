@@ -499,6 +499,17 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.EqueueCoalescedTriggers.Cumulative",
     "FrameEvent.EqueueCoalescedDataChanges.Cumulative",
     "FrameEvent.DrawPrepColdWakes.Cumulative",
+    "FrameEvent.CpRecorderPackets.Cumulative",
+    "FrameEvent.CpRecorderBytes.Cumulative",
+    "FrameEvent.CpRecorderSubmits.Cumulative",
+    "FrameEvent.CpRecorderDrains.Cumulative",
+    "FrameEvent.CpRecorderRingFullWaits.Cumulative",
+    "FrameEvent.CpRecorderWakes.Cumulative",
+    "FrameEvent.CpRecorderParks.Cumulative",
+    "FrameEvent.CpRecorderVerifyChecks.Cumulative",
+    "FrameEvent.CpRecorderVerifyMismatches.Cumulative",
+    "FrameEvent.CpRecorderPlacementSamples.Cumulative",
+    "FrameEvent.CpRecorderSameCoreSamples.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
@@ -550,6 +561,9 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.GraphicsPipelineDriver.Calls.Cumulative",
     "FrameWait.ComputePipelineCreate.Calls.Cumulative",
     "FrameWait.PipelineOptimize.Calls.Cumulative",
+    "FrameWait.CpRecorderDrain.Calls.Cumulative",
+    "FrameWait.CpRecorderRingFull.Calls.Cumulative",
+    "FrameWait.CpRecorderExecute.Calls.Cumulative",
 };
 static_assert(kFrameWaitCallNames.back() != nullptr, "FrameWait names must match the enum");
 constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
@@ -594,6 +608,9 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.GraphicsPipelineDriver.Nanoseconds.Cumulative",
     "FrameWait.ComputePipelineCreate.Nanoseconds.Cumulative",
     "FrameWait.PipelineOptimize.Nanoseconds.Cumulative",
+    "FrameWait.CpRecorderDrain.Nanoseconds.Cumulative",
+    "FrameWait.CpRecorderRingFull.Nanoseconds.Cumulative",
+    "FrameWait.CpRecorderExecute.Nanoseconds.Cumulative",
 };
 static_assert(kFrameWaitTimeNames.back() != nullptr, "FrameWait names must match the enum");
 

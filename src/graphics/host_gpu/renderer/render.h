@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/queueSubmission.h"
+#include "graphics/host_gpu/renderer/commandStream.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorSetReuse.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -38,6 +39,8 @@ struct DrawIndexBufferSource;
 struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
+class CommandRecorder;
+class CommandSink;
 struct RenderExecutorTestAccess;
 
 namespace DrawPrep {
@@ -190,6 +193,30 @@ public:
 	// barriers are recorded outside rendering first, unless they can be sunk (see above).
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+
+	// Recorder-aware recording (KYTY_CP_RECORDER, commandRecorder.h). A CommandSink has
+	// vk::CommandBuffer's method names; with the recorder off it records natively, exactly as the
+	// native handle would, and with the recorder on it encodes packets for the recorder thread.
+	//  - Sink(): Handle()'s semantics (pending batched barriers recorded first, a foreign command,
+	//    the push-constant shadow forgotten) without the drain Handle() needs in recorder mode.
+	//  - StateSink(): StateHandle()'s semantics, for state commands.
+	//  - EmissionSink(): StateSink() at an emission safe point (the draw's emission tail, a
+	//    dispatch): the caller holds no native handle obtained from Handle()/StateHandle(), so a
+	//    direct window opened by one of them (below) closes and commands go to the recorder again.
+	// In recorder mode Handle() and StateHandle() drain the recorder (it executes everything
+	// encoded so far) and open a direct window: the CP records natively, and every
+	// CommandBuffer method and sink records natively too, until the next safe point, Submit or
+	// Begin. Native handles must stay function locals, never live across a safe point.
+	[[nodiscard]] CommandSink Sink() const;
+	[[nodiscard]] CommandSink StateSink() const;
+	[[nodiscard]] CommandSink EmissionSink() const;
+	// Marks an emission safe point without a sink.
+	void BeginEmission() const { CloseDirectWindow(); }
+	// The native command buffer being recorded, for identity comparisons only (Image::Transit
+	// targets, the dynamic-state shadow). Never record through it.
+	[[nodiscard]] vk::CommandBuffer Identity() const noexcept { return m_buffer; }
+	// The recorder of this buffer's scheduler (null with KYTY_CP_RECORDER off).
+	[[nodiscard]] CommandRecorder* Recorder() const noexcept { return m_recorder; }
 
 	// Queues a global memory dependency (synchronization2 masks).
 	void RequestMemoryBarrier(vk::PipelineStageFlags2 src_stages, vk::AccessFlags2 src_access,
@@ -401,7 +428,428 @@ private:
 	// NoteFeedbackKeep() since the last BeginRendering() (at most one depth attachment per draw).
 	mutable std::optional<vk::ImageMemoryBarrier2> m_feedback_keep;
 
+	// KYTY_CP_RECORDER: the scheduler's recorder and its encoder (null when off), and whether a
+	// direct window is open (the CP records natively after a drain; see Sink()).
+	CommandRecorder*        m_recorder      = nullptr;
+	CommandStream::Encoder* m_encoder       = nullptr;
+	mutable bool            m_direct_window = false;
+	[[nodiscard]] bool      Encoding() const noexcept {
+		return m_encoder != nullptr && !m_direct_window;
+	}
+	void OpenDirectWindow(const void* caller) const;
+	void CloseDirectWindow() const;
+
 	friend class CommandScheduler;
+	friend class CommandSink;
+};
+
+// Native command recording for the recorder-aware paths (see CommandBuffer::Sink()). Every method
+// records into the native command buffer or encodes an identical packet (commandStream.h); the
+// choice is made per call, so a sink obtained before a direct window opened follows it.
+class CommandSink {
+public:
+	explicit CommandSink(const CommandBuffer& owner) noexcept: m_owner(&owner) {}
+
+	[[nodiscard]] vk::CommandBuffer Identity() const noexcept { return m_owner->m_buffer; }
+
+	void beginRendering(const vk::RenderingInfo& info) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->beginRendering(info);
+		} else {
+			m_owner->m_buffer.beginRendering(info);
+		}
+	}
+	void endRendering() const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->endRendering();
+		} else {
+			m_owner->m_buffer.endRendering();
+		}
+	}
+	void pipelineBarrier2(const vk::DependencyInfo& info) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->pipelineBarrier2(info);
+		} else {
+			m_owner->m_buffer.pipelineBarrier2(info);
+		}
+	}
+	void pipelineBarrier(vk::PipelineStageFlags src, vk::PipelineStageFlags dst,
+	                     vk::DependencyFlags flags, uint32_t memory_count,
+	                     const vk::MemoryBarrier* memory, uint32_t buffer_count,
+	                     const vk::BufferMemoryBarrier* buffers, uint32_t image_count,
+	                     const vk::ImageMemoryBarrier* images) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->pipelineBarrier(src, dst, flags, memory_count, memory, buffer_count,
+			                                    buffers, image_count, images);
+		} else {
+			m_owner->m_buffer.pipelineBarrier(src, dst, flags, memory_count, memory, buffer_count,
+			                                  buffers, image_count, images);
+		}
+	}
+	void copyBuffer(vk::Buffer source, vk::Buffer destination, uint32_t count,
+	                const vk::BufferCopy* regions) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->copyBuffer(source, destination, count, regions);
+		} else {
+			m_owner->m_buffer.copyBuffer(source, destination, count, regions);
+		}
+	}
+	void copyBufferToImage(vk::Buffer source, vk::Image destination, vk::ImageLayout layout,
+	                       uint32_t count, const vk::BufferImageCopy* regions) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->copyBufferToImage(source, destination, layout, count, regions);
+		} else {
+			m_owner->m_buffer.copyBufferToImage(source, destination, layout, count, regions);
+		}
+	}
+	void copyImageToBuffer(vk::Image source, vk::ImageLayout layout, vk::Buffer destination,
+	                       uint32_t count, const vk::BufferImageCopy* regions) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->copyImageToBuffer(source, layout, destination, count, regions);
+		} else {
+			m_owner->m_buffer.copyImageToBuffer(source, layout, destination, count, regions);
+		}
+	}
+	void copyImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
+	               vk::ImageLayout destination_layout, uint32_t count,
+	               const vk::ImageCopy* regions) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->copyImage(source, source_layout, destination, destination_layout,
+			                              count, regions);
+		} else {
+			m_owner->m_buffer.copyImage(source, source_layout, destination, destination_layout,
+			                            count, regions);
+		}
+	}
+	void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
+	                uint32_t value) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->fillBuffer(buffer, offset, size, value);
+		} else {
+			m_owner->m_buffer.fillBuffer(buffer, offset, size, value);
+		}
+	}
+	void bindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->bindPipeline(point, pipeline);
+		} else {
+			m_owner->m_buffer.bindPipeline(point, pipeline);
+		}
+	}
+	void bindDescriptorSets(vk::PipelineBindPoint point, vk::PipelineLayout layout,
+	                        uint32_t first_set, uint32_t set_count, const vk::DescriptorSet* sets,
+	                        uint32_t dynamic_count, const uint32_t* dynamic_offsets) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->bindDescriptorSets(point, layout, first_set, set_count, sets,
+			                                       dynamic_count, dynamic_offsets);
+		} else {
+			m_owner->m_buffer.bindDescriptorSets(point, layout, first_set, set_count, sets,
+			                                     dynamic_count, dynamic_offsets);
+		}
+	}
+	void pushDescriptorSetKHR(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
+	                          uint32_t count, const vk::WriteDescriptorSet* writes) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->pushDescriptorSetKHR(point, layout, set, count, writes);
+		} else {
+			m_owner->m_buffer.pushDescriptorSetKHR(point, layout, set, count, writes);
+		}
+	}
+	void pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t offset,
+	                   uint32_t size, const void* data) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->pushConstants(layout, stages, offset, size, data);
+		} else {
+			m_owner->m_buffer.pushConstants(layout, stages, offset, size, data);
+		}
+	}
+	void bindVertexBuffers2(uint32_t first, uint32_t count, const vk::Buffer* buffers,
+	                        const vk::DeviceSize* offsets, const vk::DeviceSize* sizes,
+	                        const vk::DeviceSize* strides) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->bindVertexBuffers2(first, count, buffers, offsets, sizes, strides);
+		} else {
+			m_owner->m_buffer.bindVertexBuffers2(first, count, buffers, offsets, sizes, strides);
+		}
+	}
+	void bindIndexBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType type) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->bindIndexBuffer(buffer, offset, type);
+		} else {
+			m_owner->m_buffer.bindIndexBuffer(buffer, offset, type);
+		}
+	}
+	void setViewportWithCount(uint32_t count, const vk::Viewport* viewports) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setViewportWithCount(count, viewports);
+		} else {
+			m_owner->m_buffer.setViewportWithCount(count, viewports);
+		}
+	}
+	void setScissorWithCount(uint32_t count, const vk::Rect2D* scissors) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setScissorWithCount(count, scissors);
+		} else {
+			m_owner->m_buffer.setScissorWithCount(count, scissors);
+		}
+	}
+	void setLineWidth(float width) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setLineWidth(width);
+		} else {
+			m_owner->m_buffer.setLineWidth(width);
+		}
+	}
+	void setBlendConstants(const float constants[4]) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setBlendConstants(constants);
+		} else {
+			m_owner->m_buffer.setBlendConstants(constants);
+		}
+	}
+	void setDepthTestEnable(vk::Bool32 enable) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setDepthTestEnable(enable);
+		} else {
+			m_owner->m_buffer.setDepthTestEnable(enable);
+		}
+	}
+	void setDepthWriteEnable(vk::Bool32 enable) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setDepthWriteEnable(enable);
+		} else {
+			m_owner->m_buffer.setDepthWriteEnable(enable);
+		}
+	}
+	void setDepthCompareOp(vk::CompareOp op) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setDepthCompareOp(op);
+		} else {
+			m_owner->m_buffer.setDepthCompareOp(op);
+		}
+	}
+	void setDepthBiasEnable(vk::Bool32 enable) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setDepthBiasEnable(enable);
+		} else {
+			m_owner->m_buffer.setDepthBiasEnable(enable);
+		}
+	}
+	void setDepthBias(float constant, float clamp, float slope) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setDepthBias(constant, clamp, slope);
+		} else {
+			m_owner->m_buffer.setDepthBias(constant, clamp, slope);
+		}
+	}
+	void setStencilTestEnable(vk::Bool32 enable) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setStencilTestEnable(enable);
+		} else {
+			m_owner->m_buffer.setStencilTestEnable(enable);
+		}
+	}
+	void setStencilOp(vk::StencilFaceFlags faces, vk::StencilOp fail, vk::StencilOp pass,
+	                  vk::StencilOp depth_fail, vk::CompareOp compare) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setStencilOp(faces, fail, pass, depth_fail, compare);
+		} else {
+			m_owner->m_buffer.setStencilOp(faces, fail, pass, depth_fail, compare);
+		}
+	}
+	void setStencilCompareMask(vk::StencilFaceFlags faces, uint32_t mask) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setStencilCompareMask(faces, mask);
+		} else {
+			m_owner->m_buffer.setStencilCompareMask(faces, mask);
+		}
+	}
+	void setStencilWriteMask(vk::StencilFaceFlags faces, uint32_t mask) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setStencilWriteMask(faces, mask);
+		} else {
+			m_owner->m_buffer.setStencilWriteMask(faces, mask);
+		}
+	}
+	void setStencilReference(vk::StencilFaceFlags faces, uint32_t reference) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setStencilReference(faces, reference);
+		} else {
+			m_owner->m_buffer.setStencilReference(faces, reference);
+		}
+	}
+	void setCullMode(vk::CullModeFlags mode) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setCullMode(mode);
+		} else {
+			m_owner->m_buffer.setCullMode(mode);
+		}
+	}
+	void setFrontFace(vk::FrontFace face) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setFrontFace(face);
+		} else {
+			m_owner->m_buffer.setFrontFace(face);
+		}
+	}
+	void setDepthBoundsTestEnable(vk::Bool32 enable) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setDepthBoundsTestEnable(enable);
+		} else {
+			m_owner->m_buffer.setDepthBoundsTestEnable(enable);
+		}
+	}
+	void setDepthBounds(float min, float max) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setDepthBounds(min, max);
+		} else {
+			m_owner->m_buffer.setDepthBounds(min, max);
+		}
+	}
+	void setColorWriteEnableEXT(uint32_t count, const vk::Bool32* enables) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setColorWriteEnableEXT(count, enables);
+		} else {
+			m_owner->m_buffer.setColorWriteEnableEXT(count, enables);
+		}
+	}
+	void setAttachmentFeedbackLoopEnableEXT(vk::ImageAspectFlags aspects) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->setAttachmentFeedbackLoopEnableEXT(aspects);
+		} else {
+			m_owner->m_buffer.setAttachmentFeedbackLoopEnableEXT(aspects);
+		}
+	}
+	void draw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
+	          uint32_t first_instance) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->draw(vertex_count, instance_count, first_vertex, first_instance);
+		} else {
+			m_owner->m_buffer.draw(vertex_count, instance_count, first_vertex, first_instance);
+		}
+	}
+	void drawIndexed(uint32_t index_count, uint32_t instance_count, uint32_t first_index,
+	                 int32_t vertex_offset, uint32_t first_instance) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->drawIndexed(index_count, instance_count, first_index, vertex_offset,
+			                                first_instance);
+		} else {
+			m_owner->m_buffer.drawIndexed(index_count, instance_count, first_index, vertex_offset,
+			                              first_instance);
+		}
+	}
+	void drawMeshTasksEXT(uint32_t x, uint32_t y, uint32_t z) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->drawMeshTasksEXT(x, y, z);
+		} else {
+			m_owner->m_buffer.drawMeshTasksEXT(x, y, z);
+		}
+	}
+	void drawMeshTasksIndirectEXT(vk::Buffer buffer, vk::DeviceSize offset, uint32_t draw_count,
+	                              uint32_t stride) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->drawMeshTasksIndirectEXT(buffer, offset, draw_count, stride);
+		} else {
+			m_owner->m_buffer.drawMeshTasksIndirectEXT(buffer, offset, draw_count, stride);
+		}
+	}
+	void drawMeshTasksIndirectCountEXT(vk::Buffer buffer, vk::DeviceSize offset,
+	                                   vk::Buffer count_buffer, vk::DeviceSize count_offset,
+	                                   uint32_t max_count, uint32_t stride) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->drawMeshTasksIndirectCountEXT(buffer, offset, count_buffer,
+			                                                  count_offset, max_count, stride);
+		} else {
+			m_owner->m_buffer.drawMeshTasksIndirectCountEXT(buffer, offset, count_buffer,
+			                                                count_offset, max_count, stride);
+		}
+	}
+	void drawIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t draw_count,
+	                  uint32_t stride) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->drawIndirect(buffer, offset, draw_count, stride);
+		} else {
+			m_owner->m_buffer.drawIndirect(buffer, offset, draw_count, stride);
+		}
+	}
+	void drawIndexedIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t draw_count,
+	                         uint32_t stride) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->drawIndexedIndirect(buffer, offset, draw_count, stride);
+		} else {
+			m_owner->m_buffer.drawIndexedIndirect(buffer, offset, draw_count, stride);
+		}
+	}
+	void drawIndirectCount(vk::Buffer buffer, vk::DeviceSize offset, vk::Buffer count_buffer,
+	                       vk::DeviceSize count_offset, uint32_t max_count, uint32_t stride) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->drawIndirectCount(buffer, offset, count_buffer, count_offset,
+			                                      max_count, stride);
+		} else {
+			m_owner->m_buffer.drawIndirectCount(buffer, offset, count_buffer, count_offset,
+			                                    max_count, stride);
+		}
+	}
+	void drawIndexedIndirectCount(vk::Buffer buffer, vk::DeviceSize offset, vk::Buffer count_buffer,
+	                              vk::DeviceSize count_offset, uint32_t max_count,
+	                              uint32_t stride) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->drawIndexedIndirectCount(buffer, offset, count_buffer, count_offset,
+			                                             max_count, stride);
+		} else {
+			m_owner->m_buffer.drawIndexedIndirectCount(buffer, offset, count_buffer, count_offset,
+			                                           max_count, stride);
+		}
+	}
+	void dispatch(uint32_t x, uint32_t y, uint32_t z) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->dispatch(x, y, z);
+		} else {
+			m_owner->m_buffer.dispatch(x, y, z);
+		}
+	}
+	void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->dispatchIndirect(buffer, offset);
+		} else {
+			m_owner->m_buffer.dispatchIndirect(buffer, offset);
+		}
+	}
+	void resetQueryPool(vk::QueryPool pool, uint32_t first, uint32_t count) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->resetQueryPool(pool, first, count);
+		} else {
+			m_owner->m_buffer.resetQueryPool(pool, first, count);
+		}
+	}
+	void beginQuery(vk::QueryPool pool, uint32_t query, vk::QueryControlFlags flags) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->beginQuery(pool, query, flags);
+		} else {
+			m_owner->m_buffer.beginQuery(pool, query, flags);
+		}
+	}
+	void endQuery(vk::QueryPool pool, uint32_t query) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->endQuery(pool, query);
+		} else {
+			m_owner->m_buffer.endQuery(pool, query);
+		}
+	}
+	void copyQueryPoolResults(vk::QueryPool pool, uint32_t first, uint32_t count,
+	                          vk::Buffer destination, vk::DeviceSize offset, vk::DeviceSize stride,
+	                          vk::QueryResultFlags flags) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->copyQueryPoolResults(pool, first, count, destination, offset,
+			                                         stride, flags);
+		} else {
+			m_owner->m_buffer.copyQueryPoolResults(pool, first, count, destination, offset, stride,
+			                                       flags);
+		}
+	}
+
+private:
+	const CommandBuffer* m_owner;
 };
 
 // Graphics dynamic state last recorded by a draw (KYTY_DYNAMIC_STATE_SHADOW). Dynamic state

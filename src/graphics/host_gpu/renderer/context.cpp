@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
@@ -20,6 +21,14 @@
 #include <bit>
 #include <cstdlib>
 #include <cstring>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define KYTY_RECORDER_CALLER() _ReturnAddress()
+#else
+#define KYTY_RECORDER_CALLER() __builtin_return_address(0)
+#endif
+
 namespace Libs::Graphics {
 
 // ------------------------------------------------------------------------------------------------
@@ -189,12 +198,62 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 	}
 	// Including push-constant updates with other layouts (helper passes, occlusion reductions).
 	m_push_constants.valid = false;
+	if (Encoding()) {
+		// KYTY_CP_RECORDER: the recorder executes everything encoded so far (including the batch
+		// flushed above); the caller then records natively at exactly this position.
+		OpenDirectWindow(KYTY_RECORDER_CALLER());
+	}
 	return m_buffer;
 }
 
 vk::CommandBuffer CommandBuffer::StateHandle() const {
 	EXIT_IF(IsInvalid());
+	if (Encoding()) {
+		OpenDirectWindow(KYTY_RECORDER_CALLER());
+	}
 	return m_buffer;
+}
+
+CommandSink CommandBuffer::Sink() const {
+	EXIT_IF(IsInvalid());
+	// Handle()'s logical effects, in the same order.
+	if (m_internal_recording == 0 && BarrierBatchEnabled()) {
+		FlushBarriers();
+		NoteForeignCommand();
+	}
+	m_push_constants.valid = false;
+	return CommandSink(*this);
+}
+
+CommandSink CommandBuffer::StateSink() const {
+	EXIT_IF(IsInvalid());
+	return CommandSink(*this);
+}
+
+CommandSink CommandBuffer::EmissionSink() const {
+	EXIT_IF(IsInvalid());
+	CloseDirectWindow();
+	return CommandSink(*this);
+}
+
+void CommandBuffer::OpenDirectWindow(const void* caller) const {
+	EXIT_IF(m_recorder == nullptr || m_direct_window);
+	// Drain attribution: the GpuOpProfiler site when active, else the caller of Handle().
+	const void* site  = nullptr;
+	const void* scope = nullptr;
+	if (GpuOpProfiler::Active()) {
+		GpuOpProfiler::Detail::CurrentSites(&site, &scope);
+	}
+	m_recorder->Drain(site != nullptr ? site : caller, site != nullptr);
+	m_direct_window = true;
+	m_recorder->SetWindowOpen(true);
+}
+
+void CommandBuffer::CloseDirectWindow() const {
+	if (m_direct_window) {
+		m_direct_window = false;
+		m_recorder->SetWindowOpen(false);
+	}
 }
 
 void CommandBuffer::ResetBarrierState() const {
@@ -395,10 +454,11 @@ void CommandBuffer::RecordPendingUploads() const {
 		dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(destinations.size());
 		dependency.pBufferMemoryBarriers    = destinations.data();
 	}
-	m_buffer.pipelineBarrier2(dependency);
+	const auto sink = StateSink();
+	sink.pipelineBarrier2(dependency);
 	for (const auto& upload: m_pending.uploads) {
-		m_buffer.copyBuffer(upload.source, upload.destination, upload.region_count,
-		                    m_pending.upload_regions.data() + upload.first_region);
+		sink.copyBuffer(upload.source, upload.destination, upload.region_count,
+		                m_pending.upload_regions.data() + upload.first_region);
 	}
 	--m_internal_recording;
 	MemoryStats::Count(MemoryStats::Counter::UploadCopies, m_pending.uploads.size());
@@ -483,7 +543,7 @@ void CommandBuffer::FlushBarriers() const {
 	dependency.pBufferMemoryBarriers    = m_pending.buffers.data();
 	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(m_pending.images.size());
 	dependency.pImageMemoryBarriers     = m_pending.images.data();
-	m_buffer.pipelineBarrier2(dependency);
+	StateSink().pipelineBarrier2(dependency);
 	--m_internal_recording;
 
 	m_last_memory_valid = m_pending.has_memory;
@@ -545,6 +605,13 @@ void CommandBuffer::Begin() {
 	m_push_constants.valid = false;
 	// Commands of other submissions can precede this buffer on the queue: no epoch, no elision.
 	ResetBarrierState();
+	m_direct_window = false;
+	if (m_recorder != nullptr) {
+		m_recorder->SetWindowOpen(false);
+		// KYTY_CP_RECORDER: the recorder begins the native buffer (CommandScheduler::BeginCommand
+		// encodes the Begin packet right after this).
+		return;
+	}
 	auto buffer = StateHandle();
 
 	vk::CommandBufferBeginInfo begin_info {};
@@ -577,7 +644,7 @@ void CommandBuffer::BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipel
 		return;
 	}
 	// State commands: not ordered by barriers, so not a batch flush point (render.h).
-	StateHandle().bindPipeline(point, pipeline);
+	StateSink().bindPipeline(point, pipeline);
 	current = pipeline;
 }
 
@@ -598,7 +665,7 @@ void CommandBuffer::BindDescriptorSet(vk::PipelineBindPoint point, vk::PipelineL
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorSetBindsAvoided);
 		return;
 	}
-	StateHandle().bindDescriptorSets(point, layout, 0, 1, &set, 0, nullptr);
+	StateSink().bindDescriptorSets(point, layout, 0, 1, &set, 0, nullptr);
 	state.layout    = DescriptorSetReuseEnabled() ? layout : nullptr;
 	state.bound_set = DescriptorSetReuseEnabled() ? set : nullptr;
 	state.writes.clear();
@@ -617,7 +684,7 @@ void CommandBuffer::PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlag
 		Profiler::CountFrameEvent(Profiler::FrameEvent::PushConstantUpdatesAvoided);
 		return;
 	}
-	StateHandle().pushConstants(layout, stages, 0, size, data);
+	StateSink().pushConstants(layout, stages, 0, size, data);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::PushConstantUpdates);
 	shadow.valid = PushConstantShadowEnabled() && size <= sizeof(shadow.dwords);
 	if (shadow.valid) {
@@ -680,7 +747,7 @@ int32_t CommandBuffer::PushDescriptors(vk::PipelineBindPoint point, vk::Pipeline
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushesAvoided);
 		return result;
 	}
-	StateHandle().pushDescriptorSetKHR(point, layout, set, count, writes);
+	StateSink().pushDescriptorSetKHR(point, layout, set, count, writes);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushes);
 	state.layout    = nullptr;
 	state.bound_set = nullptr;
@@ -821,7 +888,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	StateHandle().beginRendering(rendering);
+	StateSink().beginRendering(rendering);
 	m_context.GetOcclusionCounter().Begin();
 	--m_internal_recording;
 	if (m_context.GetOcclusionCounter().Active() &&
@@ -857,7 +924,7 @@ void CommandBuffer::EndRendering() const {
 	// The occlusion counter may also record a query reduction here (Accumulate): foreign work.
 	++m_internal_recording;
 	m_context.GetOcclusionCounter().End();
-	StateHandle().endRendering();
+	StateSink().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
 	m_context.GetOcclusionCounter().Accumulate();

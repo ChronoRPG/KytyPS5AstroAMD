@@ -387,7 +387,7 @@ static bool DynamicStateShadowEnabled() {
 class DynamicStateRecorder {
 public:
 	DynamicStateRecorder(GraphicsDynamicStateShadow& shadow, const CommandBuffer& buffer,
-	                     vk::CommandBuffer vk_buffer)
+	                     vk::CommandBuffer vk_buffer /* identity */)
 	    : m_shadow(shadow) {
 		m_reuse = DynamicStateShadowEnabled() && shadow.valid && shadow.command == vk_buffer &&
 		          shadow.pipeline != nullptr &&
@@ -435,12 +435,12 @@ private:
 	uint64_t                    m_avoided = 0;
 };
 
-static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
+static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandSink& vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
                                      const RenderDepthInfo& depth, const RenderState& rendering,
                                      GraphicsDynamicStateShadow& shadow) {
 	KYTY_PROFILER_FUNCTION();
-	DynamicStateRecorder recorder(shadow, buffer, vk_buffer);
+	DynamicStateRecorder recorder(shadow, buffer, vk_buffer.Identity());
 
 	const auto& ctx = buffer.GetRegisters();
 	const auto&        vp  = ctx.GetScreenViewport();
@@ -739,7 +739,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		image.Transit(layout, image.binding.attachment_access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
-		              buffer.StateHandle(), true);
+		              buffer.Identity(), true);
 		const auto extent       = target.Extent();
 		state.width             = std::min(state.width, extent.width);
 		state.height            = std::min(state.height, extent.height);
@@ -873,7 +873,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		image.Transit(layout, access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
-		              buffer.StateHandle(), true);
+		              buffer.Identity(), true);
 		state.width               = std::min(state.width, depth.desc.info.extent.width);
 		state.height              = std::min(state.height, depth.desc.info.extent.height);
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
@@ -1125,7 +1125,7 @@ static PreparedIndirectBuffers ObtainIndirectBuffers(CommandBuffer&            b
 
 // Shader and transfer writes (compute culling, DMA, cache uploads) -> indirect command fetch.
 // Must be recorded outside a rendering instance.
-static void IndirectArgumentsBarrier(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer) {
+static void IndirectArgumentsBarrier(const CommandBuffer& buffer, const CommandSink& vk_buffer) {
 	if (BarrierBatchEnabled()) {
 		// Recorded (outside rendering) by the BeginRendering() that precedes the draw.
 		buffer.RequestMemoryBarrier(vk::PipelineStageFlagBits2::eAllGraphics |
@@ -1148,7 +1148,7 @@ static void IndirectArgumentsBarrier(const CommandBuffer& buffer, vk::CommandBuf
 	                          nullptr, 0, nullptr);
 }
 
-static void EmitIndirectDraw(vk::CommandBuffer vk_buffer, const DrawIndirectSource& source,
+static void EmitIndirectDraw(const CommandSink& vk_buffer, const DrawIndirectSource& source,
                              const PreparedIndirectBuffers& prepared) {
 	if (source.count_addr != 0) {
 		if (source.indexed) {
@@ -1540,7 +1540,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	return prepared;
 }
 
-static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
+static void CommitVertexBuffers(const CommandSink&           vk_buffer,
                                 const PreparedVertexBuffers& prepared) {
 	for (uint32_t i = 0; i < prepared.count; i++) {
 		EXIT_IF(prepared.buffers[i] == nullptr);
@@ -1552,7 +1552,7 @@ static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
 	}
 }
 
-static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
+static void CommitIndexBuffer(const CommandSink& vk_buffer, const PreparedIndexBuffer& prepared) {
 	if (prepared.buffer == nullptr) {
 		return;
 	}
@@ -1578,7 +1578,7 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	                  draw.index_count, index_addr);
 }
 
-static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
+static void EmitDrawPrimitives(const HW::UserConfig& ucfg, const CommandSink& vk_buffer,
                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
@@ -1905,7 +1905,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const CommandBuffer::DrawScope draw_scope(
 	    buffer, DrawIsBarrierSafe(stages, state.color_info, state.color_count, state.depth_info,
 	                              feedback_aspects, indirect != nullptr, plain_pixel));
-	auto vk_buffer = buffer.StateHandle();
+	// Emission safe point (KYTY_CP_RECORDER): no native handle obtained during the preparation above
+	// is alive; from here the draw's commands go to the recorder (render.h, CommandBuffer::Sink).
+	const auto vk_buffer = buffer.EmissionSink();
 	SetDrawDebugPhase(buffer, submit_id, draw, emit, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
@@ -1968,7 +1970,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// The shadow now describes this command buffer with this pipeline bound. A pipeline without
 	// color attachments declares no dynamic color-write enable, so binding it invalidated that
 	// state for later pipelines.
-	m_dynamic_state.command  = vk_buffer;
+	m_dynamic_state.command  = vk_buffer.Identity();
 	m_dynamic_state.pipeline = pipeline.pipeline;
 	if (state.color_count == 0) {
 		m_dynamic_state.color_write_valid = false;

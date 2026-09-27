@@ -19,6 +19,7 @@
 namespace Libs::Graphics {
 
 class GpuTimestampRing;
+class CommandRecorder;
 
 // Host work that commands of the current recording read and that finishes after recording
 // (TextureCache staging copies made on a worker). Submit makes the batch wait for it on the
@@ -116,6 +117,14 @@ public:
 	void SetSubmitDependency(SubmitDependency* dependency, uint32_t slot = 0) noexcept {
 		m_submit_dependencies[slot] = dependency;
 	}
+	// KYTY_CP_RECORDER (commandRecorder.h): the guest scheduler's recorder, or null.
+	[[nodiscard]] CommandRecorder* Recorder() const noexcept { return m_recorder.get(); }
+	// Waits until the recorder has handed tick `tick` (and every older one) to the queue or the
+	// submission broker; a no-op without a recorder. Code that assumes "every tick older than the
+	// current recording reached the queue or the broker" calls it first. from_producer: called by
+	// the recording thread (the recorder is then woken first). Never call it while holding
+	// GraphicContext::queue_mutex: the recorder may need it to submit.
+	void WaitRecorded(uint64_t tick, bool from_producer = true);
 
 private:
 	class CommandPool {
@@ -125,6 +134,9 @@ private:
 		KYTY_CLASS_NO_COPY(CommandPool);
 
 		vk::CommandBuffer Commit();
+		// KYTY_CP_RECORDER: the recorder records from this pool; growing it (the only pool call
+		// the recording thread makes) drains the recorder first.
+		void SetRecorder(CommandRecorder* recorder) noexcept { m_recorder = recorder; }
 
 	private:
 		static constexpr size_t GrowStep = 4;
@@ -133,6 +145,7 @@ private:
 
 		GraphicContext&                m_graphics;
 		MasterSemaphore&               m_master;
+		CommandRecorder*               m_recorder = nullptr;
 		vk::CommandPool                m_pool = nullptr;
 		std::vector<vk::CommandBuffer> m_buffers;
 		std::vector<uint64_t>          m_ticks;
@@ -179,6 +192,9 @@ private:
 	// Guest scheduler with KYTY_GPU_OP_PROFILE / counters enabled (gpuOpProfiler.h).
 	bool m_gpu_ops = false;
 	std::array<SubmitDependency*, SubmitDependencySlots> m_submit_dependencies {};
+	// KYTY_CP_RECORDER: the recorder thread of the guest scheduler (after m_gpu_timing, whose
+	// ring it drives; destroyed before it).
+	std::unique_ptr<CommandRecorder> m_recorder;
 	// Declared last: the runner starts in the constructor and uses the members above.
 	std::jthread m_priority_thread;
 };

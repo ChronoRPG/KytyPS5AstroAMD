@@ -6,6 +6,7 @@
 #include "common/rendererBatch.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
@@ -89,6 +90,10 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 		found = search(0, m_hint);
 	}
 	if (!found) {
+		if (m_recorder != nullptr) {
+			// vkAllocateCommandBuffers needs the pool the recorder may be recording from.
+			m_recorder->Drain(nullptr, false);
+		}
 		found           = Grow();
 		m_ticks[*found] = m_master.CurrentTick();
 	}
@@ -102,7 +107,9 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 }
 
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics, Role role)
-    : m_master(graphics), m_context(context), m_graphics(graphics),
+    : m_master(graphics,
+               role == Role::Guest && CommandRecorder::ConfiguredMode() != CommandRecorder::Mode::Off),
+      m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
 	if (role == Role::Guest && GpuTiming::Enabled()) {
@@ -112,6 +119,14 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 		}
 	}
 	m_gpu_ops = role == Role::Guest && GpuOpProfiler::Enabled();
+	if (const auto mode = CommandRecorder::ConfiguredMode();
+	    role == Role::Guest && mode != CommandRecorder::Mode::Off) {
+		m_recorder = std::make_unique<CommandRecorder>(graphics, m_master, m_gpu_timing.get(),
+		                                               m_gpu_ops, mode);
+		m_command.m_recorder = m_recorder.get();
+		m_command.m_encoder  = &m_recorder->Encoder();
+		m_command_pool.SetRecorder(m_recorder.get());
+	}
 }
 
 CommandScheduler::~CommandScheduler() {
@@ -142,6 +157,11 @@ void CommandScheduler::Shutdown() {
 		Submit({}, true);
 	}
 	m_master.Wait(CurrentTick() - 1);
+	if (m_recorder != nullptr) {
+		// Every tick was recorded and handed to the queue: stop the recorder thread before the
+		// timing ring (its single producer until now) and the pool are used from here.
+		m_recorder->Stop();
+	}
 	if (m_gpu_timing) {
 		// Every submitted tick is complete: collect the remaining pairs before the ring (and its
 		// query pool) is destroyed with this scheduler. No slot is left recording here.
@@ -461,6 +481,13 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	if (m_recorder != nullptr) {
+		// The recorder begins the native buffer and stamps KYTY_GPU_TIMING / GpuOpProfiler there,
+		// with this recording's tick and start time.
+		m_recorder->Begin(m_command.m_buffer, m_master.CurrentTick(),
+		                  m_gpu_timing ? GpuTiming::NowNs() : 0);
+		return m_command;
+	}
 	if (m_gpu_timing) {
 		// Reuse the retirement point that just recycled a command buffer: read completed pairs
 		// without waiting, then reset and stamp this buffer's pair before any rendering begins.
@@ -512,6 +539,37 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 	};
 
 	const uint64_t submit_ns = m_gpu_timing ? GpuTiming::NowNs() : 0;
+	if (m_recorder != nullptr) {
+		// KYTY_CP_RECORDER: the final render-pass end and barrier batch are encoded like every
+		// other command (or recorded natively in an open direct window); the recorder then stamps
+		// the timing end, ends the buffer and hands it to the broker or the queue. The tick is
+		// allocated here, exactly as in queued mode.
+		m_command.EndRendering();
+		m_command.FlushBarriers();
+		m_command.CloseDirectWindow();
+		CommandStream::SubmitPacket packet;
+		packet.submit       = submit;
+		packet.submit_ns    = submit_ns;
+		packet.debug_op     = m_command.m_debug_op;
+		packet.debug_submit = m_command.m_debug_submit_id;
+		packet.debug_arg0   = m_command.m_debug_arg0;
+		packet.debug_arg1   = m_command.m_debug_arg1;
+		packet.debug_arg2   = m_command.m_debug_arg2;
+		packet.debug_arg3   = m_command.m_debug_arg3;
+		packet.debug_arg4   = m_command.m_debug_arg4;
+		{
+			std::lock_guard lock(m_operation_mutex);
+			count_boundary();
+			packet.tick = m_master.NextTick();
+			packet.submit.AddSignal(m_master.Handle(), packet.tick);
+			packet.preserve_completion =
+			    (force_completion || m_preserve_current_completion) ? 1u : 0u;
+			m_preserve_current_completion = false;
+		}
+		m_recorder->Submit(packet);
+		m_command.m_buffer = nullptr;
+		return packet.tick;
+	}
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("CommandScheduler::SubmitEnd");
 		if (m_gpu_timing) {
@@ -612,6 +670,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 
 	m_command.m_buffer = nullptr;
 	return tick;
+}
+
+void CommandScheduler::WaitRecorded(uint64_t tick, bool from_producer) {
+	if (m_recorder != nullptr && m_recorder->GetMode() == CommandRecorder::Mode::Thread) {
+		m_recorder->WaitRecorded(tick, from_producer);
+	}
 }
 
 void CommandScheduler::BeginNext() {

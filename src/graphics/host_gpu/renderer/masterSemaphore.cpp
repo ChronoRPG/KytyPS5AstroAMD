@@ -9,8 +9,9 @@
 
 namespace Libs::Graphics {
 
-MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
-	if (graphics.submission_queue.Enabled()) {
+MasterSemaphore::MasterSemaphore(GraphicContext& graphics, bool track_dispatch)
+    : m_graphics(graphics) {
+	if (graphics.submission_queue.Enabled() || track_dispatch) {
 		m_submission_progress = std::make_shared<SubmissionProgress>();
 	}
 	vk::SemaphoreTypeCreateInfo type_info {};
