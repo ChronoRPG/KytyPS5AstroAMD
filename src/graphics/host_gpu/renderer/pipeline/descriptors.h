@@ -62,6 +62,15 @@ struct PreparedBindings {
 	// by RenderExecutor::PrepareBindings (null program: none).
 	const ShaderRecompiler::IR::CompiledShaderInfo*      texture_program = nullptr;
 	std::vector<ShaderRecompiler::IR::DescriptorValue> texture_words;
+	// The stage's earlier texture sets (program, T# words, resolved bindings), most recent first,
+	// for stages alternating between a few sets (desert mesh stamps: about three per frame). Swapped
+	// with the current set, never copied; their bindings are revalidated like the current ones.
+	struct TextureSet {
+		const ShaderRecompiler::IR::CompiledShaderInfo*      program = nullptr;
+		std::vector<ShaderRecompiler::IR::DescriptorValue> words;
+		std::vector<TextureBinding>                         images;
+	};
+	std::array<TextureSet, 3> texture_history {};
 };
 
 [[nodiscard]] vk::DescriptorType

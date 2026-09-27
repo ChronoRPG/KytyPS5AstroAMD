@@ -624,6 +624,7 @@ private:
 		uint64_t target_records    = 0;
 		uint64_t texture_repeats   = 0;
 		uint64_t texture_misses    = 0;
+		uint64_t texture_history_hits = 0;
 		uint64_t view_repeats      = 0;
 		uint64_t verify_checks     = 0;
 		uint64_t verify_mismatches = 0;

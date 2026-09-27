@@ -851,6 +851,9 @@ enum class FrameEvent : uint32_t {
 	DrawPrepUncleanHintPublication,
 	DrawPrepUncleanExact,
 	DrawPrepUncleanBacking,
+	// KYTY_DRAW_SEQUENCE_FAST, textures: stages whose T# words matched one of their earlier sets
+	// (PreparedBindings::texture_history), before that set's repeat was checked.
+	DrawSequenceTextureHistoryHits,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

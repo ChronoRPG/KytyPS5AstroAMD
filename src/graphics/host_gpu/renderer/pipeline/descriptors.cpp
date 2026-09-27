@@ -1023,13 +1023,42 @@ void RenderExecutor::ResetBindings() {
 bool RenderExecutor::RepeatStageTextures(const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                          const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
                                          PreparedBindings&                               prepared) {
-	if (!DrawSequenceEnabled(DrawSequencePart::Textures) || !TextureBindingMemo::Enabled() ||
-	    prepared.texture_program != &program || prepared.images.empty() ||
-	    !std::ranges::equal(prepared.texture_words, snapshot.images)) {
+	if (!DrawSequenceEnabled(DrawSequencePart::Textures) || !TextureBindingMemo::Enabled()) {
+		return false;
+	}
+	auto&      totals  = m_draw_sequence_totals;
+	const auto matches = [&](const ShaderRecompiler::IR::CompiledShaderInfo*  set_program,
+	                         const std::vector<ShaderRecompiler::IR::DescriptorValue>& words) {
+		return set_program == &program && std::ranges::equal(words, snapshot.images);
+	};
+	if (!matches(prepared.texture_program, prepared.texture_words)) {
+		auto&      history = prepared.texture_history;
+		const auto found   = std::ranges::find_if(
+            history, [&](const auto& set) { return matches(set.program, set.words); });
+		if (found == history.end()) {
+			// New words: the current set becomes the most recent earlier one, and the caller
+			// resolves into the oldest one's vectors (their capacity is reused).
+			if (prepared.texture_program != nullptr) {
+				std::rotate(history.begin(), history.end() - 1, history.end());
+				std::swap(history.front().program, prepared.texture_program);
+				std::swap(history.front().words, prepared.texture_words);
+				std::swap(history.front().images, prepared.images);
+			}
+			prepared.texture_program = nullptr;
+			return false;
+		}
+		// An earlier set of these words becomes the current one (the current set takes its
+		// place); its bindings are validated below like the current set's.
+		std::swap(found->program, prepared.texture_program);
+		std::swap(found->words, prepared.texture_words);
+		std::swap(found->images, prepared.images);
+		totals.texture_history_hits++;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTextureHistoryHits);
+	}
+	if (prepared.images.empty()) {
 		return false;
 	}
 	auto&      texture_cache = m_context.GetTextureCache();
-	auto&      totals        = m_draw_sequence_totals;
 	const bool verify        = DrawSequenceVerifyMode() != 0;
 	if (!m_texture_memo.TryRepeatResolve(texture_cache, prepared.images, !verify)) {
 		totals.texture_misses++;
@@ -1090,10 +1119,10 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shader_data_buffer = {};
 	prepared.buffer_sources.clear();
 	prepared.buffers.clear();
-	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
 	if (!RepeatStageTextures(program, snapshot, prepared)) {
+		prepared.images.resize(program.info.images.size());
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& binding = prepared.images[i];
 			ResolveTexture(program.info.images[i], snapshot.images[i], binding);

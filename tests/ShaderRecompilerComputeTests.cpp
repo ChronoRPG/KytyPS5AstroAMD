@@ -11757,6 +11757,26 @@ public:
                     totals().view_repeats == s1.view_repeats + 2 * one,
                 "the stage did not repeat once its new words were resolved and revalidated");
 
+        // Alternating between the two sets (as the desert stamps do): each switch finds the other
+        // set in the stage's history and repeats it.
+        const auto words_b = snapshot.images[1];
+        snapshot.images[1] = value;
+        const auto h0 = totals();
+        bind_stage();
+        Require(name, "history repeat",
+                totals().texture_history_hits == h0.texture_history_hits + one &&
+                    totals().texture_repeats == h0.texture_repeats + one &&
+                    prepared.images[1].image_id == prepared.images[0].image_id,
+                "switching back to an earlier T# set did not repeat it from the history");
+        snapshot.images[1] = words_b;
+        const auto h1 = totals();
+        bind_stage();
+        Require(name, "history repeat back",
+                totals().texture_history_hits == h1.texture_history_hits + one &&
+                    totals().texture_repeats == h1.texture_repeats + one &&
+                    prepared.images[1].image_id != prepared.images[0].image_id,
+                "switching to the other T# set again did not repeat it from the history");
+
         // A guest write to the first texture: its resolution still repeats (it does not depend on
         // the contents), its view does not (FindTexture refreshes the image).
         WriteMetadata(context, texture_address, width * height * 4, 0x40404040u);
