@@ -3115,6 +3115,68 @@ public:
                 ordered_finished.load(),
             "submit done did not drain prior PM4 work");
 
+    // Frame fence (KYTY_FRAME_FENCE, 4bbd701b): a submission admitted after a bounded Done
+    // starts only once every submission admitted before that Done has completed, on any
+    // queue. Frame N is a graphics submission suspended on WAIT_REG_MEM; frame N+1, admitted
+    // after one Done, is an async-compute label write. With the fence the write waits for
+    // frame N; without it the write overtakes the suspended frame (the cross-queue order that
+    // broke Astro Bot's water). An idle Done (KYTY_AGC_DONE_MODE=idle) would wait for the
+    // suspended frame itself, so the check needs the bounded Done.
+    const char *done_mode = std::getenv("KYTY_AGC_DONE_MODE");
+    if (done_mode == nullptr || std::strcmp(done_mode, "idle") != 0) {
+      const char *fence_mode = std::getenv("KYTY_FRAME_FENCE");
+      const bool frame_fence =
+          fence_mode == nullptr || std::strcmp(fence_mode, "0") != 0;
+      uint32_t fence_label = 0;
+      uint32_t fence_prefix = 0;
+      uint32_t fence_suffix = 0;
+      uint32_t fence_compute = 0;
+      std::array<uint32_t, 17> frame_n{};
+      frame_n[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+      frame_n[2] = static_cast<uint32_t>(address(&fence_prefix));
+      frame_n[3] = static_cast<uint32_t>(address(&fence_prefix) >> 32u);
+      frame_n[4] = 11;
+      frame_n[5] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+      frame_n[6] = 0x10u | 3u;
+      frame_n[7] = static_cast<uint32_t>(address(&fence_label));
+      frame_n[8] = static_cast<uint32_t>(address(&fence_label) >> 32u);
+      frame_n[9] = 1;
+      frame_n[10] = UINT32_MAX;
+      frame_n[12] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+      frame_n[14] = static_cast<uint32_t>(address(&fence_suffix));
+      frame_n[15] = static_cast<uint32_t>(address(&fence_suffix) >> 32u);
+      frame_n[16] = 22;
+      std::array<uint32_t, 5> frame_n1{};
+      write_packet(frame_n1.data(), &fence_compute, 33);
+
+      gpu.Submit(frame_n, {});
+      gpu.Done(); // bounded: records the frame boundary; nothing earlier is pending
+      gpu.SubmitCompute(0x20, frame_n1);
+      // Host commands run between packets. Observe frame N suspended and whether frame N+1
+      // ran before it completed; stay far below the fence's 2 s safety timeout.
+      bool suspended = false;
+      bool compute_overtook = false;
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+      while (std::chrono::steady_clock::now() < deadline &&
+             !(suspended && compute_overtook)) {
+        gpu.SendCommandSync([&] {
+          suspended = fence_prefix == 11 && fence_suffix == 0;
+          compute_overtook |= fence_compute == 33 && fence_suffix == 0;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+      gpu.SendCommandSync([&] { fence_label = 1; });
+      drain_submissions();
+      Require("GpuCommandLane", "frame fence",
+              suspended && fence_suffix == 22 && fence_compute == 33 &&
+                  compute_overtook == !frame_fence,
+              frame_fence ? "async compute admitted after Done ran before the previous "
+                            "frame's suspended submission completed"
+                          : "with KYTY_FRAME_FENCE=0 async compute did not run while the "
+                            "previous frame was suspended");
+    }
+
     auto &resources = context;
     constexpr uint64_t empty_unmap_base = 0x0000000200400000ull;
     constexpr uint64_t empty_unmap_size = 0x4000;
