@@ -2535,12 +2535,24 @@ void BufferCache::RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value)
 	}
 	m_known_fills.push_back({vaddr, size, value});
 	m_has_known_fills.store(true, std::memory_order_release);
+	m_known_fill_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 std::optional<uint32_t> BufferCache::KnownFill(uint64_t vaddr, uint64_t size) const {
+	std::scoped_lock lock(m_known_fill_mutex);
+	return KnownFillLocked(vaddr, size);
+}
+
+std::optional<uint32_t> BufferCache::KnownFill(uint64_t vaddr, uint64_t size,
+                                               uint64_t& generation) const {
+	std::scoped_lock lock(m_known_fill_mutex);
+	generation = m_known_fill_generation.load(std::memory_order_relaxed);
+	return KnownFillLocked(vaddr, size);
+}
+
+std::optional<uint32_t> BufferCache::KnownFillLocked(uint64_t vaddr, uint64_t size) const {
 	// The range may be covered by several adjacent fills (e.g. per-slice consumption); all of
 	// them must carry the same value.
-	std::scoped_lock        lock(m_known_fill_mutex);
 	const uint64_t          end    = vaddr + size;
 	uint64_t                cursor = vaddr;
 	std::optional<uint32_t> value;
@@ -2595,6 +2607,10 @@ void BufferCache::ForgetKnownFillsLocked(uint64_t vaddr, uint64_t size) {
 	}
 	m_known_fills.swap(kept);
 	m_has_known_fills.store(!m_known_fills.empty(), std::memory_order_release);
+	m_known_fill_generation.fetch_add(1, std::memory_order_acq_rel);
+	if (!GuestGpu::IsGpuThread()) {
+		m_known_fill_foreign.fetch_add(1, std::memory_order_acq_rel);
+	}
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -2695,6 +2711,26 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::IsRegionGpuModifiedRelaxed(uint64_t vaddr, uint64_t size) const {
 	return m_memory_tracker.IsRegionGpuModifiedRelaxed(vaddr, size);
+}
+
+BufferCache::PageStates BufferCache::CountPageStates(uint64_t vaddr, uint64_t size) const {
+	PageStates states;
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return states;
+	}
+	const auto end = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	for (auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE); page < end;
+	     page += TRACKER_PAGE_SIZE) {
+		MemoryTracker::DirtyState state;
+		if (!m_memory_tracker.QueryDirtyRelaxed(page, TRACKER_PAGE_SIZE, state)) {
+			states.untracked++;
+		} else if (state.gpu) {
+			states.gpu_dirty++;
+		} else if (!state.cpu) {
+			states.clean++;
+		}
+	}
+	return states;
 }
 
 bool BufferCache::GpuDirtyMirrorMatches(uint64_t vaddr, uint64_t size) {

@@ -25,8 +25,10 @@
 #include "loader/systemContent.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
@@ -904,6 +906,21 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
+// KYTY_TITLE_UPDATE=sync restores the synchronous title update (the present thread waits for the
+// window thread).
+static bool TitleUpdateSync() {
+	static const bool sync = [] {
+		const auto* value = std::getenv("KYTY_TITLE_UPDATE");
+		return value != nullptr && std::strcmp(value, "sync") == 0;
+	}();
+	return sync;
+}
+
+static std::mutex   g_title_mutex;
+static std::string  g_title_text;
+static SDL_WindowID g_title_window_id     = 0;
+static bool         g_title_update_queued = false;
+
 void WindowContext::UpdateTitle() {
 	static char title[128];
 	static char title_id[12];
@@ -945,16 +962,49 @@ void WindowContext::UpdateTitle() {
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
 
-	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
+	if (TitleUpdateSync()) {
+		struct TitleUpdate {
+			SDL_Window*  window;
+			std::string* text;
+		} update {window, &text};
+		EXIT_IF(!SDL_RunOnMainThread(
+		    [](void* data) {
+			    auto& title = *static_cast<TitleUpdate*>(data);
+			    SDL_SetWindowTitle(title.window, title.text->c_str());
+		    },
+		    &update, true));
+		return;
+	}
+
+	// The present thread calls this before it fires the flip events, so it must not wait for the
+	// window thread: that thread runs at the guest threads' priority and, when every CPU is busy,
+	// can stay ready for a whole quantum. The newest title goes into one slot, and at most one
+	// main-thread callback is queued to apply it (bounded, however long the main thread lags).
+	{
+		std::lock_guard lock(g_title_mutex);
+		g_title_text      = std::move(text);
+		g_title_window_id = SDL_GetWindowID(window);
+		if (g_title_update_queued) {
+			return;
+		}
+		g_title_update_queued = true;
+	}
 	EXIT_IF(!SDL_RunOnMainThread(
-	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
+	    [](void* /*data*/) {
+		    std::string  pending_text;
+		    SDL_WindowID window_id = 0;
+		    {
+			    std::lock_guard lock(g_title_mutex);
+			    pending_text          = g_title_text;
+			    window_id             = g_title_window_id;
+			    g_title_update_queued = false;
+		    }
+		    // The window may be gone by the time the main thread runs this.
+		    if (auto* target = SDL_GetWindowFromID(window_id); target != nullptr) {
+			    SDL_SetWindowTitle(target, pending_text.c_str());
+		    }
 	    },
-	    &update, true));
+	    nullptr, false));
 }
 
 } // namespace Libs::Graphics

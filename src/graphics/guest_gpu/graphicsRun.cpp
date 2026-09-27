@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
@@ -942,7 +943,24 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
+	// Hang-trace CP rows for GDS transfers (the append/consume counter resets and readbacks of
+	// passes such as Astro Bot's GI ray-bundle linked lists): address = GDS byte offset, value =
+	// fill value or memory address, ref = 0 fill, 1 memory to GDS, 2 GDS to memory.
+	const auto trace_gds = [&](uint64_t gds_offset, uint64_t value, uint64_t direction) {
+		if (HangTrace::CpTraceEnabled()) {
+			HangTrace::CpEvent event;
+			event.event   = "gds-dma";
+			event.address = gds_offset;
+			event.value   = value;
+			event.ref     = direction;
+			event.size    = num_bytes;
+			HangTrace::RecordCp(event);
+		}
+	};
 	if (src_sel == 2) {
+		if (dst_gds) {
+			trace_gds(dst_address_or_offset, src_address_or_offset_or_immediate & 0xffffffffu, 0);
+		}
 		buffer_cache.FillBuffer(
 		    dst_address_or_offset, num_bytes,
 		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
@@ -954,6 +972,11 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	}
 	if (src_gds && dst_gds) {
 		EXIT("unsupported dmaData GDS-to-GDS copy\n");
+	}
+	if (dst_gds) {
+		trace_gds(dst_address_or_offset, src_address_or_offset_or_immediate, 1);
+	} else if (src_gds) {
+		trace_gds(src_address_or_offset_or_immediate, dst_address_or_offset, 2);
 	}
 	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
 	                        dst_gds, src_gds);
@@ -2719,7 +2742,31 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 	}
 }
 
+// KYTY_LOOP_GUARD: guarded shaders count exhausted invocations in the last GDS dword. The mapped
+// word is read without waiting for the GPU (a diagnostic) and reported when it changes.
+static void NoteLoopGuardHits(RenderContext& renderer) {
+	const auto& options = Libs::Graphics::ShaderRecompiler::GetCodegenOptions();
+	if (options.loop_guard_budget == 0 || options.loop_guard_shaders.empty()) {
+		return;
+	}
+	const auto mapped = renderer.GetBufferCache().GetGdsBuffer()->Mapped();
+	if (mapped.size() < sizeof(uint32_t)) {
+		return;
+	}
+	static uint32_t reported = 0;
+	uint32_t        hits     = 0;
+	std::memcpy(&hits, mapped.data() + mapped.size() - sizeof(uint32_t), sizeof(hits));
+	if (hits != reported) {
+		reported = hits;
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Loop guard: {} invocations of the guarded shaders exhausted the {}-iteration loop "
+		    "budget (KYTY_LOOP_GUARD)\n",
+		    hits, options.loop_guard_budget));
+	}
+}
+
 void CommandProcessor::Flip() {
+	NoteLoopGuardHits(m_renderer);
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
@@ -2733,6 +2780,7 @@ void CommandProcessor::Flip() {
 }
 
 void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
+	NoteLoopGuardHits(m_renderer);
 	auto& command = CurrentBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {
@@ -2753,6 +2801,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 
 void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action,
                                          void* dst_gpu_addr, uint32_t value) {
+	NoteLoopGuardHits(m_renderer);
 	auto& command = CurrentBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {

@@ -44,8 +44,11 @@ inline void ObserveSrtRead(const SrtRuntime& runtime, uint64_t address,
 enum class RuntimeValueType { Any, Integer };
 
 // Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
-// dynamic offsets remain explicit and are never assigned a fake slot.
-void BuildSrtPlan(Program& program);
+// dynamic offsets remain explicit and are never assigned a fake slot. With variant_reads
+// (KYTY_SRT_VARIANT_READS), a read whose address is not a valid runtime value (a loop-carried
+// pointer, data the GPU produces) is a runtime read as well: a flat slot is evaluated before the
+// dispatch, when that address does not exist yet.
+void BuildSrtPlan(Program& program, bool variant_reads = false);
 // Compile bounded adjacent flat-read runs after cloning and clean-slot discovery.
 void BuildSrtReadRuns(ResourcePlan& program);
 // Opt-in immutable operand decoding; never evaluates or reads guest values.

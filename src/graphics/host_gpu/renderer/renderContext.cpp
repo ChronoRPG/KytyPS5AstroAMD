@@ -12,6 +12,10 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
+#include <shared_mutex>
 
 namespace Libs::Graphics {
 
@@ -194,6 +198,61 @@ void RenderContext::PrepareBda() {
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_buffer_cache.SynchronizeBdaBuffers(m_mapped_ranges);
 	m_fault_process_pending = true;
+}
+
+void RenderContext::NoteHostBackingWrite(uint64_t vaddr, uint64_t size,
+                                         HostWriter writer) noexcept {
+	const auto states = m_buffer_cache.CountPageStates(vaddr, size);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::HostBackingWrites);
+	if (states.gpu_dirty == 0 && states.clean == 0) {
+		return;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::HostBackingWriteGpuDirtyPages, states.gpu_dirty);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::HostBackingWriteCleanPages, states.clean);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::fprintf(stderr,
+		             "HostBackingWrite: %s addr=0x%016" PRIx64 " size=0x%" PRIx64
+		             " lands on %" PRIu64 " GPU-dirty and %" PRIu64
+		             " clean tracked page(s) the tracker is not told about\n",
+		             writer == HostWriter::LodStats ? "LOD-statistics report" : "occlusion result",
+		             vaddr, size, states.gpu_dirty, states.clean);
+	}
+}
+
+void RenderContext::NoteGuestProtection(uint64_t vaddr, uint64_t size, bool allows_read,
+                                        bool allows_write) noexcept {
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GuestProtectCalls);
+	{
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		if (!m_mapped_ranges.Intersects(vaddr, size)) {
+			return;
+		}
+	}
+	const auto watched = m_page_manager.CountWatchedPages(vaddr, size);
+	// Pages whose tracking protection the new guest mode replaces: a write-watched page that
+	// becomes writable, an access-watched page that becomes readable or writable.
+	const auto overridden = (allows_write ? watched.write : 0u) +
+	                        (allows_read || allows_write ? watched.access : 0u);
+	const bool restricts = !allows_read || !allows_write;
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GuestProtectWatchedPages,
+	                          watched.write + watched.access);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GuestProtectOverriddenPages, overridden);
+	if (restricts) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::GuestProtectRestrictsGpuMemory);
+	}
+	if (overridden == 0 && !restricts) {
+		return;
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::fprintf(stderr,
+		             "GuestProtect: addr=0x%016" PRIx64 " size=0x%" PRIx64
+		             " read=%d write=%d on GPU memory: %" PRIu64 " write-watched and %" PRIu64
+		             " access-watched page(s), %" PRIu64 " whose tracking protection it replaces\n",
+		             vaddr, size, allows_read ? 1 : 0, allows_write ? 1 : 0, watched.write,
+		             watched.access, overridden);
+	}
 }
 
 void RenderContext::RunGarbageCollector() {

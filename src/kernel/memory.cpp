@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
@@ -19,7 +20,9 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
@@ -85,6 +88,16 @@ static Graphics::RenderContext& GetGpuResources() {
 static bool IsGpuAddressRange(uint64_t vaddr, uint64_t size) {
 	constexpr uint64_t GPU_ADDRESS_LIMIT = 1ull << 40u;
 	return vaddr != 0 && size != 0 && vaddr < GPU_ADDRESS_LIMIT && size < GPU_ADDRESS_LIMIT - vaddr;
+}
+
+// Tracker-gap detector (RenderContext::NoteGuestProtection): the host protection `mode` is about
+// to be applied to [vaddr, vaddr + size) directly, not through resource tracking's PageManager.
+static void NoteGuestProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return;
+	}
+	const auto bits = static_cast<uint32_t>(mode);
+	GetGpuResources().NoteGuestProtection(vaddr, size, (bits & 1u) != 0, (bits & 2u) != 0);
 }
 
 static void MapGpuRange(uint64_t vaddr, uint64_t size) {
@@ -209,6 +222,62 @@ static bool IsPrivateCommittedRangeType(VirtualRangeType type) {
 static bool g_test_fail_next_range_replace = false;
 #endif
 
+// KYTY_CLAMP_RANGE_MEMO (default on; =0 off): VirtualRanges::ClampRangeSize answers from a
+// per-thread cache of runs of adjacent committed ranges, valid while the ranges are unchanged
+// (VirtualRanges::m_generation). Buffer bindings clamp every V# range (tens of thousands per
+// frame); the locked lookup was about 1.2 ms per flip on the command processor (U49).
+static bool ClampRangeMemoEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CLAMP_RANGE_MEMO");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// KYTY_CLAMP_RANGE_MEMO_VERIFY=1|exit: every cached answer is compared with the locked lookup.
+static int ClampRangeMemoVerifyMode() {
+	static const int mode = [] {
+		const auto* value = std::getenv("KYTY_CLAMP_RANGE_MEMO_VERIFY");
+		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
+			return 0;
+		}
+		return std::strcmp(value, "exit") == 0 ? 2 : 1;
+	}();
+	return mode;
+}
+
+namespace {
+
+// A run [begin, end) of adjacent committed ranges of one VirtualRanges, seen at `generation`.
+// `end_is_run_end`: the run was followed to its end (otherwise a bounded walk stopped earlier and
+// only requests ending inside it are answered).
+struct ClampRun {
+	const void* owner          = nullptr;
+	uint64_t    generation     = 0;
+	uint64_t    begin          = 0;
+	uint64_t    end            = 0;
+	bool        end_is_run_end = false;
+};
+
+struct ClampRuns {
+	std::array<ClampRun, 4> entries {};
+	uint32_t                next = 0;
+};
+
+thread_local ClampRuns t_clamp_runs;
+
+struct ClampRangeMemoTotals {
+	uint64_t hits              = 0;
+	uint64_t misses            = 0;
+	uint64_t verify_checks     = 0;
+	uint64_t verify_mismatches = 0;
+	uint64_t verify_races      = 0;
+};
+
+thread_local ClampRangeMemoTotals t_clamp_totals;
+
+} // namespace
+
 class VirtualRanges {
 public:
 	struct Range {
@@ -225,6 +294,7 @@ public:
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		BumpGenerationUnlocked();
 
 		if (start == 0 || size == 0) {
 			return false;
@@ -255,6 +325,7 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		BumpGenerationUnlocked();
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -286,6 +357,7 @@ public:
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		BumpGenerationUnlocked();
 
 		for (size_t index = 0; index < m_ranges.size(); index++) {
 			auto& r = m_ranges[index];
@@ -301,6 +373,7 @@ public:
 	                 uint64_t offset, int protection, int memory_type, VirtualRangeType type,
 	                 const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		BumpGenerationUnlocked();
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -348,6 +421,7 @@ public:
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
+		BumpGenerationUnlocked();
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -360,12 +434,14 @@ public:
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
+		BumpGenerationUnlocked();
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
 
 	void SetMemoryType(uint64_t start, uint64_t size, int memory_type) {
 		Common::LockGuard lock(m_mutex);
+		BumpGenerationUnlocked();
 
 		EditUnlocked(start, size, [memory_type](Range* r) { r->memory_type = memory_type; });
 	}
@@ -430,40 +506,41 @@ public:
 		return false;
 	}
 
+	// The committed prefix of [virtual_addr, virtual_addr + size): how far the run of adjacent
+	// committed ranges containing virtual_addr covers it (0 when virtual_addr is not committed).
+	// KYTY_CLAMP_RANGE_MEMO: a run this thread found while the ranges were as they are now answers
+	// without the lock; every change of the ranges advances m_generation, under m_mutex, before it
+	// starts, so an unchanged generation means the run still exists as found.
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
-
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
 		}
-
-		auto vma = std::upper_bound(
-		    m_ranges.begin(), m_ranges.end(), virtual_addr,
-		    [](uint64_t value, const Range& range) { return value < range.start; });
-		if (vma == m_ranges.begin()) {
-			return 0;
+		if (ClampRangeMemoEnabled()) {
+			const auto generation = m_generation.load(std::memory_order_acquire);
+			for (const auto& run: t_clamp_runs.entries) {
+				if (run.owner != this || run.generation != generation || virtual_addr < run.begin ||
+				    virtual_addr >= run.end) {
+					continue;
+				}
+				uint64_t clamped = 0;
+				if (size <= run.end - virtual_addr) {
+					clamped = size;
+				} else if (run.end_is_run_end) {
+					clamped = run.end - virtual_addr;
+				} else {
+					break; // beyond the part of the run that was walked
+				}
+				t_clamp_totals.hits++;
+				if (ClampRangeMemoVerifyMode() != 0) {
+					VerifyClampHit(virtual_addr, size, clamped, generation);
+				}
+				return clamped;
+			}
+			t_clamp_totals.misses++;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ClampRangeMemoMisses);
 		}
-		--vma;
-
-		const auto vma_end = End(vma->start, vma->size);
-		if (virtual_addr < vma->start || virtual_addr >= vma_end ||
-		    !IsCommittedRangeType(vma->type)) {
-			return 0;
-		}
-
-		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
-		uint64_t expected     = virtual_addr + clamped_size;
-		++vma;
-
-		while (vma != m_ranges.end() && vma->start == expected && IsCommittedRangeType(vma->type) &&
-		       clamped_size < size) {
-			const auto chunk = std::min(size - clamped_size, vma->size);
-			clamped_size += chunk;
-			expected += chunk;
-			++vma;
-		}
-
-		return clamped_size;
+		Common::LockGuard lock(m_mutex);
+		return ClampRangeSizeUnlocked(virtual_addr, size, ClampRangeMemoEnabled());
 	}
 
 	uint64_t CountPageTableEntries(bool gpu) {
@@ -494,6 +571,105 @@ public:
 private:
 	static uint64_t End(uint64_t start, uint64_t size) {
 		return (UINT64_MAX - start < size ? UINT64_MAX : start + size);
+	}
+
+	// Callers hold m_mutex, before they change m_ranges (KYTY_CLAMP_RANGE_MEMO).
+	void BumpGenerationUnlocked() noexcept {
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
+	}
+
+	// ClampRangeSize's lookup; callers hold m_mutex. `remember`: record the run for this thread.
+	uint64_t ClampRangeSizeUnlocked(uint64_t virtual_addr, uint64_t size, bool remember) {
+		auto vma = std::upper_bound(
+		    m_ranges.begin(), m_ranges.end(), virtual_addr,
+		    [](uint64_t value, const Range& range) { return value < range.start; });
+		if (vma == m_ranges.begin()) {
+			return 0;
+		}
+		--vma;
+
+		const auto vma_end = End(vma->start, vma->size);
+		if (virtual_addr < vma->start || virtual_addr >= vma_end ||
+		    !IsCommittedRangeType(vma->type)) {
+			return 0;
+		}
+		// The run of adjacent committed ranges around the address, walking at most RunWalk ranges
+		// each way: a bounded walk only narrows what later lookups can be answered from.
+		constexpr uint32_t RunWalk   = 64;
+		uint64_t           run_begin = vma->start;
+		{
+			auto     previous = vma;
+			uint32_t walked   = 0;
+			while (previous != m_ranges.begin() && walked++ < RunWalk) {
+				--previous;
+				if (!IsCommittedRangeType(previous->type) ||
+				    End(previous->start, previous->size) != run_begin) {
+					break;
+				}
+				run_begin = previous->start;
+			}
+		}
+		uint64_t run_end        = vma_end;
+		bool     end_is_run_end = true;
+		auto     next           = std::next(vma);
+		for (uint32_t walked = 0; next != m_ranges.end() && next->start == run_end &&
+		                          IsCommittedRangeType(next->type);
+		     ++next) {
+			if (walked++ == RunWalk) {
+				end_is_run_end = false;
+				break;
+			}
+			run_end = End(next->start, next->size);
+		}
+		if (remember) {
+			auto& runs = t_clamp_runs;
+			runs.entries[runs.next++ % runs.entries.size()] = {
+			    this, m_generation.load(std::memory_order_relaxed), run_begin, run_end,
+			    end_is_run_end};
+		}
+		if (size <= run_end - virtual_addr) {
+			return size;
+		}
+		if (end_is_run_end) {
+			return run_end - virtual_addr;
+		}
+		// The walk stopped inside the run (`next` is the first range it did not take): follow the
+		// rest as far as the request reaches, as the walk would have.
+		uint64_t clamped_size = run_end - virtual_addr;
+		uint64_t expected     = run_end;
+		for (; next != m_ranges.end() && next->start == expected &&
+		       IsCommittedRangeType(next->type) && clamped_size < size;
+		     ++next) {
+			const auto chunk = std::min(size - clamped_size, next->size);
+			clamped_size += chunk;
+			expected += chunk;
+		}
+		return clamped_size;
+	}
+
+	// KYTY_CLAMP_RANGE_MEMO_VERIFY: the locked lookup after a cached answer. A different answer
+	// while the generation is still the one the hit saw is a mismatch; otherwise a change of the
+	// ranges raced the lookup.
+	void VerifyClampHit(uint64_t virtual_addr, uint64_t size, uint64_t cached, uint64_t generation) {
+		Common::LockGuard lock(m_mutex);
+		t_clamp_totals.verify_checks++;
+		const auto locked = ClampRangeSizeUnlocked(virtual_addr, size, false);
+		if (locked == cached) {
+			return;
+		}
+		if (m_generation.load(std::memory_order_relaxed) != generation) {
+			t_clamp_totals.verify_races++;
+			return;
+		}
+		t_clamp_totals.verify_mismatches++;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ClampRangeMemoVerifyMismatches);
+		std::fprintf(stderr,
+		             "ClampRangeMemoVerify: addr=0x%016" PRIx64 " size=0x%" PRIx64
+		             " cached 0x%" PRIx64 ", locked 0x%" PRIx64 "\n",
+		             virtual_addr, size, cached, locked);
+		if (ClampRangeMemoVerifyMode() == 2) {
+			EXIT("ClampRangeMemoVerify: a cached committed-range answer differs\n");
+		}
 	}
 
 	static bool SameMergeKey(const Range& left, const Range& right) {
@@ -656,6 +832,8 @@ private:
 
 	std::vector<Range> m_ranges;
 	Common::Mutex      m_mutex;
+	// Advanced before every change of m_ranges (KYTY_CLAMP_RANGE_MEMO); starts at 1.
+	std::atomic<uint64_t> m_generation {1};
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -994,6 +1172,43 @@ static bool GpuDirtyHint(Graphics::BufferCache& buffers, uint64_t vaddr, uint64_
 	return dirty;
 }
 
+// The host return address of the calling function (diagnostics).
+#if defined(_MSC_VER) && !defined(__clang__)
+#define KYTY_MEMORY_CALLER() reinterpret_cast<uint64_t>(_ReturnAddress())
+#else
+#define KYTY_MEMORY_CALLER() reinterpret_cast<uint64_t>(__builtin_return_address(0))
+#endif
+
+// DrawPrepFallbackUnclean diagnostics: why a preparation's read was refused as not provably
+// clean. Always counted (FrameEvent.DrawPrepUnclean*); with the hang trace also aggregated in
+// unclean.csv by reason, read purpose, calling host code and page, with the page's last GPU writer.
+static void NoteDrawPrepUnclean(Profiler::FrameEvent event, const char* reason, uint64_t vaddr,
+                                uint64_t size, uint64_t caller) {
+	Profiler::CountFrameEvent(event);
+	if (HangTrace::Enabled()) {
+		HangTrace::RecordUncleanRead(vaddr, size, reason, Graphics::DrawPrep::ReadPurpose(), caller);
+	}
+}
+
+// Which exact predicate refused a clean read (GPU thread or a GpuReadDelegate scope; a thread
+// with neither is refused before any predicate).
+static const char* ExactUncleanReason(uint64_t vaddr, uint64_t size) {
+	if (!Graphics::GuestGpu::IsGpuThread() && !Graphics::GpuReadDelegate::Active()) {
+		return "thread";
+	}
+	auto& resources = GetGpuResources();
+	if (resources.GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+		return "buffer-gpu-dirty";
+	}
+	if (resources.GetBufferCache().HasPendingBackingPublication(vaddr, size)) {
+		return "publication";
+	}
+	if (resources.GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+		return "image-gpu-modified";
+	}
+	return "verdict";
+}
+
 // Draw-prep (readSet.h): every read of a speculative draw preparation is recorded for its
 // certificate. The GPU thread applies the exact clean predicate. Other preparing threads cannot
 // read the GPU thread's unlocked dirty state; they gate reads with a conservative, thread-safe
@@ -1002,15 +1217,31 @@ static bool GpuDirtyHint(Graphics::BufferCache& buffers, uint64_t vaddr, uint64_
 // range with the exact predicate. The hint does not consult the texture cache: a range owned by
 // a GPU-modified image is caught at commit.
 // The gate of a draw-prep read: the failure it takes, None when the backing may be read.
+// `caller`: the host code that asked for the read (diagnostics).
 static Graphics::DrawPrep::ReadFailure DrawPrepGate(const Graphics::DrawPrep::Recorder& recorder,
-                                                    uint64_t vaddr, uint64_t size) {
+                                                    uint64_t vaddr, uint64_t size,
+                                                    uint64_t caller) {
 	using Graphics::DrawPrep::ReadFailure;
+	using Event = Profiler::FrameEvent;
 	if (recorder.exact) {
-		return GpuCleanGate(vaddr, size) ? ReadFailure::None : ReadFailure::Unclean;
+		if (GpuCleanGate(vaddr, size)) {
+			return ReadFailure::None;
+		}
+		NoteDrawPrepUnclean(Event::DrawPrepUncleanExact,
+		                    HangTrace::Enabled() ? ExactUncleanReason(vaddr, size) : "exact", vaddr,
+		                    size, caller);
+		return ReadFailure::Unclean;
 	}
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		auto& buffers = GetGpuResources().GetBufferCache();
-		if (GpuDirtyHint(buffers, vaddr, size) || buffers.HasPendingBackingPublication(vaddr, size)) {
+		if (GpuDirtyHint(buffers, vaddr, size)) {
+			NoteDrawPrepUnclean(Event::DrawPrepUncleanHintGpuDirty, "hint-gpu-dirty", vaddr, size,
+			                    caller);
+			return ReadFailure::Unclean;
+		}
+		if (buffers.HasPendingBackingPublication(vaddr, size)) {
+			NoteDrawPrepUnclean(Event::DrawPrepUncleanHintPublication, "hint-publication", vaddr,
+			                    size, caller);
 			return ReadFailure::Unclean;
 		}
 	}
@@ -1019,40 +1250,46 @@ static Graphics::DrawPrep::ReadFailure DrawPrepGate(const Graphics::DrawPrep::Re
 
 // A backing read that failed after the gate (exact reads fail as Unclean, as before).
 static Graphics::DrawPrep::ReadFailure DrawPrepBackingFailure(
-    const Graphics::DrawPrep::Recorder& recorder) {
+    const Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, uint64_t size, uint64_t caller) {
 	using Graphics::DrawPrep::ReadFailure;
-	return recorder.exact ? ReadFailure::Unclean : ReadFailure::Backing;
+	if (!recorder.exact) {
+		return ReadFailure::Backing;
+	}
+	NoteDrawPrepUnclean(Profiler::FrameEvent::DrawPrepUncleanBacking, "backing", vaddr, size,
+	                    caller);
+	return ReadFailure::Unclean;
 }
 
 // The gated read of TryReadForDrawPrep, without recording it. False (and a failed read set) when
 // it cannot be served.
 static bool ReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, void* data,
-                            uint64_t size) {
+                            uint64_t size, uint64_t caller) {
 	using Graphics::DrawPrep::ReadFailure;
 	auto& reads = *recorder.reads;
 	if (reads.Failed()) {
 		return false;
 	}
-	if (const auto failure = DrawPrepGate(recorder, vaddr, size); failure != ReadFailure::None) {
+	if (const auto failure = DrawPrepGate(recorder, vaddr, size, caller);
+	    failure != ReadFailure::None) {
 		reads.Fail(failure);
 		return false;
 	}
 	if (!TryReadBacking(vaddr, data, size)) {
-		reads.Fail(DrawPrepBackingFailure(recorder));
+		reads.Fail(DrawPrepBackingFailure(recorder, vaddr, size, caller));
 		return false;
 	}
 	return true;
 }
 
 static bool TryReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, void* data,
-                               uint64_t size) {
-	return ReadForDrawPrep(recorder, vaddr, data, size) &&
+                               uint64_t size, uint64_t caller) {
+	return ReadForDrawPrep(recorder, vaddr, data, size, caller) &&
 	       recorder.reads->Record(vaddr, data, size);
 }
 
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (auto* recorder = Graphics::DrawPrep::ActiveRecorder(); recorder != nullptr) [[unlikely]] {
-		return TryReadForDrawPrep(*recorder, vaddr, data, size);
+		return TryReadForDrawPrep(*recorder, vaddr, data, size, KYTY_MEMORY_CALLER());
 	}
 	return TryReadGpuCleanBackingExact(vaddr, data, size);
 }
@@ -1066,7 +1303,7 @@ bool TryReadGpuCleanBackingDigest(uint64_t vaddr, void* data, uint64_t size, uin
 		digest = XXH3_64bits(data, size);
 		return true;
 	}
-	if (!ReadForDrawPrep(*recorder, vaddr, data, size)) {
+	if (!ReadForDrawPrep(*recorder, vaddr, data, size, KYTY_MEMORY_CALLER())) {
 		return false;
 	}
 	digest = XXH3_64bits(data, size);
@@ -1101,12 +1338,14 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest, InPlac
 	if (reads.Failed()) {
 		return false;
 	}
-	if (const auto failure = DrawPrepGate(*recorder, vaddr, size); failure != ReadFailure::None) {
+	const auto caller = KYTY_MEMORY_CALLER();
+	if (const auto failure = DrawPrepGate(*recorder, vaddr, size, caller);
+	    failure != ReadFailure::None) {
 		reads.Fail(failure);
 		return false;
 	}
 	if (!TryInspectBacking(vaddr, size, hash, stats)) {
-		reads.Fail(DrawPrepBackingFailure(*recorder));
+		reads.Fail(DrawPrepBackingFailure(*recorder, vaddr, size, caller));
 		return false;
 	}
 	return reads.RecordDigest(vaddr, size, digest);
@@ -3663,6 +3902,12 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 }
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+TestClampTotals TestClampRangeMemoTotals() {
+	const auto& totals = t_clamp_totals;
+	return {totals.hits, totals.misses, totals.verify_checks, totals.verify_mismatches,
+	        totals.verify_races};
+}
+
 void TestFailNextPhysicalMemoryUnmap() {
 	TestFailPhysicalMemoryUnmapAfter(0);
 }
@@ -3900,6 +4145,7 @@ void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mo
 
 	const auto host_mode = VirtualMemory::IsExecute(mode) ? VirtualMemory::Mode::ExecuteReadWrite
 	                                                      : VirtualMemory::Mode::ReadWrite;
+	NoteGuestProtection(vaddr, size, host_mode);
 	EXIT_IF(!g_guest_address_space->Protect(vaddr, size, host_mode));
 	g_virtual_ranges->Protect(vaddr, size, ProgramProtection(mode));
 }
@@ -3935,6 +4181,7 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 		*old_mode = static_cast<VirtualMemory::Mode>(
 		    ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
 	}
+	NoteGuestProtection(aligned_addr, aligned_size, mode);
 	if (!g_guest_address_space->Protect(aligned_addr, aligned_size, mode)) {
 		return false;
 	}
@@ -4000,6 +4247,7 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	}
 	const auto old_mode = static_cast<VirtualMemory::Mode>(
 	    old_ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
+	NoteGuestProtection(aligned_addr, aligned_len, mode);
 	bool ok = g_guest_address_space->Protect(aligned_addr, aligned_len, mode);
 
 	if (!ok) {

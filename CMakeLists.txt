@@ -468,6 +468,16 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+# Per-thread profiler counters (common/profiler.h); also prints a timing of the counting paths.
+add_executable(profiler_counter_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ProfilerCounterTests.cpp"
+)
+target_link_libraries(profiler_counter_tests common)
+target_include_directories(profiler_counter_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(profiler_counter_tests Threads::Threads)
+endif()
+
 add_executable(lod_stats_report_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LodStatsReportTests.cpp"
 )
@@ -525,6 +535,8 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/BindingLayout.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/WriteRangeAnalysis.cpp"
+	# BindingLayout asks LoopGuardApplies (KYTY_LOOP_GUARD) whether a program binds GDS.
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"
 )
 target_link_libraries(resource_tracking_tests common fmt::fmt)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
@@ -550,6 +562,22 @@ add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(event_queue_lifetime_tests common fmt::fmt)
 target_include_directories(event_queue_lifetime_tests PRIVATE ${inc_headers})
+
+# Kernel event delivery semantics: kqueue-style coalescing, EV_CLEAR/EV_ONESHOT, delivery order.
+add_executable(event_queue_semantics_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/EventQueueSemanticsTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
+target_link_libraries(event_queue_semantics_tests common fmt::fmt)
+target_include_directories(event_queue_semantics_tests PRIVATE ${inc_headers})
+
+# Service-thread priority, sched_yield and the pending-signal fast path.
+add_executable(thread_service_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ThreadServiceTests.cpp"
+)
+target_link_libraries(thread_service_tests common)
+target_include_directories(thread_service_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(kernel_file_system_tests
 	"${KYTY_TESTS_DIR}/KernelFileSystemTests.cpp")
@@ -659,14 +687,21 @@ if(BUILD_TESTING)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME profiler_counters COMMAND $<TARGET_FILE:profiler_counter_tests>)
 	add_test(NAME lod_stats_report COMMAND $<TARGET_FILE:lod_stats_report_tests>)
 	add_test(NAME game_patch_filter COMMAND $<TARGET_FILE:game_patch_filter_tests>)
 	add_test(NAME lod_stats_codegen
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --lod-stats-codegen-only)
+	add_test(NAME gi_probe_codegen
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gi-probe-codegen-only)
+	add_test(NAME gi_probe
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gi-probe-only)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
+	add_test(NAME event_queue_semantics COMMAND $<TARGET_FILE:event_queue_semantics_tests>)
+	add_test(NAME thread_service COMMAND $<TARGET_FILE:thread_service_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
@@ -680,6 +715,15 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	# KYTY_CLAMP_RANGE_MEMO: verify mode and off.
+	add_test(NAME virtual_memory_allocation_clamp_memo_verify
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	set_tests_properties(virtual_memory_allocation_clamp_memo_verify PROPERTIES
+		ENVIRONMENT "KYTY_CLAMP_RANGE_MEMO_VERIFY=exit")
+	add_test(NAME virtual_memory_allocation_clamp_memo_off
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	set_tests_properties(virtual_memory_allocation_clamp_memo_off PROPERTIES
+		ENVIRONMENT "KYTY_CLAMP_RANGE_MEMO=0")
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline
@@ -772,6 +816,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-epoch-memo-only)
 	set_tests_properties(binding_epoch_memo_no_sync_epoch PROPERTIES
 		ENVIRONMENT "KYTY_SYNC_EPOCH=0")
+	# Tracker-gap detectors: the page states they classify host writes by.
+	add_test(NAME tracker_gap_detectors
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tracker-gap-detectors-only)
 	# KYTY_TEXTURE_MEMO_REVALIDATE: default, verify mode, off.
 	add_test(NAME texture_memo_revalidate
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)
@@ -783,6 +830,18 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)
 	set_tests_properties(texture_memo_revalidate_off PROPERTIES
 		ENVIRONMENT "KYTY_TEXTURE_MEMO_REVALIDATE=0")
+	# KYTY_DRAW_SEQUENCE_FAST: default, off, and the verify mode over the whole compute/renderer
+	# suite (every repeated target lookup and stage texture set is checked against the full path).
+	add_test(NAME draw_sequence
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-sequence-only)
+	add_test(NAME draw_sequence_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-sequence-only)
+	set_tests_properties(draw_sequence_off PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_SEQUENCE_FAST=0")
+	add_test(NAME draw_sequence_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(draw_sequence_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_SEQUENCE_VERIFY=exit")
 	# Draw-prep end to end: serial vs command-processor draws, in each engine mode.
 	add_test(NAME draw_prep_engine
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
@@ -811,7 +870,7 @@ if(BUILD_TESTING)
 	add_test(NAME draw_prep_engine_parallel_inplace_verify
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_inplace_verify PROPERTIES
-		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE_VERIFY=exit;KYTY_DRAW_PREP_LOCKFREE_HINT_VERIFY=exit;KYTY_TRACKER_RELAXED_VERIFY=exit;KYTY_BINDING_EPOCH_MEMO_VERIFY=exit")
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE_VERIFY=exit;KYTY_DRAW_PREP_LOCKFREE_HINT_VERIFY=exit;KYTY_TRACKER_RELAXED_VERIFY=exit;KYTY_BINDING_EPOCH_MEMO_VERIFY=exit;KYTY_DRAW_SEQUENCE_VERIFY=exit")
 	add_test(NAME draw_prep_engine_parallel_copied
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_copied PROPERTIES
@@ -840,6 +899,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texel-sync-gpu-dirty-only)
 	set_tests_properties(texture_cache_texel_sync_gpu_dirty_whole_images PROPERTIES
 		ENVIRONMENT "KYTY_ALIAS_BYTES=0")
+	# KYTY_SRT_VARIANT_READS: loop-variant scalar reads and runtime S_BUFFER_LOAD V#s through BDA.
+	add_test(NAME srt_variant_reads
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srt-variant-only)
 
 	if(WIN32)
 		# These tests still depend on the Windows multisample-depth path.
@@ -850,6 +912,19 @@ if(BUILD_TESTING)
 		add_test(NAME buffer_cache_ranges
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 	endif()
+
+	# A failed check fails its test from its message too, not only from the exit status (which
+	# a harness can lose, or a process exit can overtake when the check runs on another thread).
+	# The failure formats of the test programs: "<Suite>: failed: ...", "<Suite>: <case> failed
+	# ...", "FAILED: ...", "... test failed: ..." and "SaveDataMemoryTests:<line>: ...".
+	# failure_message_fails_test checks the expression itself: a program that prints a failure
+	# and exits with status 0 must fail (inverted by WILL_FAIL).
+	add_test(NAME failure_message_fails_test
+		COMMAND ${CMAKE_COMMAND} -E echo "SelfTests: failed: a check failed, the process exited 0")
+	set_tests_properties(failure_message_fails_test PROPERTIES WILL_FAIL TRUE)
+	get_property(kyty_test_names DIRECTORY PROPERTY TESTS)
+	set_tests_properties(${kyty_test_names} PROPERTIES FAIL_REGULAR_EXPRESSION
+		"Tests: failed: ;Tests: [^\n]* failed at ;Tests: [^\n]* failed: ;FAILED: ;test failed: ;SaveDataMemoryTests:[0-9]+: ")
 
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests

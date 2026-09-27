@@ -1,7 +1,10 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <string_view>
 
 namespace Libs::Graphics::ShaderRecompiler {
 namespace {
@@ -29,6 +32,31 @@ CodegenOptions FromEnvironment() {
 	options.sample_lod_clamp = EnvFlag("KYTY_SAMPLE_LOD_CLAMP", options.sample_lod_clamp);
 	options.host_ftz_inputs  = EnvFlag("KYTY_HOST_FTZ_INPUTS", options.host_ftz_inputs);
 	options.exec_selects     = EnvFlag("KYTY_EXEC_SELECTS", options.exec_selects);
+	options.ps_append_live_election =
+	    EnvFlag("KYTY_PS_APPEND_LIVE_ELECTION", options.ps_append_live_election);
+	if (const auto* mode = std::getenv("KYTY_PS_LIVE_EXEC"); mode != nullptr && mode[0] != '\0') {
+		options.ps_live_exec = std::strcmp(mode, "all") == 0 ? PsLiveExec::All
+		                       : std::strcmp(mode, "0") == 0 ? PsLiveExec::Off
+		                                                     : PsLiveExec::AppendConsume;
+	}
+	if (const auto* budget = std::getenv("KYTY_LOOP_GUARD"); budget != nullptr) {
+		options.loop_guard_budget = static_cast<uint32_t>(std::strtoul(budget, nullptr, 0));
+	}
+	if (const auto* list = std::getenv("KYTY_LOOP_GUARD_SHADERS"); list != nullptr) {
+		std::string_view text(list);
+		while (!text.empty()) {
+			const auto comma = text.find(',');
+			const auto token = std::string(text.substr(0, comma));
+			if (!token.empty()) {
+				options.loop_guard_shaders.push_back(std::strtoull(token.c_str(), nullptr, 16));
+			}
+			if (comma == std::string_view::npos) {
+				break;
+			}
+			text.remove_prefix(comma + 1);
+		}
+	}
+	options.srt_variant_reads = EnvFlag("KYTY_SRT_VARIANT_READS", options.srt_variant_reads);
 	if (const auto* mode = std::getenv("KYTY_MAD_MODE"); mode != nullptr) {
 		if (std::strcmp(mode, "exact") == 0) {
 			options.mad_mode = MadMode::Exact;
@@ -50,6 +78,13 @@ CodegenOptions& Storage() {
 
 const CodegenOptions& GetCodegenOptions() {
 	return Storage();
+}
+
+bool LoopGuardApplies(uint64_t shader_hash) {
+	const auto& options = Storage();
+	return options.loop_guard_budget != 0 &&
+	       std::ranges::find(options.loop_guard_shaders, shader_hash) !=
+	           options.loop_guard_shaders.end();
 }
 
 void SetCodegenOptions(const CodegenOptions& options) {

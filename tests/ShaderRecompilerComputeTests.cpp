@@ -77,6 +77,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -94,6 +95,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 #include <xxhash.h>
 
@@ -566,6 +568,16 @@ struct RenderExecutorTestAccess {
 
   static TextureBindingMemo::Totals TextureMemoTotals(const RenderExecutor &executor) {
     return executor.m_texture_memo.GetTotals();
+  }
+
+  // KYTY_DRAW_SEQUENCE_FAST: a target lookup through `record`, as a target slot makes it.
+  static ImageId FindTargetImage(RenderExecutor &executor, TextureCache::ImageDesc &desc,
+                                 TextureCache::RepeatLookup &record) {
+    return executor.FindTargetImage(desc, false, &record);
+  }
+
+  static RenderExecutor::DrawSequenceTotals DrawSequenceTotals(const RenderExecutor &executor) {
+    return executor.m_draw_sequence_totals;
   }
 
   static auto PrepareGraphicsBindings(RenderExecutor &executor,
@@ -1110,8 +1122,13 @@ std::string Hex(u32 value) {
 
 [[noreturn]] void Fail(const char *shader_name, const char *stage,
                        const std::string &message) {
+  std::fflush(stdout);
   std::fprintf(stderr, "ShaderRecompilerComputeTests: %s failed at %s: %s\n",
                shader_name, stage, message.c_str());
+  std::fflush(stderr);
+  // The default SIGABRT action, whatever a loaded library installed: abort() must end the
+  // process with a failure status (ctest also matches the message, FAIL_REGULAR_EXPRESSION).
+  std::signal(SIGABRT, SIG_DFL);
   std::abort();
 }
 
@@ -5157,6 +5174,24 @@ public:
       const auto protected_page = [&](uint64_t page) {
         return cache.IsRegionGpuModified(page, 0x1000);
       };
+      // The completion runner publishes an eager copy as soon as its submission completes, which
+      // can be before a check that the copy is still pending. hold_runner() queues a priority
+      // operation that blocks the runner until release_runner(): priority operations run in the
+      // order they were queued, so the publications of copies issued afterwards wait behind it.
+      std::atomic<bool> runner_released{true};
+      const auto hold_runner = [&] {
+        runner_released.store(false, std::memory_order_release);
+        OnGpuThread(context, [&] {
+          scheduler.DeferPriorityOperation([&runner_released] {
+            while (!runner_released.load(std::memory_order_acquire)) {
+              std::this_thread::yield();
+            }
+          });
+        });
+      };
+      const auto release_runner = [&] {
+        runner_released.store(true, std::memory_order_release);
+      };
 
       // 1. A guest read of a GPU-written value makes its page read-hot (its writer is still
       // being recorded, so this read drains as before).
@@ -5175,11 +5210,13 @@ public:
               cache.HasGpuDirtyBytes(base + guest_offset, 4) &&
                   !cache.HasPendingBackingPublication(base + guest_offset, 4),
               "an eager copy was issued with its writer's own submission");
+      hold_runner();
       submit();
-      Require(name, "eager issue",
-              !cache.HasGpuDirtyBytes(base + guest_offset, 4) &&
-                  cache.HasPendingBackingPublication(base + guest_offset, 4) &&
-                  protected_page(guest_page),
+      const bool issued = !cache.HasGpuDirtyBytes(base + guest_offset, 4) &&
+                          cache.HasPendingBackingPublication(base + guest_offset, 4) &&
+                          protected_page(guest_page);
+      release_runner();
+      Require(name, "eager issue", issued,
               "the submission after the writer did not issue an eager copy, "
               "or unprotected the page before completion");
       complete();
@@ -5194,9 +5231,11 @@ public:
       cache.AdvanceFrame();
       gpu_write(guest_offset, 0x33333333u);
       submit();
+      hold_runner();
       submit();
-      Require(name, "second eager issue",
-              cache.HasPendingBackingPublication(base + guest_offset, 4),
+      const bool second_pending = cache.HasPendingBackingPublication(base + guest_offset, 4);
+      release_runner();
+      Require(name, "second eager issue", second_pending,
               "a later writer of a hot page was not copied eagerly");
       gpu_write(guest_offset, 0x44444444u);
       complete();
@@ -5216,9 +5255,11 @@ public:
       cache.AdvanceFrame();
       gpu_write(guest_offset, 0x55555555u);
       submit();
+      hold_runner();
       submit();
-      Require(name, "third eager issue",
-              cache.HasPendingBackingPublication(base + guest_offset, 4),
+      const bool third_pending = cache.HasPendingBackingPublication(base + guest_offset, 4);
+      release_runner();
+      Require(name, "third eager issue", third_pending,
               "the eager copy was not pending before the read");
       cache.ReadMemory(base + guest_offset, 1);
       Require(name, "read during copy",
@@ -5258,11 +5299,13 @@ public:
       Require(name, "no request for guest pages",
               !cache.TakeEagerFlushRequest(false),
               "a writer of a guest-read page requested an early submission");
+      hold_runner();
       submit();
       submit();
-      Require(name, "cp eager issue",
-              cache.HasPendingBackingPublication(base + cp_offset, 4) &&
-                  cache.HasPendingBackingPublication(base + guest_offset, 4),
+      const bool both_pending = cache.HasPendingBackingPublication(base + cp_offset, 4) &&
+                                cache.HasPendingBackingPublication(base + guest_offset, 4);
+      release_runner();
+      Require(name, "cp eager issue", both_pending,
               "eager copies of both pages were not issued");
       // Recorded after the copies were issued; a CP read must not wait for it.
       gpu_write(0x20000, 0x99999999u);
@@ -5998,6 +6041,92 @@ public:
                 BufferCacheTestAccess::BindingMemoEnabled(context.GetBufferCache()) ? "on" : "off",
                 BufferCacheTestAccess::BindingMemoVerify(context.GetBufferCache()) != 0 ? "on"
                                                                                           : "off");
+  }
+
+  // Tracker-gap detectors (RenderContext::NoteHostBackingWrite, NoteGuestProtection): the page
+  // states they classify a host write by (BufferCache::CountPageStates): GPU-dirty after a GPU
+  // write, clean after an upload, neither after a CPU write, untracked before any tracking.
+  void CheckTrackerGapDetectors() {
+    constexpr const char *name = "TrackerGapDetectors";
+    constexpr uintptr_t base = 0x0000000207800000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t clean_offset = 0x10000;   // uploaded by a read binding
+    constexpr uint64_t written_offset = 0x20000; // a writable binding
+    constexpr uint64_t page = 0x1000;
+
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "detector direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "detector fixed direct-memory mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto states = [&](uint64_t offset) {
+        return cache.CountPageStates(base + offset, page);
+      };
+      const auto before = states(clean_offset);
+      Require(name, "before tracking", before.clean == 0 && before.gpu_dirty == 0,
+              "a page no binding has uploaded or written was reported clean or GPU-dirty");
+      OnGpuThread(context, [&] {
+        (void)cache.ObtainBuffer(base + clean_offset, 0x8000, false, false);
+        (void)cache.ObtainBuffer(base + written_offset, 0x8000, true, false);
+      });
+      const auto clean = states(clean_offset);
+      const auto written = states(written_offset);
+      Require(name, "clean and GPU-dirty pages",
+              clean.clean == 1 && clean.gpu_dirty == 0 && written.gpu_dirty == 1 &&
+                  written.clean == 0,
+              "an uploaded page was not clean, or a GPU-written page not GPU-dirty");
+      // A host write the detector reports (it only counts and logs).
+      context.NoteHostBackingWrite(base + clean_offset, 248,
+                                   Libs::Graphics::RenderContext::HostWriter::Occlusion);
+      context.NoteHostBackingWrite(base + written_offset, 248,
+                                   Libs::Graphics::RenderContext::HostWriter::LodStats);
+      context.NoteGuestProtection(base + clean_offset, page, true, true);
+      // A CPU write makes the clean page CPU-dirty: neither state then.
+      Require(name, "write fault",
+              context.HandleFault(PageFaultAccess::Write, base + clean_offset),
+              "a CPU write to an uploaded page did not fault through the tracker");
+      const auto dirty = states(clean_offset);
+      Require(name, "CPU-dirty page", dirty.clean == 0 && dirty.gpu_dirty == 0 &&
+                                          dirty.untracked == 0,
+              "a CPU-dirty page was reported clean, GPU-dirty or untracked");
+      // Read back the GPU-written range so the context can be torn down.
+      cache.ReadMemory(base + written_offset, 0x8000);
+      scheduler.Finish();
+      context.UnmapMemory(base, allocation_size);
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "detector direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "detector direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
   }
 
   void CheckComputeMetaClearClassification() {
@@ -11720,13 +11849,23 @@ public:
       // As every product transition of GPU-dirty ranges does (cleanVerdictCache.h).
       CleanVerdict::Invalidate(code_address + 0x40, 4, Coherence::Source::Test);
       DrawPrep::ReadSet unclean;
+      // The refused read is counted once, as an exact (GPU-thread) refusal
+      // (FrameEvent.DrawPrepUncleanExact; counted while a profiler is connected).
+      Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Thread);
+      const auto exact_before =
+          Profiler::FrameEventTotal(Profiler::FrameEvent::DrawPrepUncleanExact);
       (void)prepare(unclean);
+      const auto exact_counted =
+          Profiler::FrameEventTotal(Profiler::FrameEvent::DrawPrepUncleanExact) - exact_before;
+      Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Off);
       Require(name, "unclean code",
               unclean.Failure() == DrawPrep::ReadFailure::Unclean &&
                   reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
                       DrawPrep::ValidateResult::Unclean &&
                   in_place(reads) == DrawPrep::ValidateResult::Unclean,
               "GPU-owned code bytes were certified");
+      Require(name, "unclean read counted", exact_counted == 1,
+              "the refused read was not counted once as an exact unclean read");
       BufferCacheTestAccess::SubtractGpuDirty(cache, code_address + 0x40, 4);
       CleanVerdict::Invalidate(code_address + 0x40, 4, Coherence::Source::Test);
       context.UnmapMemory(base, allocation_size);
@@ -12207,6 +12346,285 @@ public:
                                                                allocation_size) == 0,
             "CMASK allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // KYTY_DRAW_SEQUENCE_FAST. A target lookup of an unchanged slot repeats the last one only while
+  // what its decisions read is unchanged (here the CMASK decision a recorded fill made and the
+  // images over the CMASK bytes), and a stage with the same program and T# words repeats its
+  // texture bindings and views only while TryResolve and TryAcquireView would hit. With
+  // KYTY_DRAW_SEQUENCE_VERIFY=exit (ctest draw_sequence_verify) every repeat is also checked
+  // against the full path; with KYTY_DRAW_SEQUENCE_FAST=0 nothing repeats and the results are the
+  // same.
+  void CheckDrawSequence() {
+    constexpr const char *name = "DrawSequence";
+    constexpr uintptr_t base = 0x0000000207c00000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t cmask_address = base + 0x100000;
+    constexpr uint64_t texture_address = base + 0x200000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+    // (1.0, 2.0, -1.0, 0.5) as RGBA16F texel bits.
+    constexpr uint32_t clear_word0 = 0x40003c00u;
+    constexpr uint32_t clear_word1 = 0x3800bc00u;
+    const std::vector<u32> cleared_texel{clear_word0, clear_word1};
+    const std::vector<u32> painted{0x00003c00u, 0x3c003c00u};
+    const char *setting = std::getenv("KYTY_DRAW_SEQUENCE_FAST");
+    const bool fast = setting == nullptr || std::strcmp(setting, "0") != 0;
+    const uint64_t one = fast ? 1u : 0u;
+    EnsureRuntimeContext();
+    TileSizeAlign cmask_size{};
+    Require(name, "CMASK size",
+            TileGetCmaskSize(512, 256, 1, cmask_size) && cmask_size.size == 0x1000,
+            "unexpected CMASK footprint");
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "draw-sequence direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "draw-sequence direct mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    // Every CMASK tile expanded, in guest memory.
+    std::memset(reinterpret_cast<void *>(cmask_address), 0xff, cmask_size.size);
+
+    {
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.GetGpu().SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        registers.SetColorBase(0, {.addr = base});
+        registers.SetColorInfo(
+            0, {.cmask_fast_clear_enable = true,
+                .format = Prospero::ChannelLayout::k16_16_16_16,
+                .channel_type = Prospero::ChannelType::kFloat,
+                .channel_order = Prospero::ChannelOrder::kStandard});
+        registers.SetColorAttrib2(0, {.height = 255, .width = 511});
+        registers.SetColorAttrib3(0,
+                                  {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                   .dimension = 1,
+                                   .metadata_pipe_aligned = true});
+        registers.SetColorCmask(0, {.addr = cmask_address});
+        registers.SetColorClearWord0(0, {.word0 = clear_word0});
+        registers.SetColorClearWord1(0, {.word1 = clear_word1});
+        registers.SetRenderTargetMask(0x0f);
+        scheduler.Begin(registers, user_config, shaders);
+
+        auto &texture_cache = context.GetTextureCache();
+        auto &buffer_cache = context.GetBufferCache();
+        auto &executor = context.GetRenderExecutor();
+        context.MapMemory(base, allocation_size);
+        const auto totals = [&] { return RenderExecutorTestAccess::DrawSequenceTotals(executor); };
+
+        // Targets.
+        RenderColorInfo color{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color,
+                                                           0);
+        Require(name, "target", color.image_id && color.desc.cmask.valid,
+                "the CMASK target was not resolved");
+        TextureCache::RepeatLookup record{};
+        const auto lookup = [&] {
+          auto desc = color.desc;
+          return RenderExecutorTestAccess::FindTargetImage(executor, desc, record);
+        };
+        const auto paint = [&] {
+          vk::ClearValue clear{};
+          clear.color.float32 = std::array{1.0f, 0.0f, 1.0f, 1.0f};
+          TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), color.image_id,
+                                             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+                                             clear);
+        };
+        Require(name, "guest CMASK bytes",
+                lookup() == color.image_id && !record.valid,
+                "a decision that read CMASK bytes in guest memory was recorded as repeatable");
+
+        // GPU-owned CMASK bytes holding a recorded fill of 0xFFFFFFFF (every tile expanded).
+        (void)buffer_cache.ObtainBuffer(cmask_address, cmask_size.size, true);
+        buffer_cache.FillBuffer(cmask_address, cmask_size.size, UINT32_MAX, false);
+        Require(name, "recorded fill",
+                lookup() == color.image_id && record.valid == fast,
+                "a CMASK decision made from a recorded fill was not recorded as repeatable");
+        const auto t0 = totals();
+        Require(name, "repeat",
+                lookup() == color.image_id && totals().target_repeats == t0.target_repeats + one,
+                "an unchanged target lookup did not repeat");
+
+        // A fast clear recorded as a fill of 0 moves the fill generation: the full lookup clears.
+        paint();
+        buffer_cache.FillBuffer(cmask_address, cmask_size.size, 0, false);
+        const auto t1 = totals();
+        Require(name, "new fill",
+                lookup() == color.image_id && totals().target_repeats == t1.target_repeats &&
+                    totals().target_misses == t1.target_misses + one &&
+                    ReadCachedTexel(name, context, color.image_id) == cleared_texel,
+                "a lookup after a newly recorded fast clear repeated, or did not clear");
+        // The consumed clear left a recorded fill of 0xFFFFFFFF again.
+        (void)lookup();
+        paint();
+        const auto t2 = totals();
+        Require(name, "repeat after the clear",
+                lookup() == color.image_id && totals().target_repeats == t2.target_repeats + one &&
+                    ReadCachedTexel(name, context, color.image_id) == painted,
+                "a lookup after the consumed clear did not repeat, or changed the contents");
+
+        // An image over the CMASK bytes changes what the decision reads (the bytes alias it).
+        ImageDesc alias{};
+        alias.type = BindingType::Texture;
+        alias.info.data = {cmask_address, 16 * 16 * 4};
+        alias.info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+        alias.info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
+        alias.info.type = Prospero::ImageType::kColor2D;
+        alias.info.extent = {16, 16, 1};
+        alias.info.resources = {1, 1};
+        alias.info.pitch = 16;
+        alias.info.bytes_per_block = 4;
+        alias.info.samples = 1;
+        alias.info.tile_mode = Prospero::TileMode::kLinear;
+        alias.info.mip_layout[0] = {0, 16 * 16 * 4, 16, 16};
+        alias.view_info.format = vk::Format::eR8G8B8A8Unorm;
+        alias.view_info.type = vk::ImageViewType::e2D;
+        alias.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        alias.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        const auto alias_id = texture_cache.FindImage(alias);
+        const auto t3 = totals();
+        Require(name, "alias over the CMASK",
+                alias_id && lookup() == color.image_id &&
+                    totals().target_repeats == t3.target_repeats && record.valid == fast,
+                "a lookup after an image registered over the CMASK bytes repeated, or the "
+                "aliased decision was not recorded");
+        TextureCacheTestAccess::DeleteImage(texture_cache, alias_id);
+        (void)lookup();
+        const auto t4 = totals();
+        Require(name, "repeat after the alias left",
+                lookup() == color.image_id && totals().target_repeats == t4.target_repeats + one,
+                "a lookup after the alias was freed did not repeat");
+
+        // Textures: one stage binding the same texture twice.
+        ShaderTextureResource descriptor{{
+            static_cast<uint32_t>(texture_address >> 8u),
+            (static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8Srgb) << 20u) |
+                (((width - 1u) & 3u) << 30u),
+            ((width - 1u) >> 2u) | ((height - 1u) << 14u),
+            DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+            0, 0x00700000u, 0, 0}};
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(descriptor.fields, 8, value.dwords.begin());
+        ShaderRecompiler::IR::ImageResource resource{};
+        resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+        resource.numeric_class = Prospero::TextureNumericClass::Float;
+        resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+        resource.read = true;
+        ShaderRecompiler::IR::CompiledShaderInfo program{};
+        program.stage = ShaderType::Pixel;
+        program.info.images = {resource, resource};
+        ShaderRecompiler::IR::ResourceSnapshot snapshot{};
+        snapshot.images = {value, value};
+        const ShaderStageRuntime runtime{&program, &snapshot};
+        PreparedBindings prepared;
+        const auto bind_stage = [&] {
+          RenderExecutorTestAccess::ResetBindings(executor);
+          executor.PrepareBindings(runtime, prepared);
+          executor.RebindImages(prepared);
+        };
+        bind_stage();
+        const auto view = prepared.images[0].image_view;
+        const auto s0 = totals();
+        bind_stage();
+        Require(name, "stage repeat",
+                view != nullptr && prepared.images[0].image_view == view &&
+                    prepared.images[1].image_view == view &&
+                    prepared.images[1].image_id == prepared.images[0].image_id &&
+                    totals().texture_repeats == s0.texture_repeats + one &&
+                    totals().view_repeats == s0.view_repeats + one,
+                "an unchanged stage did not repeat its texture bindings and views");
+
+        // Other T# words for the second binding, a texture on the same 1 MiB page: resolved in
+        // full. Its new image changed the owners of the first texture's page after that binding
+        // was resolved, so the next resolution revalidates the first binding's entry
+        // (TryRepeatResolve never does): only the draw after it repeats. The views repeat as soon
+        // as both are recorded.
+        snapshot.images[1].dwords[0] = static_cast<uint32_t>((texture_address + 0x10000) >> 8u);
+        const auto s1 = totals();
+        bind_stage();
+        Require(name, "changed words",
+                totals().texture_repeats == s1.texture_repeats &&
+                    totals().view_repeats == s1.view_repeats &&
+                    prepared.images[1].image_id != prepared.images[0].image_id,
+                "a stage with other T# words repeated its bindings or views");
+        bind_stage();
+        Require(name, "page owners changed",
+                totals().texture_repeats == s1.texture_repeats &&
+                    totals().texture_misses == s1.texture_misses + one &&
+                    totals().view_repeats == s1.view_repeats + one,
+                "a stage repeated a binding whose page changed its owners since it was resolved");
+        bind_stage();
+        Require(name, "repeat of the changed words",
+                totals().texture_repeats == s1.texture_repeats + one &&
+                    totals().view_repeats == s1.view_repeats + 2 * one,
+                "the stage did not repeat once its new words were resolved and revalidated");
+
+        // Alternating between the two sets (as the desert stamps do): each switch finds the other
+        // set in the stage's history and repeats it.
+        const auto words_b = snapshot.images[1];
+        snapshot.images[1] = value;
+        const auto h0 = totals();
+        bind_stage();
+        Require(name, "history repeat",
+                totals().texture_history_hits == h0.texture_history_hits + one &&
+                    totals().texture_repeats == h0.texture_repeats + one &&
+                    prepared.images[1].image_id == prepared.images[0].image_id,
+                "switching back to an earlier T# set did not repeat it from the history");
+        snapshot.images[1] = words_b;
+        const auto h1 = totals();
+        bind_stage();
+        Require(name, "history repeat back",
+                totals().texture_history_hits == h1.texture_history_hits + one &&
+                    totals().texture_repeats == h1.texture_repeats + one &&
+                    prepared.images[1].image_id != prepared.images[0].image_id,
+                "switching to the other T# set again did not repeat it from the history");
+
+        // A guest write to the first texture: its resolution still repeats (it does not depend on
+        // the contents), its view does not (FindTexture refreshes the image).
+        WriteMetadata(context, texture_address, width * height * 4, 0x40404040u);
+        const auto s2 = totals();
+        bind_stage();
+        Require(name, "guest write",
+                totals().texture_repeats == s2.texture_repeats + one &&
+                    totals().view_repeats == s2.view_repeats &&
+                    ReadCachedTexel(name, context, prepared.images[0].image_id) ==
+                        std::vector<u32>{0x40404040u},
+                "a stage with a CPU-written texture repeated its views, or kept stale contents");
+        Require(name, "verify", totals().verify_mismatches == 0,
+                "the verify mode found a repeat that differs from the full path");
+
+        RenderExecutorTestAccess::ResetBindings(executor);
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+      });
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "draw-sequence mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "draw-sequence allocation release failed");
+    std::printf("[gpu]     %-32s ok (%s)\n", name, fast ? "fast" : "off");
   }
 
   void CheckRenderExecutorDccFixedClearFloat() {
@@ -18829,6 +19247,211 @@ public:
     DestroyImage(&resolved);
     DestroyImage(&target);
     return pixel;
+  }
+
+  // Draws `vertices` (pos2/color4 triangles, pixel-space positions already in NDC) into a
+  // width x height RGBA32F target cleared to -1.0 with a fragment shader whose only descriptor,
+  // if any, is GDS, and returns the target's words. `gds` is read and written by the draw.
+  std::vector<u32> RenderFragmentWithGds(const char *name, const CompiledShader &fragment,
+                                         u32 width, u32 height,
+                                         const std::vector<u32> &vertices,
+                                         const Buffer &gds) {
+    using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
+    const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(false);
+    ValidateSpirv(name, vertex_spirv);
+    Require(name, "graphics GDS", !vertices.empty() && vertices.size() % 18u == 0u,
+            "vertex buffer must contain whole pos2/color4 triangles");
+    const auto &layout = fragment.program.bindings;
+    Require(name, "graphics GDS", !layout.UsesPushData(),
+            "the GDS fragment harness does not bind shader data");
+    std::vector<vk::DescriptorSetLayoutBinding> layout_bindings;
+    for (const auto &binding : layout.descriptors) {
+      Require(name, "graphics GDS", binding.kind == Kind::Gds,
+              "the GDS fragment harness binds only GDS");
+      layout_bindings.push_back({ShaderRecompiler::IR::NativeBinding(ShaderType::Pixel, binding.kind),
+                                 NativeDescriptorType(binding.kind),
+                                 NativeDescriptorCount(binding),
+                                 vk::ShaderStageFlagBits::eFragment});
+    }
+    if (layout_bindings.empty()) {
+      // The shader does not use GDS; the buffer is still bound, unused.
+      layout_bindings.push_back({ShaderRecompiler::IR::NativeBinding(ShaderType::Pixel, Kind::Gds),
+                                 NativeDescriptorType(Kind::Gds), 1u,
+                                 vk::ShaderStageFlagBits::eFragment});
+    }
+    Require(name, "graphics GDS", layout_bindings.size() == 1u,
+            "fragment shader requested more than the GDS binding");
+
+    Image target = CreateImageMips(name, width, height, vk::Format::eR32G32B32A32Sfloat,
+                                   vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
+                                   vk::ImageLayout::eGeneral, vk::ImageType::e2D,
+                                   vk::ImageViewType::e2D, 1);
+    auto vertex_buffer = CreateHostBuffer(name, vertices.size() * sizeof(u32),
+                                          vk::BufferUsageFlagBits::eVertexBuffer, vertices);
+    vk::ShaderModule vertex_module = CreateShaderModule(name, vertex_spirv);
+    vk::ShaderModule fragment_module = CreateShaderModule(name, fragment.spirv);
+
+    vk::DescriptorSetLayoutCreateInfo set_layout_info{};
+    set_layout_info.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
+    set_layout_info.bindingCount = static_cast<u32>(layout_bindings.size());
+    set_layout_info.pBindings = layout_bindings.data();
+    vk::DescriptorSetLayout set_layout = nullptr;
+    RequireVk(name, "graphics GDS",
+              m_device.createDescriptorSetLayout(&set_layout_info, nullptr, &set_layout),
+              "vkCreateDescriptorSetLayout");
+    vk::DescriptorPoolSize pool_size{layout_bindings[0].descriptorType, 1};
+    vk::DescriptorPoolCreateInfo pool_info{};
+    pool_info.sType = vk::StructureType::eDescriptorPoolCreateInfo;
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes = &pool_size;
+    vk::DescriptorPool pool = nullptr;
+    RequireVk(name, "graphics GDS", m_device.createDescriptorPool(&pool_info, nullptr, &pool),
+              "vkCreateDescriptorPool");
+    vk::DescriptorSetAllocateInfo set_info{};
+    set_info.sType = vk::StructureType::eDescriptorSetAllocateInfo;
+    set_info.descriptorPool = pool;
+    set_info.descriptorSetCount = 1;
+    set_info.pSetLayouts = &set_layout;
+    vk::DescriptorSet set = nullptr;
+    RequireVk(name, "graphics GDS", m_device.allocateDescriptorSets(&set_info, &set),
+              "vkAllocateDescriptorSets");
+    const vk::DescriptorBufferInfo gds_info{gds.buffer, 0, gds.size};
+    vk::WriteDescriptorSet write{};
+    write.sType = vk::StructureType::eWriteDescriptorSet;
+    write.dstSet = set;
+    write.dstBinding = layout_bindings[0].binding;
+    write.descriptorCount = 1;
+    write.descriptorType = layout_bindings[0].descriptorType;
+    write.pBufferInfo = &gds_info;
+    m_device.updateDescriptorSets(1, &write, 0, nullptr);
+
+    vk::PipelineLayoutCreateInfo pipeline_layout_info{};
+    pipeline_layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
+    pipeline_layout_info.setLayoutCount = 1;
+    pipeline_layout_info.pSetLayouts = &set_layout;
+    vk::PipelineLayout pipeline_layout = nullptr;
+    RequireVk(name, "graphics GDS",
+              m_device.createPipelineLayout(&pipeline_layout_info, nullptr, &pipeline_layout),
+              "vkCreatePipelineLayout");
+
+    vk::PipelineShaderStageCreateInfo stages[2] = {};
+    stages[0].sType = vk::StructureType::ePipelineShaderStageCreateInfo;
+    stages[0].stage = vk::ShaderStageFlagBits::eVertex;
+    stages[0].module = vertex_module;
+    stages[0].pName = "main";
+    stages[1].sType = vk::StructureType::ePipelineShaderStageCreateInfo;
+    stages[1].stage = vk::ShaderStageFlagBits::eFragment;
+    stages[1].module = fragment_module;
+    stages[1].pName = "main";
+    vk::VertexInputBindingDescription vertex_binding{0, 6u * sizeof(float),
+                                                     vk::VertexInputRate::eVertex};
+    vk::VertexInputAttributeDescription attributes[2] = {};
+    attributes[0].location = 0;
+    attributes[0].format = vk::Format::eR32G32Sfloat;
+    attributes[0].offset = 0;
+    attributes[1].location = 1;
+    attributes[1].format = vk::Format::eR32G32B32A32Sfloat;
+    attributes[1].offset = 2u * sizeof(float);
+    vk::PipelineVertexInputStateCreateInfo vertex_input{};
+    vertex_input.sType = vk::StructureType::ePipelineVertexInputStateCreateInfo;
+    vertex_input.vertexBindingDescriptionCount = 1;
+    vertex_input.pVertexBindingDescriptions = &vertex_binding;
+    vertex_input.vertexAttributeDescriptionCount = 2;
+    vertex_input.pVertexAttributeDescriptions = attributes;
+    vk::PipelineInputAssemblyStateCreateInfo input_assembly{};
+    input_assembly.sType = vk::StructureType::ePipelineInputAssemblyStateCreateInfo;
+    input_assembly.topology = vk::PrimitiveTopology::eTriangleList;
+    vk::Viewport viewport{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height),
+                          0.0f, 1.0f};
+    vk::Rect2D scissor{{0, 0}, {width, height}};
+    vk::PipelineViewportStateCreateInfo viewport_state{};
+    viewport_state.sType = vk::StructureType::ePipelineViewportStateCreateInfo;
+    viewport_state.viewportCount = 1;
+    viewport_state.pViewports = &viewport;
+    viewport_state.scissorCount = 1;
+    viewport_state.pScissors = &scissor;
+    vk::PipelineRasterizationStateCreateInfo raster{};
+    raster.sType = vk::StructureType::ePipelineRasterizationStateCreateInfo;
+    raster.polygonMode = vk::PolygonMode::eFill;
+    raster.cullMode = vk::CullModeFlagBits::eNone;
+    raster.frontFace = vk::FrontFace::eCounterClockwise;
+    raster.lineWidth = 1.0f;
+    vk::PipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = vk::StructureType::ePipelineMultisampleStateCreateInfo;
+    multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+    vk::PipelineColorBlendAttachmentState color_attachment{};
+    color_attachment.colorWriteMask =
+        vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    vk::PipelineColorBlendStateCreateInfo color_blend{};
+    color_blend.sType = vk::StructureType::ePipelineColorBlendStateCreateInfo;
+    color_blend.attachmentCount = 1;
+    color_blend.pAttachments = &color_attachment;
+    const vk::Format color_format = vk::Format::eR32G32B32A32Sfloat;
+    vk::PipelineRenderingCreateInfo rendering_pipeline{};
+    rendering_pipeline.sType = vk::StructureType::ePipelineRenderingCreateInfo;
+    rendering_pipeline.colorAttachmentCount = 1;
+    rendering_pipeline.pColorAttachmentFormats = &color_format;
+    vk::GraphicsPipelineCreateInfo pipeline_info{};
+    pipeline_info.sType = vk::StructureType::eGraphicsPipelineCreateInfo;
+    pipeline_info.pNext = &rendering_pipeline;
+    pipeline_info.stageCount = 2;
+    pipeline_info.pStages = stages;
+    pipeline_info.pVertexInputState = &vertex_input;
+    pipeline_info.pInputAssemblyState = &input_assembly;
+    pipeline_info.pViewportState = &viewport_state;
+    pipeline_info.pRasterizationState = &raster;
+    pipeline_info.pMultisampleState = &multisample;
+    pipeline_info.pColorBlendState = &color_blend;
+    pipeline_info.layout = pipeline_layout;
+    vk::Pipeline pipeline = nullptr;
+    RequireVk(name, "graphics GDS",
+              m_device.createGraphicsPipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+              "vkCreateGraphicsPipelines");
+
+    vk::CommandBuffer cmd = BeginCommands(name, "graphics GDS");
+    vk::RenderingAttachmentInfo color{};
+    color.sType = vk::StructureType::eRenderingAttachmentInfo;
+    color.imageView = target.view;
+    color.imageLayout = vk::ImageLayout::eGeneral;
+    color.loadOp = vk::AttachmentLoadOp::eClear;
+    color.storeOp = vk::AttachmentStoreOp::eStore;
+    color.clearValue.color = vk::ClearColorValue(std::array<float, 4>{-1.0f, -1.0f, -1.0f, -1.0f});
+    vk::RenderingInfo rendering{};
+    rendering.sType = vk::StructureType::eRenderingInfo;
+    rendering.renderArea.extent = vk::Extent2D{width, height};
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &color;
+    cmd.beginRendering(rendering);
+    cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, 1, &set, 0,
+                           nullptr);
+    vk::DeviceSize offset = 0;
+    cmd.bindVertexBuffers(0, 1, &vertex_buffer.buffer, &offset);
+    cmd.draw(static_cast<u32>(vertices.size() / 6u), 1, 0, 0);
+    cmd.endRendering();
+    vk::MemoryBarrier barrier{};
+    barrier.sType = vk::StructureType::eMemoryBarrier;
+    barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eTransferRead;
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader,
+                        vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer,
+                        {}, 1, &barrier, 0, nullptr, 0, nullptr);
+    EndSubmitAndFree(name, "graphics GDS", cmd);
+    target.layout = vk::ImageLayout::eGeneral;
+    auto pixels = ReadImage(name, &target);
+
+    m_device.destroyPipeline(pipeline, nullptr);
+    m_device.destroyPipelineLayout(pipeline_layout, nullptr);
+    m_device.destroyDescriptorPool(pool, nullptr);
+    m_device.destroyDescriptorSetLayout(set_layout, nullptr);
+    m_device.destroyShaderModule(fragment_module, nullptr);
+    m_device.destroyShaderModule(vertex_module, nullptr);
+    DestroyBuffer(&vertex_buffer);
+    DestroyImage(&target);
+    return pixels;
   }
 
   void CheckGpuTilerCpuParity() {
@@ -39550,6 +40173,8 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 }
 
 #include "ShaderCodegenTests.inc"
+#include "ShaderGiProbeTests.inc"
+#include "ShaderSrtVariantTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
@@ -39558,12 +40183,33 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--gi-decode-inventory") == 0) {
+    EnsureConfigInitialized();
+    return GiProbeTests::GiDecodeInventory(argv[2], argc == 4 ? argv[3] : nullptr);
+  }
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--corpus-spirv-stats") == 0) {
     EnsureConfigInitialized();
     return CorpusSpirvStats(argv[2], argc == 4 ? argv[3] : nullptr);
   }
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--gi-probe-codegen-only") == 0) {
+    GiProbeTests::CheckPixelAppendElectionCodegen();
+    GiProbeTests::CheckPixelLiveExecCodegen();
+    GiProbeTests::CheckLoopGuardCodegen();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--gi-probe-only") == 0) {
+    GiProbeTests::CheckPixelAppendElectionCodegen();
+    GiProbeTests::CheckPixelLiveExecCodegen();
+    GiProbeTests::CheckLoopGuardCodegen();
+    VulkanHarness vulkan;
+    GiProbeTests::CheckPixelAppendHelperElection(&vulkan);
+    GiProbeTests::CheckPixelAppendLiveExec(&vulkan);
+    GiProbeTests::CheckPixelWqmLiveExec(&vulkan);
+    GiProbeTests::CheckLoopGuardEndsEndlessLoop(&vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ScalarMemRealtimeCapturedPlaceholder());
@@ -40098,9 +40744,19 @@ int main(int argc, char **argv) {
     vulkan.CheckBindingEpochMemo();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--tracker-gap-detectors-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTrackerGapDetectors();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--texture-memo-revalidate-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTextureMemoRevalidation();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--draw-sequence-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDrawSequence();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-prep-code-cert-only") == 0) {
@@ -40147,6 +40803,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--exec-selects-bench") == 0) {
     VulkanHarness vulkan;
     CodegenTests::BenchExecSelects(&vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--srt-variant-only") == 0) {
+    VulkanHarness vulkan;
+    SrtVariantTests::RunAll(&vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--codegen-only") == 0) {
@@ -40321,6 +40982,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
   vulkan.CheckRenderExecutorDccFixedClearFloat();
   vulkan.CheckRenderExecutorCmaskFastClear();
+  vulkan.CheckDrawSequence();
   vulkan.CheckSampledDccClear();
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
@@ -40337,6 +40999,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBufferRangeMemo();
   vulkan.CheckBdaSyncEpoch();
   vulkan.CheckBindingEpochMemo();
+  vulkan.CheckTrackerGapDetectors();
   vulkan.CheckEagerReadback();
 #endif
   vulkan.CheckUnifiedImageViewCache();

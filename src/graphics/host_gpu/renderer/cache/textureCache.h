@@ -61,12 +61,72 @@ public:
 		ColorFastClear cmask;
 	};
 
+	// KYTY_DRAW_SEQUENCE_FAST: why a metadata decision of FindImage (MaterializeDccClear,
+	// MaterializeCmaskClear) did nothing, in terms a later decision for the same description can
+	// be checked against. `provable`: the decision read nothing but the description and fixed
+	// image fields, or only the state recorded here: the texture-cache structure over the metadata
+	// bytes (page versions: which images alias them), the recorded fills (BufferCache
+	// KnownFillGeneration; 0 when none was read) and the GPU-dirty state (set) of `gpu_ranges`.
+	// With all of it unchanged the same decision is made again, and again does nothing.
+	struct MetadataNoop {
+		static constexpr uint32_t MaxPages     = 2;
+		static constexpr uint32_t MaxGpuRanges = 4;
+
+		bool                                 provable        = false;
+		uint64_t                             first_page      = 0;
+		uint32_t                             page_count      = 0;
+		std::array<uint64_t, MaxPages>       page_versions   {};
+		uint64_t                             fill_generation = 0;
+		uint32_t                             gpu_range_count = 0;
+		std::array<GuestRange, MaxGpuRanges> gpu_ranges      {};
+	};
+	// KYTY_DRAW_SEQUENCE_FAST: what a FindImage of a description returned, and why the same
+	// lookup would return it again with nothing to do but its access bookkeeping (see
+	// TryRepeatLookup). Filled by FindImage(desc, exact_format, &record); `valid` only when every
+	// part is proven.
+	//  - Lookup: the answer came from the first-page lookup (FindImageWithSameBacking), which
+	//    reads only the owner list of the description's first page and the owners' registered
+	//    flags and SameBacking fields; every change of those bumps the page's version.
+	//  - EnsureResidency: the image's resident_first is at most `requested_first` (checked live).
+	//  - SyncAliasFromOwner: returns at once (checked live) or no registered image has the same
+	//    backing range, extent and sample count (`has_partner` false: such images start on the
+	//    same page, so a new one bumps its version).
+	//  - MaterializeDccClear / MaterializeCmaskClear: `dcc` and `cmask`.
+	struct RepeatLookup {
+		ImageId      image;
+		uint64_t     page            = 0;
+		uint64_t     page_version    = 0;
+		uint32_t     requested_first = 0;
+		bool         exact_format    = false;
+		bool         has_partner     = false;
+		bool         valid           = false;
+		MetadataNoop dcc;
+		MetadataNoop cmask;
+	};
+
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	             BufferCache& buffer_cache);
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// `record` (optional): filled as described at RepeatLookup.
+	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
+	                                      RepeatLookup* record = nullptr);
+	// The lookup `record` describes, repeated for the same `desc` and `exact_format` (the caller
+	// guarantees the description is equal to the recorded lookup's): true when every recorded proof
+	// still holds, so FindImage would return record.image and do nothing else but its access
+	// bookkeeping; with `apply` that bookkeeping (and the metadata bookkeeping of a DCC
+	// description) is performed as FindImage performs it. `apply` false only checks.
+	[[nodiscard]] bool          TryRepeatLookup(const ImageDesc& desc, bool exact_format,
+	                                            const RepeatLookup& record, bool apply);
+	// Diagnostics (KYTY_DRAW_SEQUENCE_VERIFY): residency extensions and alias synchronizations
+	// FindImage has performed; a repeat must add none.
+	[[nodiscard]] uint64_t      LookupSideEffects() const noexcept { return m_lookup_side_effects; }
+	// KYTY_DRAW_SEQUENCE_VERIFY: a GPU-owned metadata range `record` relied on is no longer
+	// GPU-modified. FindImage never ends GPU ownership of such a range before a decision that
+	// differs from the recorded one, so after a repeat check this means another thread (a guest
+	// write fault's flush, a side readback) changed it: the full lookup raced the check.
+	[[nodiscard]] bool          RepeatGpuRangesLost(const RepeatLookup& record);
 	void                        UpdateImage(ImageId id);
 	// buffer_sync: the caller copies the image into the buffer at its own range (texel reads),
 	// where GPU-dirty bytes it supersedes do not block it (SafeToSyncIntoBuffer).
@@ -261,13 +321,27 @@ private:
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id,
 	                                         RefreshIntent intent = RefreshIntent::Read);
+	// `noop` (optional): how the decision can be repeated (MetadataNoop), reset first.
 	void                        MaterializeDccClear(ImageId id, const ImageDesc& desc,
-	                                                uint32_t metadata_base_layer);
+	                                                uint32_t metadata_base_layer,
+	                                                MetadataNoop* noop = nullptr);
 	// A render-target binding whose CMASK marks every tile of a bound slice fast-cleared: clears
 	// the slice to the CLEAR_WORD colour and leaves the CMASK expanded, as the colour block's
 	// reads and the fast-clear eliminate would (KYTY_CMASK_FAST_CLEAR).
 	void                        MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
-	                                                  uint32_t metadata_base_layer);
+	                                                  uint32_t metadata_base_layer,
+	                                                  MetadataNoop* noop = nullptr);
+	// MetadataNoop helpers. Caller holds m_lock: the page versions over `range` (false when it
+	// covers more than MetadataNoop::MaxPages pages).
+	[[nodiscard]] bool CaptureMetadataPages(GuestRange range, MetadataNoop& noop) const;
+	[[nodiscard]] bool MetadataPagesHold(const MetadataNoop& noop) const;
+	// Without m_lock: the recorded fills and GPU-dirty states are still as recorded.
+	[[nodiscard]] bool MetadataStateHolds(const MetadataNoop& noop);
+	// SyncAliasFromOwner returns before looking for an owner (caller holds m_lock).
+	[[nodiscard]] static bool SyncAliasReturnsAtOnce(const Image& image);
+	// Whether a registered image other than `found` has exactly its backing range, extent and
+	// sample count on `page` (SyncAliasFromOwner's only possible owners). Caller holds m_lock.
+	[[nodiscard]] bool HasAliasPartner(uint64_t page, ImageId found, const Image& image) const;
 	// Returns DccGpuRecords or DccGpuReuses when the native path handled every slice, otherwise
 	// the first failing reason (Profiler::FrameEvent::DccFallback*) for the CPU fallback.
 	[[nodiscard]] Profiler::FrameEvent TryMaterializeGpuDccClear(ImageId id, const ImageDesc& desc,
@@ -385,6 +459,8 @@ private:
 	ImageLookupMode  m_image_lookup_mode = ImageLookupMode::FirstPage;
 	uint64_t         m_image_lookup_checks = 0;
 	uint64_t         m_image_lookup_mismatches = 0;
+	// LookupSideEffects (GPU thread).
+	uint64_t         m_lookup_side_effects = 0;
 	bool             m_readback_linear_images = false;
 	// Texture streaming (see TextureCache constructor for the environment switches).
 	bool             m_partial_upload      = true;

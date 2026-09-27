@@ -1121,7 +1121,33 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto count = Binary(state, spv::OpIAdd, TypeU32(state),
 	                          Unary(state, spv::OpBitCount, TypeU32(state), low),
 	                          Unary(state, spv::OpBitCount, TypeU32(state), high));
-	const auto first = ctx.FirstLane(ballot);
+	// KYTY_PS_APPEND_LIVE_ELECTION: a helper invocation's atomic has no effect and returns an
+	// undefined value, so a pixel shader elects the first EXEC lane that is not a helper (the
+	// count above still covers every EXEC lane). With no such lane nobody consumes the result.
+	auto elected_ballot = ballot;
+	auto lane_guard     = exec;
+	if (state.program.stage == ShaderType::Pixel && state.helper_invocation_variable != 0 &&
+	    state.lane_count == 1) {
+		const auto live =
+		    Binary(state, spv::OpLogicalAnd, TypeBool(state), exec,
+		           Unary(state, spv::OpLogicalNot, TypeBool(state), EmitIsHelperInvocation(state)));
+		elected_ballot = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4),
+		                          elected_ballot, ConstantU32(state, spv::ScopeSubgroup), live);
+		const auto elected_low  = state.builder.AllocateId();
+		const auto elected_high = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), elected_low,
+		                          elected_ballot, 0);
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), elected_high,
+		                          elected_ballot, 1);
+		const auto any_live =
+		    Binary(state, spv::OpINotEqual, TypeBool(state),
+		           Binary(state, spv::OpBitwiseOr, TypeU32(state), elected_low, elected_high),
+		           ConstantU32(state, 0));
+		// FindLSB of an empty ballot is undefined: without a live lane nothing is added.
+		lane_guard = AndCondition(state, exec, any_live);
+	}
+	const auto first = ctx.FirstLane(elected_ballot);
 	const auto source_lane =
 	    state.lane_count == 2
 	        ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), first, ConstantU32(state, 31))
@@ -1139,7 +1165,7 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    AndCondition(state,
 	                 state.lane_count == 2 ? Binary(state, spv::OpINotEqual, TypeBool(state), count,
 	                                                ConstantU32(state, 0))
-	                                       : exec,
+	                                       : lane_guard,
 	                 AndCondition(state, storage_bounds, m0_bounds)));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
 		const auto value = state.builder.AllocateId();
@@ -1169,9 +1195,55 @@ uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
 }
 
+// One dword of an S_BUFFER_LOAD through a V# the shader computed at runtime (KYTY_SRT_VARIANT_READS,
+// ResourceKind::IndirectBuffer), read through BDA. RDNA2 ISA 7.2.1, "Reads using Buffer Constant":
+// only base, stride and num_records are used; addr = (base + OFFSET + SOFFSET) & ~3. The bound is
+// the one a bound scalar buffer gets (ShaderBufferResource::GetSize: stride 0 makes num_records a
+// byte count, otherwise stride * num_records bytes), and a dword with any byte past it reads 0, as
+// the robust storage-buffer load of a bound V# does.
+uint32_t LoadIndirectScalarBuffer(ValueEmitContext& ctx, const IR::Inst& inst,
+                                  const IR::MemoryInfo& mem) {
+	auto&       state   = ctx.state;
+	const auto& handle  = *inst.Arg(0).ResolveInstruction();
+	const auto  word1   = ctx.Arg(handle, 1);
+	const auto  records = ctx.Arg(handle, 2);
+	const auto  field   = [&](uint32_t word, uint32_t first, uint32_t count) {
+		return EmitBitFieldUExtract(state, word, ConstantU32(state, first),
+		                            ConstantU32(state, count));
+	};
+	const auto u64 = [&](uint32_t value) {
+		return Unary(state, spv::OpUConvert, TypeScalarU64(state), value);
+	};
+	const auto stride = field(word1, 16, 14);
+	const auto base   = DeviceAddressFromWords(state, ctx.Arg(handle, 0), field(word1, 0, 16));
+	const auto offset = Binary(state, spv::OpIAdd, TypeU32(state), ctx.Arg(inst, 1),
+	                           ConstantU32(state, mem.offset));
+	const auto size   = Select(state, TypeScalarU64(state),
+	                           Binary(state, spv::OpIEqual, TypeBool(state), stride,
+	                                  ConstantU32(state, 0)),
+	                           u64(records),
+	                           Binary(state, spv::OpIMul, TypeScalarU64(state), u64(stride),
+	                                  u64(records)));
+	const auto dword_end =
+	    Binary(state, spv::OpIAdd, TypeScalarU64(state),
+	           u64(Binary(state, spv::OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, ~3u))),
+	           ConstantDeviceAddress(state, sizeof(uint32_t)));
+	const auto in_bounds =
+	    Binary(state, spv::OpULessThanEqual, TypeBool(state), dword_end, size);
+	// The ISA drops the two LSBs of the sum, so the dword never straddles (no unaligned merge).
+	const auto guest = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state),
+	                          Binary(state, spv::OpIAdd, TypeScalarU64(state), base, u64(offset)),
+	                          ConstantDeviceAddress(state, ~uint64_t {3}));
+	return LoadBda(ctx, guest, in_bounds, 32u);
+}
+
 void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto mem = ctx.Memory(inst);
 	if (mem.planning_only) return;
+	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
+		ctx.Define(inst, LoadIndirectScalarBuffer(ctx, inst, mem));
+		return;
+	}
 	auto& state        = ctx.state;
 	mem.kind           = IR::ResourceKind::ScalarBuffer;
 	const auto address = Binary(state, spv::OpIAdd, TypeU32(state), ctx.Arg(inst, 1),

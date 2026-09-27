@@ -39,6 +39,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -1020,6 +1021,131 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+// KYTY_GDS_TRACE=1 logs the user SGPRs of the first draws or dispatches of every program that
+// binds GDS (up to 32 programs, 4 uses each). A DS_APPEND/DS_CONSUME takes its GDS range from
+// M0, which such programs load from a user SGPR (the GdsCounterRange direct resource: base in
+// bits 31:16, size in bits 15:0), so the log shows which counters a pass uses.
+static void NoteGdsProgram(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                           const ShaderRecompiler::IR::ResourceSnapshot&   snapshot) {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_GDS_TRACE");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	if (!enabled) {
+		return;
+	}
+	constexpr uint32_t          MaxPrograms = 32;
+	constexpr uint32_t          MaxUses     = 4;
+	static std::atomic<uint64_t> hashes[MaxPrograms] {};
+	static std::atomic<uint32_t> uses[MaxPrograms] {};
+	uint32_t                     slot        = MaxPrograms;
+	for (uint32_t i = 0; i < MaxPrograms; i++) {
+		auto expected = uint64_t {0};
+		if (hashes[i].load(std::memory_order_relaxed) == program.shader_hash ||
+		    hashes[i].compare_exchange_strong(expected, program.shader_hash)) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot == MaxPrograms || uses[slot].fetch_add(1, std::memory_order_relaxed) >= MaxUses) {
+		return;
+	}
+	std::string values;
+	const auto  count = std::min<size_t>(snapshot.user_data.size(), 24);
+	for (size_t i = 0; i < count; i++) {
+		values += fmt::format(" s{}=0x{:08x}", program.user_data_base + i, snapshot.user_data[i]);
+	}
+	LOGF("GDS trace: program stage=%u hash=0x%016" PRIx64 " user data:%s\n",
+	     static_cast<uint32_t>(program.stage), program.shader_hash, values.c_str());
+}
+
+bool RenderExecutor::RepeatStageTextures(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                         const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
+                                         PreparedBindings&                               prepared) {
+	if (!DrawSequenceEnabled(DrawSequencePart::Textures) || !TextureBindingMemo::Enabled()) {
+		return false;
+	}
+	auto&      totals  = m_draw_sequence_totals;
+	const auto matches = [&](const ShaderRecompiler::IR::CompiledShaderInfo*  set_program,
+	                         const std::vector<ShaderRecompiler::IR::DescriptorValue>& words) {
+		return set_program == &program && std::ranges::equal(words, snapshot.images);
+	};
+	if (!matches(prepared.texture_program, prepared.texture_words)) {
+		auto&      history = prepared.texture_history;
+		const auto found   = std::ranges::find_if(
+            history, [&](const auto& set) { return matches(set.program, set.words); });
+		if (found == history.end()) {
+			// New words: the current set becomes the most recent earlier one, and the caller
+			// resolves into the oldest one's vectors (their capacity is reused).
+			if (prepared.texture_program != nullptr) {
+				std::rotate(history.begin(), history.end() - 1, history.end());
+				std::swap(history.front().program, prepared.texture_program);
+				std::swap(history.front().words, prepared.texture_words);
+				std::swap(history.front().images, prepared.images);
+			}
+			prepared.texture_program = nullptr;
+			return false;
+		}
+		// An earlier set of these words becomes the current one (the current set takes its
+		// place); its bindings are validated below like the current set's.
+		std::swap(found->program, prepared.texture_program);
+		std::swap(found->words, prepared.texture_words);
+		std::swap(found->images, prepared.images);
+		totals.texture_history_hits++;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTextureHistoryHits);
+	}
+	if (prepared.images.empty()) {
+		return false;
+	}
+	auto&      texture_cache = m_context.GetTextureCache();
+	const bool verify        = DrawSequenceVerifyMode() != 0;
+	if (!m_texture_memo.TryRepeatResolve(texture_cache, prepared.images, !verify)) {
+		totals.texture_misses++;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTextureMisses);
+		return false;
+	}
+	totals.texture_repeats++;
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTextureRepeats);
+	const auto storage = [](const TextureBinding& binding) {
+		return binding.desc.type == TextureCache::BindingType::Storage;
+	};
+	if (verify) {
+		// KYTY_DRAW_SEQUENCE_VERIFY: every binding's full resolution must find its own entry again
+		// (same image and description, no revalidation: same tag); it provides the result. Only
+		// the GPU thread changes what the check read (short of a guest unmap racing the draw).
+		totals.verify_checks++;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceVerifyChecks);
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			auto&      binding       = prepared.images[i];
+			const auto claimed_image = binding.image_id;
+			const auto claimed_tag   = binding.memo_tag;
+			ResolveTexture(program.info.images[i], snapshot.images[i], binding);
+			if (binding.image_id != claimed_image || binding.memo_tag != claimed_tag) {
+				totals.verify_mismatches++;
+				ReportDrawSequenceMismatch("a repeated stage texture binding");
+			}
+			BindImage(binding.image_id, storage(binding));
+		}
+		return true;
+	}
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		auto& binding = prepared.images[i];
+		// ResolveTexture's work besides the lookup TryRepeatResolve repeated.
+		binding.image_view = nullptr;
+		binding.layout     = vk::ImageLayout::eUndefined;
+		binding.mip_views.clear();
+		if (HangTrace::Enabled()) {
+			const auto descriptor =
+			    DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[i]);
+			if (!descriptor.IsNull()) {
+				HangTrace::RecordTexture(descriptor.fields);
+			}
+		}
+		BindImage(binding.image_id, storage(binding));
+	}
+	return true;
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -1032,13 +1158,17 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shader_data_buffer = {};
 	prepared.buffer_sources.clear();
 	prepared.buffers.clear();
-	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		auto& binding = prepared.images[i];
-		ResolveTexture(program.info.images[i], snapshot.images[i], binding);
-		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+	if (!RepeatStageTextures(program, snapshot, prepared)) {
+		prepared.images.resize(program.info.images.size());
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			auto& binding = prepared.images[i];
+			ResolveTexture(program.info.images[i], snapshot.images[i], binding);
+			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+		}
+		prepared.texture_program = &program;
+		prepared.texture_words.assign(snapshot.images.begin(), snapshot.images.end());
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
@@ -1052,6 +1182,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
+		NoteGdsProgram(program, snapshot);
 	}
 }
 
@@ -1286,6 +1417,37 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	// KYTY_DRAW_SEQUENCE_FAST (textures): when every binding would get TryAcquireView's hit and
+	// nothing else (TextureBindingMemo::TryRepeatViews, one texture-cache lock for the stage).
+	bool verify_views = false;
+	if (DrawSequenceEnabled(DrawSequencePart::Textures) && TextureBindingMemo::Enabled() &&
+	    !images.empty() &&
+	    std::ranges::none_of(program.info.images, [](const auto& resource) {
+		    return resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+	    })) {
+		const bool verify = DrawSequenceVerifyMode() != 0;
+		if (m_texture_memo.TryRepeatViews(texture_cache, images, !verify)) {
+			m_draw_sequence_totals.view_repeats++;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceViewRepeats);
+			if (!verify) {
+				for (auto& binding: images) {
+					binding.mip_views.clear();
+					// Sampled bindings only (TryRepeatViews).
+					texture_cache.GetImage(binding.image_id).usage.texture = true;
+				}
+				return;
+			}
+			// KYTY_DRAW_SEQUENCE_VERIFY: the loops below must acquire the views claimed here (a
+			// guest write racing the check may make them refresh an image, not change a view).
+			m_draw_sequence_totals.verify_checks++;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceVerifyChecks);
+			m_claimed_views.clear();
+			for (const auto& binding: images) {
+				m_claimed_views.push_back(m_texture_memo.EntryView(binding));
+			}
+			verify_views = true;
+		}
+	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
@@ -1321,6 +1483,14 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
+	}
+	if (verify_views) {
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			if (images[i].image_view != m_claimed_views[i]) {
+				m_draw_sequence_totals.verify_mismatches++;
+				ReportDrawSequenceMismatch("a repeated stage texture view");
+			}
+		}
 	}
 }
 

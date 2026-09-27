@@ -89,6 +89,13 @@ struct Site {
 namespace Detail {
 // Written once by InstallHooks() before any renderer thread records commands.
 extern bool g_active;
+// The calling thread's innermost and outermost site (see ScopedSite).
+extern thread_local Site* t_site;
+extern thread_local Site* t_scope;
+// Links a site into the published list the first time it is entered.
+void        LinkSite(Site& site) noexcept;
+// ScopedSite's work, for callers that set the calling thread's site themselves (e.g. a thread
+// recording on behalf of another).
 void        EnterSite(Site& site, Site*& previous, bool& scope_owner) noexcept;
 void        LeaveSite(Site* previous, bool scope_owner) noexcept;
 } // namespace Detail
@@ -99,18 +106,30 @@ void        LeaveSite(Site* previous, bool scope_owner) noexcept;
 }
 
 // Tags the operations recorded on this thread while in scope. The innermost tag is the op's
-// "site"; the outermost is its "scope" (e.g. site image.transition within scope draw).
+// "site"; the outermost is its "scope" (e.g. site image.transition within scope draw). Inlined
+// (these scopes are on every draw): Detail::EnterSite/LeaveSite do the same.
 class ScopedSite {
 public:
 	explicit ScopedSite(Site& site) noexcept {
 		if (Detail::g_active) [[unlikely]] {
 			m_set = true;
-			Detail::EnterSite(site, m_previous, m_scope_owner);
+			if (!site.linked.load(std::memory_order_acquire)) [[unlikely]] {
+				Detail::LinkSite(site);
+			}
+			m_previous    = Detail::t_site;
+			Detail::t_site = &site;
+			if (Detail::t_scope == nullptr) {
+				Detail::t_scope = &site;
+				m_scope_owner   = true;
+			}
 		}
 	}
 	~ScopedSite() {
 		if (m_set) [[unlikely]] {
-			Detail::LeaveSite(m_previous, m_scope_owner);
+			Detail::t_site = m_previous;
+			if (m_scope_owner) {
+				Detail::t_scope = nullptr;
+			}
 		}
 	}
 	ScopedSite(const ScopedSite&)            = delete;

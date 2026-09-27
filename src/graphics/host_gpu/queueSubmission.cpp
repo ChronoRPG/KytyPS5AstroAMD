@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/queueSubmission.h"
 
 #include "common/profiler.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -74,6 +75,8 @@ void QueueSubmissionBroker::Enqueue(QueuedSubmission submission) {
 
 void QueueSubmissionBroker::Worker() {
 	KYTY_PROFILER_THREAD("Vulkan queue submission");
+	// It only blocks between submissions; the CP's work reaches the GPU through it.
+	Common::RaiseServiceThreadPriority();
 	for (;;) {
 		{
 			std::unique_lock lock(m_mutex);

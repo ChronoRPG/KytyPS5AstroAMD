@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
+#include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/shader.h"
@@ -587,9 +588,13 @@ uint64_t NowNs() {
 
 // The parallel-mode window and its DrawPrep#k threads. Workers only run Prepare on claimed
 // slots (register snapshot in, preparation out); everything else stays on the GPU thread.
+// Parking follows WorkerGate (workerGate.h): KYTY_DRAW_PREP_HOT workers spin as before, the
+// others park until the unclaimed backlog reaches KYTY_DRAW_PREP_WAKE_BACKLOG.
 struct Engine::Workers {
-	Workers(PipelineCache& pipeline_cache, uint32_t window, uint32_t count, uint64_t spin_ns)
-	    : pipeline_cache(pipeline_cache), window(window), spin_ns(spin_ns) {
+	Workers(PipelineCache& pipeline_cache, uint32_t window, uint32_t count, uint64_t spin_ns,
+	        uint32_t hot, uint32_t wake_backlog, uint64_t cold_spin_ns)
+	    : pipeline_cache(pipeline_cache), window(window), spin_ns(spin_ns),
+	      cold_spin_ns(cold_spin_ns), gate(count, hot, wake_backlog) {
 		for (uint32_t index = 0; index < count; index++) {
 			threads.emplace_back([this, index] { Run(index); });
 		}
@@ -597,8 +602,7 @@ struct Engine::Workers {
 
 	~Workers() {
 		stop.store(true, std::memory_order_seq_cst);
-		signal.fetch_add(1, std::memory_order_seq_cst);
-		signal.notify_all();
+		gate.WakeAll();
 		for (auto& thread: threads) {
 			thread.join();
 		}
@@ -607,13 +611,13 @@ struct Engine::Workers {
 	Workers(const Workers&)            = delete;
 	Workers& operator=(const Workers&) = delete;
 
-	// Producer side, after Publish: wake parked workers. Paired with Run's sleepers increment
-	// and HasClaimable() reload (both seq_cst): either the worker sees the new slot before
-	// parking, or this thread sees it parking and changes the signal it waits on.
+	// Producer side, after Publish: wake parked hot workers, and now and then check whether the
+	// backlog needs a cold one. Paired with the gate's park protocol (seq_cst sleepers count and
+	// predicate reload): either the worker sees the new slot before parking, or this thread sees
+	// it parking and changes the signal it waits on.
 	void Wake() {
-		if (sleepers.load(std::memory_order_seq_cst) != 0) {
-			signal.fetch_add(1, std::memory_order_seq_cst);
-			signal.notify_all();
+		if (gate.OnPublish([this] { return window.Unclaimed(); })) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes);
 		}
 	}
 
@@ -622,39 +626,23 @@ struct Engine::Workers {
 		std::snprintf(name, sizeof(name), "DrawPrep#%u", index + 1u);
 		Profiler::SetThreadName(name);
 		t_worker_thread = true;
-		auto idle_start = NowNs();
-		uint32_t spins  = 0;
-		while (!stop.load(std::memory_order_acquire)) {
-			uint64_t seq  = 0;
-			if (auto* slot = window.TryClaim(seq); slot != nullptr) {
-				Prepare(pipeline_cache, slot->registers, slot->eligible, false, slot->prepared);
-				HashForRepeatTrace(*slot);
-				slot->worker_prepared = true;
-				window.Complete(seq);
-				idle_start = NowNs();
-				spins      = 0;
-				continue;
-			}
-			CpuRelax();
-			if ((++spins & 255u) != 0u || NowNs() - idle_start < spin_ns) {
-				continue;
-			}
-			const auto observed = signal.load(std::memory_order_seq_cst);
-			sleepers.fetch_add(1, std::memory_order_seq_cst);
-			if (!window.HasClaimable() && !stop.load(std::memory_order_seq_cst)) {
-				signal.wait(observed, std::memory_order_seq_cst);
-			}
-			sleepers.fetch_sub(1, std::memory_order_seq_cst);
-			idle_start = NowNs();
-		}
+		RunPreparationWorker(
+		    gate, window, index, spin_ns, cold_spin_ns, stop,
+		    [this](Slot& slot, uint64_t seq) {
+			    Prepare(pipeline_cache, slot.registers, slot.eligible, false, slot.prepared);
+			    HashForRepeatTrace(slot);
+			    slot.worker_prepared = true;
+			    window.Complete(seq);
+		    },
+		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); });
 	}
 
 	PipelineCache&           pipeline_cache;
 	Window<Slot>             window;
-	uint64_t                 spin_ns = 0;
+	uint64_t                 spin_ns      = 0;
+	uint64_t                 cold_spin_ns = 0;
+	WorkerGate               gate;
 	std::atomic<bool>        stop {false};
-	std::atomic<uint64_t>    signal {0};
-	std::atomic<uint32_t>    sleepers {0};
 	std::vector<std::thread> threads;
 };
 
@@ -669,11 +657,19 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
 		const auto window  = EnvUnsigned("KYTY_DRAW_PREP_WINDOW", 32, 2, 1024);
 		const auto workers = EnvUnsigned("KYTY_DRAW_PREP_WORKERS", 6, 1, 32);
 		const auto spin_us = EnvUnsigned("KYTY_DRAW_PREP_SPIN_US", 200, 0, 1000000);
+		// Workers that keep spinning; the rest park until the backlog needs them. A value of at
+		// least KYTY_DRAW_PREP_WORKERS keeps every worker hot (the behaviour before the gate).
+		const auto hot          = EnvUnsigned("KYTY_DRAW_PREP_HOT", 2, 1, 32);
+		const auto wake_backlog = EnvUnsigned("KYTY_DRAW_PREP_WAKE_BACKLOG", 8, 1, 1024);
+		const auto cold_spin_us = EnvUnsigned("KYTY_DRAW_PREP_COLD_SPIN_US", 50, 0, 1000000);
 		m_workers = std::make_unique<Workers>(m_renderer.GetPipelineCache(), window, workers,
-		                                      uint64_t {spin_us} * 1000u);
-		LOGF("DrawPrep: parallel mode, window=%u workers=%u spin=%uus cert=%s verify=%d\n",
-		     m_workers->window.Capacity(), workers, spin_us,
-		     GetCertMode() == CertMode::Log ? "log" : "value", VerifyMode());
+		                                      uint64_t {spin_us} * 1000u, hot, wake_backlog,
+		                                      uint64_t {cold_spin_us} * 1000u);
+		LOGF("DrawPrep: parallel mode, window=%u workers=%u spin=%uus hot=%u wake_backlog=%u "
+		     "cold_spin=%uus cert=%s verify=%d\n",
+		     m_workers->window.Capacity(), workers, spin_us, m_workers->gate.HotCount(),
+		     wake_backlog, cold_spin_us, GetCertMode() == CertMode::Log ? "log" : "value",
+		     VerifyMode());
 	}
 }
 

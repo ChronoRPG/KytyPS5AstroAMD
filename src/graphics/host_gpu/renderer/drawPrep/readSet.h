@@ -312,6 +312,29 @@ inline thread_local bool t_worker_thread = false;
 	return t_recorder != nullptr && t_recorder->reads->Failed();
 }
 
+// Diagnostics: what the preparing thread's current guest reads are for (a string literal, or
+// null), reported with reads refused as not provably clean (HangTrace unclean.csv).
+inline thread_local const char* t_read_purpose = nullptr;
+
+[[nodiscard]] inline const char* ReadPurpose() noexcept {
+	return t_read_purpose;
+}
+
+class ScopedReadPurpose {
+public:
+	explicit ScopedReadPurpose(const char* purpose) noexcept: m_previous(t_read_purpose) {
+		t_read_purpose = purpose;
+	}
+	~ScopedReadPurpose() { t_read_purpose = m_previous; }
+	ScopedReadPurpose(const ScopedReadPurpose&)            = delete;
+	ScopedReadPurpose& operator=(const ScopedReadPurpose&) = delete;
+
+	void Set(const char* purpose) noexcept { t_read_purpose = purpose; }
+
+private:
+	const char* m_previous;
+};
+
 // Marks the active preparation as failed (no-op outside a preparation).
 inline void FailActive(ReadFailure failure) noexcept {
 	if (t_recorder != nullptr) {

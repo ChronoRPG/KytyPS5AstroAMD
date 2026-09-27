@@ -4,16 +4,26 @@
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
+#include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <thread>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -708,6 +718,187 @@ void TestWindowConcurrent(uint32_t capacity, uint32_t workers, uint64_t items) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Worker parking (KYTY_DRAW_PREP_HOT): WorkerGate and the production worker loop
+
+void TestWorkerGateBasics() {
+	DrawPrep::WorkerGate gate(6, 2, 8);
+	Check(gate.Hot(0) && gate.Hot(1) && !gate.Hot(2) && !gate.Hot(5), "first two workers are hot");
+	Check(gate.HotCount() == 2 && gate.HasCold() && gate.WakeBacklog() == 8, "gate shape");
+	Check(!gate.MaybeWakeCold(100), "no wake without a sleeping cold worker");
+	DrawPrep::WorkerGate all(6, 6, 8);
+	Check(!all.HasCold() && all.Hot(5), "hot >= workers keeps every worker hot");
+	DrawPrep::WorkerGate clamp(6, 40, 0);
+	Check(clamp.HotCount() == 6 && clamp.WakeBacklog() == 1, "values clamp");
+	int  backlog_reads = 0;
+	auto backlog       = [&] {
+        backlog_reads++;
+        return uint64_t {100};
+	};
+	for (int i = 0; i < 64; i++) {
+		(void)all.OnPublish(backlog);
+	}
+	Check(backlog_reads == 0, "an all-hot gate never reads the backlog");
+	for (int i = 0; i < 64; i++) {
+		(void)gate.OnPublish(backlog);
+	}
+	Check(backlog_reads == 8, "the producer reads the backlog every WakeBacklog-th publish");
+}
+
+// Runs the pipeline the way Engine does: a producer publishes `items` slots (retiring the head
+// when the window is full, draining every `drain_every`), `workers` threads run the production
+// worker loop. `prepare_ns` of busy work per slot, `publish_gap_ns` of producer work per slot.
+struct PipelineResult {
+	uint64_t self_prepared   = 0; // slots the producer prepared itself
+	uint64_t commit_waits    = 0; // heads a worker still held when the producer needed them
+	uint64_t cold_wakes      = 0;
+	double   wall_ms         = 0;
+	double   worker_cpu_ms   = 0; // user + kernel time of all workers (Windows)
+	double   useful_ms       = 0; // busy work the workers did
+	bool     ok              = true;
+};
+
+void BusyNs(uint64_t ns) {
+	const auto end = std::chrono::steady_clock::now() + std::chrono::nanoseconds(ns);
+	while (std::chrono::steady_clock::now() < end) {
+	}
+}
+
+PipelineResult RunPipeline(uint32_t workers, uint32_t hot, uint64_t items, uint64_t prepare_ns,
+                           uint64_t publish_gap_ns, uint32_t drain_every, uint64_t hot_spin_ns,
+                           uint64_t cold_spin_ns, uint32_t wake_backlog, bool random_bursts) {
+	DrawPrep::Window<Item>   window(32);
+	DrawPrep::WorkerGate     gate(workers, hot, wake_backlog);
+	std::atomic<bool>        stop {false};
+	std::atomic<uint64_t>    useful_ns {0};
+	std::atomic<uint64_t>    cold_wakes {0};
+	std::vector<std::thread> threads;
+	for (uint32_t w = 0; w < workers; w++) {
+		threads.emplace_back([&, w] {
+			DrawPrep::RunPreparationWorker(
+			    gate, window, w, hot_spin_ns, cold_spin_ns, stop,
+			    [&](Item& item, uint64_t seq) {
+				    BusyNs(prepare_ns);
+				    item.output      = Work(item.input);
+				    item.prepared_by = w + 1u;
+				    item.preparations++;
+				    useful_ns.fetch_add(prepare_ns, std::memory_order_relaxed);
+				    window.Complete(seq);
+			    },
+			    [&] { cold_wakes.fetch_add(1, std::memory_order_relaxed); });
+		});
+	}
+	PipelineResult result;
+	std::mt19937   rng(12345);
+	uint64_t       next_input  = 0;
+	uint64_t       next_retire = 0;
+	const auto     retire_head = [&] {
+        auto& item = window.HeadPayload();
+        if (window.TryClaimHead()) {
+            BusyNs(prepare_ns);
+            item.output      = Work(item.input);
+            item.prepared_by = 0;
+            item.preparations++;
+            result.self_prepared++;
+        } else if (!window.HeadDone()) {
+            result.commit_waits++;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!window.HeadDone() && std::chrono::steady_clock::now() < deadline) {
+                DrawPrep::WorkerRelax();
+            }
+            result.ok &= window.HeadDone();
+        }
+        result.ok &= item.input == next_retire && item.output == Work(item.input) &&
+                     item.preparations == 1;
+        next_retire++;
+        window.Retire();
+	};
+	const auto start = std::chrono::steady_clock::now();
+	while (next_input < items) {
+		if (window.Full()) {
+			retire_head();
+		}
+		auto& item        = window.Reserve();
+		item.input        = next_input++;
+		item.output       = 0;
+		item.preparations = 0;
+		window.Publish();
+		(void)gate.OnPublish([&] { return window.Unclaimed(); });
+		BusyNs(random_bursts ? (rng() % 4 == 0 ? publish_gap_ns * 4 : publish_gap_ns / 4)
+		                     : publish_gap_ns);
+		if (next_input % drain_every == 0u) {
+			while (!window.Empty()) {
+				retire_head();
+			}
+			if (random_bursts) {
+				// An idle gap, long enough for every worker to park.
+				std::this_thread::sleep_for(std::chrono::microseconds(rng() % 2000));
+			}
+		}
+	}
+	while (!window.Empty()) {
+		retire_head();
+	}
+	result.wall_ms =
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+	stop.store(true, std::memory_order_seq_cst);
+	gate.WakeAll();
+#if defined(_WIN32)
+	for (auto& thread: threads) {
+		FILETIME creation {};
+		FILETIME exit {};
+		FILETIME kernel {};
+		FILETIME user {};
+		if (GetThreadTimes(static_cast<HANDLE>(thread.native_handle()), &creation, &exit, &kernel,
+		                   &user) != 0) {
+			const auto to_ms = [](FILETIME t) {
+				return static_cast<double>((uint64_t {t.dwHighDateTime} << 32u) | t.dwLowDateTime) /
+				       10000.0;
+			};
+			result.worker_cpu_ms += to_ms(kernel) + to_ms(user);
+		}
+	}
+#endif
+	for (auto& thread: threads) {
+		thread.join();
+	}
+	result.useful_ms  = static_cast<double>(useful_ns.load()) / 1e6;
+	result.cold_wakes = gate.ColdWakes(); // by workers (cold_wakes) and by the producer
+	result.ok &= next_retire == items && cold_wakes.load() <= result.cold_wakes;
+	return result;
+}
+
+// Bursty stress with short spins: nothing hangs, every slot is prepared exactly once, in order,
+// and cold workers are woken when the backlog grows.
+void TestWorkerGateStress() {
+	for (uint32_t hot: {1u, 2u}) {
+		const auto r = RunPipeline(6, hot, 60000, 2000, 2000, 97, 20000, 0, 4, true);
+		Check(r.ok, "gated pipeline prepares every slot once, in order");
+		Check(r.cold_wakes > 0, "cold workers are woken by a backlog");
+	}
+}
+
+// The Sky Garden shape (DEEP-TRACE-U52 3.4): about 11 us of Prepare per draw, one draw every
+// ~10 us, a drain every ~60 draws. Prints worker CPU against useful work for the old all-hot
+// behaviour and for the gate.
+void MeasureWorkerGate() {
+	struct Config {
+		const char* name;
+		uint32_t    hot;
+	};
+	for (const auto& config: {Config {"all hot (before)", 6u}, Config {"hot=2 (default)", 2u},
+	                          Config {"hot=1", 1u}}) {
+		const auto r = RunPipeline(6, config.hot, 20000, 11000, 10000, 60, 200000, 50000, 8, false);
+		Check(r.ok, "measured pipeline is correct");
+		std::printf("  gate %-17s: wall %.0f ms, worker CPU %.0f ms for %.0f ms of work, "
+		            "self-prepared %llu, commit waits %llu, cold wakes %llu\n",
+		            config.name, r.wall_ms, r.worker_cpu_ms, r.useful_ms,
+		            static_cast<unsigned long long>(r.self_prepared),
+		            static_cast<unsigned long long>(r.commit_waits),
+		            static_cast<unsigned long long>(r.cold_wakes));
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
 // Packet classification (S0/S6)
 
 void TestPacketClassification() {
@@ -893,7 +1084,11 @@ void TestRegisterIndirectPairs() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+	if (argc > 1 && std::strcmp(argv[1], "--measure-worker-gate") == 0) {
+		MeasureWorkerGate();
+		return g_failures == 0 ? 0 : 1;
+	}
 	TestLogEmptyIntervalIsClean();
 	TestLogIntersection();
 	TestLogEmptyRangeNeverIntersects();
@@ -918,6 +1113,8 @@ int main() {
 	TestWindowConcurrent(4, 8, 200000);  // tiny window: constant wrap-around and races
 	TestWindowConcurrent(32, 6, 200000); // the default shape
 	TestWindowConcurrent(32, 1, 50000);
+	TestWorkerGateBasics();
+	TestWorkerGateStress();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "DrawPrepTests: %d failure(s)\n", g_failures);
 		return 1;

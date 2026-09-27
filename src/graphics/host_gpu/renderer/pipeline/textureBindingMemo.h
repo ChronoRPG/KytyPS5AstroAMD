@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
 
 namespace Libs::Graphics {
 
@@ -110,6 +111,23 @@ public:
 	[[nodiscard]] bool TryAcquireView(TextureCache& cache, TextureBinding& binding);
 	// Remembers the view FindTexture returned for a binding described by an entry.
 	void RecordView(const TextureBinding& binding, vk::ImageView view);
+
+	// KYTY_DRAW_SEQUENCE_FAST (textures). A stage whose program and T# words are the ones its
+	// bindings were last resolved from: every binding still described by its entry (the entry holds
+	// the binding's tag, so it holds the key of that resource and those words) is what TryResolve
+	// would find for it again. True when TryResolve would hit for every binding without
+	// revalidation, checked under one texture-cache lock; with `apply` each hit's access
+	// bookkeeping is then performed, in binding order, as TryResolve performs it (the bindings
+	// keep their image and description). `apply` false only checks (verify mode).
+	[[nodiscard]] bool TryRepeatResolve(TextureCache& cache, std::span<TextureBinding> bindings,
+	                                    bool apply);
+	// RebindImages for such a stage: true when, for every binding, RebindImages would neither
+	// resolve it again nor do anything but TryAcquireView's hit (sampled bindings only). With
+	// `apply` each hit's touch and view, in binding order.
+	[[nodiscard]] bool TryRepeatViews(TextureCache& cache, std::span<TextureBinding> bindings,
+	                                  bool apply);
+	// The view recorded for the entry describing `binding` (verify mode, after TryRepeatViews).
+	[[nodiscard]] vk::ImageView EntryView(const TextureBinding& binding) const;
 
 	// KYTY_TEXTURE_MEMO_REVALIDATE (textureBindingMemo.cpp): the last TryResolve hit needed its
 	// entry revalidated for a new page version; with the verify mode on, the caller then compares

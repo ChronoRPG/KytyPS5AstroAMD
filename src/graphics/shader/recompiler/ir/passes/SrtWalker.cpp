@@ -324,7 +324,8 @@ private:
 
 class PlanBuilder {
 public:
-	explicit PlanBuilder(Program& program): m_program(program) {}
+	PlanBuilder(Program& program, bool variant_reads)
+	    : m_program(program), m_variant_reads(variant_reads) {}
 
 	void Run() {
 		m_program.srt_reads.clear();
@@ -412,7 +413,8 @@ private:
 			return;
 		}
 		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) {
+		if (!offset.IsImmediate() || offset.GetType() != Type::U32 ||
+		    (m_variant_reads && !EvaluableBeforeDispatch(inst->Arg(0)))) {
 			if (std::ranges::find(m_program.dynamic_reads, value) ==
 			    m_program.dynamic_reads.end()) {
 				m_program.dynamic_reads.push_back(value);
@@ -462,10 +464,30 @@ private:
 		}
 	}
 
+	// KYTY_SRT_VARIANT_READS: whether the read's address (its GetAddressResource or V# handle) can
+	// be computed before the dispatch, by the same rules as every other runtime value. A loop-carried
+	// pointer (a phi ResolveInvariantPhi cannot reduce) or data the GPU produces cannot: a flat slot
+	// for such a read could never be evaluated and would drop the whole dispatch.
+	bool EvaluableBeforeDispatch(Value handle) {
+		handle           = handle.Resolve();
+		const auto* inst = handle.TryInstruction();
+		if (handle.IsImmediate() || inst == nullptr) {
+			return true;
+		}
+		if (const auto it = m_evaluable_memo.find(inst); it != m_evaluable_memo.end()) {
+			return it->second;
+		}
+		const bool evaluable = ValidateRuntimeValue(m_program, handle);
+		m_evaluable_memo.emplace(inst, evaluable);
+		return evaluable;
+	}
+
 	Program&           m_program;
 	std::vector<Inst*> m_visiting;
 	std::vector<Inst*> m_visited;
 	std::vector<Patch> m_patches;
+	bool               m_variant_reads = false;
+	std::unordered_map<const Inst*, bool> m_evaluable_memo;
 };
 
 } // namespace
@@ -1944,12 +1966,12 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 	return RuntimeValidator(program, type).Run(value);
 }
 
-void BuildSrtPlan(Program& program) {
+void BuildSrtPlan(Program& program, bool variant_reads) {
 	if (program.resource_tracking_complete) {
 		EXIT("shader SRT planning failed: cannot rebuild SRT after resource tracking");
 	}
 	program.srt_plan_complete = false;
-	PlanBuilder(program).Run();
+	PlanBuilder(program, variant_reads).Run();
 	program.srt_plan_complete = true;
 }
 

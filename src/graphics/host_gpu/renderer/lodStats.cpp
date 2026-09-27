@@ -169,6 +169,8 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 			event.total_samples    = m_latest_samples;
 			event.mean_finest_mip  = m_latest_mean_finest;
 		}
+		m_context.NoteHostBackingWrite(destination, report.size(),
+		                               RenderContext::HostWriter::LodStats);
 		(void)LibKernel::Memory::TryWriteBacking(destination, report.data(), report.size());
 		Coherence::NoteContentWrite(destination, report.size(), Coherence::Source::LodStatsWrite);
 		if (HangTrace::Enabled()) {
@@ -282,6 +284,8 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 			std::array<uint8_t, ReportSize> exact {};
 			const auto summary = PackReport(words, exact.data());
 			if (writes_report) {
+				m_context.NoteHostBackingWrite(destination, write_size,
+				                               RenderContext::HostWriter::LodStats);
 				(void)LibKernel::Memory::TryWriteBacking(destination, exact.data(), write_size);
 				Coherence::NoteContentWrite(destination, write_size,
 				                            Coherence::Source::LodStatsWrite);
@@ -314,6 +318,8 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 			    LibKernel::Memory::TryReadBacking(destination, current.data(), current.size()) &&
 			    current == *record_time_report;
 			if (unchanged) {
+				m_context.NoteHostBackingWrite(destination, exact.size(),
+				                               RenderContext::HostWriter::LodStats);
 				(void)LibKernel::Memory::TryWriteBacking(destination, exact.data(), exact.size());
 				Coherence::NoteContentWrite(destination, exact.size(),
 				                            Coherence::Source::LodStatsWrite);

@@ -24,6 +24,10 @@
 #include <string>
 #include <thread>
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 #ifdef KYTY_WIN_CS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
@@ -226,12 +230,8 @@ void InitializeThreads() {
 	g_main_thread_int = Thread::GetThreadIdUnique();
 }
 
-void RaiseCurrentThreadPriority() {
 #ifdef KYTY_WIN_CS
-	static const int level = [] {
-		const char* value = std::getenv("KYTY_CP_PRIORITY");
-		return value != nullptr && value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : 1;
-	}();
+static void RaiseCurrentThreadPriorityLevel(int level) {
 	if (level == 0) {
 		return;
 	}
@@ -245,7 +245,52 @@ void RaiseCurrentThreadPriority() {
 	throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
 	throttling.StateMask   = 0;
 	(void)SetThreadInformation(thread, ThreadPowerThrottling, &throttling, sizeof(throttling));
+}
 #endif
+
+static int PriorityLevelFromEnv(const char* name, int fallback) {
+	const char* value = std::getenv(name);
+	return value != nullptr && value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : fallback;
+}
+
+void RaiseCurrentThreadPriority() {
+#ifdef KYTY_WIN_CS
+	static const int level = PriorityLevelFromEnv("KYTY_CP_PRIORITY", 1);
+	RaiseCurrentThreadPriorityLevel(level);
+#endif
+}
+
+int ServiceThreadPriorityLevel() {
+	static const int level = PriorityLevelFromEnv("KYTY_SERVICE_PRIORITY", 2);
+	return level;
+}
+
+void RaiseServiceThreadPriority() {
+#ifdef KYTY_WIN_CS
+	RaiseCurrentThreadPriorityLevel(ServiceThreadPriorityLevel());
+#endif
+}
+
+bool YieldToReadyThread() {
+#ifdef KYTY_WIN_CS
+	return SwitchToThread() != 0;
+#else
+	std::this_thread::yield();
+	return true;
+#endif
+}
+
+void YieldAndPauseMicro(uint32_t micros) {
+	const auto start = std::chrono::steady_clock::now();
+	const auto end   = start + std::chrono::microseconds(micros);
+	(void)YieldToReadyThread();
+	while (std::chrono::steady_clock::now() < end) {
+#if defined(_M_X64) || defined(__x86_64__)
+		_mm_pause();
+#else
+		std::this_thread::yield();
+#endif
+	}
 }
 
 Thread::Thread(thread_func_t func, void* arg)
