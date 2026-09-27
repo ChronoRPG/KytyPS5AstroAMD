@@ -5128,8 +5128,9 @@ public:
       // aliases age by frames (5acad01d; KYTY_IMAGE_ALIAS_AGE=ticks disables it), so the
       // two hits cost exactly that many scans and no lookup scans.
       const char *alias_age = std::getenv("KYTY_IMAGE_ALIAS_AGE");
-      const uint32_t alias_sync_scans =
-          alias_age == nullptr || std::strcmp(alias_age, "ticks") != 0 ? 1u : 0u;
+      const bool aliases_age_by_frames =
+          alias_age == nullptr || std::strcmp(alias_age, "ticks") != 0;
+      const uint32_t alias_sync_scans = aliases_age_by_frames ? 1u : 0u;
       Require(name, "normalized FindImage",
               first && repeated == first && compatible == first &&
                   (!TextureCacheTestAccess::UsesFirstPageLookup(texture_cache) ||
@@ -5814,10 +5815,16 @@ public:
       raw_d16_uint.view_info.aspect = vk::ImageAspectFlagBits::eColor;
       raw_d16_uint.view_info.usage = vk::ImageUsageFlagBits::eSampled;
       const auto raw_d16_uint_image = texture_cache.FindImage(raw_d16_uint);
+      // While aliases age by frames (5acad01d) a depth/color switch keeps the previous
+      // interpretation registered as a superseded, non-owner alias for the next switch
+      // back; KYTY_IMAGE_ALIAS_AGE=ticks frees it as before.
       Require(
           name, "raw D16 uint texture backing",
           raw_d16_uint_image && raw_d16_uint_image != raw_d16_image &&
-              !TextureCacheTestAccess::Contains(texture_cache, raw_d16_image) &&
+              TextureCacheTestAccess::Contains(texture_cache, raw_d16_image) ==
+                  aliases_age_by_frames &&
+              (!aliases_age_by_frames ||
+               !texture_cache.GetImage(raw_d16_image).IsGpuModified()) &&
               texture_cache.GetImage(raw_d16_uint_image).backing.format ==
                   vk::Format::eR16Uint,
           "D16 uint sampling did not recreate a true integer color backing");
@@ -5876,8 +5883,13 @@ public:
           texture_cache.GetImage(layered_raw_d16_depth_image);
       Require(name, "layered raw D16 owner layout",
               layered_raw_d16_depth_image != layered_d16_color_image &&
-                  !TextureCacheTestAccess::Contains(texture_cache,
-                                                    layered_d16_color_image) &&
+                  TextureCacheTestAccess::Contains(texture_cache,
+                                                   layered_d16_color_image) ==
+                      aliases_age_by_frames &&
+                  (!aliases_age_by_frames ||
+                   !texture_cache.GetImage(layered_d16_color_image)
+                        .IsGpuModified()) &&
+                  layered_depth_owner.IsGpuModified() &&
                   layered_depth_owner.info.resources.layers == 6 &&
                   layered_depth_owner.info.data.size ==
                       sizeof(layered_raw_d16_values) &&
@@ -5927,15 +5939,29 @@ public:
                   sizeof(layered_raw_d16_after));
       std::array<uint16_t, 12> layered_raw_d16_expected{};
       layered_raw_d16_expected.fill(UINT16_MAX);
+      // With kept aliases the original R16 UNORM color image is still registered. The
+      // (non-exact) UINT lookup reuses it as a format-compatible backing (MUTABLE_FORMAT,
+      // sampled through an R16 UINT view): SyncAliasFromOwner copies the depth owner's
+      // contents into it and it becomes the owner. Without kept aliases the depth switch
+      // freed that image and the lookup builds a new R16 UINT backing.
+      const auto reacquired_backing_format =
+          reacquired_layered_raw_d16_native.backing.format;
       Require(
           name, "layered raw D16 round trip",
           reacquired_layered_raw_d16_uint_image &&
               reacquired_layered_raw_d16_uint_image !=
                   layered_raw_d16_depth_image &&
-              !TextureCacheTestAccess::Contains(texture_cache,
-                                                layered_raw_d16_depth_image) &&
-              reacquired_layered_raw_d16_native.backing.format ==
-                  vk::Format::eR16Uint &&
+              TextureCacheTestAccess::Contains(texture_cache,
+                                               layered_raw_d16_depth_image) ==
+                  aliases_age_by_frames &&
+              (aliases_age_by_frames
+                   ? reacquired_layered_raw_d16_uint_image ==
+                             layered_d16_color_image &&
+                         reacquired_backing_format == vk::Format::eR16Unorm &&
+                         reacquired_layered_raw_d16_native.IsGpuModified() &&
+                         !texture_cache.GetImage(layered_raw_d16_depth_image)
+                              .IsGpuModified()
+                   : reacquired_backing_format == vk::Format::eR16Uint) &&
               reacquired_layered_raw_d16_uint_view != nullptr &&
               layered_raw_d16_after == layered_raw_d16_expected,
           "the partial depth view lost a layer or failed to restore raw UINT "
@@ -6321,16 +6347,23 @@ public:
       const auto exact_float_image =
           texture_cache.FindImage(exact_float_desc, true);
       (void)texture_cache.FindTexture(exact_float_image, exact_float_desc);
+      // Both interpretations stay registered and neither takes Buffer ownership. With kept
+      // aliases the new FLOAT alias copies the GPU owner's contents (SyncAliasFromOwner) and
+      // becomes the single owner, superseding the UINT record; without them the UINT image
+      // stays the owner and the FLOAT image is sourced from the synchronized Buffer.
       Require(
           name, "Buffer-superseded exact coexistence",
           exact_float_image != exact_buffer_image &&
               TextureCacheTestAccess::Contains(texture_cache,
                                                exact_buffer_image) &&
-              texture_cache.GetImage(exact_buffer_image).IsGpuModified() &&
+              texture_cache.GetImage(exact_buffer_image).IsGpuModified() ==
+                  !aliases_age_by_frames &&
+              texture_cache.GetImage(exact_float_image).IsGpuModified() ==
+                  aliases_age_by_frames &&
               !texture_cache.GetImage(exact_float_image).IsBufferModified() &&
-              !texture_cache.GetImage(exact_float_image).IsGpuModified(),
-          "exact-format lookup retired its old record or transferred Buffer "
-          "ownership");
+              !texture_cache.GetImage(exact_buffer_image).IsBufferModified(),
+          "exact-format lookup retired its old record, lost its single GPU "
+          "owner, or transferred Buffer ownership");
       auto exact_buffer_readback = CreateHostBuffer(
           name, sizeof(exact_buffer_value),
           vk::BufferUsageFlagBits::eTransferDst, std::vector<u32>{0});
