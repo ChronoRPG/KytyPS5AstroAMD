@@ -268,6 +268,10 @@ enum class FrameEvent : uint32_t {
 	DccFallbackMetadataAliased, // an image owns (overlaps) the metadata, or metadata overlaps data
 	DccFallbackUnsupported,    // native image lacks storage/mutable usage, or size limits
 	DccFallbackAlignment,      // canonical metadata buffer offset is not 4-byte aligned
+	// Headerless shader code hashed from a clean-backing copy (no fault possible) or in place
+	// through the guest mapping (KYTY_SHADER_HASH_BACKING).
+	ShaderCodeHashBacking,
+	ShaderCodeHashDirect,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

@@ -196,6 +196,8 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.DccFallbackMetadataAliased.Cumulative",
     "FrameEvent.DccFallbackUnsupported.Cumulative",
     "FrameEvent.DccFallbackAlignment.Cumulative",
+    "FrameEvent.ShaderCodeHashBacking.Cumulative",
+    "FrameEvent.ShaderCodeHashDirect.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
