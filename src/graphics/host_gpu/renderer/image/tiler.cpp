@@ -848,7 +848,13 @@ void TileManager::RecordImage(Image& image, bool load, vk::Buffer tiled, uint64_
 	EXIT_NOT_IMPLEMENTED(tiled_range > limits.maxStorageBufferRange);
 	const auto view_format = ImageViewFormat(infos.front().bytes_per_element, load);
 	EXIT_IF(view_format == vk::Format::eUndefined);
-	// One storage view per mip level (all layers); created before any command is recorded.
+	// Pipelines (and with the first one the image pipeline layout the descriptor pushes below
+	// name) and one storage view per mip level (all layers), all before any command is recorded.
+	std::vector<vk::Pipeline> pipelines;
+	pipelines.reserve(infos.size());
+	for (const auto& info: infos) {
+		pipelines.push_back(GetImagePipeline(load, info.family, info.bytes_per_element));
+	}
 	std::vector<std::pair<uint32_t, vk::ImageView>> views;
 	for (const auto& region: regions) {
 		const auto level = region.imageSubresource.mipLevel;
@@ -909,7 +915,6 @@ void TileManager::RecordImage(Image& image, bool load, vk::Buffer tiled, uint64_
 	const vk::DescriptorBufferInfo tiled_info {tiled, tiled_descriptor_offset, tiled_range};
 	for (size_t index = 0; index < dispatches.size(); ++index) {
 		const auto& dispatch = dispatches[index];
-		const auto& info     = infos[index];
 		const auto  level    = regions[index].imageSubresource.mipLevel;
 		const auto  view =
 		    std::ranges::find(views, level, &std::pair<uint32_t, vk::ImageView>::first)->second;
@@ -927,11 +932,11 @@ void TileManager::RecordImage(Image& image, bool load, vk::Buffer tiled, uint64_
 		writes[1].pImageInfo     = &image_info;
 		writes[2].descriptorType = vk::DescriptorType::eUniformBuffer;
 		writes[2].pBufferInfo    = &params_info;
+		EXIT_IF(m_image_pipeline_layout == nullptr);
 		m_scheduler.Current().PushDescriptors(vk::PipelineBindPoint::eCompute,
 		                                      m_image_pipeline_layout, 0,
 		                                      static_cast<uint32_t>(writes.size()), writes.data());
-		m_scheduler.Current().BindPipeline(vk::PipelineBindPoint::eCompute,
-		                                   GetImagePipeline(load, info.family, info.bytes_per_element));
+		m_scheduler.Current().BindPipeline(vk::PipelineBindPoint::eCompute, pipelines[index]);
 		command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
 		                 dispatch.push.depth);
 	}
