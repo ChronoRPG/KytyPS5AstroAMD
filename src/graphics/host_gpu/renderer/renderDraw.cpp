@@ -436,6 +436,37 @@ private:
 	uint64_t                    m_avoided = 0;
 };
 
+// The union of the scissors a draw rasterizes with (SetGraphicsDynamicParams), not yet clamped to
+// the framebuffer: every pixel the draw can write lies inside it (KYTY_ALIAS_BYTES claims only
+// the render-target blocks under it).
+vk::Rect2D DrawScissorUnion(const HW::Context& ctx, bool indexed_viewports) {
+	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
+	const auto&        vp             = ctx.GetScreenViewport();
+	const vk::Extent2D unbounded {16384, 16384};
+	int64_t            left   = INT64_MAX;
+	int64_t            top    = INT64_MAX;
+	int64_t            right  = INT64_MIN;
+	int64_t            bottom = INT64_MIN;
+	for (uint32_t i = 0; i < (indexed_viewports ? viewport_slots : 1u); i++) {
+		if (!ctx.GetClipControl().clip_disable && vp.viewports[i].xscale == 0.0f) {
+			continue; // an empty slot: zero scissor
+		}
+		const auto scissor = calc_final_scissor(vp, ctx.GetScanModeControl(), unbounded, i);
+		if (scissor.right <= scissor.left || scissor.bottom <= scissor.top) {
+			continue;
+		}
+		left   = std::min<int64_t>(left, scissor.left);
+		top    = std::min<int64_t>(top, scissor.top);
+		right  = std::max<int64_t>(right, scissor.right);
+		bottom = std::max<int64_t>(bottom, scissor.bottom);
+	}
+	if (right <= left || bottom <= top) {
+		return {};
+	}
+	return {{static_cast<int32_t>(left), static_cast<int32_t>(top)},
+	        {static_cast<uint32_t>(right - left), static_cast<uint32_t>(bottom - top)}};
+}
+
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
                                      const RenderDepthInfo& depth, const RenderState& rendering,
@@ -717,7 +748,8 @@ struct DrawCallInfo {
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
-                                                 std::span<PreparedBindings* const> stages) {
+                                                 std::span<PreparedBindings* const> stages,
+                                                 const vk::Rect2D* written) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
 	feedback_aspects       = {};
@@ -736,7 +768,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    owner->binding.needs_rebind) {
 			EXIT("color target changed after render-state discovery\n");
 		}
-		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
+		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc,
+		                                               target.guest_mip_level == 0 ? written
+		                                                                           : nullptr);
 		auto&      image      = cache.GetImage(target.image_id);
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
 		const auto& view   = target.desc.view_info;
@@ -2083,9 +2117,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    *programs);
 	vk::ImageAspectFlags feedback_aspects;
+	// Where this draw can write its colour targets (KYTY_ALIAS_BYTES ownership claims).
+	vk::Rect2D written {};
+	const bool bounded = TextureCache::AliasBytesEnabled();
+	if (bounded) {
+		const auto& outputs = vertex_stages.back().stage.program->info.outputs;
+		written             = DrawScissorUnion(
+            buffer.GetRegisters(), std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
+                return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+            }));
+	}
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
-	                         feedback_aspects, stages);
+	                         feedback_aspects, stages, bounded ? &written : nullptr);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest

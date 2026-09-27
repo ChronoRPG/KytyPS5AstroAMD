@@ -237,6 +237,19 @@ enum class FrameEvent : uint32_t {
 	ImageCopyD16,
 	AliasSyncCopies,
 	AliasSyncSkips,
+	// KYTY_ALIAS_BYTES (TextureCache): images that kept part of their GPU ownership through a write
+	// of other bytes (another alias, a bounded buffer write), render-target claims bounded by the
+	// draw's scissor, owners whose bytes were moved into the buffer (and the bytes), and owned
+	// bytes that could not be moved (no download layout).
+	AliasBytesKept,
+	AliasBytesBoundedClaims,
+	AliasBytesMaterializations,
+	AliasBytesMaterializedBytes,
+	AliasBytesUnmaterialized,
+	// Texel-buffer reads checked for image-owned bytes, and those whose 1 MiB pages hold a
+	// registered image (they take the texture-cache lock to look).
+	AliasBytesTexelReads,
+	AliasBytesTexelScans,
 	// Guest memory -> native image refreshes (TextureCache::InitializeImage) and bytes, and
 	// CPU-dirty bytes copied into device buffers (BufferCache::SynchronizeBuffer).
 	ImageUploads,

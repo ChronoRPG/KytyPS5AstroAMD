@@ -2659,8 +2659,13 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
+	// KYTY_ALIAS_BYTES: bytes a GPU-modified image owns without starting at the source (or at the
+	// destination) are not in guest memory either; the GPU path moves them into the buffer.
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
-	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size) &&
+	    (!TextureCache::AliasBytesEnabled() ||
+	     (!m_texture_cache.IsRegionGpuModified(src_vaddr, size) &&
+	      !m_texture_cache.IsRegionGpuModified(dst_vaddr, size)))) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		return;
@@ -2684,6 +2689,39 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
 	}
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+}
+
+Buffer& BufferCache::PrepareImageBytes(const RangeSet& ranges, Buffer* target) {
+	uint64_t first = UINT64_MAX;
+	uint64_t last  = 0;
+	ranges.ForEach([&](uint64_t begin, uint64_t end) {
+		first = std::min(first, begin);
+		last  = std::max(last, end);
+	});
+	EXIT_IF(first >= last);
+	Buffer* buffer = target;
+	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(first, last - first)) {
+		buffer = &m_slot_buffers[FindBuffer(first, last - first)];
+	}
+	TouchBuffer(*buffer);
+	ranges.ForEach([&](uint64_t begin, uint64_t end) {
+		(void)SynchronizeBuffer(*buffer, begin, end - begin, true, false, nullptr, "image-bytes");
+	});
+	return *buffer;
+}
+
+void BufferCache::CommitImageBytes(Buffer& buffer, const RangeSet& ranges) {
+	buffer.MarkContentWritten();
+	ranges.ForEach([&](uint64_t begin, uint64_t end) {
+		const auto size = end - begin;
+		if (!m_gpu_modified_ranges.Contains(begin, size)) {
+			CleanVerdict::Invalidate(begin, size, Coherence::Source::BufferDirtyAdd);
+		}
+		m_gpu_modified_ranges.Add(begin, size);
+		NoteBufferContentWrite(begin, size);
+		ForgetKnownFills(begin, size);
+		HangTrace::NoteGpuWrite(begin, size);
+	});
 }
 
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {

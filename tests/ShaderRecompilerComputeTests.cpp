@@ -455,6 +455,15 @@ struct TextureCacheTestAccess {
       image.RefreshComplete();
     }
     cache.MarkImageGpuModified(image);
+    // The write covers the whole image: it owns every byte (KYTY_ALIAS_BYTES).
+    image.OwnAllBytes();
+  }
+
+  // An image retired as the cache retires one (FreeImage: bytes it still owns are moved into
+  // the buffer first when KYTY_ALIAS_BYTES can, then its GPU ownership ends).
+  static void FreeImage(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    cache.FreeImage(id);
   }
 
   static bool SafeToDownload(TextureCache &cache, ImageId id) {
@@ -713,10 +722,11 @@ struct RenderExecutorTestAccess {
                                           uint32_t color_count,
                                           RenderDepthInfo &depth,
                                           std::span<PreparedBindings *const> stages = {},
-                                          vk::ImageAspectFlags *feedback_out = nullptr) {
+                                          vk::ImageAspectFlags *feedback_out = nullptr,
+                                          const vk::Rect2D *written = nullptr) {
     vk::ImageAspectFlags feedback;
     auto state = executor.AcquireRenderTargets(buffer, colors, color_count, depth,
-                                               feedback, stages);
+                                               feedback, stages, written);
     if (feedback_out != nullptr) {
       *feedback_out = feedback;
     }
@@ -6394,19 +6404,664 @@ public:
             "a restored content serial ordered the image after a later unbounded writer");
     TextureCacheTestAccess::MarkGpuModified(textures, id);
 
-    // A bounded GPU buffer write over part of the image takes its GPU ownership
-    // (InvalidateMemoryFromGPU): its bytes are the newer ones.
+    // A bounded GPU buffer write over part of the image takes the GPU ownership of the bytes it
+    // writes (InvalidateMemoryFromGPU): those bytes are the newer ones, so the image may not be
+    // synchronized over them as a whole. With KYTY_ALIAS_BYTES the image keeps owning its other
+    // bytes (a texel read or rebuild moves them into the buffer); =0 takes all of them.
     textures.InvalidateMemoryFromGPU(base + 0x100, sizeof(uint32_t));
     Require(name, "bounded writer after the image write",
             !TextureCacheTestAccess::SafeToSyncIntoBuffer(textures, id) &&
                 !textures.FindImageFromRange(base, size, true, true),
             "the image superseded a bounded GPU write made after it");
+    const auto *owner = TextureCacheTestAccess::Owner(textures, id);
+    if (TextureCache::AliasBytesEnabled()) {
+      Require(name, "bounded writer keeps the other bytes",
+              owner->IsGpuModified() && owner->IsBufferModified() &&
+                  !owner->OwnsBytesIn(base + 0x100, sizeof(uint32_t)) &&
+                  owner->OwnsBytes(base, 0x100) &&
+                  owner->OwnsBytes(base + 0x104, size - 0x104),
+              "a 4-byte bounded write took the image's GPU ownership of its other bytes");
+    } else {
+      Require(name, "bounded writer takes the image",
+              !owner->IsGpuModified() && owner->IsBufferModified(),
+              "a bounded write left the image GPU-owned (KYTY_ALIAS_BYTES=0)");
+    }
 
-    TextureCacheTestAccess::DeleteImage(textures, id);
+    TextureCacheTestAccess::FreeImage(textures, id);
     BufferCacheTestAccess::SubtractGpuDirty(buffers, base, size);
     scheduler.Finish();
     context.ShutdownGpu();
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // KYTY_ALIAS_BYTES: guest bytes shared by render targets of different layouts (Astro Bot's
+  // transient render-target heap; the Sky Garden water at resolution switches). Every check is
+  // judged on the bytes the PS5 holds: each byte keeps the last value written to it through any
+  // alias. AliasHeap::shadow mirrors those bytes. The targets are RGBA16F with the 64 KiB
+  // render-target tiling (128x64-texel blocks), filled with uniform colours.
+  struct AliasSurface {
+    const char *label = "";
+    uint64_t address = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t pitch = 0;
+    uint64_t size = 0;
+  };
+
+  struct AliasColour {
+    uint64_t bits = 0;
+    std::array<float, 4> floats{};
+  };
+
+  struct AliasHeap {
+    std::unique_ptr<RenderContext> owner;
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    uint64_t base = 0;
+    uint64_t size = 0;
+    int64_t direct_offset = -1;
+    std::vector<uint8_t> shadow;
+  };
+
+  static constexpr const char *AliasTestName = "AliasBytesAcrossPartialWrites";
+
+  static AliasSurface MakeAliasSurface(const char *label, uint64_t address, uint32_t width,
+                                       uint32_t height) {
+    AliasSurface surface{label, address, width, height};
+    surface.pitch = TileGetRenderTargetPitch(width, 8);
+    TileSizeAlign layout{};
+    Require(AliasTestName, "surface layout",
+            surface.pitch % 128 == 0 &&
+                TileGetRenderTargetSize(width, height, surface.pitch, 8, layout) &&
+                layout.size % 0x10000 == 0 && layout.size != 0,
+            "an RGBA16F render-target layout is not made of whole 64 KiB blocks");
+    surface.size = layout.size;
+    return surface;
+  }
+
+  // Four channels of k/8 (exact halves), distinct for nearby seeds.
+  static AliasColour MakeAliasColour(uint32_t seed) {
+    AliasColour colour;
+    for (uint32_t channel = 0; channel < 4; ++channel) {
+      const uint32_t eighths = 1u + (seed * 7u + channel * 13u) % 120u;
+      const int msb = 31 - std::countl_zero(eighths);
+      const uint32_t half = (static_cast<uint32_t>(msb - 3 + 15) << 10u) |
+                            ((eighths << (10 - msb)) & 0x3ffu);
+      colour.bits |= static_cast<uint64_t>(half) << (16u * channel);
+      colour.floats[channel] = static_cast<float>(eighths) / 8.0f;
+    }
+    return colour;
+  }
+
+  static TextureCache::ImageDesc AliasDesc(const AliasSurface &surface,
+                                           TextureCache::BindingType type) {
+    TextureCache::ImageDesc desc{};
+    desc.type = type;
+    desc.info.data = {surface.address, surface.size};
+    desc.info.pixel_format = vk::Format::eR16G16B16A16Sfloat;
+    desc.info.guest_format = Prospero::BufferFormat::k16_16_16_16Float;
+    desc.info.type = Prospero::ImageType::kColor2D;
+    desc.info.extent = {surface.width, surface.height, 1};
+    desc.info.resources = {1, 1};
+    desc.info.pitch = surface.pitch;
+    desc.info.bytes_per_block = 8;
+    desc.info.samples = 1;
+    desc.info.tile_mode = Prospero::TileMode::kRenderTarget;
+    desc.info.mip_layout[0] = {0, surface.size, surface.pitch, surface.height};
+    desc.view_info.format = desc.info.pixel_format;
+    desc.view_info.type = vk::ImageViewType::e2D;
+    desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+    desc.view_info.usage = type == TextureCache::BindingType::RenderTarget
+                               ? vk::ImageUsageFlagBits::eColorAttachment
+                               : vk::ImageUsageFlagBits::eSampled;
+    return desc;
+  }
+
+  // Guest address of texel (x, y): 64 KiB blocks of 128x64 texels, stored row-major, with the
+  // block-position XOR of the 64 KiB render-target swizzle (as the tiler's CPU reference).
+  static uint64_t AliasTexelAddress(const AliasSurface &surface, uint32_t x, uint32_t y) {
+    constexpr uint32_t MaxBlocks = 64;
+    struct Tables {
+      std::vector<uint32_t> offsets;
+      std::vector<uint32_t> xors;
+    };
+    static const Tables tables = [] {
+      TileBlockLayout block{};
+      Require(AliasTestName, "block layout",
+              TileGetBlockLayout(TileBlockFamily::RenderTarget64KB, 8, block) &&
+                  block.block_width == 128 && block.block_height == 64 &&
+                  block.block_size == 0x10000,
+              "unexpected 64 KiB render-target block for 8-byte elements");
+      Tables result;
+      result.offsets.resize(128u * 64u);
+      for (uint32_t row = 0; row < 64; ++row) {
+        for (uint32_t column = 0; column < 128; ++column) {
+          Require(AliasTestName, "block offset",
+                  TileGetBlockOffset(block, column, row, 0, result.offsets[row * 128u + column]),
+                  "render-target block offset could not be computed");
+        }
+      }
+      result.xors.resize(MaxBlocks * MaxBlocks);
+      for (uint32_t by = 0; by < MaxBlocks; ++by) {
+        for (uint32_t bx = 0; bx < MaxBlocks; ++bx) {
+          Require(AliasTestName, "block xor",
+                  TileGetBlockXor(block, bx, by, 0, result.xors[by * MaxBlocks + bx]),
+                  "render-target block XOR could not be computed");
+        }
+      }
+      return result;
+    }();
+    const uint32_t bx = x >> 7u;
+    const uint32_t by = y >> 6u;
+    Require(AliasTestName, "texel address", bx < MaxBlocks && by < MaxBlocks,
+            "alias test surface is larger than the block tables");
+    const uint64_t block = static_cast<uint64_t>(by) * (surface.pitch >> 7u) + bx;
+    return surface.address + block * 0x10000 +
+           (tables.offsets[(y & 63u) * 128u + (x & 127u)] ^ tables.xors[by * MaxBlocks + bx]);
+  }
+
+  std::unique_ptr<AliasHeap> OpenAliasHeap(uint64_t base, uint64_t size, uint32_t sentinel) {
+    auto heap = std::make_unique<AliasHeap>();
+    heap->base = base;
+    heap->size = size;
+    heap->owner = MakeRenderContext();
+    auto &context = *heap->owner;
+    context.GetCommandScheduler().Begin(heap->registers, heap->user_config, heap->shaders);
+    context.InitializeGpu(nullptr);
+    Require(AliasTestName, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, 0x200000, 0,
+                &heap->direct_offset) == 0,
+            "alias heap direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(AliasTestName, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                           heap->direct_offset, 0x200000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "alias heap fixed mapping failed");
+    // Bytes nothing writes read as the sentinel everywhere.
+    auto *words = static_cast<uint32_t *>(mapped);
+    std::fill(words, words + size / sizeof(uint32_t), sentinel);
+    heap->shadow.resize(size);
+    for (uint64_t offset = 0; offset < size; offset += sizeof(uint32_t)) {
+      std::memcpy(&heap->shadow[offset], &sentinel, sizeof(uint32_t));
+    }
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.MapMemory(base, size);
+    // One cache buffer over the whole heap, as the game has (writebacks of
+    // KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE only move images that start inside the written buffer).
+    OnGpuThread(context, [&] {
+      (void)context.GetBufferCache().ObtainBuffer(base, size, false, false);
+    });
+    return heap;
+  }
+
+  void CloseAliasHeap(AliasHeap &heap) {
+    auto &context = *heap.owner;
+    context.UnmapMemory(heap.base, heap.size);
+    context.GetCommandScheduler().Finish();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(AliasTestName, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(heap.base, heap.size) == 0,
+            "alias heap mapping release failed");
+    Require(AliasTestName, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(heap.direct_offset, heap.size) == 0,
+            "alias heap allocation release failed");
+  }
+
+  // A draw that writes `colour` inside `rect` of render target `surface`: bound through
+  // RenderExecutor::AcquireRenderTargets with the screen scissor set to `rect`.
+  void AliasDraw(AliasHeap &heap, const AliasSurface &surface, const AliasColour &colour,
+                 vk::Rect2D rect) {
+    auto &context = *heap.owner;
+    OnGpuThread(context, [&] {
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      auto &scheduler = context.GetCommandScheduler();
+      RenderColorInfo color{};
+      color.desc = AliasDesc(surface, TextureCache::BindingType::RenderTarget);
+      color.image_id = cache.FindImage(color.desc);
+      RenderExecutorTestAccess::BindRenderTarget(executor, color.image_id);
+      heap.registers.SetScreenScissor(
+          rect.offset.x, rect.offset.y, rect.offset.x + static_cast<int>(rect.extent.width),
+          rect.offset.y + static_cast<int>(rect.extent.height));
+      RenderDepthInfo no_depth{};
+      // What the draw path passes: the union of the draw's scissors.
+      const auto written = DrawScissorUnion(heap.registers, false);
+      const auto state = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &color, 1, no_depth, {}, nullptr, &written);
+      scheduler.Current().BeginRendering(state);
+      vk::ClearAttachment clear{};
+      clear.aspectMask = vk::ImageAspectFlagBits::eColor;
+      clear.colorAttachment = 0;
+      clear.clearValue.color.float32 = colour.floats;
+      const vk::ClearRect clear_rect{rect, 0, 1};
+      scheduler.Current().Handle().clearAttachments(1, &clear, 1, &clear_rect);
+      scheduler.Current().EndRendering();
+      RenderExecutorTestAccess::ResetBindings(executor);
+      heap.registers.SetScreenScissor(0, 0, 16384, 16384);
+    });
+    for (uint32_t y = 0; y < rect.extent.height; ++y) {
+      for (uint32_t x = 0; x < rect.extent.width; ++x) {
+        const auto address = AliasTexelAddress(surface, rect.offset.x + x, rect.offset.y + y);
+        std::memcpy(&heap.shadow[address - heap.base], &colour.bits, sizeof(colour.bits));
+      }
+    }
+  }
+
+  // A bounded GPU buffer write, made the way a written storage-buffer binding makes it
+  // (NativeStorageBuffer: written ObtainBuffer, then InvalidateMemoryFromGPU, then the shader).
+  void AliasFill(AliasHeap &heap, uint64_t address, uint64_t size, uint32_t value) {
+    auto &context = *heap.owner;
+    OnGpuThread(context, [&] {
+      auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, true, false);
+      context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+      buffer->Fill(offset, size, value);
+    });
+    for (uint64_t offset = 0; offset < size; offset += sizeof(uint32_t)) {
+      std::memcpy(&heap.shadow[address - heap.base + offset], &value, sizeof(uint32_t));
+    }
+  }
+
+  // A DMA copy (BufferCache::CopyBuffer: the source synchronizes like a texel read).
+  void AliasCopy(AliasHeap &heap, uint64_t destination, uint64_t source, uint64_t size) {
+    auto &context = *heap.owner;
+    OnGpuThread(context, [&] {
+      context.GetBufferCache().CopyBuffer(destination, source, size, false, false);
+    });
+    std::memmove(&heap.shadow[destination - heap.base], &heap.shadow[source - heap.base], size);
+  }
+
+  // The native texels of `surface` after a sampled lookup (FindImage + FindTexture).
+  std::vector<u32> AliasSample(AliasHeap &heap, const AliasSurface &surface) {
+    auto &context = *heap.owner;
+    ImageId id{};
+    OnGpuThread(context, [&] {
+      auto &cache = context.GetTextureCache();
+      auto desc = AliasDesc(surface, TextureCache::BindingType::Texture);
+      id = cache.FindImage(desc);
+      (void)cache.FindTexture(id, desc);
+    });
+    return ReadCachedTexel(AliasTestName, context, id, {0, 0, 0},
+                           {surface.width, surface.height, 1});
+  }
+
+  // Cache-buffer bytes of a GPU-owned range.
+  std::vector<uint8_t> AliasReadBytes(AliasHeap &heap, uint64_t address, uint64_t size) {
+    auto &context = *heap.owner;
+    auto &scheduler = context.GetCommandScheduler();
+    auto readback = CreateHostBuffer(AliasTestName, size, vk::BufferUsageFlagBits::eTransferDst,
+                                     {});
+    OnGpuThread(context, [&] {
+      auto [buffer, offset] =
+          context.GetBufferCache().ObtainBuffer(address, size, false, false);
+      auto &command = scheduler.Current();
+      command.EndRendering();
+      const auto native = command.Handle();
+      vk::BufferMemoryBarrier before{};
+      before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+      before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+      before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      before.buffer = buffer->Handle();
+      before.offset = offset;
+      before.size = size;
+      native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                             vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+                             nullptr);
+      const vk::BufferCopy copy{offset, 0, size};
+      native.copyBuffer(buffer->Handle(), readback.buffer, 1, &copy);
+      vk::BufferMemoryBarrier after{};
+      after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      after.buffer = readback.buffer;
+      after.offset = 0;
+      after.size = size;
+      native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                             vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &after, 0,
+                             nullptr);
+    });
+    scheduler.Finish();
+    const auto words = ReadBuffer(AliasTestName, readback, size / sizeof(u32));
+    DestroyBuffer(&readback);
+    std::vector<uint8_t> bytes(size);
+    std::memcpy(bytes.data(), words.data(), size);
+    return bytes;
+  }
+
+  // One presented guest frame plus more scheduler ticks than an overlap-stale image may idle.
+  void AliasFrame(AliasHeap &heap) {
+    auto &context = *heap.owner;
+    context.GetTextureCache().AdvanceFrame();
+    for (int tick = 0; tick < 33; ++tick) {
+      context.GetCommandScheduler().Flush();
+    }
+  }
+
+  struct AliasTally {
+    uint64_t wrong = 0;
+    uint64_t total = 0;
+    std::string detail;
+    // Wrong texels per (surface label, 64 KiB block of the surface).
+    std::map<std::pair<std::string, uint64_t>, uint64_t> blocks;
+  };
+
+  // Compares every texel of `surface` (got_at(x, y)) with the eight bytes the PS5 holds at the
+  // texel's address plus shadow_delta (0: the surface's own range; otherwise a copy of it).
+  template <typename GotAt>
+  static void AliasCompare(const AliasHeap &heap, const AliasSurface &surface, GotAt &&got_at,
+                           uint64_t shadow_delta, const char *where, AliasTally &tally) {
+    for (uint32_t y = 0; y < surface.height; ++y) {
+      for (uint32_t x = 0; x < surface.width; ++x) {
+        const auto address = AliasTexelAddress(surface, x, y) + shadow_delta;
+        uint64_t expected = 0;
+        std::memcpy(&expected, &heap.shadow[address - heap.base], sizeof(expected));
+        const uint64_t got = got_at(x, y);
+        ++tally.total;
+        if (got == expected) {
+          continue;
+        }
+        ++tally.blocks[{surface.label,
+                        (AliasTexelAddress(surface, x, y) - surface.address) >> 16u}];
+        if (tally.wrong < 3) {
+          char line[256];
+          std::snprintf(line, sizeof(line),
+                        " %s %s(%u,%u) block %" PRIu64 ": got 0x%016" PRIx64
+                        " expected 0x%016" PRIx64 ";",
+                        where, surface.label, x, y,
+                        (AliasTexelAddress(surface, x, y) - surface.address) >> 16u, got,
+                        expected);
+          tally.detail += line;
+        }
+        ++tally.wrong;
+      }
+    }
+  }
+
+  static void AliasCompareTexels(const AliasHeap &heap, const AliasSurface &surface,
+                                 const std::vector<u32> &texels, const char *where,
+                                 AliasTally &tally) {
+    AliasCompare(
+        heap, surface,
+        [&](uint32_t x, uint32_t y) {
+          const auto index = (static_cast<size_t>(y) * surface.width + x) * 2u;
+          return static_cast<uint64_t>(texels[index]) |
+                 (static_cast<uint64_t>(texels[index + 1]) << 32u);
+        },
+        0, where, tally);
+  }
+
+  void CheckAliasBytesAcrossPartialWrites() {
+    constexpr const char *name = AliasTestName;
+    EnsureRuntimeContext();
+    const auto env = [](const char *variable) {
+      const char *value = std::getenv(variable);
+      return value != nullptr ? value : "(unset)";
+    };
+    std::printf("[gpu]     %s: KYTY_ALIAS_BYTES=%s KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE=%s\n", name,
+                env("KYTY_ALIAS_BYTES"), env("KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE"));
+    std::vector<std::string> failed;
+    const auto report = [&](const char *check, const AliasTally &tally) {
+      std::printf("[gpu]       %-44s %s (%" PRIu64 " of %" PRIu64 " texels wrong)%s\n", check,
+                  tally.wrong == 0 ? "ok" : "FAIL", tally.wrong, tally.total,
+                  tally.detail.c_str());
+      if (!tally.blocks.empty()) {
+        std::string blocks;
+        size_t listed = 0;
+        for (const auto &[block, count] : tally.blocks) {
+          if (listed++ == 24) {
+            blocks += " ...";
+            break;
+          }
+          blocks += " " + block.first + "#" + std::to_string(block.second) + ":" +
+                    std::to_string(count);
+        }
+        std::printf("[gpu]         wrong texels per block (%zu blocks):%s\n", tally.blocks.size(),
+                    blocks.c_str());
+      }
+      if (tally.wrong != 0) {
+        failed.emplace_back(check);
+      }
+    };
+    constexpr uint64_t base = 0x0000000270000000ull;
+    constexpr uint64_t heap_size = 0x800000;
+    constexpr uint32_t sentinel = 0x7f7f7f7fu;
+    constexpr uint32_t written = 0x3c003800u;
+    // The A'-type quarter-resolution input at 1368p: 608x342, 5x6 blocks of 64 KiB.
+    const auto p = MakeAliasSurface("P", base, 608, 342);
+    const vk::Rect2D whole_p{{0, 0}, {p.width, p.height}};
+
+    // 1. A bounded buffer write over one block of a GPU-written image, then a copy of the
+    //    image's whole range (the memcpy X->Y / A' pattern).
+    {
+      auto heap = OpenAliasHeap(base, heap_size, sentinel);
+      AliasDraw(*heap, p, MakeAliasColour(1), whole_p);
+      AliasFill(*heap, p.address + 0x10000, 0x10000, written);
+      constexpr uint64_t destination = base + 0x400000;
+      AliasCopy(*heap, destination, p.address, p.size);
+      const auto bytes = AliasReadBytes(*heap, destination, p.size);
+      AliasTally tally;
+      AliasCompare(
+          *heap, p,
+          [&](uint32_t x, uint32_t y) {
+            uint64_t value = 0;
+            std::memcpy(&value, &bytes[AliasTexelAddress(p, x, y) - p.address], sizeof(value));
+            return value;
+          },
+          destination - p.address, "copy", tally);
+      report("1 copy after a partial buffer write", tally);
+      CloseAliasHeap(*heap);
+    }
+
+    // 1b. A copy of bytes inside a GPU-written image that does not start at the copy (a texel read
+    //     whose owner starts elsewhere): blocks 2..7 of P.
+    {
+      auto heap = OpenAliasHeap(base, heap_size, sentinel);
+      AliasDraw(*heap, p, MakeAliasColour(5), whole_p);
+      constexpr uint64_t destination = base + 0x400000;
+      constexpr uint64_t first = 0x20000;
+      constexpr uint64_t bytes = 0x60000;
+      AliasCopy(*heap, destination + first, p.address + first, bytes);
+      const auto copied = AliasReadBytes(*heap, destination + first, bytes);
+      AliasTally tally;
+      for (uint32_t y = 0; y < p.height; ++y) {
+        for (uint32_t x = 0; x < p.width; ++x) {
+          const auto offset = AliasTexelAddress(p, x, y) - p.address;
+          if (offset < first || offset >= first + bytes) {
+            continue;
+          }
+          uint64_t got = 0;
+          uint64_t expected = 0;
+          std::memcpy(&got, &copied[offset - first], sizeof(got));
+          std::memcpy(&expected, &heap->shadow[destination + offset - heap->base],
+                      sizeof(expected));
+          ++tally.total;
+          if (got != expected) {
+            ++tally.blocks[{p.label, offset >> 16u}];
+            if (tally.wrong++ < 3) {
+              char line[160];
+              std::snprintf(line, sizeof(line),
+                            " copy P(%u,%u): got 0x%016" PRIx64 " expected 0x%016" PRIx64 ";", x,
+                            y, got, expected);
+              tally.detail += line;
+            }
+          }
+        }
+      }
+      report("1b copy from inside a GPU-written image", tally);
+      CloseAliasHeap(*heap);
+    }
+
+    // 2. The same write, then the image is sampled (rebuilt from buffer bytes).
+    {
+      auto heap = OpenAliasHeap(base, heap_size, sentinel);
+      AliasDraw(*heap, p, MakeAliasColour(2), whole_p);
+      AliasFill(*heap, p.address + 0x10000, 0x10000, written);
+      AliasTally tally;
+      AliasCompareTexels(*heap, p, AliasSample(*heap, p), "sample", tally);
+      report("2 rebuild after a partial buffer write", tally);
+      CloseAliasHeap(*heap);
+    }
+
+    // 3. A GPU-written image idles past the alias lifetime; an image starting inside it is
+    //    requested (the overlap-stale free) and never written; both are sampled.
+    {
+      auto heap = OpenAliasHeap(base, heap_size, sentinel);
+      AliasDraw(*heap, p, MakeAliasColour(3), whole_p);
+      for (int frame = 0; frame < 5; ++frame) {
+        AliasFrame(*heap);
+      }
+      const auto r = MakeAliasSurface("R", base + 0x10000, 128, 64);
+      AliasTally tally;
+      AliasCompareTexels(*heap, r, AliasSample(*heap, r), "sample", tally);
+      AliasCompareTexels(*heap, p, AliasSample(*heap, p), "sample", tally);
+      report("3 overlap-stale free of a GPU-owned image", tally);
+      CloseAliasHeap(*heap);
+    }
+
+    // 4. Two layouts over one heap, as at the 1080p <-> 1368p switches. Each frame renders the
+    //    source X, copies it into the scene copy Y (the memcpy), renders X again (a later pass),
+    //    renders the quarter-resolution input Q, writes one of its blocks with a buffer write, and
+    //    samples Y and Q. Layout B renders 1920x1024 of its 2432x1368 targets (dynamic
+    //    resolution), so B's X keeps other images' bytes outside that area. In the last B frame a
+    //    history input H is sampled over bytes the idle layout-A source wrote last (it is freed
+    //    as overlap-stale by that lookup).
+    {
+      constexpr uint64_t heap_base = 0x0000000272000000ull;
+      auto heap = OpenAliasHeap(heap_base, 0x4000000, sentinel);
+      const std::array<AliasSurface, 2> xs{
+          MakeAliasSurface("XA", heap_base + 0x0000000, 1920, 1080),
+          MakeAliasSurface("XB", heap_base + 0x0800000, 2432, 1368)};
+      const std::array<AliasSurface, 2> ys{
+          MakeAliasSurface("YA", heap_base + 0x1000000, 1920, 1080),
+          MakeAliasSurface("YB", heap_base + 0x2300000, 2432, 1368)};
+      const std::array<AliasSurface, 2> qs{
+          MakeAliasSurface("QA", heap_base + 0x2000000, 480, 270),
+          MakeAliasSurface("QB", heap_base + 0x0000000, 608, 342)};
+      const auto h = MakeAliasSurface("H", heap_base + 0x0200000, 960, 540);
+      AliasTally scene;
+      AliasTally quarter;
+      AliasTally history;
+      for (uint32_t frame = 0; frame < 15; ++frame) {
+        const uint32_t layout = frame >= 6 && frame < 12 ? 1u : 0u;
+        const auto &x = xs[layout];
+        const auto &y = ys[layout];
+        const auto &q = qs[layout];
+        const vk::Rect2D rect = layout == 1 ? vk::Rect2D{{0, 0}, {1920, 1024}}
+                                            : vk::Rect2D{{0, 0}, {x.width, x.height}};
+        char where[32];
+        std::snprintf(where, sizeof(where), "frame %u", frame);
+        AliasDraw(*heap, x, MakeAliasColour(40 + frame * 4), rect);
+        AliasCopy(*heap, y.address, x.address, x.size);
+        AliasDraw(*heap, x, MakeAliasColour(41 + frame * 4), rect);
+        AliasDraw(*heap, q, MakeAliasColour(42 + frame * 4), {{0, 0}, {q.width, q.height}});
+        AliasFill(*heap, q.address + 0x10000, 0x10000, written + frame);
+        AliasCompareTexels(*heap, y, AliasSample(*heap, y), where, scene);
+        AliasCompareTexels(*heap, q, AliasSample(*heap, q), where, quarter);
+        if (frame == 11) {
+          AliasCompareTexels(*heap, h, AliasSample(*heap, h), where, history);
+        }
+        AliasFrame(*heap);
+      }
+      report("4a layout switches: scene copy Y (memcpy of X)", scene);
+      report("4b layout switches: quarter input Q", quarter);
+      report("4c layout switches: history H after a stale free", history);
+      CloseAliasHeap(*heap);
+    }
+
+    // 5. Per-draw cost of the render-target claim (FindRenderTarget, as AcquireRenderTargets calls
+    //    it for every draw) and of the scissor union, on the CPU: a target that owns all of its
+    //    bytes (the common case), and a dynamic-resolution target whose draws stay inside the
+    //    rectangle it already claimed.
+    {
+      constexpr uint64_t heap_base = 0x0000000272000000ull;
+      auto heap = OpenAliasHeap(heap_base, 0x4000000, sentinel);
+      auto &context = *heap->owner;
+      const auto full = MakeAliasSurface("F", heap_base, 1920, 1080);
+      const auto partial = MakeAliasSurface("D", heap_base + 0x1000000, 2432, 1368);
+      AliasDraw(*heap, full, MakeAliasColour(90), {{0, 0}, {full.width, full.height}});
+      const vk::Rect2D drs{{0, 0}, {1920, 1024}};
+      AliasDraw(*heap, partial, MakeAliasColour(91), drs);
+      constexpr int iterations = 20000;
+      const auto time_binds = [&](const AliasSurface &surface, const vk::Rect2D *written) {
+        // The fastest of five rounds: the loop is short and the machine is shared.
+        double ns = 1e30;
+        OnGpuThread(context, [&] {
+          auto &cache = context.GetTextureCache();
+          auto desc = AliasDesc(surface, TextureCache::BindingType::RenderTarget);
+          const auto id = cache.FindImage(desc);
+          for (int round = 0; round < 5; ++round) {
+            const auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < iterations; ++i) {
+              (void)cache.FindRenderTarget(id, desc, written);
+            }
+            ns = std::min(ns, std::chrono::duration<double, std::nano>(
+                                  std::chrono::steady_clock::now() - start)
+                                      .count() /
+                                  iterations);
+          }
+        });
+        return ns;
+      };
+      const vk::Rect2D whole{{0, 0}, {full.width, full.height}};
+      const double whole_none = time_binds(full, nullptr);
+      const double whole_rect = time_binds(full, &whole);
+      const double drs_rect = time_binds(partial, &drs);
+      const auto owner = TextureCacheTestAccess::Owner(
+          context.GetTextureCache(),
+          TextureCacheTestAccess::FindSameBacking(context.GetTextureCache(),
+                                                  AliasDesc(partial, TextureCache::BindingType::RenderTarget).info));
+      Require(name, "bounded claim kept",
+              owner != nullptr && owner->IsGpuModified() &&
+                  owner->OwnsAllBytes() == !TextureCache::AliasBytesEnabled(),
+              "a dynamic-resolution draw's claim did not follow KYTY_ALIAS_BYTES");
+      const auto time_union = [&](bool indexed) {
+        heap->registers.SetScreenScissor(0, 0, 1920, 1024);
+        uint64_t checksum = 0;
+        double ns = 1e30;
+        for (int round = 0; round < 5; ++round) {
+          const auto start = std::chrono::steady_clock::now();
+          for (int i = 0; i < iterations; ++i) {
+            checksum += DrawScissorUnion(heap->registers, indexed).extent.width;
+          }
+          ns = std::min(ns, std::chrono::duration<double, std::nano>(
+                                std::chrono::steady_clock::now() - start)
+                                    .count() /
+                                iterations);
+        }
+        heap->registers.SetScreenScissor(0, 0, 16384, 16384);
+        Require(name, "scissor union", checksum == uint64_t{iterations} * 1920 * 5,
+                "the scissor union changed between identical draws");
+        return ns;
+      };
+      const double union_ns = time_union(false);
+      const double union_indexed_ns = time_union(true);
+      std::printf("[bench]   render-target bind (FindRenderTarget): owner of all bytes %.0f ns (no "
+                  "rect) / %.0f ns (scissor), dynamic-resolution claim %.0f ns; scissor union "
+                  "%.0f ns (1 viewport) / %.0f ns (16)\n",
+                  whole_none, whole_rect, drs_rect, union_ns, union_indexed_ns);
+      CloseAliasHeap(*heap);
+    }
+
+    if (!failed.empty()) {
+      std::string list;
+      for (const auto &check : failed) {
+        list += (list.empty() ? "" : "; ") + check;
+      }
+      if (!TextureCache::AliasBytesEnabled()) {
+        // KYTY_ALIAS_BYTES=0 (or KYTY_IMAGE_ALIAS_AGE=ticks) keeps whole-image ownership, which
+        // these checks show wrong; only report it.
+        std::printf("[gpu]     %-32s whole-image ownership (KYTY_ALIAS_BYTES off): %s\n", name,
+                    list.c_str());
+        return;
+      }
+      Fail(name, "alias bytes", "failed checks: " + list);
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckImagePressureRetirement() {
@@ -20428,6 +21083,22 @@ public:
          false},
         {"depth-tiled r32f layers", Prospero::BufferFormat::k32Float,
          vk::Format::eR32Sfloat, Prospero::TileMode::kDepth, 129, 65, 1, 3, true},
+        // 2-byte depth tiling (R16 colour views of D16 memory, 256x128-element blocks) at the
+        // half-resolution depth sizes Astro Bot's water pass rebuilds from buffer bytes (U52 hang
+        // trace, 2026-09-27: 960x540 at 1080p, 1216x684 at 1368p, 1664x936 and 1920x1080), none a
+        // multiple of the block width; plus a layered and a 1-byte case.
+        {"depth-tiled r16 1216x684", Prospero::BufferFormat::k16UNorm,
+         vk::Format::eR16Unorm, Prospero::TileMode::kDepth, 1216, 684, 1, 1, true},
+        {"depth-tiled r16 960x540", Prospero::BufferFormat::k16UNorm,
+         vk::Format::eR16Unorm, Prospero::TileMode::kDepth, 960, 540, 1, 1, true},
+        {"depth-tiled r16 1664x936", Prospero::BufferFormat::k16UNorm,
+         vk::Format::eR16Unorm, Prospero::TileMode::kDepth, 1664, 936, 1, 1, true},
+        {"depth-tiled r16 1920x1080", Prospero::BufferFormat::k16UNorm,
+         vk::Format::eR16Unorm, Prospero::TileMode::kDepth, 1920, 1080, 1, 1, true},
+        {"depth-tiled r16 layers", Prospero::BufferFormat::k16UNorm,
+         vk::Format::eR16Unorm, Prospero::TileMode::kDepth, 129, 65, 1, 3, true},
+        {"depth-tiled r8 layers", Prospero::BufferFormat::k8UNorm, vk::Format::eR8Unorm,
+         Prospero::TileMode::kDepth, 130, 70, 1, 2, true},
         // KYTY_TILER_IMAGE_DIRECT_BC: uncompressed block-texel views, one per (level, layer).
         {"std64 bc7 mips", Prospero::BufferFormat::kBc7UNorm,
          vk::Format::eBc7UnormBlock, Prospero::TileMode::kStandard64KB, 256, 256, 9, 1,
@@ -20443,6 +21114,107 @@ public:
         {"std256 bc3", Prospero::BufferFormat::kBc3UNorm, vk::Format::eBc3UnormBlock,
          Prospero::TileMode::kStandard256B, 36, 20, 2, 1, false},
     };
+
+    // Linear bytes the buffer tiler (Detile) leaves for `infos`. Only each tile's width x height
+    // elements are defined; padding keeps whatever the pooled scratch held.
+    const auto detile_host = [&](const std::vector<u32> &tiled_words,
+                                 std::span<const GpuTileInfo> infos,
+                                 uint64_t linear_size) {
+      const uint64_t tiled_size = tiled_words.size() * sizeof(u32);
+      auto tiled = CreateHostBuffer(name, tiled_size, AllFlags, tiled_words);
+      const uint64_t words = (linear_size + 3u) / 4u;
+      auto output = CreateHostBuffer(
+          name, words * sizeof(u32), AllFlags,
+          std::vector<u32>(static_cast<size_t>(words), 0xabababab));
+      const auto linear =
+          tile_manager.Detile(tiled.buffer, 0, tiled_size, linear_size, infos);
+      const vk::BufferCopy copy{linear.offset, 0, words * sizeof(u32)};
+      scheduler.Current().Handle().copyBuffer(linear.buffer, output.buffer, 1, &copy);
+      host_barrier(output.buffer);
+      scheduler.Finish();
+      auto result = ReadBuffer(name, output, static_cast<size_t>(words));
+      DestroyBuffer(&output);
+      DestroyBuffer(&tiled);
+      return result;
+    };
+    // A depth-tiled surface reaches an image by two routes in TextureCache::UploadImage. The
+    // depth image (D16/D32) takes the depth path: BuildDepthTiles, one Depth64KB tile per layer at
+    // the depth pitch and plane size, then Image::Upload (its colour aliases then copy from it,
+    // maintenance8). A colour view of the same memory (e.g. the R16 alias of the half-resolution
+    // depth, rebuilt directly at the 1368p layouts) takes the colour path: TextureCalcUploadLayout
+    // with allow_depth_tile, TextureBuildGpuTileInfos and DetileToImage. `check` compares that
+    // colour path's direct and buffer variants; this compares its texels with the depth path's.
+    u32 route_checks = 0;
+    const auto check_depth_route = [&](const Case &c, uint64_t tiled_total,
+                                       const std::vector<u32> &tiled_words,
+                                       std::span<const GpuTileInfo> colour_infos,
+                                       std::span<const vk::BufferImageCopy> colour_regions,
+                                       uint64_t colour_linear_size) {
+      const std::string label = std::string(c.label) + " depth route";
+      const u32 bpe = colour_infos.front().bytes_per_element;
+      TileBlockLayout block{};
+      Require(name, (label + " block").c_str(),
+              TileGetBlockLayout(TileBlockFamily::Depth64KB, bpe, block),
+              "no Depth64KB block for this element size");
+      const u32 pitch = TileGetDepthPitch(c.width, bpe);
+      const uint64_t padded_height =
+          (static_cast<uint64_t>(c.height) + block.block_height - 1u) / block.block_height *
+          block.block_height;
+      const uint64_t plane = static_cast<uint64_t>(pitch) * padded_height * bpe;
+      Require(name, (label + " plane size").c_str(),
+              pitch == colour_infos.front().pitch && plane * c.layers == tiled_total,
+              "the depth path's pitch or plane size differs from the colour texture layout");
+      std::vector<GpuTileInfo> depth_infos;
+      for (u32 layer = 0; layer < c.layers; ++layer) {
+        GpuTileInfo tile{};
+        tile.family = TileBlockFamily::Depth64KB;
+        tile.bytes_per_element = bpe;
+        tile.linear_offset = plane * layer;
+        tile.linear_size = plane;
+        tile.tiled_offset = plane * layer;
+        tile.tiled_size = plane;
+        tile.width = c.width;
+        tile.height = c.height;
+        tile.depth = 1;
+        tile.pitch = pitch;
+        tile.surface_z = layer;
+        depth_infos.push_back(tile);
+      }
+      const auto depth_words = detile_host(tiled_words, depth_infos, plane * c.layers);
+      const auto colour_words =
+          detile_host(tiled_words, colour_infos, colour_linear_size);
+      const auto *depth_bytes = reinterpret_cast<const uint8_t *>(depth_words.data());
+      const auto *colour_bytes = reinterpret_cast<const uint8_t *>(colour_words.data());
+      uint64_t mismatches = 0;
+      std::ostringstream first;
+      for (u32 layer = 0; layer < c.layers; ++layer) {
+        const auto &region = colour_regions[layer];
+        const uint64_t row_texels =
+            region.bufferRowLength != 0 ? region.bufferRowLength : region.imageExtent.width;
+        for (u32 y = 0; y < c.height; ++y) {
+          for (u32 x = 0; x < c.width; ++x) {
+            const uint64_t depth_offset =
+                plane * layer + (static_cast<uint64_t>(y) * pitch + x) * bpe;
+            const uint64_t colour_offset =
+                region.bufferOffset + (static_cast<uint64_t>(y) * row_texels + x) * bpe;
+            if (std::memcmp(depth_bytes + depth_offset, colour_bytes + colour_offset, bpe) !=
+                0) {
+              if (mismatches++ == 0) {
+                first << "first differing texel (" << x << ", " << y << ", layer " << layer
+                      << ")";
+              }
+            }
+          }
+        }
+      }
+      if (mismatches != 0) {
+        first << ", " << mismatches << " of " << uint64_t{c.width} * c.height * c.layers
+              << " texels differ";
+        Fail(name, label.c_str(), first.str());
+      }
+      ++route_checks;
+    };
+
     u32 salt = 1;
     for (const auto &c : cases) {
       if (!TextureUploadLayoutSupported(c.guest, c.width, c.height, c.levels,
@@ -20479,6 +21251,9 @@ public:
       std::vector<u32> tiled((total.size + 3u) / 4u);
       fill(&tiled, salt++);
       check(c.label, info, tiled, infos, regions, linear_size);
+      if (c.tile == Prospero::TileMode::kDepth && c.levels == 1) {
+        check_depth_route(c, total.size, tiled, infos, regions, linear_size);
+      }
 
       // A partial band (TextureCache::TryPartialUpload): block rows [1, 3) of level 0,
       // placed at a nonzero image row (image rows are texel rows: 4 per BC block).
@@ -20575,8 +21350,9 @@ public:
       scheduler.Finish();
       DestroyBuffer(&tiled);
     }
-    std::printf("[gpu]     %-32s ok (%u parity checks, downloads %s, block uploads %s)\n",
-                name, checked, downloads ? "checked" : "unsupported",
+    std::printf("[gpu]     %-32s ok (%u parity checks, %u depth-route checks, downloads %s, "
+                "block uploads %s)\n",
+                name, checked, route_checks, downloads ? "checked" : "unsupported",
                 m_runtime_context.supports_block_texel_view ? "checked" : "unsupported");
   }
 
@@ -40202,6 +40978,11 @@ int main(int argc, char **argv) {
     vulkan.CheckTexelSyncOverStaleGpuDirtyBytes();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--alias-bytes-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckAliasBytesAcrossPartialWrites();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-pressure-retirement-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckImagePressureRetirement();
@@ -40562,6 +41343,7 @@ int main(int argc, char **argv) {
 #endif
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckTexelSyncOverStaleGpuDirtyBytes();
+  vulkan.CheckAliasBytesAcrossPartialWrites();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();
   const auto tests = MakeCases();
