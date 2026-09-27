@@ -879,6 +879,16 @@ void TextureCache::FreeImage(ImageId id, HangTrace::ImageFreeReason reason) {
 }
 
 void TextureCache::TouchImage(Image& image) {
+	if (HangTrace::CpWatch(image.info.data.address, image.info.data.size)) {
+		HangTrace::CpEvent event;
+		event.event   = "use-image";
+		event.address = image.info.data.address;
+		event.value   = static_cast<uint64_t>(image.backing.format);
+		event.ref     = (uint64_t {image.info.extent.width} << 32u) | image.info.extent.height;
+		event.aux     = (image.IsGpuModified() ? 1 : 0) | (image.IsBufferModified() ? 2 : 0);
+		event.size    = image.info.data.size;
+		HangTrace::RecordCp(event);
+	}
 	image.frame_accessed_last = m_frame.load(std::memory_order_relaxed);
 	if (image.registered) {
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
@@ -3670,6 +3680,13 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
+	if (HangTrace::CpWatch(address, size)) {
+		HangTrace::CpEvent event;
+		event.event   = "gpuwrite-buffer";
+		event.address = address;
+		event.size    = size;
+		HangTrace::RecordCp(event);
+	}
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
@@ -3722,6 +3739,16 @@ void TextureCache::InvalidateCleanImageProofs(uint64_t address, uint64_t size,
 }
 
 void TextureCache::MarkImageGpuModified(Image& image) {
+	if (HangTrace::CpWatch(image.info.data.address, image.info.data.size)) {
+		HangTrace::CpEvent event;
+		event.event   = "gpuwrite-image";
+		event.address = image.info.data.address;
+		event.value   = static_cast<uint64_t>(image.backing.format);
+		event.ref     = (uint64_t {image.info.extent.width} << 32u) | image.info.extent.height;
+		event.aux     = image.IsGpuModified() ? 1 : 0;
+		event.size    = image.info.data.size;
+		HangTrace::RecordCp(event);
+	}
 	if (!image.FullyResident()) {
 		// Every GPU-write path makes the image fully resident before recording. Reaching this
 		// point partially resident would expose undefined levels: count and report it.

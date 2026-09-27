@@ -37,6 +37,7 @@
 #include <mutex>
 #include <semaphore>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -172,6 +173,18 @@ static uint64_t CpNowNs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())
 	                                 .count());
+}
+
+// cp.csv label rows (KYTY_HANG_TRACE_CP).
+static void TraceCpLabel(const char* kind, const void* dst, uint64_t value, uint64_t size) {
+	if (HangTrace::CpTraceEnabled()) {
+		HangTrace::CpEvent event;
+		event.event   = kind;
+		event.address = reinterpret_cast<uint64_t>(dst);
+		event.value   = value;
+		event.size    = size;
+		HangTrace::RecordCp(event);
+	}
 }
 
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
@@ -755,8 +768,36 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	const auto value = ReadGuestForCp<T>(reinterpret_cast<uint64_t>(addr));
-	if (!TestWaitRegMemValue(value, ref, mask, func)) {
+	const auto value  = ReadGuestForCp<T>(reinterpret_cast<uint64_t>(addr));
+	const bool passed = TestWaitRegMemValue(value, ref, mask, func);
+	if (HangTrace::CpTraceEnabled()) {
+		// One row per wait: the first failed evaluation, and the pass (aux = failed retries).
+		struct WaitTrace {
+			uint64_t address = 0;
+			uint64_t ref     = 0;
+			int64_t  retries = -1; // -1: no failed evaluation pending
+		};
+		static std::unordered_map<const CommandProcessor*, WaitTrace> traces; // GPU thread
+		auto&      trace   = traces[this];
+		const auto address = reinterpret_cast<uint64_t>(addr);
+		const bool same    = trace.retries >= 0 && trace.address == address &&
+		                  trace.ref == static_cast<uint64_t>(ref);
+		if (!passed && same) {
+			trace.retries++;
+		} else {
+			HangTrace::CpEvent event;
+			event.event   = passed ? "wait-pass" : "wait-fail";
+			event.address = address;
+			event.value   = static_cast<uint64_t>(value);
+			event.ref     = static_cast<uint64_t>(ref);
+			event.mask    = static_cast<uint64_t>(mask);
+			event.aux     = passed ? (same ? trace.retries : 0) : static_cast<int64_t>(func);
+			event.size    = sizeof(T);
+			HangTrace::RecordCp(event);
+			trace = passed ? WaitTrace {} : WaitTrace {address, static_cast<uint64_t>(ref), 0};
+		}
+	}
+	if (!passed) {
 		// Waiting on a deferred label: it is written only after its tick completes, so that
 		// tick must be submitted before this queue suspends (the slice-end flush would do it
 		// too; flushing here also covers a label recorded earlier in this slice).
@@ -813,10 +854,13 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		        : cache.TryWriteDataGpu(address, src, uint64_t {dw_num} * sizeof(uint32_t));
 		if (written) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::WriteDataGpu);
+			TraceCpLabel("wd-gpu", dst, src[write_one_address ? dw_num - 1u : 0u],
+			             uint64_t {dw_num} * 4u);
 			return;
 		}
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::WriteDataCpu);
+	TraceCpLabel("wd-cpu", dst, src[write_one_address ? dw_num - 1u : 0u], uint64_t {dw_num} * 4u);
 
 	if (write_one_address) {
 		for (uint32_t i = 0; i < dw_num; i++) {
@@ -907,6 +951,19 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(!m_accepting);
 	submission.sequence    = m_next_submission_sequence++;
 	submission.frame_fence = FrameFenceEnabled() ? m_done_boundary : 0;
+	if (HangTrace::CpTraceEnabled()) {
+		HangTrace::CpEvent event;
+		event.event   = submission.type == SubmissionType::Compute   ? "admit-compute"
+		                : submission.type == SubmissionType::Graphics ? "admit-graphics"
+		                                                               : "admit-flip";
+		event.address = reinterpret_cast<uint64_t>(submission.commands.data());
+		event.value   = submission.frame_fence;
+		event.ref     = static_cast<uint64_t>(m_done_num.load());
+		event.size    = submission.commands.size() * sizeof(uint32_t);
+		event.queue   = submission.queue_id;
+		event.seq     = submission.sequence;
+		HangTrace::RecordCp(event);
+	}
 	m_in_flight.insert(submission.sequence);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
@@ -1054,11 +1111,21 @@ void GuestGpu::ThreadRun(void* data) {
 				HangTrace::RecordQueueWait(submission.queue_id, slice_start - submission.enqueue_ns);
 			}
 		}
+		HangTrace::SetCpContext(submission.queue_id, submission.sequence);
 		const bool complete = gpu->Process(submission);
 		if (HangTrace::Enabled()) {
 			HangTrace::RecordQueueBusy(submission.queue_id, HangTrace::NowNs() - slice_start,
 			                           complete);
 		}
+		if (HangTrace::CpTraceEnabled()) {
+			HangTrace::CpEvent event;
+			event.event = "slice";
+			// 0 complete, 1 suspended (blocked), 2 yielded
+			event.aux = complete ? 0 : (submission.command_execution.Yielded() ? 2 : 1);
+			event.value = submission.slice_progress ? 1 : 0;
+			HangTrace::RecordCp(event);
+		}
+		HangTrace::SetCpContext(UINT32_MAX, 0);
 
 		if (complete || submission.slice_progress) {
 			spin_deadline = 0;
@@ -1941,6 +2008,10 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	auto&      scheduler = GetScheduler();
 	const auto tick      = scheduler.CurrentTick();
 	gpu.AddDeferredLabel(address, size, tick);
+	TraceCpLabel(proxy ? "label-defer-proxy" : (ordered ? "label-defer-ordered" : "label-defer"),
+	             dst, value, size);
+	const int64_t trace_queue =
+	    m_interrupt_event_id == 0 ? 0 : static_cast<int64_t>(m_interrupt_event_id) - 0x20 + 1;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::LabelWritesDeferred);
 	if (proxy) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::LabelWritesDeferredProxy);
@@ -1954,12 +2025,24 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	// is handed to the GPU thread: a label page may be protected by resource tracking, and only
 	// the GPU thread may take the resulting fault/readback. The interrupt follows the write.
 	scheduler.DeferPriorityOperation(
-	    [renderer, &gpu, address, value, size, tick, interrupt, event_id, interrupt_context_id] {
+	    [renderer, &gpu, address, value, size, tick, interrupt, event_id, interrupt_context_id,
+	     trace_queue] {
 		    const bool sent = gpu.TrySendCommand([renderer, &gpu, address, value, size, tick,
-		                                          interrupt, event_id, interrupt_context_id] {
+		                                          interrupt, event_id, interrupt_context_id,
+		                                          trace_queue] {
 			    {
 				    KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteDeferredLabel");
 				    std::memcpy(reinterpret_cast<void*>(address), &value, size);
+			    }
+			    if (HangTrace::CpTraceEnabled()) {
+				    HangTrace::CpEvent event;
+				    event.event   = "label-deferred-write";
+				    event.address = address;
+				    event.value   = value;
+				    event.size    = size;
+				    event.aux     = static_cast<int64_t>(tick);
+				    event.queue   = trace_queue;
+				    HangTrace::RecordCp(event);
 			    }
 			    // Emulator write outside a fence position (draw-prep log certificate only).
 			    Coherence::NoteContentWrite(address, size, Coherence::Source::CpWrite);
@@ -2010,6 +2093,7 @@ bool CommandProcessor::WriteDroppedLabel(void* dst, uint64_t value, uint32_t siz
 	}
 	KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel");
 	std::memcpy(dst, &value, size);
+	TraceCpLabel("label-dropped", dst, value, size);
 	return false;
 }
 
@@ -2215,6 +2299,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel32");
 			std::memcpy(dst, &data, sizeof(data));
 		}
+		TraceCpLabel("label-eop", dst, data, sizeof(data));
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -2248,6 +2333,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					SynchronizeGpu();
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
+					TraceCpLabel("label-gds", dst, *dst, value >> 16u);
 					Sync::WriteAtEndOfPipeGds32(m_submit_id, command, dst, value & 0xffffu,
 					                            value >> 16u);
 					if (with_interrupt) {
@@ -2291,6 +2377,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 						KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel64");
 						std::memcpy(dst, &value, sizeof(value));
 					}
+					TraceCpLabel("label-eop", dst, value, sizeof(value));
 
 					if (with_interrupt) {
 						if (with_writeback) {

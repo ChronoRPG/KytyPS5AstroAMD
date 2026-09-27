@@ -168,6 +168,26 @@ struct LodReportEvent {
 };
 void RecordLodReport(const LodReportEvent& event);
 
+// cp.csv (KYTY_HANG_TRACE_CP=1): command-processor ordering events in record order (row id):
+// submissions admitted, slices run, WAIT_REG_MEM results, label writes and GPU writes into the
+// KYTY_HANG_TRACE_CP_WATCH window ("0xADDR:0xSIZE"). The GPU thread sets the queue and admission
+// sequence it is processing (SetCpContext); events without an explicit queue carry that context.
+[[nodiscard]] bool CpTraceEnabled();
+void               SetCpContext(uint32_t queue, uint64_t sequence);
+[[nodiscard]] bool CpWatch(uint64_t address, uint64_t size);
+struct CpEvent {
+	const char* event   = "";
+	uint64_t    address = 0;
+	uint64_t    value   = 0;
+	uint64_t    ref     = 0;
+	uint64_t    mask    = 0;
+	int64_t     aux     = 0; // event-specific: compare function, result, count
+	uint64_t    size    = 0;
+	int64_t     queue   = -1; // -1: the current CP context
+	uint64_t    seq     = 0;  // with queue >= 0
+};
+void RecordCp(const CpEvent& event);
+
 // Which kind of recorded GPU write last marked a guest page GPU-owned (reported per readback).
 enum class GpuWriteKind : uint8_t { ShaderStorage, OcclusionDump, Fill, Copy };
 class ScopedGpuWriteKind {

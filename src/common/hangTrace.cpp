@@ -380,8 +380,18 @@ struct Files {
 	std::FILE* lodreports    = nullptr;
 	std::FILE* transfers     = nullptr;
 	std::FILE* compiles      = nullptr;
+	std::FILE* cp            = nullptr;
 };
 Files g_files;
+
+constexpr uint64_t       kCpRowLimit = 4'000'000;
+std::mutex               g_cp_mutex;
+std::vector<std::string> g_pending_cp_rows;
+uint64_t                 g_cp_rows_total = 0;
+thread_local uint32_t    g_cp_queue      = UINT32_MAX;
+thread_local uint64_t    g_cp_sequence   = 0;
+uint64_t                 g_cp_watch_begin = 0;
+uint64_t                 g_cp_watch_end   = 0;
 
 constexpr uint64_t       kOcclusionRowLimit = 2'000'000;
 std::mutex               g_occlusion_mutex;
@@ -632,6 +642,14 @@ void Publish() {
 	}
 	WriteRows(g_files.lodreports, rows);
 
+	if (g_files.cp != nullptr) {
+		{
+			std::scoped_lock lock(g_cp_mutex);
+			rows.swap(g_pending_cp_rows);
+		}
+		WriteRows(g_files.cp, rows);
+	}
+
 	{
 		std::scoped_lock lock(g_image_mutex);
 		rows.swap(g_pending_image_rows);
@@ -833,6 +851,41 @@ bool ImportsEnabled() {
 	return enabled;
 }
 
+bool CpTraceEnabled() {
+	static const bool enabled = Enabled() && EnvFlag("KYTY_HANG_TRACE_CP", false);
+	return enabled;
+}
+
+void SetCpContext(uint32_t queue, uint64_t sequence) {
+	g_cp_queue    = queue;
+	g_cp_sequence = sequence;
+}
+
+bool CpWatch(uint64_t address, uint64_t size) {
+	return CpTraceEnabled() && g_cp_watch_end > g_cp_watch_begin && address < g_cp_watch_end &&
+	       g_cp_watch_begin < address + size;
+}
+
+void RecordCp(const CpEvent& event) {
+	if (!CpTraceEnabled()) {
+		return;
+	}
+	const auto queue    = event.queue >= 0 ? static_cast<uint32_t>(event.queue) : g_cp_queue;
+	const auto sequence = event.queue >= 0 ? event.seq : g_cp_sequence;
+	const auto t_us     = NowNs() / 1000u;
+	std::scoped_lock lock(g_cp_mutex);
+	if (g_cp_rows_total >= kCpRowLimit) {
+		return;
+	}
+	auto row = fmt::format("{},{},{},{},{},{},0x{:x},0x{:x},0x{:x},0x{:x},{},{}", t_us,
+	                       g_cp_rows_total, OsThreadId(),
+	                       queue == UINT32_MAX ? std::string("-") : fmt::format("0x{:x}", queue),
+	                       sequence, event.event, event.address, event.value, event.ref,
+	                       event.mask, event.aux, event.size);
+	g_cp_rows_total++;
+	g_pending_cp_rows.push_back(std::move(row));
+}
+
 uint64_t NowNs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                 std::chrono::steady_clock::now() - g_start)
@@ -921,6 +974,19 @@ void Initialize() {
 	g_files.lodreports = OpenFile("lodreports.csv",
 	                              "t_ms,destination,control,has_latest,sampled_counters,"
 	                              "total_samples,mean_finest_mip,pending_copies");
+	if (CpTraceEnabled()) {
+		g_files.cp = OpenFile("cp.csv", "t_us,row,host_tid,queue,seq,event,address,value,ref,mask,"
+		                                "aux,size");
+		if (const auto* watch = std::getenv("KYTY_HANG_TRACE_CP_WATCH"); watch != nullptr) {
+			char*      end   = nullptr;
+			const auto begin = std::strtoull(watch, &end, 0);
+			if (end != nullptr && *end == ':') {
+				const auto size  = std::strtoull(end + 1, nullptr, 0);
+				g_cp_watch_begin = begin;
+				g_cp_watch_end   = begin + size;
+			}
+		}
+	}
 	g_files.lodwatch  = OpenFile("lodwatch.csv",
 	                             "t_ms,report_seq,fault_vaddr,report_offset,access,pc,thread,"
 	                             "rax,rbx,rcx,rdx,rsi,rdi,rbp,rsp,r8,r9,r10,r11,r12,r13,r14,r15,"
