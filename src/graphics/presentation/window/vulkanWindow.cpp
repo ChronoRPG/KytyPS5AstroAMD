@@ -762,6 +762,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.depthClamp  = VK_TRUE;
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+	// Optional: TileManager::TileFromImage reads native images through format-less storage views.
+	device_features.shaderStorageImageReadWithoutFormat =
+	    supported_features2.features.shaderStorageImageReadWithoutFormat;
+	graphics.storage_image_read_without_format_enabled =
+	    device_features.shaderStorageImageReadWithoutFormat == VK_TRUE;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;

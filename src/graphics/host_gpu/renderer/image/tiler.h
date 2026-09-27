@@ -72,6 +72,26 @@ public:
 	               uint64_t tiled_offset, uint64_t tiled_capacity, uint64_t linear_capacity,
 	               std::span<const GpuTileInfo> infos,
 	               ColorTransform               transform = ColorTransform::None);
+	// Direct image transfers (KYTY_TILER_IMAGE_DIRECT, default on): one compute pass moves each
+	// element between the tiled buffer and element (x, y) of the image through an unsigned-integer
+	// storage view, replacing Detile + Image::Upload (buffer->image copy) and the image->buffer
+	// copy of TileImage. The bytes that reach the image or the tiled buffer are identical. Only
+	// for single-sample 2D colour images with storage usage whose texel size equals the element
+	// size; infos[i] describes regions[i]. Returns false without recording anything otherwise,
+	// and the caller keeps its buffer path.
+	[[nodiscard]] bool DetileToImage(Image& image, vk::Buffer tiled, uint64_t tiled_offset,
+	                                 uint64_t tiled_capacity, uint64_t linear_capacity,
+	                                 std::span<const GpuTileInfo>         infos,
+	                                 std::span<const vk::BufferImageCopy> regions);
+	[[nodiscard]] bool TileFromImage(Image& image, std::span<const vk::BufferImageCopy> regions,
+	                                 vk::Buffer tiled, uint64_t tiled_offset,
+	                                 uint64_t tiled_capacity, uint64_t linear_capacity,
+	                                 std::span<const GpuTileInfo> infos);
+	[[nodiscard]] static bool ImageDirectEnabled();
+	// KYTY_TILER_IMAGE_DIRECT_VERIFY=1: every direct transfer also runs the buffer path (into
+	// scratch) and a completion callback compares both results byte for byte (FrameEvent
+	// TilerImageVerifyChecks / TilerImageVerifyMismatches; the first mismatches are logged).
+	[[nodiscard]] static bool ImageDirectVerifyEnabled();
 	[[nodiscard]] Result GetScratchBuffer(uint64_t size);
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,
 	                                const D16Layout& layout);
@@ -100,6 +120,11 @@ private:
 		uint32_t tail_x;
 		uint32_t tail_y;
 		uint32_t tail;
+		// Image variants only: the element's image texel is (image_x + x, image_y + y) of layer
+		// image_layer + z.
+		uint32_t image_x;
+		uint32_t image_y;
+		uint32_t image_layer;
 	};
 	struct Dispatch {
 		Push     push {};
@@ -128,11 +153,28 @@ private:
 	void                          ReleaseScratch(Scratch scratch);
 	void Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
 	             std::span<const GpuTileInfo> infos, uint64_t source_base, uint64_t target_base,
-	             std::vector<Dispatch>& dispatches);
+	             std::vector<Dispatch>& dispatches,
+	             std::span<const vk::BufferImageCopy> image_regions = {});
 	void Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	            std::span<Dispatch> dispatches, bool clear_target);
 	[[nodiscard]] vk::Pipeline GetPipeline(uint32_t slot);
+	// Direct image transfers: the storage view format for an element size (eUndefined when the
+	// device cannot use it in that direction), eligibility, pipelines and recording.
+	[[nodiscard]] vk::Format ImageViewFormat(uint32_t bytes_per_element, bool load);
+	[[nodiscard]] bool       ImageTransferEligible(const Image& image, bool load,
+	                                               std::span<const GpuTileInfo>         infos,
+	                                               std::span<const vk::BufferImageCopy> regions);
+	[[nodiscard]] vk::Pipeline GetImagePipeline(bool load, TileBlockFamily family,
+	                                            uint32_t bytes_per_element);
+	void RecordImage(Image& image, bool load, vk::Buffer tiled, uint64_t tiled_offset,
+	                 uint64_t tiled_capacity, std::span<const GpuTileInfo> infos,
+	                 std::span<const vk::BufferImageCopy> regions, std::span<Dispatch> dispatches);
+	// Verify mode: copies the two results into host memory and compares them on completion.
+	// ranges: {offset, size} byte ranges compared (relative to both sources).
+	void VerifyOnCompletion(const char* operation, uint64_t guest_address, vk::Buffer expected,
+	                        uint64_t expected_offset, vk::Buffer actual, uint64_t actual_offset,
+	                        uint64_t size, std::vector<std::pair<uint64_t, uint64_t>> ranges);
 	void                       SwapBgra16(Result input, Result output, uint32_t pixels);
 
 	GraphicContext&                         m_graphics;
@@ -141,6 +183,13 @@ private:
 	vk::DescriptorSetLayout                 m_descriptor_layout = nullptr;
 	vk::PipelineLayout                      m_pipeline_layout   = nullptr;
 	std::array<vk::Pipeline, PipelineCount> m_pipelines {};
+	// Direct image transfers: [load][family][log2 element bytes], created on first use.
+	vk::DescriptorSetLayout                 m_image_descriptor_layout = nullptr;
+	vk::PipelineLayout                      m_image_pipeline_layout   = nullptr;
+	std::array<vk::Pipeline, DirectionCount * FamilyCount * BytesPerElementCount>
+	                                        m_image_pipelines {};
+	// Per [load][log2 element bytes]: 0 unknown, 1 usable, 2 unusable.
+	std::array<uint8_t, DirectionCount * BytesPerElementCount> m_image_view_support {};
 	vk::Pipeline                            m_d16_to_d24  = nullptr;
 	vk::Pipeline                            m_d16_to_d32  = nullptr;
 	vk::Pipeline                            m_d24_to_d16  = nullptr;

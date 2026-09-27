@@ -281,6 +281,38 @@ foreach(shader_name IN LISTS gpu_tiler_shader_names)
 	)
 	list(APPEND gpu_tiler_shader_headers "${shader_header}")
 endforeach()
+# Image variants of the 2D tile families (TileManager::DetileToImage / TileFromImage): the same
+# sources with the linear side in a native image instead of a buffer.
+set(gpu_tiler_image_family_names
+	standard256
+	standard4
+	standard64
+	prt
+	render_target
+	depth
+)
+foreach(shader_name IN LISTS gpu_tiler_image_family_names)
+	foreach(direction IN ITEMS store load)
+		string(TOUPPER "${direction}" direction_upper)
+		set(shader_source "${gpu_tiler_shader_dir}/gpu_tiler_${shader_name}.comp")
+		set(shader_spv "${gpu_tiler_generated_dir}/gpu_tiler_image_${direction}_${shader_name}.spv")
+		set(shader_header
+		    "${gpu_tiler_generated_dir}/gpu_tiler_image_${direction}_${shader_name}_spv.h")
+		string(TOUPPER "GPU_TILER_IMAGE_${direction}_${shader_name}_SPV" shader_symbol)
+		add_custom_command(
+			OUTPUT "${shader_header}"
+			COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+			COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+			        "-DTILER_IMAGE_${direction_upper}" "-I${gpu_tiler_shader_dir}"
+			        -o "${shader_spv}" "${shader_source}"
+			COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
+			        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+			DEPENDS "${shader_source}" ${gpu_tiler_shader_includes}
+			VERBATIM
+		)
+		list(APPEND gpu_tiler_shader_headers "${shader_header}")
+	endforeach()
+endforeach()
 
 set(fault_buffer_shader_source "${gpu_tiler_shader_dir}/fault_buffer_process.comp")
 set(fault_buffer_shader_spv "${gpu_tiler_generated_dir}/fault_buffer_process.spv")

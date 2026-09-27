@@ -1,7 +1,26 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 
+// TILER_IMAGE_STORE / TILER_IMAGE_LOAD (TileManager::DetileToImage / TileFromImage): the linear
+// side is element (x, y) of one mip level of a native image, read or written through an
+// unsigned-integer storage view whose texel size equals ELEMENT_BYTES, instead of a linear buffer
+// that a buffer<->image copy then moves. The tiled side and its addressing are unchanged.
+#if defined(TILER_IMAGE_STORE) || defined(TILER_IMAGE_LOAD)
+#define TILER_IMAGE 1
+#endif
+
+#ifdef TILER_IMAGE
+#ifdef TILER_IMAGE_LOAD
+#extension GL_EXT_shader_image_load_formatted : require
+layout(set = 0, binding = 0, std430) buffer Tiled { uint data[]; } tiled_buffer;
+layout(set = 0, binding = 1) uniform readonly uimage2DArray linear_image;
+#else
+layout(set = 0, binding = 0, std430) readonly buffer Tiled { uint data[]; } tiled_buffer;
+layout(set = 0, binding = 1) uniform writeonly uimage2DArray linear_image;
+#endif
+#else
 layout(set = 0, binding = 0, std430) readonly buffer Input { uint data[]; } input_buffer;
 layout(set = 0, binding = 1, std430) buffer Output { uint data[]; } output_buffer;
+#endif
 
 layout(set = 0, binding = 2, std140) uniform Push {
 	uint src_base;
@@ -17,8 +36,53 @@ layout(set = 0, binding = 2, std140) uniform Push {
 	uint tail_x;
 	uint tail_y;
 	uint tail;
+	uint image_x;
+	uint image_y;
+	uint image_layer;
 } params;
 
+#ifdef TILER_IMAGE
+#ifdef TILER_IMAGE_LOAD
+// Tiled bytes of one element from the image texel at coord.
+void load_element(ivec3 coord, uint dst) {
+	uvec4 value = imageLoad(linear_image, coord);
+	if (ELEMENT_BYTES >= 4) {
+		tiled_buffer.data[dst >> 2] = value.x;
+		if (ELEMENT_BYTES >= 8) {
+			tiled_buffer.data[(dst >> 2) + 1u] = value.y;
+		}
+		if (ELEMENT_BYTES >= 16) {
+			tiled_buffer.data[(dst >> 2) + 2u] = value.z;
+			tiled_buffer.data[(dst >> 2) + 3u] = value.w;
+		}
+	} else {
+		uint mask = ELEMENT_BYTES == 1 ? 0xffu : 0xffffu;
+		uint shift = (dst & 3u) * 8u;
+		atomicAnd(tiled_buffer.data[dst >> 2], ~(mask << shift));
+		atomicOr(tiled_buffer.data[dst >> 2], (value.x & mask) << shift);
+	}
+}
+#else
+// Image texel at coord from the tiled bytes of one element.
+void store_element(uint src, ivec3 coord) {
+	uvec4 value = uvec4(0u);
+	if (ELEMENT_BYTES >= 4) {
+		value.x = tiled_buffer.data[src >> 2];
+		if (ELEMENT_BYTES >= 8) {
+			value.y = tiled_buffer.data[(src >> 2) + 1u];
+		}
+		if (ELEMENT_BYTES >= 16) {
+			value.z = tiled_buffer.data[(src >> 2) + 2u];
+			value.w = tiled_buffer.data[(src >> 2) + 3u];
+		}
+	} else {
+		uint mask = ELEMENT_BYTES == 1 ? 0xffu : 0xffffu;
+		value.x = (tiled_buffer.data[src >> 2] >> ((src & 3u) * 8u)) & mask;
+	}
+	imageStore(linear_image, coord, value);
+}
+#endif
+#else
 void copy_element(uint src, uint dst) {
 	if (ELEMENT_BYTES >= 4) {
 		for (uint i = 0; i < ELEMENT_BYTES; i += 4) {
@@ -32,6 +96,7 @@ void copy_element(uint src, uint dst) {
 		atomicOr(output_buffer.data[dst >> 2], value << shift);
 	}
 }
+#endif
 
 void main() {
 	uvec3 p = gl_GlobalInvocationID;
@@ -52,6 +117,15 @@ void main() {
 	                   block.y * params.blocks_per_row + block.x;
 	uint tiled = block_index * BLOCK_BYTES +
 	             block_offset(uvec3(swizzle.xy, swizzle.z + params.surface_z));
+#ifdef TILER_IMAGE
+	ivec3 coord = ivec3(int(params.image_x + p.x), int(params.image_y + p.y),
+	                    int(params.image_layer + p.z));
+#ifdef TILER_IMAGE_LOAD
+	load_element(coord, params.dst_base + tiled);
+#else
+	store_element(params.src_base + tiled, coord);
+#endif
+#else
 	uint linear = p.z * params.slice_bytes + p.y * params.pitch_bytes +
 	              p.x * ELEMENT_BYTES;
 	if (TILE == 0) {
@@ -59,4 +133,5 @@ void main() {
 	} else {
 		copy_element(params.src_base + linear, params.dst_base + tiled);
 	}
+#endif
 }

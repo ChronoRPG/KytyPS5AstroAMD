@@ -544,6 +544,17 @@ enum class FrameEvent : uint32_t {
 	PipelineLibraryLinks,
 	PipelineLibraryCacheHits,
 	PipelineLibrariesCreated,
+	// Direct image transfers (KYTY_TILER_IMAGE_DIRECT, TileManager::DetileToImage/TileFromImage):
+	// uploads that detiled straight into the image and downloads that tiled straight from it
+	// (no buffer<->image copy), with the element bytes moved.
+	TilerImageUploads,
+	TilerImageUploadBytes,
+	TilerImageDownloads,
+	TilerImageDownloadBytes,
+	// KYTY_TILER_IMAGE_DIRECT_VERIFY=1: direct transfers compared with the buffer path, and those
+	// whose bytes differed.
+	TilerImageVerifyChecks,
+	TilerImageVerifyMismatches,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
