@@ -78,6 +78,20 @@ void TestLogIntersection() {
 	      "an empty read set never conflicts");
 }
 
+void TestLogBumpWithoutReaders() {
+	// A log nobody reads only counts generations (Bump); its entries are never readable, and a
+	// Check over such an interval is conservative (Unknown), never Clean.
+	auto       log = std::make_unique<Coherence::Log>();
+	const auto g0  = log->Generation();
+	Check(log->Bump() == g0 + 1 && log->Generation() == g0 + 1, "bump claims one generation");
+	Coherence::Range  range;
+	Coherence::Source source {};
+	Check(!log->Read(g0 + 1, range, source), "a bumped generation has no entry");
+	const std::array<Coherence::Range, 1> ranges {{{0x1000, 0x2000}}};
+	Check(log->Check(g0, log->Generation(), ranges).result == Coherence::CheckResult::Unknown,
+	      "an interval of bumped generations is not certified clean");
+}
+
 void TestLogEmptyRangeNeverIntersects() {
 	auto  log_owner = std::make_unique<Coherence::Log>();
 	auto& log       = *log_owner;
@@ -628,6 +642,7 @@ int main() {
 	TestLogEmptyIntervalIsClean();
 	TestLogIntersection();
 	TestLogEmptyRangeNeverIntersects();
+	TestLogBumpWithoutReaders();
 	TestLogOverflow();
 	TestLogConcurrentAppends();
 	TestLogConcurrentWrap();

@@ -8,7 +8,10 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
+#include <algorithm>
 #include <array>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -76,14 +79,72 @@ void OcclusionCounter::Initialize() {
 	scheduler.Current().Handle().fillBuffer(m_counter->Handle(), 0, 256, 0);
 }
 
+bool OcclusionCounter::GateEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_OCCLUSION_GATE");
+		const bool  on    = value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+		if (Enabled()) {
+			std::printf("Occlusion counter: dump-pair gate %s (KYTY_OCCLUSION_GATE)\n",
+			            on ? "on" : "off");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+bool OcclusionCounter::WouldCount(uint32_t control) const noexcept {
+	return Enabled() && ControlCounts(control) && GateOpen();
+}
+
+void OcclusionCounter::BreakGate(const char* reason, uint64_t address) {
+	if (m_gate_broken) return;
+	m_gate_broken = true;
+	m_open_pairs.clear();
+	std::printf("Occlusion counter: dump-pair gate disabled (%s, address=0x%016" PRIx64
+	            "); counting every instance from now on\n",
+	            reason, address);
+	std::fflush(stdout);
+}
+
+void OcclusionCounter::UpdateOpenPairs(uint64_t address) {
+	if (!GateEnabled() || m_gate_broken) return;
+	const auto begin = address & ~uint64_t {0xf};
+	const auto found = std::find(m_open_pairs.begin(), m_open_pairs.end(), begin);
+	if ((address & 0xfu) == 0) {
+		// Begin dump: every instance until its end dump is counted. A repeated begin at an open
+		// pair keeps it open (its later end still differs against the newest begin).
+		if (found == m_open_pairs.end()) {
+			if (m_open_pairs.size() >= MaxOpenPairs) {
+				BreakGate("too many open dump pairs", address);
+				return;
+			}
+			m_open_pairs.push_back(begin);
+		}
+	} else if ((address & 0xfu) == 8u) {
+		if (found == m_open_pairs.end()) {
+			// An end without an observed begin: its begin value may predate gated instances.
+			BreakGate("end dump without an open begin", address);
+			return;
+		}
+		m_open_pairs.erase(found);
+	} else {
+		BreakGate("dump address outside the begin/end pair layout", address);
+	}
+}
+
 void OcclusionCounter::Prepare(uint32_t control) {
 	EXIT_IF(m_active || m_pending >= QueryCapacity);
 	m_prepared = false;
-	if (!Enabled() || (control & 1u) != 0 || (control & 0xf00u) == 0) return;
+	if (!Enabled() || !ControlCounts(control)) return;
 	// GFX10 ZPASS enable 1 counts all samples. Other counter selectors and slice
 	// filtering require additional emulation; never report them as invisibility.
 	if ((control & 0x00ffff00u) != 0x100u || (control >> 24u) != 0x11u) {
 		EXIT("unsupported occlusion counter mode: DB_COUNT_CONTROL=0x%08x\n", control);
+	}
+	if (!GateOpen()) {
+		// No dump pair is open: nothing counted here can reach a value the guest reads.
+		Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionScopesGated);
+		return;
 	}
 	Initialize();
 	m_context.GetCommandScheduler().Current().Handle().resetQueryPool(m_pool, m_pending, 1);
@@ -157,10 +218,38 @@ void OcclusionCounter::Dispatch(uint32_t mode, vk::Buffer output, uint64_t offse
 	                       {}, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
+// Astro Bot reads a visibility proxy's result right after the label that follows its end dump.
+// Kyty writes labels at record time, so either the result must be published before the CP
+// continues (sync; verified 2026-09-27: the Sky Garden water renders only then), or that label
+// must be written only after the publication (defer-label). KYTY_OCCLUSION_SYNC_PROXY=0 restores
+// plain asynchronous publication.
+OcclusionCounter::ProxyMode OcclusionCounter::GetProxyMode() {
+	static const ProxyMode mode = [] {
+		const auto* legacy = std::getenv("KYTY_OCCLUSION_SYNC_PROXY");
+		if (legacy != nullptr && legacy[0] == '0') {
+			return ProxyMode::Off;
+		}
+		const auto* value = std::getenv("KYTY_OCCLUSION_PROXY_MODE");
+		const auto  mode  = value != nullptr && std::strcmp(value, "sync") == 0 ? ProxyMode::Sync
+		                                                                        : ProxyMode::DeferLabel;
+		if (Enabled()) {
+			std::printf("Occlusion counter: visibility-proxy mode %s (KYTY_OCCLUSION_PROXY_MODE)\n",
+			            mode == ProxyMode::Sync ? "sync" : "defer-label");
+		}
+		return mode;
+	}();
+	return mode;
+}
+
 bool OcclusionCounter::SyncProxyDumps() {
+	return GetProxyMode() != ProxyMode::Off;
+}
+
+bool OcclusionCounter::PriorityPublication() {
 	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_OCCLUSION_SYNC_PROXY");
-		return value != nullptr && value[0] == '1';
+		const auto* label_mode = std::getenv("KYTY_LABEL_MODE");
+		return GetProxyMode() == ProxyMode::DeferLabel ||
+		       (label_mode != nullptr && std::strcmp(label_mode, "completion") == 0);
 	}();
 	return enabled;
 }
@@ -173,8 +262,15 @@ bool OcclusionCounter::Dump(uint64_t address) {
 	// Reduce into a private slot. A slot is reused only after its previous publication's tick
 	// has completed (1024 dumps in flight never happens in practice; the wait bounds it).
 	const auto slot = static_cast<uint32_t>(m_issued % PublishSlots);
-	if (m_issued >= PublishSlots && !scheduler.IsFree(m_slot_ticks[slot])) {
-		scheduler.Wait(m_slot_ticks[slot]);
+	if (m_issued >= PublishSlots) {
+		// The slot's previous publication must have read it, not only its GPU work completed.
+		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitOcclusion);
+		if (!scheduler.IsFree(m_slot_ticks[slot])) {
+			scheduler.Wait(m_slot_ticks[slot]);
+		}
+		if (PriorityPublication()) {
+			scheduler.WaitPriorityOperations(m_slot_ticks[slot]);
+		}
 	}
 	const uint64_t slot_offset = uint64_t {slot} * PublishSlotSize;
 	scheduler.EndRendering();
@@ -183,7 +279,7 @@ bool OcclusionCounter::Dump(uint64_t address) {
 	++m_issued;
 	// The shader writes the first qword of each of the 16 interleaved begin/end pairs and leaves
 	// the other member untouched; publish exactly those qwords.
-	scheduler.DeferOperation([this, address, slot_offset] {
+	auto publish = [this, address, slot_offset] {
 		m_publish->Invalidate(slot_offset, 248);
 		const auto* source = m_publish->Mapped().data() + slot_offset;
 		for (uint32_t db = 0; db < 16u; db++) {
@@ -202,8 +298,17 @@ bool OcclusionCounter::Dump(uint64_t address) {
 			HangTrace::RecordOcclusion(event);
 		}
 		m_published.fetch_add(1, std::memory_order_release);
-	});
+	};
+	if (PriorityPublication()) {
+		// TryWriteBacking and the host-visible slot are safe on the completion runner.
+		scheduler.DeferPriorityOperation(std::move(publish));
+	} else {
+		scheduler.DeferOperation(std::move(publish));
+	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionDumps);
+	// Rendering has ended above and the value is published from everything counted so far: a
+	// begin opens its pair for the instances that follow, an end closes it after its snapshot.
+	UpdateOpenPairs(address);
 	if (HangTrace::Enabled()) {
 		HangTrace::OcclusionEvent event;
 		event.event         = "dump";

@@ -326,7 +326,7 @@ endforeach()
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 set(gpu_dcc_generated_dir "${PROJECT_BINARY_DIR}/gpu_dcc_shaders")
-set(gpu_dcc_shader_names validate clear_rgba16f occlusion)
+set(gpu_dcc_shader_names validate clear occlusion)
 foreach(shader_name IN LISTS gpu_dcc_shader_names)
 	set(shader_source "${gpu_tiler_shader_dir}/gpu_dcc_${shader_name}.comp")
 	set(shader_spv "${gpu_dcc_generated_dir}/gpu_dcc_${shader_name}.spv")
@@ -481,6 +481,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/BindingLayout.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/WriteRangeAnalysis.cpp"
 )
 target_link_libraries(resource_tracking_tests common fmt::fmt)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
@@ -541,6 +542,15 @@ add_executable(ampr_counter_bank_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(ampr_counter_bank_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+# Pure helpers of the texture/descriptor binding path; no Vulkan device is created.
+add_executable(binding_path_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BindingPathTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptorSetReuse.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.cpp"
+)
+target_link_libraries(binding_path_tests common fmt::fmt xxhash Vulkan::Headers)
+target_include_directories(binding_path_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -594,6 +604,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_cache_gc_policy COMMAND $<TARGET_FILE:image_cache_gc_policy_tests>)
 	add_test(NAME ampr_counter_bank COMMAND $<TARGET_FILE:ampr_counter_bank_tests>)
 	add_test(NAME draw_prep COMMAND $<TARGET_FILE:draw_prep_tests>)
+	add_test(NAME binding_path COMMAND $<TARGET_FILE:binding_path_tests>)
 	add_test(NAME image_exact_lookup
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-exact-lookup-only)
 	add_test(NAME image_pressure_retirement
@@ -667,6 +678,7 @@ if(BUILD_TESTING)
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
+		binding_path_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests

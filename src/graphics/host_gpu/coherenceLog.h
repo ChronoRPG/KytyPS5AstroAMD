@@ -21,6 +21,8 @@
 // range is unknown appends a universe entry.
 //
 // The generation is the clean-verdict generation: CleanVerdict::Invalidate() appends here.
+// Entries are recorded only when something reads them (LogReadersEnabled: the log-mode draw-prep
+// certificate or its audit); otherwise an append only bumps the generation.
 //
 // Readers (the draw-prep certificate check on the GPU thread) ask whether any entry in the
 // generation interval (g0, g1] intersects a set of ranges. The log is a ring: an interval that
@@ -123,6 +125,10 @@ public:
 		return generation;
 	}
 
+	// Claims the next generation without recording an entry. For a log that is never read; must
+	// not be mixed with Append on the same log (Append waits for the previous lap's entry).
+	uint64_t Bump() noexcept { return m_generation.fetch_add(1, std::memory_order_seq_cst) + 1u; }
+
 	// Reads the entry of `generation`. False when it is not (or no longer) readable.
 	[[nodiscard]] bool Read(uint64_t generation, Range& range, Source& source) const noexcept {
 		const auto& entry = m_entries[generation & (Capacity - 1u)];
@@ -204,35 +210,37 @@ private:
 // The process-wide log (one per coherence domain: the guest GPU).
 inline Log g_log;
 
-[[nodiscard]] inline uint64_t Generation() noexcept {
-	return g_log.Generation();
-}
-
-inline uint64_t Append(Range range, Source source) noexcept {
-	return g_log.Append(range, source);
-}
-
-inline uint64_t Append(uint64_t address, uint64_t size, Source source) noexcept {
-	return g_log.Append(MakeRange(address, size), source);
-}
-
-// Emulator writes of backing bytes outside a publication change content, not cleanliness, so
-// only the log-mode draw-prep certificate (KYTY_DRAW_PREP_CERT=log, or its audit
-// KYTY_DRAW_PREP_LOG_AUDIT=1) needs them logged. Otherwise they do not touch the generation,
-// which the clean-verdict cache shares.
-[[nodiscard]] inline bool ContentWritesLogged() noexcept {
-	static const bool logged = [] {
+// Whether anything reads the log's entries: only the log-mode draw-prep certificate
+// (KYTY_DRAW_PREP_CERT=log) and its audit (KYTY_DRAW_PREP_LOG_AUDIT=1). Otherwise transitions
+// only bump the generation (the clean-verdict cache's), exactly as before the log existed.
+// Decided once per process, so entries are either always or never recorded.
+[[nodiscard]] inline bool LogReadersEnabled() noexcept {
+	static const bool enabled = [] {
 		const auto* cert  = std::getenv("KYTY_DRAW_PREP_CERT");
 		const auto* audit = std::getenv("KYTY_DRAW_PREP_LOG_AUDIT");
 		return (cert != nullptr && std::strcmp(cert, "log") == 0) ||
 		       (audit != nullptr && *audit != '\0' && std::strcmp(audit, "0") != 0);
 	}();
-	return logged;
+	return enabled;
 }
 
-// Call after the bytes are written.
+[[nodiscard]] inline uint64_t Generation() noexcept {
+	return g_log.Generation();
+}
+
+inline uint64_t Append(Range range, Source source) noexcept {
+	return LogReadersEnabled() ? g_log.Append(range, source) : g_log.Bump();
+}
+
+inline uint64_t Append(uint64_t address, uint64_t size, Source source) noexcept {
+	return Append(MakeRange(address, size), source);
+}
+
+// Emulator writes of backing bytes outside a publication change content, not cleanliness, so
+// only log readers need them. Otherwise they do not touch the generation, which the
+// clean-verdict cache shares. Call after the bytes are written.
 inline void NoteContentWrite(uint64_t address, uint64_t size, Source source) noexcept {
-	if (ContentWritesLogged()) {
+	if (LogReadersEnabled()) {
 		Append(address, size, source);
 	}
 }

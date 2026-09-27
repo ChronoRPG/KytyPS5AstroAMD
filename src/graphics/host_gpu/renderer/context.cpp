@@ -43,6 +43,21 @@ bool BarrierSinkEnabled() {
 	return enabled;
 }
 
+bool DrawWriteSinkEnabled() {
+	static const bool enabled = BarrierBatchEnabled() && EnvSwitch("KYTY_DRAW_WRITE_SINK", true);
+	return enabled;
+}
+
+bool PushConstantShadowEnabled() {
+	static const bool enabled = EnvSwitch("KYTY_PUSH_CONSTANT_SHADOW", true);
+	return enabled;
+}
+
+bool DescriptorSetReuseEnabled() {
+	static const bool enabled = EnvSwitch("KYTY_DESCRIPTOR_SET_REUSE", true);
+	return enabled;
+}
+
 namespace {
 
 using Stage2  = vk::PipelineStageFlagBits2;
@@ -143,6 +158,8 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 		FlushBarriers();
 		NoteForeignCommand();
 	}
+	// Including push-constant updates with other layouts (helper passes, occlusion reductions).
+	m_push_constants.valid = false;
 	return m_buffer;
 }
 
@@ -256,14 +273,15 @@ void CommandBuffer::FlushBarriers() const {
 		return;
 	}
 	EXIT_IF(IsInvalid());
-	const GpuOpProfiler::ScopedSite site(BatchSite(m_pending.origins));
-	++m_internal_recording;
 	if (m_rendering) {
 		// Pipeline barriers cannot be recorded inside dynamic rendering. (A command recorded
 		// through Handle() mostly ends rendering anyway; only a draw that has to restart its own
-		// instance counts as a barrier split, in BeginRendering().)
+		// instance counts as a barrier split, in BeginRendering().) Ended before the batch site
+		// is entered, so the end is attributed to the site whose command needed the flush.
 		EndRendering();
 	}
+	const GpuOpProfiler::ScopedSite site(BatchSite(m_pending.origins));
+	++m_internal_recording;
 	if (m_pending.has_memory) {
 		// The requests were issued in some order with nothing recorded between them. Widening
 		// every buffer/image barrier by the global dependency reproduces the execution and
@@ -321,6 +339,17 @@ bool CommandBuffer::CanSinkPending() const {
 	       m_pending.has_memory && m_pending.images.empty() && m_pending.buffers.empty();
 }
 
+bool CommandBuffer::CanSinkDrawWrites() const {
+	// A draw continuing its rendering instance may pass pending barriers that consist only of
+	// the post-draw shader-write requests of earlier draws. Every such request was made inside
+	// this instance: a new instance records the pending batch before it begins. Any other origin
+	// (guest synchronization, layout transitions, buffer barriers, indirect arguments, GDS)
+	// keeps the ordinary rules.
+	return DrawWriteSinkEnabled() && m_draw_scope && m_rendering && m_pending.has_memory &&
+	       m_pending.images.empty() && m_pending.buffers.empty() &&
+	       m_pending.origins == OriginBit(BarrierOrigin::ShaderWrite);
+}
+
 void CommandBuffer::NoteDrawRecorded() const {
 	m_recorded_since_flush = true;
 	if (!(m_draw_scope && m_draw_safe && m_rendering && m_epoch_instance == m_rendering_serial)) {
@@ -331,7 +360,12 @@ void CommandBuffer::NoteDrawRecorded() const {
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
 	m_bound_pipelines = {};
-	for (auto& state: m_descriptor_states) state.layout = nullptr;
+	for (auto& state: m_descriptor_states) {
+		state.layout    = nullptr;
+		state.bound_set = nullptr;
+	}
+	// Push constants are undefined at the start of a command buffer.
+	m_push_constants.valid = false;
 	// Commands of other submissions can precede this buffer on the queue: no epoch, no elision.
 	ResetBarrierState();
 	auto buffer = StateHandle();
@@ -371,12 +405,55 @@ void CommandBuffer::BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipel
 }
 
 void CommandBuffer::InvalidateDescriptors(vk::PipelineBindPoint point) {
-	m_descriptor_states[BindingPointIndex(point)].layout = nullptr;
+	auto& state     = m_descriptor_states[BindingPointIndex(point)];
+	state.layout    = nullptr;
+	state.bound_set = nullptr;
 }
 
-void CommandBuffer::PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout,
-                                    uint32_t set, uint32_t count,
-                                    const vk::WriteDescriptorSet* writes) {
+void CommandBuffer::BindDescriptorSet(vk::PipelineBindPoint point, vk::PipelineLayout layout,
+                                      vk::DescriptorSet set) {
+	auto& state = m_descriptor_states[BindingPointIndex(point)];
+	EXIT_IF(set == nullptr || layout == nullptr);
+	if (DescriptorSetReuseEnabled() && state.bound_set == set && state.layout == layout) {
+		// Still bound as set 0 with this layout: nothing since disturbed it (every other bind and
+		// every push descriptor update of this bind point passes through this class), and binding
+		// a pipeline never disturbs descriptor sets.
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorSetBindsAvoided);
+		return;
+	}
+	StateHandle().bindDescriptorSets(point, layout, 0, 1, &set, 0, nullptr);
+	state.layout    = DescriptorSetReuseEnabled() ? layout : nullptr;
+	state.bound_set = DescriptorSetReuseEnabled() ? set : nullptr;
+	state.writes.clear();
+	state.buffers.clear();
+	state.images.clear();
+}
+
+void CommandBuffer::PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages,
+                                  uint32_t size, const void* data) {
+	auto& shadow = m_push_constants;
+	// Push-constant values persist in the command buffer across pipeline binds; values set with
+	// this very layout are valid for every pipeline created with it.
+	if (PushConstantShadowEnabled() && shadow.valid && shadow.layout == layout &&
+	    shadow.stages == stages && shadow.size == size &&
+	    std::memcmp(shadow.dwords.data(), data, size) == 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::PushConstantUpdatesAvoided);
+		return;
+	}
+	StateHandle().pushConstants(layout, stages, 0, size, data);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::PushConstantUpdates);
+	shadow.valid = PushConstantShadowEnabled() && size <= sizeof(shadow.dwords);
+	if (shadow.valid) {
+		shadow.layout = layout;
+		shadow.stages = stages;
+		shadow.size   = size;
+		std::memcpy(shadow.dwords.data(), data, size);
+	}
+}
+
+int32_t CommandBuffer::PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout,
+                                       uint32_t set, uint32_t count,
+                                       const vk::WriteDescriptorSet* writes) {
 	auto& state = m_descriptor_states[BindingPointIndex(point)];
 	bool supported = Common::RendererBatchEnabled() && set == 0;
 	size_t buffer_count = 0, image_count = 0;
@@ -394,28 +471,43 @@ void CommandBuffer::PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLay
 		buffer_count += buffer_type ? write.descriptorCount : 0u;
 		image_count += image_type ? write.descriptorCount : 0u;
 	}
-	bool equal = supported && state.layout == layout && state.writes.size() == count &&
-	             state.buffers.size() == buffer_count && state.images.size() == image_count;
-	size_t buffer_index = 0, image_index = 0;
-	for (uint32_t i = 0; equal && i < count; ++i) {
-		const auto& write = writes[i];
-		const auto& old = state.writes[i];
-		equal = write.dstBinding == old.dstBinding && write.dstArrayElement == old.dstArrayElement &&
-		        write.descriptorCount == old.descriptorCount && write.descriptorType == old.descriptorType;
-		const bool buffer_type = write.descriptorType == vk::DescriptorType::eStorageBuffer ||
-		                         write.descriptorType == vk::DescriptorType::eUniformBuffer;
-		for (uint32_t j = 0; equal && j < write.descriptorCount; ++j) {
-			if (buffer_type) equal = write.pBufferInfo[j] == state.buffers[buffer_index++];
-			else equal = write.pImageInfo[j] == state.images[image_index++];
+	int32_t result = PushMissState;
+	if (supported && state.layout == layout && state.bound_set == nullptr) {
+		result = state.writes.size() == count && state.buffers.size() == buffer_count &&
+		                 state.images.size() == image_count
+		             ? PushAvoided
+		             : PushMissShape;
+		size_t buffer_index = 0, image_index = 0;
+		for (uint32_t i = 0; result == PushAvoided && i < count; ++i) {
+			const auto& write = writes[i];
+			const auto& old   = state.writes[i];
+			if (write.dstBinding != old.dstBinding || write.dstArrayElement != old.dstArrayElement ||
+			    write.descriptorCount != old.descriptorCount ||
+			    write.descriptorType != old.descriptorType) {
+				result = PushMissShape;
+				break;
+			}
+			const bool buffer_type = write.descriptorType == vk::DescriptorType::eStorageBuffer ||
+			                         write.descriptorType == vk::DescriptorType::eUniformBuffer;
+			for (uint32_t j = 0; j < write.descriptorCount; ++j) {
+				const bool equal = buffer_type ? write.pBufferInfo[j] == state.buffers[buffer_index++]
+				                               : write.pImageInfo[j] == state.images[image_index++];
+				if (!equal) {
+					result = static_cast<int32_t>(i);
+					break;
+				}
+			}
 		}
 	}
-	if (equal) {
+	if (result == PushAvoided) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushesAvoided);
-		return;
+		return result;
 	}
 	StateHandle().pushDescriptorSetKHR(point, layout, set, count, writes);
-	state.layout = nullptr;
-	if (!supported) return;
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushes);
+	state.layout    = nullptr;
+	state.bound_set = nullptr;
+	if (!supported) return result;
 	state.writes.assign(writes, writes + count);
 	state.buffers.clear();
 	state.images.clear();
@@ -432,6 +524,7 @@ void CommandBuffer::PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLay
 		write.pImageInfo = nullptr;
 	}
 	state.layout = layout;
+	return result;
 }
 
 void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
@@ -447,8 +540,17 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {
 	const auto count_control = GetRegisters().GetDepthCountControl();
-	const bool same_instance =
-	    m_rendering && m_render_state == state && m_occlusion_control == count_control;
+	auto&      occlusion     = m_context.GetOcclusionCounter();
+	// A DB_COUNT_CONTROL change matters only when this instance or the next one is counted
+	// (KYTY_OCCLUSION_GATE, occlusion.h): with neither counted, no sample can reach a guest value.
+	const bool same_control =
+	    m_occlusion_control == count_control ||
+	    (OcclusionCounter::GateEnabled() && !occlusion.Active() && !occlusion.WouldCount(count_control));
+	const bool same_instance = m_rendering && m_render_state == state && same_control;
+	if (same_instance) {
+		m_occlusion_control = count_control;
+	}
+	bool barrier_split = false;
 	if (!BarrierBatchEnabled()) {
 		if (same_instance) {
 			return;
@@ -463,12 +565,31 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 			NoteDrawRecorded();
 			return;
 		}
+		if (CanSinkDrawWrites()) {
+			CountBatch(GpuOpProfiler::BarrierBatchEvent::DrawWriteSinks);
+			NoteDrawRecorded();
+			return;
+		}
 		// The pending barrier cannot move past this draw: end the instance to record it.
 		CountBatch(GpuOpProfiler::BarrierBatchEvent::RenderSplits);
+		barrier_split = true;
 	}
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
-	EndRendering();
+	if (m_rendering) {
+		// Attribution of the end (GpuOps.EndRendering.<site>): a pending barrier that could not
+		// be sunk, or different targets/state/occlusion control.
+		if (barrier_split) {
+			KYTY_GPU_OP_SITE("render.barrier_split");
+			EndRendering();
+		} else if (m_render_state == state) {
+			KYTY_GPU_OP_SITE("render.occlusion_control");
+			EndRendering();
+		} else {
+			KYTY_GPU_OP_SITE("render.state_change");
+			EndRendering();
+		}
+	}
 	if (BarrierBatchEnabled()) {
 		FlushBarriers();
 	}
@@ -544,6 +665,7 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
+	GpuOpProfiler::CountEndRendering();
 	// The occlusion counter may also record a query reduction here (Accumulate): foreign work.
 	++m_internal_recording;
 	m_context.GetOcclusionCounter().End();

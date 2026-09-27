@@ -1319,14 +1319,14 @@ KYTY_HW_UC_PARSER(HwUcSetGdsOaRegisters) {
 }
 
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
 	return (cmd_id == 0xc0061050 ? 7 : 6);
 }
 
 KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	Profiler::CountFrameWork(Profiler::FrameWork::DispatchDirectCommands);
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_DISPATCH_DIRECT);
@@ -1343,7 +1343,7 @@ KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 }
 
 KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	Profiler::CountFrameWork(Profiler::FrameWork::DispatchIndirectCommands);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0011600 && cmd_id != 0xc0021600);
@@ -1361,7 +1361,7 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 }
 
 KYTY_CP_OP_PARSER(CpOpGetLodStats) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0038e00);
 	if (Profiler::LoadingEnabled()) {
@@ -1432,7 +1432,7 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 }
 
 KYTY_CP_OP_PARSER(CpOpDispatchReset) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0001024);
 
@@ -1442,7 +1442,7 @@ KYTY_CP_OP_PARSER(CpOpDispatchReset) {
 }
 
 KYTY_CP_OP_PARSER(CpOpPfpSyncMe) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0004200);
 
@@ -1450,7 +1450,7 @@ KYTY_CP_OP_PARSER(CpOpPfpSyncMe) {
 }
 
 KYTY_CP_OP_PARSER(CpOpRewind) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0005900);
 	EXIT_NOT_IMPLEMENTED((buffer[0] & ~0x81000000u) != 0);
@@ -1461,7 +1461,7 @@ KYTY_CP_OP_PARSER(CpOpRewind) {
 }
 
 KYTY_CP_OP_PARSER(CpOpSetPredication) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_PREDICATION);
 
@@ -1493,7 +1493,7 @@ KYTY_CP_OP_PARSER(CpOpSetPredication) {
 }
 
 KYTY_CP_OP_PARSER(CpOpCondExec) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_COND_EXEC);
 
@@ -1518,7 +1518,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 }
 
 KYTY_CP_OP_PARSER(CpOpBranch) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_INDIRECT_BUFFER);
 
@@ -1592,7 +1592,7 @@ static uint8_t CopyDataSrcToDma(uint32_t src) {
 }
 
 KYTY_CP_OP_PARSER(CpOpCopyData) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != KYTY_PM4(6, Pm4::IT_COPY_DATA, 0u));
 
@@ -1632,7 +1632,7 @@ KYTY_CP_OP_PARSER(CpOpCopyData) {
 }
 
 KYTY_CP_OP_PARSER(CpOpDmaData) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != KYTY_PM4(7, Pm4::IT_DMA_DATA, 0u));
 
@@ -1664,7 +1664,7 @@ KYTY_CP_OP_PARSER(CpOpDmaData) {
 }
 
 KYTY_CP_OP_PARSER(CpOpDrawIndex) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0073a00 && cmd_id != 0xc0042700);
 
@@ -1705,7 +1705,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 }
 
 KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	Profiler::CountFrameWork(Profiler::FrameWork::DrawIndirectCommands);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0032400 && cmd_id != 0xc0032500);
@@ -1720,7 +1720,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 }
 
 KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 	Profiler::CountFrameWork(Profiler::FrameWork::DrawIndirectMultiCommands);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0082c00 && cmd_id != 0xc0083800);
@@ -1745,7 +1745,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 }
 
 KYTY_CP_OP_PARSER(CpOpDrawIndexOffset) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0033500);
 
@@ -1763,7 +1763,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexOffset) {
 }
 
 KYTY_CP_OP_PARSER(CpOpDrawIndexAuto) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0012d00);
 
@@ -1778,7 +1778,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexAuto) {
 }
 
 KYTY_CP_OP_PARSER(CpOpClearState) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0001200);
 	EXIT_NOT_IMPLEMENTED((buffer[0] & ~0xfu) != 0);
@@ -1789,7 +1789,7 @@ KYTY_CP_OP_PARSER(CpOpClearState) {
 }
 
 KYTY_CP_OP_PARSER(CpOpContextState) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	const auto packet_size_dw = KYTY_PM4_LEN(cmd_id);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_R(cmd_id) != Pm4::R_CONTEXT_STATE);
@@ -1802,7 +1802,7 @@ KYTY_CP_OP_PARSER(CpOpContextState) {
 }
 
 KYTY_CP_OP_PARSER(CpOpDumpConstRam) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0038300);
 
@@ -1820,7 +1820,7 @@ KYTY_CP_OP_PARSER(CpOpDumpConstRam) {
 }
 
 KYTY_CP_OP_PARSER(CpOpEventWrite) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_EVENT_WRITE);
 
@@ -1840,7 +1840,7 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 }
 
 KYTY_CP_OP_PARSER(CpOpEventWriteEop) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0044700);
 
@@ -1862,7 +1862,7 @@ KYTY_CP_OP_PARSER(CpOpEventWriteEop) {
 }
 
 KYTY_CP_OP_PARSER(CpOpEventWriteEos) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0034802);
 
@@ -1885,7 +1885,7 @@ KYTY_CP_OP_PARSER(CpOpEventWriteEos) {
 }
 
 KYTY_CP_OP_PARSER(CpOpFlip) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc004105c);
 
@@ -1902,7 +1902,7 @@ KYTY_CP_OP_PARSER(CpOpFlip) {
 }
 
 KYTY_CP_OP_PARSER(CpOpIncrementCeCounter) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008400);
 	EXIT_NOT_IMPLEMENTED(buffer[0] != 1);
@@ -1913,7 +1913,7 @@ KYTY_CP_OP_PARSER(CpOpIncrementCeCounter) {
 }
 
 KYTY_CP_OP_PARSER(CpOpIncrementDeCounter) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008500);
 	EXIT_NOT_IMPLEMENTED(buffer[0] != 0);
@@ -1924,7 +1924,7 @@ KYTY_CP_OP_PARSER(CpOpIncrementDeCounter) {
 }
 
 KYTY_CP_OP_PARSER(CpOpIndexType) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0002A00);
 
@@ -1934,7 +1934,7 @@ KYTY_CP_OP_PARSER(CpOpIndexType) {
 }
 
 KYTY_CP_OP_PARSER(CpOpIndexBufferSize) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0001300);
 
@@ -1944,7 +1944,7 @@ KYTY_CP_OP_PARSER(CpOpIndexBufferSize) {
 }
 
 KYTY_CP_OP_PARSER(CpOpIndexBase) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0012600);
 
@@ -1956,7 +1956,7 @@ KYTY_CP_OP_PARSER(CpOpIndexBase) {
 }
 
 KYTY_CP_OP_PARSER(CpOpSetBase) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_BASE);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 4u);
@@ -1979,7 +1979,7 @@ KYTY_CP_OP_PARSER(CpOpSetBase) {
 }
 
 KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_INDIRECT_BUFFER);
 
@@ -2024,7 +2024,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 }
 
 KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_CONTEXT_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
@@ -2095,7 +2095,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 }
 
 KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_SH_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
@@ -2159,7 +2159,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 }
 
 KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG_INDIRECT);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 5u);
@@ -2214,7 +2214,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 }
 
 KYTY_CP_OP_PARSER(CpOpMarker) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	// EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0001000);
 
@@ -2252,7 +2252,7 @@ KYTY_CP_OP_PARSER(CpOpMarker) {
 }
 
 KYTY_CP_OP_PARSER(CpOpNop) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	auto r = KYTY_PM4_R(cmd_id);
 
@@ -2275,7 +2275,7 @@ KYTY_CP_OP_PARSER(CpOpNop) {
 }
 
 KYTY_CP_OP_PARSER(CpOpNumInstances) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0002f00);
 
@@ -2285,7 +2285,7 @@ KYTY_CP_OP_PARSER(CpOpNumInstances) {
 }
 
 KYTY_CP_OP_PARSER(CpOpPopMarker) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
 
@@ -2298,7 +2298,7 @@ KYTY_CP_OP_PARSER(CpOpPopMarker) {
 }
 
 KYTY_CP_OP_PARSER(CpOpPushMarker) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
 
@@ -2313,7 +2313,7 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 }
 
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060);
 
@@ -2354,13 +2354,21 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			default: EXIT("unknown release_mem interrupt selector\n");
 		}
 		if (queued) {
-			cp.BufferFlush();
+			cp.BufferFlushForEop();
 		}
 	};
 
 	if (data_sel == 0 || interrupt_selector == 4) {
 		if (eop_event_type != 0x28 || gcr_cntl != 0) {
 			cp.EmitGlobalBarrier();
+		}
+
+		// INT_SEL does not gate DATA_SEL on RDNA: write the data too (KYTY_EOP_DROPPED_LABELS).
+		if (interrupt_selector == 4 && data_sel != 0 && dst_gpu_addr != nullptr &&
+		    cp.WriteReleaseMemDroppedData(dst_gpu_addr, value, data_sel, true,
+		                                  interrupt_context_id)) {
+			cp.BufferFlushForEop(); // the deferred data write raises the interrupt
+			return 7;
 		}
 
 		trigger_interrupt();
@@ -2393,7 +2401,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		cp.BufferFlush();
+		cp.BufferFlushForEop();
 
 		return 7;
 	}
@@ -2411,7 +2419,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
 		if (interrupt_selector == 0x01) {
-			cp.BufferFlush();
+			cp.BufferFlushForEop();
 		}
 
 		return 7;
@@ -2440,7 +2448,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 }
 
 KYTY_CP_OP_PARSER(CpOpSetContextReg) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	auto cmd_offset = NormalizeRegisterOffset(buffer[0]);
 
@@ -2486,7 +2494,7 @@ KYTY_CP_OP_PARSER(CpOpSetContextReg) {
 }
 
 KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	auto cmd_offset = buffer[0];
 	if (cmd_offset == Pm4::SH_NOP) {
@@ -2523,7 +2531,7 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 }
 
 KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
@@ -2581,7 +2589,7 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 }
 
 KYTY_CP_OP_PARSER(CpOpWaitFlipDone) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0051018);
 
@@ -2644,19 +2652,19 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 }
 
 KYTY_CP_OP_PARSER(CpOpWaitRegMem32) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	return CpOpWaitRegMemSized<uint32_t>(cp, cmd_id, buffer);
 }
 
 KYTY_CP_OP_PARSER(CpOpWaitRegMem64) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	return CpOpWaitRegMemSized<uint64_t>(cp, cmd_id, buffer);
 }
 
 KYTY_CP_OP_PARSER(CpOpWaitOnCeCounter) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008600);
 	EXIT_NOT_IMPLEMENTED(buffer[0] != 1);
@@ -2667,7 +2675,7 @@ KYTY_CP_OP_PARSER(CpOpWaitOnCeCounter) {
 }
 
 KYTY_CP_OP_PARSER(CpOpWaitOnDeCounterDiff) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0008800);
 
@@ -2677,7 +2685,7 @@ KYTY_CP_OP_PARSER(CpOpWaitOnDeCounterDiff) {
 }
 
 KYTY_CP_OP_PARSER(CpOpWriteConstRam) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
 	auto offset = buffer[0];
@@ -2692,7 +2700,7 @@ KYTY_CP_OP_PARSER(CpOpWriteConstRam) {
 }
 
 KYTY_CP_OP_PARSER(CpOpWriteData) {
-	KYTY_PROFILER_FUNCTION();
+	KYTY_PROFILER_DETAIL_FUNCTION();
 
 	auto op = (cmd_id >> 8u) & 0xffu;
 

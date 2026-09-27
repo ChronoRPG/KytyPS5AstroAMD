@@ -141,7 +141,13 @@ enum class DrawKind : uint8_t { Index, Auto };
 class Engine {
 public:
 	// service_commands runs the GPU thread's pending cross-thread commands (used while waiting).
-	Engine(RenderContext& renderer, std::function<void()> service_commands);
+	// after_commit runs after every committed draw has been recorded, with the command buffer
+	// bound to the live registers again (the command processor's per-draw hooks, e.g. the
+	// idle-GPU early submit). Commits happen at packet boundaries (before a fence packet or a
+	// service command, at the end of a slice) or at the start of a draw packet, before the
+	// packet records anything, so a flush there splits no packet.
+	Engine(RenderContext& renderer, std::function<void()> service_commands,
+	       std::function<void()> after_commit);
 	~Engine();
 	Engine(const Engine&)            = delete;
 	Engine& operator=(const Engine&) = delete;
@@ -173,6 +179,7 @@ private:
 	RenderContext&           m_renderer;
 	Mode                     m_mode;
 	std::function<void()>    m_service_commands;
+	std::function<void()>    m_after_commit;
 	std::unique_ptr<Slot>    m_inline_slot;
 	std::unique_ptr<Workers> m_workers; // parallel mode: the window and its threads
 	uint64_t                 m_draws_since_fence = 0;

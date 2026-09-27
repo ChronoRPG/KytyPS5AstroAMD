@@ -73,7 +73,11 @@ namespace GpuOpProfiler {
 struct Site {
 	const char*            name;
 	const char*            plot_name = nullptr; // "GpuOps.Barriers.<name>", set when linked
+	const char*            end_plot_name = nullptr; // "GpuOps.EndRendering.<name>"
 	std::atomic<uint64_t>  barriers {0};        // cumulative guest pipeline barrier calls
+	// Cumulative guest rendering instances ended while this was the innermost site
+	// (CommandBuffer::EndRendering). Explains every gpu_render_passes begin after the first.
+	std::atomic<uint64_t>  end_renderings {0};
 	std::atomic<Site*>     next {nullptr};
 	std::atomic<bool>      linked {false};
 
@@ -144,14 +148,26 @@ enum class BarrierBatchEvent : uint32_t {
 	Elided,       // requests dropped: covered by the previous flushed barrier, nothing since
 	Sunk,         // pending batch kept across a draw continuing the same rendering instance
 	RenderSplits, // flushes that had to end an active rendering instance
+	// Pending post-draw shader-write barriers kept across a draw continuing the same rendering
+	// instance (KYTY_DRAW_WRITE_SINK, render.h).
+	DrawWriteSinks,
 	Count,
 };
 namespace Detail {
 void CountBarrierBatch(BarrierBatchEvent event, uint64_t amount) noexcept;
+void CountEndRendering() noexcept;
 } // namespace Detail
 inline void CountBarrierBatch(BarrierBatchEvent event, uint64_t amount = 1) noexcept {
 	if (Detail::g_active) [[unlikely]] {
 		Detail::CountBarrierBatch(event, amount);
+	}
+}
+// One guest rendering instance ended (CommandBuffer::EndRendering), attributed to the innermost
+// KYTY_GPU_OP_SITE: published as the summary.csv column gpu_rendering_ends, the FrameEvent
+// GpuRenderingEnds and cumulative Tracy plots GpuOps.EndRendering.<site>.
+inline void CountEndRendering() noexcept {
+	if (Detail::g_active) [[unlikely]] {
+		Detail::CountEndRendering();
 	}
 }
 

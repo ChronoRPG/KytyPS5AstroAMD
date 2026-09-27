@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
@@ -24,6 +25,9 @@ struct TextureBinding {
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+	// TextureBindingMemo entry (slot, unique tag) whose description `desc` equals; tag 0: none.
+	uint64_t                   memo_tag  = 0;
+	uint32_t                   memo_slot = 0;
 };
 
 struct PreparedBindings {
@@ -45,6 +49,10 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	std::vector<uint32_t>                 shader_data;
+	// Workgroup count of a direct compute dispatch, for write-range proofs that bound addresses
+	// by workgroup ids. Unknown for draws and indirect dispatches.
+	std::array<uint32_t, 3>               dispatch_groups {};
+	bool                                  has_dispatch_groups = false;
 };
 
 [[nodiscard]] vk::DescriptorType

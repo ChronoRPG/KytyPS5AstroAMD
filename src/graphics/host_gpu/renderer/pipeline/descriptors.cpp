@@ -29,6 +29,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/WriteRangeAnalysis.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
@@ -40,6 +41,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <span>
+#include <string>
 #include <vector>
 #include <xxhash.h>
 
@@ -130,10 +132,40 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+// KYTY_PRECISE_WRITE_RANGES=0 treats every writable storage binding as written in full (the
+// behaviour before write-range proofs).
+static bool PreciseWriteRangesEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PRECISE_WRITE_RANGES");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// KYTY_WRITE_RANGE_LOG=N logs the first N writable storage bindings: shader, guest range, the
+// proven written spans (or why the binding stays whole) and the evaluated address intervals.
+static uint32_t WriteRangeLogLimit() {
+	static const uint32_t limit = [] {
+		const auto* value = std::getenv("KYTY_WRITE_RANGE_LOG");
+		return value == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
+	return limit;
+}
+
+// KYTY_WRITE_RANGE_STATS=0 skips the image lookup behind FrameEvent.WriteRangeImagesSpared.
+static bool WriteRangeImageStatsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_WRITE_RANGE_STATS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
-                    uint32_t slot, uint32_t& buffer_offset) {
+                    uint32_t slot, uint32_t& buffer_offset,
+                    const std::vector<GuestRange>* written_ranges) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -145,8 +177,13 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
-	                                                              resource.formatted, id);
+	// A proven write range narrows what becomes GPU-owned and which images go stale; everything
+	// else about the binding (synchronization, descriptor range) is unchanged.
+	const bool narrowed = resource.written && written_ranges != nullptr;
+	auto [buffer, offset] =
+	    narrowed ? context.GetBufferCache().ObtainWrittenBuffer(address, size, *written_ranges, id)
+	             : context.GetBufferCache().ObtainBuffer(address, size, resource.written,
+	                                                     resource.formatted, id);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -155,7 +192,11 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
-	if (resource.written) {
+	if (narrowed) {
+		for (const auto& range: *written_ranges) {
+			context.GetTextureCache().InvalidateMemoryFromGPU(range.address, range.size);
+		}
+	} else if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
 	const char* access = "Read";
@@ -684,21 +725,44 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
                                     TextureBinding&                              binding) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage = resource.written;
-	if (storage) {
-		ValidateStorageImageResource(resource);
-	}
 	// The same state a freshly returned binding had: no view yet, no mip views (their capacity
 	// is kept), undefined layout.
 	binding.image_view = nullptr;
 	binding.layout     = vk::ImageLayout::eUndefined;
 	binding.mip_views.clear();
+
+	auto&      texture_cache     = m_context.GetTextureCache();
+	const bool memo              = TextureBindingMemo::Enabled();
+	const bool description_cache =
+	    Common::RendererBatchEnabled() && resource.indirect_resources.size() <= 256u;
+	TextureBindingMemo::Key memo_key;
+	uint64_t                hash = 0;
+	if (memo || description_cache) {
+		memo_key = TextureBindingMemo::MakeKey(resource, descriptor.fields);
+		hash     = TextureBindingMemo::Hash(memo_key);
+	}
+	// Exactly the answer of the full resolution below (see textureBindingMemo.h), including the
+	// FindImage access bookkeeping; validation of the key's resource already passed.
+	if (memo && m_texture_memo.TryResolve(texture_cache, memo_key, hash, binding)) {
+		if (!descriptor.IsNull() && HangTrace::Enabled()) {
+			HangTrace::RecordTexture(descriptor.fields);
+		}
+		return;
+	}
+	if (storage) {
+		ValidateStorageImageResource(resource);
+	}
+	TextureBindingMemo::Forget(binding);
 	auto& desc = binding.desc;
 
-	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
 		desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 		                                         : TextureCache::BindingType::Texture);
 		binding.image_id = texture_cache.FindImage(desc);
+		if (memo) {
+			m_texture_memo.Record(texture_cache, memo_key, hash, binding, binding.image_id, false,
+			                      false);
+		}
 		return;
 	}
 
@@ -706,7 +770,7 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 		HangTrace::RecordTexture(descriptor.fields);
 	}
 
-	if (Common::RendererBatchEnabled() && resource.indirect_resources.size() <= 256u) {
+	if (description_cache) {
 		const TextureDescriptionKey key {resource.resource_class, resource.numeric_class,
 		                                 resource.dimension,      resource.mip_mode,
 		                                 resource.mip_count,      resource.conversion_format,
@@ -714,12 +778,7 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 		                                 resource.written,        resource.atomic,
 		                                 resource.depth_compare,  resource.cube,
 		                                 resource.r128};
-		const auto hash =
-		    XXH3_64bits_withSeed(descriptor.fields, sizeof(descriptor.fields),
-		                         (static_cast<uint64_t>(key.dimension) << 32u) ^
-		                             (static_cast<uint64_t>(key.numeric_class) << 16u) ^
-		                             (key.written ? 1u : 0u) ^ (key.depth_compare ? 2u : 0u) ^
-		                             (static_cast<uint64_t>(key.mip_mode) << 8u));
+		// TextureBindingMemo::Hash is this cache's hash of the dwords and key.
 		auto& entry = m_texture_descriptions[hash % m_texture_descriptions.size()];
 		if (entry.valid && entry.key == key &&
 		    std::ranges::equal(entry.words, descriptor.fields)) {
@@ -741,9 +800,12 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 	const auto pixel_format = desc.info.pixel_format;
 	const auto view_format = desc.view_info.format;
 	const auto byte_size = desc.info.data.size;
+	const auto base_level = desc.view_info.base_level;
+	const auto base_layer = desc.view_info.base_layer;
 	const bool shader_conversion = TextureGetSurfaceFormatInfo(descriptor.Format()).conversion_format !=
 	                               Prospero::BufferFormat::kInvalid;
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	const auto found               = id;
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -761,6 +823,12 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 		                             descriptor.DstSelXYZW());
 	}
 	binding.image_id = id;
+	if (memo) {
+		const bool view_rebased =
+		    desc.view_info.base_level != base_level || desc.view_info.base_layer != base_layer;
+		m_texture_memo.Record(texture_cache, memo_key, hash, binding, found, shader_conversion,
+		                      view_rebased);
+	}
 }
 
 static bool SamplerMemoEnabled() {
@@ -812,9 +880,61 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
-vk::DescriptorBufferInfo RenderExecutor::UploadShaderData(std::span<const uint32_t> data) {
+// KYTY_UPLOAD_DEDUP=0 restores the previous per-draw upload memo (64 hashed slots, only with
+// KYTY_RENDERER_BATCH=1).
+static bool UploadDedupEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_UPLOAD_DEDUP");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+vk::DescriptorBufferInfo RenderExecutor::UploadShaderData(std::span<const uint32_t> data,
+                                                          uint32_t                  site) {
 	// These shader tables are read-only and ring allocations live until their GPU
 	// tick retires. A wrap that reuses them must submit/wait and advance that tick.
+	if (UploadDedupEnabled()) {
+		// Identical bytes uploaded earlier in the same tick (the same command buffer) reuse that
+		// allocation: the ring never overwrites a range during the tick that allocated it (a wrap
+		// that reaches it first submits and completes that tick, which changes CurrentTick()),
+		// and the tables are read-only. Equal contents then give equal descriptors, which the
+		// push-descriptor shadow can skip.
+		if (data.size_bytes() > 16u * 1024u) {
+			return NativeUpload(m_context, data);
+		}
+		EXIT_IF(data.empty());
+		const auto tick = m_context.GetCommandScheduler().CurrentTick();
+		auto&      last_slot = m_upload_last_slot[site % m_upload_last_slot.size()];
+		if (const auto& last = m_upload_dedup[last_slot];
+		    last.allocation.buffer != nullptr && last.tick == tick &&
+		    std::ranges::equal(data, last.words)) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadLastHits);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadReuseHits);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadBytesAvoided,
+			                          data.size_bytes());
+			return last.allocation;
+		}
+		const auto hash = XXH3_64bits(data.data(), data.size_bytes());
+		const auto slot = static_cast<uint32_t>(hash % m_upload_dedup.size());
+		auto&      entry = m_upload_dedup[slot];
+		last_slot        = slot;
+		if (entry.allocation.buffer != nullptr && entry.tick == tick && entry.hash == hash &&
+		    std::ranges::equal(data, entry.words)) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadReuseHits);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadBytesAvoided,
+			                          data.size_bytes());
+			return entry.allocation;
+		}
+		const auto allocation = NativeUpload(m_context, data);
+		entry.words.assign(data.begin(), data.end());
+		entry.allocation = allocation;
+		entry.hash       = hash;
+		// The upload may have submitted (ring wrap): the allocation belongs to the tick after it.
+		entry.tick = m_context.GetCommandScheduler().CurrentTick();
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadReuseMisses);
+		return allocation;
+	}
 	if (!Common::RendererBatchEnabled() || data.size_bytes() > 16u * 1024u) {
 		return NativeUpload(m_context, data);
 	}
@@ -927,6 +1047,125 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	}
 }
 
+namespace {
+
+struct WriteRangeScratch {
+	ShaderRecompiler::IR::WriteRangeEvaluator         evaluator;
+	std::vector<ShaderRecompiler::IR::WriteRangeSpan> spans;
+	std::vector<GuestRange>                           ranges;
+};
+
+WriteRangeScratch& ThreadWriteRangeScratch() {
+	thread_local WriteRangeScratch scratch;
+	return scratch;
+}
+
+// The descriptor's stride/swizzle/ADD_TID bits normalized exactly as the resource
+// specialization that selected the compiled program (BuildResourceSpecialization).
+uint32_t SpecializedPackedStride(const ShaderBufferResource& descriptor) {
+	auto       packed  = descriptor.PackedStride();
+	const auto stride  = packed & 0x3fffu;
+	const bool swizzle = stride != 0u && ((packed >> 14u) & 1u) != 0u;
+	if (stride == 0u) {
+		packed &= ~((1u << 14u) | (3u << 16u));
+	} else if (!swizzle) {
+		packed &= ~(3u << 16u);
+	}
+	return packed;
+}
+
+} // namespace
+
+// Guest ranges the shader can write through writable buffer `index`, or nullptr when the whole
+// binding must be treated as written (no proof, proof covers everything, or disabled).
+static const std::vector<GuestRange>* ResolveWrittenRanges(RenderContext&            context,
+                                                           const ShaderStageRuntime& runtime,
+                                                           const PreparedBindings&   prepared,
+                                                           uint32_t index, bool& evaluated,
+                                                           WriteRangeScratch& scratch) {
+	const auto& program  = *runtime.program;
+	const auto& snapshot = *runtime.resources;
+	const auto& resource = program.info.buffers[index];
+	const auto& source   = prepared.buffer_sources[index];
+	if (!resource.written || source.address == 0 || source.size == 0) {
+		return nullptr;
+	}
+	const auto* entry  = program.write_ranges.Find(index);
+	bool        proven = false;
+	const char* result = "unprovable";
+	if (!PreciseWriteRangesEnabled()) {
+		result = "disabled";
+	} else if (entry == nullptr || !entry->bounded) {
+		result = "unprovable";
+	} else if (index >= snapshot.buffers.size() ||
+	           SpecializedPackedStride(DecodeNativeDescriptor<ShaderBufferResource>(
+	               snapshot.buffers[index])) != entry->packed_stride) {
+		result = "stride-mismatch";
+	} else {
+		if (!evaluated) {
+			const ShaderRecompiler::IR::WriteRangeInputs inputs {
+			    .user_data     = snapshot.user_data,
+			    .flattened_srt = snapshot.flattened_srt,
+			    .groups        = prepared.dispatch_groups,
+			    .has_groups    = prepared.has_dispatch_groups,
+			};
+			scratch.evaluator.Evaluate(program.write_ranges, inputs);
+			evaluated = true;
+		}
+		proven = scratch.evaluator.Spans(program.write_ranges, index, source.size, scratch.spans);
+		result = proven ? "narrowed" : "unbounded";
+	}
+	uint64_t written_bytes = source.size;
+	scratch.ranges.clear();
+	if (proven) {
+		written_bytes = 0;
+		for (const auto& span: scratch.spans) {
+			scratch.ranges.push_back({source.address + span.begin, span.end - span.begin});
+			written_bytes += span.end - span.begin;
+		}
+	}
+	const bool narrowed = proven && written_bytes < source.size;
+	if (proven && !narrowed) {
+		result = "covers-binding";
+	}
+	uint32_t spared = 0;
+	if (narrowed) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::WriteRangeNarrowed);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::WriteRangeBytesAvoided,
+		                          source.size - written_bytes);
+		if (WriteRangeImageStatsEnabled()) {
+			spared = context.GetTextureCache().CountImagesOutsideGpuWrite(source.address,
+			                                                              source.size, scratch.ranges);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::WriteRangeImagesSpared, spared);
+		}
+	} else {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::WriteRangeWhole);
+	}
+
+	if (const auto limit = WriteRangeLogLimit(); limit != 0u) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < limit) {
+			std::string spans;
+			for (const auto& range: scratch.ranges) {
+				spans += fmt::format(" 0x{:x}+0x{:x}", range.address, range.size);
+			}
+			const auto detail =
+			    entry != nullptr && evaluated
+			        ? scratch.evaluator.Describe(program.write_ranges, index)
+			        : std::string(entry == nullptr ? "no-proof" : entry->bounded ? "" : "unprovable");
+			LOGF("WriteRange: stage=%s shader=0x%016" PRIx64 " slot=%u guest=0x%016" PRIx64
+			     " size=0x%" PRIx64 " read=%d atomic=%d groups=%s%ux%ux%u result=%s written=0x%" PRIx64
+			     " images_spared=%u spans:%s detail: %s\n",
+			     ShaderStageResourceName(program.stage), program.shader_hash, index, source.address,
+			     source.size, resource.read ? 1 : 0, resource.atomic ? 1 : 0,
+			     prepared.has_dispatch_groups ? "" : "unknown:", prepared.dispatch_groups[0],
+			     prepared.dispatch_groups[1], prepared.dispatch_groups[2], result, written_bytes,
+			     spared, spans.c_str(), detail.c_str());
+		}
+	}
+	return narrowed ? &scratch.ranges : nullptr;
+}
+
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -945,11 +1184,15 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
+	auto& write_scratch = ThreadWriteRangeScratch();
+	bool  write_ranges_evaluated = false;
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		uint32_t buffer_offset = 0;
+		uint32_t   buffer_offset = 0;
+		const auto* written      = ResolveWrittenRanges(m_context, *prepared.runtime, prepared, i,
+		                                                write_ranges_evaluated, write_scratch);
 		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
 		                                               program.info.buffers[i], program.stage, i,
-		                                               buffer_offset));
+		                                               buffer_offset, written));
 		pack_memory_offset(i, buffer_offset);
 	}
 	// GET_LOD_STATS counter per image, 16 bits: MipStatsCntId (T# dword 6 bits 0..7) in bits 0..7,
@@ -968,13 +1211,15 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		        : 0x8000u;
 		prepared.shader_data[layout.MipStatsOffsetDword() + i / 2u] |= id << ((i & 1u) * 16u);
 	}
+	// Upload sites: stage type and table kind (the dedup checks the site's last entry first).
+	const auto site = static_cast<uint32_t>(program.stage) * 2u;
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
-		prepared.flattened_srt = UploadShaderData(snapshot.flattened_srt);
+		prepared.flattened_srt = UploadShaderData(snapshot.flattened_srt, site);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
-		prepared.shader_data_buffer = UploadShaderData(prepared.shader_data);
+		prepared.shader_data_buffer = UploadShaderData(prepared.shader_data, site + 1u);
 	}
 }
 
@@ -1013,8 +1258,9 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
 			}
 			binding.image_view = binding.mip_views.front();
-		} else {
+		} else if (!m_texture_memo.TryAcquireView(texture_cache, binding)) {
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
+			m_texture_memo.RecordView(binding, binding.image_view);
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
@@ -1058,6 +1304,38 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
+// Why a renderer push-descriptor update was recorded (FrameEvent.DescriptorPushMiss*).
+static void CountDescriptorPushMiss(int32_t result, std::span<const vk::WriteDescriptorSet> writes) {
+	using Event = Profiler::FrameEvent;
+	if (result == CommandBuffer::PushAvoided) {
+		return;
+	}
+	if (result == CommandBuffer::PushMissState) {
+		Profiler::CountFrameEvent(Event::DescriptorPushMissLayout);
+		return;
+	}
+	if (result == CommandBuffer::PushMissShape || result < 0 ||
+	    static_cast<size_t>(result) >= writes.size()) {
+		Profiler::CountFrameEvent(Event::DescriptorPushMissShape);
+		return;
+	}
+	// NativeBinding(stage, kind) = kind + stage group * DescriptorBindingKind::Count.
+	const auto kind = static_cast<BindingKind>(writes[static_cast<size_t>(result)].dstBinding %
+	                                           static_cast<uint32_t>(BindingKind::Count));
+	if (ShaderRecompiler::IR::ImageBindingResourceClass(kind) !=
+	    ShaderRecompiler::IR::ImageResourceClass::None) {
+		Profiler::CountFrameEvent(Event::DescriptorPushMissImage);
+		return;
+	}
+	switch (kind) {
+		case BindingKind::Samplers: Profiler::CountFrameEvent(Event::DescriptorPushMissSampler); break;
+		case BindingKind::Buffers: Profiler::CountFrameEvent(Event::DescriptorPushMissBuffer); break;
+		case BindingKind::FlattenedSrt:
+		case BindingKind::ShaderData: Profiler::CountFrameEvent(Event::DescriptorPushMissUpload); break;
+		default: Profiler::CountFrameEvent(Event::DescriptorPushMissOther); break;
+	}
+}
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -1087,9 +1365,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	vk::ShaderStageFlags push_stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
 	                                       ? vk::ShaderStageFlagBits::eFragment
 	                                       : vk::ShaderStageFlags {};
+	bool mesh_stage = false;
 	for (const auto* prepared: prepared_bindings) {
 		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
 		const auto& program = *prepared->runtime->program;
+		mesh_stage |= program.stage == ShaderType::Mesh;
 		write_count += program.bindings.descriptors.size();
 		for (const auto& binding: program.bindings.descriptors) {
 			descriptor_count += NativeDescriptorCount(binding);
@@ -1279,29 +1559,55 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 
 	if (has_push_data) {
-		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
-		                        push_data.dwords.data());
+		buffer.PushConstants(pipeline.pipeline_layout, push_stages, sizeof(push_data),
+		                     push_data.dwords.data());
+	}
+	if (mesh_stage) {
+		// The mesh draw path then records its draw arguments over the first push-constant dwords
+		// through StateHandle(); the shadow no longer describes what is in effect.
+		buffer.InvalidatePushConstants();
 	}
 
 	if (!m_descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		if (pipeline.uses_push_descriptors) {
-			buffer.PushDescriptors(pipeline_bind_point, pipeline.pipeline_layout, 0,
-			                               static_cast<uint32_t>(m_descriptor_writes.size()),
-			                               m_descriptor_writes.data());
+			const auto result = buffer.PushDescriptors(
+			    pipeline_bind_point, pipeline.pipeline_layout, 0,
+			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data());
+			CountDescriptorPushMiss(result, m_descriptor_writes);
 		} else {
-			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
-			for (auto& write: m_descriptor_writes) {
-				write.dstSet = set;
-			}
-			m_context.GetGraphics().device.updateDescriptorSets(
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
-			    nullptr);
-			buffer.InvalidateDescriptors(pipeline_bind_point);
-			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
-			                             0, nullptr);
+			CommitDescriptorSet(buffer, pipeline_bind_point, pipeline);
 		}
 	}
+}
+
+void RenderExecutor::CommitDescriptorSet(CommandBuffer& buffer, vk::PipelineBindPoint point,
+                                         const PipelineCache::Pipeline& pipeline) {
+	const auto        layout = pipeline.descriptor_set_layout;
+	const bool        reuse  = DescriptorSetReuseEnabled();
+	const auto        tick   = m_context.GetCommandScheduler().CurrentTick();
+	uint64_t          hash   = 0;
+	vk::DescriptorSet set    = nullptr;
+	if (reuse) {
+		hash = DescriptorSetReuse::Hash(layout, m_descriptor_writes);
+		set  = m_descriptor_set_reuse.Find(tick, layout, m_descriptor_writes, hash);
+	}
+	if (set != nullptr) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorSetsReused);
+	} else {
+		set = m_context.GetDescriptorHeap().Commit(layout);
+		for (auto& write: m_descriptor_writes) {
+			write.dstSet = set;
+		}
+		m_context.GetGraphics().device.updateDescriptorSets(
+		    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
+		    nullptr);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorSetsWritten);
+		if (reuse) {
+			m_descriptor_set_reuse.Insert(tick, layout, m_descriptor_writes, hash, set);
+		}
+	}
+	buffer.BindDescriptorSet(point, pipeline.pipeline_layout, set);
 }
 
 } // namespace Libs::Graphics

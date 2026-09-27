@@ -286,6 +286,40 @@ static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 	return header != nullptr ? (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0 : 0;
 }
 
+// KYTY_SHADER_HASH_BACKING=0 hashes headerless shader code in place. By default the code bytes are
+// first copied from the clean backing: code often shares a 4 KiB tracker page with GPU-written
+// storage data, and hashing through the protected guest mapping then faults and drains the GPU
+// on every draw (u37 Sky Garden: ~7.8k CP-thread faults at XXH3_64bits, ~33 ms per flip). The
+// clean-backing read proves the exact code bytes are not GPU-owned; otherwise the in-place hash
+// keeps the fault/readback path.
+static bool ShaderHashBackingEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_SHADER_HASH_BACKING");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+static uint64_t HashShaderCode(std::span<const uint32_t> code) {
+	if (DrawPrep::Speculative()) {
+		// Never reached while preparing (GetShaderParams fails the preparation first): a draw-prep
+		// preparation must not read code outside its certificate, nor fall back to the mapping.
+		DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+		return 0;
+	}
+	if (ShaderHashBackingEnabled()) {
+		static thread_local std::vector<uint32_t> scratch;
+		scratch.resize(code.size());
+		if (LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(code.data()),
+		                                              scratch.data(), code.size_bytes())) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderCodeHashBacking);
+			return XXH3_64bits(scratch.data(), code.size_bytes());
+		}
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderCodeHashDirect);
+	return XXH3_64bits(code.data(), code.size_bytes());
+}
+
 static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,
 	                                std::span<const uint32_t> user_data,
 	                                const ShaderMappedData& data, uint32_t user_data_base = 0) {
@@ -300,7 +334,8 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uin
 	const auto code_words = data.code_size_bytes / sizeof(uint32_t);
 	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
 	if (declared_hash == 0 && DrawPrep::Speculative()) {
-		// Hashing the whole code would read it outside the certificate.
+		// Hashing the whole code would read it outside the certificate (and HashShaderCode may
+		// fall back to reading the guest mapping): the serial path hashes it at commit.
 		DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
 	}
 	ShaderParams params {
@@ -308,7 +343,7 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uin
 	    .user_data_count = static_cast<uint32_t>(user_data.size()) + user_data_base,
 	    .hash            = declared_hash != 0        ? declared_hash
 	                       : DrawPrep::Speculative() ? 0
-	                                                 : XXH3_64bits(code.data(), code.size_bytes()),
+	                                                 : HashShaderCode(code),
 	};
 	EXIT_IF(user_data.size() > HW::UserSgprInfo::SGPRS_MAX ||
 	        params.user_data_count > params.user_data.size());

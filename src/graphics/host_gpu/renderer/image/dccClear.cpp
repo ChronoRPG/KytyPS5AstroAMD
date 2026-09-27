@@ -3,29 +3,33 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/profiler.h"
-#include "gpu_dcc_shaders/gpu_dcc_clear_rgba16f_spv.h"
+#include "gpu_dcc_shaders/gpu_dcc_clear_spv.h"
 #include "gpu_dcc_shaders/gpu_dcc_validate_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <map>
 #include <span>
 
 namespace Libs::Graphics {
 
+struct DccClearHelper::PaletteImages {
+	std::map<vk::Format, std::unique_ptr<VulkanImage>> images;
+};
+
 DccClearHelper::DccClearHelper(GraphicContext& graphics, CommandScheduler& scheduler)
-    : m_graphics(graphics), m_scheduler(scheduler) {
-	static_assert(sizeof(Push) == 24);
+    : m_graphics(graphics), m_scheduler(scheduler),
+      m_palette_images(std::make_unique<PaletteImages>()) {
+	static_assert(sizeof(Push) == 28);
 	const auto& limits = graphics.physical_device_properties.limits;
-	const auto features = graphics.GetFormatProperties(vk::Format::eR16G16B16A16Sfloat);
-	m_supported = static_cast<bool>(features.optimalTilingFeatures &
-	                                vk::FormatFeatureFlagBits::eStorageImage) &&
-	              graphics.max_push_descriptors >= 3 &&
+	m_supported = graphics.max_push_descriptors >= 4 &&
 	              limits.maxComputeWorkGroupInvocations >= WorkgroupSize &&
 	              limits.maxComputeWorkGroupSize[0] >= WorkgroupSize &&
 	              limits.maxComputeWorkGroupCount[0] != 0 &&
@@ -36,10 +40,11 @@ DccClearHelper::DccClearHelper(GraphicContext& graphics, CommandScheduler& sched
 		return;
 	}
 
-	const std::array<vk::DescriptorSetLayoutBinding, 3> bindings {{
+	const std::array<vk::DescriptorSetLayoutBinding, 4> bindings {{
 	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
 	    {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
-	    {2, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	    {2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	    {3, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
 	}};
 	vk::DescriptorSetLayoutCreateInfo descriptor_info {};
 	descriptor_info.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
@@ -72,15 +77,24 @@ DccClearHelper::DccClearHelper(GraphicContext& graphics, CommandScheduler& sched
 		RequireVulkanSuccess(result, "create DCC clear compute pipeline");
 	};
 	create_pipeline(GPU_DCC_VALIDATE_SPV, m_validate_pipeline);
-	create_pipeline(GPU_DCC_CLEAR_RGBA16F_SPV, m_clear_pipeline);
+	create_pipeline(GPU_DCC_CLEAR_SPV, m_clear_pipeline);
 	m_scratch = std::make_unique<Buffer>(
 	    graphics, scheduler, MemoryUsage::DeviceLocal, 0,
 	    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer,
 	    ScratchSize);
+	m_palette = std::make_unique<Buffer>(
+	    graphics, scheduler, MemoryUsage::DeviceLocal, 0,
+	    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
+	    PaletteSize);
 }
 
 DccClearHelper::~DccClearHelper() {
 	// The owning TextureCache is destroyed after RenderContext drains its scheduler.
+	for (auto& [format, image]: m_palette_images->images) {
+		if (image != nullptr && image->image != nullptr) {
+			m_graphics.DeleteImage(*image);
+		}
+	}
 	if (m_validate_pipeline != nullptr) {
 		m_graphics.device.destroyPipeline(m_validate_pipeline, nullptr);
 	}
@@ -95,31 +109,187 @@ DccClearHelper::~DccClearHelper() {
 	}
 }
 
-bool DccClearHelper::Supports(const Image& image, uint64_t metadata_size) const {
-	const auto& native = image.backing;
-	if (!m_supported || native.image == nullptr ||
-	    native.format != vk::Format::eR16G16B16A16Sfloat ||
-	    native.image_type != vk::ImageType::e2D || native.samples != 1 || native.layers != 1 ||
-	    native.mip_levels != 1 || native.extent.depth != 1 || native.extent.width == 0 ||
-	    native.extent.height == 0 || !(native.usage & vk::ImageUsageFlagBits::eStorage) ||
-	    metadata_size == 0 || metadata_size > MaxMetadataSize || metadata_size % 4096 != 0) {
-		return false;
+vk::Format DccClearHelper::AliasFormat(vk::Format view_format, uint32_t& texel_bytes) {
+	// Same compatibility class (texel size) as the view format: a mutable-format image can be
+	// viewed through it, and its texels hold exactly the view format's encoded bits.
+	constexpr std::array<std::pair<vk::Format, uint32_t>, 5> aliases {{
+	    {vk::Format::eR8Uint, 1},
+	    {vk::Format::eR16Uint, 2},
+	    {vk::Format::eR32Uint, 4},
+	    {vk::Format::eR32G32Uint, 8},
+	    {vk::Format::eR32G32B32A32Uint, 16},
+	}};
+	for (const auto& [alias, bytes]: aliases) {
+		if (ImageViewOps::FormatsCompatible(alias, view_format) &&
+		    ImageViewOps::FormatsCompatible(view_format, alias)) {
+			texel_bytes = bytes;
+			return alias;
+		}
+	}
+	texel_bytes = 0;
+	return vk::Format::eUndefined;
+}
+
+DccClearHelper::Support DccClearHelper::SupportsFormat(vk::Format view_format) const {
+	if (!m_supported) {
+		return Support::Disabled;
+	}
+	uint32_t   texel_bytes = 0;
+	const auto alias       = AliasFormat(view_format, texel_bytes);
+	// Depth/stencil and block-compressed formats have their own compatibility classes.
+	if (alias == vk::Format::eUndefined) {
+		return Support::Format;
+	}
+	const auto alias_features =
+	    m_graphics.GetFormatProperties(alias).optimalTilingFeatures;
+	const auto view_features = m_graphics.GetFormatProperties(view_format).optimalTilingFeatures;
+	if (!(alias_features & vk::FormatFeatureFlagBits::eStorageImage) ||
+	    !(view_features & vk::FormatFeatureFlagBits::eTransferDst) ||
+	    !(view_features & vk::FormatFeatureFlagBits::eTransferSrc)) {
+		return Support::Format;
+	}
+	return Support::Ok;
+}
+
+DccClearHelper::Support DccClearHelper::SupportsImage(const Image& image, vk::Format view_format,
+                                                      uint64_t metadata_size) const {
+	const auto format_support = SupportsFormat(view_format);
+	if (format_support != Support::Ok) {
+		return format_support;
+	}
+	uint32_t    texel_bytes = 0;
+	const auto  alias       = AliasFormat(view_format, texel_bytes);
+	const auto& native      = image.backing;
+	if (native.image == nullptr || native.image_type != vk::ImageType::e2D ||
+	    native.samples != 1 || native.mip_levels != 1 || native.extent.depth != 1 ||
+	    native.extent.width == 0 || native.extent.height == 0 ||
+	    !(native.usage & vk::ImageUsageFlagBits::eStorage) ||
+	    !ImageViewOps::FormatsCompatible(native.format, alias) ||
+	    (native.format != alias && !(native.flags & vk::ImageCreateFlagBits::eMutableFormat)) ||
+	    metadata_size == 0 || metadata_size > MaxMetadataSize || metadata_size % 4 != 0) {
+		return Support::Unsupported;
 	}
 	const auto& limits = m_graphics.physical_device_properties.limits;
 	const uint64_t pixels = static_cast<uint64_t>(native.extent.width) * native.extent.height;
 	// Keep the shader's rounded invocation count and index arithmetic within uint32_t.
 	const uint64_t max_elements = std::numeric_limits<uint32_t>::max() - (WorkgroupSize - 1u);
 	const auto alignment = std::max<uint64_t>(m_graphics.StorageMinAlignment(), 4);
-	return pixels <= max_elements &&
-	       metadata_size + alignment - 1 <= limits.maxStorageBufferRange;
+	if (pixels > max_elements || metadata_size + alignment - 1 > limits.maxStorageBufferRange) {
+		return Support::Unsupported;
+	}
+	return Support::Ok;
 }
 
-void DccClearHelper::Record(Image& image, vk::Buffer metadata, uint64_t metadata_offset,
-                           uint64_t metadata_size, bool alpha_msb) {
+void DccClearHelper::RecordPalette(vk::CommandBuffer command, vk::Format view_format,
+                                   uint32_t texel_bytes, const ClearValues& values) {
+	auto& slot = m_palette_images->images[view_format];
+	if (slot == nullptr) {
+		slot = std::make_unique<VulkanImage>();
+		vk::ImageCreateInfo create {};
+		create.imageType     = vk::ImageType::e2D;
+		create.extent        = vk::Extent3D {1, 1, 1};
+		create.mipLevels     = 1;
+		create.arrayLayers   = static_cast<uint32_t>(ClearCodes.size());
+		create.format        = view_format;
+		create.tiling        = vk::ImageTiling::eOptimal;
+		create.initialLayout = vk::ImageLayout::eUndefined;
+		create.usage         = vk::ImageUsageFlagBits::eTransferSrc |
+		               vk::ImageUsageFlagBits::eTransferDst;
+		create.sharingMode = vk::SharingMode::eExclusive;
+		create.samples     = vk::SampleCountFlagBits::e1;
+		if (!m_graphics.CreateImage(create, *slot)) {
+			EXIT("DCC clear: failed to create the palette image (format %d)\n",
+			     static_cast<int>(view_format));
+		}
+	}
+	const auto palette_image = slot->image;
+	const vk::ImageSubresourceRange all_layers {vk::ImageAspectFlagBits::eColor, 0, 1, 0,
+	                                            static_cast<uint32_t>(ClearCodes.size())};
+
+	// Earlier copies out of the image and shader reads of the palette buffer precede the
+	// rewrites below (queue order; one palette serves every record).
+	vk::ImageMemoryBarrier2 image_barrier {};
+	image_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	image_barrier.srcAccessMask       = vk::AccessFlagBits2::eNone;
+	image_barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	image_barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	image_barrier.oldLayout           = vk::ImageLayout::eUndefined;
+	image_barrier.newLayout           = vk::ImageLayout::eTransferDstOptimal;
+	image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	image_barrier.image               = palette_image;
+	image_barrier.subresourceRange    = all_layers;
+	vk::BufferMemoryBarrier2 buffer_barrier {};
+	buffer_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	buffer_barrier.srcAccessMask       = vk::AccessFlagBits2::eNone;
+	buffer_barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	buffer_barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	buffer_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	buffer_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	buffer_barrier.buffer              = m_palette->Handle();
+	buffer_barrier.offset              = 0;
+	buffer_barrier.size                = PaletteSize;
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount  = 1;
+	dependency.pImageMemoryBarriers     = &image_barrier;
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &buffer_barrier;
+	command.pipelineBarrier2(dependency);
+
+	// The same conversion the CPU fallback's ClearImage applies to the decoded clear value.
+	std::array<vk::BufferImageCopy, ClearCodes.size()> copies {};
+	uint32_t copy_count = 0;
+	for (uint32_t index = 0; index < ClearCodes.size(); ++index) {
+		if (!values[index]) {
+			continue;
+		}
+		const vk::ImageSubresourceRange layer {vk::ImageAspectFlagBits::eColor, 0, 1, index, 1};
+		command.clearColorImage(palette_image, vk::ImageLayout::eTransferDstOptimal,
+		                        &*values[index], 1, &layer);
+		auto& copy                 = copies[copy_count++];
+		copy.bufferOffset          = uint64_t {index} * 16u;
+		copy.imageSubresource      = {vk::ImageAspectFlagBits::eColor, 0, index, 1};
+		copy.imageExtent           = vk::Extent3D {1, 1, 1};
+	}
+	(void)texel_bytes;
+	image_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	image_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	image_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	image_barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+	image_barrier.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
+	image_barrier.newLayout     = vk::ImageLayout::eTransferSrcOptimal;
+	dependency                          = {};
+	dependency.imageMemoryBarrierCount  = 1;
+	dependency.pImageMemoryBarriers     = &image_barrier;
+	command.pipelineBarrier2(dependency);
+	if (copy_count != 0) {
+		command.copyImageToBuffer(palette_image, vk::ImageLayout::eTransferSrcOptimal,
+		                          m_palette->Handle(), copy_count, copies.data());
+	}
+	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	buffer_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	buffer_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead;
+	dependency                          = {};
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &buffer_barrier;
+	command.pipelineBarrier2(dependency);
+}
+
+void DccClearHelper::RecordSlice(Image& image, vk::Format view_format, uint32_t layer,
+                                 vk::Buffer metadata, uint64_t metadata_offset,
+                                 uint64_t metadata_size, const ClearValues& values) {
 	KYTY_GPU_OP_SITE("dcc.clear");
 	KYTY_PROFILER_DETAIL_FUNCTION();
-	EXIT_IF(!Supports(image, metadata_size) || metadata == nullptr || metadata_offset % 4 != 0 ||
+	EXIT_IF(SupportsImage(image, view_format, metadata_size) != Support::Ok ||
+	        metadata == nullptr || metadata_offset % 4 != 0 || layer >= image.backing.layers ||
 	        metadata_offset > std::numeric_limits<uint64_t>::max() - metadata_size);
+	uint32_t   texel_bytes = 0;
+	const auto alias       = AliasFormat(view_format, texel_bytes);
+	uint32_t   decodable   = 0;
+	for (uint32_t index = 0; index < ClearCodes.size(); ++index) {
+		decodable |= values[index] ? 1u << index : 0u;
+	}
 	const auto alignment = std::max<uint64_t>(m_graphics.StorageMinAlignment(), 4);
 	const auto descriptor_offset = Common::AlignDown(metadata_offset, alignment);
 	const auto prefix = metadata_offset - descriptor_offset;
@@ -130,18 +300,25 @@ void DccClearHelper::Record(Image& image, vk::Buffer metadata, uint64_t metadata
 	    m_graphics.physical_device_properties.limits.maxComputeWorkGroupCount[0]);
 	const Push push {static_cast<uint32_t>(prefix / sizeof(uint32_t)),
 	                 static_cast<uint32_t>(metadata_size / sizeof(uint32_t)),
-	                 image.backing.extent.width, image.backing.extent.height,
-	                 static_cast<uint32_t>(groups), alpha_msb ? 1u : 0u};
+	                 image.backing.extent.width,
+	                 image.backing.extent.height,
+	                 static_cast<uint32_t>(groups),
+	                 decodable,
+	                 texel_bytes};
 	ImageViewInfo view_info {};
-	view_info.format = vk::Format::eR16G16B16A16Sfloat;
-	view_info.usage = vk::ImageUsageFlagBits::eStorage;
+	view_info.format      = alias;
+	view_info.type        = vk::ImageViewType::e2D;
+	view_info.base_layer  = layer;
+	view_info.layer_count = 1;
+	view_info.usage       = vk::ImageUsageFlagBits::eStorage;
 	const auto view = image.FindView(view_info);
 	image.NoteContentWrite();
 
 	m_scheduler.EndRendering();
 	const auto command = m_scheduler.Current().Handle();
-	image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, std::nullopt,
-	              command);
+	RecordPalette(command, view_format, texel_bytes, values);
+	image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
+	              ImageSubresourceRange {0, 1, layer, 1}, command);
 	std::array<vk::BufferMemoryBarrier2, 2> before {};
 	before[0].srcStageMask = vk::PipelineStageFlagBits2::eAllCommands |
 	                         vk::PipelineStageFlagBits2::eHost;
@@ -171,17 +348,19 @@ void DccClearHelper::Record(Image& image, vk::Buffer metadata, uint64_t metadata
 
 	const vk::DescriptorBufferInfo metadata_info {metadata, descriptor_offset, prefix + metadata_size};
 	const vk::DescriptorBufferInfo scratch_info {m_scratch->Handle(), 0, ScratchSize};
+	const vk::DescriptorBufferInfo palette_info {m_palette->Handle(), 0, PaletteSize};
 	const vk::DescriptorImageInfo image_info {nullptr, view, vk::ImageLayout::eGeneral};
-	std::array<vk::WriteDescriptorSet, 3> writes {};
+	std::array<vk::WriteDescriptorSet, 4> writes {};
 	for (uint32_t index = 0; index < writes.size(); ++index) {
 		writes[index].dstBinding = index;
 		writes[index].descriptorCount = 1;
 		writes[index].descriptorType =
-		    index == 2 ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eStorageBuffer;
+		    index == 3 ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eStorageBuffer;
 	}
 	writes[0].pBufferInfo = &metadata_info;
 	writes[1].pBufferInfo = &scratch_info;
-	writes[2].pImageInfo = &image_info;
+	writes[2].pBufferInfo = &palette_info;
+	writes[3].pImageInfo = &image_info;
 	m_scheduler.Current().PushDescriptors(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),

@@ -333,7 +333,10 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
 			return false;
 		}
-		Scheduler().Wait(watch.tick);
+		{
+			Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitStreamWrap);
+			Scheduler().Wait(watch.tick);
+		}
 		if (Usage() == MemoryUsage::Download) {
 			Scheduler().WaitPriorityOperations(watch.tick);
 		}

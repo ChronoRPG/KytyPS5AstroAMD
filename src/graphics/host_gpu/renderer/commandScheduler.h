@@ -19,6 +19,20 @@ namespace Libs::Graphics {
 
 class GpuTimestampRing;
 
+// Host work that commands of the current recording read and that finishes after recording
+// (TextureCache staging copies made on a worker). Submit makes the batch wait for it on the
+// GPU through a host-signalled timeline semaphore, so the recording thread never blocks.
+class SubmitDependency {
+public:
+	virtual ~SubmitDependency() = default;
+	// A value of Semaphore() the next batch must wait for, or 0 when all work handed out so far
+	// has finished on the host (its writes then precede vkQueueSubmit).
+	[[nodiscard]] virtual uint64_t      PendingValue()    = 0;
+	[[nodiscard]] virtual vk::Semaphore Semaphore() const = 0;
+	// Host-side wait, used when the batch has no free wait slot.
+	virtual void WaitHost(uint64_t value) = 0;
+};
+
 class CommandScheduler {
 public:
 	// Diagnostic attribution only; both kinds retain the same completion boundary.
@@ -52,6 +66,14 @@ public:
 	    Common::UniqueFunction<void>&& operation,
 	    PriorityOperationKind kind = PriorityOperationKind::Generic);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+	// Called on the completion runner after every priority operation (e.g. to wake queues
+	// suspended on what it published). Clear it, then DrainPriorityOperations, before the
+	// context dies: the call happens while the operation is still marked active.
+	using ProgressHook = void (*)(void* context);
+	void SetProgressHook(ProgressHook hook, void* context);
+	// KYTY_PRIORITY_WAKE_BATCH=0 restores a runner wake per queued operation and a waiter
+	// broadcast after every operation.
+	[[nodiscard]] static bool PriorityWakeupsBatched();
 
 	// Draw-prep: the register set the current command buffer reads. A committed draw's buffer is
 	// pointed at that draw's register snapshot (the live registers may already belong to later
@@ -83,6 +105,10 @@ public:
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
+	// Recording-thread only; the owner clears it before it is destroyed.
+	void SetSubmitDependency(SubmitDependency* dependency) noexcept {
+		m_submit_dependency = dependency;
+	}
 
 private:
 	class CommandPool {
@@ -126,9 +152,14 @@ private:
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
-	std::jthread                 m_priority_thread;
+	// The completion runner sleeps on its own condition, so a push can wake exactly it.
+	std::condition_variable      m_priority_available;
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
+	// Threads in WaitPriorityOperations/DrainPriorityOperations (m_operation_mutex).
+	uint32_t                     m_priority_waiters     = 0;
+	ProgressHook                 m_progress_hook         = nullptr;
+	void*                        m_progress_hook_context = nullptr;
 	OperationState               m_operation_state      = OperationState::Open;
 	// Guarded by m_operation_mutex, alongside callback registration and the
 	// queued-submit tick transition. Captured into each owned submission record.
@@ -140,6 +171,9 @@ private:
 	std::unique_ptr<GpuTimestampRing> m_gpu_timing;
 	// Guest scheduler with KYTY_GPU_OP_PROFILE / counters enabled (gpuOpProfiler.h).
 	bool m_gpu_ops = false;
+	SubmitDependency* m_submit_dependency = nullptr;
+	// Declared last: the runner starts in the constructor and uses the members above.
+	std::jthread m_priority_thread;
 };
 
 } // namespace Libs::Graphics

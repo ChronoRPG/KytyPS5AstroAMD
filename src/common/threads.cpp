@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <chrono>             // IWYU pragma: keep
 #include <condition_variable> // IWYU pragma: keep
 #include <mutex>
@@ -223,6 +224,28 @@ static std::atomic<int> g_thread_counter = 0;
 void InitializeThreads() {
 	g_main_thread     = std::this_thread::get_id();
 	g_main_thread_int = Thread::GetThreadIdUnique();
+}
+
+void RaiseCurrentThreadPriority() {
+#ifdef KYTY_WIN_CS
+	static const int level = [] {
+		const char* value = std::getenv("KYTY_CP_PRIORITY");
+		return value != nullptr && value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : 1;
+	}();
+	if (level == 0) {
+		return;
+	}
+	auto* thread = GetCurrentThread();
+	(void)SetThreadPriority(thread, level == 2 ? THREAD_PRIORITY_HIGHEST
+	                                           : THREAD_PRIORITY_ABOVE_NORMAL);
+	// Keep the thread off efficiency scheduling (EcoQoS) even when the window is in the
+	// background.
+	THREAD_POWER_THROTTLING_STATE throttling {};
+	throttling.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+	throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+	throttling.StateMask   = 0;
+	(void)SetThreadInformation(thread, ThreadPowerThrottling, &throttling, sizeof(throttling));
+#endif
 }
 
 Thread::Thread(thread_func_t func, void* arg)

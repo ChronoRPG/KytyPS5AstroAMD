@@ -1,12 +1,20 @@
 #version 450
 
+// Inspects one DCC metadata slice exactly as TextureCache's CPU fallback does: the slice is a
+// clear when its first byte is a clear code the CPU decoder accepts for this binding
+// (decodable_mask) and every byte of the slice equals it. Publishes the indirect dispatch size of
+// the conditional clear (0 when rejected) and the raw texel bits of the accepted clear value.
+
 layout(local_size_x = 128) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer Metadata { uint words[]; } metadata;
 layout(set = 0, binding = 1, std430) writeonly buffer Decision {
 	uvec4 dispatch_args;
-	vec4 color;
+	uvec4 raw;
 } decision;
+// Raw texel bits of the clear value of codes 0x00, 0x20, 0x40, 0x80, 0xC0 (16 bytes each), as
+// vkCmdClearColorImage encodes them in the view format.
+layout(set = 0, binding = 2, std430) readonly buffer Palette { uvec4 raw[5]; } palette;
 
 layout(push_constant, std430) uniform Push {
 	uint metadata_base_words;
@@ -14,10 +22,22 @@ layout(push_constant, std430) uniform Push {
 	uint width;
 	uint height;
 	uint clear_groups;
-	uint alpha_msb;
+	uint decodable_mask;
+	uint texel_bytes;
 } params;
 
 shared uint mismatched;
+
+uint CodeIndex(uint code) {
+	switch (code) {
+		case 0x00u: return 0u;
+		case 0x20u: return 1u;
+		case 0x40u: return 2u;
+		case 0x80u: return 3u;
+		case 0xc0u: return 4u;
+		default: return 5u;
+	}
+}
 
 void main() {
 	uint lane = gl_LocalInvocationID.x;
@@ -27,11 +47,11 @@ void main() {
 	barrier();
 
 	uint code = metadata.words[params.metadata_base_words] & 0xffu;
-	bool recognized = code == 0x00u || code == 0x40u || code == 0x80u || code == 0xc0u;
+	uint index = CodeIndex(code);
+	bool valid = index < 5u && ((params.decodable_mask >> index) & 1u) != 0u;
 	uint packed = code * 0x01010101u;
-	bool valid = recognized;
-	for (uint index = lane; index < params.metadata_words; index += 128u) {
-		valid = (metadata.words[params.metadata_base_words + index] == packed) && valid;
+	for (uint word = lane; valid && word < params.metadata_words; word += 128u) {
+		valid = metadata.words[params.metadata_base_words + word] == packed;
 	}
 	if (!valid) {
 		atomicOr(mismatched, 1u);
@@ -41,12 +61,6 @@ void main() {
 	if (lane == 0) {
 		bool accepted = mismatched == 0;
 		decision.dispatch_args = uvec4(accepted ? params.clear_groups : 0u, 1u, 1u, 0u);
-		float rgb = (code & 0x80u) != 0 ? 1.0 : 0.0;
-		float alpha = (code & 0x40u) != 0 ? 1.0 : 0.0;
-		vec4 color = vec4(rgb, rgb, rgb, alpha);
-		if (params.alpha_msb == 0) {
-			color = color.wyzx;
-		}
-		decision.color = accepted ? color : vec4(0.0);
+		decision.raw = accepted ? palette.raw[index] : uvec4(0u);
 	}
 }

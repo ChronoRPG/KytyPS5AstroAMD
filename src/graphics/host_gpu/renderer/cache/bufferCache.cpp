@@ -46,6 +46,16 @@ bool SideReadbackEnabled() {
 	return value == nullptr || !(value[0] == '0' && value[1] == '\0');
 }
 
+// GPU-thread reads (CP reads of GPU-written data, GPU-thread faults) also use side copies and wait
+// for them in place, unless KYTY_READBACK_SIDE_GPU_THREAD is "0" (then they always drain).
+bool SideReadbackGpuThreadEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_READBACK_SIDE_GPU_THREAD");
+		return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
+}
+
 // Aligned side-copy window in bytes: a power of two between 4 KiB and 1 MiB (default 64 KiB).
 uint64_t SideReadbackWindow() {
 	constexpr uint64_t Default = 64 * 1024;
@@ -413,9 +423,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 
-	// Side copies serve guest (non-GPU-thread) reads only. Writes need the CPU-dirty transition
-	// on the GPU thread, and GPU-thread callers would have to wait for the copy anyway.
-	const bool side_path = m_side != nullptr && !is_write && !GuestGpu::IsGpuThread();
+	// Writes need the CPU-dirty transition of the drain path. Guest-thread reads use side copies;
+	// GPU-thread reads do too (KYTY_READBACK_SIDE_GPU_THREAD, default on) and wait for the copy
+	// themselves: it waits only for the producing recording, not for the current one, and the
+	// current recording is neither split nor submitted.
+	const bool gpu_thread = GuestGpu::IsGpuThread();
+	const bool side_path =
+	    m_side != nullptr && !is_write && (!gpu_thread || SideReadbackGpuThreadEnabled());
 	if (OverlapsPendingSideReadback(page_begin, page_end)) {
 		// Another fault already copies these pages: wait for (or finish) its publication instead
 		// of copying again. Writes and GPU-thread reads must also be ordered after it.
@@ -423,7 +437,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::ReadbackSideWait);
 			CompleteSideReadbacks(page_begin, page_end - page_begin);
 		}
-		if (side_path) {
+		// A GPU-thread read continues below: bytes re-dirtied since that copy was issued still
+		// need their own readback before the caller reads.
+		if (side_path && !gpu_thread) {
 			// If a newer writer re-dirtied the page meanwhile it stays protected, and the
 			// retried access faults into a fresh readback.
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackSideDuplicateWaits);
@@ -435,6 +451,36 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		gpu.SendCommandSync([&, this, vaddr, size, is_write] {
 			ReadMemoryDrain(vaddr, size, is_write, trace);
 		});
+		record(std::nullopt);
+		return;
+	}
+
+	if (gpu_thread) {
+		std::shared_ptr<SideReadback> issued;
+		const auto                    result = TryIssueSideReadback(vaddr, size, issued);
+		if (result == SideIssueResult::Issued) {
+			{
+				Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::GpuWaitSideCopy);
+				CompleteSideReadback(*issued);
+			}
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackGpuThreadSideCopies);
+			trace.begin      = issued->begin;
+			trace.size       = issued->end - issued->begin;
+			trace.downloaded = true;
+			record(std::nullopt);
+			return;
+		}
+		switch (result) {
+			case SideIssueResult::CurrentWriter:
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackSideFallbackCurrentWriter);
+				break;
+			case SideIssueResult::Unbounded:
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackSideFallbackUnbounded);
+				break;
+			default: Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackSideFallbackOther); break;
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackGpuThreadDrains);
+		ReadMemoryDrain(vaddr, size, false, trace);
 		record(std::nullopt);
 		return;
 	}
@@ -502,7 +548,8 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
 	trace.size  = window_end - window_begin;
 	if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 		trace.downloaded = true;
-		const auto tick  = m_scheduler.CurrentTick();
+		const auto                    tick = m_scheduler.CurrentTick();
+		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitDrain);
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
@@ -637,8 +684,12 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 	RequireVulkanSuccess(command.begin(&begin_info), "begin side-readback command buffer");
-	// The timeline wait below orders the producer. This barrier's first scope additionally
-	// covers every earlier submission on this queue, so the copy observes all submitted work.
+	// The timeline wait below orders the producer (and, on the side queue, the newest unbounded
+	// writer). On a shared queue this barrier's first scope additionally covers every earlier
+	// submission, so the copy observes all submitted work. On the side queue later queue-0 work
+	// can overwrite copied bytes while the copy runs; such a writer re-adds them as GPU-dirty
+	// and keeps their pages protected (UnmarkReadbackPending retains them), so the possibly
+	// torn published bytes are never read before a newer readback replaces them.
 	vk::BufferMemoryBarrier before {};
 	before.srcAccessMask       = vk::AccessFlagBits::eMemoryWrite;
 	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
@@ -666,6 +717,13 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	readback->value  = value;
 	slot.busy.store(true, std::memory_order_relaxed);
 
+	// On the separate side queue nothing but the timeline wait orders the copy after queue-0
+	// work, so it must also cover the newest unbounded (address) writer, whose bytes carry no
+	// writer tick. It is older than `current` here (checked above), hence already submitted.
+	const bool side_queue = m_graphics.side_queue != nullptr;
+	if (side_queue) {
+		producer = std::max(producer, m_unbounded_write_tick);
+	}
 	const auto                      master     = m_scheduler.GetMasterSemaphore().Handle();
 	const uint64_t                  wait_value = producer;
 	const vk::PipelineStageFlags    wait_stage = vk::PipelineStageFlagBits::eTransfer;
@@ -685,7 +743,20 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	submit.signalSemaphoreCount = 1;
 	submit.pSignalSemaphores    = &side.semaphore;
 	vk::Result submit_result;
-	{
+	if (side_queue) {
+		// Every tick older than the current recording was handed to queue 0 or to the submission
+		// broker. Drain the broker only if the producer has not reached the driver yet, so this
+		// wait is never submitted ahead of its signal.
+		const auto& progress = m_scheduler.GetMasterSemaphore().GetSubmissionProgress();
+		if (progress != nullptr &&
+		    progress->dispatched_tick.load(std::memory_order_acquire) < producer) {
+			Common::LockGuard lock(m_graphics.queue_mutex);
+			m_graphics.submission_queue.DrainPendingLocked();
+		}
+		Common::LockGuard lock(m_graphics.side_queue_mutex);
+		submit_result = m_graphics.side_queue.submit(1, &submit, nullptr);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackSideQueueCopies);
+	} else {
 		// Every tick older than the current recording was handed to the queue or to the
 		// submission broker (drained here first), so the producer is submitted before this
 		// copy waits on it. The current recording follows this copy in submission order.
@@ -1074,6 +1145,45 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
+std::pair<Buffer*, uint64_t> BufferCache::ObtainWrittenBuffer(uint64_t vaddr, uint64_t size,
+                                                              std::span<const GuestRange> written,
+                                                              BufferId                    id) {
+	auto& command = m_scheduler.Current();
+	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: buffer request requires a recording command buffer\n");
+	}
+	for (const auto& range: written) {
+		if (!range.Valid() || range.address < vaddr || range.End() > vaddr + size) {
+			EXIT("BufferCache: written range 0x%016" PRIx64 "+0x%" PRIx64
+			     " is outside its binding 0x%016" PRIx64 "+0x%" PRIx64 "\n",
+			     range.address, range.size, vaddr, size);
+		}
+	}
+	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		id = FindBuffer(vaddr, size);
+	}
+	auto& buffer = m_slot_buffers[id];
+	TouchBuffer(buffer);
+	// Bytes the shader cannot write only need the upload a read binding gets. Each written range
+	// then uploads anything dirtied meanwhile and becomes GPU-owned under the same tracker locks,
+	// exactly as a whole writable binding does.
+	(void)SynchronizeBuffer(buffer, vaddr, size, false, false, nullptr, "written-binding");
+	// Writable descriptors reserve a new version before recording their shader commands.
+	buffer.MarkContentWritten();
+	for (const auto& range: written) {
+		(void)SynchronizeBuffer(buffer, range.address, range.size, true, false, nullptr,
+		                        "written-binding");
+		if (!m_gpu_modified_ranges.Contains(range.address, range.size)) {
+			CleanVerdict::Invalidate(range.address, range.size, Coherence::Source::BufferDirtyAdd);
+		}
+		m_gpu_modified_ranges.Add(range.address, range.size);
+		NoteBufferContentWrite(range.address, range.size);
+		ForgetKnownFills(range.address, range.size);
+		HangTrace::NoteGpuWrite(range.address, range.size);
+	}
+	return {&buffer, buffer.Offset(vaddr)};
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
@@ -1127,6 +1237,44 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
 	RecordKnownFill(vaddr, size, value);
+}
+
+bool BufferCache::TryWriteDataGpu(uint64_t vaddr, const uint32_t* data, uint64_t size) {
+	if (vaddr == 0 || data == nullptr || size == 0 || (vaddr & 3u) != 0 || (size & 3u) != 0 ||
+	    size > 65536 || !GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	// Only bytes owned by recorded GPU work need ordering on the GPU timeline; everything else
+	// keeps the CPU write (which faults into the usual invalidation when tracked).
+	if (!HasGpuDirtyBytes(vaddr, size) && !HasPendingBackingPublication(vaddr, size)) {
+		return false;
+	}
+	KYTY_GPU_OP_SITE("buffercache.write_data");
+	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	HangTrace::ScopedGpuWriteKind trace_kind(HangTrace::GpuWriteKind::Copy);
+	auto [buffer, offset] = ObtainBuffer(vaddr, size, true, true);
+	auto& command         = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = buffer->Handle();
+	before.offset              = offset;
+	before.size                = size;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+	                       nullptr);
+	native.updateBuffer(buffer->Handle(), offset, size, data);
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1, &after, 0,
+	                       nullptr);
+	return true;
 }
 
 void BufferCache::RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value) {

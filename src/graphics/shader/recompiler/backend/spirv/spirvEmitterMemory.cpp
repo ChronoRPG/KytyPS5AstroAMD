@@ -174,11 +174,13 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	const auto bit =
 	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
+	// Atomic: lanes and waves faulting on pages that share a bitmap word must not lose bits
+	// (a load/or/store sequence races and drops faults).
 	const auto pointer = FaultElementPointer(state, word);
-	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-	state.builder.AddFunction(spv::OpStore, pointer,
-	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
+	const auto result  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), result, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
 }
 
 uint32_t GetBdaPointer(ValueEmitContext& ctx, uint32_t address) {

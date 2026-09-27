@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -43,6 +44,8 @@ enum class ContextStateOperation : uint32_t {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// The last Process call stopped after a completed packet to let other queues run.
+	[[nodiscard]] bool Yielded() const noexcept { return m_yielded; }
 
 private:
 	friend class CommandProcessor;
@@ -57,6 +60,8 @@ private:
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
+	bool                      m_yield         = false; // stop after the current packet
+	bool                      m_yielded       = false;
 };
 
 class CommandProcessor {
@@ -80,7 +85,18 @@ public:
 	void            BufferInit();
 	void            BufferFlush();
 	void            BufferFlushAndWait();
+	// Flush requested by an end-of-pipe interrupt. Interrupts fire when their tick completes, so
+	// only every KYTY_EOP_FLUSH_BATCH-th request flushes (default 8; 1 = flush every time); a
+	// slice always ends with a flush, so a pending interrupt is submitted before the CP blocks.
+	void            BufferFlushForEop();
+	static uint32_t EopFlushPacketLimit();
 	void            BufferWait();
+	// Early submit when the GPU ran out of submitted work (KYTY_IDLE_FLUSH_DRAWS). Call after
+	// recording a draw or dispatch, at a packet boundary.
+	void            MaybeFlushIdleGpu();
+	// Graphics queue: after KYTY_GFX_SLICE_DRAWS draws in a slice, end the slice after the
+	// current packet when another queue has runnable work. Call after recording a draw.
+	void            MaybeYieldSlice();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { return m_sh_ctx; }
@@ -167,6 +183,30 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	// Defers an end-of-pipe label (and its interrupt) to the completion of the current tick when
+	// a visibility-proxy dump armed it (KYTY_OCCLUSION_PROXY_MODE=defer-label), every label is
+	// deferred (KYTY_LABEL_MODE=completion), or an older deferred label to the same address is
+	// still pending (write order). Returns false when the label must be written now.
+	[[nodiscard]] bool TryDeferLabel(void* dst, uint64_t value, uint32_t size, bool interrupt,
+	                                 uint32_t interrupt_context_id);
+	// KYTY_GDS_EOP_MODE=defer: snapshot a GDS range at this packet and write it to `dst` at the
+	// tick's completion instead of draining the GPU. Returns false for the synchronous path.
+	[[nodiscard]] bool TryDeferGdsRead(uint32_t* dst, uint32_t dw_offset, uint32_t dw_size,
+	                                   bool interrupt, uint32_t interrupt_context_id);
+	// Writes (or defers) the data of an end-of-pipe event Kyty used to drop (counted under
+	// `counter`). Returns true when a deferred write took over raising the interrupt.
+	[[nodiscard]] bool WriteDroppedLabel(void* dst, uint64_t value, uint32_t size, bool interrupt,
+	                                     uint32_t interrupt_context_id,
+	                                     Profiler::FrameEvent counter);
+
+public:
+	// RELEASE_MEM with INT_SEL=4 and DATA_SEL != 0 (previously no data was written): writes the
+	// data (1: 32-bit, 2: 64-bit, 3: reference clock). Returns true when a deferred write took
+	// over raising the interrupt (the caller then only flushes).
+	[[nodiscard]] bool WriteReleaseMemDroppedData(void* dst, uint64_t value, uint32_t data_sel,
+	                                              bool interrupt, uint32_t interrupt_context_id);
+
+private:
 	[[nodiscard]] bool  TryDrawIndirectNative(DrawIndirectSource source);
 	void                ValidateIndirectSource(const DrawIndirectSource& source);
 	[[nodiscard]] uint32_t NumInstances();
@@ -218,6 +258,17 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	uint32_t  m_deferred_eop_flushes        = 0;
+	uint32_t  m_packets_since_eop_request   = 0;
+	// A visibility-proxy end dump was recorded: defer the next end-of-pipe label (defer-label).
+	bool      m_defer_next_label            = false;
+	// The current WAIT_FLIP_DONE packet already flushed and suspended (retries skip the flush).
+	bool      m_flip_wait_suspended         = false;
+	// MaybeFlushIdleGpu: recording tick being counted and its draws/dispatches so far.
+	uint64_t  m_idle_flush_tick             = 0;
+	uint32_t  m_idle_flush_draws            = 0;
+	// Draws recorded in the current graphics slice (MaybeYieldSlice).
+	uint32_t  m_slice_draws                 = 0;
 
 	struct DrawPrepDeleter {
 		void operator()(DrawPrep::Engine* engine) const noexcept;

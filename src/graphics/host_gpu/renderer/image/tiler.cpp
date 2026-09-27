@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "gpu_tiler_shaders/gpu_tiler_demote_d16_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_depth_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_promote_d16_spv.h"
@@ -23,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -58,9 +60,30 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 	RequireVulkanSuccess(
 	    m_graphics.device.createPipelineLayout(&layout_info, nullptr, &m_pipeline_layout),
 	    "create TileManager pipeline layout");
+
+	// KYTY_TILER_SCRATCH_POOL=0 restores one native scratch buffer per detile/tile operation;
+	// KYTY_TILER_SCRATCH_POOL_MB bounds the idle pooled bytes (default 256).
+	const auto* pool = std::getenv("KYTY_TILER_SCRATCH_POOL");
+	if (pool == nullptr || std::strcmp(pool, "0") != 0) {
+		m_scratch_pool_limit = 256ull * 1024 * 1024;
+		if (const auto* limit = std::getenv("KYTY_TILER_SCRATCH_POOL_MB"); limit != nullptr) {
+			m_scratch_pool_limit = std::strtoull(limit, nullptr, 10) * 1024ull * 1024ull;
+		}
+	}
+	// Detile output is consumed only by buffer->image copies (and element-wise conversions)
+	// that read exactly the width x height elements of each tile at its pitch, all of which the
+	// dispatches write; only row/level padding was cleared. KYTY_TILER_CLEAR_SCRATCH=1 clears.
+	if (const auto* clear = std::getenv("KYTY_TILER_CLEAR_SCRATCH");
+	    clear != nullptr && std::strcmp(clear, "1") == 0) {
+		m_clear_detile_scratch = true;
+	}
 }
 
 TileManager::~TileManager() {
+	for (const auto& scratch: m_scratch_pool) {
+		vmaDestroyBuffer(m_graphics.allocator, scratch.buffer, scratch.allocation);
+	}
+	m_scratch_pool.clear();
 	for (auto pipeline: m_pipelines) {
 		if (pipeline != nullptr) {
 			m_graphics.device.destroyPipeline(pipeline, nullptr);
@@ -91,8 +114,30 @@ TileManager::~TileManager() {
 
 TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	EXIT_IF(size == 0);
+	// Every upload detiles into a fresh scratch buffer. Reuse completed ones by size class
+	// instead of creating and destroying a native buffer per upload.
+	constexpr uint64_t MinClass   = 64ull * 1024;
+	constexpr uint64_t LargeClass = 64ull * 1024 * 1024;
+	const uint64_t     capacity   = m_scratch_pool_limit == 0 ? size
+	                                : size <= LargeClass
+	                                    ? std::max(MinClass, std::bit_ceil(size))
+	                                    : Common::AlignUp(size, 16ull * 1024 * 1024);
+	if (m_scratch_pool_limit != 0) {
+		std::scoped_lock lock(m_scratch_mutex);
+		for (size_t index = m_scratch_pool.size(); index > 0; --index) {
+			if (m_scratch_pool[index - 1].capacity == capacity) {
+				auto scratch = m_scratch_pool[index - 1];
+				m_scratch_pool.erase(m_scratch_pool.begin() + static_cast<std::ptrdiff_t>(index - 1));
+				m_scratch_pool_bytes -= capacity;
+				Profiler::CountFrameEvent(Profiler::FrameEvent::TilerScratchPoolHits);
+				scratch.size = size;
+				return scratch;
+			}
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TilerScratchPoolMisses);
+	}
 	vk::BufferCreateInfo create {};
-	create.size  = size;
+	create.size  = capacity;
 	create.usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
 	               vk::BufferUsageFlagBits::eTransferDst;
 
@@ -104,13 +149,40 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	RequireVulkanSuccess(static_cast<vk::Result>(vmaCreateBuffer(
 	                         m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr)),
 	                     "allocate TileManager scratch buffer");
-	return {buffer, memory, size};
+	return {buffer, memory, size, capacity};
 }
 
 void TileManager::DeferDestroy(Scratch scratch) {
+	if (m_scratch_pool_limit != 0) {
+		// Runs once the scheduler tick that uses the buffer has completed.
+		m_scheduler.DeferOperation([this, scratch] { ReleaseScratch(scratch); });
+		return;
+	}
 	auto allocator = m_graphics.allocator;
 	m_scheduler.DeferOperation(
 	    [allocator, scratch] { vmaDestroyBuffer(allocator, scratch.buffer, scratch.allocation); });
+}
+
+void TileManager::ReleaseScratch(Scratch scratch) {
+	std::vector<Scratch> evicted;
+	{
+		std::scoped_lock lock(m_scratch_mutex);
+		if (scratch.capacity <= m_scratch_pool_limit) {
+			while (!m_scratch_pool.empty() &&
+			       scratch.capacity > m_scratch_pool_limit - m_scratch_pool_bytes) {
+				evicted.push_back(m_scratch_pool.front());
+				m_scratch_pool_bytes -= m_scratch_pool.front().capacity;
+				m_scratch_pool.erase(m_scratch_pool.begin());
+			}
+			m_scratch_pool.push_back(scratch);
+			m_scratch_pool_bytes += scratch.capacity;
+		} else {
+			evicted.push_back(scratch);
+		}
+	}
+	for (const auto& old: evicted) {
+		vmaDestroyBuffer(m_graphics.allocator, old.buffer, old.allocation);
+	}
 }
 
 void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
@@ -374,7 +446,7 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	auto scratch = AllocateScratch(Common::AlignUp(linear_capacity, 4));
 	DeferDestroy(scratch);
 	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches,
-	       true);
+	       m_clear_detile_scratch);
 	return {scratch.buffer, 0, linear_capacity};
 }
 

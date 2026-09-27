@@ -481,9 +481,10 @@ struct Engine::Workers {
 	std::vector<std::thread> threads;
 };
 
-Engine::Engine(RenderContext& renderer, std::function<void()> service_commands)
+Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
+               std::function<void()> after_commit)
     : m_renderer(renderer), m_mode(GetMode()), m_service_commands(std::move(service_commands)),
-      m_inline_slot(std::make_unique<Slot>()) {
+      m_after_commit(std::move(after_commit)), m_inline_slot(std::make_unique<Slot>()) {
 	if (m_mode == Mode::Parallel) {
 		const auto window  = EnvUnsigned("KYTY_DRAW_PREP_WINDOW", 32, 2, 1024);
 		const auto workers = EnvUnsigned("KYTY_DRAW_PREP_WORKERS", 6, 1, 32);
@@ -619,6 +620,9 @@ void Engine::Commit(Slot& slot) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepUnused);
 	}
 	scheduler.RestoreRegisters(previous);
+	if (m_after_commit) {
+		m_after_commit();
+	}
 }
 
 void Engine::NoteFence() {
