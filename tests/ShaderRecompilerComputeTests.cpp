@@ -14086,6 +14086,25 @@ public:
       const vk::Bool32 write = true;
       cmd.setColorWriteEnableEXT(1, &write);
       cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      if (PipelineDynamicRasterStateEnabled()) {
+        // Dynamic in every renderer pipeline (KYTY_PIPELINE_DYNAMIC_STATE); the
+        // draw path records them from the same registers the key used to hold.
+        const auto &mode = registers.GetModeControl();
+        vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
+        if (mode.cull_back) {
+          cull_mode |= vk::CullModeFlagBits::eBack;
+        }
+        if (mode.cull_front) {
+          cull_mode |= vk::CullModeFlagBits::eFront;
+        }
+        cmd.setCullMode(cull_mode);
+        cmd.setFrontFace(mode.face ? vk::FrontFace::eClockwise
+                                   : vk::FrontFace::eCounterClockwise);
+        cmd.setDepthBoundsTestEnable(depth.depth_bounds_test_enable);
+        if (depth.depth_bounds_test_enable) {
+          cmd.setDepthBounds(depth.depth_min_bounds, depth.depth_max_bounds);
+        }
+      }
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
       cmd.draw(vertex_count, 1, 0, 0);
