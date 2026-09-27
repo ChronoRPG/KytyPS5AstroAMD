@@ -22,7 +22,8 @@
 //
 // The generation is the clean-verdict generation: CleanVerdict::Invalidate() appends here.
 // Entries are recorded only when something reads them (LogReadersEnabled: the log-mode draw-prep
-// certificate or its audit); otherwise an append only bumps the generation.
+// certificate, the default whenever draw prep runs, or its audit); otherwise an append only bumps
+// the generation.
 //
 // Readers (the draw-prep certificate check on the GPU thread) ask whether any entry in the
 // generation interval (g0, g1] intersects a set of ranges. The log is a ring: an interval that
@@ -210,15 +211,21 @@ private:
 // The process-wide log (one per coherence domain: the guest GPU).
 inline Log g_log;
 
-// Whether anything reads the log's entries: only the log-mode draw-prep certificate
-// (KYTY_DRAW_PREP_CERT=log) and its audit (KYTY_DRAW_PREP_LOG_AUDIT=1). Otherwise transitions
-// only bump the generation (the clean-verdict cache's), exactly as before the log existed.
-// Decided once per process, so entries are either always or never recorded.
+// Whether anything reads the log's entries: only the log-mode draw-prep certificate (the default
+// whenever draw prep runs, KYTY_DRAW_PREP=inline|parallel; KYTY_DRAW_PREP_CERT=value turns it
+// off) and its audit (KYTY_DRAW_PREP_LOG_AUDIT=1). Otherwise transitions only bump the
+// generation (the clean-verdict cache's), exactly as before the log existed. Decided once per
+// process, so entries are either always or never recorded. Keep in step with
+// DrawPrep::GetMode() and DrawPrep::GetCertMode().
 [[nodiscard]] inline bool LogReadersEnabled() noexcept {
 	static const bool enabled = [] {
+		const auto* prep  = std::getenv("KYTY_DRAW_PREP");
 		const auto* cert  = std::getenv("KYTY_DRAW_PREP_CERT");
 		const auto* audit = std::getenv("KYTY_DRAW_PREP_LOG_AUDIT");
-		return (cert != nullptr && std::strcmp(cert, "log") == 0) ||
+		const bool  prep_on =
+		    prep != nullptr && (std::strcmp(prep, "inline") == 0 || std::strcmp(prep, "parallel") == 0);
+		const bool log_certificates = prep_on && !(cert != nullptr && std::strcmp(cert, "value") == 0);
+		return log_certificates ||
 		       (audit != nullptr && *audit != '\0' && std::strcmp(audit, "0") != 0);
 	}();
 	return enabled;
