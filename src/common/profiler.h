@@ -288,6 +288,10 @@ enum class FrameEvent : uint32_t {
 	LabelWritesDeferredOrdered,
 	WaitRegMemDeferredLabel,
 	WaitRegMemDeferredLabelFlushes,
+	// Completion-runner (priority) operations run, and broadcasts to WaitPriorityOperations /
+	// DrainPriorityOperations waiters (KYTY_PRIORITY_WAKE_BATCH: only at a tick boundary with waiters).
+	PriorityOperationsRun,
+	PriorityWaiterWakeups,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

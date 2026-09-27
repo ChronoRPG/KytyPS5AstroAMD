@@ -52,6 +52,14 @@ public:
 	    Common::UniqueFunction<void>&& operation,
 	    PriorityOperationKind kind = PriorityOperationKind::Generic);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+	// Called on the completion runner after every priority operation (e.g. to wake queues
+	// suspended on what it published). Clear it, then DrainPriorityOperations, before the
+	// context dies: the call happens while the operation is still marked active.
+	using ProgressHook = void (*)(void* context);
+	void SetProgressHook(ProgressHook hook, void* context);
+	// KYTY_PRIORITY_WAKE_BATCH=0 restores a runner wake per queued operation and a waiter
+	// broadcast after every operation.
+	[[nodiscard]] static bool PriorityWakeupsBatched();
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
@@ -104,9 +112,14 @@ private:
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
-	std::jthread                 m_priority_thread;
+	// The completion runner sleeps on its own condition, so a push can wake exactly it.
+	std::condition_variable      m_priority_available;
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
+	// Threads in WaitPriorityOperations/DrainPriorityOperations (m_operation_mutex).
+	uint32_t                     m_priority_waiters     = 0;
+	ProgressHook                 m_progress_hook         = nullptr;
+	void*                        m_progress_hook_context = nullptr;
 	OperationState               m_operation_state      = OperationState::Open;
 	// Guarded by m_operation_mutex, alongside callback registration and the
 	// queued-submit tick transition. Captured into each owned submission record.
@@ -118,6 +131,8 @@ private:
 	std::unique_ptr<GpuTimestampRing> m_gpu_timing;
 	// Guest scheduler with KYTY_GPU_OP_PROFILE / counters enabled (gpuOpProfiler.h).
 	bool m_gpu_ops = false;
+	// Declared last: the runner starts in the constructor and uses the members above.
+	std::jthread m_priority_thread;
 };
 
 } // namespace Libs::Graphics
