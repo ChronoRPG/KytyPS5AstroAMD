@@ -34,6 +34,13 @@
 #endif
 
 namespace HangTrace {
+
+namespace Detail {
+std::atomic<int8_t> g_enabled {-1};
+uint64_t            g_cp_watch_begin = 0;
+uint64_t            g_cp_watch_end   = 0;
+} // namespace Detail
+
 namespace {
 
 constexpr uint32_t kMaxQueues   = 64;
@@ -225,6 +232,34 @@ struct TransferTotals {
 };
 std::mutex                                                          g_transfer_mutex;
 std::unordered_map<TransferKey, TransferTotals, TransferKeyHash>    g_transfers;
+
+// unclean.csv (RecordUncleanRead). Distinct keys per published second; further keys fold into
+// page 0 of the same reason, purpose and caller.
+constexpr size_t kUncleanKeyLimit = 4096;
+struct UncleanKey {
+	const char* reason  = nullptr;
+	const char* purpose = nullptr;
+	uint64_t    caller  = 0;
+	uint64_t    page    = 0;
+	bool        operator==(const UncleanKey&) const = default;
+};
+struct UncleanKeyHash {
+	size_t operator()(const UncleanKey& k) const {
+		uint64_t h = k.page * 0x9E3779B97F4A7C15ull;
+		h ^= reinterpret_cast<uintptr_t>(k.reason) + (h << 6u) + (h >> 2u);
+		h ^= reinterpret_cast<uintptr_t>(k.purpose) + (h << 6u) + (h >> 2u);
+		h ^= k.caller + (h << 6u) + (h >> 2u);
+		return static_cast<size_t>(h * 0x94D049BB133111EBull);
+	}
+};
+struct UncleanTotals {
+	uint64_t count         = 0;
+	uint64_t bytes         = 0;
+	uint64_t first_address = 0;
+	uint64_t first_size    = 0;
+};
+std::mutex                                                     g_unclean_mutex;
+std::unordered_map<UncleanKey, UncleanTotals, UncleanKeyHash> g_unclean_reads;
 std::unordered_map<NativeImageKey, NativeImageTotals, NativeImageKeyHash> g_native_images;
 
 // LOD report watch state.
@@ -399,6 +434,7 @@ struct Files {
 	std::FILE* transfers     = nullptr;
 	std::FILE* compiles      = nullptr;
 	std::FILE* cp            = nullptr;
+	std::FILE* unclean       = nullptr;
 };
 Files g_files;
 
@@ -408,8 +444,8 @@ std::vector<std::string> g_pending_cp_rows;
 uint64_t                 g_cp_rows_total = 0;
 thread_local uint32_t    g_cp_queue      = UINT32_MAX;
 thread_local uint64_t    g_cp_sequence   = 0;
-uint64_t                 g_cp_watch_begin = 0;
-uint64_t                 g_cp_watch_end   = 0;
+using Detail::g_cp_watch_begin;
+using Detail::g_cp_watch_end;
 
 constexpr uint64_t       kOcclusionRowLimit = 2'000'000;
 std::mutex               g_occlusion_mutex;
@@ -523,6 +559,18 @@ std::string FormatAddress(uint64_t address) {
 	if (const auto* m = FindModule(address); m != nullptr) {
 		return fmt::format("{}+0x{:x}", m->name, address - m->base);
 	}
+	return fmt::format("0x{:x}", address);
+}
+
+// A host code address as "exe+0x<rva>" when it lies in the emulator's image (resolve with its
+// PDB), else absolute.
+std::string FormatHostAddress(uint64_t address) {
+#ifdef _WIN32
+	static const auto base = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+	if (base != 0 && address >= base && address - base < 0x40000000u) {
+		return fmt::format("exe+0x{:x}", address - base);
+	}
+#endif
 	return fmt::format("0x{:x}", address);
 }
 
@@ -696,6 +744,30 @@ void Publish() {
 	WriteRows(g_files.transfers, rows);
 
 	{
+		std::unordered_map<UncleanKey, UncleanTotals, UncleanKeyHash> unclean;
+		{
+			std::scoped_lock lock(g_unclean_mutex);
+			unclean.swap(g_unclean_reads);
+		}
+		const auto now_ms = NowMs();
+		std::scoped_lock lock(g_page_writer_mutex);
+		for (const auto& [key, totals]: unclean) {
+			std::string writer = ",,";
+			if (auto it = g_page_writers.find(key.page >> 12u); it != g_page_writers.end()) {
+				writer = fmt::format("{},{},{}",
+				                     kGpuWriteKindNames[static_cast<uint32_t>(it->second.kind)],
+				                     now_ms - std::min(now_ms, it->second.t_ms), it->second.size);
+			}
+			rows.push_back(fmt::format("{},{},{},{},0x{:x},{},{},0x{:x},{},{}", t_ms, key.reason,
+			                           key.purpose != nullptr ? key.purpose : "",
+			                           FormatHostAddress(key.caller), key.page, totals.count,
+			                           totals.bytes, totals.first_address, totals.first_size,
+			                           writer));
+		}
+	}
+	WriteRows(g_files.unclean, rows);
+
+	{
 		std::scoped_lock lock(g_compile_mutex);
 		rows.swap(g_pending_compile_rows);
 	}
@@ -858,7 +930,8 @@ void Publish() {
 
 	for (auto* file: {g_files.summary, g_files.apr, g_files.imports, g_files.imports_index,
 	                  g_files.lod, g_files.tex, g_files.modules, g_files.queues, g_files.readbacks,
-	                  g_files.images, g_files.lodwatch, g_files.transfers, g_files.compiles}) {
+	                  g_files.images, g_files.lodwatch, g_files.transfers, g_files.compiles,
+	                  g_files.unclean}) {
 		if (file != nullptr) {
 			std::fflush(file);
 		}
@@ -867,8 +940,9 @@ void Publish() {
 
 } // namespace
 
-bool Enabled() {
-	static const bool enabled = EnvFlag("KYTY_HANG_TRACE", false);
+bool Detail::ReadEnabled() noexcept {
+	const bool enabled = EnvFlag("KYTY_HANG_TRACE", false);
+	g_enabled.store(enabled ? 1 : 0, std::memory_order_relaxed);
 	return enabled;
 }
 
@@ -885,11 +959,6 @@ bool CpTraceEnabled() {
 void SetCpContext(uint32_t queue, uint64_t sequence) {
 	g_cp_queue    = queue;
 	g_cp_sequence = sequence;
-}
-
-bool CpWatch(uint64_t address, uint64_t size) {
-	return CpTraceEnabled() && g_cp_watch_end > g_cp_watch_begin && address < g_cp_watch_end &&
-	       g_cp_watch_begin < address + size;
 }
 
 void RecordCp(const CpEvent& event) {
@@ -994,6 +1063,10 @@ void Initialize() {
 	g_files.transfers = OpenFile("transfers.csv",
 	                             "t_ms,kind,reason,detail,address,format,width,height,count,bytes,"
 	                             "span_bytes");
+	g_files.unclean   = OpenFile("unclean.csv",
+	                             "t_ms,reason,purpose,caller,page,count,bytes,first_address,"
+	                             "first_size,last_gpu_writer,last_gpu_write_age_ms,"
+	                             "last_gpu_write_size");
 	g_files.readbacks = OpenFile("readbacks.csv",
 	                             "t_ms,kind,vaddr,size,window_begin,window_size,downloaded,"
 	                             "duration_us,host_tid,thread,pc,stack_callers,last_gpu_writer,"
@@ -1072,7 +1145,7 @@ void Shutdown() {
 	for (auto** file: {&g_files.summary, &g_files.apr, &g_files.imports, &g_files.imports_index,
 	                   &g_files.lod, &g_files.tex, &g_files.modules, &g_files.queues,
 	                   &g_files.readbacks, &g_files.images, &g_files.lodwatch,
-	                   &g_files.transfers, &g_files.compiles}) {
+	                   &g_files.transfers, &g_files.compiles, &g_files.unclean}) {
 		if (*file != nullptr) {
 			std::fclose(*file);
 			*file = nullptr;
@@ -1591,6 +1664,24 @@ void RecordTransfer(TransferKind kind, const char* reason, const char* detail, u
 	totals.count++;
 	totals.bytes += bytes;
 	totals.span_bytes += span_bytes;
+}
+
+void RecordUncleanRead(uint64_t address, uint64_t size, const char* reason, const char* purpose,
+                       uint64_t caller) {
+	if (!Enabled()) {
+		return;
+	}
+	UncleanKey key {reason != nullptr ? reason : "", purpose, caller, address & ~uint64_t {0xfff}};
+	std::scoped_lock lock(g_unclean_mutex);
+	if (g_unclean_reads.size() >= kUncleanKeyLimit && !g_unclean_reads.contains(key)) {
+		key.page = 0;
+	}
+	auto& totals = g_unclean_reads[key];
+	if (totals.count++ == 0) {
+		totals.first_address = address;
+		totals.first_size    = size;
+	}
+	totals.bytes += size;
 }
 
 void RecordQueueWait(uint32_t queue, uint64_t wait_ns) {

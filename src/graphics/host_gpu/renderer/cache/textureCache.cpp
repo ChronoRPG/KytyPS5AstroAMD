@@ -636,6 +636,7 @@ void TextureCache::EnsureResidency(ImageId id, uint32_t first_level, bool sampli
 	if (first_level >= image.resident_first) {
 		return;
 	}
+	++m_lookup_side_effects;
 	const auto prefix    = ResidentPrefixSize(image.info, first_level);
 	const auto new_first = prefix != 0 ? first_level : 0u;
 	// The registered range grows. For everything keyed on the page owner index (clean-page
@@ -2554,8 +2555,14 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 }
 
 void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
-                                       uint32_t metadata_base_layer) {
+                                       uint32_t metadata_base_layer, MetadataNoop* noop) {
+	if (noop != nullptr) {
+		*noop = {};
+	}
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc) {
+		if (noop != nullptr) {
+			noop->provable = true;
+		}
 		return;
 	}
 	KYTY_PROFILER_DETAIL_FUNCTION();
@@ -2567,6 +2574,10 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		// A native DCC allocation must not retain a reused HTile/CMask/FMask interpretation.
 		m_surface_metas.erase(range.address);
 		if (range.size == 0 || desc.info.resources.levels != 1 || image.info.resources.levels != 1) {
+			// Decided by the description and the image's level count (fixed for its lifetime).
+			if (noop != nullptr) {
+				noop->provable = true;
+			}
 			return;
 		}
 	}
@@ -2592,17 +2603,29 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		// The guest's DCC fast clear is a uniform fill of the metadata. When the whole range still
 		// holds a recorded fill (nothing wrote it since), every slice's code is that byte: no
 		// GPU readback is needed to decide the clear.
-		const auto known = m_buffer_cache.KnownFill(range.address, range.size);
+		uint64_t   fill_generation = 0;
+		const auto known = m_buffer_cache.KnownFill(range.address, range.size, fill_generation);
 		bool       unaliased = false;
+		bool       pages     = false;
+		MetadataNoop decided;
 		if (known) {
 			std::scoped_lock lock {m_lock};
 			unaliased = FindImagesInRegion(range.address, range.size, false).empty();
+			pages     = noop != nullptr && CaptureMetadataPages(range, decided);
 		}
 		const uint32_t known_byte = known ? (*known & 0xffu) : 0u;
 		if (known && unaliased && *known == known_byte * 0x01010101u) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DccKnownFillClears);
 			vk::ClearValue clear {};
 			if (!DecodeDccClear(desc, static_cast<uint8_t>(known_byte), clear.color)) {
+				// Decided by the GPU-dirty state, the recorded fill and the images over the bytes.
+				if (pages) {
+					decided.fill_generation = fill_generation;
+					decided.gpu_ranges[0]   = range;
+					decided.gpu_range_count = 1;
+					decided.provable        = true;
+					*noop                   = decided;
+				}
 				return; // e.g. 0xFF: not a clear code, nothing to materialize
 			}
 			const auto slice_size = range.size / layers;
@@ -2794,9 +2817,19 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 }
 
 void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
-                                         uint32_t metadata_base_layer) {
+                                         uint32_t metadata_base_layer, MetadataNoop* noop) {
 	using Event = Profiler::FrameEvent;
+	if (noop != nullptr) {
+		*noop = {};
+	}
+	// Decided by the description alone.
+	const auto description_noop = [noop] {
+		if (noop != nullptr) {
+			noop->provable = true;
+		}
+	};
 	if (!desc.cmask.valid || desc.type != BindingType::RenderTarget || !id) {
+		description_noop();
 		return;
 	}
 	KYTY_PROFILER_DETAIL_FUNCTION();
@@ -2808,15 +2841,29 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 	    view.layer_count == 0 || metadata_base_layer >= layers ||
 	    view.layer_count > layers - metadata_base_layer) {
 		Profiler::CountFrameEvent(Event::CmaskFastClearShape);
+		description_noop();
 		return;
 	}
 	vk::ClearValue clear {};
 	if (!DecodePackedColorClear64(view.format, desc.cmask.clear_word0, desc.cmask.clear_word1,
 	                              clear.color)) {
 		Profiler::CountFrameEvent(Event::CmaskFastClearFormat);
+		description_noop();
 		return;
 	}
 	const auto slice_size = range.size / layers;
+	// MetadataNoop: the images over the bound slices' bytes are captured before any slice is
+	// decided (a change in between only makes the record older than what the decisions read, so a
+	// repeat is refused). Every slice must be decided by aliasing or by a recorded fill of
+	// GPU-owned bytes that is not a clear; reading guest bytes, an inspection or a clear refuse.
+	MetadataNoop decided;
+	bool         provable = false;
+	if (noop != nullptr) {
+		std::scoped_lock lock {m_lock};
+		provable = CaptureMetadataPages(
+		    {range.address + slice_size * metadata_base_layer, slice_size * view.layer_count},
+		    decided);
+	}
 	// Slices whose GPU-owned bytes only a native inspection or a readback can decide.
 	std::vector<uint8_t> native(view.layer_count, 0);
 	for (uint32_t slice = 0; slice < view.layer_count; slice++) {
@@ -2836,12 +2883,24 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		// native inspection below, which reads them on the GPU.
 		std::optional<uint32_t> value;
 		if (m_buffer_cache.IsRegionGpuModified(metadata.address, metadata.size)) {
-			value = m_buffer_cache.KnownFill(metadata.address, metadata.size);
+			uint64_t fill_generation = 0;
+			value = m_buffer_cache.KnownFill(metadata.address, metadata.size, fill_generation);
 			if (!value) {
 				native[slice] = 1;
+				provable      = false;
 				continue;
 			}
+			if (provable) {
+				if ((decided.fill_generation != 0 && decided.fill_generation != fill_generation) ||
+				    decided.gpu_range_count == MetadataNoop::MaxGpuRanges) {
+					provable = false;
+				} else {
+					decided.fill_generation                          = fill_generation;
+					decided.gpu_ranges[decided.gpu_range_count++] = metadata;
+				}
+			}
 		} else {
+			provable = false;
 			std::vector<uint32_t> words(metadata.size / sizeof(uint32_t));
 			if (LibKernel::Memory::TryReadBacking(metadata.address, words.data(), metadata.size) &&
 			    std::all_of(words.begin(), words.end(),
@@ -2856,6 +2915,7 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 			                                                        : Event::CmaskFastClearUnproven);
 			continue;
 		}
+		provable = false;
 		{
 			std::scoped_lock lock {m_lock};
 			ClearImage(m_scheduler.Current(), id, view.format,
@@ -2869,6 +2929,10 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		Profiler::CountFrameEvent(Event::CmaskFastClears);
 	}
 	if (std::ranges::find(native, uint8_t {1}) == native.end()) {
+		if (provable) {
+			decided.provable = true;
+			*noop            = decided;
+		}
 		return;
 	}
 	// GPU-owned bytes without a recorded fill (the game's own fill kernel is not a proven uniform
@@ -2998,8 +3062,11 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
-ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup* record) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
+	if (record != nullptr) {
+		*record = {};
+	}
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -3016,6 +3083,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		std::scoped_lock lock {m_lock};
 		ImageIds candidates;
 		const bool use_legacy = m_image_lookup_mode != ImageLookupMode::FirstPage;
+		// The answer is the first-page lookup's, unchanged by anything below (RepeatLookup).
+		bool first_page_answer = false;
 		if (use_legacy) {
 			candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 			for (const auto id: candidates) {
@@ -3041,7 +3110,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				}
 			}
 		} else {
-			result = FindImageWithSameBacking(desc.info, exact_format);
+			result            = FindImageWithSameBacking(desc.info, exact_format);
+			first_page_answer = static_cast<bool>(result);
 		}
 
 		int32_t view_mip   = -1;
@@ -3084,6 +3154,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
+			first_page_answer = false;
 			// A prefix computed as not applicable (0) keeps the image fully resident; InsertImage
 			// computes it when this lookup did not.
 			result = InsertImage(desc.info,
@@ -3108,9 +3179,29 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		SyncAliasFromOwner(result);
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
+		// RepeatLookup: the state a repeat is checked against, taken after the residency extension
+		// and alias synchronization above (which may re-register the image or make it the owner).
+		// Video-out lookups also check the image's contents below: never repeated.
+		ImagePageTable::PageRange pages {};
+		if (record != nullptr && first_page_answer && image.registered &&
+		    desc.type != BindingType::VideoOut &&
+		    ImagePageTable::TryGetPageRange(desc.info.data.address, desc.info.data.size, pages) &&
+		    FindImageWithSameBacking(desc.info, exact_format) == result) {
+			record->image           = result;
+			record->page            = pages.first;
+			record->page_version    = PageVersion(pages.first);
+			record->requested_first = RequestedFirstLevel(desc, image.info.resources.levels);
+			record->exact_format    = exact_format;
+			record->has_partner     = HasAliasPartner(pages.first, result, image);
+			record->valid           = true;
+		}
 	}
-	MaterializeDccClear(result, desc, metadata_base_layer);
-	MaterializeCmaskClear(result, desc, metadata_base_layer);
+	const bool recording = record != nullptr && record->valid;
+	MaterializeDccClear(result, desc, metadata_base_layer, recording ? &record->dcc : nullptr);
+	MaterializeCmaskClear(result, desc, metadata_base_layer, recording ? &record->cmask : nullptr);
+	if (recording) {
+		record->valid = record->dcc.provable && record->cmask.provable;
+	}
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		std::scoped_lock lock {m_lock};
@@ -3124,6 +3215,90 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 	}
 	return result;
+}
+
+bool TextureCache::CaptureMetadataPages(GuestRange range, MetadataNoop& noop) const {
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(range.address, range.size, pages) ||
+	    pages.last_exclusive - pages.first > MetadataNoop::MaxPages) {
+		return false;
+	}
+	noop.first_page = pages.first;
+	noop.page_count = static_cast<uint32_t>(pages.last_exclusive - pages.first);
+	for (uint32_t i = 0; i < noop.page_count; i++) {
+		noop.page_versions[i] = PageVersion(pages.first + i);
+	}
+	return true;
+}
+
+bool TextureCache::MetadataPagesHold(const MetadataNoop& noop) const {
+	for (uint32_t i = 0; i < noop.page_count; i++) {
+		if (PageVersion(noop.first_page + i) != noop.page_versions[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool TextureCache::MetadataStateHolds(const MetadataNoop& noop) {
+	if (noop.fill_generation != 0 &&
+	    m_buffer_cache.KnownFillGeneration() != noop.fill_generation) {
+		return false;
+	}
+	for (uint32_t i = 0; i < noop.gpu_range_count; i++) {
+		const auto& range = noop.gpu_ranges[i];
+		if (!m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool TextureCache::RepeatGpuRangesLost(const RepeatLookup& record) {
+	for (const auto* noop: {&record.dcc, &record.cmask}) {
+		for (uint32_t i = 0; i < noop->gpu_range_count; i++) {
+			const auto& range = noop->gpu_ranges[i];
+			if (!m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool TextureCache::TryRepeatLookup(const ImageDesc& desc, bool exact_format,
+                                   const RepeatLookup& record, bool apply) {
+	if (!record.valid || record.exact_format != exact_format) {
+		return false;
+	}
+	if (m_scheduler.Current().IsInvalid()) {
+		EXIT("TextureCache: image lookup requires a valid command buffer\n");
+	}
+	// The metadata decisions read these outside the texture-cache lock, as FindImage's do.
+	if (!MetadataStateHolds(record.dcc) || !MetadataStateHolds(record.cmask)) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	auto*            image = m_slot_images.try_get(record.image);
+	if (m_image_lookup_mode != ImageLookupMode::FirstPage || image == nullptr ||
+	    !image->registered || PageVersion(record.page) != record.page_version ||
+	    record.requested_first < image->resident_first ||
+	    (record.has_partner && !SyncAliasReturnsAtOnce(*image)) ||
+	    !MetadataPagesHold(record.dcc) || !MetadataPagesHold(record.cmask)) {
+		return false;
+	}
+	if (!apply) {
+		return true;
+	}
+	// FindImage's access bookkeeping, and MaterializeDccClear's for a DCC description (it assigns
+	// the metadata and drops any other interpretation of those bytes before deciding anything).
+	image->tick_accessed_last = m_scheduler.CurrentTick();
+	TouchImage(*image);
+	if (desc.info.metadata.kind == ImageMetadataKind::Dcc) {
+		image->info.metadata = desc.info.metadata;
+		m_surface_metas.erase(desc.info.metadata.range.address);
+	}
+	return true;
 }
 
 void TextureCache::UpdateImage(ImageId id) {
@@ -3286,8 +3461,29 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 	}
 }
 
+bool TextureCache::SyncAliasReturnsAtOnce(const Image& image) {
+	return !AliasAgeByFrames() || image.alias_owner || image.depth_id || image.info.data.Empty() ||
+	       image.info.HasStencil() || image.backing.image == nullptr;
+}
+
+bool TextureCache::HasAliasPartner(uint64_t page, ImageId found, const Image& image) const {
+	bool partner = false;
+	if (const auto* owners = m_image_page_table.Find(page); owners != nullptr) {
+		owners->ForEach([&](ImageId id) {
+			const auto* other = m_slot_images.try_get(id);
+			if (id != found && other != nullptr && other->registered &&
+			    other->info.data == image.info.data && other->info.extent == image.info.extent &&
+			    other->backing.samples == image.backing.samples) {
+				partner = true;
+			}
+		});
+	}
+	return partner;
+}
+
 void TextureCache::SyncAliasFromOwner(ImageId id) {
 	auto& image = m_slot_images[id];
+	// TextureCache::SyncAliasReturnsAtOnce mirrors this condition.
 	if (!AliasAgeByFrames() || image.alias_owner || image.depth_id || image.info.data.Empty() ||
 	    image.info.HasStencil() || image.backing.image == nullptr) {
 		return;
@@ -3303,6 +3499,7 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 		    other->backing.samples != image.backing.samples) {
 			continue;
 		}
+		++m_lookup_side_effects;
 		// Taking over the owner's contents makes this image GPU-owned: whole chain.
 		RequireFullResidency(id);
 		const auto trace_sync = [&](const char* reason, uint64_t bytes) {

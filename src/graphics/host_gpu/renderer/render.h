@@ -494,6 +494,13 @@ private:
 	                        const ShaderTextureResource& descriptor,
 	                        const TextureBindingMemo::Key& memo_key, uint64_t hash, bool memo,
 	                        TextureBinding& binding);
+	// KYTY_DRAW_SEQUENCE_FAST (textures): PrepareBindings' texture resolution of a stage whose
+	// program and T# words are those its bindings were last resolved from, when
+	// TextureBindingMemo::TryRepeatResolve proves each ResolveTexture would give the same answer:
+	// performs what those resolutions would do (their bookkeeping, BindImage) and returns true.
+	[[nodiscard]] bool RepeatStageTextures(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                                       const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
+	                                       PreparedBindings&                               prepared);
 	[[nodiscard]] vk::Sampler NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
 	                                        uint32_t                                        index,
 	                                        const ShaderRecompiler::IR::DescriptorValue&    value);
@@ -607,6 +614,23 @@ private:
 	std::array<TextureDescriptionEntry, 4096> m_texture_descriptions;
 	// KYTY_TEXTURE_BINDING_MEMO: (T# dwords, resource) -> resolved image, description and view.
 	TextureBindingMemo m_texture_memo;
+	// KYTY_DRAW_SEQUENCE_VERIFY: the views a repeated stage claimed (RebindImages).
+	std::vector<vk::ImageView> m_claimed_views;
+	// KYTY_DRAW_SEQUENCE_FAST outcomes, always counted (the DrawSequence* frame events need a
+	// connected profiler); read by tests.
+	struct DrawSequenceTotals {
+		uint64_t target_repeats    = 0;
+		uint64_t target_misses     = 0;
+		uint64_t target_records    = 0;
+		uint64_t texture_repeats   = 0;
+		uint64_t texture_misses    = 0;
+		uint64_t texture_history_hits = 0;
+		uint64_t view_repeats      = 0;
+		uint64_t verify_checks     = 0;
+		uint64_t verify_mismatches = 0;
+		uint64_t verify_races      = 0;
+	};
+	DrawSequenceTotals m_draw_sequence_totals;
 	// KYTY_SAMPLER_MEMO: final sampler dwords -> native sampler. The sampler cache never evicts,
 	// so a remembered handle stays the one GetSampler returns for those dwords.
 	struct SamplerMemoEntry {
@@ -616,7 +640,8 @@ private:
 	std::array<SamplerMemoEntry, 64> m_sampler_memo {};
 	// KYTY_TARGET_DESC_MEMO: target descriptions are pure functions of the target registers
 	// (and constant device format support). Keyed on the exact register bytes; FindImage and
-	// everything after it still run for every draw.
+	// everything after it still run for every draw, except that a lookup of the unchanged
+	// description repeats the last one when that is proven (`lookup`, KYTY_DRAW_SEQUENCE_FAST).
 	struct ColorTargetDescMemo {
 		bool                            valid = false;
 		HW::RenderTarget                registers {};
@@ -626,14 +651,21 @@ private:
 		uint32_t                        guest_mip_level   = 0;
 		uint32_t                        guest_array_layer = 0;
 		Prospero::ColorComponentMapping export_mapping;
+		TextureCache::RepeatLookup      lookup;
 	};
 	std::array<ColorTargetDescMemo, RENDER_COLOR_ATTACHMENTS_MAX> m_color_target_memo {};
 	struct DepthTargetDescMemo {
-		bool                    valid = false;
-		HW::DepthRenderTarget   registers {};
-		TextureCache::ImageDesc desc;
+		bool                       valid = false;
+		HW::DepthRenderTarget      registers {};
+		TextureCache::ImageDesc    desc;
+		TextureCache::RepeatLookup lookup;
 	};
 	DepthTargetDescMemo        m_depth_target_memo {};
+	// A target lookup of `desc` (equal to the description `record` was made for, if it is valid):
+	// the proven repeat of the recorded lookup (TextureCache::TryRepeatLookup), otherwise
+	// FindImage, recording into `record`. Null `record`: FindImage (colorRenderTarget.cpp).
+	[[nodiscard]] ImageId FindTargetImage(TextureCache::ImageDesc& desc, bool exact_format,
+	                                      TextureCache::RepeatLookup* record);
 	GraphicsDynamicStateShadow m_dynamic_state {};
 	// Draw-prep (drawPrep.h): the preparation of the draw the engine is committing, taken by
 	// RefreshShaders in place of GetGraphicsPrograms when its certificate holds. Null otherwise.

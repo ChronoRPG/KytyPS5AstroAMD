@@ -52,9 +52,15 @@ namespace Libs::Graphics::GpuOpProfiler {
 
 namespace Detail {
 bool g_active = false;
+// The innermost and outermost KYTY_GPU_OP_SITE of the calling thread (ScopedSite, EnterSite).
+thread_local Site* t_site  = nullptr;
+thread_local Site* t_scope = nullptr;
 } // namespace Detail
 
 namespace {
+
+using Detail::t_scope;
+using Detail::t_site;
 
 // ------------------------------------------------------------------------------------------------
 // Configuration
@@ -117,13 +123,13 @@ uint64_t HandleBits(Handle handle) noexcept {
 // ------------------------------------------------------------------------------------------------
 // Sites
 
-thread_local Site* t_site  = nullptr;
-thread_local Site* t_scope = nullptr;
-
 std::atomic<Site*> g_sites {nullptr};
 constinit Site     g_unknown_site {"?"};
 
-void LinkSite(Site& site) noexcept {
+} // namespace
+
+// Links `site` into the published list (once; ScopedSite checks `linked` first).
+void Detail::LinkSite(Site& site) noexcept {
 	if (site.linked.load(std::memory_order_acquire)) {
 		return;
 	}
@@ -142,6 +148,10 @@ void LinkSite(Site& site) noexcept {
 	} while (!g_sites.compare_exchange_weak(head, &site, std::memory_order_release,
 	                                        std::memory_order_relaxed));
 }
+
+namespace {
+
+using Detail::LinkSite;
 
 // ------------------------------------------------------------------------------------------------
 // Counters

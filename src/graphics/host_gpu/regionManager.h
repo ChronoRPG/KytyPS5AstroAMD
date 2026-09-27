@@ -194,13 +194,13 @@ public:
 			bits.UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu) {
-			PublishCpuMirror();
+			PublishCpuMirror(start, end);
 		}
 		if constexpr (source == DirtySource::Gpu) {
 			// Any GPU ownership transition supersedes an outstanding side readback: a newer
 			// writer (enable) or an explicit download/unmark (disable) now owns these pages.
 			m_readback_pending.UnsetRange(start, end);
-			PublishGpuMirror();
+			PublishGpuMirror(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>();
@@ -221,11 +221,11 @@ public:
 			}
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
-				PublishCpuMirror();
+				PublishCpuMirror(start, end);
 				UpdateProtection<true, false>();
 			} else {
 				m_readback_pending.UnsetRange(start, end);
-				PublishGpuMirror();
+				PublishGpuMirror(start, end);
 				UpdateProtection<false, true>();
 			}
 		}
@@ -272,11 +272,16 @@ public:
 		// another watcher (an image) and are not part of a fault/reprotect cycle.
 		const RegionBits already_dirty(m_cpu_dirty, start, end);
 		m_cpu_dirty.SetRange(start, end);
+		// The pages whose CPU-dirty bits may change: the faulting ones and the fault-ahead window.
+		size_t changed_begin = start;
+		size_t changed_end   = end;
 		if (policy.ahead_pages > 1) {
 			const size_t window_begin = start / policy.ahead_pages * policy.ahead_pages;
 			const size_t window_end   = std::min<size_t>(
                 (end + policy.ahead_pages - 1) / policy.ahead_pages * policy.ahead_pages,
                 TRACKER_REGION_PAGES);
+			changed_begin = std::min(changed_begin, window_begin);
+			changed_end   = std::max(changed_end, window_end);
 			RegionBits all;
 			all.Fill();
 			const RegionBits window = RegionBits(all, window_begin, window_end) & ~m_gpu_dirty &
@@ -288,7 +293,7 @@ public:
 			}
 		}
 		// Published before the pages become writable: a guest write can only land after it.
-		PublishCpuMirror();
+		PublishCpuMirror(changed_begin, changed_end);
 		UpdateProtection<false, false>();
 		if (policy.hot_frames == 0) {
 			return result;
@@ -357,7 +362,7 @@ public:
 		const RegionBits normal = RegionBits(m_cpu_dirty, start, end) & ~hot;
 		if (normal.Any()) {
 			m_cpu_dirty ^= normal;
-			PublishCpuMirror();
+			PublishCpuMirror(start, end);
 			UpdateProtection<true, false>();
 		}
 		for (const auto [first, last]: normal) {
@@ -400,7 +405,7 @@ public:
 		m_hot ^= hot;
 		hot_count.fetch_sub(settled, std::memory_order_relaxed);
 		m_cpu_dirty ^= hot;
-		PublishCpuMirror();
+		PublishCpuMirror(start, end);
 		UpdateProtection<true, false>();
 		for (const auto [first, last]: hot) {
 			for (auto page = first; page < last; page++) {
@@ -467,7 +472,7 @@ public:
 			cleared += last - first;
 		}
 		if (cleared != 0) {
-			PublishGpuMirror();
+			PublishGpuMirror(start, end);
 		}
 		uint64_t         retained = 0;
 		const RegionBits dirty(m_gpu_dirty, start, end);
@@ -488,16 +493,20 @@ private:
 	// Callers hold `lock`, before pages become CPU-dirty (Dirtied).
 	void BumpDirtied() noexcept { m_dirtied.fetch_add(1, std::memory_order_release); }
 
-	// Callers hold `lock`, after changing m_gpu_dirty (IsGpuModifiedRelaxed).
-	void PublishGpuMirror() noexcept {
-		for (size_t word = 0; word < RegionBits::Words; word++) {
+	// Callers hold `lock`, after changing the GPU-dirty bits of pages [first, last), and no other
+	// (IsGpuModifiedRelaxed). Only the mirror words of those pages are stored: the other words
+	// already equal their bits, and threads reading them keep their cache lines.
+	void PublishGpuMirror(size_t first = 0, size_t last = TRACKER_REGION_PAGES) noexcept {
+		for (size_t word = first / 64u; word < (last + 63u) / 64u; word++) {
 			m_gpu_mirror[word].store(m_gpu_dirty.Word(word), std::memory_order_relaxed);
 		}
 	}
-	// Callers hold `lock` (or construct), after changing m_cpu_dirty and before any page this
-	// makes CPU-dirty becomes writable (IsCpuModifiedRelaxed).
-	void PublishCpuMirror() noexcept {
-		for (size_t word = 0; word < RegionBits::Words; word++) {
+	// Callers hold `lock` (or construct), after changing the CPU-dirty bits of pages [first,
+	// last), and no other, and before any page this makes CPU-dirty becomes writable
+	// (IsCpuModifiedRelaxed). Only the mirror words of those pages are stored, as above: a write
+	// fault no longer rewrites both mirror cache lines the GPU thread reads.
+	void PublishCpuMirror(size_t first = 0, size_t last = TRACKER_REGION_PAGES) noexcept {
+		for (size_t word = first / 64u; word < (last + 63u) / 64u; word++) {
 			m_cpu_mirror[word].store(m_cpu_dirty.Word(word), std::memory_order_relaxed);
 		}
 	}

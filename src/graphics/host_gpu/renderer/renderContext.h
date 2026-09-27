@@ -65,6 +65,21 @@ public:
 	void               PrepareBda();
 	void               RunGarbageCollector();
 
+	// Detectors for guest-memory changes resource tracking does not see. They only count
+	// (FrameEvent.HostBackingWrite*, GuestProtect*) and log the first occurrences to stderr.
+	//  - An emulator write of guest backing bytes outside a publication (LOD-statistics reports,
+	//    occlusion results), called right before it lands, from any thread: the GPU-dirty pages
+	//    it overwrites (a later readback of them brings the GPU's older bytes back) and the
+	//    tracked clean pages (a GPU copy of them keeps the old bytes until the page is dirtied).
+	//  - A guest protection change of GPU-mapped memory (KernelMprotect), before it applies: the
+	//    watched pages whose watch it overrides (their writes, or all accesses, stop faulting), and
+	//    changes that restrict access (a later tracking transition sets the tracking protection,
+	//    not the guest's).
+	enum class HostWriter : uint8_t { LodStats, Occlusion };
+	void NoteHostBackingWrite(uint64_t vaddr, uint64_t size, HostWriter writer) noexcept;
+	void NoteGuestProtection(uint64_t vaddr, uint64_t size, bool allows_read,
+	                         bool allows_write) noexcept;
+
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void TriggerInterrupt(int event_id, uint32_t context_id);

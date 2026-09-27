@@ -3,6 +3,8 @@
 
 #include "common/common.h"
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <tracy/Tracy.hpp> // IWYU pragma: export
@@ -23,32 +25,70 @@ inline constexpr uint32_t DeepOrangeA200 = 0xff6e40;
 
 namespace Profiler {
 
+// The instrumentation below sits on hot paths (hundreds of thousands of calls per guest flip on
+// the command processor), so every "is it on?" check is an inlined load of a flag, and counters
+// are per thread (see CountFrameEvent).
+namespace Detail {
+// Environment switches read on first use by any thread: -1 until then, else 0 or 1. They are
+// constant-initialized, so they are correct even before this module's dynamic initialization.
+extern std::atomic<int8_t> g_frames_only;
+extern std::atomic<int8_t> g_aggregate;
+extern std::atomic<int8_t> g_detailed;
+extern std::atomic<int8_t> g_shared_counters;
+[[nodiscard]] bool ReadFramesOnly() noexcept;
+[[nodiscard]] bool ReadAggregate() noexcept;
+[[nodiscard]] bool ReadDetailed() noexcept;
+[[nodiscard]] bool ReadSharedCounters() noexcept;
+// ScopedBlock emits Tracy zones: the profiler is started and not in frame-only mode. Set by
+// Initialize, cleared by Shutdown.
+extern std::atomic<bool> g_zones;
+} // namespace Detail
+
 class ScopedBlock {
 public:
-	explicit ScopedBlock(const tracy::SourceLocationData* source_location, bool active = true);
+	explicit ScopedBlock(const tracy::SourceLocationData* source_location, bool active = true) {
+		if (active && Detail::g_zones.load(std::memory_order_relaxed)) [[unlikely]] {
+			Begin(source_location);
+		}
+	}
 	ScopedBlock(const ScopedBlock&)            = delete;
 	ScopedBlock& operator=(const ScopedBlock&) = delete;
 	ScopedBlock(ScopedBlock&&)                 = delete;
 	ScopedBlock& operator=(ScopedBlock&&)      = delete;
-	~ScopedBlock();
+	~ScopedBlock() {
+		if (m_zone.has_value()) [[unlikely]] {
+			End();
+		}
+	}
 
 	void End();
 
 private:
+	void Begin(const tracy::SourceLocationData* source_location);
+
 	std::optional<tracy::ScopedZone> m_zone;
 };
 
 void EndBlock();
 void SetThreadName(const char* name);
-// Opt in before launching with KYTY_PROFILE_DETAILS=1. High-frequency nested
-// zones remain disabled for measurements comparable to the normal instrumentation.
-[[nodiscard]] bool DetailedEnabled();
 // Keep frame markers and aggregate workload counters, without per-call zones.
 // Set KYTY_PROFILE_FRAMES_ONLY=1 before launching; it overrides detailed profiling.
-[[nodiscard]] bool FramesOnlyEnabled();
+[[nodiscard]] inline bool FramesOnlyEnabled() {
+	const auto value = Detail::g_frames_only.load(std::memory_order_relaxed);
+	return value >= 0 ? value != 0 : Detail::ReadFramesOnly();
+}
+// Opt in before launching with KYTY_PROFILE_DETAILS=1. High-frequency nested
+// zones remain disabled for measurements comparable to the normal instrumentation.
+[[nodiscard]] inline bool DetailedEnabled() {
+	const auto value = Detail::g_detailed.load(std::memory_order_relaxed);
+	return value >= 0 ? value != 0 : Detail::ReadDetailed();
+}
 // Additional diagnostic counters/timers; requires KYTY_PROFILE_AGGREGATES=1 and frame-only
 // mode. Collection separately requires a connected profiler. Keep off for performance runs.
-[[nodiscard]] bool AggregateEnabled();
+[[nodiscard]] inline bool AggregateEnabled() {
+	const auto value = Detail::g_aggregate.load(std::memory_order_relaxed);
+	return value >= 0 ? value != 0 : Detail::ReadAggregate();
+}
 
 enum class FrameWork : uint32_t {
 	DrawIndex,
@@ -62,7 +102,8 @@ enum class FrameWork : uint32_t {
 
 // DrawIndex/DrawAuto include expanded indirect draws. The command categories
 // describe their origins and must not be added to those renderer-call totals.
-void CountFrameWork(FrameWork kind);
+// Counted in frame-only mode (defined below).
+inline void CountFrameWork(FrameWork kind);
 
 // The first four categories are mutually exclusive per original scheduler submission,
 // not per driver call or merged VkSubmitInfo. Generic also includes forced completion
@@ -771,9 +812,53 @@ enum class FrameEvent : uint32_t {
 	BindingEpochMemoVerifyChecks,
 	BindingEpochMemoVerifyMismatches,
 	BindingEpochMemoVerifyRaces,
+	// Tracker-gap detectors (RenderContext::NoteHostBackingWrite, NoteGuestProtection): emulator
+	// writes of guest bytes outside publications and the GPU-dirty and clean tracked pages they
+	// land on; guest protection changes, the watched pages of GPU memory they cover and those
+	// whose tracking protection they replace, and those that restrict access to GPU memory.
+	HostBackingWrites,
+	HostBackingWriteGpuDirtyPages,
+	HostBackingWriteCleanPages,
+	GuestProtectCalls,
+	GuestProtectWatchedPages,
+	GuestProtectOverriddenPages,
+	GuestProtectRestrictsGpuMemory,
+	// KYTY_CLAMP_RANGE_MEMO: lookups the per-thread committed-run cache could not answer, and its
+	// verify mode's mismatches.
+	ClampRangeMemoMisses,
+	ClampRangeMemoVerifyMismatches,
+	// KYTY_DRAW_SEQUENCE_FAST, targets (TextureCache::RepeatLookup): lookups answered by a proven
+	// repeat of the slot's last one, recorded lookups whose proofs no longer held, and lookups
+	// recorded as repeatable.
+	DrawSequenceTargetRepeats,
+	DrawSequenceTargetMisses,
+	DrawSequenceTargetRecords,
+	// KYTY_DRAW_SEQUENCE_FAST, textures: stages whose texture resolution repeated the last one
+	// (TextureBindingMemo::TryRepeatResolve), stages with the same program and T# words whose
+	// repeat was not proven, and stages whose views were all TryAcquireView hits (TryRepeatViews).
+	DrawSequenceTextureRepeats,
+	DrawSequenceTextureMisses,
+	DrawSequenceViewRepeats,
+	// KYTY_DRAW_SEQUENCE_VERIFY: reuses checked against the full path, disagreements, and
+	// disagreements a guest write racing the check explains.
+	DrawSequenceVerifyChecks,
+	DrawSequenceVerifyMismatches,
+	DrawSequenceVerifyRaces,
+	// Draw-prep reads refused as not provably clean, by cause (DrawPrepFallbackUnclean; with the
+	// hang trace also unclean.csv): a worker's GPU-dirty hint (tracker GPU-dirty pages) or pending
+	// backing publication, the GPU thread's exact predicate, and an exact read without a backing.
+	DrawPrepUncleanHintGpuDirty,
+	DrawPrepUncleanHintPublication,
+	DrawPrepUncleanExact,
+	DrawPrepUncleanBacking,
+	// KYTY_DRAW_SEQUENCE_FAST, textures: stages whose T# words matched one of their earlier sets
+	// (PreparedBindings::texture_history), before that set's repeat was checked.
+	DrawSequenceTextureHistoryHits,
 	Count,
 };
-void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
+// Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip
+// (defined below).
+inline void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
 
 enum class FrameWait : uint32_t {
 	ReadMemory,
@@ -850,6 +935,87 @@ enum class FrameWait : uint32_t {
 	Count,
 };
 
+namespace Detail {
+
+// Where the aggregate counters go (CountFrameEvent, ScopedFrameWait, AddFrameWait):
+//   Off    - nowhere: aggregate diagnostics are off, or no profiler was connected at the last
+//            guest flip (PublishFrameWork refreshes it; Initialize sets it first);
+//   Thread - the calling thread's counter block (ThreadCounters), summed at every guest flip;
+//   Shared - KYTY_PROFILE_COUNTERS=shared, the previous implementation for comparisons: every
+//            call checks the switches and the connection and adds to shared atomics.
+// FrameWork counters follow frame-only mode instead: the calling thread's block, or the shared
+// atomics with KYTY_PROFILE_COUNTERS=shared.
+enum class CounterSink : uint8_t { Off, Thread, Shared };
+extern std::atomic<CounterSink> g_event_sink;
+
+constexpr size_t kFrameEventCount = static_cast<size_t>(FrameEvent::Count);
+constexpr size_t kFrameWorkCount  = static_cast<size_t>(FrameWork::Count);
+constexpr size_t kFrameWaitCount  = static_cast<size_t>(FrameWait::Count);
+
+// One thread's counters, written only by that thread with a relaxed load and store (no locked
+// instruction, no cache line shared with other writers) and summed by the flip publisher. Blocks
+// are never freed: a thread's totals stay in the sums after it exits, and the next new thread
+// reuses the released block and continues its totals (every published value is cumulative).
+struct alignas(64) ThreadCounters {
+	std::array<std::atomic<uint64_t>, kFrameEventCount> events {};
+	std::array<std::atomic<uint64_t>, kFrameWorkCount>  work {};
+	std::array<std::atomic<uint64_t>, kFrameWaitCount>  wait_calls {};
+	std::array<std::atomic<uint64_t>, kFrameWaitCount>  wait_ns {};
+	std::atomic<bool>                                    in_use {false};
+	ThreadCounters*                                      next = nullptr; // registry, immutable
+};
+extern thread_local ThreadCounters* t_counters;
+// Registers the calling thread's block (reusing a released one) and sets t_counters.
+[[nodiscard]] ThreadCounters& AcquireThreadCounters() noexcept;
+[[nodiscard]] inline ThreadCounters& CurrentThreadCounters() noexcept {
+	auto* counters = t_counters;
+	if (counters == nullptr) [[unlikely]] {
+		counters = &AcquireThreadCounters();
+	}
+	return *counters;
+}
+// Owner-thread increment.
+inline void Add(std::atomic<uint64_t>& counter, uint64_t amount) noexcept {
+	counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+}
+[[nodiscard]] inline bool SharedCounters() {
+	const auto value = g_shared_counters.load(std::memory_order_relaxed);
+	return value >= 0 ? value != 0 : ReadSharedCounters();
+}
+void CountFrameEventShared(FrameEvent kind, uint64_t amount) noexcept;
+void CountFrameWorkShared(FrameWork kind) noexcept;
+// Registered counter blocks (tests).
+[[nodiscard]] size_t CounterBlockCount() noexcept;
+
+} // namespace Detail
+
+// The cumulative count of `kind` the next guest flip would publish (every thread's block plus the
+// shared atomics). Diagnostics and tests.
+[[nodiscard]] uint64_t FrameEventTotal(FrameEvent kind);
+
+inline void CountFrameEvent(FrameEvent kind, uint64_t amount) {
+	const auto sink = Detail::g_event_sink.load(std::memory_order_relaxed);
+	if (sink == Detail::CounterSink::Off) [[likely]] {
+		return;
+	}
+	if (sink == Detail::CounterSink::Thread) [[likely]] {
+		Detail::Add(Detail::CurrentThreadCounters().events[static_cast<size_t>(kind)], amount);
+		return;
+	}
+	Detail::CountFrameEventShared(kind, amount);
+}
+
+inline void CountFrameWork(FrameWork kind) {
+	if (!FramesOnlyEnabled()) [[likely]] {
+		return;
+	}
+	if (Detail::SharedCounters()) [[unlikely]] {
+		Detail::CountFrameWorkShared(kind);
+		return;
+	}
+	Detail::Add(Detail::CurrentThreadCounters().work[static_cast<size_t>(kind)], 1);
+}
+
 // Aggregate inclusive CPU work/wait durations, not GPU time or an additive frame budget.
 // ReadMemory may nest within DCC fallback, shader readiness or resource materialization,
 // and may itself be reentrant. DriverSubmit can overlap renderer work on another thread.
@@ -860,18 +1026,31 @@ enum class FrameWait : uint32_t {
 // spanning an on-demand connection change are omitted; no per-call zones are emitted.
 class ScopedFrameWait {
 public:
-	explicit ScopedFrameWait(FrameWait kind);
+	explicit ScopedFrameWait(FrameWait kind): m_kind(kind) {
+		if (Detail::g_event_sink.load(std::memory_order_relaxed) != Detail::CounterSink::Off)
+		    [[unlikely]] {
+			Begin();
+		}
+	}
 	ScopedFrameWait(const ScopedFrameWait&) = delete;
 	ScopedFrameWait& operator=(const ScopedFrameWait&) = delete;
 	ScopedFrameWait(ScopedFrameWait&&) = delete;
 	ScopedFrameWait& operator=(ScopedFrameWait&&) = delete;
-	~ScopedFrameWait();
+	~ScopedFrameWait() {
+		if (m_sink != Detail::CounterSink::Off) [[unlikely]] {
+			Finish();
+		}
+	}
 
 private:
-	FrameWait m_kind;
-	uint64_t m_start_ns = 0;
-	uint64_t m_connection = 0;
-	bool m_active = false;
+	void Begin();
+	void Finish();
+
+	FrameWait           m_kind;
+	uint64_t            m_start_ns   = 0;
+	uint64_t            m_connection = 0;
+	// Where the scope is counted (Off: not counted).
+	Detail::CounterSink m_sink = Detail::CounterSink::Off;
 };
 
 // Adds externally measured totals (the GPU timeline entries above) with the same gating as

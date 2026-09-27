@@ -817,6 +817,57 @@ void TestFaultAheadWindow() {
   Release(memory);
 }
 
+// The lock-free dirty mirrors are republished only for the pages a transition changes
+// (RegionManager::Publish*Mirror): transitions spanning mirror words (64 pages each) and a
+// 128-page fault-ahead window keep every word equal to the locked bits. The allocation starts 16
+// pages into its region, so its pages 48 and 112 begin new words.
+void TestMirrorsAcrossWords() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 128;
+  PolicyHarness harness(policy);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  constexpr uint64_t pages = 160;
+  auto *memory = Allocate(harness.page_manager, pages);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto mirrors_agree = [&](const char *stage) {
+    for (uint64_t page = 0; page < pages; page++) {
+      const auto start = address + page * page_size;
+      MemoryTracker::DirtyState relaxed;
+      if (!tracker.QueryDirtyRelaxed(start, page_size, relaxed) ||
+          relaxed.cpu != tracker.IsRegionCpuModified(start, page_size) ||
+          relaxed.gpu != tracker.IsRegionGpuModified(start, page_size)) {
+        std::fprintf(stderr, "mirror differs at page %llu after %s\n",
+                     static_cast<unsigned long long>(page), stage);
+        Check(false, "a lock-free dirty mirror differs from the locked bits");
+      }
+    }
+  };
+  UploadAll(tracker, address, page_size * pages);
+  mirrors_agree("the upload");
+  // Region page 66: the fault-ahead window is region pages [0, 128), two mirror words.
+  Check(WriteFault(tracker, address + page_size * 50) == 0, "a clean write fault flushed");
+  Check(tracker.IsRegionCpuModified(address, page_size) &&
+            tracker.IsRegionCpuModified(address + page_size * 111, page_size) &&
+            !tracker.IsRegionCpuModified(address + page_size * 112, page_size),
+        "the fault-ahead window is not region pages [0, 128)");
+  mirrors_agree("a fault-ahead window over two words");
+  UploadAll(tracker, address + page_size * 40, page_size * 20);
+  mirrors_agree("an upload across a word boundary");
+  UploadAll(tracker, address, page_size * pages); // GPU ownership needs clean pages
+  tracker.MarkRegionAsGpuModified(address + page_size * 44, page_size * 80);
+  mirrors_agree("a GPU mark across two word boundaries");
+  tracker.MarkReadbackPending(address + page_size * 100, page_size * 20);
+  (void)tracker.UnmarkReadbackPending(address + page_size * 100, page_size * 20);
+  mirrors_agree("a completed readback across a word boundary");
+  tracker.UnmarkRegionAsGpuModified(address + page_size * 44, page_size * 80);
+  mirrors_agree("a GPU unmark across two word boundaries");
+  tracker.MarkRegionAsCpuModified(address + page_size * 60, page_size * 60);
+  mirrors_agree("a CPU mark across two word boundaries");
+  tracker.UntrackMemory(address, page_size * pages);
+  Release(memory);
+}
+
 void TestHotPagePromotionAndUpload() {
   MemoryTracker::FaultPolicy policy;
   policy.hot_frames = 2;
@@ -2114,6 +2165,7 @@ int main(int argc, char **argv) {
   TestCleanVerdictTrackerTransitionsBump();
   TestCleanVerdictCrossThreadInvalidation();
   TestFaultAheadWindow();
+  TestMirrorsAcrossWords();
   TestHotPagePromotionAndUpload();
   TestHotPageDemotionPaths();
   TestFaultMutationEpochWithHotPages();

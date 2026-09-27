@@ -322,8 +322,9 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		if (TargetDescMemoEnabled()) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TargetDescMemoMisses);
 			std::memcpy(&memo.registers, &z, sizeof(z));
-			memo.desc  = r.desc;
-			memo.valid = true;
+			memo.desc   = r.desc;
+			memo.lookup = {};
+			memo.valid  = true;
 		}
 	}
 	r.depth_clear_enable      = rc.depth_clear_enable;
@@ -365,8 +366,8 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 			r.stencil_back = r.stencil_front;
 		}
 	}
-	auto& cache = m_context.GetTextureCache();
-	r.image_id = cache.FindImage(r.desc);
+	// r.desc is the memo's description (KYTY_DRAW_SEQUENCE_FAST: its last lookup may repeat).
+	r.image_id = FindTargetImage(r.desc, false, TargetDescMemoEnabled() ? &memo.lookup : nullptr);
 	BindRenderTarget(r.image_id);
 }
 

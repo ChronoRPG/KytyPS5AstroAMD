@@ -473,6 +473,29 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.BindingEpochMemoVerifyChecks.Cumulative",
     "FrameEvent.BindingEpochMemoVerifyMismatches.Cumulative",
     "FrameEvent.BindingEpochMemoVerifyRaces.Cumulative",
+    "FrameEvent.HostBackingWrites.Cumulative",
+    "FrameEvent.HostBackingWriteGpuDirtyPages.Cumulative",
+    "FrameEvent.HostBackingWriteCleanPages.Cumulative",
+    "FrameEvent.GuestProtectCalls.Cumulative",
+    "FrameEvent.GuestProtectWatchedPages.Cumulative",
+    "FrameEvent.GuestProtectOverriddenPages.Cumulative",
+    "FrameEvent.GuestProtectRestrictsGpuMemory.Cumulative",
+    "FrameEvent.ClampRangeMemoMisses.Cumulative",
+    "FrameEvent.ClampRangeMemoVerifyMismatches.Cumulative",
+    "FrameEvent.DrawSequenceTargetRepeats.Cumulative",
+    "FrameEvent.DrawSequenceTargetMisses.Cumulative",
+    "FrameEvent.DrawSequenceTargetRecords.Cumulative",
+    "FrameEvent.DrawSequenceTextureRepeats.Cumulative",
+    "FrameEvent.DrawSequenceTextureMisses.Cumulative",
+    "FrameEvent.DrawSequenceViewRepeats.Cumulative",
+    "FrameEvent.DrawSequenceVerifyChecks.Cumulative",
+    "FrameEvent.DrawSequenceVerifyMismatches.Cumulative",
+    "FrameEvent.DrawSequenceVerifyRaces.Cumulative",
+    "FrameEvent.DrawPrepUncleanHintGpuDirty.Cumulative",
+    "FrameEvent.DrawPrepUncleanHintPublication.Cumulative",
+    "FrameEvent.DrawPrepUncleanExact.Cumulative",
+    "FrameEvent.DrawPrepUncleanBacking.Cumulative",
+    "FrameEvent.DrawSequenceTextureHistoryHits.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
@@ -840,15 +863,142 @@ void RemoveBlock(Profiler::ScopedBlock* block) {
 
 namespace Profiler {
 
-ScopedBlock::ScopedBlock(const tracy::SourceLocationData* source_location, bool active) {
-	if (active && !FramesOnlyEnabled() && tracy::ProfilerAvailable()) {
-		m_zone.emplace(source_location, TRACY_CALLSTACK, true);
-		g_block_stack.push_back(this);
+namespace Detail {
+
+std::atomic<int8_t>      g_frames_only {-1};
+std::atomic<int8_t>      g_aggregate {-1};
+std::atomic<int8_t>      g_detailed {-1};
+std::atomic<int8_t>      g_shared_counters {-1};
+std::atomic<bool>        g_zones {false};
+std::atomic<CounterSink> g_event_sink {CounterSink::Off};
+thread_local ThreadCounters* t_counters = nullptr;
+
+namespace {
+
+bool EnvEquals(const char* name, const char* expected) {
+	const auto* setting = std::getenv(name);
+	return setting != nullptr && std::strcmp(setting, expected) == 0;
+}
+
+// Every thread's counter block (push-only list; blocks are never freed).
+std::atomic<ThreadCounters*> g_counter_blocks {nullptr};
+
+// Returns the thread's block at thread exit: a later thread continues its totals.
+struct ThreadCountersRelease {
+	ThreadCountersRelease()                                        = default;
+	ThreadCountersRelease(const ThreadCountersRelease&)            = delete;
+	ThreadCountersRelease& operator=(const ThreadCountersRelease&) = delete;
+	~ThreadCountersRelease() {
+		if (auto* block = t_counters; block != nullptr) {
+			t_counters = nullptr;
+			block->in_use.store(false, std::memory_order_release);
+		}
+	}
+};
+
+// The next guest flip's counting: see CounterSink.
+CounterSink CurrentEventSink() {
+	if (SharedCounters()) {
+		return CounterSink::Shared;
+	}
+	return AggregateEnabled() && tracy::ProfilerAvailable() && TracyIsConnected ? CounterSink::Thread
+	                                                                          : CounterSink::Off;
+}
+
+} // namespace
+
+struct Totals {
+	std::array<uint64_t, kFrameEventCount> events {};
+	std::array<uint64_t, kFrameWorkCount>  work {};
+	std::array<uint64_t, kFrameWaitCount>  wait_calls {};
+	std::array<uint64_t, kFrameWaitCount>  wait_ns {};
+};
+
+// Every thread's block summed (block by block, each read in order); `aggregates`: also the event
+// and wait counters.
+void SumThreadCounters(Totals& totals, bool aggregates) {
+	for (auto* block = g_counter_blocks.load(std::memory_order_acquire); block != nullptr;
+	     block       = block->next) {
+		for (size_t i = 0; i < kFrameWorkCount; ++i) {
+			totals.work[i] += block->work[i].load(std::memory_order_relaxed);
+		}
+		if (!aggregates) {
+			continue;
+		}
+		for (size_t i = 0; i < kFrameEventCount; ++i) {
+			totals.events[i] += block->events[i].load(std::memory_order_relaxed);
+		}
+		for (size_t i = 0; i < kFrameWaitCount; ++i) {
+			totals.wait_calls[i] += block->wait_calls[i].load(std::memory_order_relaxed);
+			totals.wait_ns[i] += block->wait_ns[i].load(std::memory_order_relaxed);
+		}
 	}
 }
 
-ScopedBlock::~ScopedBlock() {
-	End();
+bool ReadFramesOnly() noexcept {
+	const bool enabled = EnvEquals("KYTY_PROFILE_FRAMES_ONLY", "1");
+	g_frames_only.store(enabled ? 1 : 0, std::memory_order_relaxed);
+	return enabled;
+}
+
+bool ReadAggregate() noexcept {
+	const bool enabled = FramesOnlyEnabled() && EnvEquals("KYTY_PROFILE_AGGREGATES", "1");
+	g_aggregate.store(enabled ? 1 : 0, std::memory_order_relaxed);
+	return enabled;
+}
+
+bool ReadDetailed() noexcept {
+	const bool enabled = !FramesOnlyEnabled() && EnvEquals("KYTY_PROFILE_DETAILS", "1");
+	g_detailed.store(enabled ? 1 : 0, std::memory_order_relaxed);
+	return enabled;
+}
+
+bool ReadSharedCounters() noexcept {
+	const bool enabled = EnvEquals("KYTY_PROFILE_COUNTERS", "shared");
+	g_shared_counters.store(enabled ? 1 : 0, std::memory_order_relaxed);
+	return enabled;
+}
+
+size_t CounterBlockCount() noexcept {
+	size_t count = 0;
+	for (auto* block = g_counter_blocks.load(std::memory_order_acquire); block != nullptr;
+	     block       = block->next) {
+		count++;
+	}
+	return count;
+}
+
+ThreadCounters& AcquireThreadCounters() noexcept {
+	thread_local ThreadCountersRelease release;
+	(void)release;
+	ThreadCounters* acquired = nullptr;
+	for (auto* block = g_counter_blocks.load(std::memory_order_acquire); block != nullptr;
+	     block       = block->next) {
+		bool expected = false;
+		if (!block->in_use.load(std::memory_order_relaxed) &&
+		    block->in_use.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+			acquired = block;
+			break;
+		}
+	}
+	if (acquired == nullptr) {
+		acquired = new ThreadCounters();
+		acquired->in_use.store(true, std::memory_order_relaxed);
+		auto* head = g_counter_blocks.load(std::memory_order_relaxed);
+		do {
+			acquired->next = head;
+		} while (!g_counter_blocks.compare_exchange_weak(head, acquired, std::memory_order_release,
+		                                                 std::memory_order_relaxed));
+	}
+	t_counters = acquired;
+	return *acquired;
+}
+
+} // namespace Detail
+
+void ScopedBlock::Begin(const tracy::SourceLocationData* source_location) {
+	m_zone.emplace(source_location, TRACY_CALLSTACK, true);
+	g_block_stack.push_back(this);
 }
 
 void ScopedBlock::End() {
@@ -870,79 +1020,80 @@ void SetThreadName(const char* name) {
 	}
 }
 
-bool DetailedEnabled() {
-	if (FramesOnlyEnabled()) {
-		return false;
-	}
-	static const bool enabled = [] {
-		const auto* setting = std::getenv("KYTY_PROFILE_DETAILS");
-		return setting != nullptr && std::strcmp(setting, "1") == 0;
-	}();
-	return enabled;
-}
-
-bool FramesOnlyEnabled() {
-	static const bool enabled = [] {
-		const auto* setting = std::getenv("KYTY_PROFILE_FRAMES_ONLY");
-		return setting != nullptr && std::strcmp(setting, "1") == 0;
-	}();
-	return enabled;
-}
-
-bool AggregateEnabled() {
-	if (!FramesOnlyEnabled()) {
-		return false;
-	}
-	static const bool enabled = [] {
-		const auto* setting = std::getenv("KYTY_PROFILE_AGGREGATES");
-		return setting != nullptr && std::strcmp(setting, "1") == 0;
-	}();
-	return enabled;
-}
-
-void CountFrameWork(FrameWork kind) {
+// KYTY_PROFILE_COUNTERS=shared: the previous counting, every call checking the switches and the
+// connection and adding to one shared array.
+void Detail::CountFrameWorkShared(FrameWork kind) noexcept {
 	if (FramesOnlyEnabled()) {
 		g_frame_work[static_cast<size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
 	}
 }
 
-void CountFrameEvent(FrameEvent kind, uint64_t amount) {
+void Detail::CountFrameEventShared(FrameEvent kind, uint64_t amount) noexcept {
 	if (AggregateEnabled() && tracy::ProfilerAvailable() && TracyIsConnected) {
 		g_frame_events[static_cast<size_t>(kind)].fetch_add(amount, std::memory_order_relaxed);
 	}
 }
 
-ScopedFrameWait::ScopedFrameWait(FrameWait kind): m_kind(kind) {
-	if (!AggregateEnabled() || !tracy::ProfilerAvailable() || !TracyIsConnected) {
+void ScopedFrameWait::Begin() {
+	const auto sink = Detail::g_event_sink.load(std::memory_order_relaxed);
+	if (sink == Detail::CounterSink::Shared &&
+	    (!AggregateEnabled() || !tracy::ProfilerAvailable() || !TracyIsConnected)) {
 		return;
 	}
 #ifdef TRACY_ON_DEMAND
 	m_connection = tracy::GetProfiler().ConnectionId();
 #endif
-	m_active = true;
+	m_sink     = sink;
 	m_start_ns = FrameWaitClockNs();
 }
 
-ScopedFrameWait::~ScopedFrameWait() {
-	if (!m_active || !tracy::ProfilerAvailable() || !TracyIsConnected) {
+void ScopedFrameWait::Finish() {
+	if (m_sink == Detail::CounterSink::Shared && (!tracy::ProfilerAvailable() || !TracyIsConnected)) {
 		return;
 	}
 #ifdef TRACY_ON_DEMAND
+	// Scopes spanning an on-demand connection change are omitted.
 	if (m_connection != tracy::GetProfiler().ConnectionId()) {
 		return;
 	}
 #endif
 	const auto elapsed = FrameWaitClockNs() - m_start_ns;
-	auto& totals = g_frame_waits[static_cast<size_t>(m_kind)];
+	const auto index   = static_cast<size_t>(m_kind);
+	if (m_sink == Detail::CounterSink::Thread) {
+		auto& counters = Detail::CurrentThreadCounters();
+		Detail::Add(counters.wait_ns[index], elapsed);
+		Detail::Add(counters.wait_calls[index], 1);
+		return;
+	}
+	auto& totals = g_frame_waits[index];
 	totals.nanoseconds.fetch_add(elapsed, std::memory_order_relaxed);
 	totals.calls.fetch_add(1, std::memory_order_relaxed);
 }
 
+uint64_t FrameEventTotal(FrameEvent kind) {
+	const auto index = static_cast<size_t>(kind);
+	uint64_t   total = g_frame_events[index].load(std::memory_order_relaxed);
+	for (auto* block = Detail::g_counter_blocks.load(std::memory_order_acquire); block != nullptr;
+	     block       = block->next) {
+		total += block->events[index].load(std::memory_order_relaxed);
+	}
+	return total;
+}
+
 void AddFrameWait(FrameWait kind, uint64_t calls, uint64_t nanoseconds) {
-	if (!AggregateEnabled() || !tracy::ProfilerAvailable() || !TracyIsConnected) {
+	const auto sink  = Detail::g_event_sink.load(std::memory_order_relaxed);
+	const auto index = static_cast<size_t>(kind);
+	if (sink == Detail::CounterSink::Thread) {
+		auto& counters = Detail::CurrentThreadCounters();
+		Detail::Add(counters.wait_ns[index], nanoseconds);
+		Detail::Add(counters.wait_calls[index], calls);
 		return;
 	}
-	auto& totals = g_frame_waits[static_cast<size_t>(kind)];
+	if (sink == Detail::CounterSink::Off || !AggregateEnabled() || !tracy::ProfilerAvailable() ||
+	    !TracyIsConnected) {
+		return;
+	}
+	auto& totals = g_frame_waits[index];
 	totals.nanoseconds.fetch_add(nanoseconds, std::memory_order_relaxed);
 	totals.calls.fetch_add(calls, std::memory_order_relaxed);
 }
@@ -968,27 +1119,30 @@ void PublishFrameWork() {
 		return;
 	}
 	const auto flip = g_completed_flips.fetch_add(1, std::memory_order_relaxed) + 1;
-	std::array<uint64_t, kFrameWorkCount> snapshot {};
-	for (size_t i = 0; i < kFrameWorkCount; ++i) {
-		snapshot[i] = g_frame_work[i].load(std::memory_order_relaxed);
-	}
-	// Each category is monotonic, but this is not an atomic cross-category
-	// snapshot. Producer work can straddle the marker and these relaxed loads.
+	// The totals: the shared atomics (all of them with KYTY_PROFILE_COUNTERS=shared) plus every
+	// thread's block. Each category is monotonic, but this is not an atomic cross-category
+	// snapshot: producer work can straddle the marker and these loads.
+	const bool aggregates = tracy::ProfilerAvailable() && AggregateEnabled() && TracyIsConnected;
+	Detail::Totals totals;
+	Detail::SumThreadCounters(totals, aggregates);
 	if (tracy::ProfilerAvailable()) {
 		for (size_t i = 0; i < kFrameWorkCount; ++i) {
-			TracyPlot(kFrameWorkNames[i], static_cast<int64_t>(snapshot[i]));
+			const auto count = g_frame_work[i].load(std::memory_order_relaxed) + totals.work[i];
+			TracyPlot(kFrameWorkNames[i], static_cast<int64_t>(count));
 		}
-		if (AggregateEnabled() && TracyIsConnected) {
+		if (aggregates) {
 			for (size_t i = 0; i < kFrameEventCount; ++i) {
-				const auto count = g_frame_events[i].load(std::memory_order_relaxed);
+				const auto count = g_frame_events[i].load(std::memory_order_relaxed) + totals.events[i];
 				TracyPlot(kFrameEventNames[i], static_cast<int64_t>(count));
 			}
 			// Calls/time are independently atomic, not a cross-thread transaction. A scope
 			// completing at this boundary can split the pair across adjacent samples.
 			// Durations belong to the completion interval, including time before its marker.
 			for (size_t i = 0; i < kFrameWaitCount; ++i) {
-				const auto calls = g_frame_waits[i].calls.load(std::memory_order_relaxed);
-				const auto ns = g_frame_waits[i].nanoseconds.load(std::memory_order_relaxed);
+				const auto calls =
+				    g_frame_waits[i].calls.load(std::memory_order_relaxed) + totals.wait_calls[i];
+				const auto ns =
+				    g_frame_waits[i].nanoseconds.load(std::memory_order_relaxed) + totals.wait_ns[i];
 				TracyPlot(kFrameWaitCallNames[i], static_cast<int64_t>(calls));
 				TracyPlot(kFrameWaitTimeNames[i], static_cast<int64_t>(ns));
 			}
@@ -996,6 +1150,8 @@ void PublishFrameWork() {
 		// Written last so the exporter can identify a complete snapshot group.
 		TracyPlot("FrameWork.CompletedFlips.Cumulative", static_cast<int64_t>(flip));
 	}
+	// Counting for the next flip follows the connection (CounterSink).
+	Detail::g_event_sink.store(Detail::CurrentEventSink(), std::memory_order_relaxed);
 }
 
 bool LoadingEnabled() {
@@ -1097,7 +1253,13 @@ void Initialize() {
 		} else if (DetailedEnabled()) {
 			::printf("Tracy detailed zones enabled (KYTY_PROFILE_DETAILS=1)\n");
 		}
+		if (Detail::SharedCounters()) {
+			::printf("Profiler counters: shared atomics (KYTY_PROFILE_COUNTERS=shared)\n");
+		}
 	}
+	Detail::g_zones.store(!FramesOnlyEnabled() && tracy::ProfilerAvailable(),
+	                      std::memory_order_relaxed);
+	Detail::g_event_sink.store(Detail::CurrentEventSink(), std::memory_order_relaxed);
 	HangTrace::Initialize();
 	if (LoadingEnabled() && tracy::ProfilerAvailable() && !g_loading_publisher.joinable()) {
 		try {
@@ -1136,6 +1298,8 @@ void Shutdown() {
 		g_loading_publisher.request_stop();
 		g_loading_publisher.join();
 	}
+	Detail::g_zones.store(false, std::memory_order_relaxed);
+	Detail::g_event_sink.store(Detail::CounterSink::Off, std::memory_order_relaxed);
 	if (tracy::ProfilerAvailable()) {
 		tracy::ShutdownProfiler();
 	}

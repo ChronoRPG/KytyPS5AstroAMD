@@ -213,6 +213,15 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+// KYTY_CLAMP_RANGE_MEMO outcomes of the calling thread's ClampRangeSize calls.
+struct TestClampTotals {
+	uint64_t hits              = 0;
+	uint64_t misses            = 0;
+	uint64_t verify_checks     = 0;
+	uint64_t verify_mismatches = 0;
+	uint64_t verify_races      = 0;
+};
+TestClampTotals TestClampRangeMemoTotals();
 void     TestFailNextPhysicalMemoryUnmap();
 void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
 void     TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);

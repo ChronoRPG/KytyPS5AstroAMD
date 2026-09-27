@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -11,6 +12,7 @@ namespace Ime = Libs::Dialog::ImeDialog;
 #define CHECK(condition)                                                       \
   do {                                                                         \
     if (!(condition)) {                                                        \
+      std::fprintf(stderr, "ImeDialogTests: failed: %s\n", #condition);        \
       std::abort();                                                            \
     }                                                                          \
   } while (false)

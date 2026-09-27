@@ -712,6 +712,9 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 	const bool speculative       = DrawPrep::Speculative();
 	const bool use_clean_backing = use_clean_backing_env || speculative;
 	EXIT_NOT_IMPLEMENTED(num_input_semantics > ShaderVertexInputInfo::RES_MAX);
+	// Diagnostics of refused reads (HangTrace unclean.csv): the attribute table, then the
+	// vertex-buffer descriptors.
+	DrawPrep::ScopedReadPurpose read_purpose("vertex-attributes");
 
 	// KYTY_SHADER_METADATA_BATCH: read the used span of each table with one silent probe. A
 	// successful probe proves every word of the span clean, so each word equals what its own
@@ -776,6 +779,7 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 	}
 
 	// The vertex-buffer descriptors those attributes select, again as one span when possible.
+	read_purpose.Set("vertex-buffers");
 	std::array<uint32_t, MaxBatchWords * 2> sharp_words {};
 	uint32_t                                sharp_first  = 0;
 	bool                                    sharps_batched = false;

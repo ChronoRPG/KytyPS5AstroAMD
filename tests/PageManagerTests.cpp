@@ -358,6 +358,40 @@ void TestRegionMaskWatcherRanges() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+// The tracker-gap detector's view (PageManager::CountWatchedPages): write-watched pages, pages
+// watched for every access, sub-page ranges, and nothing once unwatched.
+void TestCountWatchedPages() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *memory = Allocate(region_size * 2);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto region_base =
+      (allocation_base + region_size - 1) & ~(region_size - 1);
+  const auto span = page_size * 6;
+  auto counts = manager.CountWatchedPages(region_base, span);
+  Check(counts.write == 0 && counts.access == 0,
+        "pages no one watches were counted as watched");
+  manager.UpdatePageWatchers<true>(region_base + page_size, page_size * 2);
+  RegionBits access_mask;
+  access_mask.Set(4);
+  manager.UpdatePageWatchersForRegion<true, true>(region_base, access_mask);
+  counts = manager.CountWatchedPages(region_base, span);
+  Check(counts.write == 2 && counts.access == 1,
+        "write- and access-watched pages were not told apart");
+  counts = manager.CountWatchedPages(region_base + page_size * 2 + 16, 16);
+  Check(counts.write == 1 && counts.access == 0,
+        "a sub-page range did not count its page");
+  counts = manager.CountWatchedPages(region_base + region_size - page_size, page_size * 2);
+  Check(counts.write == 0 && counts.access == 0,
+        "a range into a region no one tracks was counted as watched");
+  manager.UpdatePageWatchersForRegion<false, true>(region_base, access_mask);
+  manager.UpdatePageWatchers<false>(region_base + page_size, page_size * 2);
+  counts = manager.CountWatchedPages(region_base, span);
+  Check(counts.write == 0 && counts.access == 0, "unwatched pages were still counted");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestRegionEndpointBatching() {
   PageManager manager;
   constexpr auto page_size = TRACKER_PAGE_SIZE;
@@ -585,6 +619,7 @@ int main(int argc, char **argv) {
   TestBatchedWatcherRanges();
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
+  TestCountWatchedPages();
   TestReadWriteWatcherInteractions();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");

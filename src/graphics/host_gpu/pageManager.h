@@ -25,6 +25,14 @@ public:
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
 
+	// Pages of [vaddr, vaddr + size) that resource tracking watches: for writes only (the host
+	// page is read-only) and for every access (no access). Any thread; a snapshot.
+	struct WatchedPages {
+		uint64_t write  = 0;
+		uint64_t access = 0;
+	};
+	[[nodiscard]] WatchedPages CountWatchedPages(uint64_t vaddr, uint64_t size);
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

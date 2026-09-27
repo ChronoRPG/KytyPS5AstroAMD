@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -40,6 +41,106 @@ bool CmaskFastClearEnabled() {
 		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
 	return enabled;
+}
+
+bool DrawSequenceEnabled(DrawSequencePart part) {
+	static const uint32_t parts = [] {
+		constexpr uint32_t all = static_cast<uint32_t>(DrawSequencePart::Targets) |
+		                         static_cast<uint32_t>(DrawSequencePart::Textures);
+		const auto* value = std::getenv("KYTY_DRAW_SEQUENCE_FAST");
+		if (value == nullptr || *value == '\0' || std::strcmp(value, "1") == 0) {
+			return all;
+		}
+		if (std::strcmp(value, "0") == 0) {
+			return 0u;
+		}
+		uint32_t selected = 0;
+		if (std::strstr(value, "targets") != nullptr) {
+			selected |= static_cast<uint32_t>(DrawSequencePart::Targets);
+		}
+		if (std::strstr(value, "textures") != nullptr) {
+			selected |= static_cast<uint32_t>(DrawSequencePart::Textures);
+		}
+		return selected;
+	}();
+	return (parts & static_cast<uint32_t>(part)) != 0;
+}
+
+int DrawSequenceVerifyMode() {
+	static const int mode = [] {
+		const auto* value = std::getenv("KYTY_DRAW_SEQUENCE_VERIFY");
+		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
+			return 0;
+		}
+		return std::strcmp(value, "exit") == 0 ? 2 : 1;
+	}();
+	return mode;
+}
+
+void ReportDrawSequenceMismatch(const char* what) {
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceVerifyMismatches);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::fprintf(stderr, "DrawSequenceVerify: %s differs from the full path\n", what);
+	}
+	if (DrawSequenceVerifyMode() == 2) {
+		EXIT("DrawSequenceVerify: %s differs from the full path\n", what);
+	}
+}
+
+ImageId RenderExecutor::FindTargetImage(TextureCache::ImageDesc& desc, bool exact_format,
+                                        TextureCache::RepeatLookup* record) {
+	auto& cache = m_context.GetTextureCache();
+	if (record == nullptr || !DrawSequenceEnabled(DrawSequencePart::Targets)) {
+		return cache.FindImage(desc, exact_format);
+	}
+	auto&      totals = m_draw_sequence_totals;
+	const auto full   = [&] {
+		const auto id = cache.FindImage(desc, exact_format, record);
+		if (record->valid) {
+			totals.target_records++;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTargetRecords);
+		}
+		return id;
+	};
+	if (!record->valid) {
+		return full();
+	}
+	const bool verify  = DrawSequenceVerifyMode() != 0;
+	// Read before the check: a guest write fault changing the recorded fills after it (on another
+	// thread) races the lookup (verify below).
+	const auto foreign = m_context.GetBufferCache().ForeignKnownFillChanges();
+	if (!cache.TryRepeatLookup(desc, exact_format, *record, !verify)) {
+		totals.target_misses++;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTargetMisses);
+		return full();
+	}
+	totals.target_repeats++;
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTargetRepeats);
+	if (!verify) {
+		return record->image;
+	}
+	// KYTY_DRAW_SEQUENCE_VERIFY: the full lookup must return the same image and do nothing but its
+	// bookkeeping: no residency extension or alias synchronization, and metadata decisions that
+	// are again provable no-ops. It provides the result (and the next record).
+	totals.verify_checks++;
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceVerifyChecks);
+	const auto claimed = *record; // the full lookup records again
+	const auto effects = cache.LookupSideEffects();
+	const auto id      = full();
+	if (id != claimed.image || cache.LookupSideEffects() != effects || !record->valid) {
+		if (m_context.GetBufferCache().ForeignKnownFillChanges() != foreign ||
+		    cache.RepeatGpuRangesLost(claimed)) {
+			// Another thread forgot a recorded fill or ended GPU ownership of the metadata
+			// meanwhile: the full lookup decided on other metadata than the check.
+			totals.verify_races++;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceVerifyRaces);
+		} else {
+			totals.verify_mismatches++;
+			ReportDrawSequenceMismatch("a repeated target lookup");
+		}
+	}
+	return id;
 }
 
 static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
@@ -108,7 +209,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			r.guest_mip_level   = memo->guest_mip_level;
 			r.guest_array_layer = memo->guest_array_layer;
 			r.export_mapping    = memo->export_mapping;
-			r.image_id          = m_context.GetTextureCache().FindImage(r.desc, exact_format);
+			r.image_id          = FindTargetImage(r.desc, exact_format, &memo->lookup);
 			BindRenderTarget(r.image_id);
 			return;
 		}
@@ -411,7 +512,6 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	auto& texture_cache        = m_context.GetTextureCache();
 	if (memo != nullptr) {
 		std::memcpy(&memo->registers, &rt, sizeof(rt));
 		memo->mask              = mask;
@@ -420,12 +520,13 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		memo->guest_mip_level   = rt.view.current_mip_level;
 		memo->guest_array_layer = view.base_layer;
 		memo->export_mapping    = target_format.export_mapping;
+		memo->lookup            = {};
 		memo->valid             = true;
 	}
 	r.desc                     = std::move(desc);
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
+	r.image_id = FindTargetImage(r.desc, exact_format, memo != nullptr ? &memo->lookup : nullptr);
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
 }
