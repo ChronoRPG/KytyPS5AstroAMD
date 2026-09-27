@@ -381,15 +381,14 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	// By default a sampled texture holds only the levels its views can sample (finer than the
 	// T# MIN_LOD / BASE_LEVEL clamp is never read); =poison also fills the other levels with a
 	// visible marker to check that claim on screen.
-	// Default off: a partially resident image left mip 0 of the Sky Garden water's normal map
-	// undefined (zero) although the water samples it (U44). =1 enables, =poison enables and marks
-	// non-resident levels.
-	m_residency = ResidencyMode::Off;
+	// The Sky Garden water's normal map keeps mip 0 non-resident (zero) because its T# MIN_LOD is
+	// 1.0, so no view samples it; the white water was the stale quarter-res input B (U44 bisect).
+	m_residency = ResidencyMode::On;
 	if (const auto* residency = std::getenv("KYTY_TEXTURE_RESIDENT_MIPS"); residency != nullptr) {
 		if (std::strcmp(residency, "poison") == 0) {
 			m_residency = ResidencyMode::Poison;
-		} else if (std::strcmp(residency, "0") != 0) {
-			m_residency = ResidencyMode::On;
+		} else if (std::strcmp(residency, "0") == 0) {
+			m_residency = ResidencyMode::Off;
 		}
 	}
 	if (const auto* idle = std::getenv("KYTY_TEXTURE_RESIDENT_IDLE_FRAMES"); idle != nullptr) {
