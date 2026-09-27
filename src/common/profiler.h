@@ -238,6 +238,22 @@ enum class FrameEvent : uint32_t {
 	// Shader map lookups answered by the per-thread memo (KYTY_SHADER_MAP_MEMO).
 	ShaderMapMemoHits,
 	ShaderMapMemoMisses,
+	// Texture streaming (TextureCache, KYTY_TEXTURE_PARTIAL_UPLOAD): refreshes that uploaded only
+	// the mip rows/levels overlapping dirty chunks, their tiled bytes, the bytes a full refresh
+	// would have added, chunk-tracked refreshes that still had to upload the whole image
+	// (ineligible, too dirty, or no partial validity), chunks newly dirtied by CPU writes
+	// (~ write faults on tracked texture pages) and KYTY_TEXTURE_PARTIAL_VERIFY mismatches.
+	TexturePartialUploads,
+	TexturePartialUploadBytes,
+	TexturePartialSkippedBytes,
+	TexturePartialFallbacks,
+	TextureChunkInvalidations,
+	TexturePartialVerifyMismatches,
+	// Overlapped texture images kept alive instead of freed (KYTY_TEXTURE_OVERLAP_KEEP_FRAMES).
+	TextureOverlapKeeps,
+	// TileManager scratch buffers reused from its pool or newly allocated (KYTY_TILER_SCRATCH_POOL).
+	TilerScratchPoolHits,
+	TilerScratchPoolMisses,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
@@ -274,6 +290,9 @@ enum class FrameWait : uint32_t {
 	// (StagePrepJoin), and helper-thread job time (StagePrepHelper, not on the GPU thread).
 	StagePrepJoin,
 	StagePrepHelper,
+	// GPU-thread CPU time of TextureCache guest-memory -> image refreshes (staging copies,
+	// detile and copy recording), full or partial.
+	TextureUpload,
 	Count,
 };
 

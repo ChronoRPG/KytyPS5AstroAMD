@@ -34,6 +34,7 @@
 #include <span>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -285,6 +286,34 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	} else {
 		LOGF("Image cache policy: submission age (Approach A)\n");
 	}
+	// Texture streaming. KYTY_TEXTURE_PARTIAL_UPLOAD=0 restores whole-image CPU write tracking
+	// and whole-image refreshes. KYTY_TEXTURE_DIRTY_CHUNK_KB (power of two, 4..4096, default 64)
+	// is the write-tracking granularity. KYTY_TEXTURE_PARTIAL_BANDS=0 refreshes whole mip
+	// levels instead of rows of tile blocks. KYTY_TEXTURE_PARTIAL_VERIFY=1 hashes every clean
+	// chunk before a partial refresh and falls back to a full one on a mismatch (diagnostic).
+	m_partial_upload = EnvNotZero("KYTY_TEXTURE_PARTIAL_UPLOAD");
+	m_partial_bands  = EnvNotZero("KYTY_TEXTURE_PARTIAL_BANDS");
+	if (const auto* verify = std::getenv("KYTY_TEXTURE_PARTIAL_VERIFY");
+	    verify != nullptr && std::strcmp(verify, "1") == 0) {
+		m_partial_verify = true;
+	}
+	if (const auto* chunk = std::getenv("KYTY_TEXTURE_DIRTY_CHUNK_KB"); chunk != nullptr) {
+		const auto kib = std::strtoull(chunk, nullptr, 10);
+		if (kib >= 4 && kib <= 4096 && std::has_single_bit(kib)) {
+			m_chunk_shift = static_cast<uint32_t>(std::countr_zero(kib)) + 10u;
+		} else {
+			LOGF("KYTY_TEXTURE_DIRTY_CHUNK_KB=%s ignored (power of two 4..4096 expected)\n", chunk);
+		}
+	}
+	// KYTY_TEXTURE_OVERLAP_KEEP_FRAMES=N (default 0: off) keeps a clean, texture-only image that a
+	// newer overlapping image would retire as stale, while it was used in the last N frames.
+	if (const auto* keep = std::getenv("KYTY_TEXTURE_OVERLAP_KEEP_FRAMES"); keep != nullptr) {
+		m_overlap_keep_frames = std::strtoull(keep, nullptr, 10);
+	}
+	LOGF("Texture streaming: partial_upload=%u chunk=%u KiB bands=%u verify=%u overlap_keep=%" PRIu64
+	     " frames\n",
+	     m_partial_upload ? 1u : 0u, (1u << m_chunk_shift) >> 10u, m_partial_bands ? 1u : 0u,
+	     m_partial_verify ? 1u : 0u, m_overlap_keep_frames);
 }
 
 TextureCache::~TextureCache() {
@@ -383,6 +412,22 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
 	m_registered_image_memory += image.AccountedSize();
+	// Registration precedes the first TrackImage, so the tracking mode never changes while
+	// the image watches pages.
+	if (m_partial_upload && !image.IsTracked() && ChunkTrackingEligible(image)) {
+		image.EnableChunkTracking(m_chunk_shift);
+	}
+}
+
+bool TextureCache::ChunkTrackingEligible(const Image& image) const {
+	const auto& info = image.info;
+	// Page-aligned ranges only: then every write fault on one of the image's pages overlaps its
+	// bytes, and no same-page neighbour write can untrack a page without dirtying it.
+	return info.pixel_format != vk::Format::eUndefined && image.backing.image != nullptr &&
+	       !info.IsDepth() && !info.HasStencil() && !info.HasMetadata() && info.samples == 1 &&
+	       info.metadata.compression == VideoOutCompression::Uncompressed &&
+	       info.data.address % TRACKER_PAGE_SIZE == 0 && info.data.size % TRACKER_PAGE_SIZE == 0 &&
+	       info.data.size > (uint64_t {1} << m_chunk_shift);
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -427,7 +472,9 @@ void TextureCache::DeleteImage(ImageId id) {
 		                           tick - std::min(tick, image->tick_accessed_last));
 		HangTrace::SetImageFreeReason(HangTrace::ImageFreeReason::Other);
 	}
-	if (!image->depth_id) {
+	// Stencil associations only ever point at depth images (AssociateStencil requires one, and
+	// an image's pixel format never changes), so retiring a color image skips the full scan.
+	if (!image->depth_id && image->info.IsDepth()) {
 		std::vector<ImageId> associations;
 		m_slot_images.ForEach([&](ImageId candidate, const Image& associated) {
 			if (associated.depth_id == id) {
@@ -500,6 +547,10 @@ void TextureCache::TrackImage(ImageId id) {
 	if (!image.registered) {
 		return;
 	}
+	if (image.ChunkTracked()) {
+		TrackChunkImage(image);
+		return;
+	}
 	const auto image_begin = image.info.data.address;
 	const auto image_end   = image.info.data.End();
 	if (image_begin == image.track_addr && image_end == image.track_addr_end) {
@@ -554,9 +605,100 @@ void TextureCache::TrackImageTail(ImageId id) {
 	m_page_manager.UpdatePageWatchers<true>(address, size);
 }
 
+void TextureCache::TrackChunkImage(Image& image) {
+	if (!image.IsTracked()) {
+		// Nothing is watched: the untracked marks describe holes of a previous tracked period.
+		std::fill(image.chunks.untracked.begin(), image.chunks.untracked.end(), 0);
+		image.track_addr     = image.info.data.address;
+		image.track_addr_end = image.info.data.End();
+		m_page_manager.UpdatePageWatchers<true>(image.info.data.address, image.info.data.size);
+		return;
+	}
+	// Watch again every chunk a CPU write released. Their dirty marks stay until a refresh:
+	// a write after this point faults and is recorded before it reaches memory.
+	(void)UpdateChunkWatchers<true>(image, 0, image.chunks.count);
+}
+
+template <bool track>
+uint32_t TextureCache::UpdateChunkWatchers(Image& image, uint32_t first, uint32_t last) {
+	auto&          chunks     = image.chunks;
+	const uint64_t chunk_size = uint64_t {1} << chunks.shift;
+	const uint64_t begin      = image.info.data.address; // page aligned (ChunkTrackingEligible)
+	const uint64_t end        = image.info.data.End();
+	uint32_t       changed    = 0;
+	uint32_t       run_first  = UINT32_MAX;
+	const auto     flush      = [&](uint32_t run_last) {
+		if (run_first == UINT32_MAX) {
+			return;
+		}
+		const auto run_begin = std::max(begin, chunks.base + uint64_t {run_first} * chunk_size);
+		const auto run_end   = std::min(end, chunks.base + uint64_t {run_last} * chunk_size);
+		if (run_begin < run_end) {
+			m_page_manager.UpdatePageWatchers<track>(run_begin, run_end - run_begin);
+		}
+		run_first = UINT32_MAX;
+	};
+	for (uint32_t index = first; index < last; index++) {
+		// track: re-watch released chunks; untrack: release still-watched chunks.
+		if (Image::ChunkBit(chunks.untracked, index) == track) {
+			if constexpr (track) {
+				Image::ClearChunkBit(chunks.untracked, index);
+			} else {
+				Image::SetChunkBit(chunks.untracked, index);
+			}
+			if (run_first == UINT32_MAX) {
+				run_first = index;
+			}
+			changed++;
+		} else {
+			flush(index);
+		}
+	}
+	flush(last);
+	return changed;
+}
+
+void TextureCache::InvalidateChunks(Image& image, uint64_t address, uint64_t size) {
+	const auto begin = std::max(Common::AlignDown(address, TRACKER_PAGE_SIZE), image.info.data.address);
+	const auto end = std::min(Common::AlignUp(address + size, TRACKER_PAGE_SIZE), image.info.data.End());
+	if (begin >= end) {
+		return;
+	}
+	auto& chunks = image.chunks;
+	// Whole rewrites (see ChunkState::full_streak) release everything on the first write.
+	constexpr uint32_t WholeRewriteStreak = 2;
+	const bool         whole = chunks.full_streak >= WholeRewriteStreak;
+	const uint32_t     first = whole ? 0u : static_cast<uint32_t>((begin - chunks.base) >> chunks.shift);
+	const uint32_t     last  = whole ? chunks.count
+	                                 : static_cast<uint32_t>(((end - 1 - chunks.base) >> chunks.shift) + 1);
+	chunks.whole_released |= whole;
+	uint32_t newly = 0;
+	for (uint32_t index = first; index < last; index++) {
+		newly += image.MarkChunkDirty(index) ? 1u : 0u;
+	}
+	if (newly != 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureChunkInvalidations, newly);
+	}
+	// Release only the written chunks: writes elsewhere in the image keep faulting and are
+	// recorded chunk by chunk, so a refresh knows every byte that may have changed.
+	if (image.IsTracked()) {
+		(void)UpdateChunkWatchers<false>(image, first, last);
+	}
+	image.NoteChunkWrite(address, size);
+}
+
 void TextureCache::UntrackImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (!image.IsTracked()) {
+		return;
+	}
+	if (image.ChunkTracked()) {
+		(void)UpdateChunkWatchers<false>(image, 0, image.chunks.count);
+		std::fill(image.chunks.untracked.begin(), image.chunks.untracked.end(), 0);
+		image.track_addr     = 0;
+		image.track_addr_end = 0;
+		// Writes are no longer observed: only a full refresh can restore partial validity.
+		image.SetPartialValid(false);
 		return;
 	}
 	const auto address   = image.track_addr;
@@ -1149,9 +1291,27 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		return {merged_id};
 	}
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
-		FreeImage(cached_id, HangTrace::ImageFreeReason::OverlapStale);
+		if (KeepOverlappedImage(cached, current_frame)) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureOverlapKeeps);
+		} else {
+			FreeImage(cached_id, HangTrace::ImageFreeReason::OverlapStale);
+		}
 	}
 	return {merged_id};
+}
+
+bool TextureCache::KeepOverlappedImage(const Image& cached, uint64_t current_frame) const {
+	// A partially overlapped sampled texture stays valid: it watches its own pages and a later
+	// use refreshes (at most) its written chunks. Freeing it only bounds the number of live
+	// aliases; streamed textures that return to their slot are otherwise recreated and fully
+	// uploaded. Keep only clean texture-only images used recently, and never in crowded ranges
+	// (each live alias adds a page watcher; the tracker allows 127 per page).
+	return m_overlap_keep_frames != 0 && !m_overlap_crowded && cached.ChunkTracked() &&
+	       !cached.IsGpuModified() && !cached.IsBufferModified() && !cached.depth_id &&
+	       !cached.usage.render_target && !cached.usage.depth_target && !cached.usage.storage &&
+	       !cached.usage.video_out && !cached.binding.is_target &&
+	       current_frame - std::min(current_frame, cached.frame_accessed_last) <=
+	           m_overlap_keep_frames;
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
@@ -1385,7 +1545,9 @@ void TextureCache::InitializeImage(ImageId id) {
 		return;
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
+	bool       guest_refresh = false;
 	if (upload) {
+		Profiler::ScopedFrameWait upload_time(Profiler::FrameWait::TextureUpload);
 		// Attribution only: why this refresh happens and how much of the image was dirtied.
 		const bool  first  = !image.WasEverUploaded();
 		const char* reason = image.IsBufferModified()
@@ -1400,33 +1562,299 @@ void TextureCache::InitializeImage(ImageId id) {
 		        ? HangTrace::LastGpuWriteKind(span != 0 ? image.DirtySpanBegin()
 		                                                : image.info.data.address)
 		        : nullptr;
-		const auto [source, source_offset] =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
-		if (source == nullptr) {
-			EXIT("TextureCache: failed to obtain image upload source\n");
+		const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
+		// A refresh from guest memory of a sampled-only chunk-tracked image leaves native
+		// contents equal to guest bytes everywhere; later refreshes can then be partial.
+		guest_refresh = image.ChunkTracked() && !image.IsBufferModified() &&
+		                !image.IsGpuModified() && !image.depth_id && binding == BindingType::Texture;
+		PartialUploadResult partial {};
+		if (image.ChunkTracked() && image.chunks.dirty_count != 0 && !first) {
+			partial = TryPartialUpload(image);
+			if (!partial.done) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::TexturePartialFallbacks);
+			}
 		}
-		UploadImage(image, *source, source_offset);
+		if (!partial.done) {
+			const auto [source, source_offset] =
+			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+			if (source == nullptr) {
+				EXIT("TextureCache: failed to obtain image upload source\n");
+			}
+			UploadImage(image, *source, source_offset);
+		}
+		const auto uploaded = partial.done ? partial.bytes : image.info.data.size;
 		image.ClearBufferModified();
 		image.NoteUpload();
 		image.ClearDirtySpan();
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageUploads);
-		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageUploadBytes, image.info.data.size);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageUploadBytes, uploaded);
+		if (partial.done) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TexturePartialUploads);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TexturePartialUploadBytes, uploaded);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TexturePartialSkippedBytes,
+			                          image.info.data.size - std::min(image.info.data.size, uploaded));
+		}
 		if (HangTrace::Enabled()) {
-			const auto binding =
-			    image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
-			HangTrace::RecordTransfer(HangTrace::TransferKind::ImageUpload, reason,
+			// Partial refreshes: bytes are the tiled guest bytes refreshed, span_bytes the dirty
+			// chunk bytes that caused the refresh.
+			HangTrace::RecordTransfer(HangTrace::TransferKind::ImageUpload,
+			                          partial.done ? "cpu-write-partial" : reason,
 			                          writer != nullptr ? writer
 			                          : image.depth_id  ? "stencil-plane"
 			                                            : UploadBindingName(binding),
 			                          image.info.data.address,
 			                          static_cast<uint32_t>(image.backing.format),
-			                          image.info.extent.width, image.info.extent.height,
-			                          image.info.data.size, span);
+			                          image.info.extent.width, image.info.extent.height, uploaded,
+			                          partial.done ? partial.dirty_bytes : span);
 		}
 	}
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
+	if (image.ChunkTracked()) {
+		auto& chunks = image.chunks;
+		if (upload && chunks.whole_released) {
+			// A whole release says nothing about how much was written; probe periodically.
+			if (++chunks.whole_cycles >= 8) {
+				chunks.whole_cycles = 0;
+				chunks.full_streak  = 0;
+			}
+		} else if (upload && chunks.dirty_count != 0) {
+			const bool nearly_all = uint64_t {chunks.dirty_count} * 8 >= uint64_t {chunks.count} * 7;
+			chunks.full_streak    = nearly_all ? std::min(chunks.full_streak + 1, 255u) : 0u;
+		}
+		chunks.whole_released = false;
+		image.ClearChunkDirty();
+		if (guest_refresh) {
+			image.SetPartialValid(true);
+			if (m_partial_verify) {
+				RecordChunkHashes(image);
+			}
+		}
+	}
+}
+
+TextureCache::PartialUploadResult TextureCache::TryPartialUpload(Image& image) {
+	PartialUploadResult result;
+	const auto&         info = image.info;
+	auto&               chunks = image.chunks;
+	if (!image.PartialValid() || image.IsGpuModified() || image.IsBufferModified() ||
+	    image.depth_id || info.samples != 1 || image.backing.samples != 1 || info.IsVolume() ||
+	    !info.IsTiled() || info.IsDepth() ||
+	    info.metadata.compression != VideoOutCompression::Uncompressed ||
+	    chunks.dirty_count == 0 || chunks.dirty_count >= chunks.count ||
+	    UploadBinding(image) != BindingType::Texture) {
+		return result;
+	}
+	const auto transfer = BuildTextureTransfer(image, BindingType::Texture, TransferDirection::Upload);
+	if (!transfer.valid || transfer.swap_bgra16 || transfer.tiles.empty() ||
+	    transfer.tiles.size() != transfer.regions.size()) {
+		return result;
+	}
+	if (m_partial_verify && !VerifyCleanChunks(image)) {
+		return result;
+	}
+
+	// Select the parts of the chain whose tiled guest bytes overlap a dirty chunk. A detile
+	// dispatch reads only its tile's [tiled_offset, tiled_offset + tiled_size) range, so every
+	// changed byte that affects a texel lies in a selected part. Outside the mip tail, 2D block
+	// families address a texel as (block row * blocks per row + block column) * block size plus
+	// an offset that depends only on the texel's position inside its block, so a run of block
+	// rows is an independent sub-surface: its own tiled range, texel rows and copy region.
+	const uint64_t                   base = info.data.address;
+	std::vector<GpuTileInfo>         tiles;
+	std::vector<vk::BufferImageCopy> regions;
+	uint64_t                         linear_total = 0;
+	uint64_t                         tiled_bytes  = 0;
+	const auto add = [&](GpuTileInfo tile, vk::BufferImageCopy region, uint64_t linear_size) {
+		linear_total        = Common::AlignUp(linear_total, 256);
+		tile.linear_offset  = linear_total;
+		tile.linear_size    = linear_size;
+		region.bufferOffset = linear_total;
+		linear_total += linear_size;
+		tiled_bytes += tile.tiled_size;
+		tiles.push_back(tile);
+		regions.push_back(region);
+	};
+	const auto texel_height = std::max(transfer.layout.surface.texture.texel_height, 1u);
+	for (size_t index = 0; index < transfer.tiles.size(); index++) {
+		const auto& tile   = transfer.tiles[index];
+		const auto& region = transfer.regions[index];
+		if (tile.tiled_size == 0 || !image.ChunkRangeDirty(base + tile.tiled_offset, tile.tiled_size)) {
+			continue;
+		}
+		TileBlockLayout block {};
+		const bool      family_bands = tile.family == TileBlockFamily::Standard256B ||
+		                          tile.family == TileBlockFamily::Standard4KB ||
+		                          tile.family == TileBlockFamily::Standard64KB ||
+		                          tile.family == TileBlockFamily::Prt64KB;
+		const bool bands = m_partial_bands && family_bands && !tile.tail && tile.depth == 1 &&
+		                   region.imageOffset.y == 0 &&
+		                   TileGetBlockLayout(tile.family, tile.bytes_per_element, block) &&
+		                   block.block_depth == 1 && block.block_width != 0 &&
+		                   block.block_height != 0 && block.block_size != 0;
+		const uint32_t tiled_width = tile.tiled_width != 0 ? tile.tiled_width : tile.pitch;
+		const uint64_t row_bytes =
+		    bands ? static_cast<uint64_t>((tiled_width + block.block_width - 1) / block.block_width) *
+		                block.block_size
+		          : 0;
+		const uint32_t rows =
+		    bands ? (tile.height + block.block_height - 1) / block.block_height : 0;
+		if (!bands || row_bytes == 0 || rows <= 1 || rows * row_bytes > tile.tiled_size) {
+			add(tile, region, tile.linear_size);
+			continue;
+		}
+		const uint64_t pitch_bytes = static_cast<uint64_t>(tile.pitch) * tile.bytes_per_element;
+		for (uint32_t row = 0; row < rows;) {
+			const auto row_dirty = [&](uint32_t r) {
+				return image.ChunkRangeDirty(base + tile.tiled_offset + r * row_bytes, row_bytes);
+			};
+			if (!row_dirty(row)) {
+				row++;
+				continue;
+			}
+			uint32_t end_row = row + 1;
+			while (end_row < rows && row_dirty(end_row)) {
+				end_row++;
+			}
+			const uint32_t y0   = row * block.block_height;
+			const uint32_t y1   = std::min(end_row * block.block_height, tile.height);
+			GpuTileInfo    band = tile;
+			band.tiled_offset   = tile.tiled_offset + row * row_bytes;
+			band.tiled_size     = (end_row - row) * row_bytes;
+			band.height         = y1 - y0;
+			band.tiled_height   = (end_row - row) * block.block_height;
+			auto band_region    = region;
+			const uint32_t texel_y0 = y0 * texel_height;
+			const uint32_t texel_y1 = std::min(y1 * texel_height, region.imageExtent.height);
+			band_region.imageOffset.y      = static_cast<int32_t>(texel_y0);
+			band_region.imageExtent.height = texel_y1 - texel_y0;
+			add(band, band_region, static_cast<uint64_t>(band.height) * pitch_bytes);
+			row = end_row;
+		}
+	}
+	if (tiles.empty()) {
+		// The writes touched only bytes no texel is decoded from (gaps between levels).
+		result.done        = true;
+		result.dirty_bytes = static_cast<uint64_t>(chunks.dirty_count) << chunks.shift;
+		return result;
+	}
+	// Nearly everything is dirty: the plain refresh needs fewer dispatches for the same bytes.
+	if (tiled_bytes >= info.data.size - info.data.size / 8) {
+		return result;
+	}
+
+	// Source: an existing cache buffer for this range (synchronized page by page) or the
+	// canonical GPU-written bytes; otherwise only the selected tiled ranges of guest memory.
+	vk::Buffer tiled_buffer   = nullptr;
+	uint64_t   tiled_offset   = 0;
+	uint64_t   tiled_capacity = 0;
+	if (m_buffer_cache.IsRegionRegistered(base, info.data.size) ||
+	    m_buffer_cache.IsRegionGpuModified(base, info.data.size)) {
+		const auto [source, source_offset] = m_buffer_cache.ObtainBufferForImage(base, info.data.size);
+		if (source == nullptr) {
+			EXIT("TextureCache: failed to obtain image upload source\n");
+		}
+		tiled_buffer   = source->Handle();
+		tiled_offset   = source_offset;
+		tiled_capacity = info.data.size;
+	} else {
+		struct SourceRange {
+			uint64_t offset;
+			uint64_t size;
+			uint64_t packed;
+		};
+		std::vector<SourceRange> ranges;
+		uint64_t                 packed_total = 0;
+		for (auto& tile: tiles) {
+			const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const SourceRange& r) {
+				return r.offset == tile.tiled_offset && r.size == tile.tiled_size;
+			});
+			if (found != ranges.end()) {
+				tile.tiled_offset = found->packed;
+				continue;
+			}
+			packed_total = Common::AlignUp(packed_total, 256);
+			ranges.push_back({tile.tiled_offset, tile.tiled_size, packed_total});
+			tile.tiled_offset = packed_total;
+			packed_total += tile.tiled_size;
+		}
+		auto& staging         = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Upload);
+		auto [mapped, offset] = staging.Map(packed_total, 256);
+		if (mapped == nullptr) {
+			return result;
+		}
+		for (const auto& range: ranges) {
+			if (!LibKernel::Memory::TryReadBacking(base + range.offset, mapped + range.packed,
+			                                       range.size) &&
+			    !LibKernel::Memory::TryReadPrtBacking(base + range.offset, mapped + range.packed,
+			                                          range.size)) {
+				EXIT("TextureCache: failed to read mapped guest image backing\n");
+			}
+		}
+		staging.Commit();
+		tiled_buffer   = staging.Handle();
+		tiled_offset   = offset;
+		tiled_capacity = packed_total;
+	}
+	const auto linear = m_tiler.Detile(tiled_buffer, tiled_offset, tiled_capacity, linear_total, tiles);
+	for (auto& region: regions) {
+		region.bufferOffset += linear.offset;
+	}
+	image.Upload(regions, linear.buffer, linear.offset, linear.size);
+	result.done        = true;
+	result.bytes       = tiled_bytes;
+	result.dirty_bytes = static_cast<uint64_t>(chunks.dirty_count) << chunks.shift;
+	return result;
+}
+
+void TextureCache::RecordChunkHashes(Image& image) {
+	auto&          chunks     = image.chunks;
+	const uint64_t chunk_size = uint64_t {1} << chunks.shift;
+	chunks.hashes.assign(chunks.count, 0);
+	std::vector<uint8_t> bytes(chunk_size);
+	for (uint32_t index = 0; index < chunks.count; index++) {
+		const auto begin = std::max(image.info.data.address, chunks.base + uint64_t {index} * chunk_size);
+		const auto end = std::min(image.info.data.End(), chunks.base + uint64_t {index + 1} * chunk_size);
+		if (begin >= end ||
+		    (!LibKernel::Memory::TryReadBacking(begin, bytes.data(), end - begin) &&
+		     !LibKernel::Memory::TryReadPrtBacking(begin, bytes.data(), end - begin))) {
+			chunks.hashes.clear();
+			return;
+		}
+		chunks.hashes[index] = XXH3_64bits(bytes.data(), static_cast<size_t>(end - begin));
+	}
+}
+
+bool TextureCache::VerifyCleanChunks(Image& image) {
+	auto&          chunks     = image.chunks;
+	const uint64_t chunk_size = uint64_t {1} << chunks.shift;
+	if (chunks.hashes.size() != chunks.count) {
+		return false;
+	}
+	std::vector<uint8_t> bytes(chunk_size);
+	for (uint32_t index = 0; index < chunks.count; index++) {
+		if (Image::ChunkBit(chunks.dirty, index)) {
+			continue;
+		}
+		const auto begin = std::max(image.info.data.address, chunks.base + uint64_t {index} * chunk_size);
+		const auto end = std::min(image.info.data.End(), chunks.base + uint64_t {index + 1} * chunk_size);
+		if (begin >= end ||
+		    (!LibKernel::Memory::TryReadBacking(begin, bytes.data(), end - begin) &&
+		     !LibKernel::Memory::TryReadPrtBacking(begin, bytes.data(), end - begin))) {
+			return false;
+		}
+		if (XXH3_64bits(bytes.data(), static_cast<size_t>(end - begin)) != chunks.hashes[index]) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TexturePartialVerifyMismatches);
+			if (++m_partial_verify_mismatches <= 64) {
+				LOGF("Texture partial verify: clean chunk changed without a recorded write: "
+				     "image=0x%016" PRIx64 " size=0x%" PRIx64 " chunk=0x%016" PRIx64 "\n",
+				     image.info.data.address, image.info.data.size, begin);
+			}
+			return false;
+		}
+	}
+	return true;
 }
 
 bool TextureCache::TryMaterializeGpuDccClear(ImageId id, const ImageDesc& desc,
@@ -1806,6 +2234,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (!use_legacy) {
 				candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 			}
+			constexpr size_t CrowdedOverlap = 24;
+			m_overlap_crowded = candidates.size() > CrowdedOverlap;
 			for (const auto candidate: candidates) {
 				view_mip                = -1;
 				view_layer              = -1;
@@ -2598,6 +3028,10 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr) {
+			continue;
+		}
+		if (owner->ChunkTracked()) {
+			InvalidateChunks(*owner, address, size);
 			continue;
 		}
 		if (owner->Overlaps(address, size)) {

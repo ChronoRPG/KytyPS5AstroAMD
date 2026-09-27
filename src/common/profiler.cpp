@@ -178,6 +178,15 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.VertexTableBatchMisses.Cumulative",
     "FrameEvent.ShaderMapMemoHits.Cumulative",
     "FrameEvent.ShaderMapMemoMisses.Cumulative",
+    "FrameEvent.TexturePartialUploads.Cumulative",
+    "FrameEvent.TexturePartialUploadBytes.Cumulative",
+    "FrameEvent.TexturePartialSkippedBytes.Cumulative",
+    "FrameEvent.TexturePartialFallbacks.Cumulative",
+    "FrameEvent.TextureChunkInvalidations.Cumulative",
+    "FrameEvent.TexturePartialVerifyMismatches.Cumulative",
+    "FrameEvent.TextureOverlapKeeps.Cumulative",
+    "FrameEvent.TilerScratchPoolHits.Cumulative",
+    "FrameEvent.TilerScratchPoolMisses.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
@@ -207,6 +216,7 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.ReadbackSideWait.Calls.Cumulative",
     "FrameWait.StagePrepJoin.Calls.Cumulative",
     "FrameWait.StagePrepHelper.Calls.Cumulative",
+    "FrameWait.TextureUpload.Calls.Cumulative",
 };
 static_assert(kFrameWaitCallNames.back() != nullptr, "FrameWait names must match the enum");
 constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
@@ -229,6 +239,7 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.ReadbackSideWait.Nanoseconds.Cumulative",
     "FrameWait.StagePrepJoin.Nanoseconds.Cumulative",
     "FrameWait.StagePrepHelper.Nanoseconds.Cumulative",
+    "FrameWait.TextureUpload.Nanoseconds.Cumulative",
 };
 static_assert(kFrameWaitTimeNames.back() != nullptr, "FrameWait names must match the enum");
 

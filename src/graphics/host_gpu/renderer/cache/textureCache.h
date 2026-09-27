@@ -147,6 +147,21 @@ private:
 	void                      TouchImage(Image& image);
 	void                      SyncAliasFromOwner(ImageId id);
 	void                      TrackImage(ImageId id);
+	// Chunk-granular tracking (Image::ChunkState). Caller holds m_lock.
+	[[nodiscard]] bool        ChunkTrackingEligible(const Image& image) const;
+	void                      TrackChunkImage(Image& image);
+	template <bool track>
+	uint32_t                  UpdateChunkWatchers(Image& image, uint32_t first, uint32_t last);
+	void                      InvalidateChunks(Image& image, uint64_t address, uint64_t size);
+	struct PartialUploadResult {
+		bool     done        = false;
+		uint64_t bytes       = 0; // tiled guest bytes detiled and uploaded
+		uint64_t dirty_bytes = 0; // dirty chunk bytes that caused the refresh
+	};
+	[[nodiscard]] PartialUploadResult TryPartialUpload(Image& image);
+	void                      RecordChunkHashes(Image& image);
+	[[nodiscard]] bool        VerifyCleanChunks(Image& image);
+	[[nodiscard]] bool        KeepOverlappedImage(const Image& cached, uint64_t current_frame) const;
 	void                      TrackImageHead(ImageId id);
 	void                      TrackImageTail(ImageId id);
 	void                      UntrackImage(ImageId id);
@@ -250,6 +265,16 @@ private:
 	uint64_t         m_image_lookup_checks = 0;
 	uint64_t         m_image_lookup_mismatches = 0;
 	bool             m_readback_linear_images = false;
+	// Texture streaming (see TextureCache constructor for the environment switches).
+	bool             m_partial_upload      = true;
+	bool             m_partial_bands       = true;
+	bool             m_partial_verify      = false;
+	uint32_t         m_chunk_shift         = 16;
+	uint64_t         m_overlap_keep_frames = 0;
+	// Set by FindImage for the ResolveOverlap calls of one lookup: many live overlapping
+	// images already share the requested range, so overlapped images are not kept.
+	bool             m_overlap_crowded     = false;
+	uint64_t         m_partial_verify_mismatches = 0;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
