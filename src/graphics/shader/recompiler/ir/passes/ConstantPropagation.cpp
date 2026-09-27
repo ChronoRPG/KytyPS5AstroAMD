@@ -1,13 +1,220 @@
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <optional>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
+
+// Finite value sets for U32 SSA values: the exact set of values an instruction can produce when
+// it is small (bit-field extracts of a few bits, masks, and arithmetic on such values), or
+// unknown. A compare whose outcome is the same for every pair of possible operands folds to a
+// constant. This is exact: nothing is assumed about unknown values. It exists for V_MOVRELS /
+// V_MOVRELD, whose select chains compare M0 against every VGPR offset above the base, while the
+// guest computes M0 from a 3-bit field (times a small stride), so most compares are always false.
+class ValueSetAnalysis {
+public:
+	using Set = std::optional<std::vector<uint32_t>>;
+
+	static constexpr size_t MaxValues  = 64;
+	static constexpr size_t MaxProduct = 4096;
+	static constexpr int    MaxDepth   = 24;
+
+	Set Of(Value value, int depth = 0) {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			if (value.GetType() == Type::U32) {
+				return std::vector<uint32_t> {value.U32()};
+			}
+			return std::nullopt;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->GetType() != Type::U32 || depth > MaxDepth) {
+			return std::nullopt;
+		}
+		if (const auto it = m_memo.find(inst); it != m_memo.end()) {
+			return it->second;
+		}
+		if (!m_active.insert(inst).second) {
+			return std::nullopt; // A cycle through phis: give up on this path.
+		}
+		auto result = Compute(*inst, depth + 1);
+		m_active.erase(inst);
+		m_memo.emplace(inst, result);
+		return result;
+	}
+
+	// Folds a U32 compare when both operand sets are known and every pair gives the same answer.
+	template <typename Predicate>
+	std::optional<bool> Compare(Value lhs, Value rhs, Predicate predicate) {
+		const auto a = Of(lhs);
+		if (!a.has_value()) {
+			return std::nullopt;
+		}
+		const auto b = Of(rhs);
+		if (!b.has_value() || a->size() * b->size() > MaxProduct) {
+			return std::nullopt;
+		}
+		bool any_true  = false;
+		bool any_false = false;
+		for (const auto x: *a) {
+			for (const auto y: *b) {
+				(predicate(x, y) ? any_true : any_false) = true;
+				if (any_true && any_false) {
+					return std::nullopt;
+				}
+			}
+		}
+		return any_true;
+	}
+
+private:
+	static Set Normalize(std::vector<uint32_t> values) {
+		std::sort(values.begin(), values.end());
+		values.erase(std::unique(values.begin(), values.end()), values.end());
+		if (values.size() > MaxValues) {
+			return std::nullopt;
+		}
+		return values;
+	}
+
+	template <typename Function>
+	static Set Cross(const Set& a, const Set& b, Function function) {
+		if (!a.has_value() || !b.has_value() || a->size() * b->size() > MaxProduct) {
+			return std::nullopt;
+		}
+		std::vector<uint32_t> values;
+		values.reserve(a->size() * b->size());
+		for (const auto x: *a) {
+			for (const auto y: *b) {
+				values.push_back(function(x, y));
+			}
+		}
+		return Normalize(std::move(values));
+	}
+
+	// Every value v with (v & ~mask) == 0, when the mask has few bits.
+	static Set Submasks(uint32_t mask) {
+		if (std::popcount(mask) > 6) {
+			return std::nullopt;
+		}
+		std::vector<uint32_t> values;
+		for (uint32_t subset = mask;; subset = (subset - 1u) & mask) {
+			values.push_back(subset);
+			if (subset == 0u) {
+				break;
+			}
+		}
+		return Normalize(std::move(values));
+	}
+
+	static uint32_t Bits(const std::vector<uint32_t>& values) {
+		uint32_t bits = 0;
+		for (const auto value: values) {
+			bits |= value;
+		}
+		return bits;
+	}
+
+	Set Compute(const Inst& inst, int depth) {
+		const auto arg = [&](size_t index) { return Of(inst.Arg(index), depth); };
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::BitFieldUExtract: {
+				const auto offset = inst.Arg(1).Resolve();
+				const auto count  = inst.Arg(2).Resolve();
+				if (!offset.IsImmediate() || !count.IsImmediate() ||
+				    offset.GetType() != Type::U32 || count.GetType() != Type::U32 ||
+				    offset.U32() > 32u || count.U32() > 32u - offset.U32()) {
+					return std::nullopt;
+				}
+				const auto shift = offset.U32();
+				const auto mask =
+				    count.U32() == 32u ? UINT32_MAX : (uint32_t {1} << count.U32()) - 1u;
+				if (count.U32() == 0u) {
+					return std::vector<uint32_t> {0u};
+				}
+				if (const auto source = arg(0); source.has_value()) {
+					std::vector<uint32_t> values;
+					for (const auto value: *source) {
+						values.push_back(shift == 32u ? 0u : (value >> shift) & mask);
+					}
+					return Normalize(std::move(values));
+				}
+				return Submasks(mask);
+			}
+			case ValueOpcode::BitwiseAnd32: {
+				const auto a = arg(0);
+				const auto b = arg(1);
+				if (a.has_value() && b.has_value()) {
+					return Cross(a, b, [](uint32_t x, uint32_t y) { return x & y; });
+				}
+				// x & y only keeps bits the known side can have.
+				if (a.has_value()) {
+					return Submasks(Bits(*a));
+				}
+				if (b.has_value()) {
+					return Submasks(Bits(*b));
+				}
+				return std::nullopt;
+			}
+			case ValueOpcode::BitwiseOr32:
+				return Cross(arg(0), arg(1), [](uint32_t x, uint32_t y) { return x | y; });
+			case ValueOpcode::BitwiseXor32:
+				return Cross(arg(0), arg(1), [](uint32_t x, uint32_t y) { return x ^ y; });
+			case ValueOpcode::IAdd32:
+				return Cross(arg(0), arg(1), [](uint32_t x, uint32_t y) { return x + y; });
+			case ValueOpcode::ISub32:
+				return Cross(arg(0), arg(1), [](uint32_t x, uint32_t y) { return x - y; });
+			case ValueOpcode::IMul32:
+				return Cross(arg(0), arg(1), [](uint32_t x, uint32_t y) { return x * y; });
+			case ValueOpcode::ShiftLeftLogical32:
+				return Cross(arg(0), arg(1), [](uint32_t x, uint32_t y) { return x << (y & 31u); });
+			case ValueOpcode::ShiftRightLogical32:
+				return Cross(arg(0), arg(1), [](uint32_t x, uint32_t y) { return x >> (y & 31u); });
+			case ValueOpcode::UMin32:
+				return Cross(arg(0), arg(1), [](uint32_t x, uint32_t y) { return std::min(x, y); });
+			case ValueOpcode::UMax32:
+				return Cross(arg(0), arg(1), [](uint32_t x, uint32_t y) { return std::max(x, y); });
+			case ValueOpcode::SelectU32: {
+				auto a = arg(1);
+				auto b = arg(2);
+				if (!a.has_value() || !b.has_value()) {
+					return std::nullopt;
+				}
+				a->insert(a->end(), b->begin(), b->end());
+				return Normalize(std::move(*a));
+			}
+			case ValueOpcode::Phi: {
+				std::vector<uint32_t> values;
+				for (size_t index = 0; index < inst.NumArgs(); index++) {
+					if (inst.Arg(index).Resolve().TryInstruction() == &inst) {
+						continue;
+					}
+					const auto incoming = arg(index);
+					if (!incoming.has_value()) {
+						return std::nullopt;
+					}
+					values.insert(values.end(), incoming->begin(), incoming->end());
+				}
+				if (values.empty()) {
+					return std::nullopt;
+				}
+				return Normalize(std::move(values));
+			}
+			default: return std::nullopt;
+		}
+	}
+
+	std::unordered_map<const Inst*, Set> m_memo;
+	std::unordered_set<const Inst*>      m_active;
+};
 
 Value Arg(const Inst& inst, size_t index) {
 	return inst.Arg(index).Resolve();
@@ -194,8 +401,18 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 	return false;
 }
 
+template <typename Predicate>
+void FoldU32CompareBySets(Inst& inst, ValueSetAnalysis* sets, Predicate predicate) {
+	if (FoldU32Compare(inst, predicate) || sets == nullptr) {
+		return;
+	}
+	if (const auto result = sets->Compare(Arg(inst, 0), Arg(inst, 1), predicate)) {
+		Replace(inst, Value(*result));
+	}
+}
+
 void FoldInstruction(Block& block, Block::iterator instruction,
-                      std::unordered_set<Inst*>& lowered_ancillary) {
+                      std::unordered_set<Inst*>& lowered_ancillary, ValueSetAnalysis* sets) {
 	auto& inst = *instruction;
 	switch (inst.GetOpcode()) {
 		case ValueOpcode::Phi: FoldPhi(inst); return;
@@ -531,22 +748,22 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			FoldU32(inst, [](uint32_t a, uint32_t b) { return std::max(a, b); });
 			return;
 		case ValueOpcode::IEqual32:
-			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a == b; });
+			FoldU32CompareBySets(inst, sets, [](uint32_t a, uint32_t b) { return a == b; });
 			return;
 		case ValueOpcode::INotEqual32:
-			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a != b; });
+			FoldU32CompareBySets(inst, sets, [](uint32_t a, uint32_t b) { return a != b; });
 			return;
 		case ValueOpcode::ULessThan32:
-			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a < b; });
+			FoldU32CompareBySets(inst, sets, [](uint32_t a, uint32_t b) { return a < b; });
 			return;
 		case ValueOpcode::ULessThanEqual32:
-			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a <= b; });
+			FoldU32CompareBySets(inst, sets, [](uint32_t a, uint32_t b) { return a <= b; });
 			return;
 		case ValueOpcode::UGreaterThan32:
-			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a > b; });
+			FoldU32CompareBySets(inst, sets, [](uint32_t a, uint32_t b) { return a > b; });
 			return;
 		case ValueOpcode::UGreaterThanEqual32:
-			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a >= b; });
+			FoldU32CompareBySets(inst, sets, [](uint32_t a, uint32_t b) { return a >= b; });
 			return;
 		case ValueOpcode::SLessThan32:
 		case ValueOpcode::SLessThanEqual32:
@@ -648,9 +865,11 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 
 void ConstantPropagationPass(const BlockList& blocks) {
 	std::unordered_set<Inst*> lowered_ancillary;
+	ValueSetAnalysis          value_sets;
+	auto* sets = GetCodegenOptions().movrel_range ? &value_sets : nullptr;
 	for (auto* block: blocks) {
 		for (auto inst = block->begin(); inst != block->end(); ++inst) {
-			FoldInstruction(*block, inst, lowered_ancillary);
+			FoldInstruction(*block, inst, lowered_ancillary, sets);
 		}
 	}
 	// Normalize retained PHI/select values only after every supported field read has
