@@ -328,11 +328,25 @@ void CommandBuffer::RecordPendingUploads() const {
 		barrier.size                = VK_WHOLE_SIZE;
 		destinations.push_back(barrier);
 	}
+	// Many destinations (a BDA synchronization pass) use one global dependency with the same
+	// scopes instead: it orders at least everything the buffer barriers order.
+	constexpr size_t   MaxBufferBarriers = 8;
+	const bool         global            = destinations.size() > MaxBufferBarriers;
+	vk::MemoryBarrier2 memory {};
+	memory.srcStageMask  = destinations.front().srcStageMask;
+	memory.srcAccessMask = destinations.front().srcAccessMask;
+	memory.dstStageMask  = destinations.front().dstStageMask;
+	memory.dstAccessMask = destinations.front().dstAccessMask;
 	++m_internal_recording;
 	vk::DependencyInfo dependency {};
-	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
-	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(destinations.size());
-	dependency.pBufferMemoryBarriers    = destinations.data();
+	dependency.dependencyFlags = vk::DependencyFlagBits::eByRegion;
+	if (global) {
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &memory;
+	} else {
+		dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(destinations.size());
+		dependency.pBufferMemoryBarriers    = destinations.data();
+	}
 	m_buffer.pipelineBarrier2(dependency);
 	for (const auto& upload: m_pending.uploads) {
 		m_buffer.copyBuffer(upload.source, upload.destination, upload.region_count,
@@ -344,12 +358,33 @@ void CommandBuffer::RecordPendingUploads() const {
 	// The copies' writes before every later access. These join the batch recorded right after
 	// the copies: its other barriers ordered earlier commands against later ones, which the
 	// copies (writing only their destinations, reading host-written staging data) do not need.
-	for (auto& barrier: destinations) {
-		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
-		barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-		barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-		barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-		m_pending.buffers.push_back(barrier);
+	constexpr auto post_src_stage  = vk::PipelineStageFlagBits2::eTransfer;
+	constexpr auto post_src_access = vk::AccessFlagBits2::eTransferWrite;
+	constexpr auto post_dst_stage  = vk::PipelineStageFlagBits2::eAllCommands;
+	const auto     post_dst_access =
+	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	if (global) {
+		if (m_pending.has_memory) {
+			m_pending.memory.srcStageMask |= post_src_stage;
+			m_pending.memory.srcAccessMask |= post_src_access;
+			m_pending.memory.dstStageMask |= post_dst_stage;
+			m_pending.memory.dstAccessMask |= post_dst_access;
+		} else {
+			m_pending.memory               = vk::MemoryBarrier2 {};
+			m_pending.memory.srcStageMask  = post_src_stage;
+			m_pending.memory.srcAccessMask = post_src_access;
+			m_pending.memory.dstStageMask  = post_dst_stage;
+			m_pending.memory.dstAccessMask = post_dst_access;
+			m_pending.has_memory           = true;
+		}
+	} else {
+		for (auto& barrier: destinations) {
+			barrier.srcStageMask  = post_src_stage;
+			barrier.srcAccessMask = post_src_access;
+			barrier.dstStageMask  = post_dst_stage;
+			barrier.dstAccessMask = post_dst_access;
+			m_pending.buffers.push_back(barrier);
+		}
 	}
 	m_pending.uploads.clear();
 	m_pending.upload_regions.clear();
