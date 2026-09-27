@@ -535,6 +535,7 @@ target_include_directories(ampr_counter_bank_tests PRIVATE "${KYTY_SOURCE_DIR}")
 # Pure helpers of the texture/descriptor binding path; no Vulkan device is created.
 add_executable(binding_path_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BindingPathTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptorSetReuse.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.cpp"
 )
 target_link_libraries(binding_path_tests common fmt::fmt xxhash Vulkan::Headers)
