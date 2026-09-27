@@ -2481,6 +2481,25 @@ public:
     context.InitializeGpu(nullptr);
     auto &gpu = context.GetGpu();
 
+    // RELEASE_MEM interrupts and data_sel 1 labels request a command-buffer flush, but only
+    // every KYTY_EOP_FLUSH_BATCH-th request submits (default 8, a33abe76); BufferFlush
+    // (slice ends) resets the count. Mirror that rule for the processor below, which only
+    // this check drives: the result is the tick advance one flush request causes.
+    const uint32_t eop_flush_batch = [] {
+      const char *value = std::getenv("KYTY_EOP_FLUSH_BATCH");
+      const auto parsed =
+          value != nullptr ? std::strtoul(value, nullptr, 10) : 8ul;
+      return static_cast<uint32_t>(std::clamp(parsed, 1ul, 1024ul));
+    }();
+    uint32_t pending_eop_flushes = 0;
+    const auto eop_flush_request = [&]() -> uint64_t {
+      if (++pending_eop_flushes < eop_flush_batch) {
+        return 0;
+      }
+      pending_eop_flushes = 0;
+      return 1;
+    };
+
     const auto caller_thread = std::this_thread::get_id();
     std::thread::id gpu_thread;
     std::thread::id nested_thread;
@@ -2589,17 +2608,20 @@ public:
                     "submitted extra GPU work");
           }
 
+          // An interrupt-only GDS release raises the interrupt without reading GDS, so it
+          // never waits: it only requests a (batched) flush.
           auto gds_interrupt_only =
               make_release_mem(5, 1, &interrupt_only_gds_label, 1ull << 16u);
           Pm4Execution gds_interrupt_execution;
           const auto interrupt_tick = gpu_scheduler.CurrentTick();
           const auto interrupt_result =
               processor->Process(gds_interrupt_execution, gds_interrupt_only);
+          const auto interrupt_advance = eop_flush_request();
           parser_kept_nonblocking_boundaries =
               cache_and_counter_did_not_submit &&
               cb_db_release_did_not_submit &&
               interrupt_result == Pm4ProcessResult::Complete &&
-              gpu_scheduler.CurrentTick() == interrupt_tick + 1 &&
+              gpu_scheduler.CurrentTick() == interrupt_tick + interrupt_advance &&
               interrupt_only_gds_label == UINT64_MAX;
         });
         parser_complete.release();
@@ -2638,13 +2660,16 @@ public:
                     release_label <= Sync::ReadReferenceClock(),
                 "clock write with writeback and interrupt lost its data");
 
+        // A data_sel 1 label and an interrupt-only release each request a batched flush;
+        // a GDS read waits for the GPU exactly once, with or without an interrupt.
         auto immediate = make_release_mem(1, 0, &release_label, 0x11223344u);
         Pm4Execution immediate_execution;
         const auto immediate_tick = gpu_scheduler.CurrentTick();
         const auto immediate_result =
             processor->Process(immediate_execution, immediate);
-        const bool immediate_split_once =
-            gpu_scheduler.CurrentTick() == immediate_tick + 1;
+        const auto immediate_advance = eop_flush_request();
+        const bool immediate_split_as_batched =
+            gpu_scheduler.CurrentTick() == immediate_tick + immediate_advance;
 
         auto gds = make_release_mem(5, 0, &gds_label, 1ull << 16u);
         Pm4Execution gds_execution;
@@ -2658,8 +2683,9 @@ public:
         const auto interrupt_tick = gpu_scheduler.CurrentTick();
         const auto interrupt_result =
             processor->Process(interrupt_execution, interrupt_only);
-        const bool interrupt_split_once =
-            gpu_scheduler.CurrentTick() == interrupt_tick + 1;
+        const auto interrupt_advance = eop_flush_request();
+        const bool interrupt_split_as_batched =
+            gpu_scheduler.CurrentTick() == interrupt_tick + interrupt_advance;
 
         auto gds_interrupt = make_release_mem(5, 2, &gds_label, 1ull << 16u);
         Pm4Execution gds_interrupt_execution;
@@ -2669,13 +2695,29 @@ public:
         const bool gds_interrupt_waited_once =
             gpu_scheduler.CurrentTick() == gds_interrupt_tick + 1;
 
+        // Up to the batch boundary interrupt requests leave the recording open; the
+        // boundary request submits it exactly once.
+        bool batch_boundary_submits = true;
+        for (uint64_t advance = 0; advance == 0;) {
+          auto boundary = make_release_mem(0, 4, nullptr, 0);
+          Pm4Execution boundary_execution;
+          const auto boundary_tick = gpu_scheduler.CurrentTick();
+          const auto boundary_result =
+              processor->Process(boundary_execution, boundary);
+          advance = eop_flush_request();
+          batch_boundary_submits &=
+              boundary_result == Pm4ProcessResult::Complete &&
+              gpu_scheduler.CurrentTick() == boundary_tick + advance;
+        }
+
         release_mem_submission_counts =
             immediate_result == Pm4ProcessResult::Complete &&
-            immediate_split_once && gds_result == Pm4ProcessResult::Complete &&
-            gds_waited_once && interrupt_result == Pm4ProcessResult::Complete &&
-            interrupt_split_once &&
+            immediate_split_as_batched &&
+            gds_result == Pm4ProcessResult::Complete && gds_waited_once &&
+            interrupt_result == Pm4ProcessResult::Complete &&
+            interrupt_split_as_batched &&
             gds_interrupt_result == Pm4ProcessResult::Complete &&
-            gds_interrupt_waited_once;
+            gds_interrupt_waited_once && batch_boundary_submits;
       });
       gpu.SendCommandSync([&] {
         gpu_scheduler.Finish();
@@ -2685,8 +2727,8 @@ public:
               release_mem_submission_counts &&
                   static_cast<uint32_t>(release_label) == 0x11223344u &&
                   static_cast<uint32_t>(gds_label) == 0,
-              "RELEASE_MEM lost its required split/readback or retained a "
-              "redundant GPU wait");
+              "RELEASE_MEM lost its batched flush or GDS readback wait, or "
+              "retained a redundant GPU wait");
     }
 
     alignas(uint32_t) uint32_t packet_marker_a = 0;
