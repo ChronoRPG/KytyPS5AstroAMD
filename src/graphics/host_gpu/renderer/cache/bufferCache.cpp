@@ -1083,6 +1083,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		PreserveImagesForGpuWrite(id, vaddr, size);
 		// Writable descriptors reserve a new version before recording their shader commands.
 		buffer.MarkContentWritten();
 		// An Add that changes nothing cannot stale a cached clean page, because pages with
@@ -1127,6 +1128,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainWrittenBuffer(uint64_t vaddr, ui
 	for (const auto& range: written) {
 		(void)SynchronizeBuffer(buffer, range.address, range.size, true, false, nullptr,
 		                        "written-binding");
+		PreserveImagesForGpuWrite(id, range.address, range.size);
 		if (!m_gpu_modified_ranges.Contains(range.address, range.size)) {
 			CleanVerdict::Invalidate();
 		}
@@ -1186,9 +1188,17 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		return;
 	}
 
-	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	// Obtaining the destination moves overlapping GPU-modified images into it first (their
+	// bytes outside the fill survive); only then do those images lose GPU ownership.
+	const bool preserve_images = ImageWritebackOnGpuWriteEnabled();
+	if (!preserve_images) {
+		m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	}
 	HangTrace::ScopedGpuWriteKind trace_kind(HangTrace::GpuWriteKind::Fill);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+	if (preserve_images) {
+		m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	}
 	dst->Fill(dst_offset, size, value);
 	RecordKnownFill(vaddr, size, value);
 }
@@ -1287,7 +1297,10 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 
 	auto& command = m_scheduler.Current();
-	if (dst_memory) {
+	// The source synchronizes from a GPU-modified image at its address and the destination moves
+	// overlapping GPU-modified images into itself before those images lose GPU ownership.
+	const bool preserve_images = ImageWritebackOnGpuWriteEnabled();
+	if (dst_memory && !preserve_images) {
 		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
 	}
 	const auto src_id      = src_memory ? FindBuffer(src_vaddr, size) : BufferId {};
@@ -1297,6 +1310,9 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	HangTrace::ScopedGpuWriteKind trace_kind(HangTrace::GpuWriteKind::Copy);
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
+	if (dst_memory && preserve_images) {
+		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
+	}
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
 }
 

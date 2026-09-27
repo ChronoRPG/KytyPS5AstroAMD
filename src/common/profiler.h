@@ -291,6 +291,13 @@ enum class FrameEvent : uint32_t {
 	BufferUploadCopies,
 	BufferUploadBarriers,
 	BufferUploadRenderSplits,
+	// GPU-modified images moved into a buffer before a GPU write took their ownership
+	// (BufferCache::PreserveImagesForGpuWrite): downloads, bytes, downloads covering only leading
+	// mips, and overlapping images that could not be moved (their contents are lost as before).
+	ImageWritebacks,
+	ImageWritebackBytes,
+	ImageWritebackPartial,
+	ImageWritebackSkips,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

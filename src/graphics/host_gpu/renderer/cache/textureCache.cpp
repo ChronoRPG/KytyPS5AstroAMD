@@ -2485,8 +2485,17 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	if (!m_texture_cache.SafeToDownload(image)) {
 		return false;
 	}
-	if (!buffer.IsInBounds(image.info.data.address, 1)) {
+	if (RecordImageDownload(buffer, selected) == 0) {
 		return false;
+	}
+	MemoryStats::Count(MemoryStats::Counter::BufferFromImageSyncs);
+	return true;
+}
+
+uint64_t BufferCache::RecordImageDownload(Buffer& buffer, ImageId id) {
+	auto& image = m_texture_cache.m_slot_images[id];
+	if (!buffer.IsInBounds(image.info.data.address, 1)) {
+		return 0;
 	}
 	const auto buf_offset = buffer.Offset(image.info.data.address);
 	const auto available  = buffer.Size() - buf_offset;
@@ -2496,7 +2505,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		// Volume mips contain strided block slices, so a mip's linear span cannot prove that
 		// every retained slice fits. Keep volume synchronization whole-image only.
 		if (!buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
-			return false;
+			return 0;
 		}
 		levels    = image.info.resources.levels;
 		copy_size = image.info.data.size;
@@ -2510,14 +2519,14 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		}
 	}
 	if (copy_size == 0) {
-		return false;
+		return 0;
 	}
 	auto transfer = m_texture_cache.BuildDownload(image);
 	if (!transfer.valid) {
-		return false;
+		return 0;
 	}
 	if (transfer.depth_target && copy_size != image.info.data.size) {
-		return false;
+		return 0;
 	}
 	if (!transfer.depth_target && levels < image.info.resources.levels) {
 		auto& texture = transfer.texture;
@@ -2525,21 +2534,123 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 			return region.imageSubresource.mipLevel >= levels;
 		});
 		if (texture.regions.empty()) {
-			return false;
+			return 0;
 		}
 		if (!texture.tiles.empty()) {
 			texture.tiles.clear();
 			if (!TextureBuildGpuTileInfos(copy_size, texture.regions, texture.layout, levels,
 			                              texture.tiles)) {
-				return false;
+				return 0;
 			}
 		}
 	}
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, std::move(transfer));
-	MemoryStats::Count(MemoryStats::Counter::BufferFromImageSyncs);
 	buffer.MarkContentWritten();
 	NoteBufferContentWrite(image.info.data.address, copy_size);
-	return true;
+	return copy_size;
+}
+
+// KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE=0 restores the previous behaviour: a GPU write binding over a
+// GPU-modified image drops the image's contents (see PreserveImagesForGpuWrite).
+bool BufferCache::ImageWritebackOnGpuWriteEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+void BufferCache::PreserveImagesForGpuWrite(BufferId id, uint64_t vaddr, uint64_t size) {
+	if (!ImageWritebackOnGpuWriteEnabled()) {
+		return;
+	}
+	struct Candidate {
+		ImageId    id;
+		GuestRange range;
+	};
+	std::vector<Candidate> candidates;
+	auto&                  buffer       = m_slot_buffers[id];
+	const auto             buffer_begin = buffer.CpuAddress();
+	const auto             buffer_end   = buffer_begin + buffer.Size();
+	{
+		std::scoped_lock lock {m_texture_cache.m_lock};
+		// Exactly the images TextureCache::InvalidateMemoryFromGPU takes GPU ownership from.
+		for (const auto image_id: m_texture_cache.FindImagesInRegion(vaddr, size, true)) {
+			const auto& image = m_texture_cache.m_slot_images[image_id];
+			if (!image.Overlaps(vaddr, size) || !image.IsGpuModified()) {
+				continue;
+			}
+			// Only an image whose native contents supersede every byte of its range (no CPU
+			// write since, no newer buffer write) can be moved into the buffer as a whole.
+			// Depth-associated color aliases publish through their depth image.
+			const auto image_range = image.info.data;
+			bool       movable     = !image.depth_id && image.SafeToDownload() &&
+			                image_range.address >= buffer_begin &&
+			                image_range.address < buffer_end;
+			const GuestRange range {image_range.address,
+			                        std::min(image_range.End(), buffer_end) - image_range.address};
+			if (movable) {
+				// The buffer will own the whole moved range. Another GPU-modified image there
+				// that this write does not already take ownership from would lose its contents
+				// to this one's: keep the previous behaviour in that (alias) case.
+				for (const auto other_id:
+				     m_texture_cache.FindImagesInRegion(range.address, range.size, true)) {
+					const auto& other = m_texture_cache.m_slot_images[other_id];
+					if (other_id != image_id && other.Overlaps(range.address, range.size) &&
+					    other.IsGpuModified() && !other.Overlaps(vaddr, size)) {
+						movable = false;
+						break;
+					}
+				}
+			}
+			if (!movable) {
+				MemoryStats::Count(MemoryStats::Counter::ImageWritebackSkips);
+				continue;
+			}
+			candidates.push_back({image_id, range});
+		}
+	}
+	for (const auto& candidate: candidates) {
+		const auto& range = candidate.range;
+		// Own the moved range exactly like a writable binding: upload its CPU-dirty pages (bytes
+		// the image download may not cover keep their guest values), take the tracker pages
+		// under their locks, then overwrite the image's bytes with its native contents.
+		(void)SynchronizeBuffer(buffer, range.address, range.size, true, false, nullptr,
+		                        "image-writeback");
+		uint64_t copied     = 0;
+		uint64_t image_size = 0;
+		{
+			std::scoped_lock lock {m_texture_cache.m_lock};
+			const auto*      image = m_texture_cache.m_slot_images.try_get(candidate.id);
+			// A guest thread may have dirtied the image since the scan. Its fault then waits for
+			// this GPU-thread command and reads back the buffer's (guest-valued) bytes.
+			if (image != nullptr && image->SafeToDownload() &&
+			    image->info.data.address == range.address) {
+				image_size = image->info.data.size;
+				copied     = RecordImageDownload(buffer, candidate.id);
+			}
+		}
+		if (copied != 0) {
+			MemoryStats::Count(MemoryStats::Counter::ImageWritebacks);
+			MemoryStats::Count(MemoryStats::Counter::ImageWritebackBytes, copied);
+			if (copied < image_size) {
+				MemoryStats::Count(MemoryStats::Counter::ImageWritebackPartial);
+			}
+		} else {
+			MemoryStats::Count(MemoryStats::Counter::ImageWritebackSkips);
+		}
+		// The tracker pages are GPU-owned now, so their bytes must be too (downloaded or not).
+		buffer.MarkContentWritten();
+		if (!m_gpu_modified_ranges.Contains(range.address, range.size)) {
+			CleanVerdict::Invalidate();
+		}
+		m_gpu_modified_ranges.Add(range.address, range.size);
+		NoteBufferContentWrite(range.address, range.size);
+		ForgetKnownFills(range.address, range.size);
+		HangTrace::NoteGpuWrite(range.address, range.size);
+		// As for any GPU buffer write: overlapping images are now rebuilt from the buffer.
+		m_texture_cache.InvalidateMemoryFromGPU(range.address, range.size);
+	}
 }
 
 bool TextureCache::DownloadImageMemory(ImageId id) {

@@ -161,6 +161,19 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// Records a download of a GPU-modified image into `buffer` at the image's own guest address
+	// (every mip level that fits). Caller holds the texture-cache lock and has checked that the
+	// image may be downloaded. Returns the bytes covered from the image start, 0 when nothing
+	// was recorded.
+	[[nodiscard]] uint64_t RecordImageDownload(Buffer& buffer, Common::SlotId image_id);
+	// A GPU write about to own [vaddr, vaddr + size) of buffer `id` takes GPU ownership away from
+	// every overlapping GPU-modified image (TextureCache::InvalidateMemoryFromGPU), after which
+	// the image is rebuilt from the buffer. Moves each such image's contents into the buffer
+	// first and makes those bytes GPU-owned, so neither the rebuild nor a CPU readback sees the
+	// stale guest bytes (KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE=0 disables). GPU thread, before the
+	// writer is recorded and before InvalidateMemoryFromGPU.
+	void PreserveImagesForGpuWrite(BufferId id, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] static bool ImageWritebackOnGpuWriteEnabled();
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	struct ReadMemoryTrace {

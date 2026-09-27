@@ -255,6 +255,11 @@ void RecordGpuOpCounts(const GpuOpCounts& counts);
 //   mem_upload_copies                    vkCmdCopyBuffer calls recording CPU-dirty uploads
 //   mem_upload_barriers                  pipeline barriers recorded around those uploads
 //   mem_upload_render_splits             uploads that had to end an active rendering instance
+//   mem_image_writebacks / _bytes        GPU-modified images moved into a buffer before a GPU
+//                                        write took their ownership (PreserveImagesForGpuWrite)
+//   mem_image_writeback_partial          of those, downloads that covered only leading mips
+//   mem_image_writeback_skips            overlapping GPU-modified images that could not be moved
+//                                        (unsupported/unsafe/outside the buffer): contents lost
 enum class MemoryCounter : uint8_t {
 	WriteFaults,
 	ReadFaults,
@@ -272,6 +277,10 @@ enum class MemoryCounter : uint8_t {
 	UploadCopies,
 	UploadBarriers,
 	UploadRenderSplits,
+	ImageWritebacks,
+	ImageWritebackBytes,
+	ImageWritebackPartial,
+	ImageWritebackSkips,
 	Count
 };
 void CountMemory(MemoryCounter counter, uint64_t amount = 1);

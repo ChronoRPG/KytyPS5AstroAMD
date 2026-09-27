@@ -36,6 +36,10 @@ inline constexpr std::array<Profiler::FrameEvent, static_cast<size_t>(Counter::C
     Profiler::FrameEvent::BufferUploadCopies,
     Profiler::FrameEvent::BufferUploadBarriers,
     Profiler::FrameEvent::BufferUploadRenderSplits,
+    Profiler::FrameEvent::ImageWritebacks,
+    Profiler::FrameEvent::ImageWritebackBytes,
+    Profiler::FrameEvent::ImageWritebackPartial,
+    Profiler::FrameEvent::ImageWritebackSkips,
 }};
 // A missing initializer would leave the value-initialized first FrameEvent at the end.
 static_assert(kEvents.back() != Profiler::FrameEvent::SubmitBoundaryUnprotected,

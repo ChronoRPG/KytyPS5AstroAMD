@@ -303,6 +303,10 @@ constexpr std::array<MemoryCounterColumn, static_cast<size_t>(MemoryCounter::Cou
         {"mem_upload_copies", 1},
         {"mem_upload_barriers", 1},
         {"mem_upload_render_splits", 1},
+        {"mem_image_writebacks", 1},
+        {"mem_image_writeback_bytes", 1},
+        {"mem_image_writeback_partial", 1},
+        {"mem_image_writeback_skips", 1},
     }};
 static_assert(kMemoryCounterColumns.back().name != nullptr,
               "memory counter columns must match HangTrace::MemoryCounter");
