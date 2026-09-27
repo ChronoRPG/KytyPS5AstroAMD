@@ -238,6 +238,59 @@ enum class FrameEvent : uint32_t {
 	// Shader map lookups answered by the per-thread memo (KYTY_SHADER_MAP_MEMO).
 	ShaderMapMemoHits,
 	ShaderMapMemoMisses,
+	// Draw-prep S5/S6 (KYTY_DRAW_PREP=inline|parallel). Submitted: direct draws handed to the
+	// engine. Published: entered the preparation window (parallel). Ready: prepared by a worker
+	// before the command processor needed it. SelfPrepared: prepared on the command processor
+	// (inline mode, or the head slot was still unclaimed). Committed: the prepared programs were
+	// used after a valid certificate. Unused: the draw returned before its programs were needed.
+	DrawPrepSubmitted,
+	DrawPrepPublished,
+	DrawPrepReady,
+	DrawPrepSelfPrepared,
+	DrawPrepCommitted,
+	DrawPrepUnused,
+	// Serial fallbacks per reason. Ineligible: tessellation, O15 reuse or a draw the engine does
+	// not take. Unclean/Backing/Overflow/Inconsistent/Uncertified: preparation reads (readSet.h).
+	// NotPublished: a source or permutation was missing. ShaderMap: the shader map changed before
+	// commit. CertUnclean/CertChanged: a read range was not clean, or held other bytes, at commit.
+	// CoherenceLog: the log check failed (KYTY_DRAW_PREP_CERT=log). Mismatch: the commit's own
+	// pixel-activity or export-mapping decision differed from the snapshot's.
+	DrawPrepFallbackIneligible,
+	DrawPrepFallbackUnclean,
+	DrawPrepFallbackBacking,
+	DrawPrepFallbackOverflow,
+	DrawPrepFallbackInconsistent,
+	DrawPrepFallbackUncertified,
+	DrawPrepFallbackNotPublished,
+	DrawPrepFallbackShaderMap,
+	DrawPrepFallbackCertUnclean,
+	DrawPrepFallbackCertChanged,
+	DrawPrepFallbackCoherenceLog,
+	DrawPrepFallbackMismatch,
+	// Certificate sizes (coalesced ranges and bytes of committed certificates).
+	DrawPrepCertRanges,
+	DrawPrepCertBytes,
+	// KYTY_DRAW_PREP_VERIFY: prepared draws re-prepared serially, and differences.
+	DrawPrepVerifyChecks,
+	DrawPrepVerifyMismatches,
+	// S0 window measurement: fences (packets that end a preparation window) and the number of
+	// direct draws parsed since the previous fence, bucketed. Also counted with
+	// KYTY_DRAW_PREP_HISTOGRAM=1 in off mode.
+	DrawPrepFences,
+	DrawPrepFenceDraws0,
+	DrawPrepFenceDraws1,
+	DrawPrepFenceDraws2To3,
+	DrawPrepFenceDraws4To7,
+	DrawPrepFenceDraws8To15,
+	DrawPrepFenceDraws16To31,
+	DrawPrepFenceDraws32To63,
+	DrawPrepFenceDraws64Plus,
+	// Parallel mode: drains (window committed because of a fence or a full window), the summed
+	// window occupancy observed at each publish (mean = sum / Published), and head slots the
+	// command processor had to wait for while a worker was preparing them.
+	DrawPrepDrains,
+	DrawPrepWindowOccupancy,
+	DrawPrepCommitWaits,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
@@ -274,6 +327,11 @@ enum class FrameWait : uint32_t {
 	// (StagePrepJoin), and helper-thread job time (StagePrepHelper, not on the GPU thread).
 	StagePrepJoin,
 	StagePrepHelper,
+	// Draw-prep: command-processor time waiting for a worker's head slot (CommitWaitNs),
+	// preparation time on any thread, and certificate validation time at commit.
+	DrawPrepCommitWait,
+	DrawPrepPrepare,
+	DrawPrepValidate,
 	Count,
 };
 

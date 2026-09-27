@@ -53,6 +53,28 @@ public:
 	    PriorityOperationKind kind = PriorityOperationKind::Generic);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
+	// Draw-prep: the register set the current command buffer reads. A committed draw's buffer is
+	// pointed at that draw's register snapshot (the live registers may already belong to later
+	// packets) and restored afterwards; it survives command-buffer restarts in between because
+	// the scheduler reuses one CommandBuffer wrapper.
+	struct RegisterBinding {
+		HW::Context*    registers   = nullptr;
+		HW::UserConfig* user_config = nullptr;
+		HW::Shader*     shaders     = nullptr;
+	};
+	[[nodiscard]] RegisterBinding BindRegisters(HW::Context& registers, HW::UserConfig& user_config,
+	                                            HW::Shader& shaders) noexcept {
+		const RegisterBinding previous {m_command.m_registers, m_command.m_user_config,
+		                                m_command.m_shaders};
+		m_command.Bind(registers, user_config, shaders);
+		return previous;
+	}
+	void RestoreRegisters(const RegisterBinding& binding) noexcept {
+		m_command.m_registers   = binding.registers;
+		m_command.m_user_config = binding.user_config;
+		m_command.m_shaders     = binding.shaders;
+	}
+
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();

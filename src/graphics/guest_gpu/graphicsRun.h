@@ -69,6 +69,9 @@ private:
 	void              Enqueue(Submission submission);
 	void              WaitForIdle();
 	void              ProcessCommands();
+	[[nodiscard]] bool HasPendingCommands() const noexcept {
+		return m_pending_commands.load(std::memory_order_acquire) != 0;
+	}
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);

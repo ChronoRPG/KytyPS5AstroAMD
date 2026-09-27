@@ -178,6 +178,40 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.VertexTableBatchMisses.Cumulative",
     "FrameEvent.ShaderMapMemoHits.Cumulative",
     "FrameEvent.ShaderMapMemoMisses.Cumulative",
+    "FrameEvent.DrawPrepSubmitted.Cumulative",
+    "FrameEvent.DrawPrepPublished.Cumulative",
+    "FrameEvent.DrawPrepReady.Cumulative",
+    "FrameEvent.DrawPrepSelfPrepared.Cumulative",
+    "FrameEvent.DrawPrepCommitted.Cumulative",
+    "FrameEvent.DrawPrepUnused.Cumulative",
+    "FrameEvent.DrawPrepFallbackIneligible.Cumulative",
+    "FrameEvent.DrawPrepFallbackUnclean.Cumulative",
+    "FrameEvent.DrawPrepFallbackBacking.Cumulative",
+    "FrameEvent.DrawPrepFallbackOverflow.Cumulative",
+    "FrameEvent.DrawPrepFallbackInconsistent.Cumulative",
+    "FrameEvent.DrawPrepFallbackUncertified.Cumulative",
+    "FrameEvent.DrawPrepFallbackNotPublished.Cumulative",
+    "FrameEvent.DrawPrepFallbackShaderMap.Cumulative",
+    "FrameEvent.DrawPrepFallbackCertUnclean.Cumulative",
+    "FrameEvent.DrawPrepFallbackCertChanged.Cumulative",
+    "FrameEvent.DrawPrepFallbackCoherenceLog.Cumulative",
+    "FrameEvent.DrawPrepFallbackMismatch.Cumulative",
+    "FrameEvent.DrawPrepCertRanges.Cumulative",
+    "FrameEvent.DrawPrepCertBytes.Cumulative",
+    "FrameEvent.DrawPrepVerifyChecks.Cumulative",
+    "FrameEvent.DrawPrepVerifyMismatches.Cumulative",
+    "FrameEvent.DrawPrepFences.Cumulative",
+    "FrameEvent.DrawPrepFenceDraws0.Cumulative",
+    "FrameEvent.DrawPrepFenceDraws1.Cumulative",
+    "FrameEvent.DrawPrepFenceDraws2To3.Cumulative",
+    "FrameEvent.DrawPrepFenceDraws4To7.Cumulative",
+    "FrameEvent.DrawPrepFenceDraws8To15.Cumulative",
+    "FrameEvent.DrawPrepFenceDraws16To31.Cumulative",
+    "FrameEvent.DrawPrepFenceDraws32To63.Cumulative",
+    "FrameEvent.DrawPrepFenceDraws64Plus.Cumulative",
+    "FrameEvent.DrawPrepDrains.Cumulative",
+    "FrameEvent.DrawPrepWindowOccupancy.Cumulative",
+    "FrameEvent.DrawPrepCommitWaits.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
@@ -207,6 +241,9 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.ReadbackSideWait.Calls.Cumulative",
     "FrameWait.StagePrepJoin.Calls.Cumulative",
     "FrameWait.StagePrepHelper.Calls.Cumulative",
+    "FrameWait.DrawPrepCommitWait.Calls.Cumulative",
+    "FrameWait.DrawPrepPrepare.Calls.Cumulative",
+    "FrameWait.DrawPrepValidate.Calls.Cumulative",
 };
 static_assert(kFrameWaitCallNames.back() != nullptr, "FrameWait names must match the enum");
 constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
@@ -229,6 +266,9 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.ReadbackSideWait.Nanoseconds.Cumulative",
     "FrameWait.StagePrepJoin.Nanoseconds.Cumulative",
     "FrameWait.StagePrepHelper.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepCommitWait.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepPrepare.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepValidate.Nanoseconds.Cumulative",
 };
 static_assert(kFrameWaitTimeNames.back() != nullptr, "FrameWait names must match the enum");
 

@@ -208,6 +208,12 @@ inline thread_local Recorder* t_recorder = nullptr;
 	return t_recorder != nullptr;
 }
 
+// A preparation is running on this thread and has already failed: callers stop early instead of
+// continuing on possibly stale or missing inputs (the result is discarded anyway).
+[[nodiscard]] inline bool SpeculativeFailed() noexcept {
+	return t_recorder != nullptr && t_recorder->reads->Failed();
+}
+
 // Marks the active preparation as failed (no-op outside a preparation).
 inline void FailActive(ReadFailure failure) noexcept {
 	if (t_recorder != nullptr) {

@@ -7,10 +7,15 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace DrawPrep {
+class Engine;
+} // namespace DrawPrep
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 
@@ -65,7 +70,7 @@ public:
 
 	CommandProcessor(RenderContext& renderer, int interrupt_event_id)
 	    : m_renderer(renderer), m_interrupt_event_id(interrupt_event_id) {}
-	~CommandProcessor() = default;
+	~CommandProcessor();
 
 	KYTY_CLASS_NO_COPY(CommandProcessor);
 
@@ -165,6 +170,12 @@ private:
 	[[nodiscard]] bool  TryDrawIndirectNative(DrawIndirectSource source);
 	void                ValidateIndirectSource(const DrawIndirectSource& source);
 	[[nodiscard]] uint32_t NumInstances();
+	// Draw-prep (drawPrep.h): the engine of the graphics processor, created on first use when
+	// KYTY_DRAW_PREP (or the S0 histogram) is enabled; null otherwise.
+	[[nodiscard]] DrawPrep::Engine* DrawPrepEngine();
+	[[nodiscard]] bool TrySubmitPreparedDraw(const DrawIndexArgs* index_args,
+	                                         const DrawAutoArgs*  auto_args);
+	void               DrainPreparedDraws();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
@@ -207,6 +218,11 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+
+	struct DrawPrepDeleter {
+		void operator()(DrawPrep::Engine* engine) const noexcept;
+	};
+	std::unique_ptr<DrawPrep::Engine, DrawPrepDeleter> m_draw_prep;
 };
 
 } // namespace Libs::Graphics

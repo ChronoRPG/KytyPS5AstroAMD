@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
@@ -87,6 +88,10 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	g_shader_map_generation.fetch_add(1, std::memory_order_release);
 }
 
+uint64_t ShaderMapGeneration() {
+	return g_shader_map_generation.load(std::memory_order_acquire);
+}
+
 static bool ShaderMapMemoEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_SHADER_MAP_MEMO");
@@ -95,11 +100,21 @@ static bool ShaderMapMemoEnabled() {
 	return enabled;
 }
 
-static ShaderMappedData ShaderGetMappedDataLocked(uint64_t addr, const char* label) {
+static ShaderMappedData ShaderGetMappedDataLocked(uint64_t addr, const char* label,
+                                                  bool* found = nullptr) {
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
 		return iter->second;
+	}
+	if (DrawPrep::Speculative()) {
+		// A draw prepared ahead may see a shader the guest has not registered yet; the serial
+		// path decides at commit.
+		DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+		if (found != nullptr) {
+			*found = false;
+		}
+		return {};
 	}
 
 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
@@ -127,8 +142,11 @@ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 		return entry.data;
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderMapMemoMisses);
-	const auto data  = ShaderGetMappedDataLocked(addr, label);
-	entry            = {addr, generation, data};
+	bool       found = true;
+	const auto data  = ShaderGetMappedDataLocked(addr, label, &found);
+	if (found) {
+		entry = {addr, generation, data};
+	}
 	return data;
 }
 
@@ -158,17 +176,20 @@ static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 		const auto* value = std::getenv("KYTY_SHADER_METADATA_BACKING");
 		return value != nullptr && std::strcmp(value, "1") == 0;
 	}();
-	if (use_clean_backing) {
+	// A draw-prep preparation reads only through recorded probes (a clean probe returns the
+	// bytes the mapped read would) and never falls back to the guest mapping.
+	const bool speculative = DrawPrep::Speculative();
+	if (use_clean_backing || speculative) {
 		// Probe only the bytes this path consumes, in its original dependent order.
 		// A shader header may share a protected page with unrelated GPU-owned bytes.
 		// No values persist across calls; failed proofs retain the fault/readback path.
-		const auto read_word = [](const uint32_t* address) {
+		const auto read_word = [speculative](const uint32_t* address) {
 			uint32_t value = 0;
 			const bool clean = LibKernel::Memory::TryReadGpuCleanBacking(
 			    reinterpret_cast<uint64_t>(address), &value, sizeof(value));
 			Profiler::CountFrameEvent(clean ? Profiler::FrameEvent::ShaderHeaderProbeHits
 			                               : Profiler::FrameEvent::ShaderHeaderProbeMisses);
-			return clean ? value : *address;
+			return clean || speculative ? value : *address;
 		};
 		const auto* code = reinterpret_cast<const uint32_t*>(shader_addr);
 		EXIT_IF(code == nullptr);
@@ -194,6 +215,9 @@ static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 		    reinterpret_cast<uint64_t>(&header->hash0), hashes.data(), sizeof(hashes));
 		Profiler::CountFrameEvent(clean ? Profiler::FrameEvent::ShaderHeaderProbeHits
 		                               : Profiler::FrameEvent::ShaderHeaderProbeMisses);
+		if (!clean && speculative) {
+			return 0; // the failed probe already failed the preparation
+		}
 		return clean ? (static_cast<uint64_t>(hashes[1]) << 32u) | hashes[0]
 		             : (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0;
 	}
@@ -204,6 +228,9 @@ static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,
 	                                std::span<const uint32_t> user_data,
 	                                const ShaderMappedData& data, uint32_t user_data_base = 0) {
+	if (DrawPrep::SpeculativeFailed()) {
+		return {};
+	}
 	if (data.code_size_bytes == 0 || data.code_size_bytes % sizeof(uint32_t) != 0) {
 		EXIT("%s hash=0x%016" PRIx64 " shader=0x%016" PRIx64
 		     " has invalid AGC shader_size=0x%08" PRIx32 "\n",
@@ -211,11 +238,16 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uin
 	}
 	const auto code_words = data.code_size_bytes / sizeof(uint32_t);
 	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
+	if (declared_hash == 0 && DrawPrep::Speculative()) {
+		// Hashing the whole code would read it outside the certificate.
+		DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+	}
 	ShaderParams params {
 	    .code            = code,
 	    .user_data_count = static_cast<uint32_t>(user_data.size()) + user_data_base,
-	    .hash            = declared_hash != 0 ? declared_hash
-	                                          : XXH3_64bits(code.data(), code.size_bytes()),
+	    .hash            = declared_hash != 0        ? declared_hash
+	                       : DrawPrep::Speculative() ? 0
+	                                                 : XXH3_64bits(code.data(), code.size_bytes()),
 	};
 	EXIT_IF(user_data.size() > HW::UserSgprInfo::SGPRS_MAX ||
 	        params.user_data_count > params.user_data.size());
@@ -428,6 +460,12 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 
 	info.buffers_num = 0;
 
+	// A failed draw-prep preparation is discarded; its partial tables may be stale.
+	const bool speculative = DrawPrep::Speculative();
+	if (speculative && DrawPrep::ActiveRecorder()->reads->Failed()) {
+		return;
+	}
+
 	for (int ri = 0; ri < info.resources_num; ri++) {
 		const auto& r = info.resources[ri];
 
@@ -445,6 +483,11 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 				uint64_t offset2 = b.addr - base;
 
 				if (offset1 < stride && offset2 < stride) {
+					if (speculative && (b.num_records != r.NumRecords() ||
+					                    b.attr_num >= ShaderVertexInputBuffer::ATTR_MAX)) {
+						DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+						return;
+					}
 					EXIT_NOT_IMPLEMENTED(b.num_records != r.NumRecords());
 					b.addr = base;
 					EXIT_NOT_IMPLEMENTED(b.attr_num >= ShaderVertexInputBuffer::ATTR_MAX);
@@ -484,10 +527,14 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 	EXIT_IF(attrib == nullptr || buffer == nullptr);
 
 	const bool debug_dump = Config::GraphicsDebugDumpEnabled();
-	static const bool use_clean_backing = [] {
+	static const bool use_clean_backing_env = [] {
 		const auto* value = std::getenv("KYTY_SHADER_METADATA_BACKING");
 		return value != nullptr && std::strcmp(value, "1") == 0;
 	}();
+	// A draw-prep preparation reads only through recorded probes and stops at the first failed
+	// one (which already failed the preparation) instead of reading the guest mapping.
+	const bool speculative       = DrawPrep::Speculative();
+	const bool use_clean_backing = use_clean_backing_env || speculative;
 	EXIT_NOT_IMPLEMENTED(num_input_semantics > ShaderVertexInputInfo::RES_MAX);
 
 	// KYTY_SHADER_METADATA_BATCH: read the used span of each table with one silent probe. A
@@ -534,7 +581,10 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 				                              ? Profiler::FrameEvent::VertexMetadataProbeHits
 				                              : Profiler::FrameEvent::VertexMetadataProbeMisses);
 			}
-			if (!attribute_clean) attribute = attrib[in.semantic];
+			if (!attribute_clean) {
+				if (speculative) return;
+				attribute = attrib[in.semantic];
+			}
 		}
 		attributes[i] = attribute;
 
@@ -582,6 +632,11 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t offset      = (attribute >> 14u) & 0xfffu;
 		uint32_t fetch_index = (attribute >> 26u) & 0x1u;
 
+		if (speculative && index >= ShaderVertexInputInfo::RES_MAX) {
+			// Possibly stale bytes: let the serial path decide.
+			DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+			return;
+		}
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
 
 		const auto* sharp = &buffer[index * 4];
@@ -609,6 +664,7 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 			}
 		}
 		if (!descriptor_clean) {
+			if (speculative) return;
 			r.fields[0] = sharp[0];
 			r.fields[1] = sharp[1];
 			r.fields[2] = sharp[2];
@@ -939,9 +995,16 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	    GetDeclaredShaderHash(regs.es_regs.data_addr),
 	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
 	    merged ? 8u : 0u);
+	if (DrawPrep::SpeculativeFailed()) {
+		return params; // discarded; the serial path decides at commit
+	}
 	if (!merged) {
 		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
+			if (DrawPrep::Speculative()) {
+				DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+				return params;
+			}
 			EXIT("failed to prepare vertex shader program\n");
 		}
 		info.wave_size = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
@@ -965,6 +1028,9 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		const auto back_params =
 		    GetShaderParams(regs.gs_regs.data_addr, "ShaderRecompiler GS",
 		                    GetDeclaredShaderHash(regs.gs_regs.data_addr), {}, back);
+		if (DrawPrep::SpeculativeFailed()) {
+			return params;
+		}
 		params.back_code = back_params.code;
 		params.user_data[0] = static_cast<uint32_t>(regs.gs_regs.user_data_addr);
 		params.user_data[1] = static_cast<uint32_t>(regs.gs_regs.user_data_addr >> 32u);

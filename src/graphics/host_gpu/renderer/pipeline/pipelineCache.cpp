@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/stagePrepWorker.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1412,6 +1413,59 @@ struct PipelineCache::ProgramCache {
 		return true;
 	}
 
+	// Draw-prep: both stages materialized on the calling thread with probe-only reads (routed to
+	// the active DrawPrep recorder), then the permutations looked up and bound in the serial
+	// order (pixel first; push data follows that order). Never compiles or publishes.
+	PipelineCache::SpeculativeResult
+	TryPrepareSpeculative(bool pixel_active, const ShaderParams& ps_params,
+	                      ShaderPixelInputInfo& ps_info, StagePrep& ps_prep,
+	                      const ShaderParams& vs_params, ShaderVertexInputInfo& vs_info,
+	                      StagePrep& vs_prep, uint32_t push_data_cursor,
+	                      PipelineCache::GraphicsPrograms& programs) {
+		using Result  = PipelineCache::SpeculativeResult;
+		auto& scratch = ThreadScratch();
+		auto& evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
+		auto& ps_key  = scratch.key;
+		auto& vs_key  = scratch.second_key;
+		const SourceEntry* ps_source = nullptr;
+		if (pixel_active) {
+			BuildKey(ps_params, ps_info, ps_key);
+			ps_source = FindSourceMemo(ps_key, scratch);
+			if (ps_source == nullptr || ps_source->skip_dispatch.load(std::memory_order_relaxed)) {
+				return Result::NotPublished;
+			}
+		}
+		BuildKey(vs_params, vs_info, vs_key);
+		const auto* vs_source = FindSourceMemo(vs_key, scratch);
+		if (vs_source == nullptr || vs_source->skip_dispatch.load(std::memory_order_relaxed)) {
+			return Result::NotPublished;
+		}
+		if (pixel_active &&
+		    !MaterializeStage(*ps_source, MakeSpeculativeRuntime(ps_params), evaluation, ps_prep)) {
+			return Result::ReadFailed;
+		}
+		if (!MaterializeStage(*vs_source, MakeSpeculativeRuntime(vs_params), evaluation, vs_prep)) {
+			return Result::ReadFailed;
+		}
+		if (pixel_active) {
+			const auto* permutation = FindPermutationMemo(*ps_source, ps_key.stage,
+			                                              ps_prep.specialization, push_data_cursor,
+			                                              scratch);
+			if (permutation == nullptr) {
+				return Result::NotPublished;
+			}
+			programs.pixel = Bind(*permutation, ps_info, ps_prep, push_data_cursor);
+		}
+		const auto* permutation = FindPermutationMemo(*vs_source, vs_key.stage,
+		                                              vs_prep.specialization, push_data_cursor,
+		                                              scratch);
+		if (permutation == nullptr) {
+			return Result::NotPublished;
+		}
+		programs.vertex[0] = Bind(*permutation, vs_info, vs_prep, push_data_cursor);
+		return Result::Ok;
+	}
+
 	explicit ProgramCache(vk::Device device): device(device) {}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
@@ -1653,6 +1707,65 @@ bool PipelineCache::TessellationActive(const HW::UserConfig& user_config) {
 	return user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 }
 
+namespace {
+
+// Static stage information shared by GetGraphicsPrograms and the draw-prep speculative
+// preparation: pure functions of the registers and constant device limits.
+void FinishMeshStage(const GraphicContext& graphics, ShaderVertexInputInfo& vertex_info) {
+	EXIT_NOT_IMPLEMENTED(!graphics.mesh_shader_enabled);
+	auto& mesh              = vertex_info.mesh;
+	mesh.host_subgroup_size = graphics.subgroup_size;
+	const auto& limits      = graphics.mesh_shader_properties;
+	const auto  logical_threads = mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
+	const auto  host_threads    = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
+	                          std::min(mesh.host_subgroup_size, mesh.wave_size);
+	if (host_threads > limits.maxMeshWorkGroupInvocations ||
+	    host_threads > limits.maxMeshWorkGroupSize[0] ||
+	    mesh.max_vertices > limits.maxMeshOutputVertices ||
+	    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
+	    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
+		EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
+		     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+	}
+}
+
+void ApplyDualSourceBlending(const HW::Context& context, ShaderPixelInputInfo& pixel_info) {
+	const auto& blend          = context.GetBlendControl(0);
+	const auto  is_dual_source = [](uint8_t factor) {
+		return factor >= static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color) &&
+		       factor <= static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
+	};
+	pixel_info.dual_source_blending =
+	    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
+	    (is_dual_source(blend.color_srcblend) || is_dual_source(blend.color_destblend) ||
+	     (blend.separate_alpha_blend &&
+	      (is_dual_source(blend.alpha_srcblend) || is_dual_source(blend.alpha_destblend))));
+	if (pixel_info.dual_source_blending) {
+		// MRT1 supplies a second blend source for the same render target as MRT0.
+		pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
+		pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
+	}
+}
+
+void ApplyClipSpace(const GraphicContext& graphics, const HW::Context& context,
+                    ShaderVertexInputInfo& last_vertex_stage) {
+	if (!context.GetClipControl().clip_disable) {
+		return;
+	}
+	const auto& viewport = context.GetScreenViewport().viewports[0];
+	const auto& limits   = graphics.GetPhysicalDeviceProperties().limits;
+	auto&       clip     = last_vertex_stage.clip_space;
+	clip.scale[0]        = viewport.xscale;
+	clip.scale[1]        = viewport.yscale;
+	clip.offset[0]       = viewport.xoffset;
+	clip.offset[1]       = viewport.yoffset;
+	clip.half_extent[0] = static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u)) * 0.5f;
+	clip.half_extent[1] = static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
+	clip.enabled        = true;
+}
+
+} // namespace
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -1674,56 +1787,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
-		auto& mesh              = vertex_info[0].mesh;
-		mesh.host_subgroup_size = m_graphics.subgroup_size;
-		const auto& limits      = m_graphics.mesh_shader_properties;
-		const auto  logical_threads =
-		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
-		const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
-		                          std::min(mesh.host_subgroup_size, mesh.wave_size);
-		if (host_threads > limits.maxMeshWorkGroupInvocations ||
-		    host_threads > limits.maxMeshWorkGroupSize[0] ||
-		    mesh.max_vertices > limits.maxMeshOutputVertices ||
-		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
-		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
-			EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
-			     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
-		}
+		FinishMeshStage(m_graphics, vertex_info[0]);
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
-		const auto& blend          = context.GetBlendControl(0);
-		const auto  is_dual_source = [](uint8_t factor) {
-			return factor >= static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color) &&
-			       factor <= static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
-		};
-		pixel_info.dual_source_blending =
-		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
-		    (is_dual_source(blend.color_srcblend) || is_dual_source(blend.color_destblend) ||
-		     (blend.separate_alpha_blend &&
-		      (is_dual_source(blend.alpha_srcblend) || is_dual_source(blend.alpha_destblend))));
-		if (pixel_info.dual_source_blending) {
-			// MRT1 supplies a second blend source for the same render target as MRT0.
-			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
-			pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
-		}
+		ApplyDualSourceBlending(context, pixel_info);
 	}
-	if (context.GetClipControl().clip_disable) {
-		const auto& viewport = context.GetScreenViewport().viewports[0];
-		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
-		auto&       clip     = vertex_info[tess_active ? 2u : 0u].clip_space;
-		clip.scale[0]        = viewport.xscale;
-		clip.scale[1]        = viewport.yscale;
-		clip.offset[0]       = viewport.xoffset;
-		clip.offset[1]       = viewport.yoffset;
-		clip.half_extent[0] =
-		    static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u)) * 0.5f;
-		clip.half_extent[1] =
-		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
-		clip.enabled = true;
-	}
+	ApplyClipSpace(m_graphics, context, vertex_info[tess_active ? 2u : 0u]);
 	static_zone.End();
 	// The program cache locks internally, so no pipeline lock is held across materialization.
 	auto& scratch    = ProgramCache::ThreadScratch();
@@ -1770,6 +1841,47 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		}
 	}
 	return serial(vertex_info, pixel_info, stage_preps);
+}
+
+PipelineCache::SpeculativeResult PipelineCache::PrepareGraphicsProgramsSpeculative(
+    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+    const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
+    ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info, StagePrep& vertex_prep,
+    StagePrep& pixel_prep, GraphicsPrograms& programs) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
+	EXIT_IF(!DrawPrep::Speculative());
+	if (TessellationActive(user_config) || ResourceReuseEnabled()) {
+		return SpeculativeResult::Ineligible;
+	}
+	const auto read_failed = [] { return DrawPrep::ActiveRecorder()->reads->Failed(); };
+	// The same static stage preparation as GetGraphicsPrograms (non-tessellated).
+	const auto vertex_params = PrepareProgram(vertex_regs, context, user_config, vertex_info);
+	if (read_failed()) {
+		return SpeculativeResult::ReadFailed;
+	}
+	if (vertex_info.logical_stage == ShaderType::Mesh) {
+		FinishMeshStage(m_graphics, vertex_info);
+	}
+	ShaderParams pixel_params;
+	if (pixel_active) {
+		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		ApplyDualSourceBlending(context, pixel_info);
+	}
+	ApplyClipSpace(m_graphics, context, vertex_info);
+	if (read_failed()) {
+		return SpeculativeResult::ReadFailed;
+	}
+	const uint32_t push_data_start = vertex_info.logical_stage == ShaderType::Mesh
+	                                     ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount
+	                                     : 0;
+	const auto result = m_program_cache->TryPrepareSpeculative(
+	    pixel_active, pixel_params, pixel_info, pixel_prep, vertex_params, vertex_info, vertex_prep,
+	    push_data_start, programs);
+	if (result == SpeculativeResult::Ok && read_failed()) {
+		return SpeculativeResult::ReadFailed;
+	}
+	return result;
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,

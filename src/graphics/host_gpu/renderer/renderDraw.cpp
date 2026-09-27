@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -1184,6 +1185,21 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
+// Draw-prep: installs a validated preparation as if GetGraphicsPrograms had produced it. The
+// stage preps are swapped (the preparation keeps the old vectors' capacity) and the stage
+// runtimes re-pointed at the draw state's copies.
+static void ApplyPreparedDraw(DrawPrep::PreparedDraw& prepared, DrawRenderState& state) {
+	state.programs       = prepared.programs;
+	state.vertex_info[0] = prepared.vertex_info;
+	state.ps_input_info  = prepared.pixel_info;
+	std::swap(state.stage_preps.vertex[0], prepared.vertex_prep);
+	std::swap(state.stage_preps.pixel, prepared.pixel_prep);
+	state.vertex_info[0].stage.resources = &state.stage_preps.vertex[0].resources;
+	if (state.ps_input_info.stage.program != nullptr) {
+		state.ps_input_info.stage.resources = &state.stage_preps.pixel.resources;
+	}
+}
+
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
                            DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
@@ -1211,6 +1227,24 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
 	state.vertex_stages_written = PipelineCache::TessellationActive(buffer.GetUserConfig()) ? 3u : 1u;
+	// Draw-prep: use the draw's speculative preparation when its certificate holds now.
+	if (auto* prepared = buffer.GetContext().GetRenderExecutor().TakePreparedDraw();
+	    prepared != nullptr && DrawPrep::Validate(*prepared, state.ps_active, target_export_mapping)) {
+		ApplyPreparedDraw(*prepared, state);
+		if (DrawPrep::VerifyMode() != 0) {
+			// The serial preparation on copies, from the same (snapshot) registers.
+			auto vertex_copy = std::make_unique<std::array<ShaderVertexInputInfo, 3>>();
+			auto pixel_copy  = std::make_unique<ShaderPixelInputInfo>();
+			auto prep_copy   = std::make_unique<PipelineCache::GraphicsStagePreps>();
+			const auto serial = pipeline_cache.GetGraphicsPrograms(
+			    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
+			    target_export_mapping, state.ps_active, *vertex_copy, *pixel_copy, *prep_copy);
+			(void)DrawPrep::VerifyCommitted(state.programs, state.vertex_info[0],
+			                                state.ps_input_info, state.stage_preps, serial,
+			                                (*vertex_copy)[0], *pixel_copy, *prep_copy);
+		}
+		return;
+	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,

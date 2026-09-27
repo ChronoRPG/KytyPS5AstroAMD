@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -285,6 +286,39 @@ CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 		processor = std::make_unique<CommandProcessor>(m_renderer, ComputeQueueBase + queue_id - 1);
 	}
 	return *processor;
+}
+
+CommandProcessor::~CommandProcessor() = default;
+
+void CommandProcessor::DrawPrepDeleter::operator()(DrawPrep::Engine* engine) const noexcept {
+	delete engine;
+}
+
+DrawPrep::Engine* CommandProcessor::DrawPrepEngine() {
+	// Only the graphics processor draws; compute queues would only dilute the S0 histogram.
+	if (!DrawPrep::PacketHookEnabled() || IsAsyncComputeQueue()) {
+		return nullptr;
+	}
+	if (m_draw_prep == nullptr) {
+		m_draw_prep.reset(new DrawPrep::Engine(m_renderer));
+	}
+	return m_draw_prep.get();
+}
+
+bool CommandProcessor::TrySubmitPreparedDraw(const DrawIndexArgs* index_args,
+                                             const DrawAutoArgs*  auto_args) {
+	if (DrawPrep::GetMode() == DrawPrep::Mode::Off) {
+		return false;
+	}
+	auto* engine = DrawPrepEngine();
+	return engine != nullptr &&
+	       engine->Submit(m_submit_id, index_args, auto_args, m_ctx, m_ucfg, m_sh_ctx);
+}
+
+void CommandProcessor::DrainPreparedDraws() {
+	if (m_draw_prep != nullptr) {
+		m_draw_prep->Drain();
+	}
 }
 
 void CommandProcessor::Reset() {
@@ -760,6 +794,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	} execution_scope(*this, execution);
 
 	ProcessPm4(execution);
+	// Draw-prep: every draw parsed in this slice is committed before the slice ends.
+	DrainPreparedDraws();
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
@@ -779,6 +815,11 @@ void CommandProcessor::SuspendPm4() {
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
+			// Draw-prep: service commands (readbacks, unmaps) observe every parsed draw.
+			if (m_draw_prep != nullptr && m_draw_prep->Pending() &&
+			    g_gpu_state->HasPendingCommands()) {
+				m_draw_prep->Drain();
+			}
 			g_gpu_state->ProcessCommands();
 		}
 		auto& cursor = execution.m_buffer_stack.back();
@@ -858,6 +899,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		if (DrawPrep::PacketHookEnabled()) [[unlikely]] {
+			// Window fences commit every pending draw before their handler runs.
+			if (auto* engine = DrawPrepEngine(); engine != nullptr) {
+				engine->OnPacket(
+				    DrawPrep::ClassifyPacket(packet_header & ~1u, packet + 1, remaining_dw));
+			}
+		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
@@ -981,11 +1029,18 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
+		if (!m_pending_num_instances.empty()) {
+			// The inherited count may be GPU data an earlier (pending) draw writes.
+			DrainPreparedDraws();
+		}
 		args.instance_count = NumInstances();
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
+	}
+	if (TrySubmitPreparedDraw(&args, nullptr)) {
+		return;
 	}
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 }
@@ -1349,7 +1404,13 @@ void CommandProcessor::ReportLodStats(uint64_t destination, uint32_t size, uint3
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
+		if (!m_pending_num_instances.empty()) {
+			DrainPreparedDraws();
+		}
 		args.instance_count = NumInstances();
+	}
+	if (TrySubmitPreparedDraw(nullptr, &args)) {
+		return;
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }
