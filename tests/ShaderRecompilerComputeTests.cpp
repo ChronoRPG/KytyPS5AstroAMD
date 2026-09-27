@@ -11950,7 +11950,15 @@ public:
       Require(name, "ring contents", same, "bytes copied through the ring differ");
       scheduler.SetSubmitDependency(dma, 1);
     }
+    context.UnmapMemory(base, allocation_size);
     scheduler.Finish();
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
