@@ -268,6 +268,29 @@ enum class FrameEvent : uint32_t {
 	DccFallbackMetadataAliased, // an image owns (overlaps) the metadata, or metadata overlaps data
 	DccFallbackUnsupported,    // native image lacks storage/mutable usage, or size limits
 	DccFallbackAlignment,      // canonical metadata buffer offset is not 4-byte aligned
+	// Guest memory tracking and buffer uploads (graphics/host_gpu/memoryStats.h, mirrored in the
+	// hang-trace mem_* columns): guest write/read faults handled by RenderContext and the time
+	// spent handling them (nanoseconds), host protection calls/pages removing write access and
+	// restoring read-write access and their time, contended region tracking lock acquisitions,
+	// tiler scratch buffer allocations (count, bytes, nanoseconds), SynchronizeBufferFromImage
+	// downloads, and the copy commands, pipeline barriers and rendering-instance ends recorded by
+	// CPU-dirty buffer uploads (BufferCache::SynchronizeBuffer).
+	GuestWriteFaults,
+	GuestReadFaults,
+	GuestFaultNanoseconds,
+	PageProtectCalls,
+	PageProtectPages,
+	PageUnprotectCalls,
+	PageUnprotectPages,
+	PageProtectNanoseconds,
+	TrackerLockContended,
+	TilerScratchAllocs,
+	TilerScratchBytes,
+	TilerScratchNanoseconds,
+	BufferFromImageSyncs,
+	BufferUploadCopies,
+	BufferUploadBarriers,
+	BufferUploadRenderSplits,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

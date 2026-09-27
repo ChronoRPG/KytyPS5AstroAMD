@@ -41,7 +41,8 @@
 // active rendering instance). After the transfer columns: gpu_rendering_ends (guest rendering
 // instances ended, every cause; per-site Tracy plots GpuOps.EndRendering.<site>) and
 // gpu_draw_write_sinks (post-draw shader-write barriers kept pending across a draw continuing the
-// same instance, KYTY_DRAW_WRITE_SINK). New columns are only ever appended.
+// same instance, KYTY_DRAW_WRITE_SINK). Then the guest memory tracking / upload counters
+// (MemoryCounter below, mem_* columns). New columns are only ever appended.
 
 #include <cstdint>
 #include <string>
@@ -239,6 +240,41 @@ struct GpuOpCounts {
 	uint64_t draw_write_sinks = 0;
 };
 void RecordGpuOpCounts(const GpuOpCounts& counts);
+
+// Guest memory tracking and buffer upload counters (graphics/host_gpu/memoryStats.h), summed per
+// second into summary.csv columns appended after gpu_draw_write_sinks, in enum order (column
+// names in hangTrace.cpp; *_us columns are nanosecond counters divided by 1000). Append only.
+//   mem_write_faults / mem_read_faults   guest write/read faults handled by RenderContext
+//   mem_fault_us                         time inside RenderContext::HandleFault (both kinds)
+//   mem_protect_calls / _pages           host protection calls that remove write access
+//   mem_unprotect_calls / _pages         host protection calls that restore read-write access
+//   mem_protect_us                       time inside those protection calls (both directions)
+//   mem_tracker_lock_contended           region tracking spinlock acquisitions that had to spin
+//   mem_scratch_allocs / _bytes / _us    tiler scratch buffers (vmaCreateBuffer) and their cost
+//   mem_buffer_from_image                SynchronizeBufferFromImage downloads recorded
+//   mem_upload_copies                    vkCmdCopyBuffer calls recording CPU-dirty uploads
+//   mem_upload_barriers                  pipeline barriers recorded around those uploads
+//   mem_upload_render_splits             uploads that had to end an active rendering instance
+enum class MemoryCounter : uint8_t {
+	WriteFaults,
+	ReadFaults,
+	FaultNs,
+	ProtectCalls,
+	ProtectPages,
+	UnprotectCalls,
+	UnprotectPages,
+	ProtectNs,
+	TrackerLockContended,
+	ScratchAllocs,
+	ScratchAllocBytes,
+	ScratchAllocNs,
+	BufferFromImageSyncs,
+	UploadCopies,
+	UploadBarriers,
+	UploadRenderSplits,
+	Count
+};
+void CountMemory(MemoryCounter counter, uint64_t amount = 1);
 
 } // namespace HangTrace
 

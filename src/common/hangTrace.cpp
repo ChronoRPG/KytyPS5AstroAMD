@@ -274,10 +274,38 @@ struct Totals {
 	std::atomic<uint64_t> gpu_barrier_rp_splits {0};
 	std::atomic<uint64_t> gpu_rendering_ends {0};
 	std::atomic<uint64_t> gpu_draw_write_sinks {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(MemoryCounter::Count)> memory {};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(TransferKind::Count)> transfer_count {};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(TransferKind::Count)> transfer_bytes {};
 };
 Totals g_totals;
+
+struct MemoryCounterColumn {
+	const char* name;
+	uint64_t    divisor;
+};
+// summary.csv names of HangTrace::MemoryCounter, in enum order.
+constexpr std::array<MemoryCounterColumn, static_cast<size_t>(MemoryCounter::Count)>
+    kMemoryCounterColumns {{
+        {"mem_write_faults", 1},
+        {"mem_read_faults", 1},
+        {"mem_fault_us", 1000},
+        {"mem_protect_calls", 1},
+        {"mem_protect_pages", 1},
+        {"mem_unprotect_calls", 1},
+        {"mem_unprotect_pages", 1},
+        {"mem_protect_us", 1000},
+        {"mem_tracker_lock_contended", 1},
+        {"mem_scratch_allocs", 1},
+        {"mem_scratch_bytes", 1},
+        {"mem_scratch_us", 1000},
+        {"mem_buffer_from_image", 1},
+        {"mem_upload_copies", 1},
+        {"mem_upload_barriers", 1},
+        {"mem_upload_render_splits", 1},
+    }};
+static_assert(kMemoryCounterColumns.back().name != nullptr,
+              "memory counter columns must match HangTrace::MemoryCounter");
 
 std::mutex                  g_publish_mutex;
 std::condition_variable_any g_publish_condition;
@@ -677,6 +705,10 @@ void Publish() {
 		}
 		line += fmt::format(",{},{}", take(g_totals.gpu_rendering_ends),
 		                    take(g_totals.gpu_draw_write_sinks));
+		for (size_t counter = 0; counter < kMemoryCounterColumns.size(); counter++) {
+			line += fmt::format(",{}", take(g_totals.memory[counter]) /
+			                               kMemoryCounterColumns[counter].divisor);
+		}
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
@@ -754,6 +786,10 @@ void Initialize() {
 	                  "xfer_buffer_upload_bytes,xfer_image_copies,xfer_image_copy_bytes,"
 	                  "xfer_alias_syncs,xfer_alias_sync_bytes";
 	summary_header += ",gpu_rendering_ends,gpu_draw_write_sinks";
+	for (const auto& column: kMemoryCounterColumns) {
+		summary_header += ',';
+		summary_header += column.name;
+	}
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.transfers = OpenFile("transfers.csv",
 	                             "t_ms,kind,reason,detail,address,format,width,height,count,bytes,"
@@ -1375,6 +1411,13 @@ void RecordGpuFrame(const GpuFrame& frame) {
 	g_totals.gpu_dispatch_latency_ns.fetch_add(frame.dispatch_latency_ns,
 	                                           std::memory_order_relaxed);
 	g_totals.gpu_dropped.fetch_add(frame.dropped, std::memory_order_relaxed);
+}
+
+void CountMemory(MemoryCounter counter, uint64_t amount) {
+	if (!Enabled() || counter >= MemoryCounter::Count) {
+		return;
+	}
+	g_totals.memory[static_cast<size_t>(counter)].fetch_add(amount, std::memory_order_relaxed);
 }
 
 void RecordGpuOpCounts(const GpuOpCounts& counts) {

@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -968,6 +969,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			                          0, static_cast<uint32_t>(copies.size()), 0, total_size, size);
 		}
 		auto& command = m_scheduler.Current();
+		if (command.ActiveRenderingSerial() != 0) {
+			MemoryStats::Count(MemoryStats::Counter::UploadRenderSplits);
+		}
+		MemoryStats::Count(MemoryStats::Counter::UploadCopies);
+		MemoryStats::Count(MemoryStats::Counter::UploadBarriers, 2);
 		command.EndRendering();
 		const auto native = command.Handle();
 		vk::BufferMemoryBarrier before {};

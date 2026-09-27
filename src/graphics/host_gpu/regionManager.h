@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/rendererBatch.h"
+#include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
@@ -34,7 +35,12 @@ public:
 		if (m_owner.load(std::memory_order_relaxed) == thread) {
 			EXIT("recursive region tracking lock\n");
 		}
+		bool contended = false;
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
+			if (!contended) {
+				contended = true;
+				MemoryStats::Count(MemoryStats::Counter::TrackerLockContended);
+			}
 			if (m_owner.load(std::memory_order_relaxed) == thread) {
 				EXIT("recursive region tracking lock while contended\n");
 			}
