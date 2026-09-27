@@ -189,11 +189,19 @@ private:
 		// the hot page runs it reports.
 		BufferId                  buffer_id;
 		std::vector<BdaHotRange>* hot_ranges = nullptr;
+		// KYTY_BDA_HOT_SYNC_VERIFY: the epochs a hot pass relied on (0: not verifying), and the
+		// normal CPU-dirty pages found while both still held, which the hot pass would have missed.
+		uint64_t verify_fault_epoch     = 0;
+		uint64_t verify_structure_epoch = 0;
+		uint64_t verify_mismatch_pages  = 0;
 	};
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSyncStats* stats);
 	// KYTY_BDA_HOT_SYNC pass: re-synchronizes only the hot page runs the last full pass recorded.
 	// False (nothing done) when a recorded buffer is gone; the caller then scans fully.
 	[[nodiscard]] bool SynchronizeBdaHotRanges(BdaSyncStats& stats);
+	// KYTY_BDA_HOT_SYNC_VERIFY: the full scan after a hot pass that relied on these epochs.
+	void VerifyBdaHotPass(const RangeSet& mapped_ranges, uint64_t fault_epoch,
+	                      uint64_t structure_epoch);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer,
 	                                     BdaSyncStats* stats = nullptr,

@@ -22,6 +22,7 @@
 #include <array>
 #include <atomic>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -47,6 +48,25 @@ bool IncrementalBdaSyncEnabled() {
 bool BdaHotSyncEnabled() {
 	const auto* value = std::getenv("KYTY_BDA_HOT_SYNC");
 	return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+}
+
+// KYTY_BDA_HOT_SYNC_VERIFY=1 follows every hot pass with the full scan it replaced and counts
+// the CPU-dirty non-hot pages that scan finds while the pass's epochs still hold
+// (BdaSyncHotVerifyMismatches, expected 0); "exit" stops on the first one. Diagnostic: it costs
+// the full scans again.
+int BdaHotSyncVerifyMode() {
+	static const int mode = [] {
+		const auto* value = std::getenv("KYTY_BDA_HOT_SYNC_VERIFY");
+		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
+			return 0;
+		}
+		return std::strcmp(value, "exit") == 0 ? 2 : 1;
+	}();
+	return mode;
+}
+
+bool BdaHotSyncVerifyEnabled() {
+	return BdaHotSyncVerifyMode() != 0;
 }
 
 // KYTY_UPLOAD_BATCH_SCOPED_FLUSH=0 restores recording every pending barrier at the end of each
@@ -1248,6 +1268,13 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			}
 			return;
 		}
+		if (stats != nullptr && stats->verify_fault_epoch != 0 &&
+		    m_memory_tracker.FaultMutationEpoch() == stats->verify_fault_epoch &&
+		    m_bda_structure_epoch.load(std::memory_order_acquire) == stats->verify_structure_epoch) {
+			// Called under the region lock: a transition that dirtied this page published its
+			// epoch change before the lock was released, so it would be visible here.
+			stats->verify_mismatch_pages += bytes / TRACKER_PAGE_SIZE;
+		}
 		copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		total_size += bytes;
 	};
@@ -1962,6 +1989,9 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncUploadCopies,
 				                          stats.upload_copies);
 			}
+			if (BdaHotSyncVerifyEnabled()) {
+				VerifyBdaHotPass(mapped_ranges, cpu_epoch, structure_epoch);
+			}
 			return;
 		}
 		// A recorded buffer is gone although the structure epoch held: scan everything.
@@ -1989,6 +2019,37 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncScannedBuffers, stats.scanned_buffers);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncUploadBytes, stats.upload_bytes);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncUploadCopies, stats.upload_copies);
+	}
+}
+
+void BufferCache::VerifyBdaHotPass(const RangeSet& mapped_ranges, uint64_t fault_epoch,
+                                   uint64_t structure_epoch) {
+	// The full scan the hot pass replaced. It uploads whatever it finds, so this mode stays
+	// correct even when it reports a mismatch.
+	BdaSyncStats verify;
+	verify.verify_fault_epoch     = fault_epoch;
+	verify.verify_structure_epoch = structure_epoch;
+	{
+		const UploadBatch upload_batch(*this);
+		mapped_ranges.ForEach([this, &verify](uint64_t start, uint64_t end) {
+			SynchronizeBuffersInRange(start, end - start, &verify);
+		});
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncHotVerifyChecks);
+	if (verify.verify_mismatch_pages == 0) {
+		return;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncHotVerifyMismatches,
+	                          verify.verify_mismatch_pages);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::fprintf(stderr,
+		             "BdaHotSyncVerify: a hot pass would have missed %" PRIu64
+		             " CPU-dirty page(s) (fault epoch %" PRIu64 ", structure epoch %" PRIu64 ")\n",
+		             verify.verify_mismatch_pages, fault_epoch, structure_epoch);
+	}
+	if (BdaHotSyncVerifyMode() == 2) {
+		EXIT("BdaHotSyncVerify: a hot pass missed CPU-dirty pages\n");
 	}
 }
 

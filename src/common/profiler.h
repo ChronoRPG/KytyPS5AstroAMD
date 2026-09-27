@@ -553,6 +553,10 @@ enum class FrameEvent : uint32_t {
 	// barriers pending but no queued upload, and so left them to the next flush point instead of
 	// recording them (and ending the rendering instance) right away.
 	UploadBatchFlushesDeferred,
+	// KYTY_BDA_HOT_SYNC_VERIFY: hot passes re-checked by a full scan, and CPU-dirty non-hot pages
+	// that scan found while the hot pass's epochs still held (pages the hot pass missed; 0).
+	BdaSyncHotVerifyChecks,
+	BdaSyncHotVerifyMismatches,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
