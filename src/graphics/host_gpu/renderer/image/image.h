@@ -112,6 +112,7 @@ public:
 		uint32_t              count       = 0; // 0: whole-image tracking
 		uint32_t              shift       = 0;
 		uint32_t              dirty_count = 0;
+		uint32_t              untracked_count = 0;
 		// Consecutive refreshes that found (nearly) every chunk dirty. Such an image is
 		// rewritten whole by the CPU: its next write releases every chunk at once, so it takes
 		// one fault per refresh instead of one per chunk.
@@ -133,7 +134,8 @@ public:
 		chunks.count     = static_cast<uint32_t>(count);
 		chunks.dirty.assign((count + 63) / 64, 0);
 		chunks.untracked.assign((count + 63) / 64, 0);
-		chunks.dirty_count = 0;
+		chunks.dirty_count     = 0;
+		chunks.untracked_count = 0;
 	}
 	[[nodiscard]] static bool ChunkBit(const std::vector<uint64_t>& bits, uint32_t index) noexcept {
 		return (bits[index >> 6] >> (index & 63u)) & 1u;

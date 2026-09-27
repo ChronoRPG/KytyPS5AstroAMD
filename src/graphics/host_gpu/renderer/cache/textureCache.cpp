@@ -661,19 +661,26 @@ void TextureCache::TrackChunkImage(Image& image) {
 	if (!image.IsTracked()) {
 		// Nothing is watched: the untracked marks describe holes of a previous tracked period.
 		std::fill(image.chunks.untracked.begin(), image.chunks.untracked.end(), 0);
+		image.chunks.untracked_count = 0;
 		image.track_addr     = image.info.data.address;
 		image.track_addr_end = image.info.data.End();
 		m_page_manager.UpdatePageWatchers<true>(image.info.data.address, image.info.data.size);
 		return;
 	}
 	// Watch again every chunk a CPU write released. Their dirty marks stay until a refresh:
-	// a write after this point faults and is recorded before it reaches memory.
-	(void)UpdateChunkWatchers<true>(image, 0, image.chunks.count);
+	// a write after this point faults and is recorded before it reaches memory. (Runs on every
+	// bind; nothing to scan while all chunks are watched.)
+	if (image.chunks.untracked_count != 0) {
+		(void)UpdateChunkWatchers<true>(image, 0, image.chunks.count);
+	}
 }
 
 template <bool track>
 uint32_t TextureCache::UpdateChunkWatchers(Image& image, uint32_t first, uint32_t last) {
 	auto&          chunks     = image.chunks;
+	if (track ? chunks.untracked_count == 0 : chunks.untracked_count == chunks.count) {
+		return 0;
+	}
 	const uint64_t chunk_size = uint64_t {1} << chunks.shift;
 	const uint64_t begin      = image.info.data.address; // page aligned (ChunkTrackingEligible)
 	const uint64_t end        = image.info.data.End();
@@ -707,6 +714,11 @@ uint32_t TextureCache::UpdateChunkWatchers(Image& image, uint32_t first, uint32_
 		}
 	}
 	flush(last);
+	if constexpr (track) {
+		chunks.untracked_count -= changed;
+	} else {
+		chunks.untracked_count += changed;
+	}
 	return changed;
 }
 
@@ -747,6 +759,7 @@ void TextureCache::UntrackImage(ImageId id) {
 	if (image.ChunkTracked()) {
 		(void)UpdateChunkWatchers<false>(image, 0, image.chunks.count);
 		std::fill(image.chunks.untracked.begin(), image.chunks.untracked.end(), 0);
+		image.chunks.untracked_count = 0;
 		image.track_addr     = 0;
 		image.track_addr_end = 0;
 		// Writes are no longer observed: only a full refresh can restore partial validity.
