@@ -237,6 +237,28 @@ void TraceDccDiagnostic(const char* format, Args... args) {
 
 } // namespace
 
+struct TextureCache::TextureTransfer {
+	TextureUploadLayout              layout;
+	std::vector<vk::BufferImageCopy> regions;
+	std::vector<GpuTileInfo>         tiles;
+	bool                             swap_bgra16 = false;
+	bool                             valid       = false;
+
+	[[nodiscard]] uint64_t LinearSize() const {
+		uint64_t size = 0;
+		for (const auto& tile: tiles) {
+			size = std::max(size, tile.linear_offset + tile.linear_size);
+		}
+		return size;
+	}
+};
+
+struct TextureCache::ImageDownload {
+	TextureTransfer texture;
+	bool                depth_target = false;
+	bool                valid        = false;
+};
+
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
                            PageManager& page_manager, BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
@@ -323,6 +345,26 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	     " frames\n",
 	     m_partial_upload ? 1u : 0u, (1u << m_chunk_shift) >> 10u, m_partial_bands ? 1u : 0u,
 	     m_partial_verify ? 1u : 0u, m_overlap_keep_frames);
+	// KYTY_TEXTURE_RESIDENT_MIPS=0 registers, watches and uploads every level of every texture.
+	// By default a sampled texture holds only the levels its views can sample (finer than the
+	// T# MIN_LOD / BASE_LEVEL clamp is never read); =poison also fills the other levels with a
+	// visible marker to check that claim on screen.
+	if (const auto* residency = std::getenv("KYTY_TEXTURE_RESIDENT_MIPS"); residency != nullptr) {
+		if (std::strcmp(residency, "0") == 0) {
+			m_residency = ResidencyMode::Off;
+		} else if (std::strcmp(residency, "poison") == 0) {
+			m_residency = ResidencyMode::Poison;
+		}
+	}
+	if (const auto* idle = std::getenv("KYTY_TEXTURE_RESIDENT_IDLE_FRAMES"); idle != nullptr) {
+		m_resident_idle_frames = std::strtoull(idle, nullptr, 10);
+	}
+	LOGF("Texture streaming: resident mip levels %s, idle partially resident images retired "
+	     "after %" PRIu64 " frames\n",
+	     m_residency == ResidencyMode::Off      ? "off (whole chains)"
+	     : m_residency == ResidencyMode::Poison ? "on, non-resident levels poisoned"
+	                                            : "on",
+	     m_resident_idle_frames);
 	// KYTY_TEXTURE_ASYNC_STAGING=0 keeps texture refresh staging copies on the GPU thread.
 	if (EnvNotZero("KYTY_TEXTURE_ASYNC_STAGING")) {
 		m_staging_copier = std::make_unique<StagingCopier>(graphics);
@@ -431,19 +473,238 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 }
 
 bool TextureCache::SafeToDownload(const Image& image) {
-	if (!image.SafeToDownload()) {
+	// Non-resident levels hold undefined native contents and must never reach guest memory.
+	// (GPU-written images are always fully resident; this only keeps downloads exact.)
+	if (!image.SafeToDownload() || !image.FullyResident()) {
 		return false;
 	}
 	const auto range = image.info.data;
 	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
 }
 
-ImageId TextureCache::InsertImage(const ImageInfo& info) {
+ImageId TextureCache::InsertImage(const ImageInfo& info, uint32_t resident_first,
+                                  uint64_t resident_prefix) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	if (resident_first != 0) {
+		if (resident_prefix == 0) {
+			resident_prefix = ResidentPrefixSize(info, resident_first);
+		}
+		if (resident_prefix != 0) {
+			auto& image          = m_slot_images[id];
+			image.resident_first = resident_first;
+			image.live           = {info.data.address, resident_prefix};
+			if (m_resident_idle_frames != 0) {
+				m_partial_images.push_back(id);
+			}
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureResidentImages);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureResidentLevelsSkipped,
+			                          resident_first);
+		}
+	}
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
 	return id;
+}
+
+uint32_t TextureCache::RequestedFirstLevel(const ImageDesc& desc, uint32_t levels) const {
+	if (m_residency == ResidencyMode::Off || desc.type != BindingType::Texture || levels <= 1) {
+		return 0;
+	}
+	// The finest level a sampled view can read. Its minimum LOD (the T# MIN_LOD clamp, applied
+	// through VK_EXT_image_view_min_lod) bounds every level-of-detail computation: trilinear
+	// filtering at the clamp reads floor(min_lod) and the next coarser level, nearest-mip
+	// selection rounds only towards coarser levels, and texel fetches of finer levels are out
+	// of range for the view. Levels below base_level are outside the view altogether.
+	const auto& view  = desc.view_info;
+	const auto  first = view.base_level + (view.min_lod >> 8u);
+	return std::min(first, levels - 1u);
+}
+
+uint64_t TextureCache::ResidentPrefixSize(const ImageInfo& info, uint32_t first_level) const {
+	if (first_level == 0 || m_residency == ResidencyMode::Off || info.data.Empty() ||
+	    info.type != Prospero::ImageType::kColor2D || info.resources.layers != 1 ||
+	    info.samples != 1 || info.resources.levels <= first_level || info.IsDepth() ||
+	    info.HasStencil() || info.HasMetadata() ||
+	    info.metadata.compression != VideoOutCompression::Uncompressed ||
+	    info.pixel_format == vk::Format::eUndefined) {
+		return 0;
+	}
+	// The guest bytes of levels [first_level, levels), from the same layout the refresh detiles
+	// (PS5 stores the chain smallest level first: the mip tail block, then coarser to finer).
+	const auto transfer =
+	    BuildTextureTransfer(info, 1, BindingType::Texture, TransferDirection::Upload);
+	if (!transfer.valid) {
+		return 0;
+	}
+	uint64_t begin = UINT64_MAX;
+	uint64_t end   = 0;
+	if (!transfer.tiles.empty()) {
+		if (transfer.tiles.size() != transfer.regions.size()) {
+			return 0;
+		}
+		for (size_t index = 0; index < transfer.tiles.size(); ++index) {
+			if (transfer.regions[index].imageSubresource.mipLevel < first_level) {
+				continue;
+			}
+			const auto& tile = transfer.tiles[index];
+			begin            = std::min(begin, tile.tiled_offset);
+			end              = std::max(end, tile.tiled_offset + tile.tiled_size);
+		}
+	} else {
+		for (uint32_t level = first_level; level < info.resources.levels; ++level) {
+			const auto& mip = transfer.layout.mips[level];
+			begin           = std::min(begin, mip.offset);
+			end             = std::max(end, mip.offset + mip.size);
+		}
+	}
+	// Only a proper prefix: it keeps the first page (exact-backing lookups start there) and
+	// leaves every non-resident byte after it.
+	if (begin != 0 || end == 0 || end >= info.data.size) {
+		return 0;
+	}
+	return end;
+}
+
+void TextureCache::EnsureResidency(ImageId id, uint32_t first_level, bool sampling) {
+	auto& image = m_slot_images[id];
+	if (first_level >= image.resident_first) {
+		return;
+	}
+	const auto prefix    = ResidentPrefixSize(image.info, first_level);
+	const auto new_first = prefix != 0 ? first_level : 0u;
+	// The registered range grows. For everything keyed on the page owner index (clean-page
+	// proofs, lookups, binding identity caches) this is an unregister and a register.
+	const bool registered = image.registered;
+	if (registered) {
+		UnregisterImage(id);
+	}
+	image.resident_first = new_first;
+	image.live = new_first != 0 ? GuestRange {image.info.data.address, prefix} : image.info.data;
+	if (registered) {
+		RegisterImage(id);
+	}
+	// Newly resident levels hold undefined contents: refresh every resident level before use
+	// (from the GPU-written buffer bytes when there are any, as for a new image).
+	image.MarkResidencyDirty();
+	image.residency_refresh = true;
+	if (m_buffer_cache.HasGpuDirtyBytes(image.live.address, image.live.size)) {
+		image.MarkBufferModified();
+	}
+	image.residency_poisoned = image.residency_poisoned && new_first != 0;
+	Profiler::CountFrameEvent(sampling ? Profiler::FrameEvent::TextureResidencyExtensions
+	                                   : Profiler::FrameEvent::TextureResidencyFullFallbacks);
+}
+
+void TextureCache::RetireIdlePartialImages() {
+	// A partially resident image overlaps no neighbouring streamed texture, so the overlap
+	// rule that used to retire unused ones never fires: its full native mip chain would stay
+	// allocated until a same-slot replacement or memory pressure. Retire one unused for
+	// KYTY_TEXTURE_RESIDENT_IDLE_FRAMES presented frames instead; a later use recreates it and
+	// uploads only its resident levels. Once per frame, over partially resident images only.
+	const auto frame = m_frame.load(std::memory_order_relaxed);
+	if (m_resident_idle_frames == 0 || m_partial_images.empty() || frame == m_partial_scan_frame) {
+		return;
+	}
+	m_partial_scan_frame = frame;
+	const auto tick      = m_scheduler.CurrentTick();
+	size_t     kept      = 0;
+	for (size_t index = 0; index < m_partial_images.size(); ++index) {
+		const auto id    = m_partial_images[index];
+		auto*      image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered || image->FullyResident()) {
+			continue;
+		}
+		const bool idle =
+		    frame - std::min(frame, image->frame_accessed_last) > m_resident_idle_frames &&
+		    tick - std::min(tick, image->tick_accessed_last) > NumFramesBeforeRemoval &&
+		    !image->binding.is_bound && !image->binding.is_target && !image->IsGpuModified();
+		if (idle) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureResidentIdleFrees);
+			FreeImage(id, HangTrace::ImageFreeReason::ResidentIdle);
+			continue;
+		}
+		m_partial_images[kept++] = id;
+	}
+	m_partial_images.resize(kept);
+}
+
+void TextureCache::RequireFullResidency(ImageId id) {
+	if (m_slot_images[id].FullyResident()) {
+		return;
+	}
+	// A use other than sampling through a clamped view (render or storage target, copy,
+	// clear, download, presentation): the whole chain is live from now on. Refresh it before
+	// the caller records anything that reads or partially writes it.
+	EnsureResidency(id, 0, false);
+	RefreshImage(id);
+}
+
+void TextureCache::RestrictToResidentLevels(const Image& image, TextureTransfer& transfer) const {
+	if (image.FullyResident()) {
+		return;
+	}
+	const auto first = image.resident_first;
+	const bool tiled = !transfer.tiles.empty();
+	EXIT_IF(tiled && transfer.tiles.size() != transfer.regions.size());
+	size_t kept = 0;
+	for (size_t index = 0; index < transfer.regions.size(); ++index) {
+		if (transfer.regions[index].imageSubresource.mipLevel < first) {
+			continue;
+		}
+		transfer.regions[kept] = transfer.regions[index];
+		if (tiled) {
+			transfer.tiles[kept] = transfer.tiles[index];
+		}
+		kept++;
+	}
+	transfer.regions.resize(kept);
+	if (tiled) {
+		transfer.tiles.resize(kept);
+		// The detiled scratch holds only the resident levels.
+		uint64_t base = UINT64_MAX;
+		for (const auto& tile: transfer.tiles) {
+			base = std::min(base, tile.linear_offset);
+		}
+		for (size_t index = 0; index < kept; ++index) {
+			transfer.tiles[index].linear_offset -= base;
+			transfer.regions[index].bufferOffset -= base;
+		}
+	}
+}
+
+void TextureCache::PoisonNonResidentLevels(Image& image) {
+	// KYTY_TEXTURE_RESIDENT_MIPS=poison: fill the levels no view may sample with a marker
+	// (magenta/green texels) so any read of a non-resident level shows on screen.
+	auto transfer = BuildTextureTransfer(image, BindingType::Texture, TransferDirection::Upload);
+	if (!transfer.valid) {
+		return;
+	}
+	std::vector<vk::BufferImageCopy> regions;
+	uint64_t                         bytes = 0;
+	const auto element = std::max(image.info.bytes_per_block, 1u);
+	const auto texel   = image.info.IsBlock() ? 4u : 1u;
+	for (auto region: transfer.regions) {
+		if (region.imageSubresource.mipLevel >= image.resident_first) {
+			continue;
+		}
+		region.bufferOffset      = 0;
+		region.bufferRowLength   = 0;
+		region.bufferImageHeight = 0;
+		const uint64_t size = static_cast<uint64_t>((region.imageExtent.width + texel - 1) / texel) *
+		                      ((region.imageExtent.height + texel - 1) / texel) * element;
+		bytes = std::max(bytes, size);
+		regions.push_back(region);
+	}
+	if (regions.empty() || bytes == 0) {
+		return;
+	}
+	const auto scratch = m_tiler.GetScratchBuffer(bytes);
+	m_scheduler.EndRendering();
+	m_scheduler.Current().Handle().fillBuffer(scratch.buffer, 0, Common::AlignUp(bytes, 4),
+	                                          0xF81FF81Fu);
+	image.Upload(regions, scratch.buffer, 0, scratch.size);
+	image.residency_poisoned = true;
 }
 
 void TextureCache::RegisterImage(ImageId id) {
@@ -452,11 +713,11 @@ void TextureCache::RegisterImage(ImageId id) {
 		EXIT("TextureCache: invalid image registration\n");
 	}
 	ImagePageTable::PageRange pages {};
-	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
+	if (!ImagePageTable::TryGetPageRange(image.live.address, image.live.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
 	InvalidateCleanImageProofs();
-	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
+	ForEachPage(image.live.address, image.live.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 		// Before the image can watch pages (TrackImage follows registration).
 		m_image_page_counts[page].fetch_add(1);
@@ -466,9 +727,13 @@ void TextureCache::RegisterImage(ImageId id) {
 	m_total_used_memory += image.AccountedSize();
 	m_registered_image_memory += image.AccountedSize();
 	// Registration precedes the first TrackImage, so the tracking mode never changes while
-	// the image watches pages.
-	if (m_partial_upload && !image.IsTracked() && ChunkTrackingEligible(image)) {
-		image.EnableChunkTracking(m_chunk_shift);
+	// the image watches pages. Re-registration (a residency change) re-derives it.
+	if (!image.IsTracked()) {
+		if (m_partial_upload && ChunkTrackingEligible(image)) {
+			image.EnableChunkTracking(m_chunk_shift);
+		} else {
+			image.chunks = {};
+		}
 	}
 }
 
@@ -479,8 +744,9 @@ bool TextureCache::ChunkTrackingEligible(const Image& image) const {
 	return info.pixel_format != vk::Format::eUndefined && image.backing.image != nullptr &&
 	       !info.IsDepth() && !info.HasStencil() && !info.HasMetadata() && info.samples == 1 &&
 	       info.metadata.compression == VideoOutCompression::Uncompressed &&
-	       info.data.address % TRACKER_PAGE_SIZE == 0 && info.data.size % TRACKER_PAGE_SIZE == 0 &&
-	       info.data.size > (uint64_t {1} << m_chunk_shift);
+	       image.live.address % TRACKER_PAGE_SIZE == 0 &&
+	       image.live.size % TRACKER_PAGE_SIZE == 0 &&
+	       image.live.size > (uint64_t {1} << m_chunk_shift);
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -491,10 +757,10 @@ void TextureCache::UnregisterImage(ImageId id) {
 	InvalidateCleanImageProofs();
 	UntrackImage(id);
 	ImagePageTable::PageRange pages {};
-	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
+	if (!ImagePageTable::TryGetPageRange(image.live.address, image.live.size, pages)) {
 		EXIT("TextureCache: registered image is outside the guest address space\n");
 	}
-	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
+	ForEachPage(image.live.address, image.live.size, [this, id](uint64_t page) {
 		auto* owners = m_image_page_table.Find(page);
 		if (owners == nullptr || !owners->Erase(id)) {
 			EXIT("TextureCache: image missing from page owner index\n");
@@ -606,15 +872,15 @@ void TextureCache::TrackImage(ImageId id) {
 		TrackChunkImage(image);
 		return;
 	}
-	const auto image_begin = image.info.data.address;
-	const auto image_end   = image.info.data.End();
+	const auto image_begin = image.live.address;
+	const auto image_end   = image.live.End();
 	if (image_begin == image.track_addr && image_end == image.track_addr_end) {
 		return;
 	}
 	if (!image.IsTracked()) {
 		image.track_addr     = image_begin;
 		image.track_addr_end = image_end;
-		m_page_manager.UpdatePageWatchers<true>(image_begin, image.info.data.size);
+		m_page_manager.UpdatePageWatchers<true>(image_begin, image.live.size);
 		return;
 	}
 	if (image_begin < image.track_addr) {
@@ -630,7 +896,7 @@ void TextureCache::TrackImageHead(ImageId id) {
 	if (!image.registered) {
 		return;
 	}
-	const auto image_begin = image.info.data.address;
+	const auto image_begin = image.live.address;
 	if (image_begin == image.track_addr) {
 		return;
 	}
@@ -647,7 +913,7 @@ void TextureCache::TrackImageTail(ImageId id) {
 	if (!image.registered) {
 		return;
 	}
-	const auto image_end = image.info.data.End();
+	const auto image_end = image.live.End();
 	if (image_end == image.track_addr_end) {
 		return;
 	}
@@ -665,9 +931,9 @@ void TextureCache::TrackChunkImage(Image& image) {
 		// Nothing is watched: the untracked marks describe holes of a previous tracked period.
 		std::fill(image.chunks.untracked.begin(), image.chunks.untracked.end(), 0);
 		image.chunks.untracked_count = 0;
-		image.track_addr     = image.info.data.address;
-		image.track_addr_end = image.info.data.End();
-		m_page_manager.UpdatePageWatchers<true>(image.info.data.address, image.info.data.size);
+		image.track_addr     = image.live.address;
+		image.track_addr_end = image.live.End();
+		m_page_manager.UpdatePageWatchers<true>(image.live.address, image.live.size);
 		return;
 	}
 	// Watch again every chunk a CPU write released. Their dirty marks stay until a refresh:
@@ -685,8 +951,8 @@ uint32_t TextureCache::UpdateChunkWatchers(Image& image, uint32_t first, uint32_
 		return 0;
 	}
 	const uint64_t chunk_size = uint64_t {1} << chunks.shift;
-	const uint64_t begin      = image.info.data.address; // page aligned (ChunkTrackingEligible)
-	const uint64_t end        = image.info.data.End();
+	const uint64_t begin      = image.live.address; // page aligned (ChunkTrackingEligible)
+	const uint64_t end        = image.live.End();
 	uint32_t       changed    = 0;
 	uint32_t       run_first  = UINT32_MAX;
 	const auto     flush      = [&](uint32_t run_last) {
@@ -726,8 +992,8 @@ uint32_t TextureCache::UpdateChunkWatchers(Image& image, uint32_t first, uint32_
 }
 
 void TextureCache::InvalidateChunks(Image& image, uint64_t address, uint64_t size) {
-	const auto begin = std::max(Common::AlignDown(address, TRACKER_PAGE_SIZE), image.info.data.address);
-	const auto end = std::min(Common::AlignUp(address + size, TRACKER_PAGE_SIZE), image.info.data.End());
+	const auto begin = std::max(Common::AlignDown(address, TRACKER_PAGE_SIZE), image.live.address);
+	const auto end   = std::min(Common::AlignUp(address + size, TRACKER_PAGE_SIZE), image.live.End());
 	if (begin >= end) {
 		return;
 	}
@@ -780,7 +1046,7 @@ void TextureCache::UntrackImage(ImageId id) {
 
 void TextureCache::UntrackImageHead(ImageId id) {
 	auto&      image = m_slot_images[id];
-	const auto begin = image.info.data.address;
+	const auto begin = image.live.address;
 	if (!image.IsTracked() || begin < image.track_addr) {
 		return;
 	}
@@ -797,7 +1063,7 @@ void TextureCache::UntrackImageHead(ImageId id) {
 
 void TextureCache::UntrackImageTail(ImageId id) {
 	auto&      image = m_slot_images[id];
-	const auto end   = image.info.data.End();
+	const auto end   = image.live.End();
 	if (!image.IsTracked() || image.track_addr_end < end) {
 		return;
 	}
@@ -935,6 +1201,8 @@ void TextureCache::PrepareImageCopy(Image& image) {
 
 void TextureCache::RefreshCopySource(ImageId id) {
 	auto& image = m_slot_images[id];
+	// A copy reads every level: non-resident levels must hold guest data first.
+	RequireFullResidency(id);
 	RefreshImage(id);
 	if (image.IsDefinitelyCpuDirty()) {
 		EXIT("TextureCache: image copy source remained CPU-dirty after refresh\n");
@@ -1051,6 +1319,8 @@ const char* TextureCache::TryDirectReinterpret(Image& destination, Image& source
 
 bool TextureCache::CopyImage(ImageId destination_id, ImageId source_id, const char* context) {
 	RefreshCopySource(source_id);
+	// Levels the copy does not write must stay valid, and the result is GPU-owned.
+	RequireFullResidency(destination_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
 	TrackImage(destination_id);
@@ -1121,6 +1391,7 @@ bool TextureCache::CopyImage(ImageId destination_id, ImageId source_id, const ch
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
                                 uint32_t layer) {
 	RefreshCopySource(source_id);
+	RequireFullResidency(destination_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
 	TrackImage(destination_id);
@@ -1404,32 +1675,16 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	return expanded_id;
 }
 
-struct TextureCache::TextureTransfer {
-	TextureUploadLayout              layout;
-	std::vector<vk::BufferImageCopy> regions;
-	std::vector<GpuTileInfo>         tiles;
-	bool                             swap_bgra16 = false;
-	bool                             valid       = false;
-
-	[[nodiscard]] uint64_t LinearSize() const {
-		uint64_t size = 0;
-		for (const auto& tile: tiles) {
-			size = std::max(size, tile.linear_offset + tile.linear_size);
-		}
-		return size;
-	}
-};
-
-struct TextureCache::ImageDownload {
-	TextureTransfer texture;
-	bool                depth_target = false;
-	bool                valid        = false;
-};
-
 TextureCache::TextureTransfer
 TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
                                     TransferDirection direction) const {
-	const auto& info             = image.info;
+	return BuildTextureTransfer(image.info, image.backing.samples, binding, direction);
+}
+
+TextureCache::TextureTransfer TextureCache::BuildTextureTransfer(const ImageInfo& info,
+                                                                 uint32_t backing_samples,
+                                                                 BindingType binding,
+                                                                 TransferDirection direction) {
 	const bool  upload           = direction == TransferDirection::Upload;
 	const bool  render_target    = binding == BindingType::RenderTarget;
 	const bool  video_out        = binding == BindingType::VideoOut;
@@ -1452,7 +1707,7 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 	if (upload) {
 		if ((render_target || video_out) &&
 		    (info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
-		     info.samples != 1 || image.backing.samples != 1)) {
+		     info.samples != 1 || backing_samples != 1)) {
 			EXIT("TextureCache: invalid color-attachment upload\n");
 		}
 		owner = "TextureCache";
@@ -1533,9 +1788,11 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			     info.extent.height, info.extent.depth, info.pitch, info.resources.levels,
 			     info.resources.layers, info.samples);
 		}
-		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
+		// Resident levels only: the source holds the resident prefix (image.live) of the chain.
+		RestrictToResidentLevels(image, transfer);
+		TileManager::Result linear {source.Handle(), source_offset, image.live.size};
 		if (!transfer.tiles.empty()) {
-			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
+			linear = m_tiler.Detile(source.Handle(), source_offset, image.live.size,
 			                        transfer.LinearSize(), transfer.tiles);
 		}
 		if (transfer.swap_bgra16) {
@@ -1621,6 +1878,7 @@ void TextureCache::InitializeImage(ImageId id) {
 		const char* reason = image.IsBufferModified()
 		                         ? (first ? "first-use-gpu-buffer" : "gpu-buffer-write")
 		                     : first                     ? "first-use"
+		                     : image.residency_refresh   ? "resident-extend"
 		                     : image.DirtyFromEdgeHash() ? "cpu-edge-hash"
 		                                                 : "cpu-write";
 		const auto span = image.DirtySpanBytes();
@@ -1642,21 +1900,31 @@ void TextureCache::InitializeImage(ImageId id) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::TexturePartialFallbacks);
 			}
 		}
+		// Sources cover the resident prefix only (image.live; the whole range when fully
+		// resident): the bytes of levels no view can sample are neither read nor uploaded.
+		const auto live = image.live;
 		if (!partial.done && !TryAsyncFullUpload(image)) {
-			const bool cached_source =
-			    m_buffer_cache.IsRegionRegistered(image.info.data.address, image.info.data.size) ||
-			    m_buffer_cache.IsRegionGpuModified(image.info.data.address, image.info.data.size);
+			const bool cached_source = m_buffer_cache.IsRegionRegistered(live.address, live.size) ||
+			                           m_buffer_cache.IsRegionGpuModified(live.address, live.size);
 			Profiler::CountFrameEvent(cached_source ? Profiler::FrameEvent::TextureUploadBytesBuffer
 			                                        : Profiler::FrameEvent::TextureUploadBytesStaging,
-			                          image.info.data.size);
+			                          live.size);
 			const auto [source, source_offset] =
-			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+			    m_buffer_cache.ObtainBufferForImage(live.address, live.size);
 			if (source == nullptr) {
 				EXIT("TextureCache: failed to obtain image upload source\n");
 			}
 			UploadImage(image, *source, source_offset);
 		}
-		const auto uploaded = partial.done ? partial.bytes : image.info.data.size;
+		const auto uploaded = partial.done ? partial.bytes : live.size;
+		image.residency_refresh = false;
+		if (!image.FullyResident()) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureResidentBytesSkipped,
+			                          image.info.data.size - live.size);
+			if (m_residency == ResidencyMode::Poison && !image.residency_poisoned) {
+				PoisonNonResidentLevels(image);
+			}
+		}
 		image.ClearBufferModified();
 		image.NoteUpload();
 		image.ClearDirtySpan();
@@ -1666,16 +1934,18 @@ void TextureCache::InitializeImage(ImageId id) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TexturePartialUploads);
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TexturePartialUploadBytes, uploaded);
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TexturePartialSkippedBytes,
-			                          image.info.data.size - std::min(image.info.data.size, uploaded));
+			                          live.size - std::min(live.size, uploaded));
 		}
 		if (HangTrace::Enabled()) {
 			// Partial refreshes: bytes are the tiled guest bytes refreshed, span_bytes the dirty
 			// chunk bytes that caused the refresh.
+			// Partially resident textures: detail "texture-resident", bytes = resident bytes.
 			HangTrace::RecordTransfer(HangTrace::TransferKind::ImageUpload,
 			                          partial.done ? "cpu-write-partial" : reason,
-			                          writer != nullptr ? writer
-			                          : image.depth_id  ? "stencil-plane"
-			                                            : UploadBindingName(binding),
+			                          writer != nullptr          ? writer
+			                          : image.depth_id           ? "stencil-plane"
+			                          : !image.FullyResident()   ? "texture-resident"
+			                                                     : UploadBindingName(binding),
 			                          image.info.data.address,
 			                          static_cast<uint32_t>(image.backing.format),
 			                          image.info.extent.width, image.info.extent.height, uploaded,
@@ -1754,7 +2024,8 @@ TextureCache::PartialUploadResult TextureCache::TryPartialUpload(Image& image) {
 	for (size_t index = 0; index < transfer.tiles.size(); index++) {
 		const auto& tile   = transfer.tiles[index];
 		const auto& region = transfer.regions[index];
-		if (tile.tiled_size == 0 || !image.ChunkRangeDirty(base + tile.tiled_offset, tile.tiled_size)) {
+		if (region.imageSubresource.mipLevel < image.resident_first || tile.tiled_size == 0 ||
+		    !image.ChunkRangeDirty(base + tile.tiled_offset, tile.tiled_size)) {
 			continue;
 		}
 		TileBlockLayout block {};
@@ -1814,7 +2085,8 @@ TextureCache::PartialUploadResult TextureCache::TryPartialUpload(Image& image) {
 		return result;
 	}
 	// Nearly everything is dirty: the plain refresh needs fewer dispatches for the same bytes.
-	if (tiled_bytes >= info.data.size - info.data.size / 8) {
+	const auto live = image.live;
+	if (tiled_bytes >= live.size - live.size / 8) {
 		return result;
 	}
 
@@ -1823,15 +2095,15 @@ TextureCache::PartialUploadResult TextureCache::TryPartialUpload(Image& image) {
 	vk::Buffer tiled_buffer   = nullptr;
 	uint64_t   tiled_offset   = 0;
 	uint64_t   tiled_capacity = 0;
-	if (m_buffer_cache.IsRegionRegistered(base, info.data.size) ||
-	    m_buffer_cache.IsRegionGpuModified(base, info.data.size)) {
-		const auto [source, source_offset] = m_buffer_cache.ObtainBufferForImage(base, info.data.size);
+	if (m_buffer_cache.IsRegionRegistered(base, live.size) ||
+	    m_buffer_cache.IsRegionGpuModified(base, live.size)) {
+		const auto [source, source_offset] = m_buffer_cache.ObtainBufferForImage(base, live.size);
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
 		tiled_buffer   = source->Handle();
 		tiled_offset   = source_offset;
-		tiled_capacity = info.data.size;
+		tiled_capacity = live.size;
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureUploadBytesBuffer, tiled_bytes);
 	} else {
 		struct SourceRange {
@@ -1907,26 +2179,28 @@ bool TextureCache::TryAsyncFullUpload(Image& image) {
 	}
 	// Same source choice as ObtainBufferForImage: cache buffers and GPU-written bytes stay on
 	// their synchronous paths; only plain guest memory is copied by the worker.
-	const auto base = info.data.address;
-	if (m_buffer_cache.IsRegionRegistered(base, info.data.size) ||
-	    m_buffer_cache.IsRegionGpuModified(base, info.data.size)) {
+	const auto base = image.live.address;
+	const auto size = image.live.size;
+	if (m_buffer_cache.IsRegionRegistered(base, size) ||
+	    m_buffer_cache.IsRegionGpuModified(base, size)) {
 		return false;
 	}
 	auto transfer = BuildTextureTransfer(image, BindingType::Texture, TransferDirection::Upload);
 	if (!transfer.valid || transfer.swap_bgra16 || transfer.tiles.empty()) {
 		return false;
 	}
+	RestrictToResidentLevels(image, transfer);
 	auto& staging         = StagingRing();
-	auto [mapped, offset] = staging.Map(info.data.size, 256);
+	auto [mapped, offset] = staging.Map(size, 256);
 	if (mapped == nullptr) {
 		return false;
 	}
 	staging.Commit();
-	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureUploadBytesAsync, info.data.size);
-	m_staging_copier->Enqueue({{base, mapped, info.data.size}}, &staging, offset, info.data.size);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureUploadBytesAsync, size);
+	m_staging_copier->Enqueue({{base, mapped, size}}, &staging, offset, size);
 	// The detile barrier includes host writes; the submission waits for the copy on the GPU.
-	const auto linear = m_tiler.Detile(staging.Handle(), offset, info.data.size,
-	                                   transfer.LinearSize(), transfer.tiles);
+	const auto linear =
+	    m_tiler.Detile(staging.Handle(), offset, size, transfer.LinearSize(), transfer.tiles);
 	for (auto& region: transfer.regions) {
 		region.bufferOffset += linear.offset;
 	}
@@ -1940,8 +2214,8 @@ void TextureCache::RecordChunkHashes(Image& image) {
 	chunks.hashes.assign(chunks.count, 0);
 	std::vector<uint8_t> bytes(chunk_size);
 	for (uint32_t index = 0; index < chunks.count; index++) {
-		const auto begin = std::max(image.info.data.address, chunks.base + uint64_t {index} * chunk_size);
-		const auto end = std::min(image.info.data.End(), chunks.base + uint64_t {index + 1} * chunk_size);
+		const auto begin = std::max(image.live.address, chunks.base + uint64_t {index} * chunk_size);
+		const auto end   = std::min(image.live.End(), chunks.base + uint64_t {index + 1} * chunk_size);
 		if (begin >= end ||
 		    (!LibKernel::Memory::TryReadBacking(begin, bytes.data(), end - begin) &&
 		     !LibKernel::Memory::TryReadPrtBacking(begin, bytes.data(), end - begin))) {
@@ -1963,8 +2237,8 @@ bool TextureCache::VerifyCleanChunks(Image& image) {
 		if (Image::ChunkBit(chunks.dirty, index)) {
 			continue;
 		}
-		const auto begin = std::max(image.info.data.address, chunks.base + uint64_t {index} * chunk_size);
-		const auto end = std::min(image.info.data.End(), chunks.base + uint64_t {index + 1} * chunk_size);
+		const auto begin = std::max(image.live.address, chunks.base + uint64_t {index} * chunk_size);
+		const auto end   = std::min(image.live.End(), chunks.base + uint64_t {index + 1} * chunk_size);
 		if (begin >= end ||
 		    (!LibKernel::Memory::TryReadBacking(begin, bytes.data(), end - begin) &&
 		     !LibKernel::Memory::TryReadPrtBacking(begin, bytes.data(), end - begin))) {
@@ -2481,9 +2755,18 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
+		// Levels this lookup can sample. A new image registers only their prefix, and images that
+		// overlap only levels it cannot sample are neither merge candidates nor retired by it.
+		const auto wanted_first    = RequestedFirstLevel(desc, desc.info.resources.levels);
+		uint64_t   wanted_prefix   = 0;
+		bool       prefix_computed = false;
 		if (!result) {
 			if (!use_legacy) {
-				candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+				wanted_prefix   = ResidentPrefixSize(desc.info, wanted_first);
+				prefix_computed = true;
+				candidates    = FindImagesInRegion(
+				    desc.info.data.address,
+				    wanted_prefix != 0 ? wanted_prefix : desc.info.data.size, false);
 			}
 			constexpr size_t CrowdedOverlap = 24;
 			m_overlap_crowded = candidates.size() > CrowdedOverlap;
@@ -2510,10 +2793,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
-			result         = InsertImage(desc.info);
+			// A prefix computed as not applicable (0) keeps the image fully resident; InsertImage
+			// computes it when this lookup did not.
+			result = InsertImage(desc.info,
+			                     prefix_computed && wanted_prefix == 0 ? 0u : wanted_first,
+			                     wanted_prefix);
 			auto& inserted = m_slot_images[result];
-			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
-			                                    inserted.info.data.size)) {
+			if (m_buffer_cache.HasGpuDirtyBytes(inserted.live.address, inserted.live.size)) {
 				inserted.MarkBufferModified();
 			}
 		}
@@ -2524,6 +2810,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		if (view_layer >= 0) {
 			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
 		}
+		// Every level the (adjusted) view can sample must be resident: a finer MIN_LOD than
+		// before extends the image, any non-sampling binding makes the whole chain resident.
+		EnsureResidency(result, RequestedFirstLevel(desc, image.info.resources.levels),
+		                desc.type == BindingType::Texture);
 		SyncAliasFromOwner(result);
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
@@ -2548,6 +2838,8 @@ void TextureCache::UpdateImage(ImageId id) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
+	// External readers (presentation, depth copies) read every level.
+	RequireFullResidency(id);
 	RefreshImage(id);
 }
 
@@ -2599,6 +2891,10 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 		}
+		// The view's levels must be resident (a storage binding: the whole chain). FindImage
+		// already did this for the same description; binding caches may skip FindImage.
+		EnsureResidency(id, RequestedFirstLevel(desc, image.info.resources.levels),
+		                desc.type == BindingType::Texture);
 	}
 	if (desc.type == BindingType::Storage) {
 		MarkImageGpuModified(image);
@@ -2641,6 +2937,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
+	RequireFullResidency(id);
 	TouchImage(image);
 	MarkImageGpuModified(image);
 	image.usage.render_target = true;
@@ -2659,6 +2956,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
 	}
+	RequireFullResidency(id);
 	TouchImage(image);
 	MarkImageGpuModified(image);
 	image.usage.depth_target = true;
@@ -2683,6 +2981,8 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 	if (!image.registered || image.depth_id) {
 		EXIT("TextureCache: cannot mark an unavailable image GPU-written\n");
 	}
+	// Before the caller records its write: levels it does not write must hold guest data.
+	RequireFullResidency(id);
 	TrackImage(id);
 	CommitGpuWrite(image);
 	if (image.info.HasStencil()) {
@@ -2709,6 +3009,8 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 		    other->backing.samples != image.backing.samples) {
 			continue;
 		}
+		// Taking over the owner's contents makes this image GPU-owned: whole chain.
+		RequireFullResidency(id);
 		const auto trace_sync = [&](const char* reason, uint64_t bytes) {
 			HangTrace::RecordTransfer(HangTrace::TransferKind::AliasSync, reason, "",
 			                          image.info.data.address,
@@ -2842,6 +3144,8 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
 	KYTY_GPU_OP_SITE("texcache.clear");
+	// Levels outside the cleared range must hold guest data, and the result is GPU-owned.
+	RequireFullResidency(id);
 	auto& image = m_slot_images[id];
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
@@ -3233,6 +3537,16 @@ void TextureCache::InvalidateCleanImageProofs() {
 }
 
 void TextureCache::MarkImageGpuModified(Image& image) {
+	if (!image.FullyResident()) {
+		// Every GPU-write path makes the image fully resident before recording. Reaching this
+		// point partially resident would expose undefined levels: count and report it.
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureResidencyViolations);
+		if (++m_residency_violations <= 16) {
+			LOGF("TextureCache: GPU write to a partially resident image 0x%016" PRIx64
+			     " (resident from level %u)\n",
+			     image.info.data.address, image.resident_first);
+		}
+	}
 	if (!image.IsGpuModified()) {
 		InvalidateCleanImageProofs();
 	}
@@ -3349,8 +3663,8 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			UntrackImage(id);
 			continue;
 		}
-		const auto image_begin = owner->info.data.address;
-		const auto image_end   = owner->info.data.End();
+		const auto image_begin = owner->live.address;
+		const auto image_end   = owner->live.End();
 		if (page_end < image_end) {
 			UntrackImageHead(id);
 		} else if (image_begin < page_begin) {
@@ -3422,10 +3736,25 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		}
 		FreeImage(id, HangTrace::ImageFreeReason::Unmap);
 	}
+	// A partially resident image is registered on its resident prefix only. Its non-resident
+	// bytes must stay mapped for a later residency extension: retire it with the mapping.
+	// (Unmaps drain the GPU first; a scan of the live images is negligible next to that.)
+	std::vector<ImageId> partial;
+	m_slot_images.ForEach([&](ImageId id, const Image& image) {
+		if (image.registered && !image.FullyResident() &&
+		    ImageRangeOverlaps(image.info.data, GuestRange {address, size})) {
+			partial.push_back(id);
+		}
+	});
+	for (const auto id: partial) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureResidencyUnmapFrees);
+		FreeImage(id, HangTrace::ImageFreeReason::Unmap);
+	}
 }
 
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
+	RetireIdlePartialImages();
 	const uint64_t   tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
