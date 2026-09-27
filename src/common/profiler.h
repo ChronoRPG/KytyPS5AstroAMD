@@ -272,6 +272,10 @@ enum class FrameEvent : uint32_t {
 	// through the guest mapping (KYTY_SHADER_HASH_BACKING).
 	ShaderCodeHashBacking,
 	ShaderCodeHashDirect,
+	// GPU-thread reads of GPU-owned bytes (KYTY_READBACK_SIDE_GPU_THREAD): served by a side copy
+	// the GPU thread waited for, or by the drain path (fallback reason also counted above).
+	ReadbackGpuThreadSideCopies,
+	ReadbackGpuThreadDrains,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

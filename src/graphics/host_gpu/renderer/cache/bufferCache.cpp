@@ -46,6 +46,16 @@ bool SideReadbackEnabled() {
 	return value == nullptr || !(value[0] == '0' && value[1] == '\0');
 }
 
+// GPU-thread reads (CP reads of GPU-written data, GPU-thread faults) also use side copies and wait
+// for them in place, unless KYTY_READBACK_SIDE_GPU_THREAD is "0" (then they always drain).
+bool SideReadbackGpuThreadEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_READBACK_SIDE_GPU_THREAD");
+		return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
+}
+
 // Aligned side-copy window in bytes: a power of two between 4 KiB and 1 MiB (default 64 KiB).
 uint64_t SideReadbackWindow() {
 	constexpr uint64_t Default = 64 * 1024;
@@ -413,9 +423,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 
-	// Side copies serve guest (non-GPU-thread) reads only. Writes need the CPU-dirty transition
-	// on the GPU thread, and GPU-thread callers would have to wait for the copy anyway.
-	const bool side_path = m_side != nullptr && !is_write && !GuestGpu::IsGpuThread();
+	// Writes need the CPU-dirty transition of the drain path. Guest-thread reads use side copies;
+	// GPU-thread reads do too (KYTY_READBACK_SIDE_GPU_THREAD, default on) and wait for the copy
+	// themselves: it waits only for the producing recording, not for the current one, and the
+	// current recording is neither split nor submitted.
+	const bool gpu_thread = GuestGpu::IsGpuThread();
+	const bool side_path =
+	    m_side != nullptr && !is_write && (!gpu_thread || SideReadbackGpuThreadEnabled());
 	if (OverlapsPendingSideReadback(page_begin, page_end)) {
 		// Another fault already copies these pages: wait for (or finish) its publication instead
 		// of copying again. Writes and GPU-thread reads must also be ordered after it.
@@ -423,7 +437,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::ReadbackSideWait);
 			CompleteSideReadbacks(page_begin, page_end - page_begin);
 		}
-		if (side_path) {
+		// A GPU-thread read continues below: bytes re-dirtied since that copy was issued still
+		// need their own readback before the caller reads.
+		if (side_path && !gpu_thread) {
 			// If a newer writer re-dirtied the page meanwhile it stays protected, and the
 			// retried access faults into a fresh readback.
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackSideDuplicateWaits);
@@ -435,6 +451,36 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		gpu.SendCommandSync([&, this, vaddr, size, is_write] {
 			ReadMemoryDrain(vaddr, size, is_write, trace);
 		});
+		record(std::nullopt);
+		return;
+	}
+
+	if (gpu_thread) {
+		std::shared_ptr<SideReadback> issued;
+		const auto                    result = TryIssueSideReadback(vaddr, size, issued);
+		if (result == SideIssueResult::Issued) {
+			{
+				Profiler::ScopedFrameWait side_wait(Profiler::FrameWait::GpuWaitSideCopy);
+				CompleteSideReadback(*issued);
+			}
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackGpuThreadSideCopies);
+			trace.begin      = issued->begin;
+			trace.size       = issued->end - issued->begin;
+			trace.downloaded = true;
+			record(std::nullopt);
+			return;
+		}
+		switch (result) {
+			case SideIssueResult::CurrentWriter:
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackSideFallbackCurrentWriter);
+				break;
+			case SideIssueResult::Unbounded:
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackSideFallbackUnbounded);
+				break;
+			default: Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackSideFallbackOther); break;
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackGpuThreadDrains);
+		ReadMemoryDrain(vaddr, size, false, trace);
 		record(std::nullopt);
 		return;
 	}

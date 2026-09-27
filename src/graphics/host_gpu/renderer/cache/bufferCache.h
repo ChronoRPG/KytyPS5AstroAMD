@@ -51,8 +51,9 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-	// Guest read faults outside the GPU thread use a side copy when every dirty byte they need
-	// was written by an already submitted recording (KYTY_READBACK_SIDE_COPY=0 disables it).
+	// Reads use a side copy when every dirty byte they need was written by an already submitted
+	// recording (KYTY_READBACK_SIDE_COPY=0 disables it). GPU-thread reads wait for their copy in
+	// place (KYTY_READBACK_SIDE_GPU_THREAD=0 makes them drain instead).
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	// Publishes (waiting if necessary) every pending side readback overlapping the range. Any
 	// thread; never waits for the current recording. Required before other ownership changes.
