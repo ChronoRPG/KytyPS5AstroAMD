@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fmt/format.h>
 #include <limits>
@@ -210,6 +211,8 @@ struct CompileTotals {
 	std::atomic<uint64_t> translation_reuses {0};
 	std::atomic<uint64_t> emit_ns {0};
 	std::atomic<uint64_t> validate_ns {0};
+	std::atomic<uint64_t> validate_async {0};
+	std::atomic<uint64_t> validate_async_ns {0};
 	std::atomic<uint64_t> module_ns {0};
 	std::atomic<uint64_t> gfx_pipelines {0};
 	std::atomic<uint64_t> gfx_pipeline_ns {0};
@@ -312,13 +315,15 @@ void LogCompileTotals() {
 		return;
 	}
 	PipelineCacheLog("Compile totals: {} programs (translate {:.1f} ms, {} reused translations, "
-	                 "copies {:.1f} ms, emit {:.1f} ms, validate {:.1f} ms, module {:.1f} ms); {} "
-	                 "graphics pipelines in {:.1f} ms (new {}, permutation {}, variant {}); {} "
-	                 "compute pipelines in {:.1f} ms; {} stalls totalling {:.1f} ms, worst {:.1f} ms",
+	                 "copies {:.1f} ms, emit {:.1f} ms, validate {:.1f} ms, background validation "
+	                 "{} in {:.1f} ms, module {:.1f} ms); {} graphics pipelines in {:.1f} ms (new "
+	                 "{}, permutation {}, variant {}); {} compute pipelines in {:.1f} ms; {} stalls "
+	                 "totalling {:.1f} ms, worst {:.1f} ms",
 	                 programs, ms(t.translate_ns),
 	                 t.translation_reuses.load(std::memory_order_relaxed), ms(t.clone_ns),
-	                 ms(t.emit_ns), ms(t.validate_ns), ms(t.module_ns), pipelines,
-	                 ms(t.gfx_pipeline_ns),
+	                 ms(t.emit_ns), ms(t.validate_ns),
+	                 t.validate_async.load(std::memory_order_relaxed), ms(t.validate_async_ns),
+	                 ms(t.module_ns), pipelines, ms(t.gfx_pipeline_ns),
 	                 t.gfx_new.load(std::memory_order_relaxed),
 	                 t.gfx_permutation.load(std::memory_order_relaxed),
 	                 t.gfx_variant.load(std::memory_order_relaxed), compute, ms(t.cs_pipeline_ns),
@@ -864,6 +869,83 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+// Background spirv-val (KYTY_SHADER_VALIDATION_ASYNC, default on; only when
+// shader_validation_enabled is set). spirv-val cost 11.7 ms per shader on average (median 5.2 ms,
+// up to 235 ms for a 1.45 MB module) over 248 SPIR-V modules dumped from Astro Bot, and grows
+// with module size, which the mip-statistics instrumentation raised. It ran on the compiling
+// draw's thread before vkCreateShaderModule. Here the compile path creates the module and hands
+// the words to this thread, which validates them in order and stops the emulator on the first
+// invalid module exactly as before (same log, dump and EXIT message). Validation still covers
+// every module; the difference is that the driver may receive an invalid module before the
+// report. KYTY_SHADER_VALIDATION_ASYNC=0 validates synchronously again.
+class SpirvValidator {
+public:
+	SpirvValidator() {
+		m_thread = std::jthread([this](std::stop_token stop) { Run(stop); });
+	}
+	~SpirvValidator() {
+		// Pending modules are abandoned at shutdown.
+		m_thread.request_stop();
+		m_wake.notify_all();
+	}
+	SpirvValidator(const SpirvValidator&)            = delete;
+	SpirvValidator& operator=(const SpirvValidator&) = delete;
+
+	static bool AsyncEnabled() {
+		static const bool enabled = EnvU64("KYTY_SHADER_VALIDATION_ASYNC", 1) != 0;
+		return enabled;
+	}
+
+	void Submit(const char* label, const char* stage_name, uint64_t shader_hash,
+	            std::vector<uint32_t> spirv) {
+		{
+			std::scoped_lock lock(m_mutex);
+			m_jobs.push_back({label, stage_name, shader_hash, std::move(spirv)});
+		}
+		m_wake.notify_one();
+	}
+
+private:
+	struct Job {
+		const char*           label      = nullptr; // string literals
+		const char*           stage_name = nullptr;
+		uint64_t              shader_hash = 0;
+		std::vector<uint32_t> spirv;
+	};
+
+	void Run(const std::stop_token& stop) {
+		Profiler::SetThreadName("SpirvValidator");
+		for (;;) {
+			Job job;
+			{
+				std::unique_lock lock(m_mutex);
+				if (!m_wake.wait(lock, stop, [this] { return !m_jobs.empty(); })) {
+					return;
+				}
+				job = std::move(m_jobs.front());
+				m_jobs.pop_front();
+			}
+			const auto begin = CompileClockNs();
+			const bool valid = ValidateShaderSpirv(job.label, job.shader_hash, job.spirv);
+			const auto ns    = CompileClockNs() - begin;
+			g_compile_totals.validate_async.fetch_add(1, std::memory_order_relaxed);
+			g_compile_totals.validate_async_ns.fetch_add(ns, std::memory_order_relaxed);
+			Profiler::AddFrameWait(Profiler::FrameWait::ShaderValidate, 1, ns);
+			HangTrace::RecordShaderValidation(ns);
+			if (!valid) {
+				DumpShaderSpirv(job.stage_name, job.shader_hash, job.spirv);
+				EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", job.label,
+				     job.shader_hash);
+			}
+		}
+	}
+
+	std::mutex                  m_mutex;
+	std::condition_variable_any m_wake;
+	std::deque<Job>             m_jobs;
+	std::jthread                m_thread; // Last: joined before the members it uses go away.
+};
+
 } // namespace
 
 struct PipelineCache::Permutation {
@@ -1256,19 +1338,21 @@ struct PipelineCache::ProgramCache {
 		DumpMatchedShaderInputs(params, options, stage_name, static_state,
 		                        push_data_start_dword, result.spirv, result.ir_dump);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
-		const auto validate_begin = CompileClockNs();
-		bool       valid          = false;
-		{
-			KYTY_PROFILER_BLOCK("Shader::Validate");
-			valid = ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv);
-		}
-		if (Config::ShaderValidationEnabled()) {
-			times.validate_ns = CompileClockNs() - validate_begin;
-		}
-		if (!valid) {
-			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
-			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
-			     options.shader_hash);
+		if (validator == nullptr) {
+			const auto validate_begin = CompileClockNs();
+			bool       valid          = false;
+			{
+				KYTY_PROFILER_BLOCK("Shader::Validate");
+				valid = ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv);
+			}
+			if (Config::ShaderValidationEnabled()) {
+				times.validate_ns = CompileClockNs() - validate_begin;
+			}
+			if (!valid) {
+				DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+				EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n",
+				     options.dump_label, options.shader_hash);
+			}
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
@@ -1283,6 +1367,10 @@ struct PipelineCache::ProgramCache {
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
+		}
+		if (validator != nullptr) {
+			validator->Submit(options.dump_label, stage_name, options.shader_hash,
+			                  std::move(result.spirv));
 		}
 		const auto id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
 		GpuOpProfiler::RegisterShader(id, stage_name, options.shader_hash);
@@ -2041,7 +2129,11 @@ struct PipelineCache::ProgramCache {
 		return true;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {}
+	explicit ProgramCache(vk::Device device): device(device) {
+		if (Config::ShaderValidationEnabled() && SpirvValidator::AsyncEnabled()) {
+			validator = std::make_unique<SpirvValidator>();
+		}
+	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
@@ -2065,6 +2157,8 @@ struct PipelineCache::ProgramCache {
 	// Kept translations, least recently used first, and their estimated bytes (m_programs_mutex).
 	std::list<SourceEntry*> kept_lru;
 	size_t                  kept_bytes = 0;
+	// Background spirv-val; null when validation is off or synchronous.
+	std::unique_ptr<SpirvValidator> validator;
 };
 
 // Classifies each new graphics pipeline for stutter attribution: whether a pipeline already existed

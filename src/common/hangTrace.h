@@ -49,6 +49,8 @@
 // pcache_save_serialize_us, pcache_save_write_us, pcache_save_overlaps, pcache_save_overlap_us.
 // Then compile_translation_reuses (programs specialized from a kept translation instead of
 // translating again) and compile_clone_us (copying translations, RecordCompile clone_ns).
+// Then validate_async_count and validate_async_us: spirv-val runs on the background validator
+// (KYTY_SHADER_VALIDATION_ASYNC), off the compiling thread (RecordShaderValidation).
 // New columns are only ever appended.
 //
 //   compiles.csv       one row per new shader program permutation or pipeline: phase times, the
@@ -291,6 +293,8 @@ void RecordCompileStall(uint64_t stall_ns);
 // cache (the driver may serialize them internally); create_ns is that creation's duration.
 void RecordPipelineCacheSave(uint64_t bytes, uint64_t serialize_ns, uint64_t write_ns);
 void RecordPipelineCacheSaveOverlap(uint64_t create_ns);
+// One background spirv-val run (not on a compiling draw's thread).
+void RecordShaderValidation(uint64_t validate_ns);
 
 } // namespace HangTrace
 

@@ -298,6 +298,8 @@ struct Totals {
 	std::atomic<uint64_t> pcache_save_overlap_ns {0};
 	std::atomic<uint64_t> compile_translation_reuses {0};
 	std::atomic<uint64_t> compile_clone_ns {0};
+	std::atomic<uint64_t> validate_async {0};
+	std::atomic<uint64_t> validate_async_ns {0};
 };
 Totals g_totals;
 
@@ -736,6 +738,8 @@ void Publish() {
 		                    take(g_totals.pcache_save_overlap_ns) / 1000u);
 		line += fmt::format(",{},{}", take(g_totals.compile_translation_reuses),
 		                    take(g_totals.compile_clone_ns) / 1000u);
+		line += fmt::format(",{},{}", take(g_totals.validate_async),
+		                    take(g_totals.validate_async_ns) / 1000u);
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
@@ -820,6 +824,7 @@ void Initialize() {
 	summary_header += ",pcache_saves,pcache_save_kb,pcache_save_serialize_us,pcache_save_write_us,"
 	                  "pcache_save_overlaps,pcache_save_overlap_us";
 	summary_header += ",compile_translation_reuses,compile_clone_us";
+	summary_header += ",validate_async_count,validate_async_us";
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.compiles = OpenFile("compiles.csv",
 	                            "t_ms,kind,stage,guest_hash,id,id2,origin,translate_us,emit_us,"
@@ -1533,6 +1538,14 @@ void RecordPipelineCacheSave(uint64_t bytes, uint64_t serialize_ns, uint64_t wri
 	g_totals.pcache_save_bytes.fetch_add(bytes, std::memory_order_relaxed);
 	g_totals.pcache_save_serialize_ns.fetch_add(serialize_ns, std::memory_order_relaxed);
 	g_totals.pcache_save_write_ns.fetch_add(write_ns, std::memory_order_relaxed);
+}
+
+void RecordShaderValidation(uint64_t validate_ns) {
+	if (!Enabled()) {
+		return;
+	}
+	g_totals.validate_async.fetch_add(1, std::memory_order_relaxed);
+	g_totals.validate_async_ns.fetch_add(validate_ns, std::memory_order_relaxed);
 }
 
 void RecordPipelineCacheSaveOverlap(uint64_t create_ns) {
