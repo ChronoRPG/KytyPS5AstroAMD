@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "kernel/eventQueueFilters.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -304,17 +305,9 @@ static VideoOutEventQueues& VideoOutEventQueuesFor(VideoOutEventState& state,
 }
 
 static intptr_t MakeVideoOutEventData(intptr_t current_data, void* trigger_data) {
-	const uint64_t old_data = static_cast<uint64_t>(current_data);
-	uint64_t       counter  = (old_data >> 12u) & 0xfu;
-	if (counter != 0xfu) {
-		counter++;
-	}
-
-	const uint64_t time    = LibKernel::KernelReadTsc() & 0xfffu;
-	const uint64_t payload = static_cast<uint64_t>(reinterpret_cast<intptr_t>(trigger_data));
-
-	return static_cast<intptr_t>(time | (counter << 12u) |
-	                             ((payload & 0x0000ffffffffffffULL) << 16u));
+	return EventQueue::VideoOutEventData(
+	    current_data, static_cast<uint64_t>(reinterpret_cast<intptr_t>(trigger_data)),
+	    LibKernel::KernelReadTsc());
 }
 
 static void ResetVideoOutEvent(EventQueue::KernelEqueueEvent* event) {
@@ -324,19 +317,16 @@ static void ResetVideoOutEvent(EventQueue::KernelEqueueEvent* event) {
 	event->event.data   = 0;
 }
 
+// Occurrences the guest has not consumed yet merge into the pending event: the counter
+// (sceVideoOutGetEventCount) counts them and the payload is the newest one. KYTY_EQUEUE_COALESCE=0
+// restores the old one-copy-per-occurrence queue.
 static void TriggerVideoOutEvent(EventQueue::KernelEqueueEvent* event, void* trigger_data) {
 	EXIT_IF(event == nullptr);
 
-	auto triggered_event = event->event;
-	triggered_event.fflags =
-	    triggered_event.fflags < 0xfu ? triggered_event.fflags + 1u : triggered_event.fflags;
-	triggered_event.data = MakeVideoOutEventData(triggered_event.data, trigger_data);
-	if (event->triggered) {
-		event->pending_events.push_back(triggered_event);
-		return;
-	}
-	event->event     = triggered_event;
-	event->triggered = true;
+	EventQueue::KernelEqueueApplyTrigger(
+	    event, EventQueue::VideoOutNextState(
+	               event->event, static_cast<uint64_t>(reinterpret_cast<intptr_t>(trigger_data)),
+	               LibKernel::KernelReadTsc()));
 }
 
 static void RemoveVideoOutEventQueue(EventQueue::KernelEqueue       eq,

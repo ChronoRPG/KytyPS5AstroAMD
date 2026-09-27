@@ -771,6 +771,10 @@ enum class FrameEvent : uint32_t {
 	BindingEpochMemoVerifyChecks,
 	BindingEpochMemoVerifyMismatches,
 	BindingEpochMemoVerifyRaces,
+	// KYTY_EQUEUE_COALESCE: kernel-event triggers merged into an event that was already pending
+	// (instead of queued), and those of them that replaced a different data value.
+	EqueueCoalescedTriggers,
+	EqueueCoalescedDataChanges,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

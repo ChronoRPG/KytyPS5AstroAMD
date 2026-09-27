@@ -39,12 +39,7 @@ struct DuplicateEventOwner {
 void QueueDuplicateEvent(EventQueue::KernelEqueueEvent* event, void* trigger_data) {
 	auto next = event->event;
 	next.data = reinterpret_cast<intptr_t>(trigger_data);
-	if (event->triggered) {
-		event->pending_events.push_back(next);
-	} else {
-		event->event     = next;
-		event->triggered = true;
-	}
+	EventQueue::KernelEqueueApplyTrigger(event, next);
 }
 
 void ResetDuplicateEvent(EventQueue::KernelEqueueEvent* event) {
@@ -61,7 +56,12 @@ void PoisonDuplicateEvent(EventQueue::KernelEqueueEvent*, void*) {
 	Check(false, "duplicate add replaced trigger callback");
 }
 
-void TestDuplicateAddPreservesEventState() {
+// A duplicate add keeps the event's filter, owner and pending state and only updates its user data
+// and deadline. `legacy`: the old per-trigger queue (KYTY_EQUEUE_COALESCE=0), where both triggers
+// are delivered; otherwise the second trigger coalesces into the first (newest data wins).
+void TestDuplicateAddPreservesEventState(bool legacy) {
+	EventQueue::KernelEqueueSetCoalesceModeForTests(legacy ? EventQueue::EqueueCoalesceMode::Legacy
+	                                                       : EventQueue::EqueueCoalesceMode::Coalesce);
 	EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
 	Check(EventQueue::KernelCreateEqueue(&queue, "duplicate-add") == OK,
 	      "create duplicate add queue");
@@ -111,13 +111,18 @@ void TestDuplicateAddPreservesEventState() {
 	Libs::LibKernel::KernelUseconds timeout = 0;
 	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == OK,
 	      "read queued duplicate triggers");
-	Check(out == 2, "duplicate add preserves pending event count");
-	Check(events[0].data == 0x1234 && events[1].data == 0x5678,
-	      "duplicate add preserves current and pending event data");
+	if (legacy) {
+		Check(out == 2, "duplicate add preserves pending event count");
+		Check(events[0].data == 0x1234 && events[1].data == 0x5678,
+		      "duplicate add preserves current and pending event data");
+		Check(events[1].udata == reinterpret_cast<void*>(0x2222),
+		      "duplicate add updates pending user data");
+	} else {
+		Check(out == 1, "duplicate add keeps one coalesced pending event");
+		Check(events[0].data == 0x5678, "duplicate add keeps the newest coalesced data");
+	}
 	Check(events[0].udata == reinterpret_cast<void*>(0x2222),
 	      "duplicate add updates current user data");
-	Check(events[1].udata == reinterpret_cast<void*>(0x2222),
-	      "duplicate add updates pending user data");
 
 	EventQueue::KernelEvent timer_event {};
 	Check(EventQueue::KernelWaitEqueue(queue, &timer_event, 1, &out, &timeout) == OK && out == 1,
@@ -431,7 +436,8 @@ void TestConcurrentDelete() {
 } // namespace
 
 int main() {
-	TestDuplicateAddPreservesEventState();
+	TestDuplicateAddPreservesEventState(true);
+	TestDuplicateAddPreservesEventState(false);
 	TestCallbackStateOutlivesPort();
 	TestCallbackOwnsPayload();
 	TestPinnedClose();
