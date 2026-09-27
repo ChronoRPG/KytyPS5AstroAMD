@@ -345,6 +345,8 @@ static ValidateResult ValidateValues(const ReadSet& reads) {
 // Certificate modes:
 // - log (default): no coherence transition logged since the preparation began may touch a read
 //   or digest range, and every range must be clean now; bytes are neither compared nor re-hashed.
+//   When a transition did touch a range (or the log interval could not be read), the value check
+//   below decides instead, so log mode refuses exactly what value mode refuses.
 //   It relies on the log being complete for emulator-side changes and treats unsynchronized guest
 //   CPU writes as races (they are: only a fence orders them against a draw, and a fence commits
 //   the window before its handler runs). Audited with KYTY_DRAW_PREP_CERT=value
@@ -378,11 +380,27 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 		const auto outcome =
 		    Coherence::g_log.Check(prepared.coherence_generation, Coherence::Generation(),
 		                           CertificateRanges(prepared.reads, log_scratch));
-		if (outcome.result != Coherence::CheckResult::Clean) {
-			return fail(Failure::CoherenceLog);
-		}
-		if (!prepared.reads.AllClean(LibKernel::Memory::IsGpuCleanForRead)) {
-			return fail(Failure::CertUnclean);
+		if (outcome.result == Coherence::CheckResult::Clean) {
+			if (!prepared.reads.AllClean(LibKernel::Memory::IsGpuCleanForRead)) {
+				return fail(Failure::CertUnclean);
+			}
+		} else {
+			// A logged transition touched a certified range, or the interval could not be read:
+			// decide by value. Log mode then refuses exactly what the value certificate refuses;
+			// it only skips the byte and digest comparisons where no transition happened.
+			using E               = Profiler::FrameEvent;
+			using Result          = Coherence::CheckResult;
+			const auto log_result = outcome.result;
+			Profiler::CountFrameEvent(log_result == Result::Conflict  ? E::DrawPrepLogConflicts
+			                          : log_result == Result::Unknown ? E::DrawPrepLogUnknown
+			                                                          : E::DrawPrepLogOverflows);
+			switch (ValidateValues(prepared.reads)) {
+				case ValidateResult::Ok:
+					Profiler::CountFrameEvent(E::DrawPrepLogValueRescues);
+					break;
+				case ValidateResult::Unclean: return fail(Failure::CertUnclean);
+				case ValidateResult::Changed: return fail(Failure::CertChanged);
+			}
 		}
 	} else {
 		const auto result = ValidateValues(prepared.reads);

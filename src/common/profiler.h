@@ -738,6 +738,14 @@ enum class FrameEvent : uint32_t {
 	// Bindings that read the CMASK bytes back because no native inspection was possible
 	// (device limits or image shape); the wait is counted in FrameWait::DccFallback.
 	CmaskFastClearReadbacks,
+	// Log-mode draw-prep certificates (the default) whose coherence-log check did not pass: a
+	// logged transition intersected a certified range (Conflicts), an entry could not be read
+	// (Unknown), or the interval was older than the ring (Overflows). Each is then decided by the
+	// value check; ValueRescues counts those it accepted (the bytes were unchanged).
+	DrawPrepLogConflicts,
+	DrawPrepLogUnknown,
+	DrawPrepLogOverflows,
+	DrawPrepLogValueRescues,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

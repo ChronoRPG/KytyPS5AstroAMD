@@ -21,9 +21,7 @@
 // range is unknown appends a universe entry.
 //
 // The generation is the clean-verdict generation: CleanVerdict::Invalidate() appends here.
-// Entries are recorded only when something reads them (LogReadersEnabled: the log-mode draw-prep
-// certificate, the default whenever draw prep runs, or its audit); otherwise an append only bumps
-// the generation.
+// Entries are always recorded (LogReadersEnabled).
 //
 // Readers (the draw-prep certificate check on the GPU thread) ask whether any entry in the
 // generation interval (g0, g1] intersects a set of ranges. The log is a ring: an interval that
@@ -211,24 +209,15 @@ private:
 // The process-wide log (one per coherence domain: the guest GPU).
 inline Log g_log;
 
-// Whether anything reads the log's entries: only the log-mode draw-prep certificate (the default
-// whenever draw prep runs, KYTY_DRAW_PREP=inline|parallel; KYTY_DRAW_PREP_CERT=value turns it
-// off) and its audit (KYTY_DRAW_PREP_LOG_AUDIT=1). Otherwise transitions only bump the
-// generation (the clean-verdict cache's), exactly as before the log existed. Decided once per
-// process, so entries are either always or never recorded. Keep in step with
-// DrawPrep::GetMode() and DrawPrep::GetCertMode().
-[[nodiscard]] inline bool LogReadersEnabled() noexcept {
-	static const bool enabled = [] {
-		const auto* prep  = std::getenv("KYTY_DRAW_PREP");
-		const auto* cert  = std::getenv("KYTY_DRAW_PREP_CERT");
-		const auto* audit = std::getenv("KYTY_DRAW_PREP_LOG_AUDIT");
-		const bool  prep_on =
-		    prep != nullptr && (std::strcmp(prep, "inline") == 0 || std::strcmp(prep, "parallel") == 0);
-		const bool log_certificates = prep_on && !(cert != nullptr && std::strcmp(cert, "value") == 0);
-		return log_certificates ||
-		       (audit != nullptr && *audit != '\0' && std::strcmp(audit, "0") != 0);
-	}();
-	return enabled;
+// Transitions always record their entries. The log-mode draw-prep certificate reads them (the
+// default, with draw prep on by default), and so does the value certificate's audit. A log that
+// only bumped its generation answers Unknown for every interval containing a transition, which
+// fails every such certificate: in U51 this switch still required KYTY_DRAW_PREP=parallel in the
+// environment after draw prep became the default, and 170-210 draws per flip fell back to the
+// serial preparation. Recording costs a few stores per transition; nothing else depends on the
+// environment, so the log cannot disagree with DrawPrep::GetMode() or GetCertMode() again.
+[[nodiscard]] constexpr bool LogReadersEnabled() noexcept {
+	return true;
 }
 
 [[nodiscard]] inline uint64_t Generation() noexcept {
@@ -236,20 +225,18 @@ inline Log g_log;
 }
 
 inline uint64_t Append(Range range, Source source) noexcept {
-	return LogReadersEnabled() ? g_log.Append(range, source) : g_log.Bump();
+	return g_log.Append(range, source);
 }
 
 inline uint64_t Append(uint64_t address, uint64_t size, Source source) noexcept {
 	return Append(MakeRange(address, size), source);
 }
 
-// Emulator writes of backing bytes outside a publication change content, not cleanliness, so
-// only log readers need them. Otherwise they do not touch the generation, which the
-// clean-verdict cache shares. Call after the bytes are written.
+// Emulator writes of backing bytes outside a publication change content, not cleanliness; only
+// the log-mode certificate needs them (they also move the generation the clean-verdict cache
+// shares). Call after the bytes are written.
 inline void NoteContentWrite(uint64_t address, uint64_t size, Source source) noexcept {
-	if (LogReadersEnabled()) {
-		Append(address, size, source);
-	}
+	Append(address, size, source);
 }
 
 } // namespace Libs::Graphics::Coherence

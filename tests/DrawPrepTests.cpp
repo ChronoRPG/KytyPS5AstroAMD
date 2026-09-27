@@ -92,6 +92,36 @@ void TestLogBumpWithoutReaders() {
 	      "an interval of bumped generations is not certified clean");
 }
 
+// The process-wide log records every transition whatever the environment. Draw prep and its
+// log-mode certificate are the defaults; when the log only bumped its generation unless
+// KYTY_DRAW_PREP=parallel was spelled out, every certificate with a transition in its interval
+// failed as Unknown (U51: 170-210 extra serial preparations per flip). No variable is set here.
+void TestGlobalLogAlwaysRecords() {
+	static_assert(Coherence::LogReadersEnabled(), "the global coherence log must always record");
+	const auto added = Coherence::MakeRange(0x7000, 0x40);
+	const auto g0    = Coherence::Generation();
+	const auto g1    = Coherence::Append(added, Coherence::Source::Test);
+	Check(g1 == g0 + 1, "a global append claims one generation");
+	Coherence::Range  range;
+	Coherence::Source source {};
+	Check(Coherence::g_log.Read(g1, range, source) && range == added &&
+	          source == Coherence::Source::Test,
+	      "the global log recorded the transition");
+	const std::array<Coherence::Range, 1> touched {{{0x7010, 0x7020}}};
+	const std::array<Coherence::Range, 1> elsewhere {{{0x8000, 0x9000}}};
+	Check(Coherence::g_log.Check(g0, Coherence::Generation(), touched).result ==
+	          Coherence::CheckResult::Conflict,
+	      "a recorded transition conflicts with the ranges it touches");
+	Check(Coherence::g_log.Check(g0, Coherence::Generation(), elsewhere).result ==
+	          Coherence::CheckResult::Clean,
+	      "and with no other range");
+	const auto g2 = Coherence::Generation();
+	Coherence::NoteContentWrite(0x7100, 8, Coherence::Source::CpWrite);
+	Check(Coherence::Generation() == g2 + 1 && Coherence::g_log.Read(g2 + 1, range, source) &&
+	          source == Coherence::Source::CpWrite,
+	      "emulator content writes are recorded too");
+}
+
 void TestLogEmptyRangeNeverIntersects() {
 	auto  log_owner = std::make_unique<Coherence::Log>();
 	auto& log       = *log_owner;
@@ -835,6 +865,7 @@ int main() {
 	TestLogIntersection();
 	TestLogEmptyRangeNeverIntersects();
 	TestLogBumpWithoutReaders();
+	TestGlobalLogAlwaysRecords();
 	TestLogOverflow();
 	TestLogConcurrentAppends();
 	TestLogConcurrentWrap();
