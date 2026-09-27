@@ -717,7 +717,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
 	InvalidateCleanImageProofs();
-	NoteStructureChange();
+	NoteStructureChange(image);
 	ForEachPage(image.live.address, image.live.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 		// Before the image can watch pages (TrackImage follows registration).
@@ -756,7 +756,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		return;
 	}
 	InvalidateCleanImageProofs();
-	NoteStructureChange();
+	NoteStructureChange(image);
 	UntrackImage(id);
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.live.address, image.live.size, pages)) {
@@ -2708,7 +2708,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	TouchImage(record);
 	if (record.depth_id != depth_id) {
 		// A binding of this image now resolves to the depth image (TextureBindingMemo).
-		NoteStructureChange();
+		NoteStructureChange(record);
 	}
 	record.depth_id = depth_id;
 	return association;

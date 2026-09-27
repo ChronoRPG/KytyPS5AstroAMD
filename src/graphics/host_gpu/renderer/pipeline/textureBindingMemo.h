@@ -29,23 +29,25 @@ struct TextureBinding;
 //    FindImageWithSameBacking(final description) must return the same image and FindImage must
 //    not have rebased the view (mip/slice-of-a-larger-image answers are never recorded; DCC
 //    descriptions are never recorded because MaterializeDccClear inspects guest metadata on every
-//    lookup). That lookup reads only the first page's owner list, the registered flag and
-//    SameBacking fields, which are fixed for an image's lifetime. The owner lists and registered
-//    flags change only in TextureCache::RegisterImage/UnregisterImage, which bump
-//    TextureCache::m_binding_generation (every creation, free, expansion, overlap resolution,
-//    depth recreate, garbage/pressure collection and unmap goes through them). An entry is used only
-//    while that generation is unchanged, so FindImage would return the recorded image again.
+//    lookup). That lookup reads only the owner list of the description's first 1 MiB page, the
+//    owners' registered flags and SameBacking fields, which are fixed for an image's lifetime.
+//    Owner lists and registered flags change only in TextureCache::RegisterImage/
+//    UnregisterImage (every creation, free, expansion, overlap resolution, depth recreate,
+//    residency change, idle/garbage/pressure collection and unmap goes through them), which
+//    bump the structure version of every page the image covers (TextureCache::PageVersion). An
+//    entry is used only while its first page's version is unchanged, so FindImage would return
+//    the recorded image again.
 //  - FindImage side effects. SyncAliasFromOwner must be a no-op: either the image is its alias
 //    owner (checked live) or no other registered image has the same backing range, extent and
-//    sample count (checked once when recording, over the first-page owners; such partners exist
-//    only through registration). The tick/LRU touch is performed exactly as FindImage does. A
-//    stencil association (depth_id, checked live) or a pending rebind (checked live) takes the
-//    slow path.
+//    sample count (checked once when recording, over the first-page owners; such partners start
+//    on that page, so they appear only with a new version). The tick/LRU touch is performed
+//    exactly as FindImage does. A stencil association (depth_id, checked live; attaching one also
+//    bumps the page versions) or a pending rebind (checked live) takes the slow path.
 //  - Resident mip levels. FindImage and FindTexture call EnsureResidency with the first level
 //    the view can sample (TextureCache::RequestedFirstLevel of the description: base level plus
 //    MIN_LOD for sampled views, 0 for storage). The memo records that level and uses an entry
 //    only while the image's resident_first is at most it (checked live), so EnsureResidency
-//    would do nothing; an extension re-registers the image, which also bumps the generation.
+//    would do nothing; an extension re-registers the image, which also bumps the page versions.
 //  - FindTexture (sampled bindings only; storage bindings always take the slow path because they
 //    mark the image GPU-written). RefreshImage must be a no-op: the image is not CPU-dirty,
 //    maybe-dirty or buffer-modified, and TrackImage has nothing to do (the resident range is
@@ -57,7 +59,7 @@ struct TextureBinding;
 // that lock only for pages on which no image is registered, so it never changes an image the
 // memo can answer for.
 // Null descriptors resolve to the texture cache's permanent null images (never registered, never
-// freed); their entries do not depend on the generation.
+// freed); their entries do not depend on page versions.
 class TextureBindingMemo {
 public:
 	struct Key {

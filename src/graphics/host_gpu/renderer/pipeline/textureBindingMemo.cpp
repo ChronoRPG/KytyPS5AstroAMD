@@ -16,8 +16,10 @@ struct TextureBindingMemo::Entry {
 	Key key;
 	// 0: empty. Unique per recording, so a binding that holds this tag holds this description.
 	uint64_t tag = 0;
-	// TextureCache::m_binding_generation when recorded (unused for null images).
-	uint64_t generation = 0;
+	// The ImagePageTable page holding the description's first byte, and its structure version
+	// (TextureCache::PageVersion) when recorded (both unused for null images).
+	uint64_t page         = 0;
+	uint64_t page_version = 0;
 	ImageId  image;
 	// TextureCache::RequestedFirstLevel of the description for this image: FindImage and
 	// FindTexture extend the image's resident levels (EnsureResidency) unless its resident_first
@@ -106,12 +108,12 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 	if (!entry.null_image) {
 		std::scoped_lock lock {cache.m_lock};
 		auto*            image = cache.m_slot_images.try_get(entry.image);
-		// A structural change may alter what FindImage returns; a stencil association redirects
-		// the binding; a pending rebind, a copy from the alias owner and a residency extension
-		// (resident levels changed, or fewer than the view samples) are FindImage/RebindImages
-		// work: all take the full resolution.
-		if (entry.generation != cache.m_binding_generation.load(std::memory_order_relaxed) ||
-		    image == nullptr || !image->registered || image->depth_id ||
+		// A structural change on the description's first page may alter what FindImage returns;
+		// a stencil association redirects the binding; a pending rebind, a copy from the alias
+		// owner and a residency extension (resident levels changed, or fewer than the view
+		// samples) are FindImage/RebindImages work: all take the full resolution.
+		if (entry.page_version != cache.PageVersion(entry.page) || image == nullptr ||
+		    !image->registered || image->depth_id ||
 		    image->binding.needs_rebind || entry.requested_first < image->resident_first ||
 		    (entry.has_partner && !image->alias_owner && !image->info.HasStencil())) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoStale);
@@ -145,10 +147,11 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 	}
 	const bool null_image      = desc.info.data.Empty();
 	bool       has_partner     = false;
-	uint64_t   generation      = 0;
+	uint64_t   page            = 0;
+	uint64_t   page_version    = 0;
 	uint32_t   requested_first = 0;
 	{
-		// One critical section: the checks below and the generation describe the same state.
+		// One critical section: the checks below and the page version describe the same state.
 		std::scoped_lock lock {cache.m_lock};
 		const auto*      image = cache.m_slot_images.try_get(found);
 		if (null_image) {
@@ -159,7 +162,8 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 			}
 		} else {
 			// Only first-page answers: FindImage would return `found` again, and nothing else,
-			// while the registration generation is unchanged.
+			// while the owner list of the description's first page is unchanged (SameBacking
+			// requires the same start address, so `found` starts on that page too).
 			TextureCache::ImagePageTable::PageRange pages {};
 			if (cache.m_image_lookup_mode != TextureCache::ImageLookupMode::FirstPage ||
 			    image == nullptr || !image->registered || image->depth_id ||
@@ -188,7 +192,8 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 					}
 				});
 			}
-			generation = cache.m_binding_generation.load(std::memory_order_relaxed);
+			page         = pages.first;
+			page_version = cache.PageVersion(page);
 		}
 	}
 	if (!m_entries) {
@@ -198,15 +203,16 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 	auto&      entry = m_entries[slot];
 	entry.key             = key;
 	entry.tag             = m_next_tag++;
-	entry.generation      = generation;
+	entry.page            = page;
+	entry.page_version    = page_version;
 	entry.image           = found;
 	entry.requested_first = requested_first;
 	entry.has_partner     = has_partner;
-	entry.null_image  = null_image;
-	entry.view        = nullptr;
-	entry.desc        = desc;
-	binding.memo_tag  = entry.tag;
-	binding.memo_slot = slot;
+	entry.null_image      = null_image;
+	entry.view            = nullptr;
+	entry.desc            = desc;
+	binding.memo_tag      = entry.tag;
+	binding.memo_slot     = slot;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoFills);
 }
 
