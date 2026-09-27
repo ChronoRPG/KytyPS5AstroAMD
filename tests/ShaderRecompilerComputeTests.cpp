@@ -1889,6 +1889,30 @@ public:
     EnsureRuntimeContext();
     return std::make_unique<RenderContext>(m_runtime_context);
   }
+  // Runs `work` on the context's guest GPU thread (RenderContext::InitializeGpu) and returns
+  // its result. Garbage collection and image downloads begin backing publications, which the
+  // product issues only from that thread (BufferCache::BeginBackingPublication asserts it):
+  // RenderContext::RunGarbageCollector runs from GuestGpu::Process. The calling thread
+  // blocks, so the check's other direct scheduler use never overlaps the work.
+  template <typename Work>
+  static auto OnGpuThread(RenderContext &context, Work &&work) {
+    using Result = std::invoke_result_t<Work &>;
+    if constexpr (std::is_void_v<Result>) {
+      context.GetGpu().SendCommandSync([&work] { work(); });
+    } else {
+      std::optional<Result> result;
+      context.GetGpu().SendCommandSync(
+          [&work, &result] { result.emplace(work()); });
+      return std::move(*result);
+    }
+  }
+  // TextureCache::DownloadImageMemory as the product calls it (GC, pressure collection and
+  // ProcessDownloadImages, all on the GPU thread).
+  static bool DownloadOnGpuThread(RenderContext &context, ImageId id) {
+    return OnGpuThread(context, [&] {
+      return TextureCacheTestAccess::TryDownload(context.GetTextureCache(), id);
+    });
+  }
 
   void CheckHostImageAllocation() {
     constexpr const char *name = "HostImageAllocation";
@@ -3698,6 +3722,10 @@ public:
         Require(name, "dirty allocation", allocation.first != nullptr,
                 "dirty-GC buffer allocation failed");
       };
+      // One product GC pass: RenderContext::RunGarbageCollector runs on the GPU thread.
+      const auto collect_garbage = [&] {
+        OnGpuThread(context, [&] { cache.RunGarbageCollector(); });
+      };
       const auto ReadNativeValue =
           [&](const Libs::Graphics::Buffer &buffer, uint64_t offset) {
         auto readback =
@@ -4036,7 +4064,7 @@ public:
                        false);
 
       for (uint32_t tick = 0; tick < 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       Require(name, "age before pressure",
               cache.IsRegionRegistered(base, allocation_size),
@@ -4044,7 +4072,7 @@ public:
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
       const auto gc_submission_tick = scheduler.CurrentTick();
-      cache.RunGarbageCollector();
+      collect_garbage();
       uint32_t first_before_completion = 0;
       uint32_t second_before_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + first_offset,
@@ -4088,7 +4116,7 @@ public:
         }
         release_older_publication.release();
       });
-      cache.RunGarbageCollector();
+      collect_garbage();
       gc_returned = true;
       release_publication.join();
       scheduler.WaitPriorityOperations(older_publication_tick);
@@ -4130,7 +4158,7 @@ public:
                          false);
       }
       for (uint32_t tick = 0; tick < 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       constexpr uint64_t starvation_clean_offset =
           starvation_offset + starvation_count * starvation_stride;
@@ -4140,11 +4168,11 @@ public:
               static_cast<bool>(starvation_clean),
               "failed to create the clean starvation candidate");
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
-      cache.RunGarbageCollector();
+      collect_garbage();
       Require(
           name, "normal-GC dirty bypass",
           cache.IsRegionRegistered(base + starvation_offset,
@@ -4159,7 +4187,7 @@ public:
       BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
       const auto starvation_retired =
           BufferCacheTestAccess::PageOwner(cache, base + starvation_offset);
-      cache.RunGarbageCollector();
+      collect_garbage();
       Require(name, "critical-GC starvation cleanup",
               !cache.IsRegionRegistered(base + starvation_offset,
                                         sizeof(starvation_value)) &&
@@ -4183,7 +4211,7 @@ public:
       const auto obtained =
           cache.FindBuffer(base + obtained_offset, residency_size);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       Require(name, "lookup-only owner identity",
               cache.FindBuffer(base + lookup_only_offset, residency_size) ==
@@ -4193,7 +4221,7 @@ public:
           base + obtained_offset, residency_size, false, false, obtained);
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
-      cache.RunGarbageCollector();
+      collect_garbage();
       Require(name, "lookup versus acquisition residency",
               !cache.IsRegionRegistered(base + lookup_only_offset,
                                         residency_size) &&
@@ -4292,7 +4320,7 @@ public:
       cache.FillBuffer(base + large_offset, large_size, large_value, false);
       const auto large_submission_tick = scheduler.CurrentTick();
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       // Earlier dirty owners in this GC pass may require one ring-wrap drain
       // before the full-capacity download can reserve the stream.
@@ -4352,7 +4380,7 @@ public:
       cache.FillBuffer(base + grouped_second_offset, grouped_owner_size,
                        grouped_second_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       Require(name, "per-owner fixed-ring retirement",
               !cache.IsRegionRegistered(base + grouped_first_offset,
@@ -4454,7 +4482,7 @@ public:
               "sparse GC fixtures merged into one source owner");
       const auto sparse_gc_tick = scheduler.CurrentTick();
       for (uint32_t tick = 0; tick <= 160; ++tick) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       Require(name, "sparse multi-owner GC submission",
               scheduler.CurrentTick() == sparse_gc_tick + 1 &&
@@ -4482,7 +4510,7 @@ public:
       cache.FillBuffer(base + disjoint_dirty_offset, sizeof(disjoint_value),
                        disjoint_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       Require(name, "disjoint synchronized retirement",
               !cache.IsRegionRegistered(base + disjoint_owner_offset,
@@ -4544,7 +4572,7 @@ public:
       cache.FillBuffer(base + reacquire_dirty_offset, sizeof(reacquire_value),
                        reacquire_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
-        cache.RunGarbageCollector();
+        collect_garbage();
       }
       Require(name, "reacquire synchronized retirement",
               !cache.IsRegionRegistered(base + reacquire_owner_offset,
@@ -4883,8 +4911,15 @@ public:
     HW::UserConfig user_config{};
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
     context.MapMemory(base, allocation_size);
     TextureCacheTestAccess::ConfigurePressureCollection(cache, budget);
+    // Pressure collection downloads dirty images; it runs on the GPU thread in the product.
+    const auto collect = [&](uint64_t usage, uint64_t tick) {
+      OnGpuThread(context, [&] {
+        TextureCacheTestAccess::RunPressureCollection(cache, usage, tick);
+      });
+    };
     std::array<ImageId, 2> images{};
     for (size_t index = 0; index < images.size(); ++index) {
       const auto address = base + index * 0x10000;
@@ -4912,19 +4947,19 @@ public:
       LibKernel::Memory::WriteBacking(address, &stale[index], sizeof(uint32_t));
     }
     const auto batch_tick = scheduler.CurrentTick();
-    TextureCacheTestAccess::RunPressureCollection(cache, budget * 79 / 100, 100);
+    collect(budget * 79 / 100, 100);
     Require(name, "retain below pressure watermark",
             std::ranges::all_of(images, [&](ImageId id) {
               return TextureCacheTestAccess::Contains(cache, id);
             }) && scheduler.CurrentTick() == batch_tick,
             "B evicted or submitted while memory had headroom");
-    TextureCacheTestAccess::RunPressureCollection(cache, budget * 85 / 100, 101);
+    collect(budget * 85 / 100, 101);
     Require(name, "normal pressure preserves in-flight dirty images",
             std::ranges::all_of(images, [&](ImageId id) {
               return TextureCacheTestAccess::Contains(cache, id);
             }) && scheduler.CurrentTick() == batch_tick,
             "B forced dirty-image readback below critical pressure");
-    TextureCacheTestAccess::RunPressureCollection(cache, budget, 102);
+    collect(budget, 102);
     std::array<uint32_t, 2> before{};
     for (size_t index = 0; index < images.size(); ++index) {
       LibKernel::Memory::TryReadBacking(base + index * 0x10000, &before[index], sizeof(uint32_t));
@@ -5978,7 +6013,7 @@ public:
       const auto ms_data_size = oversized_ms.info.data.size;
       oversized_ms.info.data.size = (32ull << 20) + 4;
       const bool oversized_ms_readback =
-          !TextureCacheTestAccess::TryDownload(texture_cache, ms_depth_image);
+          !DownloadOnGpuThread(context, ms_depth_image);
       oversized_ms.info.data.size = ms_data_size;
       Require(name, "oversized multisample download rejection",
               oversized_ms_readback && oversized_ms.IsGpuModified() &&
@@ -6033,8 +6068,7 @@ public:
           "stencil address did not create a lightweight depth association");
       Require(
           name, "stencil association download rejection",
-          !TextureCacheTestAccess::TryDownload(texture_cache,
-                                               first_stencil_association),
+          !DownloadOnGpuThread(context, first_stencil_association),
           "a lightweight stencil association entered image download planning");
 
       auto exact_ms_depth_alias = ms_depth_desc;
@@ -6998,8 +7032,7 @@ public:
                   texture_cache.GetImage(compressed_image).IsGpuModified(),
               "compressed image incorrectly claimed a CPU read fault");
       Require(name, "compressed download rejection",
-              !TextureCacheTestAccess::TryDownload(texture_cache,
-                                                   compressed_image) &&
+              !DownloadOnGpuThread(context, compressed_image) &&
                   texture_cache.GetImage(compressed_image).IsGpuModified() &&
                   !texture_cache.GetImage(compressed_image).IsBufferModified(),
               "a compressed image escaped the unified download guard");
@@ -7682,7 +7715,7 @@ public:
       }
       TextureCacheTestAccess::ConfigureGarbageCollection(
           texture_cache, gc_images, 17, UINT64_MAX);
-      texture_cache.RunGarbageCollector();
+      OnGpuThread(context, [&] { texture_cache.RunGarbageCollector(); });
       Require(name, "downloadable image pre-pressure retention",
               std::ranges::all_of(gc_images,
                                   [&](ImageId image) {
@@ -7693,7 +7726,7 @@ public:
       const auto gc_batch_tick = scheduler.CurrentTick();
       TextureCacheTestAccess::ConfigureGarbageCollection(texture_cache,
                                                          gc_images, 81, 0);
-      texture_cache.RunGarbageCollector();
+      OnGpuThread(context, [&] { texture_cache.RunGarbageCollector(); });
       std::array<uint32_t, 2> gc_before_completion{};
       for (size_t index = 0; index < gc_image_offsets.size(); index++) {
         Libs::LibKernel::Memory::TryReadBacking(base + gc_image_offsets[index],
@@ -7773,7 +7806,7 @@ public:
           submit_readback_desc.info.data.address, &submit_readback_stale,
           sizeof(submit_readback_stale));
       const auto submit_readback_tick = scheduler.CurrentTick();
-      texture_cache.ProcessDownloadImages();
+      OnGpuThread(context, [&] { texture_cache.ProcessDownloadImages(); });
       TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
       uint32_t submit_before_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(
@@ -7843,7 +7876,7 @@ public:
       TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
       TextureCacheTestAccess::TrackDownload(texture_cache, linear_depth_image);
       const auto linear_depth_tick = scheduler.CurrentTick();
-      texture_cache.ProcessDownloadImages();
+      OnGpuThread(context, [&] { texture_cache.ProcessDownloadImages(); });
       TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
       std::array<uint32_t, linear_depth_words> linear_depth_before{};
       std::memcpy(linear_depth_before.data(), memory + linear_depth_offset,
@@ -7944,7 +7977,7 @@ public:
       const auto tiled_depth_tick = scheduler.CurrentTick();
       Require(
           name, "tiled depth download queue",
-          TextureCacheTestAccess::TryDownload(texture_cache, tiled_depth_image),
+          DownloadOnGpuThread(context, tiled_depth_image),
           "layered tiled depth readback was rejected");
       std::vector<uint32_t> tiled_depth_before(tiled_depth_guest.size());
       std::memcpy(tiled_depth_before.data(), memory + tiled_depth_offset,
@@ -8073,7 +8106,7 @@ public:
               "failed to clear a layered tiled D16 fallback image");
       Require(
           name, "tiled D16 download queue",
-          TextureCacheTestAccess::TryDownload(texture_cache, tiled_d16_image),
+          DownloadOnGpuThread(context, tiled_d16_image),
           "layered tiled D16 fallback readback was rejected");
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
@@ -8229,7 +8262,7 @@ public:
       const auto depth_gc_tick = scheduler.CurrentTick();
       TextureCacheTestAccess::ConfigureGarbageCollection(
           texture_cache, std::array{combined_destination_image}, 81, 0);
-      texture_cache.RunGarbageCollector();
+      OnGpuThread(context, [&] { texture_cache.RunGarbageCollector(); });
       float depth_before_completion = 0.0f;
       Libs::LibKernel::Memory::TryReadBacking(
           combined_destination.info.data.address, &depth_before_completion,
@@ -8297,7 +8330,7 @@ public:
           "failed to create six depth/stencil association pairs");
       TextureCacheTestAccess::ConfigureGarbageCollection(
           texture_cache, gc_depth_lru, 81, UINT64_MAX);
-      texture_cache.RunGarbageCollector();
+      OnGpuThread(context, [&] { texture_cache.RunGarbageCollector(); });
       bool gc_depth_budget = true;
       for (size_t index = 0; index < gc_depth_pair_count; index++) {
         const bool expected_live = index == gc_depth_pair_count - 1;
@@ -8339,7 +8372,7 @@ public:
         TextureCacheTestAccess::ConfigureGarbageCollection(
             texture_cache, std::array{image}, 81, 0);
         const auto tick = scheduler.CurrentTick();
-        texture_cache.RunGarbageCollector();
+        OnGpuThread(context, [&] { texture_cache.RunGarbageCollector(); });
         const auto handle =
             BufferCacheTestAccess::DownloadBuffer(resources.GetBufferCache())
                 .Handle();
@@ -8513,6 +8546,7 @@ public:
     HW::UserConfig user_config{};
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
     {
       auto &resources = context;
       resources.MapMemory(base, allocation_size);
@@ -8563,7 +8597,7 @@ public:
           range);
       cache.MarkGpuWritten(id);
       Require(name, "guest readback queue",
-              TextureCacheTestAccess::TryDownload(cache, id),
+              DownloadOnGpuThread(context, id),
               "tiled BGRA16 guest readback was rejected");
       auto mirror = resources.GetBufferCache().ObtainBuffer(base, total.size,
                                                             false, true);
@@ -8935,7 +8969,7 @@ public:
 
       Require(
           name, "volume readback queue",
-          TextureCacheTestAccess::TryDownload(texture_cache, storage_id),
+          DownloadOnGpuThread(context, storage_id),
           "the 3D render target could not be queued for guest-layout readback");
       auto mirror = resources.GetBufferCache().ObtainBuffer(
           base, color_size, false, true);
@@ -9844,6 +9878,7 @@ public:
       HW::UserConfig user_config{};
       HW::Shader shaders{};
       scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
       auto &resources = context;
       auto &cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
@@ -9947,7 +9982,7 @@ public:
       }
       cache.MarkGpuWritten(binding.image_id);
       cache.MarkGpuWritten(ordinary.image_id);
-      Require(name, "depth readback", TextureCacheTestAccess::TryDownload(cache, binding.image_id),
+      Require(name, "depth readback", DownloadOnGpuThread(context, binding.image_id),
               "ordinary tiled depth readback did not use the shared transfer path");
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
@@ -10282,6 +10317,7 @@ public:
                                     .metadata_pipe_aligned = true});
       registers.SetRenderTargetMask(0x0f);
       scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
 
       auto &resources = context;
       auto &texture_cache = resources.GetTextureCache();
@@ -10311,7 +10347,7 @@ public:
               "depth-tiled color backing could not be cleared");
       Require(
           name, "readback queue",
-          TextureCacheTestAccess::TryDownload(texture_cache, color.image_id),
+          DownloadOnGpuThread(context, color.image_id),
           "depth-tiled color target could not be queued for readback");
 
       RenderExecutorTestAccess::ResetBindings(executor);
@@ -10444,8 +10480,7 @@ public:
                                             raw_blocks_again.desc) != nullptr,
               "BC3 sampling replaced the GPU atlas on its next raw-block write");
       Require(name, "compressed atlas download",
-              TextureCacheTestAccess::TryDownload(texture_cache,
-                                                  raw_blocks_again.image_id),
+              DownloadOnGpuThread(context, raw_blocks_again.image_id),
               "the retained BC3 atlas could not publish its native contents");
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
@@ -11392,7 +11427,7 @@ public:
 
       Libs::LibKernel::Memory::WriteBacking(
           storage_address, &storage_stale_value, sizeof(storage_stale_value));
-      texture_cache.ProcessDownloadImages();
+      OnGpuThread(context, [&] { texture_cache.ProcessDownloadImages(); });
       Require(
           name, "storage acquisition download consumption",
           !TextureCacheTestAccess::PendingDownload(texture_cache, storage_id),
