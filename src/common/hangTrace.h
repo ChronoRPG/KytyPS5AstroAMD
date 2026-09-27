@@ -260,6 +260,10 @@ void RecordGpuOpCounts(const GpuOpCounts& counts);
 //   mem_image_writeback_partial          of those, downloads that covered only leading mips
 //   mem_image_writeback_skips            overlapping GPU-modified images that could not be moved
 //                                        (unsupported/unsafe/outside the buffer): contents lost
+//   mem_fault_ahead_pages                pages a write fault made CPU-dirty ahead of use
+//   mem_hot_promotions / _demotions      pages entering / leaving hot (sticky-dirty) tracking
+//   mem_hot_upload_pages                 hot pages visited by uploads (compared with a shadow)
+//   mem_hot_upload_skipped               of those, unchanged pages whose copy was skipped
 enum class MemoryCounter : uint8_t {
 	WriteFaults,
 	ReadFaults,
@@ -281,6 +285,11 @@ enum class MemoryCounter : uint8_t {
 	ImageWritebackBytes,
 	ImageWritebackPartial,
 	ImageWritebackSkips,
+	FaultAheadPages,
+	HotPromotions,
+	HotDemotions,
+	HotUploadPages,
+	HotUploadSkipped,
 	Count
 };
 void CountMemory(MemoryCounter counter, uint64_t amount = 1);

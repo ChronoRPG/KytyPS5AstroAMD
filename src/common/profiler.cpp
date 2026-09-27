@@ -216,6 +216,11 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.ImageWritebackBytes.Cumulative",
     "FrameEvent.ImageWritebackPartial.Cumulative",
     "FrameEvent.ImageWritebackSkips.Cumulative",
+    "FrameEvent.FaultAheadPages.Cumulative",
+    "FrameEvent.HotPagePromotions.Cumulative",
+    "FrameEvent.HotPageDemotions.Cumulative",
+    "FrameEvent.HotPageUploads.Cumulative",
+    "FrameEvent.HotPageUploadsSkipped.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 

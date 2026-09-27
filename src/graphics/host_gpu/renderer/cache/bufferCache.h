@@ -50,7 +50,10 @@ public:
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
-	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// write_fault: a guest write fault on the range (fault-ahead / hot-page policy applies).
+	void                   InvalidateMemory(uint64_t vaddr, uint64_t size, bool write_fault = false);
+	// Once per completed guest flip (any thread): the frame clock of hot-page detection.
+	void                   AdvanceFrame() noexcept;
 	// Guest read faults outside the GPU thread use a side copy when every dirty byte they need
 	// was written by an already submitted recording (KYTY_READBACK_SIDE_COPY=0 disables it).
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
@@ -159,7 +162,17 @@ private:
 	                                     BdaSyncStats* stats = nullptr,
 	                                     const char* upload_reason = nullptr);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-	                                      uint64_t total_size);
+	                                      uint64_t total_size, size_t guest_copies = SIZE_MAX,
+	                                      const uint8_t* host_data = nullptr,
+	                                      uint64_t       host_base = 0);
+	// Hot pages (GPU thread). Snapshots each hot page of hot_ranges, appends a copy (reading
+	// m_hot_scratch from the first appended srcOffset on) for those that differ from their
+	// shadow, and lists pages to return to normal tracking.
+	void CollectHotPages(Buffer& buffer, std::span<const GuestRange> hot_ranges,
+	                     std::vector<vk::BufferCopy>& copies, uint64_t& total_size,
+	                     std::vector<uint64_t>& demote);
+	void EraseHotShadows(uint64_t vaddr, uint64_t size);
+	void MaintainHotPages();
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Records a download of a GPU-modified image into `buffer` at the image's own guest address
 	// (every mip level that fits). Caller holds the texture-cache lock and has checked that the
@@ -234,6 +247,18 @@ private:
 	std::atomic<bool>                                 m_has_known_fills {false};
 	const bool                                        m_bda_incremental_sync;
 	MemoryTracker                                     m_memory_tracker;
+	// Hot pages: exact copy of the last contents uploaded for each hot page, valid for the buffer
+	// registered at that page until any other upload or GPU-side write of the page, an unbounded
+	// writer, or the buffer's unregistration erases it (GPU thread only).
+	struct HotShadow {
+		std::unique_ptr<uint8_t[]> data;
+		uint32_t                   last_change = 0;
+		uint32_t                   last_use    = 0;
+	};
+	std::map<uint64_t, HotShadow>                     m_hot_shadows;
+	std::vector<uint8_t>                              m_hot_scratch;
+	uint32_t                                          m_hot_quiet_frames = 8;
+	uint32_t                                          m_hot_sweep_frame  = 0;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};
 	// GPU-thread-only snapshots taken BEFORE the last full scan, never after it.
 	uint64_t                                          m_bda_scanned_cpu_epoch = 0;

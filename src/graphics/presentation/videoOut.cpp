@@ -1188,6 +1188,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	Profiler::PublishFrameWork();
 	HangTrace::RecordFlip();
 	m_presenter.Renderer().GetTextureCache().AdvanceFrame();
+	m_presenter.Renderer().GetBufferCache().AdvanceFrame();
 
 	if (Config::GraphicsDebugDumpEnabled() &&
 	    Config::GetPrintfDirection() != Config::LogDirection::Silent) {

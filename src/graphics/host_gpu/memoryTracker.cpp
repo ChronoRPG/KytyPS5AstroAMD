@@ -7,9 +7,59 @@ namespace Libs::Graphics {
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
-MemoryTracker::MemoryTracker(PageManager& page_manager, bool track_cpu_mutations)
-    : m_page_manager(page_manager), m_track_cpu_mutations(track_cpu_mutations) {
+MemoryTracker::MemoryTracker(PageManager& page_manager, bool track_cpu_mutations,
+                             FaultPolicy fault_policy)
+    : m_page_manager(page_manager), m_track_cpu_mutations(track_cpu_mutations),
+      m_fault_policy(fault_policy) {
+	if (m_fault_policy.ahead_pages == 0 ||
+	    (m_fault_policy.ahead_pages & (m_fault_policy.ahead_pages - 1)) != 0 ||
+	    m_fault_policy.ahead_pages > TRACKER_REGION_PAGES) {
+		EXIT("invalid memory tracker fault-ahead window\n");
+	}
 	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
+}
+
+bool MemoryTracker::IsRegionHot(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		return manager->IsHot(manager->GetCpuAddr() + offset, bytes);
+	});
+}
+
+void MemoryTracker::DemoteHotPages(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	if (m_hot_count.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	uint32_t demoted = 0;
+	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		demoted += manager->DemoteHot(manager->GetCpuAddr() + offset, bytes, m_hot_count);
+	});
+	MemoryStats::Count(MemoryStats::Counter::HotDemotions, demoted);
+}
+
+void MemoryTracker::SweepHotPages(uint32_t idle_frames) {
+	CheckNotInUploadCallback();
+	if (m_hot_count.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	std::vector<RegionManager*> managers;
+	{
+		std::lock_guard lock(m_region_mutex);
+		managers.reserve(m_region_storage.size());
+		for (const auto& manager: m_region_storage) {
+			managers.push_back(manager.get());
+		}
+	}
+	const auto frame   = Frame();
+	uint32_t   demoted = 0;
+	for (auto* manager: managers) {
+		std::scoped_lock lock(manager->lock);
+		demoted += manager->SweepHot(frame, idle_frames, m_hot_count);
+	}
+	MemoryStats::Count(MemoryStats::Counter::HotDemotions, demoted);
 }
 
 MemoryTracker::~MemoryTracker() = default;
@@ -168,10 +218,13 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	    })) {
 		EXIT("cannot untrack GPU-dirty memory\n");
 	}
-	Iterate<false>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	uint32_t demoted = 0;
+	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		NotifyCpuMutation();
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+		demoted += manager->DemoteHot(manager->GetCpuAddr() + offset, bytes, m_hot_count);
 	});
+	MemoryStats::Count(MemoryStats::Counter::HotDemotions, demoted);
 }
 
 } // namespace Libs::Graphics

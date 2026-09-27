@@ -298,6 +298,14 @@ enum class FrameEvent : uint32_t {
 	ImageWritebackBytes,
 	ImageWritebackPartial,
 	ImageWritebackSkips,
+	// Write-fault policy (KYTY_FAULT_AHEAD_KB, KYTY_HOT_PAGES, MemoryTracker): pages made CPU-dirty
+	// ahead of use by a write fault, pages entering and leaving hot (sticky-dirty, unprotected)
+	// tracking, hot pages visited by buffer uploads, and those skipped as unchanged.
+	FaultAheadPages,
+	HotPagePromotions,
+	HotPageDemotions,
+	HotPageUploads,
+	HotPageUploadsSkipped,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

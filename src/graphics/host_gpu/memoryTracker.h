@@ -19,7 +19,10 @@ namespace Libs::Graphics {
 
 class MemoryTracker final {
 public:
-	explicit MemoryTracker(PageManager& page_manager, bool track_cpu_mutations = false);
+	using FaultPolicy = RegionManager::FaultPolicy;
+
+	explicit MemoryTracker(PageManager& page_manager, bool track_cpu_mutations = false,
+	                       FaultPolicy fault_policy = {});
 	~MemoryTracker();
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);
@@ -41,17 +44,25 @@ public:
 	void                               MarkReadbackPending(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] ReadbackUnmarkResult UnmarkReadbackPending(uint64_t vaddr, uint64_t size);
 	// A dirty-state mutation token, not a backing/GPU cleanliness proof. UINT64_MAX means
-	// saturated: callers must conservatively stop reusing any previously observed token.
+	// saturated: callers must conservatively stop reusing any previously observed token. While
+	// hot pages exist it is UINT64_MAX too: they are written without faults.
 	[[nodiscard]] uint64_t CpuMutationEpoch() const noexcept {
+		if (m_hot_count.load(std::memory_order_acquire) != 0) {
+			return UINT64_MAX;
+		}
 		return m_cpu_mutation_epoch.load(std::memory_order_acquire);
 	}
-	// Removes protection from a range and flushes GPU-owned data when required.
+	// Removes protection from a range and flushes GPU-owned data when required. write_fault: the
+	// range is a guest write fault; clean pages then take the fault policy (fault-ahead window,
+	// hot-page detection, RegionManager::MarkWriteFault).
 	template <typename Flush>
-	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
+	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush,
+	                      bool write_fault = false) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
 		CheckNotInUploadCallback();
 
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			RegionManager::FaultResult fault;
 			const bool should_flush = [&] {
 				// Perform both the GPU modification check and CPU state change with the lock in
 				// case the GPU thread is racing to mark the page modified. If a flush is needed,
@@ -61,14 +72,38 @@ public:
 					return true;
 				}
 				NotifyCpuMutation();
-				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+				if (write_fault) {
+					fault = manager->MarkWriteFault(manager->GetCpuAddr() + offset, bytes,
+					                                m_fault_policy, Frame(), m_hot_count);
+				} else {
+					manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
+					                                             bytes);
+				}
 				return false;
 			}();
 			if (should_flush) {
 				on_flush();
 			}
+			MemoryStats::Count(MemoryStats::Counter::FaultAheadPages, fault.ahead_pages);
+			MemoryStats::Count(MemoryStats::Counter::HotPromotions, fault.promoted);
 		});
 	}
+
+	// Fault policy knobs (constant after construction).
+	[[nodiscard]] const FaultPolicy& GetFaultPolicy() const noexcept { return m_fault_policy; }
+	// Guest frame counter for hot-page detection (any thread, once per completed guest flip).
+	void AdvanceFrame() noexcept { m_frame.fetch_add(1, std::memory_order_relaxed); }
+	[[nodiscard]] uint32_t Frame() const noexcept {
+		return m_frame.load(std::memory_order_relaxed);
+	}
+	[[nodiscard]] uint32_t HotPageCount() const noexcept {
+		return m_hot_count.load(std::memory_order_relaxed);
+	}
+	[[nodiscard]] bool IsRegionHot(uint64_t vaddr, uint64_t size);
+	// Returns hot pages of the range to normal tracking (they stay CPU-dirty until uploaded).
+	void DemoteHotPages(uint64_t vaddr, uint64_t size);
+	// Demotes hot pages no upload visited for more than idle_frames frames.
+	void SweepHotPages(uint32_t idle_frames);
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                           const char* operation) const noexcept;
@@ -96,22 +131,42 @@ public:
 		});
 	}
 
+	// range_func(address, bytes) or range_func(address, bytes, hot). Only a caller taking the hot
+	// flag keeps hot pages CPU-dirty and writable on a read-only upload; it must then treat every
+	// hot range as possibly changed since its previous upload. Written uploads and callers
+	// without the flag return hot pages to normal tracking first.
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
 	                        UploadFunc&& upload_func) {
-		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
+		constexpr bool hot_aware = std::is_invocable_v<RangeFunc&, uint64_t, uint64_t, bool>;
+		if constexpr (hot_aware) {
+			static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t, bool>);
+		} else {
+			static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
+		}
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+		const bool  keep_hot              = hot_aware && !is_written;
+		const auto  frame                 = Frame();
+		uint32_t    demoted               = 0;
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
-			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
-			                                                      bytes, range_func);
+			demoted += manager->CollectUpload(
+			    manager->GetCpuAddr() + offset, bytes, keep_hot, frame, m_hot_count,
+			    [&](uint64_t address, uint64_t range_bytes, bool hot) noexcept {
+				    if constexpr (hot_aware) {
+					    range_func(address, range_bytes, hot);
+				    } else {
+					    range_func(address, range_bytes);
+				    }
+			    });
 			if (!is_written) {
 				manager->lock.unlock();
 			}
 		});
+		MemoryStats::Count(MemoryStats::Counter::HotDemotions, demoted);
 		upload_func();
 		// No clean-verdict bump: these GPU bits are not read by clean-read verdicts, and the
 		// only writer (BufferCache::ObtainBuffer) bumps when it adds the exact dirty range.
@@ -176,6 +231,9 @@ private:
 	PageManager&                                   m_page_manager;
 	const bool                                     m_track_cpu_mutations;
 	std::atomic_uint64_t                            m_cpu_mutation_epoch {1};
+	const FaultPolicy                              m_fault_policy;
+	std::atomic_uint32_t                           m_frame {1};
+	std::atomic_uint32_t                           m_hot_count {0};
 };
 
 } // namespace Libs::Graphics
