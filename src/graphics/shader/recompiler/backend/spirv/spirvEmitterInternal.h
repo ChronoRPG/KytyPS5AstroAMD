@@ -67,6 +67,8 @@ struct SpirvRequirements {
 	bool function_lds                 = false;
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
+	// A pixel shader's DS_APPEND/DS_CONSUME elect a non-helper lane (KYTY_PS_APPEND_LIVE_ELECTION).
+	bool helper_invocation            = false;
 	bool buffer_int64_atomics         = false;
 	bool coherent_buffers             = false;
 };
@@ -119,6 +121,9 @@ struct EmitterState {
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
+	uint32_t                   helper_invocation_variable            = 0;
+	// KYTY_LOOP_GUARD: the invocation's loop-iteration count (a Function variable).
+	uint32_t                   loop_guard_variable                   = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
@@ -353,6 +358,9 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool 
 DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags);
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+
+// Loads gl_HelperInvocation (declared when SpirvRequirements::helper_invocation is set).
+uint32_t EmitIsHelperInvocation(EmitterState& state);
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind);
 

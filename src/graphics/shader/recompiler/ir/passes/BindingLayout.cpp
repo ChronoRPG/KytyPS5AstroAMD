@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -145,7 +146,8 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 		}
 		AddBinding(next, DescriptorBindingKind::Samplers, std::move(resources));
 	}
-	if (UsesGds(program)) {
+	// KYTY_LOOP_GUARD reports through the last GDS dword, so a guarded shader always binds GDS.
+	if (UsesGds(program) || LoopGuardApplies(program.shader_hash)) {
 		AddBinding(next, DescriptorBindingKind::Gds);
 	}
 	if (program.info.uses_dma) {

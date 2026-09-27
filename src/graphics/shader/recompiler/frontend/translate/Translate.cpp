@@ -903,6 +903,24 @@ void ValidateTranslateOptions(const TranslateOptions& options) {
 	}
 }
 
+// KYTY_PS_LIVE_EXEC: the pixel shader starts with EXEC = its non-helper invocations, like the
+// PS5's pixel valid mask, instead of every invocation of the quad.
+bool StartsWithLiveExec(const Decoder::Program& decoded, const TranslateOptions& options) {
+	if (options.stage != ShaderType::Pixel) {
+		return false;
+	}
+	switch (GetCodegenOptions().ps_live_exec) {
+		case PsLiveExec::Off: return false;
+		case PsLiveExec::All: return true;
+		case PsLiveExec::AppendConsume:
+			return std::ranges::any_of(decoded.instructions, [](const Decoder::Instruction& inst) {
+				return inst.opcode == Decoder::Opcode::DS_APPEND ||
+				       inst.opcode == Decoder::Opcode::DS_CONSUME;
+			});
+	}
+	return false;
+}
+
 } // namespace
 
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
@@ -1026,6 +1044,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				initial_exec = entry_ir.ULessThan(builtin(IR::StageInputKind::LocalInvocationIndex),
 				                                  IR::U32(IR::Value(total_threads)));
 			}
+		}
+		if (StartsWithLiveExec(decoded, options)) {
+			initial_exec = entry_ir.LogicalNot(
+			    IR::U1(entry_ir.Emit(IR::ValueOpcode::IsHelperInvocation)));
 		}
 		entry_ir.SetExec(initial_exec);
 		const auto initial_mask = entry_ir.Emit(IR::ValueOpcode::Ballot, {initial_exec});

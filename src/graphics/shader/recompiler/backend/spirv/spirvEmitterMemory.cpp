@@ -1121,7 +1121,33 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto count = Binary(state, spv::OpIAdd, TypeU32(state),
 	                          Unary(state, spv::OpBitCount, TypeU32(state), low),
 	                          Unary(state, spv::OpBitCount, TypeU32(state), high));
-	const auto first = ctx.FirstLane(ballot);
+	// KYTY_PS_APPEND_LIVE_ELECTION: a helper invocation's atomic has no effect and returns an
+	// undefined value, so a pixel shader elects the first EXEC lane that is not a helper (the
+	// count above still covers every EXEC lane). With no such lane nobody consumes the result.
+	auto elected_ballot = ballot;
+	auto lane_guard     = exec;
+	if (state.program.stage == ShaderType::Pixel && state.helper_invocation_variable != 0 &&
+	    state.lane_count == 1) {
+		const auto live =
+		    Binary(state, spv::OpLogicalAnd, TypeBool(state), exec,
+		           Unary(state, spv::OpLogicalNot, TypeBool(state), EmitIsHelperInvocation(state)));
+		elected_ballot = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4),
+		                          elected_ballot, ConstantU32(state, spv::ScopeSubgroup), live);
+		const auto elected_low  = state.builder.AllocateId();
+		const auto elected_high = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), elected_low,
+		                          elected_ballot, 0);
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), elected_high,
+		                          elected_ballot, 1);
+		const auto any_live =
+		    Binary(state, spv::OpINotEqual, TypeBool(state),
+		           Binary(state, spv::OpBitwiseOr, TypeU32(state), elected_low, elected_high),
+		           ConstantU32(state, 0));
+		// FindLSB of an empty ballot is undefined: without a live lane nothing is added.
+		lane_guard = AndCondition(state, exec, any_live);
+	}
+	const auto first = ctx.FirstLane(elected_ballot);
 	const auto source_lane =
 	    state.lane_count == 2
 	        ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), first, ConstantU32(state, 31))
@@ -1139,7 +1165,7 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    AndCondition(state,
 	                 state.lane_count == 2 ? Binary(state, spv::OpINotEqual, TypeBool(state), count,
 	                                                ConstantU32(state, 0))
-	                                       : exec,
+	                                       : lane_guard,
 	                 AndCondition(state, storage_bounds, m0_bounds)));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
 		const auto value = state.builder.AllocateId();
