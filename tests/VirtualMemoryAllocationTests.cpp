@@ -1685,10 +1685,21 @@ void TestClampRangeMemoFollowsMappings() {
 	Check(test, totals().verify_mismatches == 0,
 	      "the verify mode found a cached answer that differs from the locked lookup");
 
+	// ClampRangeSize exits on an address outside every committed range, so the last lookup maps
+	// the left page alone again: the run is that page, not the two pages from before the unmap.
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 2),
 	        "KernelMunmap(both)");
-	Check(test, ClampRangeSize(crossing, 0x200) == 0,
-	      "a lookup after unmapping everything found a committed range");
+	left = reinterpret_cast<void*>(base);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &left, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "clamp_left"),
+	        "KernelMapNamedFlexibleMemory(left again)");
+	Check(test, ClampRangeSize(crossing, 0x200) == 0x100,
+	      "a lookup after unmapping both pages used the run from before it");
+	Check(test, totals().verify_mismatches == 0,
+	      "the verify mode found a cached answer that differs from the locked lookup");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap(left)");
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize * 2, SceKernelPageSize),
 	        "KernelMunmap(reserved page)");

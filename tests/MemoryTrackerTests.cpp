@@ -837,8 +837,7 @@ void TestMirrorsAcrossWords() {
       if (!tracker.QueryDirtyRelaxed(start, page_size, relaxed) ||
           relaxed.cpu != tracker.IsRegionCpuModified(start, page_size) ||
           relaxed.gpu != tracker.IsRegionGpuModified(start, page_size)) {
-        std::fprintf(stderr, "mirror differs at page %llu after %s
-",
+        std::fprintf(stderr, "mirror differs at page %llu after %s\n",
                      static_cast<unsigned long long>(page), stage);
         Check(false, "a lock-free dirty mirror differs from the locked bits");
       }
