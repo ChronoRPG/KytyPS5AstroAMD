@@ -199,6 +199,9 @@ public:
 	                       std::span<const vk::BufferCopy> regions) const;
 	// Records the pending batch now (no-op when empty).
 	void FlushBarriers() const;
+	// Whether anything is pending, and whether queued upload copies are (RequestUploadCopy).
+	[[nodiscard]] bool HasPendingBarriers() const noexcept { return !m_pending.Empty(); }
+	[[nodiscard]] bool HasPendingUploads() const noexcept { return !m_pending.uploads.empty(); }
 
 	// Brackets the draw recording path from the state commands through the draw itself. The
 	// draw must be recorded right after BeginRendering(). safe: the draw writes only its own

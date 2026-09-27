@@ -58,7 +58,9 @@ public:
 	// buffer (KYTY_UPLOAD_BATCH, CommandBuffer::RequestUploadCopy); the outermost scope's end
 	// records them all behind one barrier. Every command recorded meanwhile through
 	// CommandBuffer::Handle() records the queue first, so only commands recorded through a handle
-	// obtained BEFORE the scope began must not follow uploads made in it.
+	// obtained BEFORE the scope began must not follow uploads made in it. A scope that queued no
+	// upload leaves other pending barriers to the next flush point (KYTY_UPLOAD_BATCH_SCOPED_FLUSH,
+	// default on; =0 records them at the scope end as before).
 	class UploadBatch {
 	public:
 		explicit UploadBatch(BufferCache& cache);

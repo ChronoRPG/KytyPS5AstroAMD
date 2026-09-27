@@ -49,6 +49,16 @@ bool BdaHotSyncEnabled() {
 	return value == nullptr || !(value[0] == '0' && value[1] == '\0');
 }
 
+// KYTY_UPLOAD_BATCH_SCOPED_FLUSH=0 restores recording every pending barrier at the end of each
+// outermost UploadBatch scope, even when the scope queued no upload.
+bool UploadBatchScopedFlushEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_UPLOAD_BATCH_SCOPED_FLUSH");
+		return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
+}
+
 // Guest read faults copy GPU-owned bytes on a side command buffer unless this is "0".
 bool SideReadbackEnabled() {
 	const auto* value = std::getenv("KYTY_READBACK_SIDE_COPY");
@@ -489,9 +499,21 @@ BufferCache::UploadBatch::UploadBatch(BufferCache& cache): m_cache(cache) {
 BufferCache::UploadBatch::~UploadBatch() {
 	if (--m_cache.m_upload_batch_depth == 0 && m_cache.m_scheduler.Active()) {
 		auto& command = m_cache.m_scheduler.Current();
-		if (!command.IsInvalid()) {
-			command.FlushBarriers();
+		if (command.IsInvalid()) {
+			return;
 		}
+		// The scope exists to record its queued uploads behind one barrier pair. Barriers that
+		// were pending for other reasons (a previous draw's shader-write barrier, deferrable image
+		// transitions) wait for the next flush point as everywhere else: recording them here ended
+		// the rendering instance before every draw that followed a storage-writing draw and so
+		// defeated KYTY_DRAW_WRITE_SINK (u42 Sky Garden: ~745 instance splits per flip).
+		if (UploadBatchScopedFlushEnabled() && !command.HasPendingUploads()) {
+			if (command.HasPendingBarriers()) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::UploadBatchFlushesDeferred);
+			}
+			return;
+		}
+		command.FlushBarriers();
 	}
 }
 

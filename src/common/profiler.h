@@ -549,6 +549,10 @@ enum class FrameEvent : uint32_t {
 	// they visited. BdaSyncPasses/BdaSyncScannedBuffers count the full passes only.
 	BdaSyncHotPasses,
 	BdaSyncHotRanges,
+	// KYTY_UPLOAD_BATCH_SCOPED_FLUSH (BufferCache::UploadBatch): batch scopes that ended with
+	// barriers pending but no queued upload, and so left them to the next flush point instead of
+	// recording them (and ending the rendering instance) right away.
+	UploadBatchFlushesDeferred,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
