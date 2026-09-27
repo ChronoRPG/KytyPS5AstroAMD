@@ -1,15 +1,18 @@
 #include "loader/gamePatch.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/virtualMemory.h"
 #include "kernel/memory.h"
 #include "loader/elf.h"
+#include "loader/gamePatchFilter.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -77,8 +80,42 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 	plan->version  = root["version"].get<std::string>();
 	plan->process  = root["process"].get<std::string>();
 
+	const auto* disable_env = std::getenv(kDisableEnv);
+	const auto  patterns    = ParseDisableList(disable_env != nullptr ? disable_env : "");
+	std::vector<ModEntry> entries;
 	for (const auto& mod: root["mods"]) {
-		if (!mod.value("enabled", true)) {
+		ModEntry entry;
+		if (mod.contains("name") && mod["name"].is_string()) {
+			entry.name = mod["name"].get<std::string>();
+		}
+		entry.enabled = mod.value("enabled", true);
+		entries.push_back(std::move(entry));
+	}
+	const auto selection = SelectMods(entries, patterns);
+	for (size_t index = 0; index < entries.size(); index++) {
+		const char* reason = "applying";
+		std::string detail;
+		if (selection.decisions[index] == ModDecision::SkipDisabledInFile) {
+			reason = "skipping";
+			detail = " (disabled in the patch file)";
+		} else if (selection.decisions[index] == ModDecision::SkipDisabledByEnv) {
+			reason = "skipping";
+			detail = fmt::format(" ({} matched \"{}\")", kDisableEnv,
+			                     patterns[selection.pattern_of_mod[index]]);
+		}
+		Log::WriteToConsoleAndLog(fmt::format("Game patch: {} mod {} \"{}\"{}\n", reason,
+		                                      index + 1, entries[index].name, detail));
+	}
+	for (size_t index = 0; index < patterns.size(); index++) {
+		if (!selection.pattern_matched[index]) {
+			Log::WriteToConsoleAndLog(fmt::format("Game patch: {} pattern \"{}\" matched no mod\n",
+			                                      kDisableEnv, patterns[index]));
+		}
+	}
+
+	size_t mod_index = 0;
+	for (const auto& mod: root["mods"]) {
+		if (selection.decisions[mod_index++] != ModDecision::Apply) {
 			continue;
 		}
 		const auto name = mod["name"].get<std::string>();
@@ -254,6 +291,7 @@ bool Apply(const std::filesystem::path& plan_path, Program* main_program,
 		return false;
 	}
 	if (plan.writes.empty()) {
+		Log::WriteToConsoleAndLog("Game patch: no mod writes left to apply\n");
 		return true;
 	}
 
