@@ -151,10 +151,14 @@ private:
 	                                             uint32_t max_groups) noexcept;
 	void                          DeferDestroy(Scratch scratch);
 	void                          ReleaseScratch(Scratch scratch);
+	// image_regions (image variants): element (x, y) of infos[i] is view texel
+	// (imageOffset / image_texel + (x, y)) of image_regions[i]; with image_layer_views each region
+	// has its own single-layer view (layer 0 of the view), otherwise the view holds every layer.
 	void Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
 	             std::span<const GpuTileInfo> infos, uint64_t source_base, uint64_t target_base,
 	             std::vector<Dispatch>& dispatches,
-	             std::span<const vk::BufferImageCopy> image_regions = {});
+	             std::span<const vk::BufferImageCopy> image_regions = {}, uint32_t image_texel = 1,
+	             bool image_layer_views = false);
 	void Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	            std::span<Dispatch> dispatches, bool clear_target);
@@ -162,6 +166,8 @@ private:
 	// Direct image transfers: the storage view format for an element size (eUndefined when the
 	// device cannot use it in that direction), eligibility, pipelines and recording.
 	[[nodiscard]] vk::Format ImageViewFormat(uint32_t bytes_per_element, bool load);
+	// Uncompressed views of block-compressed images hold one level and one layer.
+	[[nodiscard]] static bool ImageLayerViews(const Image& image);
 	[[nodiscard]] bool       ImageTransferEligible(const Image& image, bool load,
 	                                               std::span<const GpuTileInfo>         infos,
 	                                               std::span<const vk::BufferImageCopy> regions);

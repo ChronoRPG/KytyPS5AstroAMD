@@ -627,6 +627,10 @@ enum class FrameEvent : uint32_t {
 	// SET_*_REG_INDIRECT packets that kept the draw-prep window open because their register pairs
 	// were clean (KYTY_DRAW_PREP_REG_INDIRECT_WINDOW); the others count as DrawPrepFenceRegIndirect.
 	DrawPrepRegIndirectKept,
+	// KYTY_TILER_IMAGE_DIRECT_BC: direct uploads into block-compressed images (also counted in
+	// TilerImageUploads/UploadBytes).
+	TilerImageBlockUploads,
+	TilerImageBlockUploadBytes,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
