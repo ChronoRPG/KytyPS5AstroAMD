@@ -731,7 +731,6 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
                                     const ShaderRecompiler::IR::DescriptorValue& value,
                                     TextureBinding&                              binding) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
-	const bool storage = resource.written;
 	// The same state a freshly returned binding had: no view yet, no mip views (their capacity
 	// is kept), undefined layout.
 	binding.image_view = nullptr;
@@ -754,8 +753,32 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 		if (!descriptor.IsNull() && HangTrace::Enabled()) {
 			HangTrace::RecordTexture(descriptor.fields);
 		}
+		if (m_texture_memo.LastHitRevalidated() && TextureBindingMemo::RevalidateVerify()) {
+			// KYTY_TEXTURE_MEMO_REVALIDATE_VERIFY: the full resolution (without the memo) must
+			// give the same image and description.
+			TextureBinding full;
+			ResolveTextureFull(resource, descriptor, memo_key, hash, false, full);
+			if (full.image_id != binding.image_id || full.desc.type != binding.desc.type ||
+			    !(full.desc.view_info == binding.desc.view_info) ||
+			    full.desc.info.data != binding.desc.info.data ||
+			    full.desc.info.pixel_format != binding.desc.info.pixel_format) {
+				TextureBindingMemo::ReportRevalidateMismatch();
+				binding = std::move(full);
+			}
+		}
 		return;
 	}
+	ResolveTextureFull(resource, descriptor, memo_key, hash, memo, binding);
+}
+
+void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResource& resource,
+                                        const ShaderTextureResource&               descriptor,
+                                        const TextureBindingMemo::Key& memo_key, uint64_t hash,
+                                        bool memo, TextureBinding& binding) {
+	auto&      texture_cache     = m_context.GetTextureCache();
+	const bool storage           = resource.written;
+	const bool description_cache =
+	    Common::RendererBatchEnabled() && resource.indirect_resources.size() <= 256u;
 	if (storage) {
 		ValidateStorageImageResource(resource);
 	}

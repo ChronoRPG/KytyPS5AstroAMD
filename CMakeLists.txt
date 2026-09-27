@@ -502,7 +502,7 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(resource_materialization_tests common fmt::fmt)
+target_link_libraries(resource_materialization_tests common fmt::fmt xxhash)
 if(LINUX)
 	# The shared-plan evaluation case runs std::thread workers.
 	target_link_libraries(resource_materialization_tests Threads::Threads)
@@ -571,6 +571,8 @@ add_executable(draw_prep_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DrawPrepTests.cpp"
 )
 target_include_directories(draw_prep_tests PRIVATE ${inc_headers})
+# ReadSet digest certificates hash with XXH3.
+target_link_libraries(draw_prep_tests xxhash)
 if(LINUX)
 	target_link_libraries(draw_prep_tests Threads::Threads)
 endif()
@@ -701,6 +703,37 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	add_test(NAME draw_prep_code_cert
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-code-cert-only)
+	add_test(NAME draw_prep_code_cert_bytes
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-code-cert-only)
+	set_tests_properties(draw_prep_code_cert_bytes PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP_CODE_DIGEST=0")
+	# KYTY_BUFFER_RANGE_MEMO and KYTY_HOT_PAGE_CHECK_LIMIT: default, verify mode, both off.
+	add_test(NAME buffer_range_memo
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
+	add_test(NAME buffer_range_memo_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
+	set_tests_properties(buffer_range_memo_verify PROPERTIES
+		ENVIRONMENT "KYTY_BUFFER_RANGE_MEMO_VERIFY=exit")
+	add_test(NAME buffer_range_memo_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
+	set_tests_properties(buffer_range_memo_off PROPERTIES
+		ENVIRONMENT "KYTY_BUFFER_RANGE_MEMO=0;KYTY_HOT_PAGE_CHECK_LIMIT=0")
+	# KYTY_BUFFER_DIRTY_QUERY_COMBINED=0: the small-read decision from the two separate queries.
+	add_test(NAME buffer_range_memo_separate_queries
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
+	set_tests_properties(buffer_range_memo_separate_queries PROPERTIES
+		ENVIRONMENT "KYTY_BUFFER_RANGE_MEMO=0;KYTY_BUFFER_DIRTY_QUERY_COMBINED=0")
+	# KYTY_TEXTURE_MEMO_REVALIDATE: default, verify mode, off.
+	add_test(NAME texture_memo_revalidate
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)
+	add_test(NAME texture_memo_revalidate_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)
+	set_tests_properties(texture_memo_revalidate_verify PROPERTIES
+		ENVIRONMENT "KYTY_TEXTURE_MEMO_REVALIDATE_VERIFY=exit")
+	add_test(NAME texture_memo_revalidate_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)
+	set_tests_properties(texture_memo_revalidate_off PROPERTIES
+		ENVIRONMENT "KYTY_TEXTURE_MEMO_REVALIDATE=0")
 	# Draw-prep end to end: serial vs command-processor draws, in each engine mode.
 	add_test(NAME draw_prep_engine
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
@@ -716,6 +749,19 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_fence PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_REG_INDIRECT_WINDOW=0")
+	# KYTY_BACKING_INPLACE and KYTY_DRAW_PREP_LOCKFREE_HINT: verify modes, and both off.
+	add_test(NAME draw_prep_engine_parallel_inplace_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_inplace_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE_VERIFY=exit;KYTY_DRAW_PREP_LOCKFREE_HINT_VERIFY=exit")
+	add_test(NAME draw_prep_engine_parallel_copied
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_copied PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE=0;KYTY_DRAW_PREP_LOCKFREE_HINT=0")
+	add_test(NAME draw_prep_code_cert_copied
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-code-cert-only)
+	set_tests_properties(draw_prep_code_cert_copied PROPERTIES
+		ENVIRONMENT "KYTY_BACKING_INPLACE=0")
 	add_test(NAME buffer_cache_eager_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --readback-eager-only)
 

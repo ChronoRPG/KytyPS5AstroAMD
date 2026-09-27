@@ -655,6 +655,50 @@ enum class FrameEvent : uint32_t {
 	DrawIndirectFallbackQuadList,
 	DrawIndirectFallbackRestart,
 	DrawIndirectFallbackMesh,
+	// KYTY_BUFFER_RANGE_MEMO (bufferCache.h): read-only synchronizations skipped because the
+	// range's tracker bits did not change since one that found nothing to upload; small read
+	// bindings that reused their stream-copy decision; facts recorded; and the verify mode's
+	// checks and mismatches (a skipped synchronization that would have uploaded, or a changed
+	// decision).
+	BufferRangeMemoCleanHits,
+	BufferRangeMemoStreamHits,
+	BufferRangeMemoRecords,
+	BufferRangeMemoVerifyChecks,
+	BufferRangeMemoVerifyMismatches,
+	// KYTY_HOT_PAGE_CHECK_LIMIT: hot pages returned to normal tracking (settled clean) after that
+	// many consecutive uploads found them unchanged.
+	HotPageCheckSettles,
+	// Bytes committed draw-prep certificates covered by digest (KYTY_DRAW_PREP_CODE_DIGEST: the
+	// code of headerless shaders; DrawPrepCertBytes counts the byte-compared ranges).
+	DrawPrepCertDigestBytes,
+	// Draws binding what the draw before them bound (renderDraw.cpp CountBindingRepeats, opt-in
+	// with KYTY_DRAW_BINDING_REPEAT_STATS=1): the same programs; and also the same images and
+	// samplers; and also the same buffers; and also the same user data and flattened SRT words.
+	DrawBindingRepeatPrograms,
+	DrawBindingRepeatTextures,
+	DrawBindingRepeatResources,
+	DrawBindingRepeatAll,
+	// KYTY_TEXTURE_MEMO_REVALIDATE: texture binding memo entries whose first page changed its owner
+	// list and that the redone lookup confirmed (counted as hits too), and the verify mode's
+	// disagreements with the full resolution.
+	TextureBindingMemoRevalidated,
+	TextureBindingMemoRevalidateMismatches,
+	// KYTY_BUFFER_DIRTY_QUERY_COMBINED: small-read stream decisions from one locked query.
+	BufferDirtyQueriesCombined,
+	// KYTY_BACKING_INPLACE: shader-code hashes taken on the backing bytes in place (and of those,
+	// under the mapping lock); DrawPrep::Validate ranges compared or hashed in place (and locked).
+	BackingInPlaceHashes,
+	BackingInPlaceHashesLocked,
+	DrawPrepValidateInPlaceRanges,
+	DrawPrepValidateInPlaceLocked,
+	// KYTY_BACKING_INPLACE_VERIFY: in-place vs copied validations; Races = differed once, then
+	// agreed on a second run (a guest write between them).
+	DrawPrepValidateVerifyChecks,
+	DrawPrepValidateVerifyMismatches,
+	DrawPrepValidateVerifyRaces,
+	// KYTY_DRAW_PREP_LOCKFREE_HINT_VERIFY: worker hints checked against the locked tracker bits.
+	DrawPrepHintVerifyChecks,
+	DrawPrepHintVerifyMismatches,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

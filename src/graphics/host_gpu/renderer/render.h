@@ -482,6 +482,11 @@ private:
 	                    const ShaderRecompiler::IR::DescriptorValue& value, TextureBinding& binding);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	// ResolveTexture's full resolution (no memo lookup); `memo` records the answer.
+	void ResolveTextureFull(const ShaderRecompiler::IR::ImageResource& resource,
+	                        const ShaderTextureResource& descriptor,
+	                        const TextureBindingMemo::Key& memo_key, uint64_t hash, bool memo,
+	                        TextureBinding& binding);
 	[[nodiscard]] vk::Sampler NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
 	                                        uint32_t                                        index,
 	                                        const ShaderRecompiler::IR::DescriptorValue&    value);

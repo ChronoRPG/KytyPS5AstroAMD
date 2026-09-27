@@ -188,6 +188,52 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+MemoryTracker::DirtyState MemoryTracker::QueryDirty(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	DirtyState state;
+	uint64_t   visited = 0;
+	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		visited++;
+		std::scoped_lock lock(manager->lock);
+		state.gpu = state.gpu || manager->IsModified<DirtySource::Gpu>(offset, bytes);
+		state.cpu = state.cpu || manager->IsModified<DirtySource::Cpu>(offset, bytes);
+	});
+	const auto regions = (vaddr + size - 1) / TRACKER_REGION_SIZE - vaddr / TRACKER_REGION_SIZE + 1;
+	if (!state.gpu && visited != regions) {
+		// IsRegionCpuModified would create the missing regions, entirely CPU dirty.
+		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
+		state.cpu = true;
+	}
+	return state;
+}
+
+bool MemoryTracker::IsRegionGpuModifiedRelaxed(uint64_t vaddr, uint64_t size) const {
+	ValidateRange(vaddr, size);
+	uint64_t remaining = size;
+	uint64_t index     = vaddr / TRACKER_REGION_SIZE;
+	uint64_t offset    = vaddr % TRACKER_REGION_SIZE;
+	while (remaining != 0) {
+		const auto  bytes   = std::min(TRACKER_REGION_SIZE - offset, remaining);
+		const auto* manager = m_regions[index].load(std::memory_order_acquire);
+		if (manager != nullptr && manager->IsGpuModifiedRelaxed(offset, bytes)) {
+			return true;
+		}
+		remaining -= bytes;
+		offset = 0;
+		index++;
+	}
+	return false;
+}
+
+bool MemoryTracker::GpuMirrorMatches(uint64_t vaddr, uint64_t size) {
+	bool matches = true;
+	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		matches = matches && manager->GpuMirrorMatches(offset, bytes);
+	});
+	return matches;
+}
+
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {

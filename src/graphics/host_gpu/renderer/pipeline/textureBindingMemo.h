@@ -111,14 +111,34 @@ public:
 	// Remembers the view FindTexture returned for a binding described by an entry.
 	void RecordView(const TextureBinding& binding, vk::ImageView view);
 
+	// KYTY_TEXTURE_MEMO_REVALIDATE (textureBindingMemo.cpp): the last TryResolve hit needed its
+	// entry revalidated for a new page version; with the verify mode on, the caller then compares
+	// it with the full resolution and reports a difference.
+	[[nodiscard]] bool        LastHitRevalidated() const noexcept { return m_last_revalidated; }
+	[[nodiscard]] static bool RevalidateVerify();
+	static void               ReportRevalidateMismatch();
+	// Always counted (the TextureBindingMemo* frame events need a connected profiler).
+	struct Totals {
+		uint64_t hits        = 0;
+		uint64_t stale       = 0;
+		uint64_t revalidated = 0;
+	};
+	[[nodiscard]] const Totals& GetTotals() const noexcept { return m_totals; }
+
 private:
 	struct Entry;
 	static constexpr uint32_t Slots = 4096;
 
 	[[nodiscard]] static bool RefreshIsNoOp(const Image& image);
+	// Whether a registered image other than `found` has exactly its backing range, extent and
+	// sample count on `page` (so SyncAliasFromOwner may copy into it). Caller holds cache.m_lock.
+	[[nodiscard]] static bool HasPartner(const TextureCache& cache, uint64_t page, ImageId found,
+	                                     const Image& image);
 
 	std::unique_ptr<Entry[]> m_entries;
-	uint64_t                 m_next_tag = 1;
+	uint64_t                 m_next_tag         = 1;
+	bool                     m_last_revalidated = false;
+	Totals                   m_totals;
 };
 
 } // namespace Libs::Graphics

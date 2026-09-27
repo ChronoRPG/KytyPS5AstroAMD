@@ -384,6 +384,121 @@ void TestGuestAddressSpaceOwnsReservationsBeforeBacking() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// KYTY_BACKING_INPLACE: CompareGpuCleanBacking / HashGpuCleanBacking see exactly the bytes a
+// copying backing read returns: inside one mapping (translated under the mapping lock once, then
+// lock-free from the per-thread mapping record), across two adjacent mappings whose backing is not
+// contiguous (gathered in guest order), and not at all once a mapping is gone.
+void TestBackingInPlaceInspection() {
+	namespace Memory  = Libs::LibKernel::Memory;
+	const char* test  = "BackingInPlaceInspection";
+	const auto  end   = Memory::KernelGetDirectMemorySize();
+	int64_t     first = 0;
+	int64_t     second = 0;
+	CheckOk(test,
+	        Memory::KernelAllocateDirectMemory(0, end, SceKernelPageSize, SceKernelPageSize,
+	                                           SceKernelMtypeC, &first),
+	        "KernelAllocateDirectMemory(first)");
+	CheckOk(test,
+	        Memory::KernelAllocateDirectMemory(0, end, SceKernelPageSize, SceKernelPageSize,
+	                                           SceKernelMtypeC, &second),
+	        "KernelAllocateDirectMemory(second)");
+	void* addr = nullptr;
+	CheckOk(test, Memory::KernelReserveVirtualRange(&addr, SceKernelPageSize * 2, 0, SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(addr);
+	// The lower page maps the second allocation, the upper one the first.
+	void* low  = addr;
+	void* high = reinterpret_cast<void*>(base + SceKernelPageSize);
+	CheckOk(test,
+	        Memory::KernelMapNamedDirectMemory(&low, SceKernelPageSize, SceKernelProtCpuRw,
+	                                           SceKernelMapFixed, second, SceKernelPageSize,
+	                                           "inplace_low"),
+	        "KernelMapNamedDirectMemory(low)");
+	CheckOk(test,
+	        Memory::KernelMapNamedDirectMemory(&high, SceKernelPageSize, SceKernelProtCpuRw,
+	                                           SceKernelMapFixed, first, SceKernelPageSize,
+	                                           "inplace_high"),
+	        "KernelMapNamedDirectMemory(high)");
+	Check(test, low == addr && high == reinterpret_cast<void*>(base + SceKernelPageSize),
+	      "fixed mappings moved");
+	auto* bytes = static_cast<uint8_t*>(addr);
+	for (uint64_t i = 0; i < SceKernelPageSize * 2; i++) {
+		bytes[i] = static_cast<uint8_t>(i * 131u + 7u);
+	}
+	const std::vector<uint8_t> expected(bytes, bytes + SceKernelPageSize * 2);
+	const auto digest_of = [&](uint64_t address, uint64_t size) {
+		std::vector<uint8_t> copy(size);
+		uint64_t             digest = 0;
+		Check(test, Memory::TryReadGpuCleanBackingDigest(address, copy.data(), size, digest),
+		      "copying digest read failed");
+		return digest;
+	};
+
+	Memory::InPlaceStats inside;
+	Check(test,
+	      Memory::CompareGpuCleanBacking(base + 0x100, expected.data() + 0x100, 0x1000, &inside) ==
+	              Memory::BackingCompare::Equal &&
+	          inside.inspected == 1,
+	      "inside one mapping: equal bytes did not compare equal");
+	Memory::InPlaceStats remembered;
+	Check(test,
+	      Memory::CompareGpuCleanBacking(base + 0x200, expected.data() + 0x200, 0x2000,
+	                                     &remembered) == Memory::BackingCompare::Equal &&
+	          remembered.inspected == 1 && remembered.locked == 0,
+	      "a second inspection inside a remembered mapping was not lock-free");
+	bytes[0x10ff] ^= 0x01u;
+	Check(test,
+	      Memory::CompareGpuCleanBacking(base + 0x100, expected.data() + 0x100, 0x1000) ==
+	          Memory::BackingCompare::Different,
+	      "a changed last byte compared equal");
+	bytes[0x10ff] ^= 0x01u;
+
+	const auto spanning = base + SceKernelPageSize - 0x80;
+	Memory::InPlaceStats gathered;
+	Check(test,
+	      Memory::CompareGpuCleanBacking(spanning, expected.data() + SceKernelPageSize - 0x80,
+	                                     0x100, &gathered) == Memory::BackingCompare::Equal &&
+	          gathered.locked == 1,
+	      "across two mappings: equal bytes did not compare equal under the mapping lock");
+	bytes[SceKernelPageSize + 0x10] ^= 0x20u;
+	Check(test,
+	      Memory::CompareGpuCleanBacking(spanning, expected.data() + SceKernelPageSize - 0x80,
+	                                     0x100) == Memory::BackingCompare::Different,
+	      "across two mappings: a changed byte of the second mapping compared equal");
+	uint64_t digest = 0;
+	Check(test,
+	      Memory::HashGpuCleanBacking(spanning, 0x100, digest) && digest == digest_of(spanning, 0x100),
+	      "across two mappings: the in-place digest differs from the copying one");
+	bytes[SceKernelPageSize + 0x10] ^= 0x20u;
+	Check(test,
+	      Memory::HashGpuCleanBacking(base, SceKernelPageSize * 2, digest) &&
+	          digest == digest_of(base, SceKernelPageSize * 2) &&
+	          Memory::HashGpuCleanBacking(base + 0x300, 0x40, digest) &&
+	          digest == digest_of(base + 0x300, 0x40),
+	      "the in-place digest differs from the copying one");
+
+	CheckOk(test, Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(high)");
+	std::vector<uint8_t> probe(0x100);
+	Check(test,
+	      Memory::CompareGpuCleanBacking(spanning, expected.data() + SceKernelPageSize - 0x80,
+	                                     0x100) == Memory::BackingCompare::Unavailable &&
+	          !Memory::HashGpuCleanBacking(spanning, 0x100, digest) &&
+	          !Memory::TryReadBacking(spanning, probe.data(), probe.size()),
+	      "a range reaching an unmapped page was inspected");
+	Check(test,
+	      Memory::CompareGpuCleanBacking(base + 0x100, expected.data() + 0x100, 0x1000) ==
+	          Memory::BackingCompare::Equal,
+	      "the remaining mapping no longer compares after its neighbor was unmapped");
+
+	CheckOk(test, Memory::KernelMunmap(base, SceKernelPageSize), "KernelMunmap(low)");
+	CheckOk(test, Memory::KernelReleaseDirectMemory(second, SceKernelPageSize),
+	        "KernelReleaseDirectMemory(second)");
+	CheckOk(test, Memory::KernelReleaseDirectMemory(first, SceKernelPageSize),
+	        "KernelReleaseDirectMemory(first)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestPrtBackingReadPreservesSparseResidency() {
 	const char*        test         = "PrtBackingReadPreservesSparseResidency";
 	constexpr uint64_t commit_size  = SceKernelMemoryPoolCommitLen;
@@ -3185,6 +3300,7 @@ int main(int argc, char** argv) {
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestPrtBackingReadPreservesSparseResidency);
+	RunTest(TestBackingInPlaceInspection);
 	RunTest(TestPrtReadDuringDirectCommit);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);

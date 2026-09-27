@@ -197,6 +197,16 @@ void TestRandomizedDifferential() {
                                   reference[index]),
             "randomized masked constructor diverged");
     }
+    // AnyInRange is exactly the masked copy's Any(), also for empty and out-of-range bounds.
+    Check(bits.AnyInRange(masked_start, masked_end) == masked.Any(),
+          "randomized AnyInRange diverged from the masked copy");
+    Check(Bits::AnyInRange(masked_start, masked_end,
+                           [&bits](size_t word) { return bits.Word(word); }) ==
+              masked.Any(),
+          "randomized word-accessor AnyInRange diverged from the masked copy");
+    const auto wide_end = masked_end + static_cast<size_t>(next_random() % 3);
+    Check(bits.AnyInRange(masked_start, wide_end) == Bits(bits, masked_start, wide_end).Any(),
+          "AnyInRange past the end diverged from the masked copy");
 
     size_t first_begin = 0;
     while (first_begin < reference.size() && !reference[first_begin]) {
@@ -276,6 +286,20 @@ void TestTrackerSizedRandomizedDifferential() {
     for (size_t index = 0; index < reference.size(); index++) {
       Check(bits.Get(index) == reference[index],
             "tracker-sized randomized bit state diverged");
+    }
+
+    // Page-run queries as the region manager makes them (IsModified, IsGpuModifiedRelaxed).
+    for (int query = 0; query < 4; query++) {
+      const auto start = static_cast<size_t>(next_random() % reference.size());
+      const auto end =
+          start + 1 + static_cast<size_t>(next_random() % (reference.size() - start));
+      bool any = false;
+      for (auto index = start; index < end; index++) {
+        any |= reference[index];
+      }
+      Check(bits.AnyInRange(start, end) == any &&
+                TrackerBits(bits, start, end).Any() == any,
+            "tracker-sized AnyInRange diverged");
     }
 
     size_t expected = 0;

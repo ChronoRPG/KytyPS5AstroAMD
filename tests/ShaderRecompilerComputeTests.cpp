@@ -193,6 +193,16 @@ struct BufferCacheTestAccess {
                                uint64_t size) {
     cache.m_gpu_modified_ranges.Subtract(address, size);
   }
+
+  // KYTY_BUFFER_RANGE_MEMO / KYTY_HOT_PAGE_CHECK_LIMIT.
+  static bool RangeMemoEnabled(const BufferCache &cache) {
+    return cache.m_range_memo != nullptr;
+  }
+  static uint32_t HotCheckLimit(const BufferCache &cache) { return cache.m_hot_check_limit; }
+  static BufferCache::RangeMemoTotals RangeMemoTotals(const BufferCache &cache) {
+    return cache.m_range_memo_totals;
+  }
+  static MemoryTracker &Tracker(BufferCache &cache) { return cache.m_memory_tracker; }
 };
 
 // Sets (or with nullptr removes) an environment switch read when a cache is constructed.
@@ -501,6 +511,23 @@ struct RenderExecutorTestAccess {
                  const ShaderRecompiler::IR::ImageResource &resource,
                  const ShaderRecompiler::IR::DescriptorValue &value) {
     return executor.ResolveTexture(resource, value);
+  }
+
+  // The full resolution without the texture binding memo (neither looked up nor recorded).
+  static TextureBinding
+  ResolveTextureFull(RenderExecutor &executor,
+                     const ShaderRecompiler::IR::ImageResource &resource,
+                     const ShaderRecompiler::IR::DescriptorValue &value) {
+    const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+    const auto key = TextureBindingMemo::MakeKey(resource, descriptor.fields);
+    TextureBinding binding;
+    executor.ResolveTextureFull(resource, descriptor, key, TextureBindingMemo::Hash(key), false,
+                                binding);
+    return binding;
+  }
+
+  static TextureBindingMemo::Totals TextureMemoTotals(const RenderExecutor &executor) {
+    return executor.m_texture_memo.GetTotals();
   }
 
   static auto PrepareGraphicsBindings(RenderExecutor &executor,
@@ -5137,6 +5164,200 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // KYTY_BUFFER_RANGE_MEMO: read bindings of a range whose tracker bits did not change skip the
+  // tracker work (a clean range's synchronization, a small range's stream decision) and still
+  // bind what the full path binds; every CPU write fault makes them look again.
+  // KYTY_HOT_PAGE_CHECK_LIMIT: a hot page that many uploads in a row found unchanged returns to
+  // fault tracking, clean; a write while it is hot, and after it settled, still reaches the GPU.
+  // Both adapt to their switches being off (then only the contents are checked).
+  void CheckBufferRangeMemo() {
+    constexpr const char *name = "BufferRangeMemo";
+    constexpr uintptr_t base = 0x0000000206400000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t large_offset = 0x10000;
+    constexpr uint64_t large_size = 0x8000; // above CACHING_PAGESIZE: never a stream copy
+    constexpr uint64_t small_offset = 0x40000;
+    constexpr uint64_t small_size = 0x100;
+    constexpr uint64_t hot_offset = large_offset + 0x2000;
+    static_assert(large_size > BufferCache::CACHING_PAGESIZE &&
+                  small_size <= BufferCache::CACHING_PAGESIZE);
+
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "range-memo direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "range-memo fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    for (uint64_t index = 0; index < allocation_size; index++) {
+      memory[index] = static_cast<uint8_t>((index * 13 + index / 4096) & 0xffu);
+    }
+
+    {
+      auto &cache = context.GetBufferCache();
+      auto &tracker = BufferCacheTestAccess::Tracker(cache);
+      context.MapMemory(base, allocation_size);
+      const bool memo_on = BufferCacheTestAccess::RangeMemoEnabled(cache);
+      const auto limit = BufferCacheTestAccess::HotCheckLimit(cache);
+      const auto totals = [&] { return BufferCacheTestAccess::RangeMemoTotals(cache); };
+      const auto read_native = [&](const Libs::Graphics::Buffer &buffer, uint64_t offset,
+                                   uint64_t bytes) {
+        auto readback = CreateHostBuffer(name, bytes, vk::BufferUsageFlagBits::eTransferDst, {0});
+        const vk::BufferCopy copy{offset, 0, bytes};
+        scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                                     vk::PipelineStageFlagBits::eHost, {}, 0,
+                                                     nullptr, 1, &barrier, 0, nullptr);
+        scheduler.Finish();
+        auto words = ReadBuffer(name, readback, static_cast<uint32_t>(bytes / 4));
+        DestroyBuffer(&readback);
+        return words;
+      };
+      // The native bytes of [base + offset, + bytes) as a read binding of the large range sees
+      // them, compared with guest memory.
+      const auto large_matches = [&](const char *stage) {
+        const auto [buffer, offset] =
+            cache.ObtainBuffer(base + large_offset, large_size, false, false);
+        const auto words = read_native(*buffer, offset, large_size);
+        Require(name, stage,
+                std::memcmp(words.data(), memory + large_offset, large_size) == 0,
+                "the bound range lost a CPU write or kept stale bytes");
+        return std::pair{buffer, offset};
+      };
+      const auto cpu_write = [&](uint64_t offset, uint32_t value) {
+        // As the guest does: the write faults on the protected page, then lands.
+        Require(name, "write fault",
+                context.HandleFault(PageFaultAccess::Write, base + offset),
+                "a CPU write to a tracked page did not fault through the tracker");
+        std::memcpy(memory + offset, &value, sizeof(value));
+      };
+
+      // A clean range: the first synchronization uploads, the second finds nothing and records
+      // it, the third skips it.
+      const auto first = large_matches("initial upload");
+      const auto records0 = totals().records;
+      const auto [second_buffer, second_offset] =
+          cache.ObtainBuffer(base + large_offset, large_size, false, false);
+      const auto hits0 = totals().clean_hits;
+      const auto [third_buffer, third_offset] =
+          cache.ObtainBuffer(base + large_offset, large_size, false, false);
+      Require(name, "clean range reuse",
+              second_buffer == first.first && second_offset == first.second &&
+                  third_buffer == first.first && third_offset == first.second &&
+                  (!memo_on || (totals().records == records0 + 1 &&
+                                totals().clean_hits == hits0 + 1)),
+              "a clean range was not recorded once and then skipped, or bound elsewhere");
+
+      // A CPU write moves the signature: uploaded, then clean again.
+      cpu_write(large_offset + 0x100, 0x5a5aa5a5u);
+      const auto hits1 = totals().clean_hits;
+      (void)large_matches("write after a skipped synchronization");
+      Require(name, "write invalidates the fact", totals().clean_hits == hits1,
+              "a synchronization after a CPU write was skipped");
+      (void)cache.ObtainBuffer(base + large_offset, large_size, false, false);
+      (void)cache.ObtainBuffer(base + large_offset, large_size, false, false);
+      Require(name, "clean again", !memo_on || totals().clean_hits == hits1 + 1,
+              "the range was not skipped again once clean");
+
+      // A small CPU-dirty range is a stream copy every time; the decision is reused, the bytes
+      // are not.
+      auto &stream = cache.GetUtilityBuffer(Libs::Graphics::MemoryUsage::Stream);
+      const auto stream_read = [&](const char *stage) {
+        const auto [buffer, offset] =
+            cache.ObtainBuffer(base + small_offset, small_size, false, false);
+        Require(name, stage,
+                buffer == &stream &&
+                    std::memcmp(stream.Mapped().data() + offset, memory + small_offset,
+                                small_size) == 0,
+                "a small CPU-dirty read did not copy the current bytes");
+      };
+      const auto stream_hits0 = totals().stream_hits;
+      stream_read("first stream copy");
+      memory[small_offset + 7] ^= 0xffu; // CPU-dirty, hence writable: no fault
+      stream_read("stream copy after a write");
+      Require(name, "stream decision reuse",
+              !memo_on || totals().stream_hits == stream_hits0 + 1,
+              "a small CPU-dirty read did not reuse its stream decision");
+
+      // A hot page: a write fault in three consecutive frames promotes it (the third upload is
+      // its first hot one, which creates its shadow).
+      for (uint32_t frame = 0; frame < 3; frame++) {
+        cpu_write(hot_offset, 0x1000u + frame);
+        (void)large_matches("hot promotion frame");
+        cache.AdvanceFrame();
+      }
+      Require(name, "hot promotion",
+              tracker.HotPageCount() == 1 && tracker.IsRegionHot(base + hot_offset, 4096),
+              "three faulting frames did not promote the page");
+      if (limit != 0) {
+        const auto settles0 = totals().settles;
+        const auto unchanged_uploads = [&](uint32_t count) {
+          for (uint32_t check = 0; check < count; check++) {
+            (void)cache.ObtainBuffer(base + large_offset, large_size, false, false);
+          }
+        };
+        // limit - 1 unchanged uploads keep it hot; a write while hot (no fault) is uploaded
+        // and restarts the count.
+        unchanged_uploads(limit - 1);
+        Require(name, "hot below the limit",
+                tracker.HotPageCount() == 1 && totals().settles == settles0,
+                "a hot page settled before its unchanged-upload limit");
+        std::memcpy(memory + hot_offset, "HOT!", 4);
+        (void)large_matches("write to a hot page");
+        unchanged_uploads(limit - 1);
+        Require(name, "hot count restarts",
+                tracker.HotPageCount() == 1 && totals().settles == settles0,
+                "a change did not restart the unchanged-upload count");
+        unchanged_uploads(1);
+        Require(name, "hot page settles",
+                tracker.HotPageCount() == 0 && totals().settles == settles0 + 1 &&
+                    !tracker.IsRegionCpuModified(base + hot_offset, 4096),
+                "an unchanged hot page did not return to clean tracking at the limit");
+        // Settled pages are write-protected again: the next write faults and is uploaded.
+        cpu_write(hot_offset, 0x3000u);
+        (void)large_matches("write after settling");
+      }
+      scheduler.Finish();
+      context.UnmapMemory(base, allocation_size);
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "range-memo direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "range-memo direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok (memo %s, hot check limit %u)\n", name,
+                BufferCacheTestAccess::RangeMemoEnabled(context.GetBufferCache()) ? "on" : "off",
+                BufferCacheTestAccess::HotCheckLimit(context.GetBufferCache()));
+  }
+
   void CheckComputeMetaClearClassification() {
     constexpr const char *name = "ComputeMetaClearClassification";
     constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
@@ -9458,6 +9679,135 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // KYTY_TEXTURE_MEMO_REVALIDATE: a texture binding memo entry whose first 1 MiB page gets a new
+  // owner (another image registered on it) is revalidated with FindImage's own lookup and stays
+  // usable, same entry and view, while that lookup still returns the recorded image; the answer
+  // equals the full resolution. With the switch off the entry is dropped and re-recorded.
+  void CheckTextureMemoRevalidation() {
+    constexpr const char *name = "TextureMemoRevalidation";
+    constexpr uintptr_t base = 0x0000000206800000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "texture-memo direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "texture-memo fixed mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+    {
+      auto &executor = context.GetRenderExecutor();
+      auto &texture_cache = context.GetTextureCache();
+      context.MapMemory(base, allocation_size);
+      ShaderTextureResource descriptor{{
+          static_cast<uint32_t>(base >> 8u),
+          (static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8Srgb) << 20u) |
+              (((width - 1u) & 3u) << 30u),
+          ((width - 1u) >> 2u) | ((height - 1u) << 14u),
+          DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0, 0}};
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      const auto totals = [&] { return RenderExecutorTestAccess::TextureMemoTotals(executor); };
+      const auto resolve = [&] {
+        return RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      };
+
+      const auto first = resolve(); // full resolution, recorded
+      const auto t0 = totals();
+      const auto second = resolve();
+      Require(name, "memo hit",
+              first.image_id && second.image_id == first.image_id &&
+                  second.memo_tag != 0 && totals().hits == t0.hits + 1,
+              "an unchanged texture binding did not hit the memo");
+
+      // Another image registers on the same 1 MiB page (disjoint bytes).
+      ImageDesc other{};
+      other.type = BindingType::Texture;
+      other.info.data = {base + 0x80000, 16 * 16 * 4};
+      other.info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+      other.info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
+      other.info.type = Prospero::ImageType::kColor2D;
+      other.info.extent = {16, 16, 1};
+      other.info.resources = {1, 1};
+      other.info.pitch = 16;
+      other.info.bytes_per_block = 4;
+      other.info.samples = 1;
+      other.info.tile_mode = Prospero::TileMode::kLinear;
+      other.info.mip_layout[0] = {0, 16 * 16 * 4, 16, 16};
+      other.view_info.format = vk::Format::eR8G8B8A8Unorm;
+      other.view_info.type = vk::ImageViewType::e2D;
+      other.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      other.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto other_id = texture_cache.FindImage(other);
+      Require(name, "second image", other_id && other_id != first.image_id,
+              "the disjoint image was not created");
+
+      const char *setting = std::getenv("KYTY_TEXTURE_MEMO_REVALIDATE");
+      const bool revalidate = setting == nullptr || std::strcmp(setting, "0") != 0;
+      const auto t1 = totals();
+      const auto third = resolve();
+      const auto full = RenderExecutorTestAccess::ResolveTextureFull(executor, resource, value);
+      Require(name, "answer after the page changed",
+              third.image_id == first.image_id && full.image_id == first.image_id &&
+                  third.desc.view_info == full.desc.view_info &&
+                  third.desc.info.data == full.desc.info.data,
+              "the binding resolved to another image or description after an unrelated image "
+              "registered on its page");
+      if (revalidate) {
+        Require(name, "revalidated entry",
+                totals().revalidated == t1.revalidated + 1 && totals().hits == t1.hits + 1 &&
+                    third.memo_tag == second.memo_tag,
+                "the entry was not revalidated in place (same entry, same view)");
+        const auto t2 = totals();
+        (void)resolve();
+        Require(name, "plain hit at the new version",
+                totals().hits == t2.hits + 1 && totals().revalidated == t2.revalidated,
+                "a revalidated entry was not a plain hit at its new page version");
+      } else {
+        Require(name, "dropped entry",
+                totals().stale == t1.stale + 1 && totals().revalidated == t1.revalidated &&
+                    third.memo_tag != second.memo_tag,
+                "with revalidation off the entry was kept");
+      }
+      scheduler.Finish();
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "texture-memo mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "texture-memo allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorColorVolumeDiscovery() {
     constexpr const char *name = "RenderExecutorColorVolumeDiscovery";
     constexpr uintptr_t base = 0x0000000203e00000ull;
@@ -10022,16 +10372,43 @@ public:
       Require(name, "certified hash",
               !reads.Failed() && speculative.hash == expected && reads.Finish(),
               "the speculative preparation failed or hashed other bytes");
+      // By its bytes, or by its digest (KYTY_DRAW_PREP_CODE_DIGEST, default on).
       bool covered = false;
-      for (const auto &range : reads.Ranges()) {
-        covered |= range.begin <= code_address && range.end >= code_address + code_bytes;
+      for (const auto ranges : {reads.Ranges(), reads.DigestRanges()}) {
+        for (const auto &range : ranges) {
+          covered |= range.begin <= code_address && range.end >= code_address + code_bytes;
+        }
       }
-      Require(name, "certificate covers the code", covered,
-              "no certified range covers every code byte");
+      const auto *digest_setting = std::getenv("KYTY_DRAW_PREP_CODE_DIGEST");
+      const bool digest = digest_setting == nullptr || std::strcmp(digest_setting, "0") != 0;
+      Require(name, "certificate covers the code",
+              covered && (reads.DigestRanges().empty() != digest) &&
+                  (!digest || reads.ByteCount() < code_bytes),
+              "no certified range covers every code byte, or the code was certified the wrong "
+              "way (bytes recorded with digests on, or no digest)");
       std::vector<uint8_t> scratch;
+      // KYTY_BACKING_INPLACE: the in-place validation decides as the copying one.
+      const auto in_place = [](const DrawPrep::ReadSet &set) {
+        return set.ValidateInPlace(
+            [](uint64_t address, const uint8_t *expected, uint64_t size) {
+              switch (LibKernel::Memory::CompareGpuCleanBacking(address, expected, size)) {
+              case LibKernel::Memory::BackingCompare::Equal:
+                return DrawPrep::ValidateResult::Ok;
+              case LibKernel::Memory::BackingCompare::Different:
+                return DrawPrep::ValidateResult::Changed;
+              case LibKernel::Memory::BackingCompare::Unavailable:
+                break;
+              }
+              return DrawPrep::ValidateResult::Unclean;
+            },
+            [](uint64_t address, uint64_t size, uint64_t &digest) {
+              return LibKernel::Memory::HashGpuCleanBacking(address, size, digest);
+            });
+      };
       Require(name, "unchanged certificate",
               reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
-                  DrawPrep::ValidateResult::Ok,
+                      DrawPrep::ValidateResult::Ok &&
+                  in_place(reads) == DrawPrep::ValidateResult::Ok,
               "the certificate rejected unchanged code");
 
       // One changed code byte, in the second page of the code.
@@ -10039,12 +10416,14 @@ public:
       changed ^= 0x40u;
       Require(name, "changed certificate",
               reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
-                  DrawPrep::ValidateResult::Changed,
+                      DrawPrep::ValidateResult::Changed &&
+                  in_place(reads) == DrawPrep::ValidateResult::Changed,
               "the certificate accepted changed code");
       changed ^= 0x40u;
       Require(name, "restored certificate",
               reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
-                  DrawPrep::ValidateResult::Ok,
+                      DrawPrep::ValidateResult::Ok &&
+                  in_place(reads) == DrawPrep::ValidateResult::Ok,
               "the certificate rejected code restored to the recorded bytes");
 
       // GPU-owned code bytes are not clean for a backing read: the preparation fails (the
@@ -10058,7 +10437,8 @@ public:
       Require(name, "unclean code",
               unclean.Failure() == DrawPrep::ReadFailure::Unclean &&
                   reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
-                      DrawPrep::ValidateResult::Unclean,
+                      DrawPrep::ValidateResult::Unclean &&
+                  in_place(reads) == DrawPrep::ValidateResult::Unclean,
               "GPU-owned code bytes were certified");
       BufferCacheTestAccess::SubtractGpuDirty(cache, code_address + 0x40, 4);
       CleanVerdict::Invalidate(code_address + 0x40, 4, Coherence::Source::Test);
@@ -37096,6 +37476,16 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-range-memo-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBufferRangeMemo();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--texture-memo-revalidate-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTextureMemoRevalidation();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--draw-prep-code-cert-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDrawPrepCertifiedShaderHash();
@@ -37298,6 +37688,7 @@ int main(int argc, char **argv) {
   vulkan.CheckDrawPrepCertifiedShaderHash();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckDrawPrepEngineDraw();
+  vulkan.CheckTextureMemoRevalidation();
   vulkan.CheckRenderExecutorColorDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
   vulkan.CheckRenderExecutorDccFixedClearFloat();
@@ -37311,6 +37702,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRasterization(false);
   vulkan.CheckRasterization(false, true);
   vulkan.CheckBufferCacheDirtyGarbageCollection();
+  vulkan.CheckBufferRangeMemo();
   vulkan.CheckEagerReadback();
 #endif
   vulkan.CheckUnifiedImageViewCache();

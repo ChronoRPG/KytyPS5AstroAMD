@@ -110,6 +110,28 @@ void                   SetFlexibleMemorySize(uint64_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// TryReadGpuCleanBacking that also returns the XXH3-64 digest of the bytes read. Inside a
+// draw-prep preparation the read is certified by that digest instead of its bytes
+// (DrawPrep::ReadSet::RecordDigest): only for bytes the preparation merely hashes.
+bool TryReadGpuCleanBackingDigest(uint64_t vaddr, void* data, uint64_t size, uint64_t& digest);
+// In-place variants (KYTY_BACKING_INPLACE, default on): the same clean gate as
+// TryReadGpuCleanBacking, then the backing bytes are compared or hashed where they are, through a
+// lock-free mapping lookup, instead of being copied into a destination first. The bytes seen are
+// exactly those a TryReadGpuCleanBacking at the same moment would have returned.
+[[nodiscard]] bool BackingInPlaceEnabled();
+enum class BackingCompare : uint8_t { Unavailable, Equal, Different };
+struct InPlaceStats {
+	uint32_t inspected = 0; // ranges inspected in place
+	uint32_t locked    = 0; // of those, inspected under the mapping lock
+};
+// Outside draw-prep preparations only (no active recorder). Unavailable when the range is not
+// clean for a backing read or has no backing.
+[[nodiscard]] BackingCompare CompareGpuCleanBacking(uint64_t vaddr, const void* expected,
+                                                    uint64_t size, InPlaceStats* stats = nullptr);
+// The XXH3-64 digest of the clean backing bytes. Inside a draw-prep preparation the read is gated
+// and certified by that digest exactly as TryReadGpuCleanBackingDigest does, without a copy.
+bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
+                         InPlaceStats* stats = nullptr);
 // The clean verdict of TryReadGpuCleanBacking without reading bytes (GPU thread; true for
 // ranges outside GPU memory).
 [[nodiscard]] bool     IsGpuCleanForRead(uint64_t vaddr, uint64_t size);

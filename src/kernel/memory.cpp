@@ -904,7 +904,8 @@ static bool QueryGpuCleanVerdict(uint64_t vaddr, uint64_t size) {
 	return result.clean;
 }
 
-static bool TryReadGpuCleanBackingExact(uint64_t vaddr, void* data, uint64_t size) {
+// The GPU-ownership gate of an exact clean backing read.
+static bool GpuCleanGate(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		// A draw-preparation helper may probe only inside a GPU-thread fork window
 		// (gpuReadDelegate.h), during which the GPU-thread-owned dirty state is stable.
@@ -915,7 +916,82 @@ static bool TryReadGpuCleanBackingExact(uint64_t vaddr, void* data, uint64_t siz
 			return false;
 		}
 	}
-	return TryReadBacking(vaddr, data, size);
+	return true;
+}
+
+static bool TryReadGpuCleanBackingExact(uint64_t vaddr, void* data, uint64_t size) {
+	return GpuCleanGate(vaddr, size) && TryReadBacking(vaddr, data, size);
+}
+
+bool BackingInPlaceEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_BACKING_INPLACE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// inspect(bytes) reads the backing bytes of the range in place (GuestBackingStore::
+// TryInspectBacking; it may run twice).
+template <typename Inspect>
+static bool TryInspectBacking(uint64_t vaddr, uint64_t size, Inspect& inspect,
+                              InPlaceStats* stats) {
+	bool       locked = false;
+	const bool done   = g_guest_address_space != nullptr &&
+	                  g_guest_address_space->TryInspectBacking(vaddr, size, inspect, &locked);
+	if (stats != nullptr) {
+		stats->inspected++;
+		stats->locked += locked ? 1u : 0u;
+	}
+	return done;
+}
+
+// KYTY_DRAW_PREP_LOCKFREE_HINT (default on): the GPU-dirty hint of preparing workers reads the
+// tracker's lock-free mirror of the GPU-dirty bits instead of taking the region locks the GPU
+// thread takes for every binding. The hint only decides whether a worker computes on the bytes at
+// all: it was a racy snapshot already (the GPU thread may mark a range right after it), and the
+// commit decides with the exact predicate either way. KYTY_DRAW_PREP_LOCKFREE_HINT_VERIFY=1|exit
+// also takes the locks and checks the mirror against the bits (equal under the locks).
+static bool LockFreeHintEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DRAW_PREP_LOCKFREE_HINT");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+static int LockFreeHintVerifyMode() {
+	static const int mode = [] {
+		const auto* value = std::getenv("KYTY_DRAW_PREP_LOCKFREE_HINT_VERIFY");
+		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
+			return 0;
+		}
+		return std::strcmp(value, "exit") == 0 ? 2 : 1;
+	}();
+	return mode;
+}
+
+static bool GpuDirtyHint(Graphics::BufferCache& buffers, uint64_t vaddr, uint64_t size) {
+	if (!LockFreeHintEnabled()) {
+		return buffers.IsRegionGpuModified(vaddr, size);
+	}
+	const bool dirty = buffers.IsRegionGpuModifiedRelaxed(vaddr, size);
+	if (LockFreeHintVerifyMode() != 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepHintVerifyChecks);
+		if (!buffers.GpuDirtyMirrorMatches(vaddr, size)) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepHintVerifyMismatches);
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+				LOGF("DrawPrepHintVerify: GPU-dirty mirror differs from the tracker bits: "
+				     "addr=0x%016" PRIx64 " size=0x%" PRIx64 "\n",
+				     vaddr, size);
+			}
+			if (LockFreeHintVerifyMode() == 2) {
+				EXIT("DrawPrepHintVerify: GPU-dirty mirror differs from the tracker bits\n");
+			}
+		}
+	}
+	return dirty;
 }
 
 // Draw-prep (readSet.h): every read of a speculative draw preparation is recorded for its
@@ -925,33 +1001,53 @@ static bool TryReadGpuCleanBackingExact(uint64_t vaddr, void* data, uint64_t siz
 // publications) so that they rarely compute on stale bytes, and the commit re-validates every
 // range with the exact predicate. The hint does not consult the texture cache: a range owned by
 // a GPU-modified image is caught at commit.
-static bool TryReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, void* data,
-                               uint64_t size) {
+// The gate of a draw-prep read: the failure it takes, None when the backing may be read.
+static Graphics::DrawPrep::ReadFailure DrawPrepGate(const Graphics::DrawPrep::Recorder& recorder,
+                                                    uint64_t vaddr, uint64_t size) {
+	using Graphics::DrawPrep::ReadFailure;
+	if (recorder.exact) {
+		return GpuCleanGate(vaddr, size) ? ReadFailure::None : ReadFailure::Unclean;
+	}
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		auto& buffers = GetGpuResources().GetBufferCache();
+		if (GpuDirtyHint(buffers, vaddr, size) || buffers.HasPendingBackingPublication(vaddr, size)) {
+			return ReadFailure::Unclean;
+		}
+	}
+	return ReadFailure::None;
+}
+
+// A backing read that failed after the gate (exact reads fail as Unclean, as before).
+static Graphics::DrawPrep::ReadFailure DrawPrepBackingFailure(
+    const Graphics::DrawPrep::Recorder& recorder) {
+	using Graphics::DrawPrep::ReadFailure;
+	return recorder.exact ? ReadFailure::Unclean : ReadFailure::Backing;
+}
+
+// The gated read of TryReadForDrawPrep, without recording it. False (and a failed read set) when
+// it cannot be served.
+static bool ReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, void* data,
+                            uint64_t size) {
 	using Graphics::DrawPrep::ReadFailure;
 	auto& reads = *recorder.reads;
 	if (reads.Failed()) {
 		return false;
 	}
-	if (recorder.exact) {
-		if (!TryReadGpuCleanBackingExact(vaddr, data, size)) {
-			reads.Fail(ReadFailure::Unclean);
-			return false;
-		}
-	} else {
-		if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-			auto& buffers = GetGpuResources().GetBufferCache();
-			if (buffers.IsRegionGpuModified(vaddr, size) ||
-			    buffers.HasPendingBackingPublication(vaddr, size)) {
-				reads.Fail(ReadFailure::Unclean);
-				return false;
-			}
-		}
-		if (!TryReadBacking(vaddr, data, size)) {
-			reads.Fail(ReadFailure::Backing);
-			return false;
-		}
+	if (const auto failure = DrawPrepGate(recorder, vaddr, size); failure != ReadFailure::None) {
+		reads.Fail(failure);
+		return false;
 	}
-	return reads.Record(vaddr, data, size);
+	if (!TryReadBacking(vaddr, data, size)) {
+		reads.Fail(DrawPrepBackingFailure(recorder));
+		return false;
+	}
+	return true;
+}
+
+static bool TryReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, void* data,
+                               uint64_t size) {
+	return ReadForDrawPrep(recorder, vaddr, data, size) &&
+	       recorder.reads->Record(vaddr, data, size);
 }
 
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -959,6 +1055,61 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return TryReadForDrawPrep(*recorder, vaddr, data, size);
 	}
 	return TryReadGpuCleanBackingExact(vaddr, data, size);
+}
+
+bool TryReadGpuCleanBackingDigest(uint64_t vaddr, void* data, uint64_t size, uint64_t& digest) {
+	auto* recorder = Graphics::DrawPrep::ActiveRecorder();
+	if (recorder == nullptr) {
+		if (!TryReadGpuCleanBackingExact(vaddr, data, size)) {
+			return false;
+		}
+		digest = XXH3_64bits(data, size);
+		return true;
+	}
+	if (!ReadForDrawPrep(*recorder, vaddr, data, size)) {
+		return false;
+	}
+	digest = XXH3_64bits(data, size);
+	return recorder->reads->RecordDigest(vaddr, size, digest);
+}
+
+BackingCompare CompareGpuCleanBacking(uint64_t vaddr, const void* expected, uint64_t size,
+                                      InPlaceStats* stats) {
+	// A preparation must record what it reads (TryReadGpuCleanBacking).
+	EXIT_IF(Graphics::DrawPrep::ActiveRecorder() != nullptr);
+	if (!GpuCleanGate(vaddr, size)) {
+		return BackingCompare::Unavailable;
+	}
+	bool equal   = false;
+	auto compare = [&](const uint8_t* bytes) {
+		equal = std::memcmp(bytes, expected, static_cast<size_t>(size)) == 0;
+	};
+	if (!TryInspectBacking(vaddr, size, compare, stats)) {
+		return BackingCompare::Unavailable;
+	}
+	return equal ? BackingCompare::Equal : BackingCompare::Different;
+}
+
+bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest, InPlaceStats* stats) {
+	auto hash = [&](const uint8_t* bytes) { digest = XXH3_64bits(bytes, static_cast<size_t>(size)); };
+	auto* recorder = Graphics::DrawPrep::ActiveRecorder();
+	if (recorder == nullptr) {
+		return GpuCleanGate(vaddr, size) && TryInspectBacking(vaddr, size, hash, stats);
+	}
+	using Graphics::DrawPrep::ReadFailure;
+	auto& reads = *recorder->reads;
+	if (reads.Failed()) {
+		return false;
+	}
+	if (const auto failure = DrawPrepGate(*recorder, vaddr, size); failure != ReadFailure::None) {
+		reads.Fail(failure);
+		return false;
+	}
+	if (!TryInspectBacking(vaddr, size, hash, stats)) {
+		reads.Fail(DrawPrepBackingFailure(*recorder));
+		return false;
+	}
+	return reads.RecordDigest(vaddr, size, digest);
 }
 
 bool IsGpuCleanForRead(uint64_t vaddr, uint64_t size) {
