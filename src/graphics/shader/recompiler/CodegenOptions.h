@@ -13,6 +13,9 @@ struct CodegenOptions {
 	// KYTY_MOVREL_RANGE=0: keep V_MOVRELS/V_MOVRELD select chains over every VGPR above the base
 	// instead of folding the compares that the M0 value set proves false.
 	bool movrel_range = true;
+	// KYTY_FAST_FMINMAX=0: emulate f32 min/max/min3/max3/med3 with two bit classifications per
+	// min/max instead of one compare-and-select plus a single two-zeros test.
+	bool fast_float_min_max = true;
 };
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();

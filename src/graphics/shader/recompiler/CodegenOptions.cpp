@@ -18,6 +18,7 @@ bool EnvFlag(const char* name, bool default_value) {
 CodegenOptions FromEnvironment() {
 	CodegenOptions options;
 	options.movrel_range = EnvFlag("KYTY_MOVREL_RANGE", options.movrel_range);
+	options.fast_float_min_max = EnvFlag("KYTY_FAST_FMINMAX", options.fast_float_min_max);
 	return options;
 }
 
