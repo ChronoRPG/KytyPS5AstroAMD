@@ -1632,23 +1632,33 @@ struct PipelineCache::ProgramCache {
 		return true;
 	}
 
+	// Translations dropped under m_programs_mutex. The caller frees them after releasing the lock:
+	// freeing a large IR program takes long enough to delay shared-lock readers (draw-prep
+	// workers' FindSource) if done under it.
+	using DroppedTranslations = std::vector<std::shared_ptr<const KeptTranslation>>;
+
 	// Requires m_programs_mutex exclusively. Keeps `kept` for `source` (unless it already has one
 	// or verification disabled it) and evicts least recently used translations over the budget.
-	void KeepTranslation(SourceEntry& source, std::shared_ptr<const KeptTranslation> kept) {
-		if (kept == nullptr || source.kept_translation != nullptr || source.kept_disabled) return;
+	void KeepTranslation(SourceEntry& source, std::shared_ptr<const KeptTranslation> kept,
+	                     DroppedTranslations& dropped) {
+		if (kept == nullptr) return;
+		if (source.kept_translation != nullptr || source.kept_disabled) {
+			dropped.push_back(std::move(kept));
+			return;
+		}
 		kept_bytes += kept->bytes;
 		source.kept_translation = std::move(kept);
 		source.kept_position    = kept_lru.insert(kept_lru.end(), &source);
 		while (kept_bytes > TranslationCacheBudget() && !kept_lru.empty()) {
-			ForgetTranslation(*kept_lru.front());
+			ForgetTranslation(*kept_lru.front(), dropped);
 		}
 	}
 
 	// Requires m_programs_mutex exclusively. Threads already copying it keep their reference.
-	void ForgetTranslation(SourceEntry& source) {
+	void ForgetTranslation(SourceEntry& source, DroppedTranslations& dropped) {
 		if (source.kept_translation == nullptr) return;
 		kept_bytes -= source.kept_translation->bytes;
-		source.kept_translation.reset();
+		dropped.push_back(std::move(source.kept_translation)); // Leaves it empty.
 		kept_lru.erase(source.kept_position);
 	}
 
@@ -1762,8 +1772,10 @@ struct PipelineCache::ProgramCache {
 			if (ResourceReuseEnabled()) source.reuse.current.permutation_index = permutation.index;
 			return &permutation;
 		};
-		std::unique_lock lock(m_programs_mutex);
-		SourceEntry*     source = nullptr;
+		// Declared before `lock`, so destroyed after it is released on every return.
+		DroppedTranslations dropped;
+		std::unique_lock    lock(m_programs_mutex);
+		SourceEntry*        source = nullptr;
 		for (;;) {
 			// Another preparer may have inserted or compiled this source since the shared lookup.
 			const auto entry = programs.find(key);
@@ -1875,12 +1887,15 @@ struct PipelineCache::ProgramCache {
 			                           push_data_cursor)) {
 				times.reused = false;
 				lock.lock();
-				ForgetTranslation(*source);
+				ForgetTranslation(*source, dropped);
 				source->kept_disabled = true;
 				lock.unlock();
 			}
 			times.clone_ns = CompileClockNs() - clone_begin;
 		}
+		// Released unlocked: it may be the last reference to a translation evicted meanwhile.
+		const bool had_kept = kept != nullptr;
+		kept.reset();
 		std::shared_ptr<KeptTranslation> keep;
 		if (!times.reused) {
 			const auto translate_begin = CompileClockNs();
@@ -1891,7 +1906,7 @@ struct PipelineCache::ProgramCache {
 			times.translate_ns = CompileClockNs() - translate_begin;
 			// Keep an unmodified copy for this source's later permutations, taken before
 			// anything below (plan extraction, specialization) reads or changes the program.
-			if (TranslationCacheEnabled() && kept == nullptr && !translated.skip_dispatch) {
+			if (TranslationCacheEnabled() && !had_kept && !translated.skip_dispatch) {
 				const auto copy_begin = CompileClockNs();
 				auto       copy       = std::make_shared<KeptTranslation>();
 				if (CopyTranslation(translated, copy->translated)) {
@@ -1916,8 +1931,9 @@ struct PipelineCache::ProgramCache {
 			// Nobody else inserts this key while `record` covers it.
 			source        = &programs.try_emplace(key, std::move(plan)).first->second;
 			record.source = source; // Still covers every permutation of it.
-			KeepTranslation(*source, std::move(keep));
+			KeepTranslation(*source, std::move(keep), dropped);
 			lock.unlock();
+			dropped.clear();
 			const bool materialized =
 			    Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
 			lock.lock();
@@ -1936,7 +1952,8 @@ struct PipelineCache::ProgramCache {
 		                                   prep.specialization, push_data_cursor,
 		                                   key.static_state, times);
 		lock.lock();
-		KeepTranslation(*source, std::move(keep)); // An existing source that had none kept.
+		// An existing source that had none kept. Anything dropped is freed after the lock.
+		KeepTranslation(*source, std::move(keep), dropped);
 		if (const auto* published =
 		        FindPermutation(*source, prep.specialization, push_data_cursor, true)) {
 			// Only possible when another cursor mapped to the same push-data start (both
