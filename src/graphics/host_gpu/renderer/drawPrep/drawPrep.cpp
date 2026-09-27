@@ -140,8 +140,13 @@ Totals& GetTotals() {
 
 Mode GetMode() {
 	static const Mode mode = [] {
+		// Parallel by default: checked against the serial path (KYTY_DRAW_PREP_VERIFY) with no
+		// mismatch in Astro Bot's Sky Garden, pool, hub and desert (U48-U50). =off reverts.
 		const auto* value = EnvValue("KYTY_DRAW_PREP");
-		if (value == nullptr || std::strcmp(value, "off") == 0 || std::strcmp(value, "0") == 0) {
+		if (value == nullptr) {
+			return Mode::Parallel;
+		}
+		if (std::strcmp(value, "off") == 0 || std::strcmp(value, "0") == 0) {
 			return Mode::Off;
 		}
 		if (std::strcmp(value, "inline") == 0) {
