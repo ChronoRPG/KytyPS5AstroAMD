@@ -324,7 +324,7 @@ endforeach()
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 set(gpu_dcc_generated_dir "${PROJECT_BINARY_DIR}/gpu_dcc_shaders")
-set(gpu_dcc_shader_names validate clear_rgba16f occlusion)
+set(gpu_dcc_shader_names validate clear occlusion)
 foreach(shader_name IN LISTS gpu_dcc_shader_names)
 	set(shader_source "${gpu_tiler_shader_dir}/gpu_dcc_${shader_name}.comp")
 	set(shader_spv "${gpu_dcc_generated_dir}/gpu_dcc_${shader_name}.spv")

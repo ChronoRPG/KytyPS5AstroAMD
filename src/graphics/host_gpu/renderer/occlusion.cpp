@@ -7,7 +7,10 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
+#include <algorithm>
 #include <array>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -75,14 +78,72 @@ void OcclusionCounter::Initialize() {
 	scheduler.Current().Handle().fillBuffer(m_counter->Handle(), 0, 256, 0);
 }
 
+bool OcclusionCounter::GateEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_OCCLUSION_GATE");
+		const bool  on    = value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+		if (Enabled()) {
+			std::printf("Occlusion counter: dump-pair gate %s (KYTY_OCCLUSION_GATE)\n",
+			            on ? "on" : "off");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+bool OcclusionCounter::WouldCount(uint32_t control) const noexcept {
+	return Enabled() && ControlCounts(control) && GateOpen();
+}
+
+void OcclusionCounter::BreakGate(const char* reason, uint64_t address) {
+	if (m_gate_broken) return;
+	m_gate_broken = true;
+	m_open_pairs.clear();
+	std::printf("Occlusion counter: dump-pair gate disabled (%s, address=0x%016" PRIx64
+	            "); counting every instance from now on\n",
+	            reason, address);
+	std::fflush(stdout);
+}
+
+void OcclusionCounter::UpdateOpenPairs(uint64_t address) {
+	if (!GateEnabled() || m_gate_broken) return;
+	const auto begin = address & ~uint64_t {0xf};
+	const auto found = std::find(m_open_pairs.begin(), m_open_pairs.end(), begin);
+	if ((address & 0xfu) == 0) {
+		// Begin dump: every instance until its end dump is counted. A repeated begin at an open
+		// pair keeps it open (its later end still differs against the newest begin).
+		if (found == m_open_pairs.end()) {
+			if (m_open_pairs.size() >= MaxOpenPairs) {
+				BreakGate("too many open dump pairs", address);
+				return;
+			}
+			m_open_pairs.push_back(begin);
+		}
+	} else if ((address & 0xfu) == 8u) {
+		if (found == m_open_pairs.end()) {
+			// An end without an observed begin: its begin value may predate gated instances.
+			BreakGate("end dump without an open begin", address);
+			return;
+		}
+		m_open_pairs.erase(found);
+	} else {
+		BreakGate("dump address outside the begin/end pair layout", address);
+	}
+}
+
 void OcclusionCounter::Prepare(uint32_t control) {
 	EXIT_IF(m_active || m_pending >= QueryCapacity);
 	m_prepared = false;
-	if (!Enabled() || (control & 1u) != 0 || (control & 0xf00u) == 0) return;
+	if (!Enabled() || !ControlCounts(control)) return;
 	// GFX10 ZPASS enable 1 counts all samples. Other counter selectors and slice
 	// filtering require additional emulation; never report them as invisibility.
 	if ((control & 0x00ffff00u) != 0x100u || (control >> 24u) != 0x11u) {
 		EXIT("unsupported occlusion counter mode: DB_COUNT_CONTROL=0x%08x\n", control);
+	}
+	if (!GateOpen()) {
+		// No dump pair is open: nothing counted here can reach a value the guest reads.
+		Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionScopesGated);
+		return;
 	}
 	Initialize();
 	m_context.GetCommandScheduler().Current().Handle().resetQueryPool(m_pool, m_pending, 1);
@@ -201,6 +262,9 @@ bool OcclusionCounter::Dump(uint64_t address) {
 		m_published.fetch_add(1, std::memory_order_release);
 	});
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionDumps);
+	// Rendering has ended above and the value is published from everything counted so far: a
+	// begin opens its pair for the instances that follow, an end closes it after its snapshot.
+	UpdateOpenPairs(address);
 	if (HangTrace::Enabled()) {
 		HangTrace::OcclusionEvent event;
 		event.event         = "dump";

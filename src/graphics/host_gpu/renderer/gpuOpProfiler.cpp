@@ -134,6 +134,8 @@ void LinkSite(Site& site) noexcept {
 	// Leaked on purpose: Tracy keeps plot name pointers for the whole session.
 	auto* plot_name = new std::string(fmt::format("GpuOps.Barriers.{}", site.name));
 	site.plot_name  = plot_name->c_str();
+	auto* end_plot_name = new std::string(fmt::format("GpuOps.EndRendering.{}", site.name));
+	site.end_plot_name  = end_plot_name->c_str();
 	Site* head      = g_sites.load(std::memory_order_relaxed);
 	do {
 		site.next.store(head, std::memory_order_relaxed);
@@ -149,6 +151,7 @@ struct Counters {
 	std::atomic<uint64_t> barriers {0};
 	std::atomic<uint64_t> transitions {0};
 	std::atomic<uint64_t> command_buffers {0};
+	std::atomic<uint64_t> rendering_ends {0};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(BarrierBatchEvent::Count)> batch {};
 };
 Counters g_counters;
@@ -1739,6 +1742,12 @@ void CountBarrierBatch(BarrierBatchEvent event, uint64_t amount) noexcept {
 	}
 }
 
+void CountEndRendering() noexcept {
+	g_counters.rendering_ends.fetch_add(1, std::memory_order_relaxed);
+	auto* site = t_site != nullptr ? t_site : &g_unknown_site;
+	site->end_renderings.fetch_add(1, std::memory_order_relaxed);
+}
+
 } // namespace Detail
 
 bool Enabled() {
@@ -1906,7 +1915,11 @@ void OnGuestFlip() {
 	counts.barriers_elided       = take_batch(BarrierBatchEvent::Elided);
 	counts.barriers_sunk         = take_batch(BarrierBatchEvent::Sunk);
 	counts.barrier_render_splits = take_batch(BarrierBatchEvent::RenderSplits);
+	counts.draw_write_sinks      = take_batch(BarrierBatchEvent::DrawWriteSinks);
+	counts.rendering_ends = g_counters.rendering_ends.exchange(0, std::memory_order_relaxed);
 	HangTrace::RecordGpuOpCounts(counts);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuRenderingEnds, counts.rendering_ends);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuDrawWriteSinks, counts.draw_write_sinks);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuBarrierRequests, counts.barrier_requests);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuBarriersMerged, counts.barriers_merged);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuBarriersElided, counts.barriers_elided);
@@ -1924,6 +1937,10 @@ void OnGuestFlip() {
 		     site       = site->next.load(std::memory_order_relaxed)) {
 			TracyPlot(site->plot_name,
 			          static_cast<int64_t>(site->barriers.load(std::memory_order_relaxed)));
+			const auto ends = site->end_renderings.load(std::memory_order_relaxed);
+			if (ends != 0) {
+				TracyPlot(site->end_plot_name, static_cast<int64_t>(ends));
+			}
 		}
 	}
 }

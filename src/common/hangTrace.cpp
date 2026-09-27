@@ -272,6 +272,8 @@ struct Totals {
 	std::atomic<uint64_t> gpu_barriers_elided {0};
 	std::atomic<uint64_t> gpu_barriers_sunk {0};
 	std::atomic<uint64_t> gpu_barrier_rp_splits {0};
+	std::atomic<uint64_t> gpu_rendering_ends {0};
+	std::atomic<uint64_t> gpu_draw_write_sinks {0};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(TransferKind::Count)> transfer_count {};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(TransferKind::Count)> transfer_bytes {};
 };
@@ -673,6 +675,8 @@ void Publish() {
 			line += fmt::format(",{},{}", take(g_totals.transfer_count[kind]),
 			                    take(g_totals.transfer_bytes[kind]));
 		}
+		line += fmt::format(",{},{}", take(g_totals.gpu_rendering_ends),
+		                    take(g_totals.gpu_draw_write_sinks));
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
@@ -749,6 +753,7 @@ void Initialize() {
 	summary_header += ",xfer_image_uploads,xfer_image_upload_bytes,xfer_buffer_uploads,"
 	                  "xfer_buffer_upload_bytes,xfer_image_copies,xfer_image_copy_bytes,"
 	                  "xfer_alias_syncs,xfer_alias_sync_bytes";
+	summary_header += ",gpu_rendering_ends,gpu_draw_write_sinks";
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.transfers = OpenFile("transfers.csv",
 	                             "t_ms,kind,reason,detail,address,format,width,height,count,bytes,"
@@ -1387,6 +1392,8 @@ void RecordGpuOpCounts(const GpuOpCounts& counts) {
 	g_totals.gpu_barriers_sunk.fetch_add(counts.barriers_sunk, std::memory_order_relaxed);
 	g_totals.gpu_barrier_rp_splits.fetch_add(counts.barrier_render_splits,
 	                                         std::memory_order_relaxed);
+	g_totals.gpu_rendering_ends.fetch_add(counts.rendering_ends, std::memory_order_relaxed);
+	g_totals.gpu_draw_write_sinks.fetch_add(counts.draw_write_sinks, std::memory_order_relaxed);
 }
 
 } // namespace HangTrace

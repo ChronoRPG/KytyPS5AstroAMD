@@ -5,6 +5,7 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/lruCache.h"
+#include "common/profiler.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
@@ -115,6 +116,8 @@ private:
 	struct GpuDccInspection {
 		GuestRange metadata;
 		BufferContentRevision revision;
+		// Clear codes (DccClearHelper::ClearCodes bits) the inspected interpretation accepted.
+		uint32_t decodable_mask = 0;
 	};
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
@@ -176,8 +179,10 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
-	[[nodiscard]] bool TryMaterializeGpuDccClear(ImageId id, const ImageDesc& desc,
-	                                             uint32_t metadata_base_layer);
+	// Returns DccGpuRecords or DccGpuReuses when the native path handled every slice, otherwise
+	// the first failing reason (Profiler::FrameEvent::DccFallback*) for the CPU fallback.
+	[[nodiscard]] Profiler::FrameEvent TryMaterializeGpuDccClear(ImageId id, const ImageDesc& desc,
+	                                                             uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;

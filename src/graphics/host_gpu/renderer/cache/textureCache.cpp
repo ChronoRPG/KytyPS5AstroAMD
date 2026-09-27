@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <atomic>
 #include <bit>
 #include <cinttypes>
@@ -271,7 +272,9 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	const auto* gpu_dcc = std::getenv("KYTY_DCC_GPU");
 	if (gpu_dcc != nullptr && std::strcmp(gpu_dcc, "1") == 0) {
 		m_dcc_clear = std::make_unique<DccClearHelper>(graphics, scheduler);
-		LOGF("DCC materialization: GPU validation and conditional clear for eligible RGBA16F targets\n");
+		LOGF("DCC materialization: GPU validation and conditional clear (%s)\n",
+		     m_dcc_clear->Available() ? "any 8/16/32/64/128-bit color view format"
+		                              : "unavailable on this device");
 	}
 	const auto* policy = std::getenv("KYTY_IMAGE_CACHE_POLICY");
 	m_pressure_gc_enabled = policy != nullptr && std::strcmp(policy, "pressure") == 0;
@@ -1429,82 +1432,156 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 }
 
-bool TextureCache::TryMaterializeGpuDccClear(ImageId id, const ImageDesc& desc,
-                                              uint32_t metadata_base_layer) {
-	const auto metadata = desc.info.metadata.range;
-	const auto& view = desc.view_info;
-	if (!m_dcc_clear || view.format != vk::Format::eR16G16B16A16Sfloat ||
-	    desc.info.IsVolume() ||
-	    desc.info.resources.levels != 1 || desc.info.TransferLayers() != 1 ||
-	    view.base_level != 0 || view.level_count != 1 ||
-	    metadata_base_layer != 0 || view.base_layer != 0 || view.layer_count != 1 ||
-	    view.aspect != vk::ImageAspectFlagBits::eColor) {
-		return false;
+Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const ImageDesc& desc,
+                                                              uint32_t metadata_base_layer) {
+	using Event = Profiler::FrameEvent;
+	using Support = DccClearHelper::Support;
+	const auto  range = desc.info.metadata.range;
+	const auto& view  = desc.view_info;
+	if (!m_dcc_clear || !m_dcc_clear->Available()) {
+		return Event::DccFallbackDisabled;
 	}
-	{
-		std::scoped_lock lock {m_lock};
-		if (!FindImagesInRegion(metadata.address, metadata.size, false).empty()) return false;
-		const auto revision = m_buffer_cache.GetContentRevision(metadata.address, metadata.size);
-		const auto found = m_gpu_dcc_inspections.find(metadata.address);
-		if (revision && found != m_gpu_dcc_inspections.end() &&
-		    found->second.metadata == metadata && found->second.revision == *revision) {
-			// A prior full-range RGBA16F pass leaves FF, nonuniform bytes, or an unsupported
-			// code. None can trigger another RGBA16F clear, for any binding or alpha order.
-			// Skip only metadata processing: the caller still refreshes this image normally.
-			++m_gpu_dcc_reuses;
-			return true;
+	// The video-out path does not consume its clear key; keep it on the CPU inspection.
+	if (desc.type == BindingType::VideoOut) {
+		return Event::DccFallbackBinding;
+	}
+	const auto layers = desc.info.TransferLayers();
+	const auto first  = metadata_base_layer;
+	const auto count  = view.layer_count;
+	if (desc.info.IsVolume() || desc.info.resources.levels != 1 || desc.info.samples != 1 ||
+	    view.base_level != 0 || view.level_count != 1 ||
+	    view.aspect != vk::ImageAspectFlagBits::eColor ||
+	    (view.type != vk::ImageViewType::e2D && view.type != vk::ImageViewType::e2DArray) ||
+	    desc.info.metadata.compression != VideoOutCompression::Uncompressed || layers == 0 ||
+	    count == 0 || first >= layers || count > layers - first) {
+		return Event::DccFallbackShape;
+	}
+	// The CPU decoder's result for every clear code under this binding (ClearCodes order).
+	DccClearHelper::ClearValues values {};
+	uint32_t                    decodable = 0;
+	for (uint32_t index = 0; index < DccClearHelper::ClearCodes.size(); ++index) {
+		vk::ClearColorValue color {};
+		if (DecodeDccClear(desc, DccClearHelper::ClearCodes[index], color)) {
+			values[index] = color;
+			decodable |= 1u << index;
 		}
 	}
-	if (desc.type != BindingType::RenderTarget ||
-	    desc.info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
-	    desc.info.samples != 1 || view.type != vk::ImageViewType::e2D ||
-	    desc.info.metadata.compression != VideoOutCompression::Uncompressed ||
-	    ImageRangeOverlaps(metadata, desc.info.data)) return false;
-	const auto eligible = [&] {
-		const auto* image = m_slot_images.try_get(id);
-		return image != nullptr && image->registered && !image->depth_id &&
-		       image->info.data == desc.info.data && image->info.extent == desc.info.extent &&
-		       SafeToDownload(*image) && m_dcc_clear->Supports(*image, metadata.size) &&
-		       FindImagesInRegion(metadata.address, metadata.size, false).empty();
+	switch (m_dcc_clear->SupportsFormat(view.format)) {
+		case Support::Ok: break;
+		case Support::Disabled: return Event::DccFallbackDisabled;
+		case Support::Format: return Event::DccFallbackFormat;
+		case Support::Unsupported: return Event::DccFallbackUnsupported;
+	}
+	const auto slice_size = range.size / layers;
+	const auto slice_range = [&](uint32_t slice) {
+		return GuestRange {range.address + slice_size * (first + slice), slice_size};
 	};
 	{
 		std::scoped_lock lock {m_lock};
-		if (!eligible()) return false;
+		if (!FindImagesInRegion(range.address, range.size, false).empty()) {
+			return Event::DccFallbackMetadataAliased;
+		}
+		// A retained inspection of an unchanged slice leaves consumed keys (0xFF), nonuniform
+		// bytes or a code its interpretation rejected. An interpretation accepting no more codes
+		// than that one reads the same bytes to the same no-op, for any image or layer; only the
+		// metadata processing is skipped, the caller still refreshes this image normally.
+		bool reusable = true;
+		for (uint32_t slice = 0; reusable && slice < count; ++slice) {
+			const auto metadata = slice_range(slice);
+			const auto revision = m_buffer_cache.GetContentRevision(metadata.address, metadata.size);
+			const auto found    = m_gpu_dcc_inspections.find(metadata.address);
+			reusable = revision && found != m_gpu_dcc_inspections.end() &&
+			           found->second.metadata == metadata && found->second.revision == *revision &&
+			           (decodable & ~found->second.decodable_mask) == 0;
+		}
+		if (reusable) {
+			m_gpu_dcc_reuses += count;
+			Profiler::CountFrameEvent(Event::DccGpuReuses, count);
+			return Event::DccGpuReuses;
+		}
+	}
+	if (ImageRangeOverlaps(range, desc.info.data)) {
+		return Event::DccFallbackMetadataAliased;
+	}
+	const auto eligible = [&]() -> std::optional<Event> {
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered || image->depth_id ||
+		    image->info.data != desc.info.data || image->info.extent != desc.info.extent ||
+		    !SafeToDownload(*image)) {
+			return Event::DccFallbackImageState;
+		}
+		if (image->backing.extent.width != desc.info.extent.width ||
+		    image->backing.extent.height != desc.info.extent.height ||
+		    view.base_layer >= image->backing.layers ||
+		    count > image->backing.layers - view.base_layer) {
+			return Event::DccFallbackShape;
+		}
+		switch (m_dcc_clear->SupportsImage(*image, view.format, slice_size)) {
+			case Support::Ok: break;
+			case Support::Disabled: return Event::DccFallbackDisabled;
+			case Support::Format: return Event::DccFallbackFormat;
+			case Support::Unsupported: return Event::DccFallbackUnsupported;
+		}
+		if (!FindImagesInRegion(range.address, range.size, false).empty()) {
+			return Event::DccFallbackMetadataAliased;
+		}
+		return std::nullopt;
+	};
+	{
+		std::scoped_lock lock {m_lock};
+		if (const auto reason = eligible()) return *reason;
 	}
 	// Use the canonical buffer and its normal GPU-write tracking. No CPU shadow of the
 	// clear value is trusted. Acquiring it may upload/submit, so hold no texture lock.
-	auto [buffer, offset] =
-	    m_buffer_cache.ObtainBuffer(metadata.address, metadata.size, true, false);
-	if (buffer == nullptr || offset % m_graphics.StorageMinAlignment() != 0) return false;
+	auto [buffer, offset] = m_buffer_cache.ObtainBuffer(range.address, range.size, true, false);
+	if (buffer == nullptr) {
+		return Event::DccFallbackUnsupported;
+	}
+	if (offset % sizeof(uint32_t) != 0) {
+		return Event::DccFallbackAlignment;
+	}
 	std::scoped_lock lock {m_lock};
-	if (!eligible()) return false;
+	if (const auto reason = eligible()) return *reason;
 	auto& image = m_slot_images[id];
 	TrackImage(id);
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("DCC::GpuMaterialize");
-		m_dcc_clear->Record(image, buffer->Handle(), offset, metadata.size,
-		                    desc.info.metadata.dcc_alpha_msb);
+		for (uint32_t slice = 0; slice < count; ++slice) {
+			m_dcc_clear->RecordSlice(image, view.format, view.base_layer + slice, buffer->Handle(),
+			                         offset + slice_size * (first + slice), slice_size, values);
+		}
 	}
 	CommitGpuWrite(image);
-	++m_gpu_dcc_records;
-	if (const auto revision = m_buffer_cache.GetContentRevision(metadata.address, metadata.size)) {
-		// Retained metadata is independent of image lifetime; cap address reuse history.
-		if (m_gpu_dcc_inspections.size() >= 256 &&
-		    !m_gpu_dcc_inspections.contains(metadata.address)) m_gpu_dcc_inspections.clear();
-		m_gpu_dcc_inspections.insert_or_assign(
-		    metadata.address, GpuDccInspection {metadata, *revision});
-	} else {
-		m_gpu_dcc_inspections.erase(metadata.address);
+	m_gpu_dcc_records += count;
+	Profiler::CountFrameEvent(Event::DccGpuRecords, count);
+	for (uint32_t slice = 0; slice < count; ++slice) {
+		const auto metadata = slice_range(slice);
+		if (const auto revision =
+		        m_buffer_cache.GetContentRevision(metadata.address, metadata.size)) {
+			// Retained metadata is independent of image lifetime; cap address reuse history.
+			if (m_gpu_dcc_inspections.size() >= 256 &&
+			    !m_gpu_dcc_inspections.contains(metadata.address)) {
+				m_gpu_dcc_inspections.clear();
+			}
+			m_gpu_dcc_inspections.insert_or_assign(
+			    metadata.address, GpuDccInspection {metadata, *revision, decodable});
+		} else {
+			m_gpu_dcc_inspections.erase(metadata.address);
+		}
 	}
 	if (m_gpu_dcc_records <= 8) {
 		LOGF("GPU DCC inspection: metadata=0x%016" PRIx64 " bytes=%" PRIu64
-		     " image=0x%016" PRIx64 "\n", metadata.address, metadata.size, desc.info.data.address);
+		     " image=0x%016" PRIx64 " format=%u type=%u slices=%u codes=0x%02x\n",
+		     range.address, range.size, desc.info.data.address,
+		     static_cast<uint32_t>(view.format), static_cast<uint32_t>(desc.type), count,
+		     decodable);
 	}
 	TraceDccDiagnostic("DCC_GPU_RECORD meta=0x%" PRIx64 " bytes=%" PRIu64
-	                   " data=0x%" PRIx64 " tick=%" PRIu64,
-	                   metadata.address, metadata.size, desc.info.data.address,
-	                   m_scheduler.CurrentTick());
-	return true;
+	                   " data=0x%" PRIx64 " format=%u type=%u first=%u count=%u tick=%" PRIu64,
+	                   range.address, range.size, desc.info.data.address,
+	                   static_cast<uint32_t>(view.format), static_cast<uint32_t>(desc.type), first,
+	                   count, m_scheduler.CurrentTick());
+	return Event::DccGpuRecords;
 }
 
 void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
@@ -1574,10 +1651,61 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			}
 			return;
 		}
-		if (m_dcc_clear) {
+		{
 			++m_gpu_dcc_attempts;
-			const bool native = TryMaterializeGpuDccClear(id, desc, metadata_base_layer);
-			if (!native) ++m_gpu_dcc_fallbacks;
+			const auto outcome = TryMaterializeGpuDccClear(id, desc, metadata_base_layer);
+			const bool native  = outcome == Profiler::FrameEvent::DccGpuRecords ||
+			                    outcome == Profiler::FrameEvent::DccGpuReuses;
+			if (!native) {
+				++m_gpu_dcc_fallbacks;
+				Profiler::CountFrameEvent(Profiler::FrameEvent::DccCpuFallbacks);
+				Profiler::CountFrameEvent(outcome);
+				// The first few fallbacks of every reason, with what decided it.
+				static std::array<std::atomic<uint32_t>, static_cast<size_t>(
+				                                             Profiler::FrameEvent::Count)>
+				    logged {};
+				if (logged[static_cast<size_t>(outcome)].fetch_add(1, std::memory_order_relaxed) <
+				    4) {
+					uint32_t state = 0;
+					uint32_t native_format = 0, native_layers = 0, native_usage = 0,
+					         native_flags = 0;
+					{
+						std::scoped_lock lock {m_lock};
+						if (const auto* image = m_slot_images.try_get(id)) {
+							state = (image->IsCpuDirty() ? 1u : 0u) |
+							        (image->IsBufferModified() ? 2u : 0u) |
+							        (image->IsGpuModified() ? 4u : 0u) |
+							        (image->registered ? 8u : 0u) |
+							        (image->depth_id ? 16u : 0u) |
+							        (m_buffer_cache.HasGpuDirtyBytes(image->info.data.address,
+							                                          image->info.data.size)
+							             ? 32u
+							             : 0u) |
+							        (!FindImagesInRegion(range.address, range.size, false).empty()
+							             ? 64u
+							             : 0u);
+							native_format = static_cast<uint32_t>(image->backing.format);
+							native_layers = image->backing.layers;
+							native_usage =
+							    static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image->backing.usage));
+							native_flags = static_cast<uint32_t>(
+							    static_cast<VkImageCreateFlags>(image->backing.flags));
+						}
+					}
+					LOGF("DCC CPU fallback (reason event %u): metadata=0x%016" PRIx64
+					     " bytes=%" PRIu64 " data=0x%016" PRIx64 " type=%u view_format=%u"
+					     " view_type=%u base_layer=%u layers=%u meta_first=%u meta_layers=%u"
+					     " extent=%ux%ux%u native_format=%u native_layers=%u usage=0x%x"
+					     " flags=0x%x state=0x%x (1 cpu-dirty 2 buffer-modified 4 gpu-modified"
+					     " 8 registered 16 stencil 32 gpu-dirty-bytes 64 metadata-image)\n",
+					     static_cast<uint32_t>(outcome), range.address, range.size,
+					     desc.info.data.address, static_cast<uint32_t>(desc.type),
+					     static_cast<uint32_t>(view.format), static_cast<uint32_t>(view.type),
+					     view.base_layer, view.layer_count, first, layers, desc.info.extent.width,
+					     desc.info.extent.height, desc.info.extent.depth, native_format,
+					     native_layers, native_usage, native_flags, state);
+				}
+			}
 			if ((m_gpu_dcc_attempts & 255u) == 0) {
 				if (tracy::ProfilerAvailable()) {
 					TracyPlot("DCC.NativeInspections", static_cast<double>(m_gpu_dcc_records));
