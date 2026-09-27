@@ -13,6 +13,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <span>
 #include <thread>
 
@@ -89,6 +90,7 @@ private:
 		bool                      slice_progress    = false; // the last slice advanced
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  enqueue_ns        = 0;
+		uint64_t                  sequence          = 0; // admission order (m_queue_mutex)
 	};
 
 	void              Enqueue(Submission submission);
@@ -111,6 +113,13 @@ private:
 	std::atomic_uint32_t                           m_deferred_label_count {0};
 	// Some queue front is marked blocked (set under m_queue_mutex; NotifyProgress fast path).
 	std::atomic_bool                               m_has_blocked {false};
+	// Bounded Done (KYTY_AGC_DONE_MODE): admission sequence numbers of submissions not yet
+	// completed, the last sequence admitted before the latest Done, and its waiters.
+	std::set<uint64_t>                             m_in_flight;
+	uint64_t                                       m_next_submission_sequence = 1;
+	uint64_t                                       m_done_boundary            = 0;
+	uint32_t                                       m_done_waiters             = 0;
+	Common::CondVar                                m_done_progress;
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;

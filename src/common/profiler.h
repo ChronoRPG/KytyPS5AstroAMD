@@ -319,6 +319,9 @@ enum class FrameEvent : uint32_t {
 	// recorded GPU work (KYTY_WRITE_DATA_GPU), and those written by the CPU at parse time.
 	WriteDataGpu,
 	WriteDataCpu,
+	// AgcSuspendPoint calls in bounded mode (KYTY_AGC_DONE_MODE) that had to wait for the previous
+	// frame's submissions.
+	AgcDoneBoundedWaits,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
@@ -370,6 +373,9 @@ enum class FrameWait : uint32_t {
 	GpuWaitGds,
 	GpuWaitSideCopy,
 	GpuWaitOther,
+	// Guest thread time in AgcSuspendPoint (GuestGpu::Done): the idle wait, or the bounded wait
+	// for the previous frame's submissions (KYTY_AGC_DONE_MODE).
+	AgcDoneWait,
 	Count,
 };
 

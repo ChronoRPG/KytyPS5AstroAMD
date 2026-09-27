@@ -223,6 +223,7 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.ReleaseMemLabelsIntSel4.Cumulative",
     "FrameEvent.WriteDataGpu.Cumulative",
     "FrameEvent.WriteDataCpu.Cumulative",
+    "FrameEvent.AgcDoneBoundedWaits.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
@@ -261,6 +262,7 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.GpuWaitGds.Calls.Cumulative",
     "FrameWait.GpuWaitSideCopy.Calls.Cumulative",
     "FrameWait.GpuWaitOther.Calls.Cumulative",
+    "FrameWait.AgcDoneWait.Calls.Cumulative",
 };
 static_assert(kFrameWaitCallNames.back() != nullptr, "FrameWait names must match the enum");
 constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
@@ -292,6 +294,7 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.GpuWaitGds.Nanoseconds.Cumulative",
     "FrameWait.GpuWaitSideCopy.Nanoseconds.Cumulative",
     "FrameWait.GpuWaitOther.Nanoseconds.Cumulative",
+    "FrameWait.AgcDoneWait.Nanoseconds.Cumulative",
 };
 static_assert(kFrameWaitTimeNames.back() != nullptr, "FrameWait names must match the enum");
 

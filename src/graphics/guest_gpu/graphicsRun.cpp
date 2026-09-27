@@ -372,17 +372,72 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 	Enqueue(std::move(submission));
 }
 
+// KYTY_AGC_DONE_MODE: "idle" makes sceAgcSuspendPoint (GuestGpu::Done) hold the submission lock
+// and wait until the CP has consumed everything and has nothing queued (the previous behaviour;
+// 105-145 ms per frame in Sky Garden, serializing guest frame N+1 building with CP frame N and
+// blocking other threads' submissions). "bounded" (default) records the frame boundary (the
+// processor-reset flag for the next graphics submission and the frame number) under the lock,
+// releases it, and waits only until the CP has completed every submission admitted before the
+// previous Done: at most two guest frames in flight on the CP.
+static bool DoneBounded() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_AGC_DONE_MODE");
+		const bool  on    = value == nullptr || std::strcmp(value, "idle") != 0;
+		std::printf("Kyty AgcSuspendPoint: %s (KYTY_AGC_DONE_MODE)\n",
+		            on ? "bounded (two frames in flight)" : "wait for idle");
+		return on;
+	}();
+	return enabled;
+}
+
 void GuestGpu::Done() {
-	GpuMutexLock lock(m_submission_mutex);
-	if (!IsGpuThread()) {
-		const auto wait_start = HangTrace::Enabled() ? HangTrace::NowNs() : 0;
-		WaitForIdle();
-		if (HangTrace::Enabled()) {
-			HangTrace::RecordDoneWait(HangTrace::NowNs() - wait_start);
+	if (!DoneBounded()) {
+		GpuMutexLock lock(m_submission_mutex);
+		if (!IsGpuThread()) {
+			const auto wait_start = HangTrace::Enabled() ? HangTrace::NowNs() : 0;
+			Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::AgcDoneWait);
+			WaitForIdle();
+			if (HangTrace::Enabled()) {
+				HangTrace::RecordDoneWait(HangTrace::NowNs() - wait_start);
+			}
+		}
+		m_graphics_done = true;
+		m_done_num++;
+		return;
+	}
+	uint64_t target = 0;
+	{
+		GpuMutexLock lock(m_submission_mutex);
+		// Admission order is what defines the frame boundary: every later graphics submission
+		// resets the processor first, exactly as after an idle wait.
+		m_graphics_done = true;
+		m_done_num++;
+		Common::LockGuard queue_lock(m_queue_mutex);
+		target              = m_done_boundary;
+		m_done_boundary     = m_next_submission_sequence - 1;
+	}
+	if (IsGpuThread() || target == 0) {
+		return;
+	}
+	const auto wait_start = HangTrace::Enabled() ? HangTrace::NowNs() : 0;
+	{
+		Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::AgcDoneWait);
+		Common::LockGuard         lock(m_queue_mutex);
+		auto                      prefix_done = [this, target] {
+			return m_stopping || m_in_flight.empty() || *m_in_flight.begin() > target;
+		};
+		if (!prefix_done()) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::AgcDoneBoundedWaits);
+			++m_done_waiters;
+			while (!prefix_done()) {
+				m_done_progress.Wait(&m_queue_mutex);
+			}
+			--m_done_waiters;
 		}
 	}
-	m_graphics_done = true;
-	m_done_num++;
+	if (HangTrace::Enabled()) {
+		HangTrace::RecordDoneWait(HangTrace::NowNs() - wait_start);
+	}
 }
 
 int GuestGpu::GetFrameNum() const {
@@ -765,6 +820,8 @@ void GuestGpu::Enqueue(Submission submission) {
 	}
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	submission.sequence = m_next_submission_sequence++;
+	m_in_flight.insert(submission.sequence);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -801,6 +858,7 @@ void GuestGpu::ThreadRun(void* data) {
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
 				gpu->m_idle.SignalAll();
+				gpu->m_done_progress.SignalAll();
 				should_stop = true;
 			} else if (!gpu->m_commands.empty()) {
 				command = std::move(gpu->m_commands.front());
@@ -909,6 +967,10 @@ void GuestGpu::ThreadRun(void* data) {
 				if (!queue.empty()) {
 					queue.front().blocked = false;
 				}
+			}
+			gpu->m_in_flight.erase(submission.sequence);
+			if (gpu->m_done_waiters != 0) {
+				gpu->m_done_progress.SignalAll();
 			}
 		}
 		gpu->m_processing = false;
