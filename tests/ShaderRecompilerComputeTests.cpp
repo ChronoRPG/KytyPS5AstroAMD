@@ -2481,6 +2481,15 @@ public:
     context.InitializeGpu(nullptr);
     auto &gpu = context.GetGpu();
 
+    // GuestGpu::Done (sceAgcSuspendPoint) is bounded by default (KYTY_AGC_DONE_MODE): it
+    // waits only for the submissions admitted before the previous Done, so two guest frames
+    // stay in flight. A second Done therefore drains everything admitted before the first;
+    // that is this check's barrier for "the submitted PM4 work has executed". With
+    // KYTY_AGC_DONE_MODE=idle each Done drains by itself.
+    const auto drain_submissions = [&gpu] {
+      gpu.Done();
+      gpu.Done();
+    };
     // RELEASE_MEM interrupts and data_sel 1 labels request a command-buffer flush, but only
     // every KYTY_EOP_FLUSH_BATCH-th request submits (default 8, a33abe76); BufferFlush
     // (slice ends) resets the count. Mirror that rule for the processor below, which only
@@ -2756,7 +2765,7 @@ public:
     graphics_gate_entered.acquire();
     live_graphics_commands[4] = 22;
     graphics_gate_release.release();
-    gpu.Done();
+    drain_submissions();
     Require("GpuCommandLane", "borrowed graphics commands",
             live_graphics_value == 22,
             "graphics submission executed a copied PM4 stream");
@@ -2774,7 +2783,7 @@ public:
     compute_gate_entered.acquire();
     live_compute_commands[4] = 44;
     compute_gate_release.release();
-    gpu.Done();
+    drain_submissions();
     Require("GpuCommandLane", "borrowed compute commands",
             live_compute_value == 44,
             "compute submission executed a copied PM4 stream");
@@ -2830,7 +2839,7 @@ public:
     write_packet(no_interrupt_graphics_commands.data(),
                  &no_interrupt_graphics_value, 55);
     gpu.Submit(no_interrupt_graphics_commands, {});
-    gpu.Done();
+    drain_submissions();
     finish_gpu();
 
     LibKernel::EventQueue::KernelEvent interrupt_event{};
@@ -2854,7 +2863,7 @@ public:
     interrupt_gate_entered.acquire();
     live_interrupt_commands[2] = 0;
     interrupt_gate_release.release();
-    gpu.Done();
+    drain_submissions();
     finish_gpu();
 
     interrupt_count = 0;
@@ -2870,7 +2879,7 @@ public:
     auto graphics_interrupt_commands = make_interrupt_packet(
         1, 1, &graphics_interrupt_label, 0x11223344u, 0);
     gpu.Submit(graphics_interrupt_commands, {});
-    gpu.Done();
+    drain_submissions();
     finish_gpu();
 
     interrupt_count = 0;
@@ -2896,7 +2905,7 @@ public:
     compute_interrupt_gate_entered.acquire();
     compute_interrupt_commands[2] |= 1u << 24u;
     compute_interrupt_gate_release.release();
-    gpu.Done();
+    drain_submissions();
     finish_gpu();
 
     interrupt_count = 0;
@@ -2912,7 +2921,7 @@ public:
     auto compute_clock_commands = make_interrupt_packet(
         3, 1, &compute_clock_label, 0, 0x567u);
     gpu.SubmitCompute(0x20, compute_clock_commands);
-    gpu.Done();
+    drain_submissions();
     finish_gpu();
 
     interrupt_count = 0;
@@ -2930,7 +2939,7 @@ public:
         2, 2, &compute_done_label, compute_done_value, 0x678u);
     compute_done_commands[1] = 0x62fu; // CS_DONE, shader-done index, no GCR action.
     gpu.SubmitCompute(0x20, compute_done_commands);
-    gpu.Done();
+    drain_submissions();
     finish_gpu();
 
     interrupt_count = 0;
@@ -3005,7 +3014,7 @@ public:
       });
       std::this_thread::yield();
     }
-    gpu.Done();
+    drain_submissions();
     Require("GpuCommandLane", "packet-boundary command polling",
             packet_marker_a_at_callback == 11 &&
                 packet_marker_b_at_callback == 0 && packet_marker_a == 11 &&
@@ -3043,7 +3052,7 @@ public:
     uint32_t ordered_suffix = 0;
     std::jthread ordered([&] {
       ordered_started.release();
-      gpu.Done();
+      drain_submissions();
       ordered_suffix = suffix;
       ordered_finished = true;
     });
@@ -3080,7 +3089,7 @@ public:
       unmap_complete.acquire();
     }
     unmap_thread.join();
-    gpu.Done();
+    drain_submissions();
     Require("GpuCommandLane", "unmap queue progress",
             unmap_returned &&
                 !resources.IsMapped(empty_unmap_base, empty_unmap_size) &&
@@ -3207,7 +3216,7 @@ public:
             dma_cursor == dma_commands.size(),
             "DMA_DATA packet stream has the wrong size");
     gpu.Submit(dma_commands, {});
-    gpu.Done();
+    drain_submissions();
     constexpr uint32_t clean_fill_value = 0xdecafbad;
     gpu.SendCommandSync([&] {
       auto &buffer_cache = resources.GetBufferCache();
