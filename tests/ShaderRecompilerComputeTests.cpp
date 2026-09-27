@@ -11808,6 +11808,300 @@ public:
     std::printf("[gpu]     %-32s ok (%s)\n", name, fast ? "fast" : "off");
   }
 
+  // KYTY_RENDER_STATE_FAST: the partial copy of a prepared vertex input gives the bytes of a full
+  // copy over any sequence of inputs built as the preparations build them, and the target
+  // resolution assigns every field of the entry it resolves: an entry full of garbage resolves
+  // exactly like a value-initialised one, on every path (memo hit and miss, no colour output,
+  // depth with and without stencil tests, inactive and unbound depth).
+  void CheckRenderStateCopies() {
+    constexpr const char *name = "RenderStateCopies";
+    constexpr uintptr_t base = 0x0000000208000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t color_address = base;
+    constexpr uint64_t depth_address = base + 0x40000;
+    constexpr uint64_t stencil_address = base + 0x80000;
+
+    // Vertex inputs: value-initialised, then only the prefixes filled (ShaderGetStaticVertexInputInfo).
+    {
+      uint64_t seed = 0x9e3779b97f4a7c15ull;
+      const auto next = [&] {
+        seed += 0x9e3779b97f4a7c15ull;
+        uint64_t z = seed;
+        z = (z ^ (z >> 30u)) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ (z >> 27u)) * 0x94d049bb133111ebull;
+        return z ^ (z >> 31u);
+      };
+      const auto count = [&](int max) {
+        // The extremes often: they exercise the resets of a longer destination.
+        switch (next() % 4u) {
+        case 0: return 0;
+        case 1: return max;
+        default: return static_cast<int>(next() % static_cast<uint64_t>(max + 1));
+        }
+      };
+      const auto make = [&](int resources, int buffers) {
+        auto info = std::make_unique<ShaderVertexInputInfo>();
+        info->stage.program =
+            reinterpret_cast<const ShaderRecompiler::IR::CompiledShaderInfo *>(next() | 8u);
+        info->stage.resources =
+            reinterpret_cast<const ShaderRecompiler::IR::ResourceSnapshot *>(next() | 8u);
+        info->logical_stage = (next() & 1u) != 0 ? ShaderType::Vertex : ShaderType::Mesh;
+        info->resources_num = resources;
+        info->buffers_num = buffers;
+        info->fetch_attrib_reg = static_cast<int>(next() % 32u);
+        info->fetch_buffer_reg = static_cast<int>(next() % 32u);
+        info->wave_size = (next() & 1u) != 0 ? 32u : 64u;
+        info->scratch_size_dwords = static_cast<uint32_t>(next());
+        info->pa_cl_vs_out_cntl = static_cast<uint32_t>(next());
+        info->clip_space.enabled = (next() & 1u) != 0;
+        info->clip_space.scale[1] = std::bit_cast<float>(static_cast<uint32_t>(next()));
+        info->mesh.primitives_per_group = static_cast<uint32_t>(next());
+        info->mesh.threads_num[2] = static_cast<uint32_t>(next());
+        info->tess.domain = static_cast<uint32_t>(next());
+        info->fetch_external = (next() & 1u) != 0;
+        info->fetch_embedded = (next() & 1u) != 0;
+        for (int i = 0; i < resources; i++) {
+          for (auto &field : info->resources[i].fields) {
+            field = static_cast<uint32_t>(next());
+          }
+          info->resources_dst[i].register_start = static_cast<int>(next() % 256u);
+          info->resources_dst[i].registers_num = static_cast<int>(next() % 5u);
+          info->resources_dst[i].attr_id = static_cast<int>(next() % 32u);
+          info->resources_dst[i].fetch_index = static_cast<uint32_t>(next() & 1u);
+        }
+        for (int i = 0; i < buffers; i++) {
+          auto &buffer = info->buffers[i];
+          buffer.addr = next();
+          buffer.stride = static_cast<uint32_t>(next());
+          buffer.num_records = static_cast<uint32_t>(next());
+          buffer.fetch_index = static_cast<uint32_t>(next() & 1u);
+          buffer.attr_num = count(ShaderVertexInputBuffer::ATTR_MAX);
+          for (int j = 0; j < buffer.attr_num; j++) {
+            buffer.attr_indices[j] = static_cast<int>(next() % 32u);
+            buffer.attr_offsets[j] = static_cast<uint32_t>(next());
+          }
+        }
+        return info;
+      };
+      auto state = std::make_unique<ShaderVertexInputInfo>();
+      for (int round = 0; round < 4000; round++) {
+        const auto source = make(count(ShaderVertexInputInfo::RES_MAX),
+                                 count(ShaderVertexInputInfo::RES_MAX));
+        Require(name, "partial vertex copy", CopyVertexInputPrefixes(*state, *source),
+                "a prepared vertex input with valid counts was refused");
+        Require(name, "vertex copy bytes",
+                std::memcmp(state.get(), source.get(), sizeof(ShaderVertexInputInfo)) == 0,
+                "round " + std::to_string(round) +
+                    ": the partial copy differs from a full copy");
+      }
+      // Cost per copy of a typical input (6 attributes in 2 buffers), both structures cache-hot
+      // (the draw state's source was written by a preparing worker, so the full copy also moves
+      // its cache lines between cores in the emulator).
+      {
+        const auto typical = make(6, 2);
+        for (int i = 0; i < 2; i++) {
+          typical->buffers[i].attr_num = 3;
+        }
+        constexpr int iterations = 200000;
+        // Loaded through volatile pointers, so no copy can be merged with the next one.
+        ShaderVertexInputInfo *volatile target = state.get();
+        const ShaderVertexInputInfo *volatile source = typical.get();
+        const auto time = [&](auto &&copy) {
+          const auto start = std::chrono::steady_clock::now();
+          for (int i = 0; i < iterations; i++) {
+            copy();
+          }
+          return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() -
+                                                          start)
+                     .count() /
+                 iterations;
+        };
+        const double full = time([&] { *target = *source; });
+        const double partial = time([&] { (void)CopyVertexInputPrefixes(*target, *source); });
+        std::printf("[gpu]     %-32s vertex input copy: full %.1f ns, partial %.1f ns\n", name,
+                    full, partial);
+      }
+      const auto kept = std::make_unique<ShaderVertexInputInfo>(*state);
+      auto invalid = make(2, 1);
+      invalid->resources_num = ShaderVertexInputInfo::RES_MAX + 1;
+      auto invalid_attrs = make(2, 1);
+      invalid_attrs->buffers[0].attr_num = -1;
+      Require(name, "invalid counts",
+              !CopyVertexInputPrefixes(*state, *invalid) &&
+                  !CopyVertexInputPrefixes(*state, *invalid_attrs) &&
+                  std::memcmp(state.get(), kept.get(), sizeof(ShaderVertexInputInfo)) == 0,
+              "a vertex input with a count out of range was copied partially");
+    }
+
+    // Target entries over garbage.
+    static_assert(std::is_trivially_copyable_v<RenderColorInfo> &&
+                  std::is_trivially_copyable_v<RenderDepthInfo>);
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "render-state direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "render-state direct mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.GetGpu().SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        auto &executor = context.GetRenderExecutor();
+        registers.SetColorBase(0, {.addr = color_address});
+        registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k8_8_8_8,
+                                   .channel_type = Prospero::ChannelType::kUNorm,
+                                   .channel_order = Prospero::ChannelOrder::kStandard});
+        registers.SetColorAttrib2(0, {.height = 31, .width = 31});
+        registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+        registers.SetRenderTargetMask(0xff);
+        scheduler.Begin(registers, user_config, shaders);
+        context.MapMemory(base, allocation_size);
+
+        // With the reset part off, the draw state's entries are value-initialised before the
+        // resolution (DrawRenderState::Reset), and so are these.
+        const bool garbage_entries = RenderStateFastEnabled(RenderStatePart::Reset);
+        const auto poisoned_color = [&](uint8_t byte) {
+          RenderColorInfo color{};
+          if (garbage_entries) {
+            std::memset(static_cast<void *>(&color), byte, sizeof(color));
+          }
+          return color;
+        };
+        const auto poisoned_depth = [&](uint8_t byte) {
+          RenderDepthInfo depth{};
+          if (garbage_entries) {
+            std::memset(static_cast<void *>(&depth), byte, sizeof(depth));
+          }
+          return depth;
+        };
+        // `garbage_first`: the entry over garbage resolves first (a description memo miss when
+        // the registers just changed), otherwise second (a memo hit).
+        const auto check_color = [&](const char *path, uint32_t slot, bool garbage_first,
+                                     bool expect_target) {
+          RenderColorInfo fresh{};
+          auto garbage = poisoned_color(garbage_first ? 0xa5u : 0x5au);
+          if (garbage_first) {
+            RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                               garbage, slot);
+          }
+          RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), fresh,
+                                                             slot);
+          if (!garbage_first) {
+            RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                               garbage, slot);
+          }
+          Require(name, path,
+                  static_cast<bool>(fresh.image_id) == expect_target &&
+                      SameRenderColorInfo(fresh, garbage),
+                  "a colour target entry resolved over garbage differs from a "
+                  "value-initialised one");
+        };
+        const auto check_depth = [&](const char *path, bool garbage_first, bool expect_target) {
+          RenderDepthInfo fresh{};
+          auto garbage = poisoned_depth(garbage_first ? 0xa5u : 0x5au);
+          if (garbage_first) {
+            RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(),
+                                                               garbage);
+          }
+          RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), fresh);
+          if (!garbage_first) {
+            RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(),
+                                                               garbage);
+          }
+          Require(name, path,
+                  static_cast<bool>(fresh.image_id) == expect_target &&
+                      SameRenderDepthInfo(fresh, garbage),
+                  "a depth target entry resolved over garbage differs from a value-initialised "
+                  "one");
+        };
+
+        // The colour description memo applies once the first 128 decisions have been logged.
+        for (int i = 0; i < 130; i++) {
+          RenderColorInfo warm_up{};
+          RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), warm_up,
+                                                             0);
+        }
+        registers.SetColorAttrib2(0, {.height = 15, .width = 31});
+        check_color("colour memo miss", 0, true, true);
+        check_color("colour memo hit", 0, false, true);
+        check_color("no colour output", 1, false, false);
+
+        HW::DepthRenderTarget depth_target{};
+        depth_target.z_info.format = Prospero::DepthFormat::kZ32F;
+        depth_target.z_read_base_addr = depth_address;
+        depth_target.z_write_base_addr = depth_address;
+        depth_target.size = {31, 31, true};
+        registers.SetDepthRenderTarget(depth_target);
+        HW::DepthControl depth_control{};
+        depth_control.z_enable = true;
+        depth_control.z_write_enable = true;
+        depth_control.zfunc = static_cast<uint8_t>(vk::CompareOp::eLessOrEqual);
+        registers.SetDepthControl(depth_control);
+        registers.SetRenderControl({});
+        check_depth("depth memo miss", true, true);
+        check_depth("depth memo hit", false, true);
+
+        auto stencil_target = depth_target;
+        stencil_target.stencil_info.format = Prospero::StencilFormat::k8UInt;
+        stencil_target.stencil_info.htile_stencil_disabled = true;
+        stencil_target.stencil_read_base_addr = stencil_address;
+        stencil_target.stencil_write_base_addr = stencil_address;
+        registers.SetDepthRenderTarget(stencil_target);
+        check_depth("stencil plane without stencil tests", true, true);
+        auto stencil_control = depth_control;
+        stencil_control.stencil_enable = true;
+        stencil_control.stencilfunc = static_cast<uint8_t>(vk::CompareOp::eAlways);
+        registers.SetDepthControl(stencil_control);
+        HW::StencilControl stencil_ops{};
+        stencil_ops.stencil_zpass = static_cast<uint8_t>(Prospero::StencilOp::kReplaceTest);
+        registers.SetStencilControl(stencil_ops);
+        HW::StencilMask stencil_mask{};
+        stencil_mask.stencil_testval = 0x12;
+        stencil_mask.stencil_mask = 0xff;
+        stencil_mask.stencil_writemask = 0xff;
+        registers.SetStencilMask(stencil_mask);
+        check_depth("stencil tests", false, true);
+
+        registers.SetDepthControl({});
+        check_depth("inactive depth", false, false);
+        registers.SetDepthRenderTarget({});
+        registers.SetDepthControl(depth_control);
+        check_depth("unbound depth attachment", false, false);
+
+        RenderExecutorTestAccess::ResetBindings(executor);
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+      });
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "render-state mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "render-state allocation release failed");
+    const char *setting = std::getenv("KYTY_RENDER_STATE_FAST");
+    std::printf("[gpu]     %-32s ok (%s)\n", name,
+                setting == nullptr || std::strcmp(setting, "0") != 0 ? "fast" : "off");
+  }
+
   void CheckRenderExecutorDccFixedClearFloat() {
     constexpr const char *name = "RenderExecutorDccFixedClearFloat";
     constexpr uintptr_t base = 0x0000000204100000ull;
@@ -39033,6 +39327,11 @@ int main(int argc, char **argv) {
     vulkan.CheckDrawSequence();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--render-state-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRenderStateCopies();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--draw-prep-code-cert-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDrawPrepCertifiedShaderHash();
@@ -39242,6 +39541,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorDccFixedClearFloat();
   vulkan.CheckRenderExecutorCmaskFastClear();
   vulkan.CheckDrawSequence();
+  vulkan.CheckRenderStateCopies();
   vulkan.CheckSampledDccClear();
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();

@@ -39,6 +39,7 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -662,9 +663,17 @@ struct DrawRenderState {
 	uint32_t vertex_stages_written = 0;
 
 	void Reset() {
-		depth_info = {};
-		for (uint32_t slot = 0; slot < color_slots_written; slot++) {
-			color_info[slot] = {};
+		// KYTY_RENDER_STATE_FAST reset: a draw reads color_info[0, color_count) and depth_info, and
+		// its target resolution assigns every field of those (ResolveRenderColorTarget,
+		// ResolveRenderDepthTarget). Debug dumps also log color_info[0] and depth_info of draws
+		// without such targets, so they still get value-initialised entries.
+		if (!RenderStateFastEnabled(RenderStatePart::Reset) || graphics_debug_dump_enabled()) {
+			depth_info = {};
+			for (uint32_t slot = 0; slot < color_slots_written; slot++) {
+				color_info[slot] = {};
+			}
+		} else {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::RenderStateMinimalResets);
 		}
 		color_slots_written = 0;
 		color_count         = 0;
@@ -1391,18 +1400,166 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
+// KYTY_RENDER_STATE_FAST vertex (renderDraw.h): copies a vertex input as the used prefixes of its
+// arrays (and of each buffer's attribute list) and the fields after the arrays, and resets the
+// entries the destination used past the source's counts. Entries past the counts hold their
+// default values in every vertex input this copies from or into: the program preparations
+// value-initialise the whole structure and fill only these prefixes
+// (ShaderGetStaticVertexInputInfo; a failed preparation is not used), the draw state starts
+// value-initialised, and this copy keeps it so. The destination then holds the bytes of a full
+// copy (KYTY_RENDER_STATE_VERIFY compares them).
+bool CopyVertexInputPrefixes(ShaderVertexInputInfo& dst, const ShaderVertexInputInfo& src) {
+	static_assert(std::is_trivially_copyable_v<ShaderVertexInputInfo>);
+	constexpr int MaxEntries    = ShaderVertexInputInfo::RES_MAX;
+	constexpr int MaxAttributes = ShaderVertexInputBuffer::ATTR_MAX;
+	const auto counts_valid = [](const ShaderVertexInputInfo& info) {
+		if (info.resources_num < 0 || info.resources_num > MaxEntries || info.buffers_num < 0 ||
+		    info.buffers_num > MaxEntries) {
+			return false;
+		}
+		for (int i = 0; i < info.buffers_num; i++) {
+			if (info.buffers[i].attr_num < 0 || info.buffers[i].attr_num > MaxAttributes) {
+				return false;
+			}
+		}
+		return true;
+	};
+	if (!counts_valid(src) || !counts_valid(dst)) {
+		return false;
+	}
+	// The three arrays lead the structure; everything from `stage` on is copied as one block.
+	const auto* base = reinterpret_cast<const std::byte*>(&src);
+	const auto  tail = sizeof(src.resources) + sizeof(src.resources_dst) + sizeof(src.buffers);
+	EXIT_IF(reinterpret_cast<const std::byte*>(&src.resources) != base ||
+	        reinterpret_cast<const std::byte*>(&src.resources_dst) != base + sizeof(src.resources) ||
+	        reinterpret_cast<const std::byte*>(&src.buffers) !=
+	            base + sizeof(src.resources) + sizeof(src.resources_dst) ||
+	        reinterpret_cast<const std::byte*>(&src.stage) != base + tail);
+
+	const int resources     = src.resources_num;
+	const int old_resources = dst.resources_num;
+	std::copy_n(src.resources, resources, dst.resources);
+	std::copy_n(src.resources_dst, resources, dst.resources_dst);
+	for (int i = resources; i < old_resources; i++) {
+		dst.resources[i]     = {};
+		dst.resources_dst[i] = {};
+	}
+	const int buffers     = src.buffers_num;
+	const int old_buffers = dst.buffers_num;
+	for (int i = 0; i < std::max(buffers, old_buffers); i++) {
+		auto&     to        = dst.buffers[i];
+		const int old_attrs = i < old_buffers ? to.attr_num : 0;
+		int       new_attrs = 0;
+		if (i < buffers) {
+			const auto& from = src.buffers[i];
+			new_attrs        = from.attr_num;
+			to.addr          = from.addr;
+			to.stride        = from.stride;
+			to.num_records   = from.num_records;
+			to.fetch_index   = from.fetch_index;
+			to.attr_num      = from.attr_num;
+			std::copy_n(from.attr_indices, new_attrs, to.attr_indices);
+			std::copy_n(from.attr_offsets, new_attrs, to.attr_offsets);
+		} else {
+			to.addr        = 0;
+			to.stride      = 0;
+			to.num_records = 0;
+			to.fetch_index = 0;
+			to.attr_num    = 0;
+		}
+		if (old_attrs > new_attrs) {
+			std::fill(to.attr_indices + new_attrs, to.attr_indices + old_attrs, 0);
+			std::fill(to.attr_offsets + new_attrs, to.attr_offsets + old_attrs, 0u);
+		}
+	}
+	std::memcpy(reinterpret_cast<std::byte*>(&dst) + tail, base + tail,
+	            sizeof(ShaderVertexInputInfo) - tail);
+	return true;
+}
+
+static void CopyPreparedVertexInfo(ShaderVertexInputInfo& dst, const ShaderVertexInputInfo& src) {
+	if (!RenderStateFastEnabled(RenderStatePart::VertexCopy)) {
+		dst = src;
+		return;
+	}
+	if (CopyVertexInputPrefixes(dst, src)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::RenderStateVertexPartialCopies);
+	} else {
+		dst = src;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::RenderStateVertexFullCopies);
+	}
+	if (RenderStateVerifyMode() != 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::RenderStateVerifyChecks);
+		if (std::memcmp(&dst, &src, sizeof(dst)) != 0) {
+			ReportRenderStateMismatch("a partial vertex input copy");
+			dst = src;
+		}
+	}
+}
+
+// KYTY_RENDER_STATE_FAST swap: exchanges two stage preparations member by member. The bindings name
+// every member in declaration order, so a new member stops this compiling until it is swapped.
+static void SwapStagePrepMembers(PipelineCache::StagePrep& a, PipelineCache::StagePrep& b) noexcept {
+	auto& [a_resources, a_specialization, a_permutation] = a;
+	auto& [b_resources, b_specialization, b_permutation] = b;
+	auto& [a_buffers, a_images, a_samplers, a_srt, a_user_data, a_fill] = a_resources;
+	auto& [b_buffers, b_images, b_samplers, b_srt, b_user_data, b_fill] = b_resources;
+	auto& [a_spec_buffers, a_spec_images] = a_specialization;
+	auto& [b_spec_buffers, b_spec_images] = b_specialization;
+	a_buffers.swap(b_buffers);
+	a_images.swap(b_images);
+	a_samplers.swap(b_samplers);
+	a_srt.swap(b_srt);
+	a_user_data.swap(b_user_data);
+	std::swap(a_fill, b_fill);
+	a_spec_buffers.swap(b_spec_buffers);
+	a_spec_images.swap(b_spec_images);
+	std::swap(a_permutation, b_permutation);
+}
+
+static bool SameStagePrep(const PipelineCache::StagePrep& a, const PipelineCache::StagePrep& b) {
+	const auto& x = a.resources;
+	const auto& y = b.resources;
+	return x.buffers == y.buffers && x.images == y.images && x.samplers == y.samplers &&
+	       x.flattened_srt == y.flattened_srt && x.user_data == y.user_data &&
+	       x.uniform_fill == y.uniform_fill && a.specialization == b.specialization &&
+	       a.permutation == b.permutation;
+}
+
+static void SwapPreparedStage(PipelineCache::StagePrep& state, PipelineCache::StagePrep& prepared) {
+	if (!RenderStateFastEnabled(RenderStatePart::PrepSwap)) {
+		std::swap(state, prepared);
+		return;
+	}
+	if (RenderStateVerifyMode() == 0) {
+		SwapStagePrepMembers(state, prepared);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::RenderStateMemberSwaps);
+		return;
+	}
+	const auto state_before    = state;
+	const auto prepared_before = prepared;
+	SwapStagePrepMembers(state, prepared);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::RenderStateMemberSwaps);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::RenderStateVerifyChecks);
+	if (!SameStagePrep(state, prepared_before) || !SameStagePrep(prepared, state_before)) {
+		ReportRenderStateMismatch("a member-wise stage preparation swap");
+		state    = prepared_before;
+		prepared = state_before;
+	}
+}
+
 // Draw-prep: installs a validated preparation as if GetGraphicsPrograms had produced it. The
 // stage preps are swapped (the preparation keeps the old vectors' capacity) and the stage
 // runtimes re-pointed at the draw state's copies. Like GetGraphicsPrograms, a draw without an
 // active pixel shader leaves the pixel prep untouched.
 static void ApplyPreparedDraw(DrawPrep::PreparedDraw& prepared, DrawRenderState& state) {
-	state.programs       = prepared.programs;
-	state.vertex_info[0] = prepared.vertex_info;
-	state.ps_input_info  = prepared.pixel_info;
-	std::swap(state.stage_preps.vertex[0], prepared.vertex_prep);
+	state.programs = prepared.programs;
+	CopyPreparedVertexInfo(state.vertex_info[0], prepared.vertex_info);
+	state.ps_input_info = prepared.pixel_info;
+	SwapPreparedStage(state.stage_preps.vertex[0], prepared.vertex_prep);
 	state.vertex_info[0].stage.resources = &state.stage_preps.vertex[0].resources;
 	if (prepared.pixel_active) {
-		std::swap(state.stage_preps.pixel, prepared.pixel_prep);
+		SwapPreparedStage(state.stage_preps.pixel, prepared.pixel_prep);
 		state.ps_input_info.stage.resources = &state.stage_preps.pixel.resources;
 	}
 }
@@ -1416,8 +1573,14 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	const auto& pixel_shader_info  = sh_ctx.GetPs();
 	const auto& shader_regs        = ctx.GetShaderRegisters();
 
-	state.programs      = {};
-	state.ps_input_info = {};
+	// KYTY_RENDER_STATE_FAST reset: a validated preparation assigns both in full
+	// (ApplyPreparedDraw), and the serial path below assigns the programs; it only needs the pixel
+	// interface value-initialised (it leaves it alone without an active pixel shader).
+	const bool reset_fast = RenderStateFastEnabled(RenderStatePart::Reset);
+	if (!reset_fast) {
+		state.programs      = {};
+		state.ps_input_info = {};
+	}
 	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
 	    target_export_mapping {};
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
@@ -1452,6 +1615,9 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 		}
 		return;
 	}
+	if (reset_fast) {
+		state.ps_input_info = {};
+	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,
@@ -1479,12 +1645,27 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
+	// KYTY_RENDER_STATE_VERIFY with the reset part: each entry resolved over the previous draw's is
+	// compared with the same resolution into a value-initialised entry (run after it, so the
+	// draw's own resolution is the one without verification), which then provides the result.
+	const bool verify_entries = RenderStateVerifyMode() != 0 &&
+	                            RenderStateFastEnabled(RenderStatePart::Reset) &&
+	                            !graphics_debug_dump_enabled();
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((mrt_mask & (1u << slot)) != 0) {
 			state.color_slots_written = std::max(state.color_slots_written, state.color_count + 1u);
-			ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
-			                         render_target_slice_offset, slot);
-			if (state.color_info[state.color_count].image_id) {
+			auto& entry = state.color_info[state.color_count];
+			ResolveRenderColorTarget(buffer, entry, render_target_slice_offset, slot);
+			if (verify_entries) {
+				RenderColorInfo reference {};
+				ResolveRenderColorTarget(buffer, reference, render_target_slice_offset, slot);
+				Profiler::CountFrameEvent(Profiler::FrameEvent::RenderStateVerifyChecks);
+				if (!SameRenderColorInfo(entry, reference)) {
+					ReportRenderStateMismatch("a colour target entry resolved over the last draw's");
+					entry = reference;
+				}
+			}
+			if (entry.image_id) {
 				state.color_count++;
 			}
 		}
@@ -1493,6 +1674,15 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
 	ResolveRenderDepthTarget(buffer, state.depth_info);
+	if (verify_entries) {
+		RenderDepthInfo reference {};
+		ResolveRenderDepthTarget(buffer, reference);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::RenderStateVerifyChecks);
+		if (!SameRenderDepthInfo(state.depth_info, reference)) {
+			ReportRenderStateMismatch("the depth target entry resolved over the last draw's");
+			state.depth_info = reference;
+		}
+	}
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,

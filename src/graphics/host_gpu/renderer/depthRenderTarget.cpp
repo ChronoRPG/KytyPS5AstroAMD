@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -275,7 +276,14 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	                          rc.depth_clear_enable || rc.copy_depth_to_color;
 	const bool stencil_active =
 	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
+	// KYTY_RENDER_STATE_FAST reset: the draw state's entry is not value-initialised before the
+	// draw. The paths without a target do it here; the one with a target assigns every field
+	// (SameRenderDepthInfo names them all), the stencil states included.
+	const bool reset_here = RenderStateFastEnabled(RenderStatePart::Reset);
 	if (!depth_active && !stencil_active) {
+		if (reset_here) {
+			r = {};
+		}
 		return;
 	}
 	const bool attachment_unbound =
@@ -299,6 +307,9 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		static std::atomic_bool logged = false;
 		if (!logged.exchange(true, std::memory_order_relaxed)) {
 			LOGF("DepthTarget: ignoring enabled depth/stencil state without a bound attachment\n");
+		}
+		if (reset_here) {
+			r = {};
 		}
 		return;
 	}
@@ -365,6 +376,9 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		} else {
 			r.stencil_back = r.stencil_front;
 		}
+	} else if (reset_here) {
+		r.stencil_front = vk::StencilOpState {};
+		r.stencil_back  = vk::StencilOpState {};
 	}
 	// r.desc is the memo's description (KYTY_DRAW_SEQUENCE_FAST: its last lookup may repeat).
 	r.image_id = FindTargetImage(r.desc, false, TargetDescMemoEnabled() ? &memo.lookup : nullptr);
@@ -433,6 +447,27 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 	                  count, regions.data());
 	destination.NoteContentWrite();
 	return true;
+}
+
+bool SameRenderDepthInfo(const RenderDepthInfo& a, const RenderDepthInfo& b) {
+	// Every field, named in declaration order (see ResolveRenderDepthTarget): a new field stops
+	// this compiling until it is compared below.
+	const auto& [a_desc, a_clear, a_load_clear, a_clear_value, a_test, a_write, a_compare,
+	             a_bounds, a_min_bounds, a_max_bounds, a_stencil_clear, a_stencil_clear_value,
+	             a_stencil_test, a_front, a_back, a_image] = a;
+	const auto& [b_desc, b_clear, b_load_clear, b_clear_value, b_test, b_write, b_compare,
+	             b_bounds, b_min_bounds, b_max_bounds, b_stencil_clear, b_stencil_clear_value,
+	             b_stencil_test, b_front, b_back, b_image] = b;
+	const auto same_float = [](float x, float y) {
+		return std::bit_cast<uint32_t>(x) == std::bit_cast<uint32_t>(y);
+	};
+	return SameImageDesc(a_desc, b_desc) && a_clear == b_clear && a_load_clear == b_load_clear &&
+	       same_float(a_clear_value, b_clear_value) && a_test == b_test && a_write == b_write &&
+	       a_compare == b_compare && a_bounds == b_bounds &&
+	       same_float(a_min_bounds, b_min_bounds) && same_float(a_max_bounds, b_max_bounds) &&
+	       a_stencil_clear == b_stencil_clear && a_stencil_clear_value == b_stencil_clear_value &&
+	       a_stencil_test == b_stencil_test && a_front == b_front && a_back == b_back &&
+	       a_image == b_image;
 }
 
 vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {

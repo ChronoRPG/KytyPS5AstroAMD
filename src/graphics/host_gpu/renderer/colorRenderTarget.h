@@ -33,6 +33,35 @@ enum class DrawSequencePart : uint32_t {
 [[nodiscard]] int  DrawSequenceVerifyMode();
 void               ReportDrawSequenceMismatch(const char* what);
 
+// KYTY_RENDER_STATE_FAST: per-draw copies and resets of the draw state that are provably
+// redundant are skipped. Unset or 1: every part; 0: none (the full copies and resets as before);
+// otherwise a comma-separated list of parts (vertex, swap, reset).
+enum class RenderStatePart : uint32_t {
+	// ApplyPreparedDraw (renderDraw.cpp) copies a prepared vertex input (about 10 KB) as its used
+	// array prefixes and the fields after the arrays. Entries past the counts hold their default
+	// values in source and destination alike, so the destination gets the bytes of a full copy.
+	VertexCopy = 1u << 0u,
+	// ApplyPreparedDraw swaps the stage preparations member by member (vector swaps) instead of
+	// through three whole-structure moves.
+	PrepSwap = 1u << 1u,
+	// The draw state's colour/depth target entries and pixel interface are not value-initialised
+	// before each draw: ResolveRenderColorTarget/ResolveRenderDepthTarget assign every field of the
+	// entry they resolve (and value-initialise it when there is no target), and every program
+	// preparation path assigns the pixel interface.
+	Reset = 1u << 2u,
+};
+[[nodiscard]] bool RenderStateFastEnabled(RenderStatePart part);
+// KYTY_RENDER_STATE_VERIFY=1|exit: every skipped copy or reset is checked against the full one,
+// which then provides the result: the vertex copy byte for byte, the swap against copies of both
+// preparations, a resolved target entry field by field against a resolution into a
+// value-initialised entry. A difference is counted (RenderStateVerifyMismatches; exit stops on
+// the first). 0: off.
+[[nodiscard]] int  RenderStateVerifyMode();
+void               ReportRenderStateMismatch(const char* what);
+
+// Every field of a target description, compared one by one (padding excluded).
+[[nodiscard]] bool SameImageDesc(const TextureCache::ImageDesc& a, const TextureCache::ImageDesc& b);
+
 struct RenderColorInfo {
 	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc         desc;
@@ -47,6 +76,9 @@ struct RenderColorInfo {
 		        std::max(desc.info.extent.height >> guest_mip_level, 1u)};
 	}
 };
+
+// Every field compared one by one (padding excluded).
+[[nodiscard]] bool SameRenderColorInfo(const RenderColorInfo& a, const RenderColorInfo& b);
 
 } // namespace Libs::Graphics
 
