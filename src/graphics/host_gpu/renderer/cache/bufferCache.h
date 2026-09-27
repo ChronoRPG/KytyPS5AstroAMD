@@ -51,8 +51,9 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-	// Guest read faults outside the GPU thread use a side copy when every dirty byte they need
-	// was written by an already submitted recording (KYTY_READBACK_SIDE_COPY=0 disables it).
+	// Reads use a side copy when every dirty byte they need was written by an already submitted
+	// recording (KYTY_READBACK_SIDE_COPY=0 disables it). GPU-thread reads wait for their copy in
+	// place (KYTY_READBACK_SIDE_GPU_THREAD=0 makes them drain instead).
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	// Publishes (waiting if necessary) every pending side readback overlapping the range. Any
 	// thread; never waits for the current recording. Required before other ownership changes.
@@ -84,6 +85,9 @@ public:
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// CP WRITE_DATA to bytes owned by recorded GPU work: records the write (vkCmdUpdateBuffer)
+	// at its position in the GPU timeline and returns true; false leaves it to the CPU write.
+	[[nodiscard]] bool TryWriteDataGpu(uint64_t vaddr, const uint32_t* data, uint64_t size);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 

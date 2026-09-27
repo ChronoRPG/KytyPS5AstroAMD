@@ -39,6 +39,8 @@ public:
 	void SubmitFlipPreparation(uint64_t request_id);
 	void WaitForSubmitSlot();
 	void WaitFlipDone(int handle, int index);
+	// Non-blocking form of WaitFlipDone: true while a flip of that buffer is still queued.
+	[[nodiscard]] bool IsFlipPending(int handle, int index);
 
 	[[nodiscard]] Impl& State() noexcept;
 

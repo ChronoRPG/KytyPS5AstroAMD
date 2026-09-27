@@ -213,6 +213,7 @@ public:
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index);
+	bool IsPending(VideoOutConfig& cfg, int index);
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
@@ -947,6 +948,7 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 	m_submit_slot_cond_var.SignalAll();
 	m_submit_cond_var.SignalAll();
 	m_mutex.Unlock();
+	m_presenter.Renderer().NotifyGpuProgress();
 	for (auto* frame: frames) {
 		m_presenter.Discard(*frame);
 	}
@@ -1108,6 +1110,13 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	}
 }
 
+bool FlipQueue::IsPending(VideoOutConfig& cfg, int index) {
+	Common::LockGuard lock(m_mutex);
+	auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
+	return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
+	       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
+}
+
 bool FlipQueue::Flip(uint32_t micros) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
@@ -1174,6 +1183,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_submit_slot_cond_var.Signal();
 	m_mutex.Unlock();
 	r.cfg->mutex.Unlock();
+	// A guest queue may be suspended in WAIT_FLIP_DONE on this buffer.
+	m_presenter.Renderer().NotifyGpuProgress();
 
 	Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
 	// A completed guest flip, not the polling iterations of FlipQueue::Flip.
@@ -1521,6 +1532,14 @@ void VideoOutDriver::CompleteFlip(uint64_t request_id) {
 
 void VideoOutDriver::WaitForSubmitSlot() {
 	m_impl->GetFlipQueue().WaitForSubmitSlot();
+}
+
+bool VideoOutDriver::IsFlipPending(int handle, int index) {
+	auto* ctx = m_impl->Get(handle);
+	EXIT_IF(ctx == nullptr);
+
+	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
+	return m_impl->GetFlipQueue().IsPending(*ctx, index);
 }
 
 void VideoOutDriver::WaitFlipDone(int handle, int index) {

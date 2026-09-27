@@ -13,6 +13,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <span>
 #include <thread>
 
@@ -41,7 +42,31 @@ public:
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
+	// Like SendCommand, but returns false (dropping nothing: the caller keeps the command's
+	// work) once the GPU no longer accepts external commands (shutdown). Any thread.
+	[[nodiscard]] bool TrySendCommand(Common::UniqueFunction<void>&& command);
+	// Something a suspended (blocked) queue may wait for has changed: clear the blocked marks so
+	// the scheduler retries them now, and wake it. Any thread.
+	void NotifyProgress();
+	// Some async compute queue has a submission that is not suspended. GPU thread.
+	[[nodiscard]] bool HasRunnableComputeWork();
+
+	// End-of-pipe labels whose guest write is deferred to their tick's completion (see
+	// CommandProcessor::TryDeferLabel). Registration and completion run on the GPU thread.
+	void AddDeferredLabel(uint64_t address, uint32_t size, uint64_t tick);
+	void RemoveDeferredLabel(uint64_t address, uint64_t tick);
+	[[nodiscard]] bool HasDeferredLabels() const noexcept {
+		return m_deferred_label_count.load(std::memory_order_acquire) != 0;
+	}
+	// Newest tick of a pending deferred label overlapping the range, or 0.
+	[[nodiscard]] uint64_t DeferredLabelTick(uint64_t address, uint64_t size);
+
 private:
+	struct DeferredLabel {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint64_t tick    = 0;
+	};
 	static constexpr uint32_t ComputePipeCount     = 7;
 	static constexpr uint32_t QueuesPerComputePipe = 8;
 	static constexpr uint32_t ComputeQueueCount    = ComputePipeCount * QueuesPerComputePipe;
@@ -62,8 +87,10 @@ private:
 		bool                      command_complete  = false;
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
+		bool                      slice_progress    = false; // the last slice advanced
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  enqueue_ns        = 0;
+		uint64_t                  sequence          = 0; // admission order (m_queue_mutex)
 	};
 
 	void              Enqueue(Submission submission);
@@ -82,6 +109,17 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
+	std::deque<DeferredLabel>                      m_deferred_labels; // m_queue_mutex
+	std::atomic_uint32_t                           m_deferred_label_count {0};
+	// Some queue front is marked blocked (set under m_queue_mutex; NotifyProgress fast path).
+	std::atomic_bool                               m_has_blocked {false};
+	// Bounded Done (KYTY_AGC_DONE_MODE): admission sequence numbers of submissions not yet
+	// completed, the last sequence admitted before the latest Done, and its waiters.
+	std::set<uint64_t>                             m_in_flight;
+	uint64_t                                       m_next_submission_sequence = 1;
+	uint64_t                                       m_done_boundary            = 0;
+	uint32_t                                       m_done_waiters             = 0;
+	Common::CondVar                                m_done_progress;
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;

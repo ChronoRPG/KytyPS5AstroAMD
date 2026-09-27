@@ -315,6 +315,60 @@ enum class FrameEvent : uint32_t {
 	TextureResidencyViolations,
 	// Partially resident images retired after KYTY_TEXTURE_RESIDENT_IDLE_FRAMES unused frames.
 	TextureResidentIdleFrees,
+	// Headerless shader code hashed from a clean-backing copy (no fault possible) or in place
+	// through the guest mapping (KYTY_SHADER_HASH_BACKING).
+	ShaderCodeHashBacking,
+	ShaderCodeHashDirect,
+	// GPU-thread reads of GPU-owned bytes (KYTY_READBACK_SIDE_GPU_THREAD): served by a side copy
+	// the GPU thread waited for, or by the drain path (fallback reason also counted above).
+	ReadbackGpuThreadSideCopies,
+	ReadbackGpuThreadDrains,
+	// Side copies submitted to the second queue of the family (KYTY_SIDE_QUEUE).
+	ReadbackSideQueueCopies,
+	// Visibility-proxy end dumps (KYTY_OCCLUSION_PROXY_MODE); end-of-pipe labels deferred to their
+	// tick's completion (all, armed by a proxy dump, kept behind an older deferred label to the
+	// same address); WAIT_REG_MEM suspensions on a pending deferred label, and those that first
+	// flushed the recording holding it.
+	OcclusionProxyDumps,
+	LabelWritesDeferred,
+	LabelWritesDeferredProxy,
+	LabelWritesDeferredOrdered,
+	WaitRegMemDeferredLabel,
+	WaitRegMemDeferredLabelFlushes,
+	// Completion-runner (priority) operations run, and broadcasts to WaitPriorityOperations /
+	// DrainPriorityOperations waiters (KYTY_PRIORITY_WAKE_BATCH: only at a tick boundary with waiters).
+	PriorityOperationsRun,
+	PriorityWaiterWakeups,
+	// CP scheduler with every queue suspended (KYTY_CP_WAKEUPS): short retry spins, timed sleeps,
+	// and completion/label/flip notifications that unblocked suspended queues.
+	CpBlockedSpins,
+	CpBlockedSleeps,
+	CpProgressWakeups,
+	// WAIT_FLIP_DONE packets that suspended their queue (KYTY_FLIP_WAIT_MODE=suspend) or blocked
+	// the GPU thread (=block).
+	FlipWaitSuspends,
+	FlipWaitBlocking,
+	// GDS end-of-pipe reads (RELEASE_MEM data_sel=5 / event source 1), and those snapshotted and
+	// written at completion instead of draining the GPU (KYTY_GDS_EOP_MODE=defer).
+	GdsEopReads,
+	GdsEopReadsDeferred,
+	// Early submits because the GPU had finished all submitted work (KYTY_IDLE_FLUSH_DRAWS), outside
+	// and inside an active rendering instance.
+	IdleFlushes,
+	IdleFlushesInPass,
+	// Graphics slices ended early so runnable async compute queues could run (KYTY_GFX_SLICE_DRAWS).
+	GfxSliceYields,
+	// End-of-pipe data writes Kyty used to drop (KYTY_EOP_DROPPED_LABELS): graphics-queue events
+	// with INT_SEL=1, and RELEASE_MEM with INT_SEL=4 and DATA_SEL 1/2/3.
+	EopLabelsIntSel1,
+	ReleaseMemLabelsIntSel4,
+	// CP WRITE_DATA packets recorded on the GPU timeline because their destination was owned by
+	// recorded GPU work (KYTY_WRITE_DATA_GPU), and those written by the CPU at parse time.
+	WriteDataGpu,
+	WriteDataCpu,
+	// AgcSuspendPoint calls in bounded mode (KYTY_AGC_DONE_MODE) that had to wait for the previous
+	// frame's submissions.
+	AgcDoneBoundedWaits,
 	// Texture binding identity memo (KYTY_TEXTURE_BINDING_MEMO, pipeline/textureBindingMemo.h).
 	// ResolveTexture answered from an entry (Hits), with no entry for the key (Misses), or with an
 	// entry that a texture-cache structure change or the image's live state ruled out (Stale: new
@@ -405,6 +459,24 @@ enum class FrameWait : uint32_t {
 	TextureUpload,
 	// StagingCopier worker time copying guest texture bytes into staging (not the GPU thread).
 	TextureStagingCopy,
+	// GPU (CP) thread blocked in MasterSemaphore::Wait (submission dispatch plus timeline wait;
+	// waits that find the tick already complete are not counted), attributed to the caller that
+	// set a ScopedGpuWaitReason: ReadMemory drains, occlusion publication waits (sync proxy,
+	// predication on unpublished dumps, publish-slot reuse), stream-buffer wraps, LOD-stats slot
+	// reuse, unmaps, predication/boolean waits, GDS end-of-pipe reads, side-copy waits of GPU
+	// thread reads, and everything untagged (GpuWaitOther).
+	GpuWaitDrain,
+	GpuWaitOcclusion,
+	GpuWaitStreamWrap,
+	GpuWaitLodStats,
+	GpuWaitUnmap,
+	GpuWaitPredication,
+	GpuWaitGds,
+	GpuWaitSideCopy,
+	GpuWaitOther,
+	// Guest thread time in AgcSuspendPoint (GuestGpu::Done): the idle wait, or the bounded wait
+	// for the previous frame's submissions (KYTY_AGC_DONE_MODE).
+	AgcDoneWait,
 	Count,
 };
 
@@ -435,6 +507,21 @@ private:
 // Adds externally measured totals (the GPU timeline entries above) with the same gating as
 // ScopedFrameWait: aggregate diagnostics enabled and a connected profiler.
 void AddFrameWait(FrameWait kind, uint64_t calls, uint64_t nanoseconds);
+
+// Per-thread attribution of GPU waits (the GpuWait* categories): the innermost scope wins.
+class ScopedGpuWaitReason {
+public:
+	explicit ScopedGpuWaitReason(FrameWait reason);
+	ScopedGpuWaitReason(const ScopedGpuWaitReason&)            = delete;
+	ScopedGpuWaitReason& operator=(const ScopedGpuWaitReason&) = delete;
+	ScopedGpuWaitReason(ScopedGpuWaitReason&&)                 = delete;
+	ScopedGpuWaitReason& operator=(ScopedGpuWaitReason&&)      = delete;
+	~ScopedGpuWaitReason();
+
+private:
+	FrameWait m_previous;
+};
+[[nodiscard]] FrameWait CurrentGpuWaitReason() noexcept;
 
 // Call immediately after the existing completed guest-flip marker. Snapshots
 // include workload and wait totals, and are cumulative so an on-demand connection

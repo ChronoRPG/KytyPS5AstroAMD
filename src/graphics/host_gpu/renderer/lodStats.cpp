@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/hangTrace.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -110,6 +111,7 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 	if (publish) {
 		const auto slot = static_cast<uint32_t>(m_issued % PublishSlots);
 		if (m_issued >= PublishSlots && !scheduler.IsFree(m_slot_ticks[slot])) {
+			Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitLodStats);
 			scheduler.Wait(m_slot_ticks[slot]);
 		}
 		slot_offset = uint64_t {slot} * PublishSlotSize;
