@@ -2073,7 +2073,8 @@ public:
 
   void CheckSchedulerTimeline() {
     EnsureRuntimeContext();
-    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    CommandScheduler scheduler(Renderer(), m_runtime_context,
+                               CommandScheduler::Role::Guest);
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
@@ -2203,7 +2204,8 @@ public:
         "completed command buffers were not reused after timeline progress");
     scheduler.Shutdown();
 
-    CommandScheduler draining(Renderer(), m_runtime_context);
+    CommandScheduler draining(Renderer(), m_runtime_context,
+                              CommandScheduler::Role::Guest);
     HW::Context drain_registers{};
     HW::UserConfig drain_user_config{};
     HW::Shader drain_shaders{};
@@ -3397,7 +3399,8 @@ public:
   void CheckUnifiedImageViewCache() {
     EnsureRuntimeContext();
     constexpr const char *name = "UnifiedImageViewCache";
-    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    CommandScheduler scheduler(Renderer(), m_runtime_context,
+                               CommandScheduler::Role::Guest);
 
     ImageInfo color_info{};
     color_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
@@ -14818,7 +14821,8 @@ public:
     constexpr const char *name = "GpuTilerCpuParity";
     EnsureRuntimeContext();
 
-    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    CommandScheduler scheduler(Renderer(), m_runtime_context,
+                               CommandScheduler::Role::Guest);
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
@@ -30378,7 +30382,8 @@ void CheckRenderTargetFormatContract() {
              std::strcmp(kind, "volume-slice-range") == 0) {
     VulkanHarness vulkan;
     auto &graphics = vulkan.RuntimeContext();
-    CommandScheduler scheduler(vulkan.RuntimeRenderer(), graphics);
+    CommandScheduler scheduler(vulkan.RuntimeRenderer(), graphics,
+                               CommandScheduler::Role::Guest);
     ImageInfo volume_info{};
     volume_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
     volume_info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
@@ -30716,7 +30721,7 @@ void CheckSampledDepthResource() {
 void CheckImageTransitionState(RenderContext &renderer) {
   constexpr const char *name = "ImageTransitionState";
   auto &context = renderer.GetGraphics();
-  CommandScheduler scheduler(renderer, context);
+  CommandScheduler scheduler(renderer, context, CommandScheduler::Role::Guest);
   const auto MakeInfo = [](vk::Format format, uint32_t levels,
                            uint32_t layers) {
     ImageInfo info{};
@@ -34709,6 +34714,19 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--readlane-key-guard-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
+    return 0;
+  }
+  // Only the recompiler semantic cases (compute and graphics), without the host/runtime
+  // checks that precede them in the default run.
+  if (argc == 2 && std::strcmp(argv[1], "--cases-only") == 0) {
+    VulkanHarness vulkan;
+    for (const auto &test : MakeCases()) {
+      RunCase(&vulkan, test);
+    }
+    for (const auto &test : MakeGraphicsCases()) {
+      RunGraphicsCase(&vulkan, test);
+    }
+    std::printf("ShaderRecompilerComputeTests: all cases passed\n");
     return 0;
   }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
