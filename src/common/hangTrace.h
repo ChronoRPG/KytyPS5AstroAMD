@@ -45,6 +45,8 @@
 // compile_programs, compile_translate_us, compile_emit_us, compile_validate_us, compile_module_us,
 // compile_gfx_pipelines, compile_gfx_pipeline_us, compile_cs_pipelines, compile_cs_pipeline_us,
 // compile_stall_us, compile_stall_max_us, compile_gfx_new, compile_gfx_perm, compile_gfx_variant.
+// Then driver pipeline cache saves (RecordPipelineCacheSave): pcache_saves, pcache_save_kb,
+// pcache_save_serialize_us, pcache_save_write_us, pcache_save_overlaps, pcache_save_overlap_us.
 // New columns are only ever appended.
 //
 //   compiles.csv       one row per new shader program permutation or pipeline: phase times, the
@@ -279,6 +281,11 @@ void RecordCompile(const CompileEvent& event);
 // A draw or dispatch spent stall_ns in the compile paths (new programs and pipelines, including
 // lock waits). compile_stall_max_us is the longest single stall of the second.
 void RecordCompileStall(uint64_t stall_ns);
+// A driver pipeline cache save (periodic or at exit): payload bytes, vkGetPipelineCacheData time
+// and file write time. Overlaps are pipelines created while a save was serializing the same
+// cache (the driver may serialize them internally); create_ns is that creation's duration.
+void RecordPipelineCacheSave(uint64_t bytes, uint64_t serialize_ns, uint64_t write_ns);
+void RecordPipelineCacheSaveOverlap(uint64_t create_ns);
 
 } // namespace HangTrace
 

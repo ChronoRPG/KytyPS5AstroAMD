@@ -290,6 +290,12 @@ struct Totals {
 	std::atomic<uint64_t> compile_gfx_new {0};
 	std::atomic<uint64_t> compile_gfx_perm {0};
 	std::atomic<uint64_t> compile_gfx_variant {0};
+	std::atomic<uint64_t> pcache_saves {0};
+	std::atomic<uint64_t> pcache_save_bytes {0};
+	std::atomic<uint64_t> pcache_save_serialize_ns {0};
+	std::atomic<uint64_t> pcache_save_write_ns {0};
+	std::atomic<uint64_t> pcache_save_overlaps {0};
+	std::atomic<uint64_t> pcache_save_overlap_ns {0};
 };
 Totals g_totals;
 
@@ -720,6 +726,12 @@ void Publish() {
 		                    take(g_totals.compile_stall_max_ns) / 1000u,
 		                    take(g_totals.compile_gfx_new), take(g_totals.compile_gfx_perm),
 		                    take(g_totals.compile_gfx_variant));
+		line += fmt::format(",{},{},{},{},{},{}", take(g_totals.pcache_saves),
+		                    take(g_totals.pcache_save_bytes) / 1024u,
+		                    take(g_totals.pcache_save_serialize_ns) / 1000u,
+		                    take(g_totals.pcache_save_write_ns) / 1000u,
+		                    take(g_totals.pcache_save_overlaps),
+		                    take(g_totals.pcache_save_overlap_ns) / 1000u);
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
@@ -801,6 +813,8 @@ void Initialize() {
 	                  "compile_module_us,compile_gfx_pipelines,compile_gfx_pipeline_us,"
 	                  "compile_cs_pipelines,compile_cs_pipeline_us,compile_stall_us,"
 	                  "compile_stall_max_us,compile_gfx_new,compile_gfx_perm,compile_gfx_variant";
+	summary_header += ",pcache_saves,pcache_save_kb,pcache_save_serialize_us,pcache_save_write_us,"
+	                  "pcache_save_overlaps,pcache_save_overlap_us";
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.compiles = OpenFile("compiles.csv",
 	                            "t_ms,kind,stage,guest_hash,id,id2,origin,translate_us,emit_us,"
@@ -1502,6 +1516,24 @@ void RecordCompileStall(uint64_t stall_ns) {
 	}
 	g_totals.compile_stall_ns.fetch_add(stall_ns, std::memory_order_relaxed);
 	UpdateMax(g_totals.compile_stall_max_ns, stall_ns);
+}
+
+void RecordPipelineCacheSave(uint64_t bytes, uint64_t serialize_ns, uint64_t write_ns) {
+	if (!Enabled()) {
+		return;
+	}
+	g_totals.pcache_saves.fetch_add(1, std::memory_order_relaxed);
+	g_totals.pcache_save_bytes.fetch_add(bytes, std::memory_order_relaxed);
+	g_totals.pcache_save_serialize_ns.fetch_add(serialize_ns, std::memory_order_relaxed);
+	g_totals.pcache_save_write_ns.fetch_add(write_ns, std::memory_order_relaxed);
+}
+
+void RecordPipelineCacheSaveOverlap(uint64_t create_ns) {
+	if (!Enabled()) {
+		return;
+	}
+	g_totals.pcache_save_overlaps.fetch_add(1, std::memory_order_relaxed);
+	g_totals.pcache_save_overlap_ns.fetch_add(create_ns, std::memory_order_relaxed);
 }
 
 } // namespace HangTrace

@@ -28,9 +28,11 @@
 #include <bit>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fmt/format.h>
 #include <limits>
 #include <memory>
@@ -39,7 +41,10 @@
 #include <shared_mutex>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <stop_token>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -109,6 +114,83 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	message += '\n';
 	Log::WriteToConsoleAndLog(message);
 }
+
+// Cache file layout: DriverCacheSignature text, XXH3-64 of the payload, payload
+// (vkGetPipelineCacheData output). Fills `payload` and returns true only for a complete,
+// matching file within MaxDriverCacheFileSize.
+bool ReadDriverCacheFile(const std::filesystem::path& file_path, const std::string& signature,
+                         std::vector<uint8_t>& payload, bool log_invalid) {
+	payload.clear();
+	const auto   path = Common::PathToString(file_path);
+	Common::File file(file_path, Common::File::Mode::Read);
+	const auto   file_size = file.IsInvalid() ? 0 : file.Size();
+	if (file_size < signature.size() + sizeof(uint64_t) || file_size > MaxDriverCacheFileSize) {
+		file.Close();
+		if (log_invalid) {
+			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
+		}
+		return false;
+	}
+	std::string cached_signature(signature.size(), '\0');
+	uint64_t    payload_hash = 0;
+	payload.resize(file_size - signature.size() - sizeof(payload_hash));
+	uint32_t signature_read = 0;
+	uint32_t hash_read      = 0;
+	uint32_t payload_read   = 0;
+	file.Read(cached_signature.data(), static_cast<uint32_t>(cached_signature.size()),
+	          &signature_read);
+	file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
+	file.Read(payload.data(), static_cast<uint32_t>(payload.size()), &payload_read);
+	file.Close();
+	if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
+	    payload_read != payload.size() || cached_signature != signature ||
+	    XXH3_64bits(payload.data(), payload.size()) != payload_hash) {
+		payload.clear();
+		if (log_invalid) {
+			PipelineCacheLog(
+			    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)", path);
+		}
+		return false;
+	}
+	return true;
+}
+
+uint64_t EnvU64(const char* name, uint64_t default_value) {
+	const auto* value = std::getenv(name);
+	if (value == nullptr || *value == '\0') {
+		return default_value;
+	}
+	char*      end    = nullptr;
+	const auto parsed = std::strtoull(value, &end, 10);
+	return end != value ? parsed : default_value;
+}
+
+// When the background saver writes the driver cache (KYTY_PIPELINE_CACHE_SAVE=0 disables it and
+// leaves only the save at exit). A save needs at least MIN_NEW (32) pipelines created since the
+// last one and no new pipeline for SETTLE (2 s), so it does not compete with a compile burst; then
+// it runs when INTERVAL_S (60 s) have passed since the last save, or when a burst has ended
+// (QUIET_S = 10 s without new pipelines, at least 15 s after the last save: level loads and area
+// transitions). A steady trickle is saved after 3 intervals regardless of calm, and fewer than
+// MIN_NEW new pipelines after 5 intervals.
+struct DriverCacheSaveSettings {
+	bool     enabled     = true;
+	uint64_t min_new     = 32;
+	uint64_t interval_ns = 60'000'000'000ull;
+	uint64_t quiet_ns    = 10'000'000'000ull;
+	uint64_t settle_ns   = 2'000'000'000ull;
+
+	static const DriverCacheSaveSettings& Get() {
+		static const DriverCacheSaveSettings settings = [] {
+			DriverCacheSaveSettings s;
+			s.enabled     = EnvU64("KYTY_PIPELINE_CACHE_SAVE", 1) != 0;
+			s.min_new     = std::max<uint64_t>(1, EnvU64("KYTY_PIPELINE_CACHE_SAVE_MIN_NEW", 32));
+			s.interval_ns = EnvU64("KYTY_PIPELINE_CACHE_SAVE_INTERVAL_S", 60) * 1'000'000'000ull;
+			s.quiet_ns    = EnvU64("KYTY_PIPELINE_CACHE_SAVE_QUIET_S", 10) * 1'000'000'000ull;
+			return s;
+		}();
+		return settings;
+	}
+};
 
 // Compile-time accounting (stutter attribution). Every new program permutation and pipeline is
 // timed per phase and reported three ways: per compile in the hang trace (compiles.csv, and
@@ -1737,6 +1819,9 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
       m_diagnostics(std::make_unique<PipelineDiagnostics>()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	if (m_driver_cache != nullptr && DriverCacheSaveSettings::Get().enabled) {
+		m_saver = std::make_unique<DriverCacheSaver>(*this);
+	}
 }
 
 PipelineCache::~PipelineCache() {
@@ -1767,43 +1852,28 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	m_driver_cache_path    = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
-	const auto path         = Common::PathToString(m_driver_cache_path);
+	auto path               = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
 		PipelineCacheLog("Vulkan pipeline cache: loading {}", path);
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initializing {}", path);
 	}
+	const auto           signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	std::vector<uint8_t> initial_data;
 	if (cache_exists) {
-		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
-		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
-		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-		if (file_size >= signature.size() + sizeof(uint64_t) &&
-		    file_size <= MaxDriverCacheFileSize) {
-			std::string cached_signature(signature.size(), '\0');
-			uint64_t    payload_hash = 0;
-			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
-			uint32_t signature_read = 0;
-			uint32_t hash_read      = 0;
-			uint32_t payload_read   = 0;
-			file.Read(cached_signature.data(), static_cast<uint32_t>(cached_signature.size()),
-			          &signature_read);
-			file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
-			file.Read(initial_data.data(), static_cast<uint32_t>(initial_data.size()),
-			          &payload_read);
-			file.Close();
-			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
-			    payload_read != initial_data.size() || cached_signature != signature ||
-			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
-				initial_data.clear();
-				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
-				    path);
-			}
-		} else {
-			file.Close();
-			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
+		ReadDriverCacheFile(m_driver_cache_path, signature, initial_data, true);
+	}
+	if (initial_data.empty()) {
+		// A save writes "<file>.tmp" and then renames it over the file. Earlier builds deleted the
+		// file before that rename, so a run killed in between left only the complete temporary
+		// file. Its payload hash rejects a partially written one.
+		auto temp_path = m_driver_cache_path;
+		temp_path += ".tmp";
+		if (Common::File::IsFileExisting(temp_path) &&
+		    ReadDriverCacheFile(temp_path, signature, initial_data, false)) {
+			path = Common::PathToString(temp_path);
+			PipelineCacheLog("Vulkan pipeline cache: recovered the interrupted save {}", path);
 		}
 	}
 
@@ -1832,41 +1902,152 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
-void PipelineCache::Save() {
-	Common::LockGuard lock(m_mutex);
-	if (m_driver_cache == nullptr) {
-		return;
+// Background saver of the driver pipeline cache. The cache used to be written only by the clean
+// exit (window close), so every killed, crashed or stalled run threw away all pipelines it had
+// compiled and the next boot compiled them again. The thread wakes once a second and saves by the
+// DriverCacheSaveSettings rules; the command processor only bumps two atomics per new pipeline.
+struct PipelineCache::DriverCacheSaver {
+	explicit DriverCacheSaver(PipelineCache& owner): cache(owner), last_save_ns(CompileClockNs()) {
+		thread = std::jthread([this](std::stop_token stop) { Run(stop); });
+	}
+	~DriverCacheSaver() { Stop(); }
+	DriverCacheSaver(const DriverCacheSaver&)            = delete;
+	DriverCacheSaver& operator=(const DriverCacheSaver&) = delete;
+
+	// Returns once no periodic save is running or can start.
+	void Stop() {
+		if (thread.joinable()) {
+			thread.request_stop();
+			thread.join();
+		}
 	}
 
-	size_t               size = 0;
-	vk::Result           result;
+	void NoteCreated() {
+		last_created_ns.store(CompileClockNs(), std::memory_order_relaxed);
+		created.fetch_add(1, std::memory_order_release);
+	}
+
+	[[nodiscard]] bool Due(uint64_t now) const {
+		const auto& settings = DriverCacheSaveSettings::Get();
+		const auto  pending  = created.load(std::memory_order_acquire) - saved_created;
+		if (pending == 0 || oversized || now < retry_after_ns) {
+			return false;
+		}
+		const auto since_save   = now - last_save_ns;
+		const auto last_created = last_created_ns.load(std::memory_order_relaxed);
+		const auto since_create = now > last_created ? now - last_created : 0;
+		if (pending < settings.min_new) {
+			return since_save >= 5 * settings.interval_ns && since_create >= settings.settle_ns;
+		}
+		return (since_save >= settings.interval_ns && since_create >= settings.settle_ns) ||
+		       (since_create >= settings.quiet_ns && since_save >= 15'000'000'000ull) ||
+		       since_save >= 3 * settings.interval_ns;
+	}
+
+	void Run(const std::stop_token& stop) {
+		Profiler::SetThreadName("PipelineCacheSaver");
+		std::mutex                  mutex;
+		std::condition_variable_any wake;
+		std::unique_lock            lock(mutex);
+		while (!stop.stop_requested()) {
+			wake.wait_for(lock, stop, std::chrono::seconds(1), [] { return false; });
+			if (stop.stop_requested() || !Due(CompileClockNs())) {
+				continue;
+			}
+			// Count only what the serialized data can contain: pipelines created before it.
+			const auto covered = created.load(std::memory_order_acquire);
+			const auto written = cache.WriteDriverCache(true);
+			const auto now     = CompileClockNs();
+			last_save_ns       = now;
+			if (written == WriteOversized) {
+				// It only grows: stop serializing it every interval. Exit still saves it.
+				oversized = true;
+			} else if (written == 0) {
+				retry_after_ns = now + DriverCacheSaveSettings::Get().interval_ns;
+			} else {
+				saved_created = covered;
+			}
+		}
+	}
+
+	// WriteDriverCache result of a periodic save skipped for exceeding MaxDriverCacheFileSize.
+	static constexpr uint64_t WriteOversized = UINT64_MAX;
+
+	PipelineCache&        cache;
+	std::atomic<uint64_t> created {0};
+	std::atomic<uint64_t> last_created_ns {0};
+	// Saver thread only, then Save() after Stop().
+	uint64_t saved_created  = 0;
+	uint64_t last_save_ns   = 0;
+	uint64_t retry_after_ns = 0;
+	bool     oversized      = false;
+	// While a save runs vkGetPipelineCacheData; pipelines created meanwhile are counted as overlaps.
+	std::atomic<bool> serializing {false};
+	std::jthread      thread; // Last: stopped before the members it uses are destroyed.
+};
+
+void PipelineCache::NotePipelineCreated(uint64_t create_ns) {
+	if (m_saver == nullptr) {
+		return;
+	}
+	m_saver->NoteCreated();
+	if (m_saver->serializing.load(std::memory_order_relaxed)) {
+		HangTrace::RecordPipelineCacheSaveOverlap(create_ns);
+	}
+}
+
+uint64_t PipelineCache::WriteDriverCache(bool periodic) {
+	const auto begin = CompileClockNs();
+	// Synchronization: vkGetPipelineCacheData has no externally synchronized parameter (vk.xml
+	// declares none for pipelineCache), and m_driver_cache is created without
+	// VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT, so vkCreate*Pipelines on the command
+	// processor may use the cache concurrently: the implementation synchronizes internally. No
+	// emulator lock is taken here, so a draw never waits for this serialization or the file I/O
+	// below; at worst a pipeline created meanwhile waits inside the driver
+	// (pcache_save_overlaps). vkDestroyPipelineCache, the only externally synchronized use, runs
+	// in Save() after the saver has stopped. The handle itself is written only before the saver
+	// starts and after it stops.
 	std::vector<uint8_t> payload;
-	for (uint32_t attempt = 0; attempt < 3; attempt++) {
+	size_t               size   = 0;
+	vk::Result           result = vk::Result::eIncomplete;
+	if (m_saver != nullptr) m_saver->serializing.store(true, std::memory_order_relaxed);
+	for (uint32_t attempt = 0; attempt < 3 && result == vk::Result::eIncomplete; attempt++) {
 		size   = 0;
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
 		if (result != vk::Result::eSuccess || size == 0 ||
 		    size > std::numeric_limits<uint32_t>::max()) {
 			break;
 		}
-		payload.resize(size);
+		// Pipelines created between the two calls grow the data; leave room for them. Whatever
+		// is returned is valid initial data, but only complete data replaces the file.
+		payload.resize(size + size / 8u + 1024u * 1024u);
+		size   = payload.size();
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
-		if (result != vk::Result::eIncomplete) {
-			break;
-		}
 	}
+	if (m_saver != nullptr) m_saver->serializing.store(false, std::memory_order_relaxed);
+	const auto serialized = CompileClockNs();
+	const char* kind      = periodic ? "periodic" : "exit";
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
-		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
+		PipelineCacheLog("Vulkan pipeline cache: {} save failed ({}, {} bytes)", kind,
 		                 vk::to_string(result), size);
-		return;
+		return 0;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
+	if (periodic && prefix.size() + payload.size() > MaxDriverCacheFileSize) {
+		// The loader rejects such a file and starts over; keep the last file that it accepts.
+		// The exit save still writes it, which is what resets an overgrown cache.
+		PipelineCacheLog("Vulkan pipeline cache: {} bytes exceed the {} byte cap; periodic saves "
+		                 "stop, the exit save still writes it",
+		                 payload.size(), MaxDriverCacheFileSize);
+		return DriverCacheSaver::WriteOversized;
+	}
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return 0;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -1879,14 +2060,46 @@ void PipelineCache::Save() {
 	}
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();
+	// std::filesystem::rename replaces the destination in one step (MoveFileExW with
+	// MOVEFILE_REPLACE_EXISTING on Windows, rename(2) elsewhere): a kill at any point leaves
+	// either the previous or the new complete file. Common::File::RenameFile deleted the old
+	// file first, so a kill between the delete and the move lost the cache.
+	std::error_code error;
+	if (prefix_written == prefix.size() && payload_written == payload.size() && flushed) {
+		std::filesystem::rename(temp_path, m_driver_cache_path, error);
+	}
 	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
-	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
-		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
-		                 Common::PathToString(m_driver_cache_path));
+	    error) {
+		PipelineCacheLog("Vulkan pipeline cache: failed to write {}{}",
+		                 Common::PathToString(m_driver_cache_path),
+		                 error ? " (" + error.message() + ")" : std::string());
+		return 0;
+	}
+	const auto written = CompileClockNs();
+	HangTrace::RecordPipelineCacheSave(payload.size(), serialized - begin, written - serialized);
+	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {} ({}, serialize {:.1f} ms, write "
+	                 "{:.1f} ms)",
+	                 payload.size(), Common::PathToString(m_driver_cache_path), kind,
+	                 static_cast<double>(serialized - begin) / 1.0e6,
+	                 static_cast<double>(written - serialized) / 1.0e6);
+	return payload.size();
+}
+
+void PipelineCache::Save() {
+	// From here on no periodic save runs, so destroying the driver cache below is safe.
+	if (m_saver != nullptr) {
+		m_saver->Stop();
+	}
+	Common::LockGuard lock(m_mutex);
+	if (m_driver_cache == nullptr) {
 		return;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
-	                 Common::PathToString(m_driver_cache_path));
+	if (m_saver != nullptr && m_saver->saved_created != 0 &&
+	    m_saver->created.load(std::memory_order_acquire) == m_saver->saved_created) {
+		PipelineCacheLog("Vulkan pipeline cache: no new pipelines since the last save");
+	} else if (WriteDriverCache(false) == 0) {
+		return;
+	}
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	m_driver_cache = nullptr;
 }
@@ -2342,6 +2555,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		                          .detail      = detail});
 	}
 	AddCompileStall(create_ns);
+	NotePipelineCreated(create_ns);
 	return remember(*iter->second);
 }
 
@@ -2390,6 +2604,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 	AddCompileStall(create_ns);
 	FlushCompileStall();
+	NotePipelineCreated(create_ns);
 	return *iter->second;
 }
 } // namespace Libs::Graphics

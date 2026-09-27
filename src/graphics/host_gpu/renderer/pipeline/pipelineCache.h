@@ -111,6 +111,8 @@ public:
 	explicit PipelineCache(GraphicContext& graphics);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
+	// Final save of the driver pipeline cache (exit). Stops the periodic saver first, then
+	// destroys the driver cache; later pipelines are created without one.
 	void Save();
 
 	struct Pipeline {
@@ -172,6 +174,7 @@ public:
 private:
 	struct ProgramCache;
 	struct PipelineDiagnostics;
+	struct DriverCacheSaver;
 
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;
@@ -239,8 +242,14 @@ private:
 	std::unique_ptr<PipelineDiagnostics> m_diagnostics;
 	// Guards the pipeline maps and the driver cache. ProgramCache has its own locks.
 	Common::Mutex m_mutex;
+	// Periodic crash-safe saves of m_driver_cache on a background thread (KYTY_PIPELINE_CACHE_SAVE).
+	std::unique_ptr<DriverCacheSaver> m_saver;
 
 	void InitializeDriverCache();
+	// Serializes m_driver_cache and atomically replaces the cache file. Returns the payload size
+	// written, 0 on failure, or UINT64_MAX for a periodic save skipped over the size cap.
+	uint64_t WriteDriverCache(bool periodic);
+	void     NotePipelineCreated(uint64_t create_ns);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
