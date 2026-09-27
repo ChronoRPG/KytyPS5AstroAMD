@@ -19,6 +19,10 @@ struct TextureBindingMemo::Entry {
 	// TextureCache::m_binding_generation when recorded (unused for null images).
 	uint64_t generation = 0;
 	ImageId  image;
+	// TextureCache::RequestedFirstLevel of the description for this image: FindImage and
+	// FindTexture extend the image's resident levels (EnsureResidency) unless its resident_first
+	// is at most this.
+	uint32_t requested_first = 0;
 	// Another registered image has the same backing range, extent and sample count, so
 	// SyncAliasFromOwner may copy into this one unless it owns the bytes.
 	bool                    has_partner = false;
@@ -67,13 +71,19 @@ uint64_t TextureBindingMemo::Hash(const Key& key) {
 }
 
 bool TextureBindingMemo::RefreshIsNoOp(const Image& image) {
-	// Mirrors TextureCache::RefreshImage for an image without a stencil association: TrackImage
-	// returns at once when the whole range is watched, the maybe-dirty edge hash runs only for a
-	// maybe-dirty image, and InitializeImage (upload) runs only for a buffer-modified or CPU-dirty
-	// image. Any new refresh trigger added there must be added here.
-	return !image.IsCpuDirty() && !image.IsBufferModified() &&
-	       image.track_addr == image.info.data.address &&
-	       image.track_addr_end == image.info.data.End();
+	// Mirrors TextureCache::RefreshImage for a registered image without a stencil association:
+	// TrackImage returns at once when the resident range (`live`) is watched as a whole, or, for
+	// a chunk-tracked image, when it is watched and no chunk was released; the maybe-dirty edge
+	// hash runs only for a maybe-dirty image; InitializeImage (upload, partial or whole) runs
+	// only for a buffer-modified or CPU-dirty image (chunk writes and residency extensions mark
+	// the image CPU-dirty). Any new refresh trigger added there must be added here.
+	if (image.IsCpuDirty() || image.IsBufferModified() || !image.IsTracked()) {
+		return false;
+	}
+	if (image.ChunkTracked()) {
+		return image.chunks.untracked_count == 0;
+	}
+	return image.track_addr == image.live.address && image.track_addr_end == image.live.End();
 }
 
 void TextureBindingMemo::Forget(TextureBinding& binding) {
@@ -97,11 +107,12 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 		std::scoped_lock lock {cache.m_lock};
 		auto*            image = cache.m_slot_images.try_get(entry.image);
 		// A structural change may alter what FindImage returns; a stencil association redirects
-		// the binding; a pending rebind and a copy from the alias owner are FindImage/RebindImages
+		// the binding; a pending rebind, a copy from the alias owner and a residency extension
+		// (resident levels changed, or fewer than the view samples) are FindImage/RebindImages
 		// work: all take the full resolution.
 		if (entry.generation != cache.m_binding_generation.load(std::memory_order_relaxed) ||
 		    image == nullptr || !image->registered || image->depth_id ||
-		    image->binding.needs_rebind ||
+		    image->binding.needs_rebind || entry.requested_first < image->resident_first ||
 		    (entry.has_partner && !image->alias_owner && !image->info.HasStencil())) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoStale);
 			return false;
@@ -132,9 +143,10 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoRejects);
 		return;
 	}
-	const bool null_image  = desc.info.data.Empty();
-	bool       has_partner = false;
-	uint64_t   generation  = 0;
+	const bool null_image      = desc.info.data.Empty();
+	bool       has_partner     = false;
+	uint64_t   generation      = 0;
+	uint32_t   requested_first = 0;
 	{
 		// One critical section: the checks below and the generation describe the same state.
 		std::scoped_lock lock {cache.m_lock};
@@ -157,6 +169,10 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 				Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoRejects);
 				return;
 			}
+			// What FindImage/FindTexture pass to EnsureResidency for this description; they
+			// already made these levels resident, and only EnsureResidency (re-registration)
+			// changes resident_first.
+			requested_first = cache.RequestedFirstLevel(desc, image->info.resources.levels);
 			// SyncAliasFromOwner copies only from images with this exact backing range, extent
 			// and sample count; they start on the same indexed page as this one. Their flags
 			// (alias owner, GPU-modified, stencil) are not considered: any such image makes the
@@ -180,11 +196,12 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 	}
 	const auto slot  = static_cast<uint32_t>(hash % Slots);
 	auto&      entry = m_entries[slot];
-	entry.key         = key;
-	entry.tag         = m_next_tag++;
-	entry.generation  = generation;
-	entry.image       = found;
-	entry.has_partner = has_partner;
+	entry.key             = key;
+	entry.tag             = m_next_tag++;
+	entry.generation      = generation;
+	entry.image           = found;
+	entry.requested_first = requested_first;
+	entry.has_partner     = has_partner;
 	entry.null_image  = null_image;
 	entry.view        = nullptr;
 	entry.desc        = desc;
@@ -210,9 +227,11 @@ bool TextureBindingMemo::TryAcquireView(TextureCache& cache, TextureBinding& bin
 		return false;
 	}
 	if (!image->info.data.Empty()) {
-		// FindTexture's rediscovery checks, a no-op RefreshImage, and no stencil plane refresh.
+		// FindTexture's rediscovery checks, a no-op EnsureResidency (the view's levels are
+		// resident), a no-op RefreshImage, and no stencil plane refresh.
 		if (!image->registered || image->depth_id || image->binding.needs_rebind ||
-		    image->info.HasStencil() || !RefreshIsNoOp(*image)) {
+		    entry.requested_first < image->resident_first || image->info.HasStencil() ||
+		    !RefreshIsNoOp(*image)) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureViewMemoMisses);
 			return false;
 		}

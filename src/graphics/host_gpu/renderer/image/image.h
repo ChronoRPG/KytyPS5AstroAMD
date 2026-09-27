@@ -89,22 +89,132 @@ public:
 	void AdoptContentSerial(uint64_t serial) noexcept { m_content_serial = serial; }
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
-		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
+		if (ImageRangeOverlaps(live.address, live.size, vaddr, size)) {
 			m_cpu_dirty        = true;
 			m_maybe_cpu_dirty  = false;
 			m_maybe_hash_valid = false;
+			// Whole-image invalidation carries no chunk information.
+			m_partial_valid = false;
 			NoteDirtySpan(vaddr, size);
-		} else if (ImagePageRangesOverlap(info.data.address, info.data.size, vaddr, size)) {
+		} else if (ImagePageRangesOverlap(live.address, live.size, vaddr, size)) {
 			m_maybe_cpu_dirty = true;
 			NoteDirtySpan(vaddr, size);
 		}
 	}
 
+	// Resident mip levels (TextureCache, KYTY_TEXTURE_RESIDENT_MIPS). PS5 mip chains are stored
+	// smallest level first, so levels [resident_first, levels) occupy the prefix `live` of the
+	// guest range. The cache registers, watches, overlap-tests and uploads only `live`; levels
+	// below resident_first hold undefined native contents that no view can sample (every
+	// sampled view clamps its minimum LOD at or above resident_first, see TextureCache::
+	// RequestedFirstLevel). Any other use makes the image fully resident first.
+	[[nodiscard]] bool FullyResident() const noexcept { return resident_first == 0; }
+	// Every resident level must be refreshed from guest memory (newly resident levels).
+	void MarkResidencyDirty() noexcept {
+		m_cpu_dirty        = true;
+		m_maybe_cpu_dirty  = false;
+		m_maybe_hash_valid = false;
+		m_partial_valid    = false;
+	}
+
+	// Chunk-granular CPU write tracking (TextureCache, KYTY_TEXTURE_PARTIAL_UPLOAD). Only for
+	// page-aligned images, so every write to one of their pages overlaps their bytes. While
+	// tracked, the image watches its whole page range except the chunks marked untracked; a
+	// chunk is untracked only by a CPU write, which also marks it dirty. Dirty chunks are the
+	// guest bytes that may differ from the native contents; they are cleared by a refresh.
+	struct ChunkState {
+		uint64_t              base        = 0; // AlignDown(data.address, chunk size)
+		uint32_t              count       = 0; // 0: whole-image tracking
+		uint32_t              shift       = 0;
+		uint32_t              dirty_count = 0;
+		uint32_t              untracked_count = 0;
+		// Consecutive refreshes that found (nearly) every chunk dirty. Such an image is
+		// rewritten whole by the CPU: its next write releases every chunk at once, so it takes
+		// one fault per refresh instead of one per chunk.
+		uint32_t              full_streak = 0;
+		// Refresh cycles since the last chunk-by-chunk cycle; every 8th cycle probes again.
+		uint32_t              whole_cycles   = 0;
+		bool                  whole_released = false;
+		std::vector<uint64_t> dirty;
+		std::vector<uint64_t> untracked;
+		// KYTY_TEXTURE_PARTIAL_VERIFY=1 only: guest-byte hash of each chunk at the last upload.
+		std::vector<uint64_t> hashes;
+	};
+	[[nodiscard]] bool ChunkTracked() const noexcept { return chunks.count != 0; }
+	void               EnableChunkTracking(uint32_t shift) {
+		chunks.shift = shift;
+		chunks.base  = live.address & ~((uint64_t {1} << shift) - 1);
+		const auto end   = live.End();
+		const auto count = ((end - chunks.base) + (uint64_t {1} << shift) - 1) >> shift;
+		chunks.count     = static_cast<uint32_t>(count);
+		chunks.dirty.assign((count + 63) / 64, 0);
+		chunks.untracked.assign((count + 63) / 64, 0);
+		chunks.dirty_count     = 0;
+		chunks.untracked_count = 0;
+		chunks.full_streak     = 0;
+		chunks.whole_cycles    = 0;
+		chunks.whole_released  = false;
+		chunks.hashes.clear();
+	}
+	[[nodiscard]] static bool ChunkBit(const std::vector<uint64_t>& bits, uint32_t index) noexcept {
+		return (bits[index >> 6] >> (index & 63u)) & 1u;
+	}
+	static void SetChunkBit(std::vector<uint64_t>& bits, uint32_t index) noexcept {
+		bits[index >> 6] |= uint64_t {1} << (index & 63u);
+	}
+	static void ClearChunkBit(std::vector<uint64_t>& bits, uint32_t index) noexcept {
+		bits[index >> 6] &= ~(uint64_t {1} << (index & 63u));
+	}
+	// Records a CPU write to chunk `index` (the caller removes the watch). Returns true when
+	// the chunk was clean before.
+	bool MarkChunkDirty(uint32_t index) noexcept {
+		if (ChunkBit(chunks.dirty, index)) {
+			return false;
+		}
+		SetChunkBit(chunks.dirty, index);
+		chunks.dirty_count++;
+		return true;
+	}
+	// A CPU write to guest bytes of this chunk-tracked image: the image needs a refresh.
+	void NoteChunkWrite(uint64_t vaddr, uint64_t size) noexcept {
+		m_cpu_dirty        = true;
+		m_maybe_cpu_dirty  = false;
+		m_maybe_hash_valid = false;
+		NoteDirtySpan(vaddr, size);
+	}
+	void ClearChunkDirty() noexcept {
+		if (chunks.dirty_count != 0) {
+			std::fill(chunks.dirty.begin(), chunks.dirty.end(), 0);
+			chunks.dirty_count = 0;
+		}
+	}
+	// Whether any chunk overlapping guest range [vaddr, vaddr + size) is dirty.
+	[[nodiscard]] bool ChunkRangeDirty(uint64_t vaddr, uint64_t size) const noexcept {
+		if (size == 0 || vaddr < chunks.base) {
+			return true;
+		}
+		const auto first = (vaddr - chunks.base) >> chunks.shift;
+		const auto last  = (vaddr + size - 1 - chunks.base) >> chunks.shift;
+		if (last >= chunks.count) {
+			return true;
+		}
+		for (auto index = first; index <= last; index++) {
+			if (ChunkBit(chunks.dirty, static_cast<uint32_t>(index))) {
+				return true;
+			}
+		}
+		return false;
+	}
+	// True while every native byte outside the dirty chunks equals the detiled guest bytes:
+	// set only after an upload from guest memory, cleared by any other write to the image.
+	[[nodiscard]] bool PartialValid() const noexcept { return m_partial_valid; }
+	void               SetPartialValid(bool valid) noexcept { m_partial_valid = valid; }
+
 	// Transfer attribution (diagnostics only): union of the guest ranges that dirtied this image
 	// since its last refresh, clipped to the image, and why it was last refreshed.
 	void NoteDirtySpan(uint64_t vaddr, uint64_t size) noexcept {
-		const auto begin = std::max(vaddr, info.data.address);
-		const auto end   = std::min(vaddr + size, info.data.End());
+		const auto begin = std::max(vaddr, live.address);
+		const auto end   = std::min(vaddr + size, live.End());
 		if (begin >= end) {
 			return;
 		}
@@ -165,21 +275,32 @@ public:
 		m_maybe_hash_valid = false;
 		m_dirty_from_hash  = false;
 		m_refreshed        = true;
+		// Also reached without an upload (the image is being overwritten on the GPU); a
+		// guest-sourced refresh sets partial validity again afterwards.
+		m_partial_valid = false;
+		ClearChunkDirty();
 		ClearDirtySpan();
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
+	void               MarkGpuModified() noexcept {
+		m_gpu_modified  = true;
+		m_partial_valid = false;
+	}
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
-	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
+	void               MarkBufferModified() noexcept {
+		m_buffer_modified = true;
+		m_partial_valid   = false;
+	}
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
+	// Against the registered (resident) guest range; see `live`.
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
-		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
-		             : ImageRangeOverlaps(info.data.address, info.data.size, address, size);
+		return pages ? ImagePageRangesOverlap(live.address, live.size, address, size)
+		             : ImageRangeOverlaps(live.address, live.size, address, size);
 	}
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
@@ -191,6 +312,14 @@ public:
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 
 	ImageInfo        info;
+	// The guest bytes of the resident levels: info.data, or its prefix when resident_first > 0.
+	// Changed only while the image is unregistered.
+	GuestRange       live;
+	uint32_t         resident_first = 0;
+	// KYTY_TEXTURE_RESIDENT_MIPS=poison: non-resident levels were filled with a marker.
+	bool             residency_poisoned = false;
+	// The next refresh uploads levels made resident by a residency change (attribution only).
+	bool             residency_refresh = false;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
 	ImageUsage       usage;
@@ -205,6 +334,18 @@ public:
 	size_t           lru_id              = 0;
 	// Last GPU writer among overlapping aliases; cleared when another alias takes the bytes.
 	bool             alias_owner         = false;
+	ChunkState       chunks;
+	// Last download into a cache buffer for texel-buffer reads (SynchronizeBufferFromImage):
+	// the buffer revision it produced and this image's content serial at the time.
+	struct TexelSyncMark {
+		Common::SlotId buffer {};
+		uint64_t       revision = 0;
+		uint64_t       epoch    = 0;
+		uint64_t       serial   = 0;
+		uint64_t       size     = 0;
+		bool           valid    = false;
+	};
+	TexelSyncMark    texel_sync;
 
 private:
 	friend struct ImageTestAccess;
@@ -226,6 +367,7 @@ private:
 	bool              m_buffer_modified  = false;
 	bool              m_dirty_from_hash  = false;
 	bool              m_refreshed        = false;
+	bool              m_partial_valid    = false;
 	uint64_t          m_content_serial   = 0;
 	uint64_t          m_definite_writes  = 0;
 	uint64_t          m_dirty_begin      = 0;

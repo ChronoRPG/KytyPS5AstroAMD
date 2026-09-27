@@ -332,8 +332,20 @@ void CommandProcessor::BufferInit() {
 
 void CommandProcessor::BufferFlush() {
 	KYTY_PROFILER_DETAIL_FUNCTION();
-	m_deferred_eop_flushes = 0;
+	m_deferred_eop_flushes     = 0;
+	m_packets_since_eop_request = 0;
 	GetScheduler().Flush();
+}
+
+uint32_t CommandProcessor::EopFlushPacketLimit() {
+	// KYTY_EOP_FLUSH_PACKETS: packets processed after the first deferred interrupt before the
+	// command buffer is flushed anyway (default 256).
+	static const uint32_t limit = [] {
+		const char* value  = std::getenv("KYTY_EOP_FLUSH_PACKETS");
+		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 256ul;
+		return static_cast<uint32_t>(std::clamp(parsed, 1ul, 1ul << 20u));
+	}();
+	return limit;
 }
 
 void CommandProcessor::BufferFlushForEop() {
@@ -880,6 +892,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
+		if (m_deferred_eop_flushes != 0 && ++m_packets_since_eop_request >= EopFlushPacketLimit()) {
+			// Bound how long a batched end-of-pipe interrupt can wait inside a long slice.
+			BufferFlush();
+		}
 		if (!execution.m_next_buffer.empty()) {
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {

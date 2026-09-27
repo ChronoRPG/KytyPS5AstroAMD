@@ -29,7 +29,10 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
+#include <unordered_map>
+#include <mutex>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
@@ -858,12 +861,85 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
 	}
 }
 
+// KYTY_VULKAN_VALIDATION_MODE=log: diagnostic runs record validation errors and warnings in a
+// file (KYTY_VULKAN_VALIDATION_LOG, default _kyty_vulkan_validation.log) and keep running,
+// instead of exiting on the first error. Each message id is written in full for its first five
+// occurrences, then as a count at every power of two.
+static bool VulkanValidationLogOnly() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VULKAN_VALIDATION_MODE");
+		return value != nullptr && std::strcmp(value, "log") == 0;
+	}();
+	return enabled;
+}
+
+static void RecordVulkanValidationMessage(const char*                                   severity,
+                                          const vk::DebugUtilsMessengerCallbackDataEXT* data) {
+	static std::mutex                                mutex;
+	static std::unordered_map<std::string, uint64_t> counts;
+	static std::FILE*                                file = [] {
+		const char* path = std::getenv("KYTY_VULKAN_VALIDATION_LOG");
+		return std::fopen(path != nullptr && path[0] != 0 ? path : "_kyty_vulkan_validation.log",
+		                  "a");
+	}();
+	// Key on the message id plus its first line with handles and numbers blanked, so the same id
+	// raised by different commands (e.g. two unrelated hazards) is reported separately.
+	std::string first_line(data->pMessage, std::strcspn(data->pMessage, "\r\n"));
+	std::string shape;
+	shape.reserve(first_line.size());
+	for (size_t i = 0; i < first_line.size(); i++) {
+		const char c = first_line[i];
+		if (c >= '0' && c <= '9') {
+			if (shape.empty() || shape.back() != '#') {
+				shape.push_back('#');
+			}
+			if (c == '0' && i + 1 < first_line.size() && (first_line[i + 1] == 'x')) {
+				i++;
+			}
+			while (i + 1 < first_line.size() &&
+			       std::isxdigit(static_cast<unsigned char>(first_line[i + 1])) != 0) {
+				i++;
+			}
+			continue;
+		}
+		shape.push_back(c);
+	}
+	const std::string id = std::string(severity) + " " +
+	                       (data->pMessageIdName != nullptr ? data->pMessageIdName : "?") + " | " +
+	                       shape.substr(0, 160);
+	std::scoped_lock lock(mutex);
+	if (counts.size() >= 4096 && counts.find(id) == counts.end()) {
+		return;
+	}
+	const auto count = ++counts[id];
+	if (file == nullptr) {
+		return;
+	}
+	if (count <= 5) {
+		std::fprintf(file, "[%s] occurrence %llu\n%s\n\n", id.c_str(),
+		             static_cast<unsigned long long>(count), data->pMessage);
+	} else if ((count & (count - 1)) == 0) {
+		std::fprintf(file, "[%s] repeated %llu times\n", id.c_str(),
+		             static_cast<unsigned long long>(count));
+	}
+	std::fflush(file);
+}
+
 static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
     vk::DebugUtilsMessageSeverityFlagBitsEXT      message_severity,
     vk::DebugUtilsMessageTypeFlagsEXT             message_types,
     const vk::DebugUtilsMessengerCallbackDataEXT* callback_data, void* /*user_data*/) {
 	EXIT_IF(callback_data == nullptr);
 	EXIT_IF(callback_data->pMessage == nullptr);
+
+	if (VulkanValidationLogOnly() &&
+	    (message_severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eError ||
+	     message_severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning)) {
+		RecordVulkanValidationMessage(
+		    message_severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eError ? "E" : "W",
+		    callback_data);
+		return VK_FALSE;
+	}
 
 	const char*     severity_str   = nullptr;
 	fmt::text_style severity_style = Log::Color::Default;
@@ -984,8 +1060,13 @@ void WindowContext::CreateVulkan() {
 		EXIT("--spirv-debug-printf and --gpu-assisted-validation are mutually exclusive\n");
 	}
 
-	vk::ValidationFeatureEnableEXT enabled_features[3]    = {};
+	vk::ValidationFeatureEnableEXT enabled_features[4]    = {};
 	uint32_t                       enabled_features_count = 0;
+	// KYTY_VULKAN_SYNC_VALIDATION=1: synchronization validation (missing or wrong barriers).
+	if (const char* sync = std::getenv("KYTY_VULKAN_SYNC_VALIDATION"); sync != nullptr && sync[0] == '1') {
+		enabled_features[enabled_features_count++] =
+		    vk::ValidationFeatureEnableEXT::eSynchronizationValidation;
+	}
 #ifdef KYTY_ENABLE_BEST_PRACTICES
 	enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eBestPractices;
 #endif

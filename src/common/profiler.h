@@ -268,6 +268,53 @@ enum class FrameEvent : uint32_t {
 	DccFallbackMetadataAliased, // an image owns (overlaps) the metadata, or metadata overlaps data
 	DccFallbackUnsupported,    // native image lacks storage/mutable usage, or size limits
 	DccFallbackAlignment,      // canonical metadata buffer offset is not 4-byte aligned
+	// Texture streaming (TextureCache, KYTY_TEXTURE_PARTIAL_UPLOAD): refreshes that uploaded only
+	// the mip rows/levels overlapping dirty chunks, their tiled bytes, the bytes a full refresh
+	// would have added, chunk-tracked refreshes that still had to upload the whole image
+	// (ineligible, too dirty, or no partial validity), chunks newly dirtied by CPU writes
+	// (~ write faults on tracked texture pages) and KYTY_TEXTURE_PARTIAL_VERIFY mismatches.
+	TexturePartialUploads,
+	TexturePartialUploadBytes,
+	TexturePartialSkippedBytes,
+	TexturePartialFallbacks,
+	TextureChunkInvalidations,
+	TexturePartialVerifyMismatches,
+	// Overlapped texture images kept alive instead of freed (KYTY_TEXTURE_OVERLAP_KEEP_FRAMES).
+	TextureOverlapKeeps,
+	// TileManager scratch buffers reused from its pool or newly allocated (KYTY_TILER_SCRATCH_POOL).
+	TilerScratchPoolHits,
+	TilerScratchPoolMisses,
+	// Texture refresh staging copies handed to the StagingCopier worker, and their bytes
+	// (KYTY_TEXTURE_ASYNC_STAGING).
+	TextureAsyncCopies,
+	TextureAsyncCopyBytes,
+	// Image refresh bytes by source route: an existing cache buffer or GPU-written bytes
+	// (BufferCache), a synchronous staging copy on the GPU thread, or the StagingCopier worker.
+	TextureUploadBytesBuffer,
+	TextureUploadBytesStaging,
+	TextureUploadBytesAsync,
+	// Guest write-fault invalidations answered without the texture-cache lock because no
+	// registered image covers the faulting 1 MiB page (KYTY_TEXTURE_FAULT_FAST_PATH).
+	TextureInvalidateSkips,
+	// Texel-buffer reads of image-backed memory (BufferCache::SynchronizeBufferFromImage):
+	// image downloads recorded, and downloads skipped because neither the image nor the buffer
+	// changed since the previous one (KYTY_TEXEL_SYNC_SKIP).
+	TexelImageSyncDownloads,
+	TexelImageSyncSkips,
+	// Resident mip levels (KYTY_TEXTURE_RESIDENT_MIPS): images created holding only the levels
+	// their views can sample and the levels left out, guest bytes their refreshes did not
+	// upload, residency extensions (a finer MIN_LOD, or any non-sampling use), extensions to
+	// the whole chain for non-sampling uses, partially resident images retired by an unmap of
+	// their non-resident bytes, and GPU writes that reached a partially resident image (0).
+	TextureResidentImages,
+	TextureResidentLevelsSkipped,
+	TextureResidentBytesSkipped,
+	TextureResidencyExtensions,
+	TextureResidencyFullFallbacks,
+	TextureResidencyUnmapFrees,
+	TextureResidencyViolations,
+	// Partially resident images retired after KYTY_TEXTURE_RESIDENT_IDLE_FRAMES unused frames.
+	TextureResidentIdleFrees,
 	// Texture binding identity memo (KYTY_TEXTURE_BINDING_MEMO, pipeline/textureBindingMemo.h).
 	// ResolveTexture answered from an entry (Hits), with no entry for the key (Misses), or with an
 	// entry that a texture-cache structure change or the image's live state ruled out (Stale: new
@@ -352,6 +399,11 @@ enum class FrameWait : uint32_t {
 	// (StagePrepJoin), and helper-thread job time (StagePrepHelper, not on the GPU thread).
 	StagePrepJoin,
 	StagePrepHelper,
+	// GPU-thread CPU time of TextureCache guest-memory -> image refreshes (staging copies,
+	// detile and copy recording), full or partial.
+	TextureUpload,
+	// StagingCopier worker time copying guest texture bytes into staging (not the GPU thread).
+	TextureStagingCopy,
 	Count,
 };
 

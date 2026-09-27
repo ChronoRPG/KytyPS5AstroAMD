@@ -34,6 +34,7 @@ class CommandBuffer;
 class CommandScheduler;
 class DccClearHelper;
 class RenderExecutor;
+class StagingCopier;
 class TextureBindingMemo;
 struct TextureCacheTestAccess;
 
@@ -145,7 +146,21 @@ private:
 		}
 	}
 
-	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
+	// resident_first > 0: register only the prefix holding levels [resident_first, levels)
+	// (resident_prefix bytes, computed when 0); stays fully resident when not applicable.
+	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info, uint32_t resident_first = 0,
+	                                      uint64_t resident_prefix = 0);
+	// Resident mip levels (Image::live, KYTY_TEXTURE_RESIDENT_MIPS). Caller holds m_lock.
+	// The finest level a view of `desc` can read, for an image with `levels` levels.
+	[[nodiscard]] uint32_t    RequestedFirstLevel(const ImageDesc& desc, uint32_t levels) const;
+	[[nodiscard]] uint64_t    ResidentPrefixSize(const ImageInfo& info, uint32_t first_level) const;
+	// Makes levels >= first_level resident (re-registration; the next refresh uploads them).
+	// `sampling`: requested by a sampled view (counted as an extension, else a fallback).
+	void                      EnsureResidency(ImageId id, uint32_t first_level, bool sampling);
+	// Whole chain resident and refreshed now, before a non-sampling use records anything.
+	void                      RequireFullResidency(ImageId id);
+	void                      PoisonNonResidentLevels(Image& image);
+	void                      RetireIdlePartialImages();
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
@@ -155,6 +170,24 @@ private:
 	void                      TouchImage(Image& image);
 	void                      SyncAliasFromOwner(ImageId id);
 	void                      TrackImage(ImageId id);
+	// Chunk-granular tracking (Image::ChunkState). Caller holds m_lock.
+	[[nodiscard]] bool        ChunkTrackingEligible(const Image& image) const;
+	void                      TrackChunkImage(Image& image);
+	template <bool track>
+	uint32_t                  UpdateChunkWatchers(Image& image, uint32_t first, uint32_t last);
+	void                      InvalidateChunks(Image& image, uint64_t address, uint64_t size);
+	struct PartialUploadResult {
+		bool     done        = false;
+		uint64_t bytes       = 0; // tiled guest bytes detiled and uploaded
+		uint64_t dirty_bytes = 0; // dirty chunk bytes that caused the refresh
+	};
+	[[nodiscard]] PartialUploadResult TryPartialUpload(Image& image);
+	// Whole-image refresh of a tiled sampled texture whose guest bytes are copied to staging
+	// by m_staging_copier. False when the ordinary refresh path must be used.
+	[[nodiscard]] bool        TryAsyncFullUpload(Image& image);
+	void                      RecordChunkHashes(Image& image);
+	[[nodiscard]] bool        VerifyCleanChunks(Image& image);
+	[[nodiscard]] bool        KeepOverlappedImage(const Image& cached, uint64_t current_frame) const;
 	void                      TrackImageHead(ImageId id);
 	void                      TrackImageTail(ImageId id);
 	void                      UntrackImage(ImageId id);
@@ -191,6 +224,12 @@ private:
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
+	[[nodiscard]] static TextureTransfer BuildTextureTransfer(const ImageInfo& info,
+	                                                          uint32_t backing_samples,
+	                                                          BindingType binding,
+	                                                          TransferDirection direction);
+	// Drops the regions (and tiles) of non-resident levels and packs the detiled scratch.
+	void RestrictToResidentLevels(const Image& image, TextureTransfer& transfer) const;
 	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
@@ -260,6 +299,35 @@ private:
 	uint64_t         m_image_lookup_checks = 0;
 	uint64_t         m_image_lookup_mismatches = 0;
 	bool             m_readback_linear_images = false;
+	// Texture streaming (see TextureCache constructor for the environment switches).
+	bool             m_partial_upload      = true;
+	bool             m_partial_bands       = true;
+	bool             m_partial_verify      = false;
+	uint32_t         m_chunk_shift         = 16;
+	uint64_t         m_overlap_keep_frames = 0;
+	// Set by FindImage for the ResolveOverlap calls of one lookup: many live overlapping
+	// images already share the requested range, so overlapped images are not kept.
+	bool             m_overlap_crowded     = false;
+	uint64_t         m_partial_verify_mismatches = 0;
+	// KYTY_TEXTURE_ASYNC_STAGING=0: null, staging copies stay on the GPU thread.
+	std::unique_ptr<StagingCopier> m_staging_copier;
+	// Device-local host-visible (resizable BAR) staging ring for StagingCopier jobs, so detile
+	// reads VRAM instead of system memory over PCIe (KYTY_TEXTURE_STAGING_REBAR=0: none).
+	std::unique_ptr<StreamBuffer>  m_texture_staging;
+	// Registered images per ImagePageTable page, readable without m_lock
+	// (KYTY_TEXTURE_FAULT_FAST_PATH=0 always takes the lock).
+	std::unique_ptr<std::atomic<uint32_t>[]> m_image_page_counts;
+	bool                                     m_fault_fast_path = true;
+	enum class ResidencyMode : uint8_t { Off, On, Poison };
+	ResidencyMode                            m_residency            = ResidencyMode::On;
+	uint64_t                                 m_residency_violations = 0;
+	// Partially resident images (stale ids are dropped by the once-per-frame scan).
+	std::vector<ImageId>                     m_partial_images;
+	uint64_t                                 m_partial_scan_frame   = 0;
+	uint64_t                                 m_resident_idle_frames = 30;
+	// KYTY_TEXEL_SYNC_SKIP=0 downloads image contents for every texel-buffer read.
+	bool                                     m_texel_sync_skip = true;
+	[[nodiscard]] StreamBuffer& StagingRing();
 	// Structural generation for TextureBindingMemo (pipeline/textureBindingMemo.h): bumped by
 	// every change of the page-owner index or of an image's registered flag, i.e. whenever the
 	// first-page lookup of FindImage may answer differently. Changing a registered image's

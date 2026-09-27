@@ -29,13 +29,36 @@
 namespace Libs::Graphics {
 
 namespace {
-constexpr uint64_t kRetiredImageByteLimit = 128ull * 1024 * 1024;
-constexpr size_t kRetiredImageCountLimit = 128;
+// Streamed textures churn through a few create-info classes (e.g. 2048^2/4096^2 BC4/BC5/BC7
+// with full mip chains, 2.8-22 MB each) at hundreds of images per second. The pool must
+// hold roughly one retirement period of that churn or most creates miss: 128 MB kept only
+// ~25 2048^2 BC7 images. KYTY_NATIVE_IMAGE_POOL=0 disables the pool (it is on by default);
+// KYTY_NATIVE_IMAGE_POOL_MB (default 1024, at most an eighth of the device budget) and
+// KYTY_NATIVE_IMAGE_POOL_COUNT (default 1024) bound the retained images.
+uint64_t RetiredImageByteLimit(const GraphicContext& graphics) {
+	static const uint64_t configured = [] {
+		const auto* value = std::getenv("KYTY_NATIVE_IMAGE_POOL_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 1024ull) * 1024ull * 1024ull;
+	}();
+	static const uint64_t limit = [&graphics] {
+		const auto budget = graphics.GetTotalMemoryBudget();
+		return budget != 0 ? std::min(configured, budget / 8) : configured;
+	}();
+	return limit;
+}
+
+size_t RetiredImageCountLimit() {
+	static const size_t limit = [] {
+		const auto* value = std::getenv("KYTY_NATIVE_IMAGE_POOL_COUNT");
+		return value != nullptr ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : size_t {1024};
+	}();
+	return limit;
+}
 
 bool NativeImagePoolEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_NATIVE_IMAGE_POOL");
-		return value != nullptr && std::strcmp(value, "1") == 0;
+		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
 	return enabled;
 }
@@ -276,12 +299,14 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 		} else {
 			VmaAllocationInfo allocation_info {};
 			vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
-			const auto bytes = static_cast<uint64_t>(allocation_info.size);
-			if (bytes <= kRetiredImageByteLimit) {
+			const auto bytes       = static_cast<uint64_t>(allocation_info.size);
+			const auto byte_limit  = RetiredImageByteLimit(*this);
+			const auto count_limit = RetiredImageCountLimit();
+			if (bytes <= byte_limit && count_limit != 0) {
 				std::scoped_lock lock(m_retired_image_mutex);
 				while (!m_retired_images.empty() &&
-				       (m_retired_images.size() >= kRetiredImageCountLimit ||
-				        bytes > kRetiredImageByteLimit - m_retired_image_bytes)) {
+				       (m_retired_images.size() >= count_limit ||
+				        bytes > byte_limit - m_retired_image_bytes)) {
 					const auto oldest = m_retired_images.front();
 					DestroyNativeImage(allocator, oldest.image, oldest.allocation);
 					m_retired_image_bytes -= oldest.bytes;

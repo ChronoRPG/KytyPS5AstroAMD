@@ -41,12 +41,21 @@ struct TextureBinding;
 //    only through registration). The tick/LRU touch is performed exactly as FindImage does. A
 //    stencil association (depth_id, checked live) or a pending rebind (checked live) takes the
 //    slow path.
+//  - Resident mip levels. FindImage and FindTexture call EnsureResidency with the first level
+//    the view can sample (TextureCache::RequestedFirstLevel of the description: base level plus
+//    MIN_LOD for sampled views, 0 for storage). The memo records that level and uses an entry
+//    only while the image's resident_first is at most it (checked live), so EnsureResidency
+//    would do nothing; an extension re-registers the image, which also bumps the generation.
 //  - FindTexture (sampled bindings only; storage bindings always take the slow path because they
 //    mark the image GPU-written). RefreshImage must be a no-op: the image is not CPU-dirty,
-//    maybe-dirty or buffer-modified and its whole range is write-watched (TrackImage no-op), and it
-//    has no stencil plane to refresh. Views are never destroyed or replaced while their image lives
+//    maybe-dirty or buffer-modified, and TrackImage has nothing to do (the resident range is
+//    watched as a whole, or, when chunk-tracked, watched with no released chunk); it has no
+//    stencil plane to refresh. Views are never destroyed or replaced while their image lives
 //    and FindView returns the first view matching the normalized info, so the recorded view of
 //    the same image id (slot generation included) is what FindView returns.
+// All image state is read under the texture-cache lock. The guest write-fault fast path skips
+// that lock only for pages on which no image is registered, so it never changes an image the
+// memo can answer for.
 // Null descriptors resolve to the texture cache's permanent null images (never registered, never
 // freed); their entries do not depend on the generation.
 class TextureBindingMemo {

@@ -113,12 +113,24 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 			scheduler.Wait(m_slot_ticks[slot]);
 		}
 		slot_offset = uint64_t {slot} * PublishSlotSize;
+		// The wait above may have finished the recording; record into the current one.
+		native = scheduler.Current().Handle();
 		const vk::BufferCopy copy {0, slot_offset, CounterBytes};
 		native.copyBuffer(counters.Handle(), m_publish->Handle(), 1, &copy);
 	}
 
 	// GET_LOD_STATS control bit 19 reports and resets, bit 18 forces a reset.
 	const bool reset = !m_initialized || ((control >> 18u) & 3u) != 0u;
+	if (reset && publish) {
+		// The reset overwrites the counters the copy above reads (write-after-read hazard found
+		// by synchronization validation): the fills must not start before the copy has read.
+		vk::MemoryBarrier war {};
+		war.srcAccessMask = vk::AccessFlagBits::eTransferRead;
+		war.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &war, 0, nullptr, 0,
+		                       nullptr);
+	}
 	if (reset) {
 		constexpr uint64_t MinBytes = uint64_t {Entries} * sizeof(uint32_t);
 		native.fillBuffer(counters.Handle(), 0, MinBytes, 0xffffffffu);
