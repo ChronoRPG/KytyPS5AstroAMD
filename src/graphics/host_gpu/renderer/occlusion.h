@@ -26,7 +26,7 @@ public:
 	void End();                    // before ending guest rendering
 	void Accumulate();             // after ending rendering; flush only when pool is full
 	// Returns true when the caller must wait for this dump's publication before continuing
-	// (KYTY_OCCLUSION_SYNC_PROXY=1 and this end dump closes a depth-only proxy scope).
+	// (default on, KYTY_OCCLUSION_SYNC_PROXY=0 disables; this end dump closes a depth-only proxy scope).
 	[[nodiscard]] bool Dump(uint64_t address);
 	[[nodiscard]] static bool SyncProxyDumps();
 	// True while a dump has been recorded but not yet published to guest memory.

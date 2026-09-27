@@ -1690,7 +1690,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 					sync = m_renderer.GetOcclusionCounter().Dump(event_address);
 				}
 				if (sync) {
-					// KYTY_OCCLUSION_SYNC_PROXY: publish this visibility-proxy result before the
+					// Publish this visibility-proxy result (KYTY_OCCLUSION_SYNC_PROXY, default on) before the
 					// CP processes the label that follows it (labels are written at record time).
 					BufferWait();
 				}

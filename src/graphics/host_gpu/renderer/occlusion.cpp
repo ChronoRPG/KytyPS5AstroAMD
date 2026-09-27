@@ -156,10 +156,14 @@ void OcclusionCounter::Dispatch(uint32_t mode, vk::Buffer output, uint64_t offse
 	                       {}, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
+// Astro Bot reads a visibility proxy's result right after the label that follows its end dump.
+// Kyty writes labels at record time, so the result must be published before the CP continues
+// (verified 2026-09-27: the Sky Garden water renders only then). KYTY_OCCLUSION_SYNC_PROXY=0
+// restores asynchronous publication.
 bool OcclusionCounter::SyncProxyDumps() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_OCCLUSION_SYNC_PROXY");
-		return value != nullptr && value[0] == '1';
+		return value == nullptr || value[0] != '0';
 	}();
 	return enabled;
 }
