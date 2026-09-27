@@ -1415,21 +1415,49 @@ struct PipelineCache::ProgramCache {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderProgramsCreated);
 		RecordProgramCompile(ProgramStageName(stage), params.hash, permutation.handle.id, times,
 		                     CompileClockNs() - stall.begin);
+		CountCompiledPermutation(stage);
+		return publish_index(entry->second, permutation);
+	}
 
-		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
-		for (const auto& [program_key, source]: programs) {
-			counts[static_cast<size_t>(program_key.stage)] += source.permutations.Size();
+	// Per-stage totals of compiled permutations (equal to the sum of every source's
+	// permutations, which the console line used to recount under the exclusive lock).
+	static constexpr size_t StageCountSlots =
+	    static_cast<size_t>(ShaderType::TessellationEvaluation) + 1;
+	std::array<std::atomic<size_t>, StageCountSlots> compiled_per_stage {};
+
+	// The "Shaders: VS n | PS n | ..." console line after every compile. std::printf to a Windows
+	// console costs milliseconds per line and the counts were recomputed over every source while
+	// the exclusive programs lock was held, so it is off unless KYTY_SHADER_COUNT_LOG=1 or shader
+	// logging is enabled (shader_log_direction). The compile totals line at shutdown and the hang
+	// trace (compiles.csv) report the same information.
+	static bool ShaderCountLogEnabled() {
+		static const bool enabled = [] {
+			const auto* value = std::getenv("KYTY_SHADER_COUNT_LOG");
+			if (value != nullptr && *value != '\0') {
+				return std::strcmp(value, "0") != 0;
+			}
+			return Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+		}();
+		return enabled;
+	}
+
+	void CountCompiledPermutation(ShaderType stage) {
+		const auto slot = static_cast<size_t>(stage);
+		if (slot < compiled_per_stage.size()) {
+			compiled_per_stage[slot].fetch_add(1, std::memory_order_relaxed);
 		}
+		if (!ShaderCountLogEnabled()) {
+			return;
+		}
+		const auto count = [&](ShaderType type) {
+			return compiled_per_stage[static_cast<size_t>(type)].load(std::memory_order_relaxed);
+		};
 		// Guest geometry shaders are compiled through the host mesh stage.
 		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
-		            counts[static_cast<size_t>(ShaderType::Vertex)],
-		            counts[static_cast<size_t>(ShaderType::Pixel)],
-		            counts[static_cast<size_t>(ShaderType::Compute)],
-		            counts[static_cast<size_t>(ShaderType::Mesh)],
-		            counts[static_cast<size_t>(ShaderType::Local)],
-		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
-		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
-		return publish_index(entry->second, permutation);
+		            count(ShaderType::Vertex), count(ShaderType::Pixel), count(ShaderType::Compute),
+		            count(ShaderType::Mesh), count(ShaderType::Local),
+		            count(ShaderType::TessellationControl),
+		            count(ShaderType::TessellationEvaluation));
 	}
 
 	// Serial composition of the pieces above for one stage. On success `input_info.stage`
