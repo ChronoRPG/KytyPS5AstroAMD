@@ -649,6 +649,10 @@ void EmitProgram(EmitterState& state) {
 	}
 	if (state.program.dispatcher_fallback) {
 		auto& dispatch = dispatcher.emplace();
+		// Insertion order of spills[0]. The high half's ids are allocated in this program order:
+		// iterating the pointer-keyed map made them depend on instruction addresses, so the same
+		// shader produced different SPIR-V on every run and missed the pipeline caches.
+		std::vector<const IR::Inst*> spill_order;
 		for (const auto* block: program.blocks) {
 			for (const auto& inst: *block) {
 				if (inst.GetOpcode() != IR::ValueOpcode::Phi) {
@@ -659,6 +663,7 @@ void EmitProgram(EmitterState& state) {
 					break;
 				}
 				dispatch.spills[0].emplace(&inst, state.builder.AllocateId());
+				spill_order.push_back(&inst);
 			}
 		}
 		const auto mark_cross_block = [&](IR::Value value, const IR::Block* consumer) {
@@ -674,6 +679,7 @@ void EmitProgram(EmitterState& state) {
 			}
 			if (!dispatch.spills[0].contains(definition)) {
 				dispatch.spills[0].emplace(definition, state.builder.AllocateId());
+				spill_order.push_back(definition);
 			}
 		};
 		for (const auto* block: program.blocks) {
@@ -696,7 +702,7 @@ void EmitProgram(EmitterState& state) {
 		dispatch.merge_label        = state.builder.AllocateId();
 		ctx.dispatcher_spills       = &dispatch.spills[0];
 		if (state.lane_count == 2) {
-			for (const auto& [inst, id]: dispatch.spills[0]) {
+			for (const auto* inst: spill_order) {
 				dispatch.spills[1].emplace(inst, state.builder.AllocateId());
 			}
 			high.dispatcher_spills = &dispatch.spills[1];
