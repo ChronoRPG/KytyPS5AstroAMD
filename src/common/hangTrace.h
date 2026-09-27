@@ -154,17 +154,27 @@ struct OcclusionEvent {
 };
 void RecordOcclusion(const OcclusionEvent& event);
 
-// lodreports.csv (KYTY_LOD_STATS_MODE=gpu): one row per GET_LOD_STATS report written to the
-// guest: counters reported as sampled, their summed sample counts and mean finest mip, whether
-// any completed statistics existed yet, and GPU copies issued but not yet completed (report age).
+// lodreports.csv (KYTY_LOD_STATS_MODE=gpu): rows for each GET_LOD_STATS report.
+//   Record rows (when the packet is recorded): whether statistics were written now (has_latest;
+//   only KYTY_LOD_REPORT_PUBLISH=rewrite/record write at record time), their sampled counters,
+//   summed counts and mean finest mip, and GPU copies issued but not completed (report age).
+//   Completion rows (pending_copies = UINT64_MAX): has_latest = 1 when the guest slot was written,
+//   sampled_counters = counters with a finest mip, total_samples = summed counts (bits 0..23).
+//   drawn_counters / counted_counters (completion rows): counters with a finest mip ("Drawn" in
+//   the guest's debug view) and counters with a non-zero count ("MipClamp", which the streamer
+//   requires before it promotes a texture to full resolution).
+enum class LodReportKind : uint8_t { Record, Completion };
 struct LodReportEvent {
-	uint64_t destination      = 0;
-	uint32_t control          = 0;
-	bool     has_latest       = false;
-	uint32_t sampled_counters = 0;
-	uint64_t total_samples    = 0;
-	double   mean_finest_mip  = 0.0;
-	uint64_t pending_copies   = 0;
+	uint64_t      destination      = 0;
+	uint32_t      control          = 0;
+	bool          has_latest       = false;
+	uint32_t      sampled_counters = 0;
+	uint64_t      total_samples    = 0;
+	double        mean_finest_mip  = 0.0;
+	uint64_t      pending_copies   = 0;
+	LodReportKind kind             = LodReportKind::Record;
+	uint32_t      drawn_counters   = 0;
+	uint32_t      counted_counters = 0;
 };
 void RecordLodReport(const LodReportEvent& event);
 

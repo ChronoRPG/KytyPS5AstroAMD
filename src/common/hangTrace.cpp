@@ -973,7 +973,8 @@ void Initialize() {
 	                             "depth_format,depth_address,condition,skip,detail");
 	g_files.lodreports = OpenFile("lodreports.csv",
 	                              "t_ms,destination,control,has_latest,sampled_counters,"
-	                              "total_samples,mean_finest_mip,pending_copies");
+	                              "total_samples,mean_finest_mip,pending_copies,drawn_counters,"
+	                              "counted_counters");
 	if (CpTraceEnabled()) {
 		g_files.cp = OpenFile("cp.csv", "t_us,row,host_tid,queue,seq,event,address,value,ref,mask,"
 		                                "aux,size");
@@ -1431,9 +1432,13 @@ void RecordLodReport(const LodReportEvent& event) {
 	if (!Enabled()) {
 		return;
 	}
-	auto row = fmt::format("{},0x{:x},0x{:x},{},{},{},{:.2f},{}", NowMs(), event.destination,
+	// Completion rows keep the UINT64_MAX pending_copies marker of the U33 format.
+	const auto pending =
+	    event.kind == LodReportKind::Completion ? ~uint64_t {0} : event.pending_copies;
+	auto row = fmt::format("{},0x{:x},0x{:x},{},{},{},{:.2f},{},{},{}", NowMs(), event.destination,
 	                       event.control, event.has_latest ? 1 : 0, event.sampled_counters,
-	                       event.total_samples, event.mean_finest_mip, event.pending_copies);
+	                       event.total_samples, event.mean_finest_mip, pending,
+	                       event.drawn_counters, event.counted_counters);
 	std::scoped_lock lock(g_occlusion_mutex);
 	if (g_lodreport_rows_total >= kOcclusionRowLimit) {
 		return;
