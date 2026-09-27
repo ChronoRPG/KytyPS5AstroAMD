@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
@@ -168,6 +169,8 @@ struct BufferCacheTestAccess {
   static StreamBuffer &DownloadBuffer(BufferCache &cache) {
     return cache.m_download_buffer;
   }
+
+  static UploadDma *Dma(BufferCache &cache) { return cache.m_upload_dma.get(); }
 
   static bool SynchronizeBufferFromImage(BufferCache &cache, Buffer &buffer,
                                          uint64_t address, uint64_t size) {
@@ -11815,6 +11818,142 @@ public:
                 DepthLayoutStableEnabled() ? "stable" : "per-draw");
   }
 
+  // KYTY_UPLOAD_DMA: CPU-dirty buffer uploads staged through the transfer queue reach the cache
+  // buffer intact (BufferCache path), the ring refuses space that the recording tick may still
+  // read and reuses it once that tick completed, and small uploads keep the direct copy.
+  void CheckUploadDma() {
+    constexpr const char *name = "UploadDma";
+    constexpr uintptr_t base = 0x0000000206800000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t upload_size = 0x200000;
+    EnsureRuntimeContext();
+    if (m_runtime_context.transfer_queue == nullptr) {
+      std::printf("[gpu]     %-32s skipped (no transfer queue or KYTY_UPLOAD_DMA=0)\n", name);
+      return;
+    }
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed mapping failed");
+    auto *memory = static_cast<uint32_t *>(mapped);
+    for (uint64_t i = 0; i < upload_size / sizeof(uint32_t); i++) {
+      memory[i] = static_cast<uint32_t>(i * 2654435761u + 0x9e37u);
+    }
+
+    // Reads `size` bytes of a native buffer through a host-visible copy.
+    const auto read_back = [&](vk::Buffer source, uint64_t offset, uint64_t size) {
+      Libs::Graphics::Buffer readback(m_runtime_context, scheduler, MemoryUsage::Download, 0,
+                                      vk::BufferUsageFlagBits::eTransferDst, size);
+      auto native = scheduler.Current().Handle();
+      vk::MemoryBarrier before{};
+      before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+      before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+      native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                             vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+                             nullptr);
+      const vk::BufferCopy copy{offset, 0, size};
+      native.copyBuffer(source, readback.Handle(), 1, &copy);
+      vk::MemoryBarrier after{};
+      after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                             vk::PipelineStageFlagBits::eHost, {}, 1, &after, 0, nullptr, 0,
+                             nullptr);
+      scheduler.Finish();
+      readback.Invalidate(0, size);
+      std::vector<uint32_t> words(size / sizeof(uint32_t));
+      std::memcpy(words.data(), readback.Mapped().data(), size);
+      return words;
+    };
+
+    auto &cache = context.GetBufferCache();
+    context.MapMemory(base, allocation_size);
+    auto *dma = BufferCacheTestAccess::Dma(cache);
+    Require(name, "enabled", dma != nullptr, "the buffer cache has no upload DMA");
+    const auto staged_before = dma->Staged();
+    const auto [buffer, buffer_offset] = cache.ObtainBuffer(base, upload_size, false, false);
+    Require(name, "allocation", buffer != nullptr, "buffer allocation failed");
+    Require(name, "staged through the copy engine", dma->Staged() > staged_before,
+            "a 2 MiB CPU-dirty upload did not use the transfer queue");
+    const auto words = read_back(buffer->Handle(), buffer_offset, upload_size);
+    for (uint64_t i = 0; i < words.size(); i++) {
+      if (words[i] != memory[i]) {
+        std::fprintf(stderr, "word %llu: 0x%08x, expected 0x%08x\n",
+                     static_cast<unsigned long long>(i), words[i], memory[i]);
+        Require(name, "contents", false, "the DMA-staged upload changed the buffer contents");
+      }
+    }
+
+    // A private ring of 1 MiB. The cache's dependency slot is borrowed and restored.
+    {
+      constexpr uint64_t Chunk = 512 * 1024;
+      UploadDma ring(m_runtime_context, scheduler, 2 * Chunk, 4096);
+      scheduler.SetSubmitDependency(&ring, 1);
+      Libs::Graphics::Buffer host(m_runtime_context, scheduler, MemoryUsage::Upload, 0,
+                                  vk::BufferUsageFlagBits::eTransferSrc, 3 * Chunk, true);
+      auto *host_words = reinterpret_cast<uint32_t *>(host.Mapped().data());
+      for (uint64_t i = 0; i < 3 * Chunk / sizeof(uint32_t); i++) {
+        host_words[i] = static_cast<uint32_t>(0xa5000000u + i);
+      }
+      host.Flush(0, 3 * Chunk);
+      Libs::Graphics::Buffer device(m_runtime_context, scheduler, MemoryUsage::DeviceLocal, 0,
+                                    vk::BufferUsageFlagBits::eTransferSrc |
+                                        vk::BufferUsageFlagBits::eTransferDst,
+                                    3 * Chunk);
+      const auto copy_from_ring = [&](uint64_t ring_offset, uint64_t device_offset) {
+        const vk::BufferCopy copy{ring_offset, device_offset, Chunk};
+        scheduler.Current().Handle().copyBuffer(ring.RingHandle(), device.Handle(), 1, &copy);
+      };
+      Require(name, "small uploads stay direct", !ring.Stage(host.Handle(), 0, 1024).has_value(),
+              "an upload below the minimum size was queued");
+      const auto first = ring.Stage(host.Handle(), 0, Chunk);
+      const auto second = ring.Stage(host.Handle(), Chunk, Chunk);
+      const auto third = ring.Stage(host.Handle(), 2 * Chunk, Chunk);
+      Require(name, "ring allocation",
+              first == uint64_t{0} && second == Chunk && !third.has_value(),
+              "the ring handed out space the recording tick still reads");
+      copy_from_ring(*first, 0);
+      copy_from_ring(*second, Chunk);
+      const auto both = read_back(device.Handle(), 0, 2 * Chunk);
+      // The previous tick completed (Finish): its ring space is free again.
+      const auto reused = ring.Stage(host.Handle(), 2 * Chunk, Chunk);
+      Require(name, "ring reuse", reused.has_value(),
+              "ring space of a completed tick was not reused");
+      copy_from_ring(*reused, 2 * Chunk);
+      const auto last = read_back(device.Handle(), 2 * Chunk, Chunk);
+      bool same = true;
+      for (uint64_t i = 0; i < both.size(); i++) {
+        same &= both[i] == host_words[i];
+      }
+      for (uint64_t i = 0; i < last.size(); i++) {
+        same &= last[i] == host_words[2 * Chunk / sizeof(uint32_t) + i];
+      }
+      Require(name, "ring contents", same, "bytes copied through the ring differ");
+      scheduler.SetSubmitDependency(dma, 1);
+    }
+    scheduler.Finish();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
@@ -18169,6 +18308,10 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
+    if (m_transfer_queue != nullptr && UploadDmaRequested()) {
+      m_runtime_context.transfer_queue_family = m_transfer_family;
+      m_runtime_context.transfer_queue = m_transfer_queue;
+    }
     m_runtime_context.attachment_feedback_loop_enabled = true;
     m_runtime_context.provoking_vertex_last_enabled = true;
     m_runtime_context.storage_image_read_without_format_enabled =
@@ -18347,16 +18490,42 @@ private:
             "production rasterization features are not supported");
 
     float priority = 1.0f;
-    vk::DeviceQueueCreateInfo queue_info{};
+    std::array<vk::DeviceQueueCreateInfo, 2> queue_infos{};
+    auto &queue_info = queue_infos[0];
     queue_info.sType = vk::StructureType::eDeviceQueueCreateInfo;
     queue_info.queueFamilyIndex = m_queue_family;
     queue_info.queueCount = 1;
     queue_info.pQueuePriorities = &priority;
+    // Like the emulator's device (KYTY_UPLOAD_DMA): a queue of a transfer-only family, when the
+    // device has one, which the runtime context hands to UploadDma.
+    u32 queue_info_count = 1;
+    {
+      u32 family_count = 0;
+      m_physical_device.getQueueFamilyProperties(&family_count, nullptr);
+      std::vector<vk::QueueFamilyProperties> families(family_count);
+      m_physical_device.getQueueFamilyProperties(&family_count, families.data());
+      for (u32 family = 0; family < family_count; family++) {
+        const auto flags = families[family].queueFlags;
+        if (family != m_queue_family && families[family].queueCount != 0 &&
+            (flags & vk::QueueFlagBits::eTransfer) &&
+            !(flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute |
+                       vk::QueueFlagBits::eVideoDecodeKHR | vk::QueueFlagBits::eVideoEncodeKHR |
+                       vk::QueueFlagBits::eOpticalFlowNV))) {
+          m_transfer_family = family;
+          auto &transfer = queue_infos[queue_info_count++];
+          transfer.sType = vk::StructureType::eDeviceQueueCreateInfo;
+          transfer.queueFamilyIndex = family;
+          transfer.queueCount = 1;
+          transfer.pQueuePriorities = &priority;
+          break;
+        }
+      }
+    }
 
     vk::DeviceCreateInfo device_info{};
     device_info.sType = vk::StructureType::eDeviceCreateInfo;
-    device_info.queueCreateInfoCount = 1;
-    device_info.pQueueCreateInfos = &queue_info;
+    device_info.queueCreateInfoCount = queue_info_count;
+    device_info.pQueueCreateInfos = queue_infos.data();
     vk::PhysicalDeviceVulkan12Features device_features12{};
     device_features12.sType =
         vk::StructureType::ePhysicalDeviceVulkan12Features;
@@ -18458,6 +18627,9 @@ private:
               "vkCreateDevice");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
     m_device.getQueue(m_queue_family, 0, &m_queue);
+    if (m_transfer_family != UINT32_MAX) {
+      m_device.getQueue(m_transfer_family, 0, &m_transfer_queue);
+    }
     {
       vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties{};
       vk::PhysicalDeviceProperties2 properties{};
@@ -18785,6 +18957,8 @@ private:
   vk::Queue m_queue = nullptr;
   vk::CommandPool m_command_pool = nullptr;
   u32 m_queue_family = 0;
+  vk::Queue m_transfer_queue = nullptr;
+  u32 m_transfer_family = UINT32_MAX;
   vk::DeviceSize m_robust_storage_alignment = 0;
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
   Buffer m_bda_pagetable_buffer;
@@ -37131,6 +37305,11 @@ int main(int argc, char **argv) {
     vulkan.CheckDepthFeedbackKeep();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--upload-dma-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckUploadDma();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--depth-layout-stable-only") == 0) {
     CheckDepthStableLayoutRules();
     VulkanHarness vulkan;
@@ -37555,6 +37734,7 @@ int main(int argc, char **argv) {
   vulkan.CheckDepthFeedbackKeep();
   CheckDepthStableLayoutRules();
   vulkan.CheckDepthLayoutStable();
+  vulkan.CheckUploadDma();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBgra16Readback();
   vulkan.CheckRasterization(false);

@@ -665,6 +665,17 @@ enum class FrameEvent : uint32_t {
 	LodStatsInstrumentedDraws,
 	LodStatsCanaryChecks,
 	LodStatsCanaryMismatches,
+	// KYTY_UPLOAD_DMA: buffer uploads whose host -> VRAM part went to the copy engine (count,
+	// bytes), those kept on the graphics queue because the ring was full, transfer-queue
+	// submissions, and guest submissions that had to wait for an unfinished transfer.
+	UploadDmaCopies,
+	UploadDmaBytes,
+	UploadDmaRingFull,
+	UploadDmaSubmits,
+	UploadDmaSubmitWaits,
+	// KYTY_UPLOAD_DMA_VERIFY=1: staged uploads compared, and those whose ring bytes differed.
+	UploadDmaVerifyChecks,
+	UploadDmaVerifyMismatches,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

@@ -474,15 +474,17 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
-	if (m_submit_dependency != nullptr) {
-		// Staging bytes that recorded commands read may still be copied by a host worker.
-		if (const auto value = m_submit_dependency->PendingValue(); value != 0) {
+	for (auto* dependency: m_submit_dependencies) {
+		if (dependency == nullptr) {
+			continue;
+		}
+		// Staging bytes that recorded commands read may still be copied by a host worker (or, for
+		// the upload DMA, by the transfer queue).
+		if (const auto value = dependency->PendingValue(); value != 0) {
 			if (submit.num_wait_semaphores < SubmitInfo::MaxSemaphores) {
-				submit.AddWait(m_submit_dependency->Semaphore(), value,
-				               vk::PipelineStageFlagBits::eComputeShader |
-				                   vk::PipelineStageFlagBits::eTransfer);
+				submit.AddWait(dependency->Semaphore(), value, dependency->WaitStages());
 			} else {
-				m_submit_dependency->WaitHost(value);
+				dependency->WaitHost(value);
 			}
 		}
 	}

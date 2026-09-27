@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/uploadDma.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -502,13 +503,18 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_bda_hot_sync(m_bda_incremental_sync && BdaHotSyncEnabled()),
       m_memory_tracker(page_manager, m_bda_incremental_sync, BufferFaultPolicy()),
       m_hot_quiet_frames(HotPageQuietFrames()),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB,
+                       graphics.transfer_queue != nullptr),
+      m_upload_dma(UploadDma::Create(graphics, scheduler)),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
+	if (m_upload_dma != nullptr) {
+		m_scheduler.SetSubmitDependency(m_upload_dma.get(), 1);
+	}
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
 	const auto null_id =
@@ -541,6 +547,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	if (m_upload_dma != nullptr) {
+		// The scheduler has drained by now; no later submission may wait on the upload DMA.
+		m_scheduler.SetSubmitDependency(nullptr, 1);
+	}
 	CompleteAllSideReadbacks();
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
@@ -1667,6 +1677,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		if (UploadBatchEnabled() && !late_source) {
 			// One barrier pair per flush for all queued uploads instead of one per upload. Inside
 			// an UploadBatch scope the copy waits for the scope end (or an earlier flush point).
+			source = StageUploadDma(source, copies);
 			command.RequestUploadCopy(source, buffer.Handle(), copies);
 			buffer.MarkContentWritten();
 			if (m_upload_batch_depth == 0) {
@@ -1727,6 +1738,58 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
 	return false;
+}
+
+vk::Buffer BufferCache::StageUploadDma(vk::Buffer source, std::span<vk::BufferCopy> copies) {
+	if (m_upload_dma == nullptr || source != m_staging_buffer.Handle() || copies.empty()) {
+		return source;
+	}
+	// The staged bytes of one upload are one packed range of the ring (SynchronizeBuffer and
+	// UploadCopies place them back to back); the transfer copies that whole range.
+	uint64_t begin = UINT64_MAX;
+	uint64_t end   = 0;
+	for (const auto& copy: copies) {
+		begin = std::min(begin, copy.srcOffset);
+		end   = std::max(end, copy.srcOffset + copy.size);
+	}
+	const auto size        = end - begin;
+	const auto ring_offset = m_upload_dma->Stage(source, begin, size);
+	if (!ring_offset.has_value()) {
+		return source;
+	}
+	for (auto& copy: copies) {
+		copy.srcOffset = copy.srcOffset - begin + *ring_offset;
+	}
+	if (UploadDmaVerify()) {
+		// The ring bytes as this recording's graphics copies read them (the whole command buffer
+		// runs after the transfer, and the ring range is not reused before this tick completes).
+		auto snapshot = std::make_shared<std::vector<uint8_t>>(
+		    m_staging_buffer.Mapped().data() + begin, m_staging_buffer.Mapped().data() + end);
+		auto readback = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                         vk::BufferUsageFlagBits::eTransferDst, size);
+		auto               native = m_scheduler.Current().Handle();
+		const vk::BufferCopy copy {*ring_offset, 0, size};
+		native.copyBuffer(m_upload_dma->RingHandle(), readback->Handle(), 1, &copy);
+		vk::MemoryBarrier to_host {};
+		to_host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		to_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eHost, {}, 1, &to_host, 0, nullptr, 0,
+		                       nullptr);
+		m_scheduler.DeferOperation([snapshot, readback, size] {
+			readback->Invalidate(0, size);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::UploadDmaVerifyChecks);
+			if (std::memcmp(readback->Mapped().data(), snapshot->data(), size) != 0) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::UploadDmaVerifyMismatches);
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+					std::printf("Upload DMA verify: %" PRIu64 " staged bytes differ in the ring\n",
+					            size);
+				}
+			}
+		});
+	}
+	return m_upload_dma->RingHandle();
 }
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,

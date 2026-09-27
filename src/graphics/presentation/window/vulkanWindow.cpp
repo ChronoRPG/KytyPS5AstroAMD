@@ -11,6 +11,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
@@ -558,10 +559,42 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	       family_queue_count);
 
 	const std::array<float, 2> queue_priorities {1.0f, 1.0f};
-	vk::DeviceQueueCreateInfo  queue_create_info {};
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
+	auto&                      queue_create_info = queue_create_infos[0];
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = graphics.side_queue_index != 0 ? 2u : 1u;
 	queue_create_info.pQueuePriorities = queue_priorities.data();
+	// KYTY_UPLOAD_DMA: one queue of a transfer-only family (the copy engines), for UploadDma.
+	// Not under RenderDoc, whose captures of the extra queue are not needed for analysis.
+	graphics.transfer_queue_family = static_cast<uint32_t>(-1);
+	if (UploadDmaRequested() && !Config::RenderDocEnabled()) {
+		uint32_t count = 0;
+		physical_device.getQueueFamilyProperties(&count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(count);
+		physical_device.getQueueFamilyProperties(&count, families.data());
+		for (uint32_t family = 0; family < count; family++) {
+			const auto flags = families[family].queueFlags;
+			if (family != queue_family && families[family].queueCount != 0 &&
+			    (flags & vk::QueueFlagBits::eTransfer) &&
+			    !(flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute)) &&
+			    !(flags & (vk::QueueFlagBits::eVideoDecodeKHR | vk::QueueFlagBits::eVideoEncodeKHR |
+			               vk::QueueFlagBits::eOpticalFlowNV))) {
+				graphics.transfer_queue_family = family;
+				break;
+			}
+		}
+	}
+	uint32_t queue_create_count = 1;
+	if (graphics.transfer_queue_family != static_cast<uint32_t>(-1)) {
+		auto& transfer            = queue_create_infos[queue_create_count++];
+		transfer.queueFamilyIndex = graphics.transfer_queue_family;
+		transfer.queueCount       = 1;
+		transfer.pQueuePriorities = queue_priorities.data();
+	}
+	std::printf("Kyty upload DMA queue: %s (KYTY_UPLOAD_DMA)\n",
+	            graphics.transfer_queue_family != static_cast<uint32_t>(-1)
+	                ? fmt::format("family {}", graphics.transfer_queue_family).c_str()
+	                : "none");
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -853,8 +886,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		pipeline_library.pNext                   = const_cast<void*>(create_info.pNext);
 		create_info.pNext                        = &pipeline_library;
 	}
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_create_infos.data();
+	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1351,6 +1384,11 @@ void WindowContext::CreateVulkan() {
 		graphic_ctx.device.getQueue(graphic_ctx.queue_family, graphic_ctx.side_queue_index,
 		                            &graphic_ctx.side_queue);
 		EXIT_IF(graphic_ctx.side_queue == nullptr);
+	}
+	if (graphic_ctx.transfer_queue_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.transfer_queue_family, 0,
+		                            &graphic_ctx.transfer_queue);
+		EXIT_IF(graphic_ctx.transfer_queue == nullptr);
 	}
 
 	if (!graphic_ctx.CreateAllocator()) {

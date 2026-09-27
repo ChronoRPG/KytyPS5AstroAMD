@@ -27,6 +27,7 @@ namespace Libs::Graphics {
 struct GraphicContext;
 class CommandScheduler;
 class TextureCache;
+class UploadDma;
 
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
@@ -225,6 +226,10 @@ private:
 	                                     bool is_written, bool is_texel_buffer,
 	                                     BdaSyncStats* stats = nullptr,
 	                                     const char* upload_reason = nullptr);
+	// KYTY_UPLOAD_DMA: moves the host -> VRAM part of the queued upload copies from the staging
+	// ring to the copy engine (UploadDma) and returns the source the graphics copies then read
+	// (the DMA ring, with the copies' source offsets rebased); otherwise `source` unchanged.
+	[[nodiscard]] vk::Buffer StageUploadDma(vk::Buffer source, std::span<vk::BufferCopy> copies);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size, size_t guest_copies = SIZE_MAX,
 	                                      const uint8_t* host_data = nullptr,
@@ -353,6 +358,8 @@ private:
 	// write fault, which changes the fault epoch, and buffers only change with the structure one.
 	std::vector<BdaHotRange>                          m_bda_hot_ranges;
 	StreamBuffer                                      m_staging_buffer;
+	// After the staging ring: destroyed first, waiting for its copies that read the ring.
+	std::unique_ptr<UploadDma>                        m_upload_dma;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;

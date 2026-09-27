@@ -65,6 +65,11 @@ struct GraphicContext {
 	uint32_t                           side_queue_index = 0;
 	vk::Queue                          side_queue       = nullptr;
 	Common::Mutex                      side_queue_mutex;
+	// Queue of a transfer-only family (the copy engines) for asynchronous uploads (KYTY_UPLOAD_DMA,
+	// renderer/cache/uploadDma.h); null when the device has none or the path is off. Only the
+	// UploadDma worker submits to it. Buffers it touches are created shared by both families.
+	uint32_t                           transfer_queue_family = static_cast<uint32_t>(-1);
+	vk::Queue                          transfer_queue        = nullptr;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

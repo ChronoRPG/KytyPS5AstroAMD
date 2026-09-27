@@ -37,8 +37,11 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 
 class Buffer {
 public:
+	// transfer_shared: concurrent sharing with the upload DMA transfer queue family
+	// (GraphicContext::transfer_queue_family), when the device has that queue.
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
+	       bool transfer_shared = false);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -101,7 +104,7 @@ private:
 class StreamBuffer final: public Buffer {
 public:
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	             uint64_t size);
+	             uint64_t size, bool transfer_shared = false);
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);

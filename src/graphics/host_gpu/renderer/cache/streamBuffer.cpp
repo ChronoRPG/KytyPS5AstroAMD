@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
+#include <array>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -57,7 +58,8 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
+               bool transfer_shared)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
@@ -66,6 +68,12 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
+	const std::array<uint32_t, 2> families {graphics.queue_family, graphics.transfer_queue_family};
+	if (transfer_shared && graphics.transfer_queue != nullptr) {
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = static_cast<uint32_t>(families.size());
+		buffer_info.pQueueFamilyIndices   = families.data();
+	}
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =
@@ -227,8 +235,8 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-                           uint64_t size)
-    : Buffer(graphics, scheduler, usage, 0, AllFlags, size),
+                           uint64_t size, bool transfer_shared)
+    : Buffer(graphics, scheduler, usage, 0, AllFlags, size, transfer_shared),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
