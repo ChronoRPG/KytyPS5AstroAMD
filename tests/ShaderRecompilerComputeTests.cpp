@@ -23831,6 +23831,67 @@ TestCase VectorDppRowXmask() {
   return test;
 }
 
+// DPP_ROW_SHARE (GFX10 dpp_ctrl 0x150-0x15F): every lane reads lane `ctrl & 15` of its row.
+TestCase VectorDppRowShare() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 2, 250, 1));
+  code.push_back(EncodeVop2Dpp(0, 0x153));
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDppRowShare";
+  test.code = code;
+  for (u32 lane = 0; lane < 32; ++lane) {
+    test.expected.push_back(100u + ((lane & ~15u) | 3u));
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// DPP8 on a VOP2 (src0 = 233): each group of eight lanes reads lane 7 - i of the group.
+TestCase VectorDpp8Vop2() {
+  using O = ShaderOpcode;
+
+  u32 selects = 0;
+  for (u32 lane = 0; lane < 8; ++lane) {
+    selects |= (7u - lane) << (lane * 3u);
+  }
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 2, 233, 1));
+  code.push_back(selects << 8u); // src0 = v0
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDpp8Vop2";
+  test.code = code;
+  for (u32 lane = 0; lane < 32; ++lane) {
+    test.expected.push_back(100u + ((lane & ~7u) | (7u - (lane & 7u))));
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{".dpp8(", 1}};
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorDppBankMaskPreservesDestination() {
   using O = ShaderOpcode;
 
@@ -31945,6 +32006,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(VectorDpp8Captured(true));
   AddCase(VectorDppQuadPermuteReverse);
   AddCase(VectorDppRowXmask);
+  AddCase(VectorDppRowShare);
+  AddCase(VectorDpp8Vop2);
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
@@ -37008,6 +37071,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorDpp8Captured(true));
     RunCase(&vulkan, VectorDppQuadPermuteReverse());
     RunCase(&vulkan, VectorDppRowXmask());
+    RunCase(&vulkan, VectorDppRowShare());
+    RunCase(&vulkan, VectorDpp8Vop2());
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
     RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
     return 0;

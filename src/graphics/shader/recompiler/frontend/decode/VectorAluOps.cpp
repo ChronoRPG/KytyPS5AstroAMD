@@ -689,11 +689,18 @@ void DecodeVop1Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 	ReadLiteralOperands(code, word_index, inst);
 }
 
+// src0 = 233 (DPP8) and 234 (DPP8 with FI = 1, fetch inactive lanes) carry eight 3-bit lane
+// selects in bits 31:8 and no source modifiers (RDNA2 ISA 6.9 / 13.3.10); 250 is DPP16.
+bool IsDpp8Encoding(uint32_t encoding) {
+	return encoding == 233u || encoding == 234u;
+}
+
 void ApplyDppModifier(Operand& operand, uint32_t modifier, uint32_t encoding) {
 	operand.dpp = true;
-	if (encoding == 233u) {
-		operand.dpp8     = true;
-		operand.dpp_ctrl = modifier >> 8u;
+	if (IsDpp8Encoding(encoding)) {
+		operand.dpp8               = true;
+		operand.dpp_ctrl           = modifier >> 8u;
+		operand.dpp_fetch_inactive = encoding == 234u;
 		return;
 	}
 	operand.negate             = ((modifier >> 20u) & 0x1u) != 0u;
@@ -1058,8 +1065,10 @@ void DecodeVop2Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	DecodeVectorGpr(vsrc1, inst.src1);
 	DecodeScalarSource(src0 + 256u, pc, inst.src0);
 	ApplyDppModifier(inst.src0, modifier, code[word_index] & 0x1ffu);
-	inst.src1.negate       = ((modifier >> 22u) & 0x1u) != 0u;
-	inst.src1.absolute     = ((modifier >> 23u) & 0x1u) != 0u;
+	if (!inst.src0.dpp8) {
+		inst.src1.negate   = ((modifier >> 22u) & 0x1u) != 0u;
+		inst.src1.absolute = ((modifier >> 23u) & 0x1u) != 0u;
+	}
 	const bool packed_fmac = inst.opcode == Opcode::V_PK_FMAC_F16;
 	if (packed_fmac) {
 		inst.src0.negate_hi = inst.src0.negate;
@@ -1167,9 +1176,11 @@ void DecodeVopcDpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	DecodeScalarSource(src0 + 256u, pc, inst.src0);
 	inst.dst.kind = IsVopcCompareExec(inst.opcode) ? OperandKind::ExecLo : OperandKind::VccLo;
 	ApplyDppModifier(inst.src0, modifier, code[word_index] & 0x1ffu);
-	inst.src1.negate   = ((modifier >> 22u) & 0x1u) != 0u;
-	inst.src1.absolute = ((modifier >> 23u) & 0x1u) != 0u;
-	inst.src_count     = 2;
+	if (!inst.src0.dpp8) {
+		inst.src1.negate   = ((modifier >> 22u) & 0x1u) != 0u;
+		inst.src1.absolute = ((modifier >> 23u) & 0x1u) != 0u;
+	}
+	inst.src_count = 2;
 	ReadLiteralOperands(code, word_index, inst);
 }
 
@@ -1490,8 +1501,10 @@ void DecodeVop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		return;
 	}
 	switch (src0) {
-		case 249u: DecodeVop2Sdwa(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
+		case 233u:
+		case 234u:
 		case 250u: DecodeVop2Dpp(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
+		case 249u: DecodeVop2Sdwa(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
 		default: break;
 	}
 
@@ -1524,9 +1537,10 @@ void DecodeVop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		return;
 	}
 	switch (src0) {
-		case 233u: DecodeVop1Dpp(pc, code, word_index, opcode, vdst, inst); return;
-		case 249u: DecodeVop1Sdwa(pc, code, word_index, opcode, vdst, inst); return;
+		case 233u:
+		case 234u:
 		case 250u: DecodeVop1Dpp(pc, code, word_index, opcode, vdst, inst); return;
+		case 249u: DecodeVop1Sdwa(pc, code, word_index, opcode, vdst, inst); return;
 		default: break;
 	}
 	const bool scalar_dst = UsesScalarDestination(inst.opcode);
@@ -1555,8 +1569,10 @@ void DecodeVopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	SetRawWords(inst, code, word_index, 1);
 
 	switch (src0) {
-		case 249u: DecodeVopcSdwa(pc, code, word_index, opcode, vsrc1, inst); return;
+		case 233u:
+		case 234u:
 		case 250u: DecodeVopcDpp(pc, code, word_index, opcode, vsrc1, inst); return;
+		case 249u: DecodeVopcSdwa(pc, code, word_index, opcode, vsrc1, inst); return;
 		default: break;
 	}
 	if (inst.opcode == Opcode::UNSUPPORTED) {
