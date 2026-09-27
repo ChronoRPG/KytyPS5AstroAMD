@@ -220,6 +220,8 @@ private:
 	uint32_t  m_deferred_eop_flushes        = 0;
 	// A visibility-proxy end dump was recorded: defer the next end-of-pipe label (defer-label).
 	bool      m_defer_next_label            = false;
+	// The current WAIT_FLIP_DONE packet already flushed and suspended (retries skip the flush).
+	bool      m_flip_wait_suspended         = false;
 };
 
 } // namespace Libs::Graphics

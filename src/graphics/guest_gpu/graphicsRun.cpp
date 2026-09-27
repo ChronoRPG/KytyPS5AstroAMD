@@ -1529,11 +1529,41 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }
 
-void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
-	BufferFlush();
+// KYTY_FLIP_WAIT_MODE=block restores the blocking WAIT_FLIP_DONE, which stalled every guest
+// queue and GPU-thread command (e.g. guest readbacks) until the presenter finished the flip. By
+// default ("suspend") only the waiting queue is suspended, like WAIT_REG_MEM, and retried when
+// a flip completes (NotifyGpuProgress) or the scheduler's blocked-queue timeout passes.
+static bool FlipWaitSuspends() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_FLIP_WAIT_MODE");
+		return value == nullptr || std::strcmp(value, "block") != 0;
+	}();
+	return enabled;
+}
 
-	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
-	                                      static_cast<int>(display_buffer_index));
+void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
+	const auto handle = static_cast<int>(video_out_handle);
+	const auto index  = static_cast<int>(display_buffer_index);
+	if (!FlipWaitSuspends()) {
+		BufferFlush();
+		Profiler::CountFrameEvent(Profiler::FrameEvent::FlipWaitBlocking);
+		m_renderer.GetVideoOut().WaitFlipDone(handle, index);
+		return;
+	}
+	if (!m_flip_wait_suspended) {
+		// First evaluation of this packet: submit everything recorded before it (as the
+		// blocking form did); retries have nothing new to submit.
+		BufferFlush();
+	}
+	if (m_renderer.GetVideoOut().IsFlipPending(handle, index)) {
+		if (!m_flip_wait_suspended) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::FlipWaitSuspends);
+		}
+		m_flip_wait_suspended = true;
+		SuspendPm4();
+		return;
+	}
+	m_flip_wait_suspended = false;
 }
 
 // KYTY_LABEL_MODE=completion writes every end-of-pipe label (RELEASE_MEM / EVENT_WRITE_EOP data

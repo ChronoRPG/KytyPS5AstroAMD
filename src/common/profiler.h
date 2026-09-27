@@ -297,6 +297,10 @@ enum class FrameEvent : uint32_t {
 	CpBlockedSpins,
 	CpBlockedSleeps,
 	CpProgressWakeups,
+	// WAIT_FLIP_DONE packets that suspended their queue (KYTY_FLIP_WAIT_MODE=suspend) or blocked
+	// the GPU thread (=block).
+	FlipWaitSuspends,
+	FlipWaitBlocking,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

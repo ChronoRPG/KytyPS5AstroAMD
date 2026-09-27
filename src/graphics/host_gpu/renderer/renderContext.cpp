@@ -33,9 +33,22 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
 	m_gpu       = std::make_unique<GuestGpu>(*this);
+	std::unique_lock lock(m_gpu_notify_mutex);
+	m_gpu_notify = m_gpu.get();
+}
+
+void RenderContext::NotifyGpuProgress() {
+	std::shared_lock lock(m_gpu_notify_mutex);
+	if (m_gpu_notify != nullptr) {
+		m_gpu_notify->NotifyProgress();
+	}
 }
 
 void RenderContext::ShutdownGpu() {
+	{
+		std::unique_lock lock(m_gpu_notify_mutex);
+		m_gpu_notify = nullptr;
+	}
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
 		m_gpu.reset();
