@@ -286,6 +286,13 @@ void RecordTransfer(TransferKind kind, const char* reason, const char* detail, u
                     uint32_t format, uint32_t width, uint32_t height, uint64_t bytes,
                     uint64_t span_bytes);
 
+// unclean.csv: draw-preparation reads refused as not provably clean (the DrawPrepFallbackUnclean
+// cause), aggregated per second by reason, read purpose, calling host code and 4 KiB guest page,
+// with the page's last recorded GPU writer (NoteGpuWrite). reason and purpose are string literals
+// (purpose may be null); caller is the host return address of the read.
+void RecordUncleanRead(uint64_t address, uint64_t size, const char* reason, const char* purpose,
+                       uint64_t caller);
+
 // Guest GPU scheduler.
 void RecordQueueWait(uint32_t queue, uint64_t wait_ns);
 void RecordQueueBusy(uint32_t queue, uint64_t busy_ns, bool complete);

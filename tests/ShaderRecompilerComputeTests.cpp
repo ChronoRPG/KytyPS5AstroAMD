@@ -11010,13 +11010,23 @@ public:
       // As every product transition of GPU-dirty ranges does (cleanVerdictCache.h).
       CleanVerdict::Invalidate(code_address + 0x40, 4, Coherence::Source::Test);
       DrawPrep::ReadSet unclean;
+      // The refused read is counted once, as an exact (GPU-thread) refusal
+      // (FrameEvent.DrawPrepUncleanExact; counted while a profiler is connected).
+      Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Thread);
+      const auto exact_before =
+          Profiler::FrameEventTotal(Profiler::FrameEvent::DrawPrepUncleanExact);
       (void)prepare(unclean);
+      const auto exact_counted =
+          Profiler::FrameEventTotal(Profiler::FrameEvent::DrawPrepUncleanExact) - exact_before;
+      Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Off);
       Require(name, "unclean code",
               unclean.Failure() == DrawPrep::ReadFailure::Unclean &&
                   reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
                       DrawPrep::ValidateResult::Unclean &&
                   in_place(reads) == DrawPrep::ValidateResult::Unclean,
               "GPU-owned code bytes were certified");
+      Require(name, "unclean read counted", exact_counted == 1,
+              "the refused read was not counted once as an exact unclean read");
       BufferCacheTestAccess::SubtractGpuDirty(cache, code_address + 0x40, 4);
       CleanVerdict::Invalidate(code_address + 0x40, 4, Coherence::Source::Test);
       context.UnmapMemory(base, allocation_size);

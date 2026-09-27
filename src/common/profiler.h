@@ -844,6 +844,13 @@ enum class FrameEvent : uint32_t {
 	DrawSequenceVerifyChecks,
 	DrawSequenceVerifyMismatches,
 	DrawSequenceVerifyRaces,
+	// Draw-prep reads refused as not provably clean, by cause (DrawPrepFallbackUnclean; with the
+	// hang trace also unclean.csv): a worker's GPU-dirty hint (tracker GPU-dirty pages) or pending
+	// backing publication, the GPU thread's exact predicate, and an exact read without a backing.
+	DrawPrepUncleanHintGpuDirty,
+	DrawPrepUncleanHintPublication,
+	DrawPrepUncleanExact,
+	DrawPrepUncleanBacking,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
@@ -1171,6 +1172,43 @@ static bool GpuDirtyHint(Graphics::BufferCache& buffers, uint64_t vaddr, uint64_
 	return dirty;
 }
 
+// The host return address of the calling function (diagnostics).
+#if defined(_MSC_VER) && !defined(__clang__)
+#define KYTY_MEMORY_CALLER() reinterpret_cast<uint64_t>(_ReturnAddress())
+#else
+#define KYTY_MEMORY_CALLER() reinterpret_cast<uint64_t>(__builtin_return_address(0))
+#endif
+
+// DrawPrepFallbackUnclean diagnostics: why a preparation's read was refused as not provably
+// clean. Always counted (FrameEvent.DrawPrepUnclean*); with the hang trace also aggregated in
+// unclean.csv by reason, read purpose, calling host code and page, with the page's last GPU writer.
+static void NoteDrawPrepUnclean(Profiler::FrameEvent event, const char* reason, uint64_t vaddr,
+                                uint64_t size, uint64_t caller) {
+	Profiler::CountFrameEvent(event);
+	if (HangTrace::Enabled()) {
+		HangTrace::RecordUncleanRead(vaddr, size, reason, Graphics::DrawPrep::ReadPurpose(), caller);
+	}
+}
+
+// Which exact predicate refused a clean read (GPU thread or a GpuReadDelegate scope; a thread
+// with neither is refused before any predicate).
+static const char* ExactUncleanReason(uint64_t vaddr, uint64_t size) {
+	if (!Graphics::GuestGpu::IsGpuThread() && !Graphics::GpuReadDelegate::Active()) {
+		return "thread";
+	}
+	auto& resources = GetGpuResources();
+	if (resources.GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+		return "buffer-gpu-dirty";
+	}
+	if (resources.GetBufferCache().HasPendingBackingPublication(vaddr, size)) {
+		return "publication";
+	}
+	if (resources.GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+		return "image-gpu-modified";
+	}
+	return "verdict";
+}
+
 // Draw-prep (readSet.h): every read of a speculative draw preparation is recorded for its
 // certificate. The GPU thread applies the exact clean predicate. Other preparing threads cannot
 // read the GPU thread's unlocked dirty state; they gate reads with a conservative, thread-safe
@@ -1179,15 +1217,31 @@ static bool GpuDirtyHint(Graphics::BufferCache& buffers, uint64_t vaddr, uint64_
 // range with the exact predicate. The hint does not consult the texture cache: a range owned by
 // a GPU-modified image is caught at commit.
 // The gate of a draw-prep read: the failure it takes, None when the backing may be read.
+// `caller`: the host code that asked for the read (diagnostics).
 static Graphics::DrawPrep::ReadFailure DrawPrepGate(const Graphics::DrawPrep::Recorder& recorder,
-                                                    uint64_t vaddr, uint64_t size) {
+                                                    uint64_t vaddr, uint64_t size,
+                                                    uint64_t caller) {
 	using Graphics::DrawPrep::ReadFailure;
+	using Event = Profiler::FrameEvent;
 	if (recorder.exact) {
-		return GpuCleanGate(vaddr, size) ? ReadFailure::None : ReadFailure::Unclean;
+		if (GpuCleanGate(vaddr, size)) {
+			return ReadFailure::None;
+		}
+		NoteDrawPrepUnclean(Event::DrawPrepUncleanExact,
+		                    HangTrace::Enabled() ? ExactUncleanReason(vaddr, size) : "exact", vaddr,
+		                    size, caller);
+		return ReadFailure::Unclean;
 	}
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		auto& buffers = GetGpuResources().GetBufferCache();
-		if (GpuDirtyHint(buffers, vaddr, size) || buffers.HasPendingBackingPublication(vaddr, size)) {
+		if (GpuDirtyHint(buffers, vaddr, size)) {
+			NoteDrawPrepUnclean(Event::DrawPrepUncleanHintGpuDirty, "hint-gpu-dirty", vaddr, size,
+			                    caller);
+			return ReadFailure::Unclean;
+		}
+		if (buffers.HasPendingBackingPublication(vaddr, size)) {
+			NoteDrawPrepUnclean(Event::DrawPrepUncleanHintPublication, "hint-publication", vaddr,
+			                    size, caller);
 			return ReadFailure::Unclean;
 		}
 	}
@@ -1196,40 +1250,46 @@ static Graphics::DrawPrep::ReadFailure DrawPrepGate(const Graphics::DrawPrep::Re
 
 // A backing read that failed after the gate (exact reads fail as Unclean, as before).
 static Graphics::DrawPrep::ReadFailure DrawPrepBackingFailure(
-    const Graphics::DrawPrep::Recorder& recorder) {
+    const Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, uint64_t size, uint64_t caller) {
 	using Graphics::DrawPrep::ReadFailure;
-	return recorder.exact ? ReadFailure::Unclean : ReadFailure::Backing;
+	if (!recorder.exact) {
+		return ReadFailure::Backing;
+	}
+	NoteDrawPrepUnclean(Profiler::FrameEvent::DrawPrepUncleanBacking, "backing", vaddr, size,
+	                    caller);
+	return ReadFailure::Unclean;
 }
 
 // The gated read of TryReadForDrawPrep, without recording it. False (and a failed read set) when
 // it cannot be served.
 static bool ReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, void* data,
-                            uint64_t size) {
+                            uint64_t size, uint64_t caller) {
 	using Graphics::DrawPrep::ReadFailure;
 	auto& reads = *recorder.reads;
 	if (reads.Failed()) {
 		return false;
 	}
-	if (const auto failure = DrawPrepGate(recorder, vaddr, size); failure != ReadFailure::None) {
+	if (const auto failure = DrawPrepGate(recorder, vaddr, size, caller);
+	    failure != ReadFailure::None) {
 		reads.Fail(failure);
 		return false;
 	}
 	if (!TryReadBacking(vaddr, data, size)) {
-		reads.Fail(DrawPrepBackingFailure(recorder));
+		reads.Fail(DrawPrepBackingFailure(recorder, vaddr, size, caller));
 		return false;
 	}
 	return true;
 }
 
 static bool TryReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, void* data,
-                               uint64_t size) {
-	return ReadForDrawPrep(recorder, vaddr, data, size) &&
+                               uint64_t size, uint64_t caller) {
+	return ReadForDrawPrep(recorder, vaddr, data, size, caller) &&
 	       recorder.reads->Record(vaddr, data, size);
 }
 
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (auto* recorder = Graphics::DrawPrep::ActiveRecorder(); recorder != nullptr) [[unlikely]] {
-		return TryReadForDrawPrep(*recorder, vaddr, data, size);
+		return TryReadForDrawPrep(*recorder, vaddr, data, size, KYTY_MEMORY_CALLER());
 	}
 	return TryReadGpuCleanBackingExact(vaddr, data, size);
 }
@@ -1243,7 +1303,7 @@ bool TryReadGpuCleanBackingDigest(uint64_t vaddr, void* data, uint64_t size, uin
 		digest = XXH3_64bits(data, size);
 		return true;
 	}
-	if (!ReadForDrawPrep(*recorder, vaddr, data, size)) {
+	if (!ReadForDrawPrep(*recorder, vaddr, data, size, KYTY_MEMORY_CALLER())) {
 		return false;
 	}
 	digest = XXH3_64bits(data, size);
@@ -1278,12 +1338,14 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest, InPlac
 	if (reads.Failed()) {
 		return false;
 	}
-	if (const auto failure = DrawPrepGate(*recorder, vaddr, size); failure != ReadFailure::None) {
+	const auto caller = KYTY_MEMORY_CALLER();
+	if (const auto failure = DrawPrepGate(*recorder, vaddr, size, caller);
+	    failure != ReadFailure::None) {
 		reads.Fail(failure);
 		return false;
 	}
 	if (!TryInspectBacking(vaddr, size, hash, stats)) {
-		reads.Fail(DrawPrepBackingFailure(*recorder));
+		reads.Fail(DrawPrepBackingFailure(*recorder, vaddr, size, caller));
 		return false;
 	}
 	return reads.RecordDigest(vaddr, size, digest);
