@@ -156,7 +156,15 @@ void OcclusionCounter::Dispatch(uint32_t mode, vk::Buffer output, uint64_t offse
 	                       {}, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
-void OcclusionCounter::Dump(uint64_t address) {
+bool OcclusionCounter::SyncProxyDumps() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_OCCLUSION_SYNC_PROXY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool OcclusionCounter::Dump(uint64_t address) {
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
 	Initialize();
@@ -207,7 +215,12 @@ void OcclusionCounter::Dump(uint64_t address) {
 		event.depth_address = m_last_scope.depth_address;
 		HangTrace::RecordOcclusion(event);
 	}
+	// An end dump sits 8 bytes after its begin dump (interleaved begin/end pairs). A pair whose
+	// latest counted scope rendered only depth is a visibility proxy (e.g. a bounding box).
+	const bool sync = SyncProxyDumps() && (address & 0xfu) == 8u && m_scopes_since_dump != 0 &&
+	                  m_last_scope.colors == 0 && m_last_scope.has_depth;
 	m_scopes_since_dump = 0;
 	m_last_scope        = {};
+	return sync;
 }
 }

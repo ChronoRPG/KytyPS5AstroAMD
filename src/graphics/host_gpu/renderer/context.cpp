@@ -515,7 +515,8 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	StateHandle().beginRendering(rendering);
 	m_context.GetOcclusionCounter().Begin();
 	--m_internal_recording;
-	if (m_context.GetOcclusionCounter().Active() && HangTrace::Enabled()) {
+	if (m_context.GetOcclusionCounter().Active() &&
+	    (HangTrace::Enabled() || OcclusionCounter::SyncProxyDumps())) {
 		const auto& db = GetRegisters().GetDepthRenderTarget();
 		m_context.GetOcclusionCounter().NoteScope(db.z_read_base_addr, state.width, state.height,
 		                                          state.num_color_attachments,

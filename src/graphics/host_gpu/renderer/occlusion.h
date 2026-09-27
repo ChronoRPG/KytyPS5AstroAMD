@@ -25,7 +25,10 @@ public:
 	void Begin();                  // after beginning guest rendering
 	void End();                    // before ending guest rendering
 	void Accumulate();             // after ending rendering; flush only when pool is full
-	void Dump(uint64_t address);
+	// Returns true when the caller must wait for this dump's publication before continuing
+	// (KYTY_OCCLUSION_SYNC_PROXY=1 and this end dump closes a depth-only proxy scope).
+	[[nodiscard]] bool Dump(uint64_t address);
+	[[nodiscard]] static bool SyncProxyDumps();
 	// True while a dump has been recorded but not yet published to guest memory.
 	[[nodiscard]] bool HasUnpublishedDumps() const noexcept {
 		return m_published.load(std::memory_order_acquire) != m_issued;

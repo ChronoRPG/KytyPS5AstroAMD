@@ -1684,8 +1684,16 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				     event_index, event_address);
 			}
 			if (OcclusionCounter::Enabled()) {
-				Common::LockGuard lock(m_renderer.GetMutex());
-				m_renderer.GetOcclusionCounter().Dump(event_address);
+				bool sync = false;
+				{
+					Common::LockGuard lock(m_renderer.GetMutex());
+					sync = m_renderer.GetOcclusionCounter().Dump(event_address);
+				}
+				if (sync) {
+					// KYTY_OCCLUSION_SYNC_PROXY: publish this visibility-proxy result before the
+					// CP processes the label that follows it (labels are written at record time).
+					BufferWait();
+				}
 				break;
 			}
 			static std::once_flag warning_once;
