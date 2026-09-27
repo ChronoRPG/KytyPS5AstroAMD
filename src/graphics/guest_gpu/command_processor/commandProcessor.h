@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -186,6 +187,20 @@ private:
 	// tick's completion instead of draining the GPU. Returns false for the synchronous path.
 	[[nodiscard]] bool TryDeferGdsRead(uint32_t* dst, uint32_t dw_offset, uint32_t dw_size,
 	                                   bool interrupt, uint32_t interrupt_context_id);
+	// Writes (or defers) the data of an end-of-pipe event Kyty used to drop (counted under
+	// `counter`). Returns true when a deferred write took over raising the interrupt.
+	[[nodiscard]] bool WriteDroppedLabel(void* dst, uint64_t value, uint32_t size, bool interrupt,
+	                                     uint32_t interrupt_context_id,
+	                                     Profiler::FrameEvent counter);
+
+public:
+	// RELEASE_MEM with INT_SEL=4 and DATA_SEL != 0 (previously no data was written): writes the
+	// data (1: 32-bit, 2: 64-bit, 3: reference clock). Returns true when a deferred write took
+	// over raising the interrupt (the caller then only flushes).
+	[[nodiscard]] bool WriteReleaseMemDroppedData(void* dst, uint64_t value, uint32_t data_sel,
+	                                              bool interrupt, uint32_t interrupt_context_id);
+
+private:
 	[[nodiscard]] bool  TryDrawIndirectNative(DrawIndirectSource source);
 	void                ValidateIndirectSource(const DrawIndirectSource& source);
 	[[nodiscard]] uint32_t NumInstances();

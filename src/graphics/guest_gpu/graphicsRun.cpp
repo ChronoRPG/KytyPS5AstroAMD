@@ -1745,6 +1745,48 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	return true;
 }
 
+// KYTY_EOP_DROPPED_LABELS: "write" (default) also writes the data of end-of-pipe events whose
+// interrupt selector made Kyty skip it (graphics INT_SEL=1, RELEASE_MEM INT_SEL=4 with a data
+// selection); "count" only counts them, as before.
+static bool DroppedLabelsWritten() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_EOP_DROPPED_LABELS");
+		return value == nullptr || std::strcmp(value, "count") != 0;
+	}();
+	return enabled;
+}
+
+bool CommandProcessor::WriteDroppedLabel(void* dst, uint64_t value, uint32_t size,
+                                         bool interrupt, uint32_t interrupt_context_id,
+                                         Profiler::FrameEvent counter) {
+	Profiler::CountFrameEvent(counter);
+	if (!DroppedLabelsWritten() || dst == nullptr || (size != 4 && size != 8)) {
+		return false;
+	}
+	if (TryDeferLabel(dst, value, size, interrupt, interrupt_context_id)) {
+		return interrupt;
+	}
+	KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel");
+	std::memcpy(dst, &value, size);
+	return false;
+}
+
+bool CommandProcessor::WriteReleaseMemDroppedData(void* dst, uint64_t value, uint32_t data_sel,
+                                                  bool interrupt, uint32_t interrupt_context_id) {
+	uint32_t size = 0;
+	switch (data_sel) {
+		case 1: size = 4; break;
+		case 2: size = 8; break;
+		case 3:
+			size  = 8;
+			value = Sync::ReadReferenceClock();
+			break;
+		default: return false; // 5 (GDS) and others keep the old behaviour
+	}
+	return WriteDroppedLabel(dst, value, size, interrupt, interrupt_context_id,
+	                         Profiler::FrameEvent::ReleaseMemLabelsIntSel4);
+}
+
 // KYTY_GDS_EOP_MODE=defer snapshots the GDS range with a copy recorded at the packet's position
 // and writes it to guest memory once that tick has completed (as a deferred label), instead of
 // draining the GPU (SynchronizeGpu) and reading GDS at record time. Default "sync" until the
@@ -1878,6 +1920,30 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		case 0x03: with_interrupt = false; break;
 		case 0x01:
 			if (!IsAsyncComputeQueue()) {
+				// INT_SEL=1 on the graphics queue used to raise only the interrupt. On RDNA
+				// INT_SEL does not gate DATA_SEL: write the data as well (KYTY_EOP_DROPPED_LABELS).
+				// Plain data selections only (32-bit data, 64-bit data, reference clock).
+				uint32_t label_size  = 0;
+				uint64_t label_value = static_cast<uint64_t>(value);
+				if constexpr (sizeof(T) == sizeof(uint32_t)) {
+					label_size = event_write_source == 0x02 ? 4u : 0u;
+				} else {
+					switch (event_write_source) {
+						case 0x01: label_size = 4; break;
+						case 0x02: label_size = 8; break;
+						case 0x04:
+							label_size  = 8;
+							label_value = Sync::ReadReferenceClock();
+							break;
+						default: break;
+					}
+				}
+				if (label_size != 0 && dst_gpu_addr != nullptr &&
+				    WriteDroppedLabel(dst_gpu_addr, label_value, label_size, true,
+				                      interrupt_context_id,
+				                      Profiler::FrameEvent::EopLabelsIntSel1)) {
+					return; // the deferred label raises the interrupt after its write
+				}
 				Sync::TriggerEopEventAtEndOfPipe(command, m_interrupt_event_id,
 				                                 interrupt_context_id);
 				return;

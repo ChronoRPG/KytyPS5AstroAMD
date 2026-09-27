@@ -311,6 +311,10 @@ enum class FrameEvent : uint32_t {
 	IdleFlushesInPass,
 	// Graphics slices ended early so runnable async compute queues could run (KYTY_GFX_SLICE_DRAWS).
 	GfxSliceYields,
+	// End-of-pipe data writes Kyty used to drop (KYTY_EOP_DROPPED_LABELS): graphics-queue events
+	// with INT_SEL=1, and RELEASE_MEM with INT_SEL=4 and DATA_SEL 1/2/3.
+	EopLabelsIntSel1,
+	ReleaseMemLabelsIntSel4,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

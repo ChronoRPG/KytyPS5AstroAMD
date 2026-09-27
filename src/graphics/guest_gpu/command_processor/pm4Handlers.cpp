@@ -2363,6 +2363,14 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			cp.EmitGlobalBarrier();
 		}
 
+		// INT_SEL does not gate DATA_SEL on RDNA: write the data too (KYTY_EOP_DROPPED_LABELS).
+		if (interrupt_selector == 4 && data_sel != 0 && dst_gpu_addr != nullptr &&
+		    cp.WriteReleaseMemDroppedData(dst_gpu_addr, value, data_sel, true,
+		                                  interrupt_context_id)) {
+			cp.BufferFlushForEop(); // the deferred data write raises the interrupt
+			return 7;
+		}
+
 		trigger_interrupt();
 
 		return 7;
