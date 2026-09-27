@@ -864,6 +864,12 @@ enum class FrameEvent : uint32_t {
 	RenderStateMemberSwaps,
 	RenderStateVerifyChecks,
 	RenderStateVerifyMismatches,
+	// KYTY_DESCRIPTOR_SET_REUSE_AUDIT (render.h): descriptor-set commits, those whose exact
+	// contents an earlier commit of the same command buffer had, and those a 64-slot cache indexed
+	// by a full digest of the contents would have held (compare DescriptorSetsReused).
+	DescriptorSetAuditCommits,
+	DescriptorSetAuditRepeats,
+	DescriptorSetAuditDigestSlotHits,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

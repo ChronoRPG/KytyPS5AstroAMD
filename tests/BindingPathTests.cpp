@@ -175,11 +175,79 @@ void TestDescriptorSetReuse() {
 	      "unsupported writes are not cached");
 }
 
+// A set whose last write is a buffer (as the flattened-SRT and shader-data stream ranges are),
+// with that buffer's offset a multiple of 256 (the stream buffer's alignment).
+struct StreamLastWrites {
+	vk::DescriptorImageInfo               image {};
+	vk::DescriptorBufferInfo              stream {};
+	std::array<vk::WriteDescriptorSet, 2> writes {};
+
+	explicit StreamLastWrites(uint64_t offset) {
+		image  = {nullptr, FakeHandle<vk::ImageView>(0x3000),
+		          vk::ImageLayout::eShaderReadOnlyOptimal};
+		stream = {FakeHandle<vk::Buffer>(0x8000), offset, 96};
+		writes[0].dstBinding      = 52;
+		writes[0].descriptorCount = 1;
+		writes[0].descriptorType  = vk::DescriptorType::eSampledImage;
+		writes[0].pImageInfo      = &image;
+		writes[1].dstBinding      = 120;
+		writes[1].descriptorCount = 1;
+		writes[1].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[1].pBufferInfo     = &stream;
+	}
+};
+
+// KYTY_DESCRIPTOR_SET_REUSE_AUDIT: what the audit counts, and the slot collision it measures.
+void TestDescriptorSetReuseAudit() {
+	const auto layout = FakeHandle<vk::DescriptorSetLayout>(0x5000);
+	const auto set_a  = FakeHandle<vk::DescriptorSet>(0x6000);
+	const auto set_b  = FakeHandle<vk::DescriptorSet>(0x6100);
+	const StreamLastWrites a(0x1000);
+	const StreamLastWrites b(0x1100);
+
+	// Hash's last two mixes (offset, then range) leave the slot bits (hash % 64) independent of
+	// offset bits 8 and up: sets that differ only there share a slot and evict each other.
+	bool same_slot = true;
+	for (uint64_t k = 1; k <= 16; k++) {
+		const StreamLastWrites other(0x100 * k);
+		same_slot &= DescriptorSetReuse::Hash(layout, other.writes) % 64 ==
+		             DescriptorSetReuse::Hash(layout, a.writes) % 64;
+	}
+	Check(same_slot, "stream offsets 256 apart share Hash's slot");
+	DescriptorSetReuse reuse;
+	const auto hash_a = DescriptorSetReuse::Hash(layout, a.writes);
+	const auto hash_b = DescriptorSetReuse::Hash(layout, b.writes);
+	reuse.Insert(1, layout, a.writes, hash_a, set_a);
+	reuse.Insert(1, layout, b.writes, hash_b, set_b);
+	Check(!reuse.Find(1, layout, a.writes, hash_a) && reuse.Find(1, layout, b.writes, hash_b) == set_b,
+	      "alternating sets in one slot evict each other");
+
+	// The digest separates them; the audit sees every repeat within a command buffer.
+	const auto digest_a = DescriptorSetReuse::Digest(layout, a.writes);
+	const auto digest_b = DescriptorSetReuse::Digest(layout, b.writes);
+	Check(digest_a != digest_b && digest_a % 64 != digest_b % 64,
+	      "the digest gives the two sets different slots");
+	const StreamLastWrites a_again(0x1000);
+	Check(DescriptorSetReuse::Digest(layout, a_again.writes) == digest_a,
+	      "equal contents give equal digests");
+	uint32_t repeats = 0;
+	uint32_t slot_hits = 0;
+	for (const auto digest: {digest_a, digest_b, digest_a, digest_b}) {
+		const auto result = reuse.Audit(1, digest);
+		repeats += result.repeat ? 1u : 0u;
+		slot_hits += result.digest_slot_hit ? 1u : 0u;
+	}
+	Check(repeats == 2 && slot_hits == 2, "A, B, A, B: two repeats, both in the digest slots");
+	const auto next_tick = reuse.Audit(2, digest_a);
+	Check(!next_tick.repeat && !next_tick.digest_slot_hit, "a new command buffer starts empty");
+}
+
 } // namespace
 
 int main() {
 	TestLayoutSignatures();
 	TestDescriptorSetReuse();
+	TestDescriptorSetReuseAudit();
 	if (g_failures != 0) {
 		std::printf("binding path tests: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;

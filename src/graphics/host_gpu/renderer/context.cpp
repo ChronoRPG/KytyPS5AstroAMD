@@ -75,6 +75,11 @@ bool DescriptorSetReuseEnabled() {
 	return enabled;
 }
 
+bool DescriptorSetReuseAuditEnabled() {
+	static const bool enabled = EnvSwitch("KYTY_DESCRIPTOR_SET_REUSE_AUDIT", false);
+	return enabled;
+}
+
 namespace {
 
 using Stage2  = vk::PipelineStageFlagBits2;
