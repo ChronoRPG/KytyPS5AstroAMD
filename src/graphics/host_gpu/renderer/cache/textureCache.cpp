@@ -1756,6 +1756,13 @@ TextureCache::TextureTransfer TextureCache::BuildTextureTransfer(const ImageInfo
 		}
 	}
 
+	if (!upload && !TextureUploadLayoutSupported(format, info.extent.width, info.extent.height,
+	                                             info.resources.levels, layers, info.tile_mode,
+	                                             allow_depth_tile, volume)) {
+		// Not downloadable (e.g. a colour view of depth-tiled memory): report an invalid transfer
+		// so callers keep their exact fallback instead of stopping the emulator.
+		return transfer;
+	}
 	transfer.layout  = TextureCalcUploadLayout(format, info.extent.width, info.extent.height,
 	                                       info.resources.levels, layers, info.tile_mode,
 	                                       info.data.size, allow_depth_tile, volume, owner);
@@ -3528,9 +3535,12 @@ void BufferCache::PreserveImagesForGpuWrite(BufferId id, uint64_t vaddr, uint64_
 	// write since, no newer buffer write) can be moved into the buffer as a whole. It must be
 	// fully resident: non-resident levels hold undefined native contents (GPU-written images are
 	// fully resident anyway, TextureCache::MarkImageGpuModified). Depth-associated color aliases
-	// publish through their depth image.
-	const auto movable_image = [](const Image& image) {
-		return !image.depth_id && image.SafeToDownload() && image.FullyResident();
+	// publish through their depth image. The image must also have a supported download layout
+	// (e.g. not a colour view of depth-tiled memory): otherwise keep the previous behaviour for it
+	// rather than taking its whole range into GPU ownership without its contents.
+	const auto movable_image = [this](const Image& image) {
+		return !image.depth_id && image.SafeToDownload() && image.FullyResident() &&
+		       m_texture_cache.BuildDownload(image).valid;
 	};
 	{
 		std::scoped_lock lock {m_texture_cache.m_lock};

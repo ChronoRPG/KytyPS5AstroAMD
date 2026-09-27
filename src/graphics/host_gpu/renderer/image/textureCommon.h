@@ -44,6 +44,10 @@ SurfaceFormatInfo      TextureGetSurfaceFormatInfo(Prospero::BufferFormat format
 RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
                                                     Prospero::ChannelType   type,
                                                     Prospero::ChannelOrder  order);
+[[nodiscard]] bool     TextureUploadLayoutSupported(Prospero::BufferFormat format, uint32_t width,
+                                                    uint32_t height, uint32_t levels, uint32_t depth,
+                                                    Prospero::TileMode tile_mode,
+                                                    bool allow_depth_tile, bool volume_texture);
 TextureUploadLayout    TextureCalcUploadLayout(Prospero::BufferFormat format, uint32_t width,
                                                uint32_t height, uint32_t levels, uint32_t depth,
                                                Prospero::TileMode tile_mode, uint64_t upload_size,
