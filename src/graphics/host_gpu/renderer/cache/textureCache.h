@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/cache/imageCacheGcPolicy.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
+#include "graphics/host_gpu/renderer/image/dccClear.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
@@ -43,10 +44,20 @@ class TextureCache {
 public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
+	// A render-target binding with CMASK fast clears enabled (CB_COLORn_INFO.FAST_CLEAR):
+	// the target's CMASK bytes and CB_COLORn_CLEAR_WORD0/1 (KYTY_CMASK_FAST_CLEAR).
+	struct ColorFastClear {
+		GuestRange range;
+		uint32_t   clear_word0 = 0;
+		uint32_t   clear_word1 = 0;
+		bool       valid       = false;
+	};
+
 	struct ImageDesc {
-		ImageInfo     info;
-		ImageViewInfo view_info;
-		BindingType   type = BindingType::Texture;
+		ImageInfo      info;
+		ImageViewInfo  view_info;
+		BindingType    type = BindingType::Texture;
+		ColorFastClear cmask;
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
@@ -227,10 +238,23 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
+	// A render-target binding whose CMASK marks every tile of a bound slice fast-cleared: clears
+	// the slice to the CLEAR_WORD colour and leaves the CMASK expanded, as the colour block's
+	// reads and the fast-clear eliminate would (KYTY_CMASK_FAST_CLEAR).
+	void                        MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
+	                                                  uint32_t metadata_base_layer);
 	// Returns DccGpuRecords or DccGpuReuses when the native path handled every slice, otherwise
 	// the first failing reason (Profiler::FrameEvent::DccFallback*) for the CPU fallback.
 	[[nodiscard]] Profiler::FrameEvent TryMaterializeGpuDccClear(ImageId id, const ImageDesc& desc,
 	                                                             uint32_t metadata_base_layer);
+	// The native inspection behind TryMaterializeGpuDccClear for any metadata whose uniform
+	// bytes select a clear value (values/decodable in DccClearHelper::ClearCodes order): clears
+	// the bound slices whose bytes all equal an accepted code and leaves those bytes 0xFF. cmask:
+	// CMASK bytes (only code 0x00), not counted as DCC work.
+	[[nodiscard]] Profiler::FrameEvent TryMaterializeGpuMetadataClear(
+	    DccClearHelper& helper, ImageId id, const ImageDesc& desc, GuestRange range,
+	    uint32_t metadata_base_layer, const DccClearHelper::ClearValues& values, uint32_t decodable,
+	    bool cmask);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
@@ -274,6 +298,8 @@ private:
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
 	std::unique_ptr<DccClearHelper>                    m_dcc_clear;
+	// Native CMASK inspection when KYTY_DCC_GPU does not create m_dcc_clear (created on first use).
+	std::unique_ptr<DccClearHelper>                    m_cmask_clear;
 	std::unordered_map<uint64_t, GpuDccInspection>      m_gpu_dcc_inspections;
 	uint64_t m_gpu_dcc_attempts = 0;
 	uint64_t m_gpu_dcc_records = 0;

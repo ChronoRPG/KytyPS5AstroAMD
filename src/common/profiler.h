@@ -720,6 +720,24 @@ enum class FrameEvent : uint32_t {
 	// KYTY_UPLOAD_DMA_VERIFY=1: staged uploads compared, and those whose ring bytes differed.
 	UploadDmaVerifyChecks,
 	UploadDmaVerifyMismatches,
+	// KYTY_CMASK_FAST_CLEAR (TextureCache::MaterializeCmaskClear), per bound render-target slice
+	// with CMASK fast clears enabled: cleared to the CLEAR_WORD colour (all CMASK bytes 0, decided
+	// on the CPU); nothing pending (all 0xFF); no proof (nonuniform or other bytes, or no native
+	// inspection possible); CMASK bytes an image covers; clear colour format not decoded;
+	// unsupported surface shape. Bindings whose GPU-owned CMASK bytes a native inspection
+	// decides on the GPU (clearing when all bytes are 0), and inspections reused for unchanged
+	// bytes.
+	CmaskFastClears,
+	CmaskFastClearExpanded,
+	CmaskFastClearUnproven,
+	CmaskFastClearAliased,
+	CmaskFastClearFormat,
+	CmaskFastClearShape,
+	CmaskFastClearInspections,
+	CmaskFastClearInspectionReuses,
+	// Bindings that read the CMASK bytes back because no native inspection was possible
+	// (device limits or image shape); the wait is counted in FrameWait::DccFallback.
+	CmaskFastClearReadbacks,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

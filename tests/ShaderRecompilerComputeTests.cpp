@@ -10721,6 +10721,216 @@ public:
     std::printf("[gpu]     %-32s ok (draw-prep %s)\n", name, mode_name);
   }
 
+  // KYTY_CMASK_FAST_CLEAR: a colour target with CB_COLOR0_INFO.FAST_CLEAR whose CMASK the game's
+  // metadata fill set to 0 (every tile fast-cleared) is cleared to CLEAR_WORD0/1 when it is
+  // bound, and its CMASK is left expanded (0xFF), as after the eliminate. Rebinding afterwards,
+  // an expanded CMASK and a partially refilled CMASK keep what was rendered; a complete refill
+  // (GPU fill or CPU write) clears again. Astro Bot's foliage-interaction input (1024x1024
+  // RGBA16F) is fast-cleared this way every frame; ignoring it left stale and NaN texels.
+  void CheckRenderExecutorCmaskFastClear() {
+    constexpr const char *name = "RenderExecutorCmaskFastClear";
+    constexpr uintptr_t base = 0x0000000206a00000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t cmask_address = base + 0x100000;
+    // (1.0, 2.0, -1.0, 0.5) as RGBA16F texel bits.
+    constexpr uint32_t clear_word0 = 0x40003c00u;
+    constexpr uint32_t clear_word1 = 0x3800bc00u;
+    const std::vector<u32> cleared_texel{clear_word0, clear_word1};
+    EnsureRuntimeContext();
+    // Astro's generic metadata fill (as in CheckRenderExecutorDccFixedClearFloat).
+    static constexpr std::array<uint32_t, 69> native_fill{
+        0xbfa00003u, 0xd7460002u, 0x04010c0au, 0x7da80408u,
+        0xbf88003fu, 0x7e000c09u, 0xbf070980u, 0x858a807eu,
+        0x7e005700u, 0x100000ffu, 0x4f800000u, 0x7e060f00u,
+        0xd5766a00u, 0x02020609u, 0x7d8a0280u, 0x4c020080u,
+        0x02000101u, 0xd56a0001u, 0x00020700u, 0x4c000303u,
+        0x4a020303u, 0x02000101u, 0xd56a0000u, 0x00020500u,
+        0xd5690001u, 0x00020009u, 0x4c060302u, 0x7d860609u,
+        0x7d8c02f9u, 0x06068c02u, 0x87ea6a0cu, 0x50000080u,
+        0xd5286a00u, 0x003200c1u, 0xd5010000u, 0x002a00c1u,
+        0xd5690000u, 0x00020009u, 0x4c000102u, 0x7d0a0080u,
+        0xbe88246au, 0xbf880015u, 0x7d0a0081u, 0xbe8a246au,
+        0xbf88000cu, 0x7d0a0082u, 0xbeea246au, 0xbf880003u,
+        0x7e000207u, 0xe0102000u, 0x80000002u, 0x8afe7e6au,
+        0xbf880003u, 0x7e000206u, 0xe0102000u, 0x80000002u,
+        0xbefe046au, 0x8afe7e0au, 0xbf880003u, 0x7e000205u,
+        0xe0102000u, 0x80000002u, 0xbefe040au, 0x8afe7e08u,
+        0xbf880003u, 0x7e000204u, 0xe0102000u, 0x80000002u,
+        0xbf810000u,
+    };
+    ShaderMapUserData(reinterpret_cast<uint64_t>(native_fill.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = sizeof(native_fill)});
+    TileSizeAlign cmask_size{};
+    Require(name, "CMASK size",
+            TileGetCmaskSize(512, 256, 1, cmask_size) && cmask_size.size == 0x1000 &&
+                TileGetCmaskSize(1024, 1024, 1, cmask_size) && cmask_size.size == 0x2000 &&
+                TileGetCmaskSize(512, 256, 1, cmask_size),
+            "unexpected CMASK footprint");
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "CMASK direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "CMASK direct mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    // Every CMASK tile expanded until the first fast clear.
+    std::memset(reinterpret_cast<void *>(cmask_address), 0xff, cmask_size.size);
+
+    {
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.GetGpu().SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        registers.SetColorBase(0, {.addr = base});
+        registers.SetColorInfo(
+            0, {.cmask_fast_clear_enable = true,
+                .format = Prospero::ChannelLayout::k16_16_16_16,
+                .channel_type = Prospero::ChannelType::kFloat,
+                .channel_order = Prospero::ChannelOrder::kStandard});
+        registers.SetColorAttrib2(0, {.height = 255, .width = 511});
+        registers.SetColorAttrib3(0,
+                                  {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                   .dimension = 1,
+                                   .metadata_pipe_aligned = true});
+        registers.SetColorCmask(0, {.addr = cmask_address});
+        registers.SetColorClearWord0(0, {.word0 = clear_word0});
+        registers.SetColorClearWord1(0, {.word1 = clear_word1});
+        registers.SetRenderTargetMask(0x0f);
+        scheduler.Begin(registers, user_config, shaders);
+
+        auto &texture_cache = context.GetTextureCache();
+        auto &executor = context.GetRenderExecutor();
+        context.MapMemory(base, allocation_size);
+        const auto fill_cmask = [&](uint32_t count, uint32_t value) {
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(native_fill.data()),
+                               .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = 64, .user_sgpr = 10, .tgid_x_en = true});
+          const std::array<uint32_t, 10> user_data{
+              static_cast<uint32_t>(cmask_address),
+              static_cast<uint32_t>(cmask_address >> 32u) | (4u << 16u),
+              count, 0x00014004u, value, 0, 0x200, 0, count, 1};
+          for (uint32_t i = 0; i < user_data.size(); i++) {
+            shaders.SetCsUserSgpr(i, user_data[i], HW::UserSgprType::Unknown);
+          }
+          executor.DispatchDirect(0, scheduler.Current(), (count + 63) / 64, 1, 1, 0x41u);
+        };
+        const auto cmask_words = static_cast<uint32_t>(cmask_size.size / 4);
+        const auto cmask_bytes = [&] {
+          context.GetBufferCache().ReadMemory(cmask_address, cmask_size.size, false);
+          std::vector<uint8_t> bytes(cmask_size.size);
+          Require(name, "CMASK readback",
+                  LibKernel::Memory::TryReadBacking(cmask_address, bytes.data(), bytes.size()),
+                  "CMASK bytes are unavailable");
+          return bytes;
+        };
+        const auto all_bytes = [](const std::vector<uint8_t> &bytes, uint8_t value) {
+          return std::all_of(bytes.begin(), bytes.end(),
+                             [value](uint8_t byte) { return byte == value; });
+        };
+        RenderColorInfo color{};
+        const auto bind = [&] {
+          RenderExecutorTestAccess::ResetBindings(executor);
+          RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                             color, 0);
+          (void)texture_cache.FindRenderTarget(color.image_id, color.desc);
+        };
+        const std::vector<u32> painted{0x00003c00u, 0x3c003c00u};
+        const auto paint = [&] {
+          vk::ClearValue clear{};
+          clear.color.float32 = std::array{1.0f, 0.0f, 1.0f, 1.0f};
+          TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), color.image_id,
+                                             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+                                             clear);
+        };
+
+        bind();
+        Require(name, "expanded CMASK keeps contents",
+                color.image_id && color.desc.cmask.valid &&
+                    color.desc.cmask.range.address == cmask_address &&
+                    color.desc.cmask.range.size == cmask_size.size &&
+                    ReadCachedTexel(name, context, color.image_id) == std::vector<u32>{0, 0},
+                "a target whose CMASK marks no tile cleared was changed");
+
+        fill_cmask(cmask_words, 0);
+        bind();
+        Require(name, "fast clear on bind",
+                ReadCachedTexel(name, context, color.image_id) == cleared_texel &&
+                    ReadCachedTexel(name, context, color.image_id, {511, 255, 0}) ==
+                        cleared_texel,
+                "a CMASK fast clear was not applied to the bound RGBA16F target");
+        Require(name, "CMASK expanded after the clear", all_bytes(cmask_bytes(), 0xff),
+                "materializing the clear left the CMASK marking tiles cleared");
+
+        paint();
+        bind();
+        Require(name, "rebinding keeps rendering",
+                ReadCachedTexel(name, context, color.image_id) == painted,
+                "rebinding after a consumed fast clear cleared the target again");
+
+        fill_cmask(cmask_words - 1, 0);
+        bind();
+        Require(name, "partial CMASK clear keeps rendering",
+                ReadCachedTexel(name, context, color.image_id) == painted,
+                "a CMASK with tiles still expanded cleared the whole target");
+
+        fill_cmask(cmask_words, 0);
+        bind();
+        Require(name, "complete refill clears",
+                ReadCachedTexel(name, context, color.image_id) == cleared_texel,
+                "completing the CMASK fast clear did not clear the target");
+
+        paint();
+        WriteMetadata(context, cmask_address, cmask_size.size, 0);
+        bind();
+        Require(name, "CPU-written CMASK clear",
+                ReadCachedTexel(name, context, color.image_id) == cleared_texel &&
+                    all_bytes(cmask_bytes(), 0xff),
+                "a CMASK fast clear in guest memory was not applied or not consumed");
+
+        paint();
+        registers.SetColorInfo(
+            0, {.format = Prospero::ChannelLayout::k16_16_16_16,
+                .channel_type = Prospero::ChannelType::kFloat,
+                .channel_order = Prospero::ChannelOrder::kStandard});
+        WriteMetadata(context, cmask_address, cmask_size.size, 0);
+        bind();
+        Require(name, "FAST_CLEAR disabled",
+                !color.desc.cmask.valid &&
+                    ReadCachedTexel(name, context, color.image_id) == painted,
+                "a target without CB_COLOR_INFO.FAST_CLEAR honoured its CMASK");
+
+        RenderExecutorTestAccess::ResetBindings(executor);
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+      });
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "CMASK mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "CMASK allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorDccFixedClearFloat() {
     constexpr const char *name = "RenderExecutorDccFixedClearFloat";
     constexpr uintptr_t base = 0x0000000204100000ull;
@@ -37819,6 +38029,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorDccFixedClearFloat();
+    vulkan.CheckRenderExecutorCmaskFastClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
@@ -37868,6 +38079,11 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorDccFixedClearFloat();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--cmask-fast-clear-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRenderExecutorCmaskFastClear();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--compute-meta-clear-only") == 0) {
     CheckDynamicRenderingState();
     VulkanHarness vulkan;
@@ -37875,6 +38091,7 @@ int main(int argc, char **argv) {
     vulkan.CheckNativeIndirectDispatch();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorDccFixedClearFloat();
+    vulkan.CheckRenderExecutorCmaskFastClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
@@ -38126,6 +38343,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorColorDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
   vulkan.CheckRenderExecutorDccFixedClearFloat();
+  vulkan.CheckRenderExecutorCmaskFastClear();
   vulkan.CheckSampledDccClear();
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();

@@ -1238,6 +1238,28 @@ bool TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices,
 	return true;
 }
 
+bool TileGetCmaskSize(uint32_t width, uint32_t height, uint32_t slices,
+                      TileSizeAlign& total_size) {
+	total_size = {};
+	if (width == 0 || height == 0 || slices == 0) {
+		return false;
+	}
+	// Gen5 CMASK keeps 4 bits per 8x8-pixel tile in the same 4 KiB pipe-aligned blocks as DCC:
+	// 2^(12 + 6 + 1) = 2^19 pixels per block, a 1024x512 raster (the DCC formula above with
+	// 64-pixel compression blocks and half-byte elements). 1024x1024 takes 8 KiB.
+	constexpr uint32_t block_width  = 1024;
+	constexpr uint32_t block_height = 512;
+	const uint64_t     blocks_x = (static_cast<uint64_t>(width) + block_width - 1u) / block_width;
+	const uint64_t     blocks_y = (static_cast<uint64_t>(height) + block_height - 1u) / block_height;
+	const uint64_t     blocks   = blocks_x * blocks_y;
+	if (blocks > UINT32_MAX / 4096u / slices) {
+		return false;
+	}
+	total_size.size  = static_cast<uint32_t>(blocks * slices * 4096u);
+	total_size.align = 4096;
+	return true;
+}
+
 bool TileGetRenderTargetMipLayout(uint32_t width, uint32_t height, uint32_t pitch,
                                   uint32_t bytes_per_element, uint32_t levels,
                                   TileSizeAlign& total_size, TileSizeOffset* level_sizes,

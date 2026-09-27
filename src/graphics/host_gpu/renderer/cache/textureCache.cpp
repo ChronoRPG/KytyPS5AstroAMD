@@ -2387,9 +2387,6 @@ bool TextureCache::VerifyCleanChunks(Image& image) {
 Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const ImageDesc& desc,
                                                               uint32_t metadata_base_layer) {
 	using Event = Profiler::FrameEvent;
-	using Support = DccClearHelper::Support;
-	const auto  range = desc.info.metadata.range;
-	const auto& view  = desc.view_info;
 	if (!m_dcc_clear || !m_dcc_clear->Available()) {
 		return Event::DccFallbackDisabled;
 	}
@@ -2397,15 +2394,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 	if (desc.type == BindingType::VideoOut) {
 		return Event::DccFallbackBinding;
 	}
-	const auto layers = desc.info.TransferLayers();
-	const auto first  = metadata_base_layer;
-	const auto count  = view.layer_count;
-	if (desc.info.IsVolume() || desc.info.resources.levels != 1 || desc.info.samples != 1 ||
-	    view.base_level != 0 || view.level_count != 1 ||
-	    view.aspect != vk::ImageAspectFlagBits::eColor ||
-	    (view.type != vk::ImageViewType::e2D && view.type != vk::ImageViewType::e2DArray) ||
-	    desc.info.metadata.compression != VideoOutCompression::Uncompressed || layers == 0 ||
-	    count == 0 || first >= layers || count > layers - first) {
+	if (desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		return Event::DccFallbackShape;
 	}
 	// The CPU decoder's result for every clear code under this binding (ClearCodes order).
@@ -2418,7 +2407,31 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 			decodable |= 1u << index;
 		}
 	}
-	switch (m_dcc_clear->SupportsFormat(view.format)) {
+	return TryMaterializeGpuMetadataClear(*m_dcc_clear, id, desc, desc.info.metadata.range,
+	                                      metadata_base_layer, values, decodable, false);
+}
+
+Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
+    DccClearHelper& helper, ImageId id, const ImageDesc& desc, GuestRange range,
+    uint32_t metadata_base_layer, const DccClearHelper::ClearValues& values, uint32_t decodable,
+    bool cmask) {
+	using Event = Profiler::FrameEvent;
+	using Support = DccClearHelper::Support;
+	const auto& view = desc.view_info;
+	if (!helper.Available()) {
+		return Event::DccFallbackDisabled;
+	}
+	const auto layers = desc.info.TransferLayers();
+	const auto first  = metadata_base_layer;
+	const auto count  = view.layer_count;
+	if (desc.info.IsVolume() || desc.info.resources.levels != 1 || desc.info.samples != 1 ||
+	    view.base_level != 0 || view.level_count != 1 ||
+	    view.aspect != vk::ImageAspectFlagBits::eColor ||
+	    (view.type != vk::ImageViewType::e2D && view.type != vk::ImageViewType::e2DArray) ||
+	    layers == 0 || count == 0 || first >= layers || count > layers - first) {
+		return Event::DccFallbackShape;
+	}
+	switch (helper.SupportsFormat(view.format)) {
 		case Support::Ok: break;
 		case Support::Disabled: return Event::DccFallbackDisabled;
 		case Support::Format: return Event::DccFallbackFormat;
@@ -2447,8 +2460,10 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 			           (decodable & ~found->second.decodable_mask) == 0;
 		}
 		if (reusable) {
-			m_gpu_dcc_reuses += count;
-			Profiler::CountFrameEvent(Event::DccGpuReuses, count);
+			if (!cmask) {
+				m_gpu_dcc_reuses += count;
+				Profiler::CountFrameEvent(Event::DccGpuReuses, count);
+			}
 			return Event::DccGpuReuses;
 		}
 	}
@@ -2468,7 +2483,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 		    count > image->backing.layers - view.base_layer) {
 			return Event::DccFallbackShape;
 		}
-		switch (m_dcc_clear->SupportsImage(*image, view.format, slice_size)) {
+		switch (helper.SupportsImage(*image, view.format, slice_size)) {
 			case Support::Ok: break;
 			case Support::Disabled: return Event::DccFallbackDisabled;
 			case Support::Format: return Event::DccFallbackFormat;
@@ -2499,13 +2514,15 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("DCC::GpuMaterialize");
 		for (uint32_t slice = 0; slice < count; ++slice) {
-			m_dcc_clear->RecordSlice(image, view.format, view.base_layer + slice, buffer->Handle(),
+			helper.RecordSlice(image, view.format, view.base_layer + slice, buffer->Handle(),
 			                         offset + slice_size * (first + slice), slice_size, values);
 		}
 	}
 	CommitGpuWrite(image);
-	m_gpu_dcc_records += count;
-	Profiler::CountFrameEvent(Event::DccGpuRecords, count);
+	if (!cmask) {
+		m_gpu_dcc_records += count;
+		Profiler::CountFrameEvent(Event::DccGpuRecords, count);
+	}
 	for (uint32_t slice = 0; slice < count; ++slice) {
 		const auto metadata = slice_range(slice);
 		if (const auto revision =
@@ -2521,7 +2538,7 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuDccClear(ImageId id, const I
 			m_gpu_dcc_inspections.erase(metadata.address);
 		}
 	}
-	if (m_gpu_dcc_records <= 8) {
+	if (!cmask && m_gpu_dcc_records <= 8) {
 		LOGF("GPU DCC inspection: metadata=0x%016" PRIx64 " bytes=%" PRIu64
 		     " image=0x%016" PRIx64 " format=%u type=%u slices=%u codes=0x%02x\n",
 		     range.address, range.size, desc.info.data.address,
@@ -2776,6 +2793,148 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	}
 }
 
+void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
+                                         uint32_t metadata_base_layer) {
+	using Event = Profiler::FrameEvent;
+	if (!desc.cmask.valid || desc.type != BindingType::RenderTarget || !id) {
+		return;
+	}
+	KYTY_PROFILER_DETAIL_FUNCTION();
+	const auto  range  = desc.cmask.range;
+	const auto& view   = desc.view_info;
+	const auto  layers = desc.info.TransferLayers();
+	if (!range.Valid() || layers == 0 || range.size % layers != 0 || (range.size / layers) % 4 != 0 ||
+	    desc.info.resources.levels != 1 || desc.info.IsVolume() || desc.info.samples != 1 ||
+	    view.layer_count == 0 || metadata_base_layer >= layers ||
+	    view.layer_count > layers - metadata_base_layer) {
+		Profiler::CountFrameEvent(Event::CmaskFastClearShape);
+		return;
+	}
+	vk::ClearValue clear {};
+	if (!DecodePackedColorClear64(view.format, desc.cmask.clear_word0, desc.cmask.clear_word1,
+	                              clear.color)) {
+		Profiler::CountFrameEvent(Event::CmaskFastClearFormat);
+		return;
+	}
+	const auto slice_size = range.size / layers;
+	// Slices whose GPU-owned bytes only a native inspection or a readback can decide.
+	std::vector<uint8_t> native(view.layer_count, 0);
+	for (uint32_t slice = 0; slice < view.layer_count; slice++) {
+		const GuestRange metadata {range.address + slice_size * (metadata_base_layer + slice),
+		                           slice_size};
+		{
+			std::scoped_lock lock {m_lock};
+			// Bytes some image also covers are not proven to be this surface's CMASK.
+			if (!FindImagesInRegion(metadata.address, metadata.size, false).empty()) {
+				Profiler::CountFrameEvent(Event::CmaskFastClearAliased);
+				continue;
+			}
+		}
+		// The proof that every tile of the slice is fast-cleared: all CMASK bytes are 0. Guest
+		// memory holds bytes the GPU does not own. GPU-owned bytes are decided here only while a
+		// recorded uniform fill still covers them (nothing wrote them since), otherwise by the
+		// native inspection below, which reads them on the GPU.
+		std::optional<uint32_t> value;
+		if (m_buffer_cache.IsRegionGpuModified(metadata.address, metadata.size)) {
+			value = m_buffer_cache.KnownFill(metadata.address, metadata.size);
+			if (!value) {
+				native[slice] = 1;
+				continue;
+			}
+		} else {
+			std::vector<uint32_t> words(metadata.size / sizeof(uint32_t));
+			if (LibKernel::Memory::TryReadBacking(metadata.address, words.data(), metadata.size) &&
+			    std::all_of(words.begin(), words.end(),
+			                [first = words.front()](uint32_t word) { return word == first; })) {
+				value = words.front();
+			}
+		}
+		if (!value || *value != 0) {
+			// 0xFFFFFFFF: every tile expanded (no pending clear). Anything else: some tiles are not
+			// fast-cleared (or the bytes encode nothing a single-sample surface uses).
+			Profiler::CountFrameEvent(value && *value == UINT32_MAX ? Event::CmaskFastClearExpanded
+			                                                        : Event::CmaskFastClearUnproven);
+			continue;
+		}
+		{
+			std::scoped_lock lock {m_lock};
+			ClearImage(m_scheduler.Current(), id, view.format,
+			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
+			            view.base_layer + slice, 1},
+			           clear);
+		}
+		// After the eliminate every tile is expanded; this also keeps a later binding from
+		// clearing again what the draws wrote meanwhile. FillBuffer can fault: no texture lock.
+		m_buffer_cache.FillBuffer(metadata.address, metadata.size, UINT32_MAX, false);
+		Profiler::CountFrameEvent(Event::CmaskFastClears);
+	}
+	if (std::ranges::find(native, uint8_t {1}) == native.end()) {
+		return;
+	}
+	// GPU-owned bytes without a recorded fill (the game's own fill kernel is not a proven uniform
+	// fill): the DCC helper's native inspection with CMASK semantics. Only code 0x00 (two
+	// fast-cleared tiles per byte) selects a clear, to the CLEAR_WORD colour; a cleared slice's
+	// bytes become 0xFF. It needs no readback; the DCC helper when KYTY_DCC_GPU=1 created it,
+	// otherwise a CMASK-only instance.
+	// KYTY_CMASK_NATIVE=0 decides them by readback instead.
+	static const bool native_enabled = [] {
+		const auto* value = std::getenv("KYTY_CMASK_NATIVE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	static_assert(DccClearHelper::ClearCodes[0] == 0x00);
+	if (native_enabled && m_dcc_clear == nullptr && m_cmask_clear == nullptr) {
+		m_cmask_clear = std::make_unique<DccClearHelper>(m_graphics, m_scheduler);
+	}
+	DccClearHelper::ClearValues values {};
+	values[0]          = clear.color;
+	auto* helper       = m_dcc_clear != nullptr ? m_dcc_clear.get() : m_cmask_clear.get();
+	const auto outcome = native_enabled && helper != nullptr
+	                         ? TryMaterializeGpuMetadataClear(*helper, id, desc, range,
+	                                                          metadata_base_layer, values, 1u, true)
+	                         : Event::DccFallbackDisabled;
+	if (outcome == Event::DccGpuRecords || outcome == Event::DccGpuReuses) {
+		Profiler::CountFrameEvent(outcome == Event::DccGpuRecords
+		                              ? Event::CmaskFastClearInspections
+		                              : Event::CmaskFastClearInspectionReuses,
+		                          view.layer_count);
+		return;
+	}
+	// No native inspection: read the undecided slices back, as the DCC CPU fallback does.
+	for (uint32_t slice = 0; slice < view.layer_count; slice++) {
+		if (native[slice] == 0) {
+			continue;
+		}
+		const GuestRange metadata {range.address + slice_size * (metadata_base_layer + slice),
+		                           slice_size};
+		Profiler::CountFrameEvent(Event::CmaskFastClearReadbacks);
+		{
+			Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::DccFallback);
+			m_buffer_cache.ReadMemory(metadata.address, metadata.size, false);
+		}
+		std::vector<uint32_t> words(metadata.size / sizeof(uint32_t));
+		if (!LibKernel::Memory::TryReadBacking(metadata.address, words.data(), metadata.size)) {
+			EXIT("TextureCache: failed to read CMASK bytes\n");
+		}
+		const bool cleared = std::all_of(words.begin(), words.end(), [](uint32_t word) { return word == 0; });
+		if (!cleared) {
+			Profiler::CountFrameEvent(std::all_of(words.begin(), words.end(),
+			                                      [](uint32_t word) { return word == UINT32_MAX; })
+			                              ? Event::CmaskFastClearExpanded
+			                              : Event::CmaskFastClearUnproven);
+			continue;
+		}
+		{
+			std::scoped_lock lock {m_lock};
+			ClearImage(m_scheduler.Current(), id, view.format,
+			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
+			            view.base_layer + slice, 1},
+			           clear);
+		}
+		m_buffer_cache.FillBuffer(metadata.address, metadata.size, UINT32_MAX, false);
+		Profiler::CountFrameEvent(Event::CmaskFastClears);
+	}
+}
+
 // TextureBindingMemo::RefreshIsNoOp mirrors when this is a no-op; keep them in sync.
 void TextureCache::RefreshImage(ImageId id) {
 	auto& image = m_slot_images[id];
@@ -2951,6 +3110,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		TouchImage(image);
 	}
 	MaterializeDccClear(result, desc, metadata_base_layer);
+	MaterializeCmaskClear(result, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		std::scoped_lock lock {m_lock};

@@ -936,8 +936,8 @@ enum class CbColorMode : uint8_t {
 // These special modes run color-buffer metadata or decompression operations. The shader is a
 // vehicle for that operation, and its exported color must not be applied as a normal draw.
 // Kyty stores expanded Vulkan images rather than compressed guest surfaces, so no equivalent
-// hardware pass is emitted. Tracked DCC clear state is materialized on attachment bind;
-// future CMask/FMask support can consume its state through the same TextureCache path.
+// hardware pass is emitted. Tracked DCC and CMASK fast-clear state is materialized on
+// attachment bind (TextureCache::MaterializeDccClear / MaterializeCmaskClear); FMask is not.
 static bool IsMetadataColorMode(uint8_t mode) {
 	return mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) ||
 	       mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
@@ -979,9 +979,13 @@ bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
 			continue;
 		}
 		const bool dcc = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
+		// A pending CMASK fast clear is written by the eliminate (TextureCache::MaterializeCmaskClear).
+		const bool cmask = mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) &&
+		                   rt.info.cmask_fast_clear_enable && rt.cmask.addr != 0 &&
+		                   CmaskFastClearEnabled();
 		// Only the layouts ResolveRenderColorTarget supports with DCC: render-target tiled,
 		// single sample.
-		const bool eligible = materialize && dcc &&
+		const bool eligible = materialize && (dcc || cmask) &&
 		                      rt.attrib3.tile_mode == Prospero::TileMode::kRenderTarget &&
 		                      rt.attrib.num_samples == 0 && rt.attrib.num_fragments == 0;
 		uint64_t image_size = 0;
