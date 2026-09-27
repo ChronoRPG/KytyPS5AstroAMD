@@ -56,6 +56,14 @@
 // gpl_cache_hits, gpl_links, gpl_link_us, gpl_libraries, gpl_library_us, gpl_optimized,
 // gpl_optimize_us. Memory counters added to MemoryCounter after mem_written_upload_late_pages
 // follow at the end of the row (kMemoryColumnsBeforeCompile in hangTrace.cpp).
+// Last, apr_grow_reads / apr_shrink_reads: reads from file offset 0 larger / smaller than the same
+// file's previous offset-0 read (Astro Bot's texture streamer promoting a texture from its 128 KiB
+// head to the full file / demoting it back); apr_shrink_max_per_flip: the most shrink reads
+// between two flips (its eviction pass stops at 32 textures); apr_stream_mib: the sum of the
+// latest offset-0 read of every file a "TextureStreamer" thread read, an estimate of the
+// streamed-texture footprint (its pool holds 4.5 GiB = 4608 MiB and evicts above 85%). Level
+// unloads issue no reads, so the estimate keeps a previous level's files: compare it within one
+// level visit.
 // New columns are only ever appended.
 //
 //   compiles.csv       one row per new shader program permutation or pipeline: phase times, the
