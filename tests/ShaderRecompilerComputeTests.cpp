@@ -27,6 +27,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -15985,6 +15986,8 @@ private:
     m_runtime_context.queue = m_queue;
     m_runtime_context.attachment_feedback_loop_enabled = true;
     m_runtime_context.provoking_vertex_last_enabled = true;
+    m_runtime_context.pipeline_library_enabled = m_pipeline_library;
+    m_runtime_context.pipeline_creation_cache_control_enabled = m_pipeline_library;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -16213,7 +16216,7 @@ private:
     device_features.fillModeNonSolid = true;
     device_features.tessellationShader = true;
     device_info.pEnabledFeatures = &device_features;
-    constexpr const char *device_extensions[] = {
+    std::vector<const char *> device_extensions = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
         VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
         VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
@@ -16224,8 +16227,23 @@ private:
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
         VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
-    device_info.enabledExtensionCount = std::size(device_extensions);
-    device_info.ppEnabledExtensionNames = device_extensions;
+    // KYTY_PIPELINE_LIBRARY=1 runs the renderer's pipeline creation through graphics pipeline
+    // libraries (pipelineLibrary.h), as on a production device that supports them. Checks that
+    // compare pipeline handles need KYTY_PIPELINE_LIBRARY_OPTIMIZE=0 (a background build replaces
+    // a linked pipeline's handle), and KYTY_PIPELINE_LIBRARY_PROBE=0 links even pipelines that
+    // the driver's cache already holds.
+    vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT pipeline_library{};
+    if (PipelineLibraryRequested()) {
+      pipeline_library.pNext = &min_lod;
+      pipeline_library.graphicsPipelineLibrary = true;
+      device_info.pNext = &pipeline_library;
+      device_features13.pipelineCreationCacheControl = true;
+      device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+      device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+      m_pipeline_library = true;
+    }
+    device_info.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
+    device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
@@ -16550,6 +16568,7 @@ private:
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
   GraphicContext m_runtime_context{};
+  bool m_pipeline_library = false;
   std::unique_ptr<RenderContext> m_renderer;
 };
 

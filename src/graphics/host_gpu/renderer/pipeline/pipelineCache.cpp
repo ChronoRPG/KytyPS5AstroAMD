@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/pipeline/stagePrepWorker.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -224,6 +225,15 @@ struct CompileTotals {
 	std::atomic<uint64_t> stalls {0};
 	std::atomic<uint64_t> stall_ns {0};
 	std::atomic<uint64_t> stall_max_ns {0};
+	// Pipeline libraries (6/7).
+	std::atomic<uint64_t> gpl_cache_hits {0};
+	std::atomic<uint64_t> gpl_links {0};
+	std::atomic<uint64_t> gpl_link_ns {0};
+	std::atomic<uint64_t> gpl_monolithic {0};
+	std::atomic<uint64_t> gpl_libraries {0};
+	std::atomic<uint64_t> gpl_library_ns {0};
+	std::atomic<uint64_t> gpl_optimized {0};
+	std::atomic<uint64_t> gpl_optimize_ns {0};
 };
 CompileTotals g_compile_totals;
 
@@ -328,6 +338,17 @@ void LogCompileTotals() {
 	                 t.gfx_permutation.load(std::memory_order_relaxed),
 	                 t.gfx_variant.load(std::memory_order_relaxed), compute, ms(t.cs_pipeline_ns),
 	                 t.stalls.load(std::memory_order_relaxed), ms(t.stall_ns), ms(t.stall_max_ns));
+	const auto links      = t.gpl_links.load(std::memory_order_relaxed);
+	const auto cache_hits = t.gpl_cache_hits.load(std::memory_order_relaxed);
+	const auto monolithic = t.gpl_monolithic.load(std::memory_order_relaxed);
+	if (links != 0 || cache_hits != 0 || monolithic != 0) {
+		PipelineCacheLog("Pipeline libraries: {} linked ({:.1f} ms), {} driver-cache hits, {} "
+		                 "monolithic, {} libraries ({:.1f} ms), {} optimized in background "
+		                 "({:.1f} ms)",
+		                 links, ms(t.gpl_link_ns), cache_hits, monolithic,
+		                 t.gpl_libraries.load(std::memory_order_relaxed), ms(t.gpl_library_ns),
+		                 t.gpl_optimized.load(std::memory_order_relaxed), ms(t.gpl_optimize_ns));
+	}
 }
 
 struct ShaderReadAttempt {
@@ -2271,13 +2292,146 @@ struct PipelineCache::PipelineDiagnostics {
 	std::unordered_map<Ids, uint32_t, IdsHash>                                  by_guest;
 };
 
+// Graphics pipeline libraries (item 6/7, KYTY_PIPELINE_LIBRARY): the library cache and the
+// background threads that compile the optimized monolithic pipeline for every fast-linked one.
+struct PipelineCache::LibraryState {
+	explicit LibraryState(PipelineCache& owner)
+	    : cache(owner), library(owner.m_graphics),
+	      optimize(EnvU64("KYTY_PIPELINE_LIBRARY_OPTIMIZE", 1) != 0) {
+		const auto count = std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_LIBRARY_THREADS", 2), 1, 8);
+		if (optimize) {
+			for (uint64_t i = 0; i < count; ++i) {
+				threads.emplace_back([this](std::stop_token stop) { Run(stop); });
+			}
+		}
+	}
+	~LibraryState() { Stop(); }
+	LibraryState(const LibraryState&)            = delete;
+	LibraryState& operator=(const LibraryState&) = delete;
+
+	struct Job {
+		const GraphicsPipelineKey*                key    = nullptr; // map node: never erased
+		vk::Pipeline                              linked = nullptr;
+		std::unique_ptr<GraphicsPipelineSnapshot> snapshot;
+	};
+
+	void Enqueue(Job job) {
+		{
+			std::scoped_lock lock(mutex);
+			if (stopped) return; // after Save(): the linked pipeline stays
+			jobs.push_back(std::move(job));
+		}
+		wake.notify_one();
+	}
+
+	// Joins the threads; queued compiles are dropped (their linked pipelines stay in use). Must
+	// run before the driver cache they use is destroyed.
+	void Stop() {
+		{
+			std::scoped_lock lock(mutex);
+			stopped = true;
+			jobs.clear();
+		}
+		for (auto& thread: threads) {
+			thread.request_stop();
+		}
+		wake.notify_all();
+		for (auto& thread: threads) {
+			if (thread.joinable()) thread.join();
+		}
+		threads.clear();
+	}
+
+	void Run(const std::stop_token& stop) {
+		Profiler::SetThreadName("PipelineOptimizer");
+		for (;;) {
+			Job job;
+			{
+				std::unique_lock lock(mutex);
+				if (!wake.wait(lock, stop, [this] { return !jobs.empty(); })) {
+					return;
+				}
+				job = std::move(jobs.front());
+				jobs.pop_front();
+			}
+			// Exactly the create info the renderer builds without libraries (a verified deep copy),
+			// so the result is the pipeline it would have created.
+			const auto   begin     = CompileClockNs();
+			vk::Pipeline optimized = nullptr;
+			const auto   result    = cache.m_graphics.device.createGraphicsPipelines(
+			    cache.m_driver_cache, 1, &job.snapshot->Info(), nullptr, &optimized);
+			const auto ns = CompileClockNs() - begin;
+			Profiler::AddFrameWait(Profiler::FrameWait::PipelineOptimize, 1, ns);
+			HangTrace::RecordPipelineLibraryEvent(HangTrace::PipelineLibraryEvent::Optimized, ns);
+			if (result != vk::Result::eSuccess || optimized == nullptr) {
+				// The linked pipeline stays; it renders the same state.
+				continue;
+			}
+			g_compile_totals.gpl_optimized.fetch_add(1, std::memory_order_relaxed);
+			g_compile_totals.gpl_optimize_ns.fetch_add(ns, std::memory_order_relaxed);
+			cache.ReplaceLinkedPipeline(job.key, job.linked, optimized);
+		}
+	}
+
+	PipelineCache&          cache;
+	GraphicsPipelineLibrary library; // guarded by PipelineCache::m_mutex
+	const bool              optimize;
+	// Linked pipelines replaced by their optimized builds; other threads may still hold a
+	// reference, and recorded command buffers may use them, so they live until the cache goes
+	// (guarded by PipelineCache::m_mutex).
+	std::vector<std::unique_ptr<Pipeline>> retired;
+	std::mutex                             mutex;
+	std::condition_variable_any            wake;
+	std::deque<Job>                        jobs;
+	bool                                   stopped = false;
+	std::vector<std::jthread>              threads; // Last: joined before the rest is destroyed.
+};
+
+void PipelineCache::ReplaceLinkedPipeline(const GraphicsPipelineKey* key, vk::Pipeline linked,
+                                          vk::Pipeline optimized) {
+	Common::LockGuard lock(m_mutex);
+	auto              entry = m_graphics_pipelines.find(*key);
+	if (entry == m_graphics_pipelines.end() || entry->second->pipeline != linked) {
+		m_graphics.device.destroyPipeline(optimized, nullptr);
+		return;
+	}
+	// A new object, not a changed handle: threads that already hold the old Pipeline& keep a
+	// consistent (still valid) pipeline; the generation makes their memos look it up again.
+	auto replacement      = std::make_unique<Pipeline>(*entry->second);
+	replacement->pipeline = optimized;
+	m_library->retired.push_back(std::move(entry->second));
+	entry->second = std::move(replacement);
+	GpuOpProfiler::RegisterGraphicsPipeline(optimized, key->vertex_shader_ids.data(),
+	                                        static_cast<uint32_t>(key->vertex_shader_ids.size()),
+	                                        key->ps_shader_id);
+	m_pipeline_generation.fetch_add(1, std::memory_order_release);
+}
+
+namespace {
+// Numbers PipelineCache instances for their generation ranges (see the constructor).
+std::atomic<uint64_t> g_pipeline_cache_instances {0};
+} // namespace
+
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)),
       m_diagnostics(std::make_unique<PipelineDiagnostics>()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// Each cache counts its generations in its own range, so a per-thread lookup memo left by a
+	// destroyed cache can never match a later cache allocated at the same address (tests create
+	// several render contexts in one process).
+	m_pipeline_generation.store(
+	    (g_pipeline_cache_instances.fetch_add(1, std::memory_order_relaxed) + 1) << 32u,
+	    std::memory_order_relaxed);
 	InitializeDriverCache();
 	if (m_driver_cache != nullptr && DriverCacheSaveSettings::Get().enabled) {
 		m_saver = std::make_unique<DriverCacheSaver>(*this);
+	}
+	if (GraphicsPipelineLibrary::Enabled(m_graphics)) {
+		m_library = std::make_unique<LibraryState>(*this);
+		PipelineCacheLog("Graphics pipeline libraries: enabled (fast link, {})",
+		                 m_library->optimize ? "optimized in background" : "linked pipelines kept");
+	} else if (PipelineLibraryRequested()) {
+		PipelineCacheLog("Graphics pipeline libraries: requested but not supported by the device");
 	}
 }
 
@@ -2294,6 +2448,14 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	if (m_library != nullptr) {
+		// Replaced linked pipelines: their layouts belong to the live entries destroyed above.
+		for (const auto& retired: m_library->retired) {
+			m_graphics.device.destroyPipeline(retired->pipeline, nullptr);
+		}
+		// Libraries go last, after every pipeline linked from them.
+		m_library.reset();
+	}
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -2547,6 +2709,10 @@ void PipelineCache::Save() {
 	if (m_saver != nullptr) {
 		m_saver->Stop();
 	}
+	// Background optimized compiles use the driver cache too; linked pipelines stay in use.
+	if (m_library != nullptr) {
+		m_library->Stop();
+	}
 	Common::LockGuard lock(m_mutex);
 	if (m_driver_cache == nullptr) {
 		return;
@@ -2571,6 +2737,43 @@ namespace {
 bool PipelineKeyNormalizationEnabled() {
 	static const bool enabled = EnvU64("KYTY_PIPELINE_KEY_NORMALIZE", 1) != 0;
 	return enabled;
+}
+
+// Accounts one graphics pipeline created through the library path and names the path in the
+// compiles.csv detail.
+void RecordLibraryPipeline(const GraphicsPipelineLibrary::Result& result, std::string& detail) {
+	auto& totals = g_compile_totals;
+	if (result.libraries_created != 0) {
+		totals.gpl_libraries.fetch_add(result.libraries_created, std::memory_order_relaxed);
+		totals.gpl_library_ns.fetch_add(result.libraries_ns, std::memory_order_relaxed);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineLibrariesCreated,
+		                          result.libraries_created);
+		HangTrace::RecordPipelineLibraryEvent(HangTrace::PipelineLibraryEvent::Library,
+		                                      result.libraries_ns, result.libraries_created);
+	}
+	const char* path = "gpl-monolithic";
+	switch (result.path) {
+		case GraphicsPipelineLibrary::Path::CacheHit:
+			path = "gpl-cache-hit";
+			totals.gpl_cache_hits.fetch_add(1, std::memory_order_relaxed);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineLibraryCacheHits);
+			HangTrace::RecordPipelineLibraryEvent(HangTrace::PipelineLibraryEvent::CacheHit, 0);
+			break;
+		case GraphicsPipelineLibrary::Path::Linked:
+			path = "gpl-linked";
+			totals.gpl_links.fetch_add(1, std::memory_order_relaxed);
+			totals.gpl_link_ns.fetch_add(result.link_ns, std::memory_order_relaxed);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineLibraryLinks);
+			HangTrace::RecordPipelineLibraryEvent(HangTrace::PipelineLibraryEvent::Linked,
+			                                      result.link_ns);
+			break;
+		default: totals.gpl_monolithic.fetch_add(1, std::memory_order_relaxed); break;
+	}
+	detail += detail.empty() ? "" : "|";
+	detail += fmt::format("{} libs={}", path, result.libraries_created);
+	if (result.fallback != nullptr) {
+		detail += fmt::format(" ({})", result.fallback);
+	}
 }
 
 // Zeroes pipeline-key fields that cannot change the pipeline CreatePipelineInternal creates, so
@@ -2982,31 +3185,37 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 
 	// Last-key memo (KYTY_PIPELINE_MEMO): most draws use their predecessor's pipeline. Exact:
-	// the comparison is the map's own key equality, and pipelines are never erased or moved
-	// before the cache is destroyed.
+	// the comparison is the map's own key equality, and pipeline objects are never destroyed
+	// before the cache is; an object replaced by an optimized build (pipeline libraries) bumps
+	// m_pipeline_generation, which invalidates every memo.
 	static const bool memo_enabled = [] {
 		const auto* value = std::getenv("KYTY_PIPELINE_MEMO");
 		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
 	struct LastPipeline {
-		const PipelineCache* cache    = nullptr;
-		Pipeline*            pipeline = nullptr;
+		const PipelineCache* cache      = nullptr;
+		Pipeline*            pipeline   = nullptr;
+		uint64_t             generation = 0;
 		GraphicsPipelineKey  key {};
 	};
 	static thread_local LastPipeline last;
 	if (memo_enabled) {
-		if (last.cache == this && last.pipeline != nullptr && last.key == key) {
+		if (last.cache == this && last.pipeline != nullptr &&
+		    last.generation == m_pipeline_generation.load(std::memory_order_acquire) &&
+		    last.key == key) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineMemoHits);
 			FlushCompileStall();
 			return *last.pipeline;
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineMemoMisses);
 	}
+	// Called with m_mutex held, so the generation read matches the object found.
 	const auto remember = [&](Pipeline& pipeline) -> Pipeline& {
 		if (memo_enabled) {
-			last.cache    = this;
-			last.pipeline = &pipeline;
-			last.key      = key;
+			last.cache      = this;
+			last.pipeline   = &pipeline;
+			last.generation = m_pipeline_generation.load(std::memory_order_relaxed);
+			last.key        = key;
 		}
 		FlushCompileStall();
 		return pipeline;
@@ -3030,10 +3239,23 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	// Pipeline libraries (6/7): the monolithic create info goes to the library path, which may
+	// fast-link it and hand back the create info for the background optimized compile.
+	GraphicsPipelineLibrary::Result library_result;
+	GraphicsPipelineCreateHook      library_hook;
+	if (m_library != nullptr) {
+		library_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
+		                   std::span<const uint32_t> layout_signature, vk::Pipeline* pipeline) {
+			library_result = m_library->library.Create(info, layout_signature, m_driver_cache);
+			*pipeline      = library_result.pipeline;
+			return library_result.result;
+		};
+	}
 	{
 		Profiler::ScopedFrameWait pipeline_create(Profiler::FrameWait::GraphicsPipelineCreate);
 		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-		                       ps_input_info, programs, static_params, m_driver_cache);
+		                       ps_input_info, programs, static_params, m_driver_cache,
+		                       m_library != nullptr ? &library_hook : nullptr);
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
@@ -3044,8 +3266,14 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	                                        static_cast<uint32_t>(key.vertex_shader_ids.size()),
 	                                        ps_id);
 
-	auto [iter, inserted] = m_graphics_pipelines.emplace(key, std::move(cached));
+	const auto created_pipeline = cached->pipeline;
+	auto [iter, inserted]       = m_graphics_pipelines.emplace(key, std::move(cached));
 	EXIT_IF(!inserted);
+	if (library_result.path == GraphicsPipelineLibrary::Path::Linked && m_library->optimize) {
+		m_library->Enqueue({.key      = &iter->first,
+		                    .linked   = created_pipeline,
+		                    .snapshot = std::move(library_result.optimize)});
+	}
 
 	const auto create_ns = CompileClockNs() - create_begin;
 	PipelineDiagnostics::Ids guest {};
@@ -3055,6 +3283,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	guest[3] = ps_active ? ps_input_info->stage.program->shader_hash : 0;
 	std::string detail;
 	const auto  origin = m_diagnostics->Classify(iter->first, guest, detail);
+	if (m_library != nullptr) {
+		RecordLibraryPipeline(library_result, detail);
+	}
 	auto&       totals = g_compile_totals;
 	totals.gfx_pipelines.fetch_add(1, std::memory_order_relaxed);
 	totals.gfx_pipeline_ns.fetch_add(create_ns, std::memory_order_relaxed);

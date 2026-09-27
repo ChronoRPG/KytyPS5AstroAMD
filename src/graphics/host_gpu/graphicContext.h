@@ -42,6 +42,11 @@ struct GraphicContext {
 	bool                               multi_draw_indirect_enabled           = false;
 	bool                               draw_indirect_count_enabled           = false;
 	bool                               index_type_uint8_enabled              = false;
+	// VK_EXT_graphics_pipeline_library with fast linking, enabled only when KYTY_PIPELINE_LIBRARY
+	// asks for it (pipeline/pipelineLibrary.h), and core Vulkan 1.3 pipelineCreationCacheControl
+	// (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT).
+	bool                               pipeline_library_enabled              = false;
+	bool                               pipeline_creation_cache_control_enabled = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

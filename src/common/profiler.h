@@ -314,6 +314,11 @@ enum class FrameEvent : uint32_t {
 	// KYTY_TRANSLATION_CACHE_VERIFY found different from a fresh one.
 	TranslationReuses,
 	TranslationVerifyMismatches,
+	// Graphics pipeline libraries (KYTY_PIPELINE_LIBRARY): pipelines fast-linked from libraries,
+	// monolithic pipelines found in the driver cache instead, and libraries created.
+	PipelineLibraryLinks,
+	PipelineLibraryCacheHits,
+	PipelineLibrariesCreated,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
@@ -365,6 +370,8 @@ enum class FrameWait : uint32_t {
 	// pipeline (layouts and vkCreateComputePipelines).
 	GraphicsPipelineDriver,
 	ComputePipelineCreate,
+	// Background optimized compiles replacing fast-linked pipelines (not on the GPU thread).
+	PipelineOptimize,
 	Count,
 };
 

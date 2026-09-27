@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -606,6 +607,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_maintenance8.pNext = supported_features2.pNext;
 		supported_features2.pNext    = &supported_maintenance8;
 	}
+	const bool pipeline_library_extension =
+	    HasExtension(device_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT supported_pipeline_library {};
+	if (pipeline_library_extension) {
+		supported_pipeline_library.pNext = supported_features2.pNext;
+		supported_features2.pNext        = &supported_pipeline_library;
+	}
 	vk::PhysicalDeviceVulkan12Features supported_features12 {};
 	supported_features12.pNext = supported_features2.pNext;
 	supported_features2.pNext  = &supported_features12;
@@ -614,6 +622,23 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    maintenance8_extension && supported_maintenance8.maintenance8 == VK_TRUE;
 	LOGF("Vulkan maintenance8 (depth/color image copies): %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
+	// Graphics pipeline libraries need fast linking: without it a link is a full compile.
+	if (pipeline_library_extension &&
+	    supported_pipeline_library.graphicsPipelineLibrary == VK_TRUE) {
+		vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT library_properties {};
+		vk::PhysicalDeviceProperties2                          properties {};
+		properties.pNext = &library_properties;
+		physical_device.getProperties2(&properties);
+		graphics.pipeline_library_enabled =
+		    library_properties.graphicsPipelineLibraryFastLinking == VK_TRUE;
+	}
+	// Only used by the library path's driver-cache probe; the default device stays unchanged.
+	graphics.pipeline_creation_cache_control_enabled =
+	    graphics.pipeline_library_enabled &&
+	    supported_features13.pipelineCreationCacheControl == VK_TRUE;
+	LOGF("Vulkan graphics pipeline library: %s, pipeline creation cache control: %s\n",
+	     graphics.pipeline_library_enabled ? "true" : "false",
+	     graphics.pipeline_creation_cache_control_enabled ? "true" : "false");
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
 	// Optional: native indirect draws fall back to CPU-read arguments without these.
 	graphics.draw_indirect_first_instance_enabled =
@@ -734,6 +759,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
+	features13.pipelineCreationCacheControl =
+	    graphics.pipeline_creation_cache_control_enabled ? VK_TRUE : VK_FALSE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
@@ -765,6 +792,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.maintenance8 = VK_TRUE;
 		maintenance8.pNext        = const_cast<void*>(create_info.pNext);
 		create_info.pNext         = &maintenance8;
+	}
+	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT pipeline_library {};
+	if (graphics.pipeline_library_enabled) {
+		pipeline_library.graphicsPipelineLibrary = VK_TRUE;
+		pipeline_library.pNext                   = const_cast<void*>(create_info.pNext);
+		create_info.pNext                        = &pipeline_library;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1150,6 +1183,14 @@ void WindowContext::CreateVulkan() {
 			    (m8 == nullptr || std::strcmp(m8, "0") != 0)) {
 				device_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
 			}
+		}
+		// Graphics pipeline libraries (KYTY_PIPELINE_LIBRARY, pipeline/pipelineLibrary.h): only
+		// enabled when requested, so the default device is unchanged.
+		if (PipelineLibraryRequested() &&
+		    HasExtension(available_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+			device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
 		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {

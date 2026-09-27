@@ -214,7 +214,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const ShaderPixelInputInfo*            ps_input_info,
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache) {
+                            vk::PipelineCache                      driver_cache,
+                            const GraphicsPipelineCreateHook*      create_hook) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -558,8 +559,27 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     dynamic_state.dynamicStateCount);
 	}
 	const auto driver_begin = std::chrono::steady_clock::now();
-	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
-	                                                 &pipeline.pipeline);
+	if (create_hook != nullptr) {
+		// The pipeline-library path shares libraries only between identically defined layouts:
+		// describe this layout's definition (descriptor set layout and push constant range).
+		// Anything that changes how the layouts above are created must be reflected here.
+		std::vector<uint32_t> layout_signature;
+		layout_signature.reserve(descriptor_bindings.size() * 4u + 3u);
+		layout_signature.push_back(pipeline.uses_push_descriptors ? 1u : 0u);
+		layout_signature.push_back(static_cast<vk::ShaderStageFlags::MaskType>(graphics_stages));
+		layout_signature.push_back(ShaderRecompiler::IR::NativePushConstantSize);
+		for (const auto& binding: descriptor_bindings) {
+			layout_signature.push_back(binding.binding);
+			layout_signature.push_back(static_cast<uint32_t>(binding.descriptorType));
+			layout_signature.push_back(binding.descriptorCount);
+			layout_signature.push_back(
+			    static_cast<vk::ShaderStageFlags::MaskType>(binding.stageFlags));
+		}
+		result = (*create_hook)(pipeline_info, layout_signature, &pipeline.pipeline);
+	} else {
+		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
+		                                                 &pipeline.pipeline);
+	}
 	Profiler::AddFrameWait(Profiler::FrameWait::GraphicsPipelineDriver, 1,
 	                       static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                                 std::chrono::steady_clock::now() - driver_begin)

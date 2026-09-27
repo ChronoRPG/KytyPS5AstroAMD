@@ -51,6 +51,9 @@
 // translating again) and compile_clone_us (copying translations, RecordCompile clone_ns).
 // Then validate_async_count and validate_async_us: spirv-val runs on the background validator
 // (KYTY_SHADER_VALIDATION_ASYNC), off the compiling thread (RecordShaderValidation).
+// Then graphics pipeline libraries (KYTY_PIPELINE_LIBRARY, RecordPipelineLibraryEvent):
+// gpl_cache_hits, gpl_links, gpl_link_us, gpl_libraries, gpl_library_us, gpl_optimized,
+// gpl_optimize_us.
 // New columns are only ever appended.
 //
 //   compiles.csv       one row per new shader program permutation or pipeline: phase times, the
@@ -295,6 +298,11 @@ void RecordPipelineCacheSave(uint64_t bytes, uint64_t serialize_ns, uint64_t wri
 void RecordPipelineCacheSaveOverlap(uint64_t create_ns);
 // One background spirv-val run (not on a compiling draw's thread).
 void RecordShaderValidation(uint64_t validate_ns);
+// Graphics pipeline libraries: a monolithic pipeline found in the driver cache (CacheHit), a
+// fast link (Linked, link time), `count` new libraries (Library, their creation time), and a
+// background optimized compile (Optimized, on a worker thread).
+enum class PipelineLibraryEvent : uint8_t { CacheHit, Linked, Library, Optimized, Count };
+void RecordPipelineLibraryEvent(PipelineLibraryEvent event, uint64_t ns, uint64_t count = 1);
 
 } // namespace HangTrace
 
