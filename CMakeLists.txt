@@ -834,6 +834,17 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_copied PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE=0;KYTY_DRAW_PREP_LOCKFREE_HINT=0")
+	# KYTY_DRAW_PREP_STEAL (off by default): the command processor stealing whenever a slot waits,
+	# with six workers and with a single one (a held head with unclaimed slots behind it, where it
+	# steals most).
+	add_test(NAME draw_prep_engine_parallel_steal
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_steal PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_STEAL=1")
+	add_test(NAME draw_prep_engine_parallel_steal_one_worker
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_steal_one_worker PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_STEAL=1;KYTY_DRAW_PREP_WORKERS=1;KYTY_DRAW_PREP_HOT=1")
 	add_test(NAME draw_prep_code_cert_copied
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-code-cert-only)
 	set_tests_properties(draw_prep_code_cert_copied PROPERTIES

@@ -584,6 +584,20 @@ uint64_t NowNs() {
 	                                 .count());
 }
 
+// The command processor preparing a stolen slot runs as a DrawPrep worker for the duration:
+// CommandScheduler::CheckActive stops the emulator if the preparation reaches the scheduler, as
+// it does on the DrawPrep#k threads.
+class WorkerThreadScope {
+public:
+	WorkerThreadScope() noexcept: m_previous(t_worker_thread) { t_worker_thread = true; }
+	~WorkerThreadScope() { t_worker_thread = m_previous; }
+	WorkerThreadScope(const WorkerThreadScope&)            = delete;
+	WorkerThreadScope& operator=(const WorkerThreadScope&) = delete;
+
+private:
+	bool m_previous;
+};
+
 } // namespace
 
 // The parallel-mode window and its DrawPrep#k threads. Workers only run Prepare on claimed
@@ -592,9 +606,9 @@ uint64_t NowNs() {
 // others park until the unclaimed backlog reaches KYTY_DRAW_PREP_WAKE_BACKLOG.
 struct Engine::Workers {
 	Workers(PipelineCache& pipeline_cache, uint32_t window, uint32_t count, uint64_t spin_ns,
-	        uint32_t hot, uint32_t wake_backlog, uint64_t cold_spin_ns)
+	        uint32_t hot, uint32_t wake_backlog, uint64_t cold_spin_ns, StealPolicy steal)
 	    : pipeline_cache(pipeline_cache), window(window), spin_ns(spin_ns),
-	      cold_spin_ns(cold_spin_ns), gate(count, hot, wake_backlog) {
+	      cold_spin_ns(cold_spin_ns), steal(steal), gate(count, hot, wake_backlog) {
 		for (uint32_t index = 0; index < count; index++) {
 			threads.emplace_back([this, index] { Run(index); });
 		}
@@ -621,6 +635,16 @@ struct Engine::Workers {
 		}
 	}
 
+	// A worker's preparation of a claimed slot. Also the command processor's for a stolen slot
+	// (Engine::CommitHead), so the two cannot differ: the conservative clean hint (exact=false),
+	// then the release store of Done that publishes the preparation to the commit.
+	void PrepareClaimed(Slot& slot, uint64_t seq) {
+		Prepare(pipeline_cache, slot.registers, slot.eligible, false, slot.prepared);
+		HashForRepeatTrace(slot);
+		slot.worker_prepared = true;
+		window.Complete(seq);
+	}
+
 	void Run(uint32_t index) {
 		char name[32];
 		std::snprintf(name, sizeof(name), "DrawPrep#%u", index + 1u);
@@ -628,12 +652,7 @@ struct Engine::Workers {
 		t_worker_thread = true;
 		RunPreparationWorker(
 		    gate, window, index, spin_ns, cold_spin_ns, stop,
-		    [this](Slot& slot, uint64_t seq) {
-			    Prepare(pipeline_cache, slot.registers, slot.eligible, false, slot.prepared);
-			    HashForRepeatTrace(slot);
-			    slot.worker_prepared = true;
-			    window.Complete(seq);
-		    },
+		    [this](Slot& slot, uint64_t seq) { PrepareClaimed(slot, seq); },
 		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); });
 	}
 
@@ -641,6 +660,7 @@ struct Engine::Workers {
 	Window<Slot>             window;
 	uint64_t                 spin_ns      = 0;
 	uint64_t                 cold_spin_ns = 0;
+	StealPolicy              steal; // KYTY_DRAW_PREP_STEAL, KYTY_DRAW_PREP_STEAL_AFTER_US
 	WorkerGate               gate;
 	std::atomic<bool>        stop {false};
 	std::vector<std::thread> threads;
@@ -659,17 +679,29 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
 		const auto spin_us = EnvUnsigned("KYTY_DRAW_PREP_SPIN_US", 200, 0, 1000000);
 		// Workers that keep spinning; the rest park until the backlog needs them. A value of at
 		// least KYTY_DRAW_PREP_WORKERS keeps every worker hot (the behaviour before the gate).
+		// Wake a parked worker once 2 slots wait unclaimed (8 until U54: the CP then waited for
+		// heads 2.5x as long after short bursts, DEEP-TRACE-U54 3.1; draw_prep_tests
+		// --measure-worker-gate, heavy bursts: 270.4 -> 265.2 ms, no extra worker CPU).
 		const auto hot          = EnvUnsigned("KYTY_DRAW_PREP_HOT", 2, 1, 32);
-		const auto wake_backlog = EnvUnsigned("KYTY_DRAW_PREP_WAKE_BACKLOG", 8, 1, 1024);
+		const auto wake_backlog = EnvUnsigned("KYTY_DRAW_PREP_WAKE_BACKLOG", 2, 1, 1024);
 		const auto cold_spin_us = EnvUnsigned("KYTY_DRAW_PREP_COLD_SPIN_US", 50, 0, 1000000);
+		// Work stealing while a worker holds the head (Engine::CommitHead): the unclaimed backlog
+		// that makes the command processor prepare slots itself (0 = never, the default), and how
+		// long it first waits for the head. Off by default: in the measured workloads it removes
+		// most of the CP's idle spin but not wall time (a stolen preparation that outlasts the
+		// head delays the commits behind it).
+		StealPolicy steal;
+		steal.min_unclaimed  = EnvUnsigned("KYTY_DRAW_PREP_STEAL", 0, 0, 1024);
+		const auto steal_us  = EnvUnsigned("KYTY_DRAW_PREP_STEAL_AFTER_US", 0, 0, 1000000);
+		steal.after_ns       = uint64_t {steal_us} * 1000u;
 		m_workers = std::make_unique<Workers>(m_renderer.GetPipelineCache(), window, workers,
 		                                      uint64_t {spin_us} * 1000u, hot, wake_backlog,
-		                                      uint64_t {cold_spin_us} * 1000u);
+		                                      uint64_t {cold_spin_us} * 1000u, steal);
 		LOGF("DrawPrep: parallel mode, window=%u workers=%u spin=%uus hot=%u wake_backlog=%u "
-		     "cold_spin=%uus cert=%s verify=%d\n",
+		     "cold_spin=%uus steal=%u steal_after=%uus cert=%s verify=%d\n",
 		     m_workers->window.Capacity(), workers, spin_us, m_workers->gate.HotCount(),
-		     wake_backlog, cold_spin_us, GetCertMode() == CertMode::Log ? "log" : "value",
-		     VerifyMode());
+		     wake_backlog, cold_spin_us, steal.min_unclaimed, steal_us,
+		     GetCertMode() == CertMode::Log ? "log" : "value", VerifyMode());
 	}
 }
 
@@ -742,6 +774,9 @@ bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
 void Engine::CommitHead() {
 	auto& window = m_workers->window;
 	EXIT_IF(window.Empty());
+	// Commits happen at packet boundaries, never inside a preparation: the recorder and the
+	// per-thread scratch the preparations below use are idle here.
+	EXIT_IF(Speculative());
 	auto& slot = window.HeadPayload();
 	if (window.TryClaimHead()) {
 		// No worker has started it: prepare it here, with the exact clean predicate.
@@ -752,18 +787,37 @@ void Engine::CommitHead() {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepReady);
 	} else {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaits);
-		Profiler::ScopedFrameWait wait(Profiler::FrameWait::DrawPrepCommitWait);
-		const auto wait_start = NowNs();
-		for (uint32_t spins = 1; !window.HeadDone(); spins++) {
-			CpuRelax();
-			// Workers never dereference guest memory, so they cannot page fault into a request
-			// this thread must service. Only as a last-resort deadlock guard, after 2 ms, pending
-			// cross-thread commands are serviced here; such a command then observes the window
-			// partially committed, as if it had arrived just before these draws were parsed.
-			if ((spins & 1023u) == 0u && m_service_commands &&
-			    NowNs() - wait_start > 2'000'000u) {
-				m_service_commands();
-			}
+		// A worker holds the head. KYTY_DRAW_PREP_STEAL: meanwhile this thread prepares the next
+		// unclaimed slots exactly as a worker does (AwaitHead, workerGate.h): same function, the
+		// workers' clean hint, CheckActive armed, Done published with a release store. They are
+		// committed in order when they reach the head, through the same Validate as any worker's
+		// preparation. Only a head this thread claims itself (above) uses the exact predicate: it
+		// is committed at once. A stolen slot is committed after the draws before it, which change
+		// what that predicate reads, so the certificate at its commit decides.
+		const auto stats = AwaitHead(
+		    m_workers->gate, window, m_workers->steal,
+		    [this](Slot& claimed, uint64_t seq) {
+			    Profiler::ScopedFrameWait steal_time(Profiler::FrameWait::DrawPrepSteal);
+			    const WorkerThreadScope   as_worker;
+			    m_workers->PrepareClaimed(claimed, seq);
+		    },
+		    [this](uint32_t spins, uint64_t spin_start) {
+			    CpuRelax();
+			    // Workers never dereference guest memory, so they cannot page fault into a
+			    // request this thread must service. Only as a last-resort deadlock guard, after
+			    // 2 ms of spinning, pending cross-thread commands are serviced here; such a
+			    // command then observes the window partially committed, as if it had arrived
+			    // just before these draws were parsed.
+			    if ((spins & 1023u) == 1023u && m_service_commands &&
+			        NowNs() - spin_start > 2'000'000u) {
+				    m_service_commands();
+			    }
+		    },
+		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); });
+		// One call per held head; its time is only the idle spin (steals are DrawPrepSteal).
+		Profiler::AddFrameWait(Profiler::FrameWait::DrawPrepCommitWait, 1, stats.spin_ns);
+		if (stats.stolen != 0) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSteals, stats.stolen);
 		}
 	}
 	Commit(slot);
