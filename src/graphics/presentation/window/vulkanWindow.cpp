@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <unordered_map>
 #include <mutex>
@@ -881,10 +882,36 @@ static void RecordVulkanValidationMessage(const char*                           
 		return std::fopen(path != nullptr && path[0] != 0 ? path : "_kyty_vulkan_validation.log",
 		                  "a");
 	}();
+	// Key on the message id plus its first line with handles and numbers blanked, so the same id
+	// raised by different commands (e.g. two unrelated hazards) is reported separately.
+	std::string first_line(data->pMessage, std::strcspn(data->pMessage, "\r\n"));
+	std::string shape;
+	shape.reserve(first_line.size());
+	for (size_t i = 0; i < first_line.size(); i++) {
+		const char c = first_line[i];
+		if (c >= '0' && c <= '9') {
+			if (shape.empty() || shape.back() != '#') {
+				shape.push_back('#');
+			}
+			if (c == '0' && i + 1 < first_line.size() && (first_line[i + 1] == 'x')) {
+				i++;
+			}
+			while (i + 1 < first_line.size() &&
+			       std::isxdigit(static_cast<unsigned char>(first_line[i + 1])) != 0) {
+				i++;
+			}
+			continue;
+		}
+		shape.push_back(c);
+	}
 	const std::string id = std::string(severity) + " " +
-	                       (data->pMessageIdName != nullptr ? data->pMessageIdName : "?");
+	                       (data->pMessageIdName != nullptr ? data->pMessageIdName : "?") + " | " +
+	                       shape.substr(0, 160);
 	std::scoped_lock lock(mutex);
-	const auto       count = ++counts[id];
+	if (counts.size() >= 4096 && counts.find(id) == counts.end()) {
+		return;
+	}
+	const auto count = ++counts[id];
 	if (file == nullptr) {
 		return;
 	}
