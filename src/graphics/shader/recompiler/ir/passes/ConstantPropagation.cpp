@@ -415,6 +415,40 @@ void FoldInstruction(Block& block, Block::iterator instruction,
                       std::unordered_set<Inst*>& lowered_ancillary, ValueSetAnalysis* sets) {
 	auto& inst = *instruction;
 	switch (inst.GetOpcode()) {
+		case ValueOpcode::GetAttributeWithBary: {
+			// The J operand of a V_INTERP_P2: when it is the second component of a hardware I/J
+			// pair, the read gets that pair's interpolation; anything else (a computed J) keeps
+			// the shader-wide interpolation.
+			auto        mode = InterpolationMode::Unknown;
+			const auto* j    = Arg(inst, 2).TryInstruction();
+			if (j != nullptr && j->GetOpcode() == ValueOpcode::GetBuiltin &&
+			    j->Arg(1).Resolve() == Value(1u)) {
+				switch (static_cast<StageInputKind>(j->Arg(0).Resolve().U32())) {
+					case StageInputKind::BaryCoordSmooth: mode = InterpolationMode::PerspectiveCenter; break;
+					case StageInputKind::BaryCoordSmoothCentroid:
+						mode = InterpolationMode::PerspectiveCentroid;
+						break;
+					case StageInputKind::BaryCoordSmoothSample:
+						mode = InterpolationMode::PerspectiveSample;
+						break;
+					case StageInputKind::BaryCoordNoPerspective:
+						mode = InterpolationMode::LinearCenter;
+						break;
+					case StageInputKind::BaryCoordNoPerspectiveCentroid:
+						mode = InterpolationMode::LinearCentroid;
+						break;
+					case StageInputKind::BaryCoordNoPerspectiveSample:
+						mode = InterpolationMode::LinearSample;
+						break;
+					default: break;
+				}
+			}
+			auto read = block.PrependNewInst(instruction, ValueOpcode::GetAttribute,
+			                                 {Arg(inst, 0), Arg(inst, 1)});
+			read->SetFlags(static_cast<uint32_t>(mode));
+			Replace(inst, Value(&*read));
+			return;
+		}
 		case ValueOpcode::Phi: FoldPhi(inst); return;
 		case ValueOpcode::SelectU1:
 			if (!FoldSelect(inst) && IsImmediate(Arg(inst, 2), Type::U1) &&

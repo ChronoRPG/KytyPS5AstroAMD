@@ -44,6 +44,10 @@ struct CodegenOptions {
 	bool robust_buffer_loads = true;
 	// KYTY_MAD_MODE=exact|position|fused, see MadMode.
 	MadMode mad_mode = MadMode::Position;
+	// KYTY_INTERP_MODES=0: interpolate every pixel input at the pixel center with the shader-wide
+	// perspective (NoPerspective on all inputs when LINEAR_CENTER is enabled) instead of per input
+	// from the I/J pair its V_INTERP_P2 reads use (centroid, sample, linear).
+	bool interp_modes = true;
 };
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();

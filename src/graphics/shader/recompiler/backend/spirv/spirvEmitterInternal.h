@@ -132,6 +132,9 @@ struct EmitterState {
 	// Instructions whose values reach a position export (MadMode::Position), built on first use.
 	bool                                  position_slice_ready = false;
 	std::unordered_set<const IR::Inst*>   position_slice;
+	// Pixel inputs whose V_INTERP_P2 reads were all resolved to hardware I/J pairs of one
+	// perspective mode (KYTY_INTERP_MODES): variable -> sampling location its decoration selects.
+	std::unordered_map<uint32_t, IR::InterpolationMode> input_interpolation;
 };
 
 uint32_t TypeVoid(EmitterState& state);

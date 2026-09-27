@@ -304,6 +304,9 @@ VALUE_OPCODE(ImageAtomicSMax32, U32, ImageResource, ImageAddress, U32, U1)
 VALUE_OPCODE(ImageAtomicInc32, U32, ImageResource, ImageAddress, U32, U1)
 VALUE_OPCODE(ImageAtomicDec32, U32, ImageResource, ImageAddress, U32, U1)
 VALUE_OPCODE(GetAttribute, U32, U32, U32)
+// V_INTERP_P2_F32 before SSA: attribute, channel and the J operand. Constant propagation turns it
+// into GetAttribute with an InterpolationMode flag.
+VALUE_OPCODE(GetAttributeWithBary, U32, U32, U32, U32)
 VALUE_OPCODE(GetInterpolationParameter, U32, U32, U32, U32)
 VALUE_OPCODE(SetAttribute, Void, U32x4, U1)
 

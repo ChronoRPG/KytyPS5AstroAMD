@@ -387,6 +387,62 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 	}
 }
 
+bool IsLinearMode(IR::InterpolationMode mode) {
+	return mode == IR::InterpolationMode::LinearCenter ||
+	       mode == IR::InterpolationMode::LinearCentroid ||
+	       mode == IR::InterpolationMode::LinearSample;
+}
+
+bool IsCentroidMode(IR::InterpolationMode mode) {
+	return mode == IR::InterpolationMode::PerspectiveCentroid ||
+	       mode == IR::InterpolationMode::LinearCentroid;
+}
+
+bool IsSampleMode(IR::InterpolationMode mode) {
+	return mode == IR::InterpolationMode::PerspectiveSample ||
+	       mode == IR::InterpolationMode::LinearSample;
+}
+
+// KYTY_INTERP_MODES: the interpolation of a pixel input variable from the I/J pairs its
+// V_INTERP_P2 reads used (all aliases of the location together). Returns Unknown when the
+// shader-wide interpolation must stay: a read with a computed J, reads mixing perspective and
+// linear pairs, or sample reads mixed with other locations. Otherwise the result's perspective
+// is shared by all reads and its location is centroid or sample when every read used it, center
+// otherwise (centroid reads of a center-decorated input then use InterpolateAtCentroid).
+IR::InterpolationMode InputInterpolation(const EmitterState& state, uint32_t location) {
+	if (!GetCodegenOptions().interp_modes) {
+		return IR::InterpolationMode::Unknown;
+	}
+	bool any = false, linear = false, perspective = false;
+	bool center = false, centroid = false, sample = false;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != IR::ValueOpcode::GetAttribute ||
+			    PixelParameterLocation(state, inst.Arg(0).U32()) != location) {
+				continue;
+			}
+			const auto mode = static_cast<IR::InterpolationMode>(inst.Flags<uint32_t>());
+			if (mode == IR::InterpolationMode::Unknown) {
+				return IR::InterpolationMode::Unknown;
+			}
+			any = true;
+			(IsLinearMode(mode) ? linear : perspective) = true;
+			(IsCentroidMode(mode) ? centroid : IsSampleMode(mode) ? sample : center) = true;
+		}
+	}
+	if (!any || (linear && perspective) || (sample && (center || centroid))) {
+		return IR::InterpolationMode::Unknown;
+	}
+	if (sample) {
+		return linear ? IR::InterpolationMode::LinearSample : IR::InterpolationMode::PerspectiveSample;
+	}
+	if (centroid && !center) {
+		return linear ? IR::InterpolationMode::LinearCentroid
+		              : IR::InterpolationMode::PerspectiveCentroid;
+	}
+	return linear ? IR::InterpolationMode::LinearCenter : IR::InterpolationMode::PerspectiveCenter;
+}
+
 void DefineInputs(EmitterState& state) {
 	state.inputs.reserve(state.program.info.inputs.size());
 	for (const auto& input: state.program.info.inputs) {
@@ -470,8 +526,26 @@ void DefineInputs(EmitterState& state) {
 				state.builder.AddAnnotation(spv::OpDecorate, input.variable_id,
 				                            spv::DecorationFlat);
 			}
-			if (state.program.stage == ShaderType::Pixel &&
-			    state.input_info.pixel->ps_no_perspective && !flat && !input.per_vertex) {
+			const auto interpolation =
+			    state.program.stage == ShaderType::Pixel && !flat && !input.per_vertex
+			        ? InputInterpolation(state, PixelParameterLocation(state, input.location))
+			        : IR::InterpolationMode::Unknown;
+			if (interpolation != IR::InterpolationMode::Unknown) {
+				state.input_interpolation.emplace(input.variable_id, interpolation);
+				if (IsLinearMode(interpolation)) {
+					state.builder.AddAnnotation(spv::OpDecorate, input.variable_id,
+					                            spv::DecorationNoPerspective);
+				}
+				if (IsCentroidMode(interpolation)) {
+					state.builder.AddAnnotation(spv::OpDecorate, input.variable_id,
+					                            spv::DecorationCentroid);
+				} else if (IsSampleMode(interpolation)) {
+					state.builder.RequireCapability(spv::CapabilitySampleRateShading);
+					state.builder.AddAnnotation(spv::OpDecorate, input.variable_id,
+					                            spv::DecorationSample);
+				}
+			} else if (state.program.stage == ShaderType::Pixel &&
+			           state.input_info.pixel->ps_no_perspective && !flat && !input.per_vertex) {
 				state.builder.AddAnnotation(spv::OpDecorate, input.variable_id,
 				                            spv::DecorationNoPerspective);
 			}

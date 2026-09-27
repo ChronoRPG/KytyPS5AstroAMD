@@ -984,7 +984,91 @@ void CheckMadPositionSlice() {
   std::printf("[codegen] %-32s ok\n", name);
 }
 
+std::vector<u32> CompilePixelShader(const char *name, const std::vector<u32> &code,
+                                    const ShaderPixelInputInfo &pixel_info) {
+  auto pixel = pixel_info;
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Pixel;
+  options.input_info.pixel = &pixel;
+  options.user_data = MakeNativeUserData(nullptr);
+  auto translated = ShaderRecompiler::TranslateProgram(code, options);
+  auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = options.user_data,
+      .shader_base = reinterpret_cast<uint64_t>(code.data()),
+  };
+  Require(name, "resource materialization",
+          ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization),
+          "pixel resources could not be materialized");
+  auto result =
+      ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+  ValidateSpirv(name, result.spirv);
+  return result.spirv;
+}
+
+// V_INTERP_P2 reads through different hardware I/J pairs: a perspective-center input, a
+// linear-center input and an input read at the centroid and at the center. KYTY_INTERP_MODES
+// decorates per input; the legacy path made every input NoPerspective because LINEAR_CENTER is
+// enabled and ignored the centroid pair.
+void CheckInterpolationModes() {
+  constexpr const char *name = "CodegenInterpolationModes";
+  std::vector<u32> code;
+  code.push_back(EncodeVintrp(0, 10, 0, 0, 0)); // v_interp_p1_f32 v10, v0, attr0.x
+  code.push_back(EncodeVintrp(1, 10, 0, 0, 1)); // v_interp_p2_f32 v10, v1, attr0.x
+  code.push_back(EncodeVintrp(0, 11, 1, 0, 4)); // linear center pair v4/v5
+  code.push_back(EncodeVintrp(1, 11, 1, 0, 5));
+  code.push_back(EncodeVintrp(0, 12, 2, 0, 2)); // perspective centroid pair v2/v3
+  code.push_back(EncodeVintrp(1, 12, 2, 0, 3));
+  code.push_back(EncodeVintrp(0, 13, 2, 1, 0)); // attr2.y at the center
+  code.push_back(EncodeVintrp(1, 13, 2, 1, 1));
+  code.push_back(EncodeVintrp(0, 14, 3, 0, 2)); // attr3 only at the centroid
+  code.push_back(EncodeVintrp(1, 14, 3, 0, 3));
+  code.push_back(EncodeVop2(0x03, 13, Vgpr(13), 14)); // v_add_f32 v13, v13, v14
+  code.push_back(EncodeExp0(0, 0xf, true, false, true));
+  code.push_back(EncodeExp1(10, 11, 12, 13));
+  AppendEnd(&code);
+  ShaderPixelInputInfo pixel{};
+  pixel.input_num = 4;
+  for (u32 i = 0; i < std::size(pixel.interpolator_settings); i++) {
+    pixel.interpolator_settings[i] = i;
+  }
+  pixel.ps_perspective_center_vgpr = 0;
+  pixel.ps_perspective_centroid_vgpr = 2;
+  pixel.ps_linear_center_vgpr = 4;
+  pixel.ps_no_perspective = true;
+  pixel.ps_system_input_base = 6;
+  struct Counts {
+    size_t no_perspective, centroid, interpolate_at_centroid;
+  };
+  const auto compile = [&](bool modes) {
+    CodegenOptions options = GetCodegenOptions();
+    options.interp_modes = modes;
+    ScopedCodegenOptions scope(options);
+    const auto spirv = CompilePixelShader(name, code, pixel);
+    return Counts{CountSpirv(spirv, " NoPerspective"), CountSpirv(spirv, " Centroid\n"),
+                  CountSpirv(spirv, "InterpolateAtCentroid")};
+  };
+  const auto modes = compile(true);
+  const auto legacy = compile(false);
+  Require(name, "per-input interpolation",
+          modes.no_perspective == 1u && modes.centroid == 1u &&
+              modes.interpolate_at_centroid == 1u,
+          "modes: NoPerspective " + std::to_string(modes.no_perspective) + ", Centroid " +
+              std::to_string(modes.centroid) + ", InterpolateAtCentroid " +
+              std::to_string(modes.interpolate_at_centroid));
+  Require(name, "legacy interpolation",
+          legacy.no_perspective == 4u && legacy.centroid == 0u &&
+              legacy.interpolate_at_centroid == 0u,
+          "legacy: NoPerspective " + std::to_string(legacy.no_perspective) + ", Centroid " +
+              std::to_string(legacy.centroid) + ", InterpolateAtCentroid " +
+              std::to_string(legacy.interpolate_at_centroid));
+  std::printf("[codegen] %-32s ok\n", name);
+}
+
 void RunAll(VulkanHarness *vulkan) {
+  CheckInterpolationModes();
   CheckMadPositionSlice();
   CheckMadModes(vulkan);
   CheckLodStatsGate();
