@@ -1772,9 +1772,13 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	}
 
 	BdaSyncStats stats;
-	mapped_ranges.ForEach([this, collect, &stats](uint64_t start, uint64_t end) {
-		SynchronizeBuffersInRange(start, end - start, collect ? &stats : nullptr);
-	});
+	{
+		// Only uploads are recorded while scanning: all of them share one barrier pair.
+		const UploadBatch upload_batch(*this);
+		mapped_ranges.ForEach([this, collect, &stats](uint64_t start, uint64_t end) {
+			SynchronizeBuffersInRange(start, end - start, collect ? &stats : nullptr);
+		});
+	}
 	if (m_bda_incremental_sync) {
 		m_bda_scanned_cpu_epoch       = cpu_epoch;
 		m_bda_scanned_structure_epoch = structure_epoch;
