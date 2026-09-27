@@ -2535,12 +2535,24 @@ void BufferCache::RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value)
 	}
 	m_known_fills.push_back({vaddr, size, value});
 	m_has_known_fills.store(true, std::memory_order_release);
+	m_known_fill_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 std::optional<uint32_t> BufferCache::KnownFill(uint64_t vaddr, uint64_t size) const {
+	std::scoped_lock lock(m_known_fill_mutex);
+	return KnownFillLocked(vaddr, size);
+}
+
+std::optional<uint32_t> BufferCache::KnownFill(uint64_t vaddr, uint64_t size,
+                                               uint64_t& generation) const {
+	std::scoped_lock lock(m_known_fill_mutex);
+	generation = m_known_fill_generation.load(std::memory_order_relaxed);
+	return KnownFillLocked(vaddr, size);
+}
+
+std::optional<uint32_t> BufferCache::KnownFillLocked(uint64_t vaddr, uint64_t size) const {
 	// The range may be covered by several adjacent fills (e.g. per-slice consumption); all of
 	// them must carry the same value.
-	std::scoped_lock        lock(m_known_fill_mutex);
 	const uint64_t          end    = vaddr + size;
 	uint64_t                cursor = vaddr;
 	std::optional<uint32_t> value;
@@ -2595,6 +2607,10 @@ void BufferCache::ForgetKnownFillsLocked(uint64_t vaddr, uint64_t size) {
 	}
 	m_known_fills.swap(kept);
 	m_has_known_fills.store(!m_known_fills.empty(), std::memory_order_release);
+	m_known_fill_generation.fetch_add(1, std::memory_order_acq_rel);
+	if (!GuestGpu::IsGpuThread()) {
+		m_known_fill_foreign.fetch_add(1, std::memory_order_acq_rel);
+	}
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,

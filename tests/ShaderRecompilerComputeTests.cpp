@@ -559,6 +559,16 @@ struct RenderExecutorTestAccess {
     return executor.m_texture_memo.GetTotals();
   }
 
+  // KYTY_DRAW_SEQUENCE_FAST: a target lookup through `record`, as a target slot makes it.
+  static ImageId FindTargetImage(RenderExecutor &executor, TextureCache::ImageDesc &desc,
+                                 TextureCache::RepeatLookup &record) {
+    return executor.FindTargetImage(desc, false, &record);
+  }
+
+  static RenderExecutor::DrawSequenceTotals DrawSequenceTotals(const RenderExecutor &executor) {
+    return executor.m_draw_sequence_totals;
+  }
+
   static auto PrepareGraphicsBindings(RenderExecutor &executor,
                                       const ShaderStageRuntime &vertex,
                                       const ShaderStageRuntime &pixel,
@@ -11487,6 +11497,265 @@ public:
                                                                allocation_size) == 0,
             "CMASK allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // KYTY_DRAW_SEQUENCE_FAST. A target lookup of an unchanged slot repeats the last one only while
+  // what its decisions read is unchanged (here the CMASK decision a recorded fill made and the
+  // images over the CMASK bytes), and a stage with the same program and T# words repeats its
+  // texture bindings and views only while TryResolve and TryAcquireView would hit. With
+  // KYTY_DRAW_SEQUENCE_VERIFY=exit (ctest draw_sequence_verify) every repeat is also checked
+  // against the full path; with KYTY_DRAW_SEQUENCE_FAST=0 nothing repeats and the results are the
+  // same.
+  void CheckDrawSequence() {
+    constexpr const char *name = "DrawSequence";
+    constexpr uintptr_t base = 0x0000000207c00000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t cmask_address = base + 0x100000;
+    constexpr uint64_t texture_address = base + 0x200000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+    // (1.0, 2.0, -1.0, 0.5) as RGBA16F texel bits.
+    constexpr uint32_t clear_word0 = 0x40003c00u;
+    constexpr uint32_t clear_word1 = 0x3800bc00u;
+    const std::vector<u32> cleared_texel{clear_word0, clear_word1};
+    const std::vector<u32> painted{0x00003c00u, 0x3c003c00u};
+    const char *setting = std::getenv("KYTY_DRAW_SEQUENCE_FAST");
+    const bool fast = setting == nullptr || std::strcmp(setting, "0") != 0;
+    const uint64_t one = fast ? 1u : 0u;
+    EnsureRuntimeContext();
+    TileSizeAlign cmask_size{};
+    Require(name, "CMASK size",
+            TileGetCmaskSize(512, 256, 1, cmask_size) && cmask_size.size == 0x1000,
+            "unexpected CMASK footprint");
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "draw-sequence direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "draw-sequence direct mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    // Every CMASK tile expanded, in guest memory.
+    std::memset(reinterpret_cast<void *>(cmask_address), 0xff, cmask_size.size);
+
+    {
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.GetGpu().SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        registers.SetColorBase(0, {.addr = base});
+        registers.SetColorInfo(
+            0, {.cmask_fast_clear_enable = true,
+                .format = Prospero::ChannelLayout::k16_16_16_16,
+                .channel_type = Prospero::ChannelType::kFloat,
+                .channel_order = Prospero::ChannelOrder::kStandard});
+        registers.SetColorAttrib2(0, {.height = 255, .width = 511});
+        registers.SetColorAttrib3(0,
+                                  {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                   .dimension = 1,
+                                   .metadata_pipe_aligned = true});
+        registers.SetColorCmask(0, {.addr = cmask_address});
+        registers.SetColorClearWord0(0, {.word0 = clear_word0});
+        registers.SetColorClearWord1(0, {.word1 = clear_word1});
+        registers.SetRenderTargetMask(0x0f);
+        scheduler.Begin(registers, user_config, shaders);
+
+        auto &texture_cache = context.GetTextureCache();
+        auto &buffer_cache = context.GetBufferCache();
+        auto &executor = context.GetRenderExecutor();
+        context.MapMemory(base, allocation_size);
+        const auto totals = [&] { return RenderExecutorTestAccess::DrawSequenceTotals(executor); };
+
+        // Targets.
+        RenderColorInfo color{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color,
+                                                           0);
+        Require(name, "target", color.image_id && color.desc.cmask.valid,
+                "the CMASK target was not resolved");
+        TextureCache::RepeatLookup record{};
+        const auto lookup = [&] {
+          auto desc = color.desc;
+          return RenderExecutorTestAccess::FindTargetImage(executor, desc, record);
+        };
+        const auto paint = [&] {
+          vk::ClearValue clear{};
+          clear.color.float32 = std::array{1.0f, 0.0f, 1.0f, 1.0f};
+          TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), color.image_id,
+                                             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+                                             clear);
+        };
+        Require(name, "guest CMASK bytes",
+                lookup() == color.image_id && !record.valid,
+                "a decision that read CMASK bytes in guest memory was recorded as repeatable");
+
+        // GPU-owned CMASK bytes holding a recorded fill of 0xFFFFFFFF (every tile expanded).
+        (void)buffer_cache.ObtainBuffer(cmask_address, cmask_size.size, true);
+        buffer_cache.FillBuffer(cmask_address, cmask_size.size, UINT32_MAX, false);
+        Require(name, "recorded fill",
+                lookup() == color.image_id && record.valid == fast,
+                "a CMASK decision made from a recorded fill was not recorded as repeatable");
+        const auto t0 = totals();
+        Require(name, "repeat",
+                lookup() == color.image_id && totals().target_repeats == t0.target_repeats + one,
+                "an unchanged target lookup did not repeat");
+
+        // A fast clear recorded as a fill of 0 moves the fill generation: the full lookup clears.
+        paint();
+        buffer_cache.FillBuffer(cmask_address, cmask_size.size, 0, false);
+        const auto t1 = totals();
+        Require(name, "new fill",
+                lookup() == color.image_id && totals().target_repeats == t1.target_repeats &&
+                    totals().target_misses == t1.target_misses + one &&
+                    ReadCachedTexel(name, context, color.image_id) == cleared_texel,
+                "a lookup after a newly recorded fast clear repeated, or did not clear");
+        // The consumed clear left a recorded fill of 0xFFFFFFFF again.
+        (void)lookup();
+        paint();
+        const auto t2 = totals();
+        Require(name, "repeat after the clear",
+                lookup() == color.image_id && totals().target_repeats == t2.target_repeats + one &&
+                    ReadCachedTexel(name, context, color.image_id) == painted,
+                "a lookup after the consumed clear did not repeat, or changed the contents");
+
+        // An image over the CMASK bytes changes what the decision reads (the bytes alias it).
+        ImageDesc alias{};
+        alias.type = BindingType::Texture;
+        alias.info.data = {cmask_address, 16 * 16 * 4};
+        alias.info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+        alias.info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
+        alias.info.type = Prospero::ImageType::kColor2D;
+        alias.info.extent = {16, 16, 1};
+        alias.info.resources = {1, 1};
+        alias.info.pitch = 16;
+        alias.info.bytes_per_block = 4;
+        alias.info.samples = 1;
+        alias.info.tile_mode = Prospero::TileMode::kLinear;
+        alias.info.mip_layout[0] = {0, 16 * 16 * 4, 16, 16};
+        alias.view_info.format = vk::Format::eR8G8B8A8Unorm;
+        alias.view_info.type = vk::ImageViewType::e2D;
+        alias.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        alias.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        const auto alias_id = texture_cache.FindImage(alias);
+        const auto t3 = totals();
+        Require(name, "alias over the CMASK",
+                alias_id && lookup() == color.image_id &&
+                    totals().target_repeats == t3.target_repeats && record.valid == fast,
+                "a lookup after an image registered over the CMASK bytes repeated, or the "
+                "aliased decision was not recorded");
+        TextureCacheTestAccess::DeleteImage(texture_cache, alias_id);
+        (void)lookup();
+        const auto t4 = totals();
+        Require(name, "repeat after the alias left",
+                lookup() == color.image_id && totals().target_repeats == t4.target_repeats + one,
+                "a lookup after the alias was freed did not repeat");
+
+        // Textures: one stage binding the same texture twice.
+        ShaderTextureResource descriptor{{
+            static_cast<uint32_t>(texture_address >> 8u),
+            (static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8Srgb) << 20u) |
+                (((width - 1u) & 3u) << 30u),
+            ((width - 1u) >> 2u) | ((height - 1u) << 14u),
+            DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+            0, 0x00700000u, 0, 0}};
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(descriptor.fields, 8, value.dwords.begin());
+        ShaderRecompiler::IR::ImageResource resource{};
+        resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+        resource.numeric_class = Prospero::TextureNumericClass::Float;
+        resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+        resource.read = true;
+        ShaderRecompiler::IR::CompiledShaderInfo program{};
+        program.stage = ShaderType::Pixel;
+        program.info.images = {resource, resource};
+        ShaderRecompiler::IR::ResourceSnapshot snapshot{};
+        snapshot.images = {value, value};
+        const ShaderStageRuntime runtime{&program, &snapshot};
+        PreparedBindings prepared;
+        const auto bind_stage = [&] {
+          RenderExecutorTestAccess::ResetBindings(executor);
+          executor.PrepareBindings(runtime, prepared);
+          executor.RebindImages(prepared);
+        };
+        bind_stage();
+        const auto view = prepared.images[0].image_view;
+        const auto s0 = totals();
+        bind_stage();
+        Require(name, "stage repeat",
+                view != nullptr && prepared.images[0].image_view == view &&
+                    prepared.images[1].image_view == view &&
+                    prepared.images[1].image_id == prepared.images[0].image_id &&
+                    totals().texture_repeats == s0.texture_repeats + one &&
+                    totals().view_repeats == s0.view_repeats + one,
+                "an unchanged stage did not repeat its texture bindings and views");
+
+        // Other T# words for the second binding, a texture on the same 1 MiB page: resolved in
+        // full. Its new image changed the owners of the first texture's page after that binding
+        // was resolved, so the next resolution revalidates the first binding's entry
+        // (TryRepeatResolve never does): only the draw after it repeats. The views repeat as soon
+        // as both are recorded.
+        snapshot.images[1].dwords[0] = static_cast<uint32_t>((texture_address + 0x10000) >> 8u);
+        const auto s1 = totals();
+        bind_stage();
+        Require(name, "changed words",
+                totals().texture_repeats == s1.texture_repeats &&
+                    totals().view_repeats == s1.view_repeats &&
+                    prepared.images[1].image_id != prepared.images[0].image_id,
+                "a stage with other T# words repeated its bindings or views");
+        bind_stage();
+        Require(name, "page owners changed",
+                totals().texture_repeats == s1.texture_repeats &&
+                    totals().texture_misses == s1.texture_misses + one &&
+                    totals().view_repeats == s1.view_repeats + one,
+                "a stage repeated a binding whose page changed its owners since it was resolved");
+        bind_stage();
+        Require(name, "repeat of the changed words",
+                totals().texture_repeats == s1.texture_repeats + one &&
+                    totals().view_repeats == s1.view_repeats + 2 * one,
+                "the stage did not repeat once its new words were resolved and revalidated");
+
+        // A guest write to the first texture: its resolution still repeats (it does not depend on
+        // the contents), its view does not (FindTexture refreshes the image).
+        WriteMetadata(context, texture_address, width * height * 4, 0x40404040u);
+        const auto s2 = totals();
+        bind_stage();
+        Require(name, "guest write",
+                totals().texture_repeats == s2.texture_repeats + one &&
+                    totals().view_repeats == s2.view_repeats &&
+                    ReadCachedTexel(name, context, prepared.images[0].image_id) ==
+                        std::vector<u32>{0x40404040u},
+                "a stage with a CPU-written texture repeated its views, or kept stale contents");
+        Require(name, "verify", totals().verify_mismatches == 0,
+                "the verify mode found a repeat that differs from the full path");
+
+        RenderExecutorTestAccess::ResetBindings(executor);
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+      });
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "draw-sequence mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "draw-sequence allocation release failed");
+    std::printf("[gpu]     %-32s ok (%s)\n", name, fast ? "fast" : "off");
   }
 
   void CheckRenderExecutorDccFixedClearFloat() {
@@ -38709,6 +38978,11 @@ int main(int argc, char **argv) {
     vulkan.CheckTextureMemoRevalidation();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--draw-sequence-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDrawSequence();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--draw-prep-code-cert-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDrawPrepCertifiedShaderHash();
@@ -38917,6 +39191,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
   vulkan.CheckRenderExecutorDccFixedClearFloat();
   vulkan.CheckRenderExecutorCmaskFastClear();
+  vulkan.CheckDrawSequence();
   vulkan.CheckSampledDccClear();
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();

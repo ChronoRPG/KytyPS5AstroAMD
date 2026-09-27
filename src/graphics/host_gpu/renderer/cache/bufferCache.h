@@ -136,6 +136,19 @@ public:
 	// consumers learn a fill value (e.g. a DCC clear code) without reading GPU memory back.
 	void RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value);
 	[[nodiscard]] std::optional<uint32_t> KnownFill(uint64_t vaddr, uint64_t size) const;
+	// The same answer, with the generation of the recorded fills it was read from (under the same
+	// lock). The generation moves whenever a fill is recorded or any part of one is forgotten, so
+	// while it is unchanged KnownFill answers every range as it did (KYTY_DRAW_SEQUENCE_FAST).
+	[[nodiscard]] std::optional<uint32_t> KnownFill(uint64_t vaddr, uint64_t size,
+	                                                uint64_t& generation) const;
+	[[nodiscard]] uint64_t KnownFillGeneration() const noexcept {
+		return m_known_fill_generation.load(std::memory_order_acquire);
+	}
+	// Changes of the recorded fills made off the GPU thread (guest write faults). Verify modes
+	// tell a change racing the GPU thread from a wrong reuse by it.
+	[[nodiscard]] uint64_t ForeignKnownFillChanges() const noexcept {
+		return m_known_fill_foreign.load(std::memory_order_acquire);
+	}
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
@@ -454,10 +467,15 @@ private:
 	};
 	void                                              ForgetKnownFills(uint64_t vaddr, uint64_t size);
 	void                                              ForgetKnownFillsLocked(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] std::optional<uint32_t>             KnownFillLocked(uint64_t vaddr, uint64_t size) const;
 	mutable std::mutex                                m_known_fill_mutex;
 	std::vector<KnownFillRange>                       m_known_fills;
 	// m_known_fills is nonempty; written under m_known_fill_mutex, read without it.
 	std::atomic<bool>                                 m_has_known_fills {false};
+	// Advanced under m_known_fill_mutex by every change of m_known_fills (KnownFillGeneration), and
+	// by those made off the GPU thread (ForeignKnownFillChanges).
+	std::atomic<uint64_t>                             m_known_fill_generation {1};
+	std::atomic<uint64_t>                             m_known_fill_foreign {0};
 	const bool                                        m_bda_incremental_sync;
 	// KYTY_BDA_HOT_SYNC (default on; needs KYTY_BDA_INCREMENTAL_SYNC=1): with hot pages present,
 	// a BDA pass whose fault and structure epochs are unchanged re-synchronizes only the hot page

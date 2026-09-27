@@ -786,6 +786,23 @@ enum class FrameEvent : uint32_t {
 	// verify mode's mismatches.
 	ClampRangeMemoMisses,
 	ClampRangeMemoVerifyMismatches,
+	// KYTY_DRAW_SEQUENCE_FAST, targets (TextureCache::RepeatLookup): lookups answered by a proven
+	// repeat of the slot's last one, recorded lookups whose proofs no longer held, and lookups
+	// recorded as repeatable.
+	DrawSequenceTargetRepeats,
+	DrawSequenceTargetMisses,
+	DrawSequenceTargetRecords,
+	// KYTY_DRAW_SEQUENCE_FAST, textures: stages whose texture resolution repeated the last one
+	// (TextureBindingMemo::TryRepeatResolve), stages with the same program and T# words whose
+	// repeat was not proven, and stages whose views were all TryAcquireView hits (TryRepeatViews).
+	DrawSequenceTextureRepeats,
+	DrawSequenceTextureMisses,
+	DrawSequenceViewRepeats,
+	// KYTY_DRAW_SEQUENCE_VERIFY: reuses checked against the full path, disagreements, and
+	// disagreements a guest write racing the check explains.
+	DrawSequenceVerifyChecks,
+	DrawSequenceVerifyMismatches,
+	DrawSequenceVerifyRaces,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

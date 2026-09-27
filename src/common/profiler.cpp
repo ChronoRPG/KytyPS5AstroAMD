@@ -482,6 +482,15 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.GuestProtectRestrictsGpuMemory.Cumulative",
     "FrameEvent.ClampRangeMemoMisses.Cumulative",
     "FrameEvent.ClampRangeMemoVerifyMismatches.Cumulative",
+    "FrameEvent.DrawSequenceTargetRepeats.Cumulative",
+    "FrameEvent.DrawSequenceTargetMisses.Cumulative",
+    "FrameEvent.DrawSequenceTargetRecords.Cumulative",
+    "FrameEvent.DrawSequenceTextureRepeats.Cumulative",
+    "FrameEvent.DrawSequenceTextureMisses.Cumulative",
+    "FrameEvent.DrawSequenceViewRepeats.Cumulative",
+    "FrameEvent.DrawSequenceVerifyChecks.Cumulative",
+    "FrameEvent.DrawSequenceVerifyMismatches.Cumulative",
+    "FrameEvent.DrawSequenceVerifyRaces.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 

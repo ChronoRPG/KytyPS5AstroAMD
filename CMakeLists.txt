@@ -789,6 +789,18 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)
 	set_tests_properties(texture_memo_revalidate_off PROPERTIES
 		ENVIRONMENT "KYTY_TEXTURE_MEMO_REVALIDATE=0")
+	# KYTY_DRAW_SEQUENCE_FAST: default, off, and the verify mode over the whole compute/renderer
+	# suite (every repeated target lookup and stage texture set is checked against the full path).
+	add_test(NAME draw_sequence
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-sequence-only)
+	add_test(NAME draw_sequence_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-sequence-only)
+	set_tests_properties(draw_sequence_off PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_SEQUENCE_FAST=0")
+	add_test(NAME draw_sequence_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(draw_sequence_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_SEQUENCE_VERIFY=exit")
 	# Draw-prep end to end: serial vs command-processor draws, in each engine mode.
 	add_test(NAME draw_prep_engine
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
@@ -817,7 +829,7 @@ if(BUILD_TESTING)
 	add_test(NAME draw_prep_engine_parallel_inplace_verify
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_inplace_verify PROPERTIES
-		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE_VERIFY=exit;KYTY_DRAW_PREP_LOCKFREE_HINT_VERIFY=exit;KYTY_TRACKER_RELAXED_VERIFY=exit;KYTY_BINDING_EPOCH_MEMO_VERIFY=exit")
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE_VERIFY=exit;KYTY_DRAW_PREP_LOCKFREE_HINT_VERIFY=exit;KYTY_TRACKER_RELAXED_VERIFY=exit;KYTY_BINDING_EPOCH_MEMO_VERIFY=exit;KYTY_DRAW_SEQUENCE_VERIFY=exit")
 	add_test(NAME draw_prep_engine_parallel_copied
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_copied PROPERTIES

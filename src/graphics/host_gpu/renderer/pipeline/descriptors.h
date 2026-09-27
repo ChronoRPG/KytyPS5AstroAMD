@@ -58,6 +58,10 @@ struct PreparedBindings {
 	// verify canary instead of the counters (KYTY_LOD_STATS_PLAIN_VARIANT=verify, draw path).
 	bool                                  mip_stats_active = false;
 	bool                                  mip_stats_canary = false;
+	// KYTY_DRAW_SEQUENCE_FAST (textures): the program and T# words `images` were last resolved from
+	// by RenderExecutor::PrepareBindings (null program: none).
+	const ShaderRecompiler::IR::CompiledShaderInfo*      texture_program = nullptr;
+	std::vector<ShaderRecompiler::IR::DescriptorValue> texture_words;
 };
 
 [[nodiscard]] vk::DescriptorType

@@ -328,6 +328,95 @@ bool TextureBindingMemo::TryAcquireView(TextureCache& cache, TextureBinding& bin
 	return true;
 }
 
+bool TextureBindingMemo::TryRepeatResolve(TextureCache& cache, std::span<TextureBinding> bindings,
+                                          bool apply) {
+	m_last_revalidated = false;
+	if (!m_entries) {
+		return false;
+	}
+	std::scoped_lock lock {cache.m_lock};
+	for (const auto& binding: bindings) {
+		const auto& entry = m_entries[binding.memo_slot % Slots];
+		if (binding.memo_tag == 0 || entry.tag != binding.memo_tag || entry.image != binding.image_id) {
+			return false;
+		}
+		if (entry.null_image) {
+			continue;
+		}
+		// TryResolve's conditions for a hit that needs no revalidation.
+		const auto* image = cache.m_slot_images.try_get(entry.image);
+		if (image == nullptr || !image->registered || image->depth_id ||
+		    image->binding.needs_rebind || entry.requested_first < image->resident_first ||
+		    cache.PageVersion(entry.page) != entry.page_version ||
+		    (entry.has_partner && !image->alias_owner && !image->info.HasStencil())) {
+			return false;
+		}
+	}
+	if (!apply) {
+		return true;
+	}
+	const auto tick = cache.m_scheduler.CurrentTick();
+	for (const auto& binding: bindings) {
+		const auto& entry = m_entries[binding.memo_slot % Slots];
+		if (!entry.null_image) {
+			auto& image              = cache.m_slot_images[entry.image];
+			image.tick_accessed_last = tick;
+			cache.TouchImage(image);
+		}
+	}
+	// The hits TryResolve would count (each finds its binding's own entry: no description copy).
+	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingDescCopiesAvoided, bindings.size());
+	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoHits, bindings.size());
+	m_totals.hits += bindings.size();
+	return true;
+}
+
+bool TextureBindingMemo::TryRepeatViews(TextureCache& cache, std::span<TextureBinding> bindings,
+                                        bool apply) {
+	if (!m_entries) {
+		return false;
+	}
+	std::scoped_lock lock {cache.m_lock};
+	for (const auto& binding: bindings) {
+		const auto& entry = m_entries[binding.memo_slot % Slots];
+		if (binding.memo_tag == 0 || binding.desc.type != TextureCache::BindingType::Texture ||
+		    entry.tag != binding.memo_tag || entry.image != binding.image_id ||
+		    entry.view == nullptr) {
+			return false;
+		}
+		const auto* image = cache.m_slot_images.try_get(binding.image_id);
+		// RebindImages resolves a binding again when its image is gone, unregistered (null images
+		// never are) or awaits a rebind; then TryAcquireView's conditions.
+		if (image == nullptr || image->binding.needs_rebind) {
+			return false;
+		}
+		if (!image->info.data.Empty() &&
+		    (!image->registered || image->depth_id ||
+		     entry.requested_first < image->resident_first || image->info.HasStencil() ||
+		     !RefreshIsNoOp(*image))) {
+			return false;
+		}
+	}
+	if (!apply) {
+		return true;
+	}
+	for (auto& binding: bindings) {
+		const auto& entry = m_entries[binding.memo_slot % Slots];
+		cache.TouchImage(cache.m_slot_images[binding.image_id]);
+		binding.image_view = entry.view;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureViewMemoHits, bindings.size());
+	return true;
+}
+
+vk::ImageView TextureBindingMemo::EntryView(const TextureBinding& binding) const {
+	if (!m_entries || binding.memo_tag == 0) {
+		return nullptr;
+	}
+	const auto& entry = m_entries[binding.memo_slot % Slots];
+	return entry.tag == binding.memo_tag ? entry.view : nullptr;
+}
+
 void TextureBindingMemo::RecordView(const TextureBinding& binding, vk::ImageView view) {
 	if (!m_entries || binding.memo_tag == 0 || view == nullptr ||
 	    binding.desc.type != TextureCache::BindingType::Texture) {
