@@ -1391,10 +1391,24 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			// Window fences commit every pending draw before their handler runs.
 			if (auto* engine = DrawPrepEngine(); engine != nullptr) {
 				const auto header       = packet_header & ~1u;
-				const auto packet_class = DrawPrep::ClassifyPacket(header, packet + 1, remaining_dw);
-				engine->OnPacket(packet_class, packet_class == DrawPrep::PacketClass::Fence
-				                                   ? DrawPrep::ClassifyFence(header)
-				                                   : DrawPrep::FenceKind::Other);
+				auto       packet_class = DrawPrep::ClassifyPacket(header, packet + 1, remaining_dw);
+				auto       fence_kind   = DrawPrep::FenceKind::Other;
+				if (packet_class == DrawPrep::PacketClass::Fence) {
+					fence_kind = DrawPrep::ClassifyFence(header);
+					// Register loads from clean guest memory keep the window open (drawPrep.h).
+					DrawPrep::RegisterIndirectRange pairs;
+					if (fence_kind == DrawPrep::FenceKind::RegIndirect &&
+					    DrawPrep::RegisterIndirectWindowEnabled() &&
+					    DrawPrep::RegisterIndirectPairs(header, packet + 1, remaining_dw, pairs) &&
+					    (pairs.size == 0 ||
+					     LibKernel::Memory::IsGpuCleanForRead(pairs.address, pairs.size))) {
+						packet_class = DrawPrep::PacketClass::WindowSafe;
+						Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepRegIndirectKept);
+						DrawPrep::GetTotals().register_indirect_kept.fetch_add(
+						    1, std::memory_order_relaxed);
+					}
+				}
+				engine->OnPacket(packet_class, fence_kind);
 			}
 		}
 		const auto packet_dw =

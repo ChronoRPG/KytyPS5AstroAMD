@@ -52,9 +52,21 @@ enum class CertMode : uint8_t { Value, Log };
 [[nodiscard]] CertMode GetCertMode();
 // The command processor's per-packet hook (window fences and the S0 histogram) is needed.
 [[nodiscard]] bool PacketHookEnabled();
-// PacketHookEnabled(), or the passive S0/fence-kind histogram: aggregate diagnostics with a
-// connected profiler (KYTY_DRAW_PREP_FENCE_HISTOGRAM=0 disables the passive part). The hook
-// changes nothing in off mode; it only classifies packets and counts.
+// KYTY_DRAW_PREP_REG_INDIRECT_WINDOW (default on; =0 keeps them fences): a SET_*_REG_INDIRECT
+// packet whose register pairs are clean for a backing read leaves the preparation window open.
+// Its handler then only reads those clean bytes (no synchronization, nothing recorded) and
+// writes command-processor registers, which pending draws do not read (they use their register
+// snapshots). The bytes read are those the serial path reads unless a pending draw (earlier in
+// the stream, not yet recorded) writes the pairs with its shaders: a readback publication only
+// writes bytes that are GPU-dirty or being published now, and the pairs are neither. Without a
+// guest wait between that draw and the load (a wait, acquire or end-of-pipe packet, which is a
+// fence and commits the window first) the hardware command processor races the draw in the same
+// way: it fetches the pairs when it reaches the packet, not after earlier draws completed. Guest
+// CPU writes that race the load race it on the hardware as well.
+[[nodiscard]] bool RegisterIndirectWindowEnabled();
+// PacketHookEnabled(), or the passive S0/fence-kind histogram in off mode: aggregate diagnostics
+// with a connected profiler and KYTY_DRAW_PREP_FENCE_HISTOGRAM=1 (opt-in). The hook changes
+// nothing in off mode; it only classifies packets and counts.
 [[nodiscard]] bool PacketHookActive();
 
 // The register state a draw reads, copied when the draw packet is parsed.
@@ -79,6 +91,17 @@ enum class Failure : uint8_t {
 	CoherenceLog,
 	Mismatch,
 };
+
+// Process-wide totals of the engine's decisions, always counted (relaxed; written on the GPU
+// thread). The DrawPrep* frame events only count with a connected profiler; tests read these.
+struct Totals {
+	std::atomic<uint64_t> committed {0};              // Validate accepted a preparation
+	std::atomic<uint64_t> fallbacks {0};              // Validate rejected one (serial preparation)
+	std::atomic<uint64_t> drains {0};                 // Drain calls that found pending draws
+	std::atomic<uint64_t> register_indirect_kept {0}; // SET_*_REG_INDIRECT packets kept in a window
+	std::atomic<Failure>  last_failure {Failure::None};
+};
+[[nodiscard]] Totals& GetTotals();
 
 // One draw's speculative preparation and its certificate. Reused across draws (vectors keep
 // their capacity).

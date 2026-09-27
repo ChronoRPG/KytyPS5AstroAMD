@@ -20,6 +20,8 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
+#include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -90,6 +92,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <xxhash.h>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <cerrno>
@@ -9630,6 +9633,388 @@ public:
                 direct_offset, allocation_size) == 0,
             "indirect argument allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Draw-prep (KYTY_DRAW_PREP_CODE_CERT, shader.cpp): a speculative preparation hashes a shader
+  // without an AGC header hash through its recorder. The hash equals the serial one, the code
+  // bytes become part of the certificate, the certificate rejects any later change of a code
+  // byte, and code that is not clean for a backing read fails the preparation instead.
+  void CheckDrawPrepCertifiedShaderHash() {
+    constexpr const char *name = "DrawPrepCertifiedShaderHash";
+    constexpr uintptr_t base = 0x0000000206000000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t code_offset = 0x2100;
+    std::vector<u32> code;
+    for (u32 i = 0; i < 700; i++) {
+      // Any headerless words (the first is not the AGC header marker 0xbeeb03ff): the code is
+      // hashed, never translated here. 2.8 KiB crosses a 4 KiB page boundary.
+      code.push_back(0xbe800000u | (i & 0xffu));
+    }
+    AppendEnd(&code);
+    const auto code_address = base + code_offset;
+    const auto code_bytes = code.size() * sizeof(u32);
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "code allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "code mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    std::memcpy(memory + code_offset, code.data(), code_bytes);
+    ShaderMapUserData(code_address,
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<uint32_t>(code_bytes)});
+
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, allocation_size);
+      HW::ComputeShaderInfo regs{};
+      regs.cs_regs.data_addr = code_address;
+      regs.cs_regs.num_thread_x = 64;
+      regs.cs_regs.num_thread_y = 1;
+      regs.cs_regs.num_thread_z = 1;
+      const HW::ShaderRegisters sh{};
+      const auto expected = XXH3_64bits(code.data(), code_bytes);
+
+      ShaderComputeInputInfo serial_info{};
+      const auto serial = PrepareProgram(regs, sh, serial_info);
+      Require(name, "serial hash", serial.hash == expected,
+              "the serial path did not hash the code bytes");
+
+      const auto prepare = [&](DrawPrep::ReadSet &reads) {
+        DrawPrep::Recorder recorder{&reads, true};
+        ShaderComputeInputInfo info{};
+        const DrawPrep::RecordScope scope(recorder);
+        return PrepareProgram(regs, sh, info);
+      };
+      DrawPrep::ReadSet reads;
+      const auto speculative = prepare(reads);
+      Require(name, "certified hash",
+              !reads.Failed() && speculative.hash == expected && reads.Finish(),
+              "the speculative preparation failed or hashed other bytes");
+      bool covered = false;
+      for (const auto &range : reads.Ranges()) {
+        covered |= range.begin <= code_address && range.end >= code_address + code_bytes;
+      }
+      Require(name, "certificate covers the code", covered,
+              "no certified range covers every code byte");
+      std::vector<uint8_t> scratch;
+      Require(name, "unchanged certificate",
+              reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
+                  DrawPrep::ValidateResult::Ok,
+              "the certificate rejected unchanged code");
+
+      // One changed code byte, in the second page of the code.
+      auto &changed = memory[code_offset + code_bytes - 8];
+      changed ^= 0x40u;
+      Require(name, "changed certificate",
+              reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
+                  DrawPrep::ValidateResult::Changed,
+              "the certificate accepted changed code");
+      changed ^= 0x40u;
+      Require(name, "restored certificate",
+              reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
+                  DrawPrep::ValidateResult::Ok,
+              "the certificate rejected code restored to the recorded bytes");
+
+      // GPU-owned code bytes are not clean for a backing read: the preparation fails (the
+      // serial path would read them back) and the old certificate no longer validates.
+      auto &cache = context.GetBufferCache();
+      BufferCacheTestAccess::AddGpuDirty(cache, code_address + 0x40, 4);
+      // As every product transition of GPU-dirty ranges does (cleanVerdictCache.h).
+      CleanVerdict::Invalidate(code_address + 0x40, 4, Coherence::Source::Test);
+      DrawPrep::ReadSet unclean;
+      (void)prepare(unclean);
+      Require(name, "unclean code",
+              unclean.Failure() == DrawPrep::ReadFailure::Unclean &&
+                  reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
+                      DrawPrep::ValidateResult::Unclean,
+              "GPU-owned code bytes were certified");
+      BufferCacheTestAccess::SubtractGpuDirty(cache, code_address + 0x40, 4);
+      CleanVerdict::Invalidate(code_address + 0x40, 4, Coherence::Source::Test);
+      context.UnmapMemory(base, allocation_size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "code mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "code allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Draw-prep end to end: the same two native draws recorded serially (RenderExecutor directly)
+  // and as a PM4 stream through the command processor, whose DrawPrep engine
+  // (KYTY_DRAW_PREP=inline|parallel) prepares each draw from its register snapshot and commits
+  // it. Between the draws a SET_SH_REG_INDIRECT packet loads the second pixel shader's address
+  // from clean guest memory: it must leave the window open (parallel: one drain for both draws)
+  // while the first draw keeps its own snapshot. Additive blending shows which pixel shader each
+  // draw ran. The shaders are headerless, so a commit also depends on the certified code hash.
+  // KYTY_DRAW_PREP=off checks the pixels only.
+  void CheckDrawPrepEngineDraw() {
+    constexpr const char *name = "DrawPrepEngineDraw";
+    constexpr uintptr_t base = 0x0000000206200000ull;
+    constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t vertex_offset = 0x1000;
+    constexpr std::array<uint64_t, 2> pixel_offsets{0x2000, 0x3000};
+    constexpr uint64_t user_data_offset = 0x4000;
+    constexpr uint64_t pairs_offset = 0x5000;
+    constexpr uint64_t target_offset = 0x20000;
+    constexpr uint32_t extent = 32;
+    // (0.25, 0, 0, 0.5) and (0, 0.5, 0, 0.5), blended with ONE/ONE over a zero clear.
+    constexpr std::array<std::array<u32, 4>, 2> colors{{
+        {0x3e800000u, 0u, 0u, 0x3f000000u},
+        {0u, 0x3f000000u, 0u, 0x3f000000u},
+    }};
+    constexpr std::array<u32, 4> expected{0x3e800000u, 0x3f000000u, 0u, 0x3f800000u};
+
+    // A fullscreen triangle from the vertex index (as in CheckRasterization).
+    std::vector<u32> vertex_code;
+    AppendVMovLiteral(&vertex_code, 1, 0xbf800000u);
+    AppendVMovLiteral(&vertex_code, 2, 0x40400000u);
+    vertex_code.push_back(EncodeVopc(0xc2, InlineU32(1), 5));
+    vertex_code.push_back(EncodeVop2(0x01, 3, Vgpr(1), 2));
+    vertex_code.push_back(EncodeVopc(0xc2, InlineU32(2), 5));
+    vertex_code.push_back(EncodeVop2(0x01, 4, Vgpr(1), 2));
+    AppendVMovU32(&vertex_code, 0, 0);
+    AppendVMovLiteral(&vertex_code, 6, 0x3f800000u);
+    vertex_code.push_back(EncodeExp0(0x0c, 0xf));
+    vertex_code.push_back(EncodeExp1(3, 4, 0, 6));
+    for (u32 parameter = 0; parameter < 8; parameter++) {
+      vertex_code.push_back(EncodeExp0(0x20 + parameter, 0xf));
+      vertex_code.push_back(EncodeExp1(0, 0, 0, 0));
+    }
+    AppendEnd(&vertex_code);
+    std::array<std::vector<u32>, 2> pixel_codes;
+    for (size_t i = 0; i < pixel_codes.size(); i++) {
+      for (u32 component = 0; component < 4; component++) {
+        AppendVMovU32(&pixel_codes[i], component, colors[i][component]);
+      }
+      pixel_codes[i].push_back(EncodeExp0(0x00, 0xf));
+      pixel_codes[i].push_back(EncodeExp1(0, 1, 2, 3));
+      AppendEnd(&pixel_codes[i]);
+    }
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "draw allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "draw mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    std::memset(memory, 0, allocation_size);
+    const auto vertex_address = base + vertex_offset;
+    const std::array<uint64_t, 2> pixel_addresses{base + pixel_offsets[0],
+                                                  base + pixel_offsets[1]};
+    const auto pairs_address = base + pairs_offset;
+    // Zeroed AGC user data in guest memory: the preparation reads and certifies it.
+    auto *user_data = reinterpret_cast<ShaderUserData *>(memory + user_data_offset);
+    std::memcpy(memory + vertex_offset, vertex_code.data(), vertex_code.size() * sizeof(u32));
+    ShaderMapUserData(vertex_address,
+                      {.type = Prospero::ShaderBinaryType::kGs,
+                       .user_data = user_data,
+                       .code_size_bytes = static_cast<uint32_t>(vertex_code.size() * sizeof(u32))});
+    for (size_t i = 0; i < pixel_codes.size(); i++) {
+      std::memcpy(memory + pixel_offsets[i], pixel_codes[i].data(),
+                  pixel_codes[i].size() * sizeof(u32));
+      ShaderMapUserData(pixel_addresses[i],
+                        {.type = Prospero::ShaderBinaryType::kPs,
+                         .user_data = user_data,
+                         .code_size_bytes =
+                             static_cast<uint32_t>(pixel_codes[i].size() * sizeof(u32))});
+    }
+    const std::array<u32, 4> pairs{
+        Pm4::SPI_SHADER_PGM_LO_PS, static_cast<u32>(pixel_addresses[1] >> 8u),
+        Pm4::SPI_SHADER_PGM_HI_PS, static_cast<u32>(pixel_addresses[1] >> 40u)};
+    std::memcpy(memory + pairs_offset, pairs.data(), sizeof(pairs));
+    const std::array<u32, 5> load_pixel_shader{
+        KYTY_PM4(5, Pm4::IT_SET_SH_REG_INDIRECT, Pm4::R_ZERO),
+        static_cast<u32>(pairs_address), static_cast<u32>(pairs_address >> 32u), 0x80000000u,
+        static_cast<u32>(pairs.size() / 2u)};
+    // DRAW_INDEX_AUTO, 3 vertices, auto-index source.
+    const std::array<u32, 3> draw{0xc0012d00u, 3u, 0x2u};
+
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      GraphicsInitJmpTables();
+      CommandProcessor processor(context, 0);
+      processor.Reset();
+      processor.BufferInit();
+      context.MapMemory(base, allocation_size);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &executor = context.GetRenderExecutor();
+      auto &texture_cache = context.GetTextureCache();
+      auto &registers = processor.GetCtx();
+      auto &shaders = processor.GetShCtx();
+      registers.SetViewportTransformControl(0x300);
+      registers.SetViewportScaleOffset(0, extent / 2, extent / 2, extent / 2, extent / 2, 1, 0);
+      registers.SetViewportZMax(0, 1);
+      registers.SetScreenScissor(0, 0, extent, extent);
+      registers.SetWindowScissor(0, 0, extent, extent, false);
+      registers.SetGenericScissor(0, 0, extent, extent, false);
+      registers.SetViewportScissor(0, 0, 0, extent, extent, false);
+      registers.SetRenderTargetMask(0xf);
+      registers.SetShaderMask(0xf);
+      registers.SetPsInControl(0x8000);
+      registers.SetColorBase(0, {.addr = base + target_offset});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32_32_32_32,
+                                 .channel_type = Prospero::ChannelType::kFloat,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = extent - 1, .width = extent - 1});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+      registers.SetTargetOutputMode(0, 4);
+      auto blend = registers.GetBlendControl(0);
+      blend.enable = true;
+      blend.color_srcblend = blend.color_destblend = blend.alpha_srcblend =
+          blend.alpha_destblend = static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+      registers.SetBlendControl(0, blend);
+      auto target_info = registers.GetRenderTarget(0).info;
+      target_info.blend_bypass = false;
+      registers.SetColorInfo(0, target_info);
+      processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      shaders.SetEsShaderBase(vertex_address);
+
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color, 0);
+      Require(name, "color target", static_cast<bool>(color.image_id),
+              "the 32x32 RGBA32F target was not created");
+      const auto clear = [&] {
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), color.image_id,
+                                           {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+      };
+      const auto read = [&] {
+        RenderColorInfo current{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                           current, 0);
+        Require(name, "stable color target", current.image_id == color.image_id,
+                "the draws moved the target to another image");
+        return ReadCachedTexel(name, context, color.image_id, {}, {extent, extent, 1});
+      };
+      const auto check = [&](const char *stage, const std::vector<u32> &pixels) {
+        bool ok = pixels.size() == size_t{extent} * extent * 4u;
+        size_t bad = 0;
+        for (size_t i = 0; ok && i < pixels.size(); i++) {
+          ok = pixels[i] == expected[i % 4];
+          bad = i;
+        }
+        Require(name, stage, ok,
+                "each draw must blend its own pixel shader's constant: component " +
+                    std::to_string(bad) + " is " +
+                    (pixels.empty() ? std::string("missing") : Hex(pixels[bad])) +
+                    ", expected " + Hex(expected[bad % 4]));
+      };
+
+      // Serial reference: RenderExecutor directly, the register load through the processor.
+      clear();
+      shaders.SetPsShaderBase(pixel_addresses[0]);
+      RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                         {.vertex_count = 3, .instance_count = 1});
+      {
+        Pm4Execution execution;
+        Require(name, "serial register load",
+                processor.Process(execution, load_pixel_shader) == Pm4ProcessResult::Complete &&
+                    shaders.GetPs().ps_regs.data_addr == pixel_addresses[1],
+                "SET_SH_REG_INDIRECT did not load the second pixel shader");
+      }
+      RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                         {.vertex_count = 3, .instance_count = 1});
+      const auto serial = read();
+      check("serial draws", serial);
+
+      // The same draws as a command stream (the programs are published now).
+      clear();
+      shaders.SetPsShaderBase(pixel_addresses[0]);
+      auto &totals = DrawPrep::GetTotals();
+      const auto committed = totals.committed.load();
+      const auto fallbacks = totals.fallbacks.load();
+      const auto drains = totals.drains.load();
+      const auto kept = totals.register_indirect_kept.load();
+      std::vector<u32> stream(draw.begin(), draw.end());
+      stream.insert(stream.end(), load_pixel_shader.begin(), load_pixel_shader.end());
+      stream.insert(stream.end(), draw.begin(), draw.end());
+      {
+        Pm4Execution execution;
+        Require(name, "command stream",
+                processor.Process(execution, stream) == Pm4ProcessResult::Complete,
+                "the draw stream did not complete");
+      }
+      const auto processed = read();
+      check("draws through the command processor", processed);
+      Require(name, "serial and command-processor pixels", processed == serial,
+              "the command processor's draws differ from the serial draws");
+
+      const auto mode = DrawPrep::GetMode();
+      if (mode != DrawPrep::Mode::Off) {
+        const auto *code_cert = std::getenv("KYTY_DRAW_PREP_CODE_CERT");
+        const uint64_t commits =
+            code_cert == nullptr || std::strcmp(code_cert, "0") != 0 ? 2u : 0u;
+        const bool window = DrawPrep::RegisterIndirectWindowEnabled();
+        const uint64_t window_drains =
+            mode == DrawPrep::Mode::Parallel ? (window ? 1u : 2u) : 0u;
+        Require(name, "committed preparations",
+                totals.committed.load() - committed == commits &&
+                    totals.fallbacks.load() - fallbacks == 2u - commits,
+                "committed " + std::to_string(totals.committed.load() - committed) +
+                    ", fell back " + std::to_string(totals.fallbacks.load() - fallbacks) +
+                    " (last failure " +
+                    std::to_string(static_cast<int>(totals.last_failure.load())) +
+                    "); expected " + std::to_string(commits) + " commits");
+        Require(name, "register load window",
+                totals.register_indirect_kept.load() - kept == (window ? 1u : 0u) &&
+                    totals.drains.load() - drains == window_drains,
+                "kept " + std::to_string(totals.register_indirect_kept.load() - kept) +
+                    ", drains " + std::to_string(totals.drains.load() - drains) +
+                    "; expected " + std::to_string(window ? 1 : 0) + " and " +
+                    std::to_string(window_drains));
+      }
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "draw mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "draw allocation release failed");
+    const char *mode_name = DrawPrep::GetMode() == DrawPrep::Mode::Parallel ? "parallel"
+                            : DrawPrep::GetMode() == DrawPrep::Mode::Inline ? "inline"
+                                                                            : "off";
+    std::printf("[gpu]     %-32s ok (draw-prep %s)\n", name, mode_name);
   }
 
   void CheckRenderExecutorDccFixedClearFloat() {
@@ -36225,6 +36610,16 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--draw-prep-code-cert-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDrawPrepCertifiedShaderHash();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--draw-prep-engine-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDrawPrepEngineDraw();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
@@ -36404,7 +36799,9 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckTilerImageDirect();
   vulkan.CheckNativeIndirectDispatch();
+  vulkan.CheckDrawPrepCertifiedShaderHash();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  vulkan.CheckDrawPrepEngineDraw();
   vulkan.CheckRenderExecutorColorDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
   vulkan.CheckRenderExecutorDccFixedClearFloat();

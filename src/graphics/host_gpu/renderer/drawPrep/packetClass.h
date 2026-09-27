@@ -92,6 +92,28 @@ enum class FenceKind : uint8_t {
 	Count,
 };
 
+// SET_SH/CONTEXT/UCONFIG_REG_INDIRECT: the guest range of the (offset, value) register pairs the
+// command processor loads (pm4Handlers.cpp CpOpIndirect*Regs; size 0 when there are none). False
+// for any other packet or a truncated one.
+struct RegisterIndirectRange {
+	uint64_t address = 0;
+	uint64_t size    = 0;
+};
+
+[[nodiscard]] inline bool RegisterIndirectPairs(uint32_t header, const uint32_t* body,
+                                                uint32_t remaining_dw, RegisterIndirectRange& range) {
+	const auto opcode = (header >> 8u) & 0xffu;
+	if ((opcode != Pm4::IT_SET_SH_REG_INDIRECT && opcode != Pm4::IT_SET_UCONFIG_REG_INDIRECT &&
+	     opcode != Pm4::IT_SET_CONTEXT_REG_INDIRECT) ||
+	    KYTY_PM4_LEN(header) != 5u || remaining_dw < 5u) {
+		return false;
+	}
+	range.address = (static_cast<uint64_t>(body[0]) & 0xfffffffcu) |
+	                (static_cast<uint64_t>(body[1]) << 32u);
+	range.size    = static_cast<uint64_t>(body[3] & 0x3fffu) * 2u * sizeof(uint32_t);
+	return true;
+}
+
 [[nodiscard]] inline FenceKind ClassifyFence(uint32_t header) {
 	const auto opcode = (header >> 8u) & 0xffu;
 	switch (opcode) {

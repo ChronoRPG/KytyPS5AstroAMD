@@ -105,7 +105,13 @@ bool SameMapping(std::span<const Prospero::ColorComponentMapping, 8> a,
 	return true;
 }
 
+Totals g_totals;
+
 } // namespace
+
+Totals& GetTotals() {
+	return g_totals;
+}
 
 Mode GetMode() {
 	static const Mode mode = [] {
@@ -161,13 +167,23 @@ bool PacketHookEnabled() {
 	return enabled;
 }
 
+bool RegisterIndirectWindowEnabled() {
+	static const bool enabled = [] {
+		const auto* value = EnvValue("KYTY_DRAW_PREP_REG_INDIRECT_WINDOW");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 bool PacketHookActive() {
 	if (PacketHookEnabled()) {
 		return true;
 	}
+	// Opt-in: classifying every packet costs the command processor about 20-50 ns per packet,
+	// which would skew aggregate comparisons. Inline and parallel modes count fence kinds anyway.
 	static const bool passive = [] {
 		const auto* value = EnvValue("KYTY_DRAW_PREP_FENCE_HISTOGRAM");
-		return Profiler::AggregateEnabled() && (value == nullptr || std::strcmp(value, "0") != 0);
+		return Profiler::AggregateEnabled() && value != nullptr && std::strcmp(value, "0") != 0;
 	}();
 	return passive && tracy::ProfilerAvailable() && TracyIsConnected;
 }
@@ -236,6 +252,8 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 	const auto fail = [&](Failure failure) {
 		prepared.failure = failure;
 		Profiler::CountFrameEvent(FallbackEvent(failure));
+		g_totals.fallbacks.fetch_add(1, std::memory_order_relaxed);
+		g_totals.last_failure.store(failure, std::memory_order_relaxed);
 		return false;
 	};
 	if (!prepared.ok) {
@@ -281,6 +299,7 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 		}
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitted);
+	g_totals.committed.fetch_add(1, std::memory_order_relaxed);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCertRanges, ranges.size());
 	uint64_t bytes = 0;
 	for (const auto& range: ranges) {
@@ -607,6 +626,7 @@ void Engine::Drain() {
 		return;
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepDrains);
+	g_totals.drains.fetch_add(1, std::memory_order_relaxed);
 	while (Pending()) {
 		CommitHead();
 	}

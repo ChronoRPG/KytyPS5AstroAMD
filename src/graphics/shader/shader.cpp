@@ -300,12 +300,42 @@ static bool ShaderHashBackingEnabled() {
 	return enabled;
 }
 
-static uint64_t HashShaderCode(std::span<const uint32_t> code) {
-	if (DrawPrep::Speculative()) {
-		// Never reached while preparing (GetShaderParams fails the preparation first): a draw-prep
-		// preparation must not read code outside its certificate, nor fall back to the mapping.
+// KYTY_DRAW_PREP_CODE_CERT=0 restores failing every draw-prep preparation of a shader without an
+// AGC header hash (Uncertified): the preparation then never reads or hashes the code.
+static bool DrawPrepCodeCertEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DRAW_PREP_CODE_CERT");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// Draw-prep: the hash of shader code without an AGC header hash (every Astro Bot shader), taken
+// over bytes read through the preparation's recorder, so they become part of its certificate
+// (readSet.h). At commit every certified range must be clean for a backing read and hold exactly
+// the recorded bytes; the serial path would then read those same bytes (HashShaderCode takes its
+// clean-backing branch, and a clean range's mapping holds the backing bytes) and compute the same
+// hash. A read that cannot be served fails the preparation (the serial path runs at commit).
+static uint64_t HashShaderCodeCertified(std::span<const uint32_t> code) {
+	if (!DrawPrepCodeCertEnabled()) {
 		DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
 		return 0;
+	}
+	static thread_local std::vector<uint32_t> scratch;
+	scratch.resize(code.size());
+	if (!LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(code.data()),
+	                                              scratch.data(), code.size_bytes())) {
+		return 0; // the recorder has failed the preparation
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderCodeHashCertified);
+	return XXH3_64bits(scratch.data(), code.size_bytes());
+}
+
+static uint64_t HashShaderCode(std::span<const uint32_t> code) {
+	if (DrawPrep::Speculative()) {
+		// A draw-prep preparation must not read code outside its certificate, nor fall back to
+		// the mapping: it hashes through its recorder instead.
+		return HashShaderCodeCertified(code);
 	}
 	if (ShaderHashBackingEnabled()) {
 		static thread_local std::vector<uint32_t> scratch;
@@ -333,17 +363,12 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uin
 	}
 	const auto code_words = data.code_size_bytes / sizeof(uint32_t);
 	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
-	if (declared_hash == 0 && DrawPrep::Speculative()) {
-		// Hashing the whole code would read it outside the certificate (and HashShaderCode may
-		// fall back to reading the guest mapping): the serial path hashes it at commit.
-		DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
-	}
+	// A draw-prep preparation hashes headerless code through its recorder (the code becomes part
+	// of its certificate; KYTY_DRAW_PREP_CODE_CERT=0 fails it instead).
 	ShaderParams params {
 	    .code            = code,
 	    .user_data_count = static_cast<uint32_t>(user_data.size()) + user_data_base,
-	    .hash            = declared_hash != 0        ? declared_hash
-	                       : DrawPrep::Speculative() ? 0
-	                                                 : HashShaderCode(code),
+	    .hash            = declared_hash != 0 ? declared_hash : HashShaderCode(code),
 	};
 	EXIT_IF(user_data.size() > HW::UserSgprInfo::SGPRS_MAX ||
 	        params.user_data_count > params.user_data.size());

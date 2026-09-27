@@ -567,8 +567,8 @@ enum class FrameEvent : uint32_t {
 	BdaSyncHotVerifyChecks,
 	BdaSyncHotVerifyMismatches,
 	// Draw-prep window fences by packet kind (DrawPrep::FenceKind, packetClass.h), counted with the
-	// S0 histogram above; also passively in off mode while aggregates are collected
-	// (KYTY_DRAW_PREP_FENCE_HISTOGRAM=0 disables that).
+	// S0 histogram above in inline and parallel modes; in off mode only with aggregates and
+	// KYTY_DRAW_PREP_FENCE_HISTOGRAM=1.
 	DrawPrepFenceRegIndirect,
 	DrawPrepFenceEventWrite,
 	DrawPrepFenceEndOfPipe,
@@ -621,6 +621,12 @@ enum class FrameEvent : uint32_t {
 	DepthFeedbackKeepMissInstance,
 	DepthFeedbackKeepMissSerial,
 	DepthFeedbackKeepMissState,
+	// Draw-prep preparations that hashed headerless shader code through their recorder, making
+	// the code part of the certificate (KYTY_DRAW_PREP_CODE_CERT, shader.cpp).
+	ShaderCodeHashCertified,
+	// SET_*_REG_INDIRECT packets that kept the draw-prep window open because their register pairs
+	// were clean (KYTY_DRAW_PREP_REG_INDIRECT_WINDOW); the others count as DrawPrepFenceRegIndirect.
+	DrawPrepRegIndirectKept,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
