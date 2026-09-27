@@ -93,6 +93,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 #include <xxhash.h>
 
@@ -5084,11 +5085,23 @@ public:
       Require(name, "no request for guest pages",
               !cache.TakeEagerFlushRequest(false),
               "a writer of a guest-read page requested an early submission");
+      // The completion runner publishes an eager copy as soon as its submission completes, which
+      // can be before the check below. Hold it meanwhile: priority operations run in the order
+      // they were queued, so one queued now runs before the copies' publications.
+      std::atomic<bool> runner_released{false};
+      OnGpuThread(context, [&] {
+        scheduler.DeferPriorityOperation([&runner_released] {
+          while (!runner_released.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+          }
+        });
+      });
       submit();
       submit();
-      Require(name, "cp eager issue",
-              cache.HasPendingBackingPublication(base + cp_offset, 4) &&
-                  cache.HasPendingBackingPublication(base + guest_offset, 4),
+      const bool both_pending = cache.HasPendingBackingPublication(base + cp_offset, 4) &&
+                                cache.HasPendingBackingPublication(base + guest_offset, 4);
+      runner_released.store(true, std::memory_order_release);
+      Require(name, "cp eager issue", both_pending,
               "eager copies of both pages were not issued");
       // Recorded after the copies were issued; a CP read must not wait for it.
       gpu_write(0x20000, 0x99999999u);
