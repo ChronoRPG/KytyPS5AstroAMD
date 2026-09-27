@@ -216,6 +216,7 @@ private:
 	[[nodiscard]] bool TrySubmitPreparedDraw(const DrawIndexArgs* index_args,
 	                                         const DrawAutoArgs*  auto_args);
 	void               DrainPreparedDraws();
+	void               NoteRepeatTraceDrawPacket();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 

@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -410,9 +411,23 @@ struct Engine::Slot {
 	PreparedDraw     prepared;
 	bool             eligible        = false; // DrawReachesPrograms, decided at submission
 	bool             worker_prepared = false;
+	// KYTY_CP_REPEAT_TRACE (repeatTrace.h): the draw's input hashes, filled by the preparing thread,
+	// and the guest address of its draw packet.
+	RepeatTrace::DrawRecord repeat;
+	uint64_t                repeat_packet = 0;
 };
 
 namespace {
+
+// After Prepare, on the preparing thread: the repeat trace's hashes of this draw's inputs.
+void HashForRepeatTrace(Engine::Slot& slot) {
+	if (!RepeatTrace::Enabled()) [[likely]] {
+		return;
+	}
+	RepeatTrace::HashDraw(slot.registers, slot.kind == DrawKind::Index ? &slot.index_args : nullptr,
+	                      slot.kind == DrawKind::Auto ? &slot.auto_args : nullptr, slot.eligible,
+	                      slot.prepared, slot.repeat);
+}
 
 uint32_t EnvUnsigned(const char* name, uint32_t fallback, uint32_t low, uint32_t high) {
 	const auto* value = EnvValue(name);
@@ -482,6 +497,7 @@ struct Engine::Workers {
 			uint64_t seq  = 0;
 			if (auto* slot = window.TryClaim(seq); slot != nullptr) {
 				Prepare(pipeline_cache, slot->registers, slot->eligible, false, slot->prepared);
+				HashForRepeatTrace(*slot);
 				slot->worker_prepared = true;
 				window.Complete(seq);
 				idle_start = NowNs();
@@ -515,6 +531,9 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
                std::function<void()> after_commit)
     : m_renderer(renderer), m_mode(GetMode()), m_service_commands(std::move(service_commands)),
       m_after_commit(std::move(after_commit)), m_inline_slot(std::make_unique<Slot>()) {
+	if (RepeatTrace::Enabled()) {
+		RepeatTrace::SetRenderContext(&m_renderer);
+	}
 	if (m_mode == Mode::Parallel) {
 		const auto window  = EnvUnsigned("KYTY_DRAW_PREP_WINDOW", 32, 2, 1024);
 		const auto workers = EnvUnsigned("KYTY_DRAW_PREP_WORKERS", 6, 1, 32);
@@ -558,6 +577,7 @@ void Engine::FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index
 	slot.registers.shaders     = shaders;
 	slot.eligible        = DrawReachesPrograms(context, user_config, shaders, count, instances);
 	slot.worker_prepared = false;
+	slot.repeat_packet   = RepeatTrace::Enabled() ? RepeatTrace::TakeDrawPacket() : 0;
 }
 
 bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
@@ -575,6 +595,7 @@ bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
 		auto& slot = *m_inline_slot;
 		FillSlot(slot, submit_id, index_args, auto_args, context, user_config, shaders);
 		Prepare(m_renderer.GetPipelineCache(), slot.registers, slot.eligible, true, slot.prepared);
+		HashForRepeatTrace(slot);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
 		Commit(slot);
 		return true;
@@ -598,6 +619,7 @@ void Engine::CommitHead() {
 	if (window.TryClaimHead()) {
 		// No worker has started it: prepare it here, with the exact clean predicate.
 		Prepare(m_renderer.GetPipelineCache(), slot.registers, slot.eligible, true, slot.prepared);
+		HashForRepeatTrace(slot);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
 	} else if (window.HeadDone()) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepReady);
@@ -644,11 +666,19 @@ void Engine::Commit(Slot& slot) {
 	} else {
 		executor.DrawAuto(slot.submit_id, scheduler.Current(), slot.auto_args);
 	}
+	const bool taken = executor.m_prepared_draw == nullptr;
 	if (executor.m_prepared_draw != nullptr) {
 		// The draw returned before preparing its programs (nothing to draw, a metadata
 		// operation, no targets): the preparation is simply dropped.
 		executor.m_prepared_draw = nullptr;
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepUnused);
+	}
+	if (RepeatTrace::Enabled()) {
+		auto record      = slot.repeat;
+		record.packet    = slot.repeat_packet;
+		record.committed = taken && slot.prepared.ok && slot.prepared.failure == Failure::None;
+		record.failure   = static_cast<uint8_t>(slot.prepared.failure);
+		RepeatTrace::OnDraw(record);
 	}
 	scheduler.RestoreRegisters(previous);
 	if (m_after_commit) {

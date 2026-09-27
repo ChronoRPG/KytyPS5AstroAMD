@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
+#include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -1176,6 +1177,15 @@ bool GuestGpu::Process(Submission& submission) {
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();
 	}
+	if (first_slice && RepeatTrace::Enabled()) {
+		// KYTY_CP_REPEAT_TRACE: a guest frame starts with the processor reset after
+		// sceAgcSuspendPoint; every submission's content is hashed.
+		if (submission.reset_processor && submission.type != SubmissionType::Compute) {
+			RepeatTrace::OnFrameBoundary();
+		}
+		RepeatTrace::OnSubmission(submission.queue_id, submission.sequence, submission.commands,
+		                          submission.constant_commands);
+	}
 
 	if (first_slice) {
 		submission.started = true;
@@ -1295,8 +1305,22 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	                                        : Pm4ProcessResult::Blocked;
 }
 
+// KYTY_CP_REPEAT_TRACE: the guest address of the packet whose handler is running (a draw packet
+// when called from DrawIndex/DrawIndexAuto).
+void CommandProcessor::NoteRepeatTraceDrawPacket() {
+	const uint32_t* packet = nullptr;
+	if (g_current_execution != nullptr && !g_current_execution->m_buffer_stack.empty()) {
+		const auto& cursor = g_current_execution->m_buffer_stack.back();
+		packet             = cursor.commands.data() + cursor.offset_dw;
+	}
+	RepeatTrace::NoteDrawPacket(packet);
+}
+
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
+	if (RepeatTrace::Enabled()) {
+		RepeatTrace::OnIndirectBuffer(commands, chain);
+	}
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
 	g_current_execution->m_next_buffer = commands;
 	g_current_execution->m_chain       = chain;
@@ -1578,12 +1602,19 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
 	}
+	if (RepeatTrace::Enabled()) {
+		NoteRepeatTraceDrawPacket();
+	}
 	if (TrySubmitPreparedDraw(&args, nullptr)) {
 		// Draw-prep: the engine runs MaybeFlushIdleGpu after it records (commits) each draw. The
 		// slice may count the draw now: a yield ends the slice after this packet, and the slice
 		// end commits the whole window before anything else runs.
 		MaybeYieldSlice();
 		return;
+	}
+	if (RepeatTrace::Enabled()) {
+		(void)RepeatTrace::TakeDrawPacket();
+		RepeatTrace::OnUnpreparedDraw();
 	}
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 	MaybeFlushIdleGpu();
@@ -1731,6 +1762,9 @@ bool CommandProcessor::TryDrawIndirectNative(DrawIndirectSource source) {
 		(void)NumInstances();
 	}
 	m_pending_num_instances.push_back(pending);
+	if (RepeatTrace::Enabled()) {
+		RepeatTrace::OnUnpreparedDraw();
+	}
 	MaybeFlushIdleGpu();
 	MaybeYieldSlice();
 	return true;
@@ -1902,6 +1936,10 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		}
 
 		const auto& cs = m_sh_ctx.GetCs().cs_regs;
+		if (RepeatTrace::Enabled()) {
+			RepeatTrace::OnDispatch(static_cast<uint32_t>(m_interrupt_event_id), m_sh_ctx.GetCs(),
+			                        thread_group_x, thread_group_y, thread_group_z, mode);
+		}
 		// local_x        = std::max(cs.num_thread_x, 1u);
 		// local_y        = std::max(cs.num_thread_y, 1u);
 		// local_z        = std::max(cs.num_thread_z, 1u);
@@ -1958,10 +1996,17 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 		}
 		args.instance_count = NumInstances();
 	}
+	if (RepeatTrace::Enabled()) {
+		NoteRepeatTraceDrawPacket();
+	}
 	if (TrySubmitPreparedDraw(nullptr, &args)) {
 		// See DrawIndex: idle flushes follow each commit, the slice counts the draw now.
 		MaybeYieldSlice();
 		return;
+	}
+	if (RepeatTrace::Enabled()) {
+		(void)RepeatTrace::TakeDrawPacket();
+		RepeatTrace::OnUnpreparedDraw();
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 	MaybeFlushIdleGpu();
