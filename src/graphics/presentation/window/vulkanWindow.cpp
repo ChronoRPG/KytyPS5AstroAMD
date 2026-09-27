@@ -637,14 +637,36 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceVulkan12Properties properties12 {};
 	properties12.pNext = &properties11;
 
+	vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties {};
 	vk::PhysicalDeviceProperties2 properties2 {};
 	properties2.pNext = &properties12;
 
 	if (graphics.mesh_shader_enabled) {
 		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
 	}
+	if (robustness2_ext_enabled) {
+		robustness2_properties.pNext = properties2.pNext;
+		properties2.pNext            = &robustness2_properties;
+	}
 	physical_device.getProperties2(&properties2);
 	ConfigureShaderFloatControls(properties12);
+	// robustBufferAccess2 (enabled below whenever supported) makes a storage-buffer load return 0
+	// when any byte lies past the descriptor range rounded up to this alignment; at 1 byte that is
+	// exactly the shaders' own dword bounds check, which they can then leave to the device.
+	{
+		ShaderRecompiler::Spirv::HostBufferRobustness robustness {};
+		robustness.storage_dword_loads_return_zero =
+		    robustness2_ext_enabled && supported_robustness2.robustBufferAccess2 == VK_TRUE &&
+		    robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u;
+		ShaderRecompiler::Spirv::SetHostBufferRobustness(robustness);
+		LOGF("Vulkan robustness: robustBufferAccess2=%s storage alignment=%" PRIu64
+		     " shader dword bounds checks=%s\n",
+		     robustness2_ext_enabled && supported_robustness2.robustBufferAccess2 == VK_TRUE
+		         ? "true"
+		         : "false",
+		     static_cast<uint64_t>(robustness2_properties.robustStorageBufferAccessSizeAlignment),
+		     robustness.storage_dword_loads_return_zero ? "device" : "shader");
+	}
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;

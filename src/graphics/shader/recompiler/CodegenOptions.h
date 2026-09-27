@@ -25,6 +25,9 @@ struct CodegenOptions {
 	// KYTY_LOD_STATS_GATE=0: record GET_LOD_STATS feedback for every sample, including images whose
 	// T# has no mip-statistics counter, and issue the finest-level AtomicUMin unconditionally.
 	bool lod_stats_gate = true;
+	// KYTY_ROBUST_BUFFER_LOADS=0: bounds-check every plain dword storage-buffer load in the shader
+	// even when the device's robustBufferAccess2 already returns zero for out-of-range dwords.
+	bool robust_buffer_loads = true;
 };
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();

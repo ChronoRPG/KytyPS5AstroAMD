@@ -23,6 +23,7 @@ CodegenOptions FromEnvironment() {
 	options.single_f2i_saturation =
 	    EnvFlag("KYTY_SINGLE_F2I_SATURATION", options.single_f2i_saturation);
 	options.lod_stats_gate = EnvFlag("KYTY_LOD_STATS_GATE", options.lod_stats_gate);
+	options.robust_buffer_loads = EnvFlag("KYTY_ROBUST_BUFFER_LOADS", options.robust_buffer_loads);
 	return options;
 }
 

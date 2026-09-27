@@ -711,6 +711,130 @@ void CheckLodStatsGate() {
               gated_spirv.size());
 }
 
+// Buffer and scalar-buffer loads that straddle the end of a descriptor range whose size is not a
+// multiple of 4 bytes, with the shader's dword bounds check and with the device's
+// robustBufferAccess2 check. Out-of-range dwords (any byte past the range) must read 0.
+void CheckRobustBufferLoads(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenRobustBufferLoads";
+  using O = ShaderOpcode;
+  if (vulkan->RobustStorageAlignment() != 1u) {
+    std::printf("[codegen] %-32s skipped (robustStorageBufferAccessSizeAlignment %u)\n", name,
+                static_cast<u32>(vulkan->RobustStorageAlignment()));
+    return;
+  }
+  constexpr u32 Lanes = 16;
+  constexpr u32 PerLane = 16;
+  constexpr u32 Data = Lanes * PerLane;  // first data dword
+  constexpr u32 RangeBytes = 4u * (Data + 8u) + 2u; // dword Data+8 is half inside
+  TestCase test;
+  test.name = name;
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1a, 1, InlineU32(2), 0)); // v1 = lane * 4
+  code.push_back(EncodeVop2(0x1a, 2, InlineU32(1), 0)); // v2 = lane * 2
+  code.push_back(EncodeVop2(0x1a, 5, InlineU32(6), 0)); // v5 = lane * 64 (output base)
+  const auto mubuf = [&](u32 opcode, u32 vdata, u32 vaddr, u32 offset) {
+    code.push_back(EncodeMubuf0(opcode, offset));
+    code.push_back(EncodeMubuf1(vdata, 0, vaddr));
+  };
+  mubuf(0x0c, 10, 1, 4u * (Data + 4u));        // dword: Data+4 .. Data+19
+  mubuf(0x0a, 11, 2, 4u * (Data + 6u));        // ushort: 2-byte steps across the end
+  mubuf(0x0b, 12, 2, 4u * (Data + 5u) + 2u);   // sshort
+  mubuf(0x08, 13, 0, 4u * (Data + 8u) - 6u);   // ubyte: 1-byte steps
+  mubuf(0x09, 14, 0, 4u * (Data + 8u) - 6u);   // sbyte
+  mubuf(0x0e, 16, 1, 4u * (Data + 2u));        // dwordx4 v[16:19]
+  AppendSmemLoadOpcode(&code, 0x0a, 20, 4u * (Data + 6u)); // s_buffer_load_dwordx4 s[20:23]
+  AppendSmemLoadOpcode(&code, 0x08, 24, 4u * (Data + 8u)); // s_buffer_load_dword s24 (partial)
+  AppendSmemLoadOpcode(&code, 0x08, 25, 4u * (Data + 7u)); // s_buffer_load_dword s25
+  code.push_back(EncodeSopp(0x0c, 0));
+  for (u32 s = 0; s < 6; s++) {
+    code.push_back(EncodeVop1(0x01, 30 + s, 20 + s)); // v_mov_b32 v(30+s), s(20+s)
+  }
+  const u32 outputs[] = {10, 11, 12, 13, 14, 16, 17, 18, 19, 30, 31, 32, 33, 34, 35};
+  for (u32 k = 0; k < std::size(outputs); k++) {
+    code.push_back(EncodeMubuf0(0x1c, 4u * k)); // buffer_store_dword v, v5, s[48:51]
+    code.push_back(EncodeMubuf1(outputs[k], 12, 5));
+  }
+  AppendEnd(&code);
+  test.initial.assign(Data + 24u, 0u);
+  for (u32 i = 0; i < Data + 24u; i++) {
+    test.initial[i] = i < Data ? 0u : 0x80a0c0e0u + (i - Data) * 0x01010101u;
+  }
+  test.compute_info.threads_num[0] = Lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.storage_buffer_range_bytes = RangeBytes;
+  test.opcodes = {O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_LOAD_USHORT,
+                  O::BUFFER_LOAD_SSHORT, O::BUFFER_LOAD_UBYTE, O::BUFFER_LOAD_SBYTE,
+                  O::BUFFER_LOAD_DWORDX4, O::S_BUFFER_LOAD_DWORDX4, O::S_BUFFER_LOAD_DWORD,
+                  O::S_WAITCNT, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+
+  // Reference: a dword reads its data when all four bytes are inside the range, else 0.
+  const auto dword = [&](u32 index) -> u32 {
+    return 4u * index + 4u <= RangeBytes && index < test.initial.size() ? test.initial[index]
+                                                                          : 0u;
+  };
+  const auto sub = [&](u32 byte, u32 bits, bool sign) -> u32 {
+    const auto word = dword(byte / 4u) >> ((byte % 4u) * 8u);
+    const auto mask = bits == 8u ? 0xffu : 0xffffu;
+    auto value = word & mask;
+    if (sign && (value & (1u << (bits - 1u))) != 0u) {
+      value |= ~mask;
+    }
+    return value;
+  };
+  std::vector<u32> expected(Data, 0u);
+  for (u32 lane = 0; lane < Lanes; lane++) {
+    const std::array<u32, 15> values = {
+        dword(Data + 4u + lane),
+        sub(4u * (Data + 6u) + 2u * lane, 16, false),
+        sub(4u * (Data + 5u) + 2u + 2u * lane, 16, true),
+        sub(4u * (Data + 8u) - 6u + lane, 8, false),
+        sub(4u * (Data + 8u) - 6u + lane, 8, true),
+        dword(Data + 2u + lane),
+        dword(Data + 3u + lane),
+        dword(Data + 4u + lane),
+        dword(Data + 5u + lane),
+        dword(Data + 6u),
+        dword(Data + 7u),
+        dword(Data + 8u),
+        dword(Data + 9u),
+        dword(Data + 8u),
+        dword(Data + 7u)};
+    std::copy(values.begin(), values.end(), expected.begin() + lane * PerLane);
+  }
+  CodegenOptions device = GetCodegenOptions();
+  device.robust_buffer_loads = true;
+  CodegenOptions shader = device;
+  shader.robust_buffer_loads = false;
+  std::vector<u32> device_spirv;
+  std::vector<u32> shader_spirv;
+  std::vector<u32> device_words;
+  std::vector<u32> shader_words;
+  {
+    // The host binds storage buffers in whole dwords (descriptors.cpp NativeStorageBuffer):
+    // NVIDIA returns data for a dword only partly inside the range despite reporting a 1-byte
+    // robustness alignment. The shader-checked run keeps the odd range to show that rounding
+    // down changes nothing for the shader's own checks.
+    auto device_test = test;
+    device_test.storage_buffer_range_bytes = RangeBytes & ~3u;
+    ScopedCodegenOptions scope(device);
+    device_words = RunCollect(vulkan, device_test, Data, &device_spirv);
+  }
+  {
+    ScopedCodegenOptions scope(shader);
+    shader_words = RunCollect(vulkan, test, Data, &shader_spirv);
+  }
+  RequireEqualWords(name, "shader-checked loads", expected, shader_words);
+  RequireEqualWords(name, "device-checked loads", expected, device_words);
+  std::printf("[codegen] %-32s ok (OpArrayLength %zu -> %zu, OpBranchConditional %zu -> %zu)\n",
+              name, CountSpirv(shader_spirv, "OpArrayLength"),
+              CountSpirv(device_spirv, "OpArrayLength"),
+              CountSpirv(shader_spirv, "OpBranchConditional"),
+              CountSpirv(device_spirv, "OpBranchConditional"));
+}
+
 void RunAll(VulkanHarness *vulkan) {
   CheckLodStatsGate();
   CheckMoveRelValueSet(vulkan);
@@ -719,6 +843,7 @@ void RunAll(VulkanHarness *vulkan) {
   CheckPackRtzExhaustive();
   CheckPackRtz(vulkan);
   CheckFloatToIntSaturation(vulkan);
+  CheckRobustBufferLoads(vulkan);
 }
 
 } // namespace CodegenTests

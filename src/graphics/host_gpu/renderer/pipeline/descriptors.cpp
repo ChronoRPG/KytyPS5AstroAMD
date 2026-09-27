@@ -191,7 +191,13 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
-	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
+	// Shaders bounds-check storage buffers in whole dwords (OpArrayLength floors the range), and
+	// may leave plain dword loads to robustBufferAccess2 (HostBufferRobustness). NVIDIA then
+	// returns data for a dword that is only partly inside the range, so bind whole dwords: a
+	// no-op for every shader-side check, and it makes the device check match them.
+	const auto range = size + adjustment >= 4u ? Common::AlignDown(size + adjustment, uint64_t {4})
+	                                           : size + adjustment;
+	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, range};
 	if (narrowed) {
 		for (const auto& range: *written_ranges) {
 			context.GetTextureCache().InvalidateMemoryFromGPU(range.address, range.size);
