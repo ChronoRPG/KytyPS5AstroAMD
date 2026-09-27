@@ -32,8 +32,13 @@
 // on copies and the outputs are compared (logged and counted; "exit" stops on a difference).
 // KYTY_DRAW_PREP_CERT=log (default)|value: see Validate() in drawPrep.cpp.
 // KYTY_DRAW_PREP_WORKERS (default 6, 1..32), KYTY_DRAW_PREP_WINDOW (default 32 slots, rounded
-// up to a power of two), KYTY_DRAW_PREP_SPIN_US (default 200: how long an idle worker spins
+// up to a power of two), KYTY_DRAW_PREP_SPIN_US (default 200: how long an idle hot worker spins
 // before parking): parallel mode only.
+// KYTY_DRAW_PREP_HOT (default 2): workers that spin like that; the others park as soon as nothing
+// is claimable and are woken, one at a time, when KYTY_DRAW_PREP_WAKE_BACKLOG (default 8)
+// published slots wait unclaimed; a woken one spins KYTY_DRAW_PREP_COLD_SPIN_US (default 50)
+// before parking again (workerGate.h). KYTY_DRAW_PREP_HOT >= KYTY_DRAW_PREP_WORKERS keeps every
+// worker hot, the behaviour before the gate.
 // KYTY_DRAW_PREP_HISTOGRAM=1: the S0 draws-per-fence histogram also in off mode (the packet
 // classification runs, nothing else changes).
 namespace Libs::Graphics {

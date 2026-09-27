@@ -775,6 +775,8 @@ enum class FrameEvent : uint32_t {
 	// (instead of queued), and those of them that replaced a different data value.
 	EqueueCoalescedTriggers,
 	EqueueCoalescedDataChanges,
+	// KYTY_DRAW_PREP_HOT: parked (cold) draw-prep workers woken because the unclaimed backlog grew.
+	DrawPrepColdWakes,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
