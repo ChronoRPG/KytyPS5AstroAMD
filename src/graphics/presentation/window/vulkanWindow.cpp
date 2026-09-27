@@ -722,6 +722,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		     static_cast<uint64_t>(robustness2_properties.robustStorageBufferAccessSizeAlignment),
 		     robustness.storage_dword_loads_return_zero ? "device" : "shader");
 	}
+	// Optional: IMAGE_SAMPLE*_CL clamps become the MinLod image operand.
+	const bool shader_resource_min_lod =
+	    supported_features2.features.shaderResourceMinLod == VK_TRUE;
+	ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = shader_resource_min_lod});
+	LOGF("Vulkan shaderResourceMinLod (IMAGE_SAMPLE*_CL): %s\n",
+	     shader_resource_min_lod ? "true" : "false");
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
@@ -771,6 +777,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.storage_image_read_without_format_enabled =
 	    device_features.shaderStorageImageReadWithoutFormat == VK_TRUE;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
+	device_features.shaderResourceMinLod = shader_resource_min_lod ? VK_TRUE : VK_FALSE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;

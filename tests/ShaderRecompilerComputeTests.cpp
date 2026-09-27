@@ -11858,6 +11858,42 @@ public:
             full.image_id == head.image_id &&
                 full_values == std::vector<float>{1.0f, 2.0f, 4.0f, 8.0f, 8.0f, 8.0f},
             "MIN_LOD 0 samples returned " + describe(full_values));
+
+    // IMAGE_SAMPLE_CL / IMAGE_SAMPLE_D_CL: the last address component is a minimum LOD.
+    // Outside pixel shaders the implicit LOD is 0, so _CL 2.0 reads level 2 (4); _D_CL with zero
+    // gradients and clamp 2.5 blends levels 2 and 3 (6); _CL 0 reads level 0 (1).
+    auto clamp_test = make_case("SampleLodClamp", 3);
+    clamp_test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                          ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+    const auto clamp_descriptor = head_descriptor(0);
+    std::copy_n(clamp_descriptor.dwords.begin(), 8, clamp_test.user_data.begin());
+    AppendVMovLiteral(&clamp_test.code, 20, std::bit_cast<uint32_t>(0.5f));
+    AppendVMovLiteral(&clamp_test.code, 21, std::bit_cast<uint32_t>(0.5f));
+    AppendVMovLiteral(&clamp_test.code, 22, std::bit_cast<uint32_t>(2.0f));
+    clamp_test.code.push_back(EncodeMimg0(0x21, 1)); // IMAGE_SAMPLE_CL
+    clamp_test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+    for (u32 reg = 23; reg < 27; ++reg) {
+      AppendVMovU32(&clamp_test.code, reg, 0);
+    }
+    AppendVMovLiteral(&clamp_test.code, 27, std::bit_cast<uint32_t>(0.5f));
+    AppendVMovLiteral(&clamp_test.code, 28, std::bit_cast<uint32_t>(0.5f));
+    AppendVMovLiteral(&clamp_test.code, 29, std::bit_cast<uint32_t>(2.5f));
+    clamp_test.code.push_back(EncodeMimg0(0x23, 1)); // IMAGE_SAMPLE_D_CL
+    clamp_test.code.push_back(EncodeMimg1(1, 23, 0, 2));
+    AppendVMovU32(&clamp_test.code, 22, 0);
+    clamp_test.code.push_back(EncodeMimg0(0x21, 1)); // IMAGE_SAMPLE_CL, clamp 0
+    clamp_test.code.push_back(EncodeMimg1(2, 20, 0, 2));
+    for (u32 index = 0; index < 3; ++index) {
+      AppendStoreVgpr(&clamp_test.code, index, index);
+    }
+    AppendEnd(&clamp_test.code);
+    const auto clamp_program = CompileCase(clamp_test, SubgroupSize());
+    const auto clamp_values = as_floats(run(clamp_test, clamp_program,
+                                            resolve(clamp_program, 0), 3, false));
+    Require(name, "sample LOD clamp",
+            clamp_values == std::vector<float>{4.0f, 6.0f, 1.0f},
+            "IMAGE_SAMPLE_CL 2 / _D_CL 2.5 / _CL 0 returned " + describe(clamp_values) +
+                " instead of 4,6,1");
     RenderExecutorTestAccess::ResetBindings(executor);
     std::printf("[gpu]     %-32s ok\n", "StreamedHeadMinLodResidency");
   }
@@ -11937,8 +11973,53 @@ public:
             "blend/min/max samples returned " + std::to_string(results[0]) + "/" +
                 std::to_string(results[1]) + "/" + std::to_string(results[2]) +
                 " instead of 8.5/6/11");
+
+    // IMAGE_SAMPLE_LZ_O (RDNA2 8.2.5): six-bit signed texel offsets in the first address dword.
+    // From texel (1,1): (+1,0) 7, (0,+1) 10, (-1,-1) 1, (+9,0) clamps to x=3 (8; outside the
+    // ConstOffset range every device supports, so the coordinate moves), (-8,0) clamps to x=0 (5).
+    {
+      constexpr std::array<uint32_t, 5> offsets{0x0001u, 0x0100u, 0x3f3fu, 0x0009u, 0x0038u};
+      constexpr std::array<float, 5> expected{7.0f, 10.0f, 1.0f, 8.0f, 5.0f};
+      TestCase offset_test;
+      offset_test.name = "SampleLzOffsets";
+      offset_test.has_user_data = true;
+      std::copy_n(descriptor.dwords.begin(), 8, offset_test.user_data.begin());
+      // Clamp to edge, point filtering.
+      const ShaderSamplerResource point_sampler{{2u | (2u << 3u) | (2u << 6u), 0, 0, 0}};
+      std::copy_n(point_sampler.fields, 4, offset_test.user_data.begin() + 8);
+      offset_test.user_data[50] = static_cast<u32>(offsets.size() * sizeof(uint32_t));
+      offset_test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                             ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+      offset_test.required_spirv = {"ConstOffset"};
+      AppendVMovLiteral(&offset_test.code, 21, std::bit_cast<uint32_t>(0.375f));
+      AppendVMovLiteral(&offset_test.code, 22, std::bit_cast<uint32_t>(0.375f));
+      for (u32 index = 0; index < offsets.size(); ++index) {
+        AppendVMovU32(&offset_test.code, 20, offsets[index]);
+        offset_test.code.push_back(EncodeMimg0(0x37, 1)); // IMAGE_SAMPLE_LZ_O
+        offset_test.code.push_back(EncodeMimg1(index, 20, 0, 2));
+      }
+      for (u32 index = 0; index < offsets.size(); ++index) {
+        AppendStoreVgpr(&offset_test.code, index, index);
+      }
+      AppendEnd(&offset_test.code);
+      const auto offset_program = CompileCase(offset_test, SubgroupSize());
+      const auto sampler = context.GetSamplerCache().GetSampler(point_sampler);
+      auto output = CreateStorageBuffer(offset_test.name, {}, offsets.size());
+      Dispatch(offset_test, offset_program, output, nullptr, &sampled, nullptr, nullptr, sampler);
+      const auto words = ReadBuffer(offset_test.name, output, offsets.size());
+      DestroyBuffer(&output);
+      std::string actual;
+      bool        match = true;
+      for (size_t index = 0; index < offsets.size(); ++index) {
+        const auto value = std::bit_cast<float>(words[index]);
+        match = match && value == expected[index];
+        actual += (index == 0 ? "" : ",") + std::to_string(value);
+      }
+      Require(name, "sample texel offsets", match,
+              "IMAGE_SAMPLE_LZ_O returned " + actual + " instead of 7,10,1,8,5");
+    }
     RenderExecutorTestAccess::ResetBindings(executor);
-    std::printf("[gpu]     %-32s ok\n", "SamplerFilterMode");
+    std::printf("[gpu]     %-32s ok\n", "SamplerFilterMode+SampleLzOffsets");
   }
 
   void CheckRenderExecutorStencilBindingDiscovery() {
@@ -18549,6 +18630,7 @@ private:
     m_storage_image_read_without_format =
         available_features.shaderStorageImageReadWithoutFormat == VK_TRUE;
     device_features.shaderImageGatherExtended = true;
+    device_features.shaderResourceMinLod = available_features.shaderResourceMinLod;
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
     device_features.fillModeNonSolid = true;
@@ -18601,6 +18683,8 @@ private:
               : 0u;
       ShaderRecompiler::Spirv::SetHostBufferRobustness(
           {.storage_dword_loads_return_zero = m_robust_storage_alignment == 1u});
+      ShaderRecompiler::Spirv::SetHostImageFeatures(
+          {.min_lod = available_features.shaderResourceMinLod == VK_TRUE});
     }
 
     vk::CommandPoolCreateInfo pool_info{};
@@ -30000,8 +30084,7 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
-  AppendVMovU32(&code, 20,
-                1); // Non-constant +1 X offset is not a SPIR-V ConstOffset.
+  AppendVMovU32(&code, 20, 1); // +1 X texel offset, a full 32-bit dword even with A16.
   AppendVMovLiteral(&code, 21, 0x36003900u); // x=0.625, y=0.375 packed as f16.
   AppendVMovU32(&code, 22, 0);
   code.push_back(EncodeMimg0(0x30, 0xf));
@@ -30011,8 +30094,11 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   }
   AppendEnd(&code);
 
+  // The coordinates select texel (2,1); the offset moves the read to texel (3,1).
   auto image = MakeRgbaImage(4, 4);
-  SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
+  SetRgbaPixel(&image, 4, 2, 1, 0x40a00000u, 0x40c00000u, 0x40e00000u,
+               0x41000000u);
+  SetRgbaPixel(&image, 4, 3, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
                0x40800000u);
 
   TestCase test;
@@ -30022,7 +30108,8 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
-  test.required_spirv = {"UnpackHalf2x16"};
+  // The offset written under the result's EXEC is the literal: a ConstOffset.
+  test.required_spirv = {"UnpackHalf2x16", "ConstOffset"};
   test.forbidden_spirv = {"OpBitFieldSExtract"};
   return test;
 }

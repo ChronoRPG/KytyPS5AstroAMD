@@ -21,6 +21,7 @@ enum HostFloatControlBits : uint32_t {
 
 std::atomic_uint32_t g_host_float_controls {0};
 std::atomic_bool     g_storage_dword_loads_return_zero {false};
+std::atomic_bool     g_image_min_lod {false};
 
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
@@ -358,6 +359,14 @@ void SetHostBufferRobustness(const HostBufferRobustness& robustness) {
 HostBufferRobustness GetHostBufferRobustness() {
 	return {.storage_dword_loads_return_zero =
 	            g_storage_dword_loads_return_zero.load(std::memory_order_relaxed)};
+}
+
+void SetHostImageFeatures(const HostImageFeatures& features) {
+	g_image_min_lod.store(features.min_lod, std::memory_order_relaxed);
+}
+
+HostImageFeatures GetHostImageFeatures() {
+	return {.min_lod = g_image_min_lod.load(std::memory_order_relaxed)};
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,

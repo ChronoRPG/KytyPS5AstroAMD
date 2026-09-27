@@ -32,6 +32,15 @@ struct HostBufferRobustness {
 void                 SetHostBufferRobustness(const HostBufferRobustness& robustness);
 HostBufferRobustness GetHostBufferRobustness();
 
+// Optional image features of the device (set once by the device layer).
+struct HostImageFeatures {
+	// shaderResourceMinLod: the MinLod image operand, used for IMAGE_SAMPLE*_CL.
+	bool min_lod = false;
+};
+
+void              SetHostImageFeatures(const HostImageFeatures& features);
+HostImageFeatures GetHostImageFeatures();
+
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
                                   ShaderStageInputInfo input_info);
 

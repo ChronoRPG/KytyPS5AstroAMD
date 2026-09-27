@@ -48,6 +48,12 @@ struct CodegenOptions {
 	// perspective (NoPerspective on all inputs when LINEAR_CENTER is enabled) instead of per input
 	// from the I/J pair its V_INTERP_P2 reads use (centroid, sample, linear).
 	bool interp_modes = true;
+	// KYTY_SAMPLE_OFFSETS=0: ignore the texel offsets of IMAGE_SAMPLE*_O (the behaviour before
+	// U50) instead of applying them.
+	bool sample_offsets = true;
+	// KYTY_SAMPLE_LOD_CLAMP=0: ignore the LOD clamp of IMAGE_SAMPLE*_CL (the behaviour before U50)
+	// instead of applying it as the sample's minimum LOD.
+	bool sample_lod_clamp = true;
 };
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();
