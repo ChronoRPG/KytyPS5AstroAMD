@@ -15049,9 +15049,38 @@ public:
         Fail(name, stage, out.str());
       }
     };
+    // Detile leaves its linear scratch uncleared by default (KYTY_TILER_CLEAR_SCRATCH, see
+    // TileManager::Detile): only the width x height (x depth) elements of each tile are
+    // defined, and row, slice and level padding keeps whatever the pooled scratch held. Every
+    // consumer (buffer->image copies, D16 conversion) reads only those elements, so compare
+    // exactly the bytes the reference defines.
+    auto compare_defined = [&](const char *stage,
+                               const std::vector<uint8_t> &expected,
+                               const std::vector<uint8_t> &actual,
+                               const std::vector<uint8_t> &defined) {
+      Require(name, stage,
+              expected.size() == actual.size() &&
+                  expected.size() == defined.size(),
+              "detile comparison sizes differ");
+      size_t defined_bytes = 0;
+      for (size_t i = 0; i < expected.size(); i++) {
+        if (defined[i] == 0) {
+          continue;
+        }
+        ++defined_bytes;
+        if (expected[i] != actual[i]) {
+          std::ostringstream out;
+          out << "first mismatch at " << i << " of " << expected.size();
+          Fail(name, stage, out.str());
+        }
+      }
+      Require(name, stage, defined_bytes != 0,
+              "the reference defined no linear bytes");
+    };
     auto convert_reference = [&](bool to_tiled, std::vector<uint8_t> *dst,
                                  const std::vector<uint8_t> &src,
-                                 const GpuTileInfo &info) {
+                                 const GpuTileInfo &info,
+                                 std::vector<uint8_t> *defined = nullptr) {
       TileBlockLayout block{};
       Require(name, "reference layout",
               TileGetBlockLayout(info.family, info.bytes_per_element, block),
@@ -15100,6 +15129,10 @@ public:
                     "CPU reference address escaped storage");
             std::memcpy(dst->data() + dst_offset, src.data() + src_offset,
                         info.bytes_per_element);
+            if (defined != nullptr) {
+              std::fill_n(defined->begin() + static_cast<std::ptrdiff_t>(dst_offset),
+                          info.bytes_per_element, uint8_t{1});
+            }
           }
         }
       }
@@ -15180,12 +15213,14 @@ public:
       std::vector<uint8_t> tiled(tiled_size);
       std::vector<uint8_t> cpu(linear_size, 0);
       std::vector<uint8_t> gpu(linear_size, 0xab);
+      std::vector<uint8_t> defined(linear_size, 0);
       fill(&tiled, ++case_index);
       for (const auto &info : infos) {
-        convert_reference(false, &cpu, tiled, info);
+        convert_reference(false, &cpu, tiled, info, &defined);
       }
       gpu_detile(tiled, &gpu, tiled_size, linear_size, infos);
-      compare((std::string(stage) + " detile bytes").c_str(), cpu, gpu);
+      compare_defined((std::string(stage) + " detile bytes").c_str(), cpu, gpu,
+                      defined);
 
       std::vector<uint8_t> linear(linear_size);
       std::vector<uint8_t> cpu_tiled(tiled_size, 0xab);
@@ -15225,6 +15260,7 @@ public:
         std::vector<uint8_t> tiled(storage_size);
         std::vector<uint8_t> cpu(storage_size, 0);
         std::vector<uint8_t> gpu(storage_size, 0xab);
+        std::vector<uint8_t> defined(storage_size, 0);
         fill(&tiled, ++case_index);
 
         GpuTileInfo info{};
@@ -15241,7 +15277,7 @@ public:
                                  family.family == TileBlockFamily::Depth64KB
                              ? 3
                              : 0;
-        convert_reference(false, &cpu, tiled, info);
+        convert_reference(false, &cpu, tiled, info, &defined);
         gpu_detile(tiled, &gpu, storage_size, storage_size,
                    std::span<const GpuTileInfo>(&info, 1));
         const auto family_label = [&](const char *operation) {
@@ -15250,7 +15286,8 @@ public:
               << " bpe=" << bpe;
           return out.str();
         };
-        compare(family_label("detile bytes").c_str(), cpu, gpu);
+        compare_defined(family_label("detile bytes").c_str(), cpu, gpu,
+                        defined);
 
         {
           std::vector<uint8_t> linear(storage_size);
@@ -15366,10 +15403,11 @@ public:
         std::vector<uint8_t> tiled(total.size);
         std::vector<uint8_t> cpu(total.size, 0);
         std::vector<uint8_t> gpu(total.size, 0xab);
+        std::vector<uint8_t> defined(total.size, 0);
         fill(&tiled, ++case_index);
-        convert_reference(false, &cpu, tiled, infos[0]);
+        convert_reference(false, &cpu, tiled, infos[0], &defined);
         gpu_detile(tiled, &gpu, total.size, total.size, infos);
-        compare("format bytes", cpu, gpu);
+        compare_defined("format bytes", cpu, gpu, defined);
         ++format_cases;
       }
     }
@@ -15766,6 +15804,7 @@ public:
         std::vector<uint8_t> tiled(block.block_size);
         std::vector<uint8_t> cpu(linear_size, 0xcd);
         std::vector<uint8_t> gpu(linear_size, 0xab);
+        std::vector<uint8_t> defined(linear_size, 0);
         fill(&tiled, ++case_index);
         GpuTileInfo info{};
         info.family = block.family;
@@ -15782,10 +15821,10 @@ public:
                                  family == TileBlockFamily::Depth64KB
                              ? 2
                              : 0;
-        convert_reference(false, &cpu, tiled, info);
+        convert_reference(false, &cpu, tiled, info, &defined);
         gpu_detile(tiled, &gpu, block.block_size, linear_size,
                    std::span<const GpuTileInfo>(&info, 1));
-        compare("tail bytes", cpu, gpu);
+        compare_defined("tail bytes", cpu, gpu, defined);
 
         std::vector<uint8_t> linear(linear_size);
         std::vector<uint8_t> cpu_tiled(block.block_size, 0xab);
@@ -15805,6 +15844,7 @@ public:
     std::vector<uint8_t> small_input(small_block.block_size);
     std::vector<uint8_t> small_expected(small_block.block_size, 0);
     std::vector<uint8_t> small_output(small_block.block_size, 0xab);
+    std::vector<uint8_t> small_defined(small_block.block_size, 0);
     fill(&small_input, 0xee);
     GpuTileInfo small_info{};
     small_info.family = small_block.family;
@@ -15814,17 +15854,24 @@ public:
     small_info.width = 1;
     small_info.height = 1;
     small_info.pitch = small_block.block_width;
-    convert_reference(false, &small_expected, small_input, small_info);
+    convert_reference(false, &small_expected, small_input, small_info,
+                      &small_defined);
     gpu_detile(small_input, &small_output, small_input.size(),
                small_output.size(),
                std::span<const GpuTileInfo>(&small_info, 1));
-    compare("small detile", small_expected, small_output);
+    compare_defined("small detile", small_expected, small_output,
+                    small_defined);
 
+    // The second detile reuses the completed scratch of the first. New input
+    // makes an element the dispatch failed to write visible as a mismatch.
+    fill(&small_input, 0xef);
+    convert_reference(false, &small_expected, small_input, small_info);
     std::fill(small_output.begin(), small_output.end(), 0xab);
     gpu_detile(small_input, &small_output, small_input.size(),
                small_output.size(),
                std::span<const GpuTileInfo>(&small_info, 1));
-    compare("scheduler-owned reuse", small_expected, small_output);
+    compare_defined("scheduler-owned reuse", small_expected, small_output,
+                    small_defined);
 
     constexpr auto volume_format = Prospero::BufferFormat::k32UInt;
     constexpr auto volume_tile = Prospero::TileMode::kLinear;
