@@ -264,10 +264,11 @@ void Converter::Record(CommandBuffer& buffer, const Slot& slot, const Inputs& in
 	push.max_groups_y         = inputs.max_groups_y;
 	push.max_groups_total     = inputs.max_groups_total;
 	push.generation           = slot.generation;
-	// Handle() records the pending batch (the barrier above) first.
-	const auto native = buffer.Handle();
-	native.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-	native.dispatch(1, 1, 1);
+	// Sink() records the pending batch (the barrier above) first, as Handle() did, and resets the
+	// push-constant shadow, without draining the CP recorder.
+	auto sink = buffer.Sink();
+	sink.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+	sink.dispatch(1, 1, 1);
 	// The conversion's writes before the draw's indirect command reads and its mesh shaders'
 	// parameter loads, and before the completion check's host read. Recorded by the draw's
 	// BeginRendering (the instance was ended above, so the barrier cannot be sunk past it).
