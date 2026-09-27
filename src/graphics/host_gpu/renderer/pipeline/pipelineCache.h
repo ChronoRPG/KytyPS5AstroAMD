@@ -12,8 +12,10 @@
 #include "graphics/shader/shader.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <type_traits>
@@ -111,6 +113,8 @@ public:
 	explicit PipelineCache(GraphicContext& graphics);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
+	// Final save of the driver pipeline cache (exit). Stops the periodic saver first, then
+	// destroys the driver cache; later pipelines are created without one.
 	void Save();
 
 	struct Pipeline {
@@ -188,6 +192,9 @@ public:
 
 private:
 	struct ProgramCache;
+	struct PipelineDiagnostics;
+	struct DriverCacheSaver;
+	struct LibraryState;
 
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;
@@ -251,11 +258,41 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// Why new graphics pipelines were needed (compiles.csv, compile totals); guarded by m_mutex.
+	std::unique_ptr<PipelineDiagnostics> m_diagnostics;
 	// Guards the pipeline maps and the driver cache. ProgramCache has its own locks.
 	Common::Mutex m_mutex;
+	// Periodic crash-safe saves of m_driver_cache on a background thread (KYTY_PIPELINE_CACHE_SAVE).
+	std::unique_ptr<DriverCacheSaver> m_saver;
+	// Graphics pipeline libraries and the background compiles that replace linked pipelines
+	// (KYTY_PIPELINE_LIBRARY, pipelineLibrary.h); null when off or unsupported.
+	std::unique_ptr<LibraryState> m_library;
+	// Bumped whenever a cached pipeline object is replaced (a linked pipeline by its optimized
+	// build), so that per-thread lookup memos do not keep returning the replaced object. Starts in
+	// a range of its own per cache instance, so memos never match another instance.
+	std::atomic<uint64_t> m_pipeline_generation {0};
 
 	void InitializeDriverCache();
+	// Serializes m_driver_cache and atomically replaces the cache file. Returns the payload size
+	// written, 0 on failure, or UINT64_MAX for a periodic save skipped over the size cap.
+	uint64_t WriteDriverCache(bool periodic);
+	void     NotePipelineCreated(uint64_t create_ns);
+	// Background compile finished: swaps `optimized` in for the linked pipeline cached under `key`.
+	void ReplaceLinkedPipeline(const GraphicsPipelineKey* key, vk::Pipeline linked,
+	                           vk::Pipeline optimized);
 };
+
+// Creates a graphics pipeline from a complete monolithic create info instead of
+// vkCreateGraphicsPipelines (the pipeline-library path). `layout_signature` identifies the
+// definition of info.layout (identically defined layouts have equal signatures).
+using GraphicsPipelineCreateHook =
+    std::function<vk::Result(const vk::GraphicsPipelineCreateInfo& info,
+                             std::span<const uint32_t> layout_signature, vk::Pipeline* pipeline)>;
+
+// KYTY_PIPELINE_DYNAMIC_STATE (default on): cull mode, front face, the depth-bounds test enable and
+// the depth bounds are dynamic state of every renderer graphics pipeline, recorded per draw by
+// SetGraphicsDynamicParams, instead of pipeline-key fields (=0: baked into each pipeline).
+[[nodiscard]] bool PipelineDynamicRasterStateEnabled();
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
@@ -265,7 +302,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const ShaderPixelInputInfo*            ps_input_info,
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache);
+                            vk::PipelineCache                      driver_cache,
+                            const GraphicsPipelineCreateHook*      create_hook = nullptr);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);

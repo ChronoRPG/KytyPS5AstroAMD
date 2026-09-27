@@ -42,7 +42,25 @@
 // instances ended, every cause; per-site Tracy plots GpuOps.EndRendering.<site>) and
 // gpu_draw_write_sinks (post-draw shader-write barriers kept pending across a draw continuing the
 // same instance, KYTY_DRAW_WRITE_SINK). Then the guest memory tracking / upload counters
-// (MemoryCounter below, mem_* columns). New columns are only ever appended.
+// (MemoryCounter below, mem_* columns). Then shader/pipeline compilation (see RecordCompile):
+// compile_programs, compile_translate_us, compile_emit_us, compile_validate_us, compile_module_us,
+// compile_gfx_pipelines, compile_gfx_pipeline_us, compile_cs_pipelines, compile_cs_pipeline_us,
+// compile_stall_us, compile_stall_max_us, compile_gfx_new, compile_gfx_perm, compile_gfx_variant.
+// Then driver pipeline cache saves (RecordPipelineCacheSave): pcache_saves, pcache_save_kb,
+// pcache_save_serialize_us, pcache_save_write_us, pcache_save_overlaps, pcache_save_overlap_us.
+// Then compile_translation_reuses (programs specialized from a kept translation instead of
+// translating again) and compile_clone_us (copying translations, RecordCompile clone_ns).
+// Then validate_async_count and validate_async_us: spirv-val runs on the background validator
+// (KYTY_SHADER_VALIDATION_ASYNC), off the compiling thread (RecordShaderValidation).
+// Then graphics pipeline libraries (KYTY_PIPELINE_LIBRARY, RecordPipelineLibraryEvent):
+// gpl_cache_hits, gpl_links, gpl_link_us, gpl_libraries, gpl_library_us, gpl_optimized,
+// gpl_optimize_us. Memory counters added to MemoryCounter after mem_written_upload_late_pages
+// follow at the end of the row (kMemoryColumnsBeforeCompile in hangTrace.cpp).
+// New columns are only ever appended.
+//
+//   compiles.csv       one row per new shader program permutation or pipeline: phase times, the
+//                      requesting thread, and for graphics pipelines which key fields differ from
+//                      the closest existing pipeline of the same programs (RecordCompile)
 
 #include <cstdint>
 #include <string>
@@ -242,9 +260,58 @@ struct GpuOpCounts {
 };
 void RecordGpuOpCounts(const GpuOpCounts& counts);
 
+// Shader and pipeline compilation (graphics/host_gpu/renderer/pipeline/pipelineCache.cpp). One
+// event per new program permutation (translate = ShaderRecompiler::TranslateProgram, emit =
+// CompileProgram: specialization and SPIR-V emission, validate = spirv-val, module =
+// vkCreateShaderModule) or new pipeline (pipeline = pipeline and layout creation, including
+// vkCreateGraphicsPipelines/vkCreateComputePipelines). total_ns is the wall time of the whole
+// compile on the thread that needed it. summary.csv adds each column per second.
+enum class CompileKind : uint8_t { Program, GraphicsPipeline, ComputePipeline, Count };
+// Graphics pipelines only: whether another pipeline already existed for the same program ids
+// (Variant, detail names the differing key fields), only for the same guest shaders with other
+// program permutations (Permutation), or for neither (New).
+enum class PipelineOrigin : uint8_t { None, New, Permutation, Variant };
+struct CompileEvent {
+	CompileKind      kind         = CompileKind::Program;
+	PipelineOrigin   origin       = PipelineOrigin::None;
+	const char*      stage        = "";
+	uint64_t         guest_hash   = 0;
+	uint64_t         id           = 0; // program id (for pipelines: the first vertex program)
+	uint64_t         id2          = 0; // pipelines: pixel program id
+	uint64_t         translate_ns = 0;
+	uint64_t         emit_ns      = 0;
+	uint64_t         validate_ns  = 0;
+	uint64_t         module_ns    = 0;
+	uint64_t         pipeline_ns  = 0;
+	uint64_t         total_ns     = 0;
+	uint64_t         spirv_words  = 0;
+	std::string_view detail;
+	// Programs: copy of a kept translation (reused, translate_ns 0) or of a new one being kept.
+	uint64_t         clone_ns = 0;
+	bool             reused   = false;
+};
+void RecordCompile(const CompileEvent& event);
+// A draw or dispatch spent stall_ns in the compile paths (new programs and pipelines, including
+// lock waits). compile_stall_max_us is the longest single stall of the second.
+void RecordCompileStall(uint64_t stall_ns);
+// A driver pipeline cache save (periodic or at exit): payload bytes, vkGetPipelineCacheData time
+// and file write time. Overlaps are pipelines created while a save was serializing the same
+// cache (the driver may serialize them internally); create_ns is that creation's duration.
+void RecordPipelineCacheSave(uint64_t bytes, uint64_t serialize_ns, uint64_t write_ns);
+void RecordPipelineCacheSaveOverlap(uint64_t create_ns);
+// One background spirv-val run (not on a compiling draw's thread).
+void RecordShaderValidation(uint64_t validate_ns);
+// Graphics pipeline libraries: a monolithic pipeline found in the driver cache (CacheHit), a
+// fast link (Linked, link time), `count` new libraries (Library, their creation time), and a
+// background optimized compile (Optimized, on a worker thread).
+enum class PipelineLibraryEvent : uint8_t { CacheHit, Linked, Library, Optimized, Count };
+void RecordPipelineLibraryEvent(PipelineLibraryEvent event, uint64_t ns, uint64_t count = 1);
+
 // Guest memory tracking and buffer upload counters (graphics/host_gpu/memoryStats.h), summed per
 // second into summary.csv columns appended after gpu_draw_write_sinks, in enum order (column
-// names in hangTrace.cpp; *_us columns are nanosecond counters divided by 1000). Append only.
+// names in hangTrace.cpp; *_us columns are nanosecond counters divided by 1000). Append only;
+// counters added after WrittenUploadLatePages are emitted at the end of the row, after the
+// compile columns, so that no existing column index moves.
 //   mem_write_faults / mem_read_faults   guest write/read faults handled by RenderContext
 //   mem_fault_us                         time inside RenderContext::HandleFault (both kinds)
 //   mem_protect_calls / _pages           host protection calls that remove write access

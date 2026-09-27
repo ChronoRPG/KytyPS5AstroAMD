@@ -524,6 +524,24 @@ enum class FrameEvent : uint32_t {
 	// log-mode certificate would have accepted stale bytes).
 	DrawPrepLogWouldReject,
 	DrawPrepLogMissed,
+	// New compute pipelines (graphics ones are GraphicsPipelinesCreated). Programs and pipelines
+	// are also recorded per compile in the hang trace (compiles.csv).
+	ComputePipelinesCreated,
+	// Program compiles run outside the exclusive programs lock: requests that waited for another
+	// thread's compile of the same source or permutation, and finished compiles dropped because an
+	// equal permutation had been published meanwhile.
+	ProgramCompileWaits,
+	ProgramCompileDuplicates,
+	// Program permutations specialized from a source's kept translation instead of translating
+	// the guest code again (KYTY_TRANSLATION_CACHE), and reused translations that
+	// KYTY_TRANSLATION_CACHE_VERIFY found different from a fresh one.
+	TranslationReuses,
+	TranslationVerifyMismatches,
+	// Graphics pipeline libraries (KYTY_PIPELINE_LIBRARY): pipelines fast-linked from libraries,
+	// monolithic pipelines found in the driver cache instead, and libraries created.
+	PipelineLibraryLinks,
+	PipelineLibraryCacheHits,
+	PipelineLibrariesCreated,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
@@ -588,6 +606,18 @@ enum class FrameWait : uint32_t {
 	DrawPrepCommitWait,
 	DrawPrepPrepare,
 	DrawPrepValidate,
+	// Phases of a new program permutation, nested in ShaderProgramMiss: TranslateProgram,
+	// CompileProgram (specialization + SPIR-V emission), spirv-val and vkCreateShaderModule.
+	ShaderTranslate,
+	ShaderEmit,
+	ShaderValidate,
+	ShaderModuleCreate,
+	// vkCreateGraphicsPipelines alone (nested in GraphicsPipelineCreate), and a whole new compute
+	// pipeline (layouts and vkCreateComputePipelines).
+	GraphicsPipelineDriver,
+	ComputePipelineCreate,
+	// Background optimized compiles replacing fast-linked pipelines (not on the GPU thread).
+	PipelineOptimize,
 	Count,
 };
 

@@ -771,6 +771,12 @@ struct Program: ResourcePlan {
 std::string ProgramToString(const Program& program);
 bool        HasShaderMemoryWrites(const Program& program);
 
+// Deep copy of a translated program (ir/ProgramClone.cpp); false when `source` references an
+// instruction or block it does not own. The pipeline cache specializes such copies instead of
+// translating a program source again (KYTY_TRANSLATION_CACHE). Adding a member to Program,
+// ResourcePlan, Block or Inst requires updating CloneProgram (its layout checks enforce it).
+[[nodiscard]] bool CloneProgram(const Program& source, Program& target);
+
 void  ValidateProgram(const Program& program, bool require_ssa);
 void  ResolveControlFlowIdentities(Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);

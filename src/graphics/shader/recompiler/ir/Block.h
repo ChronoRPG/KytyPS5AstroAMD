@@ -53,6 +53,10 @@ public:
 	std::array<Value, NumVectorRegs> ssa_vreg_values {};
 
 private:
+	// Copies every member (except the SSA scratch arrays above); update it (and its layout
+	// check) when adding one.
+	friend bool CloneProgram(const Program& source, Program& target);
+
 	InstructionList     instructions;
 	std::vector<Block*> predecessors;
 	std::vector<Block*> successors;

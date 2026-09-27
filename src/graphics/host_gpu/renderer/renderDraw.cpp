@@ -571,6 +571,40 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		shadow.stencil_valid = true;
 	}
 
+	if (PipelineDynamicRasterStateEnabled()) {
+		// Formerly pipeline-key fields (PipelineCache::GetGraphicsPipeline), from the same
+		// registers: rect lists are drawn without culling.
+		const bool        rect_list = Prospero::IsRectList(buffer.GetUserConfig().GetPrimType());
+		vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
+		if (!rect_list && mode.cull_back) {
+			cull_mode |= vk::CullModeFlagBits::eBack;
+		}
+		if (!rect_list && mode.cull_front) {
+			cull_mode |= vk::CullModeFlagBits::eFront;
+		}
+		if (recorder.Update(shadow.cull_mode, cull_mode)) {
+			vk_buffer.setCullMode(cull_mode);
+		}
+		const auto front_face =
+		    mode.face ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise;
+		if (recorder.Update(shadow.front_face, front_face)) {
+			vk_buffer.setFrontFace(front_face);
+		}
+#if !defined(__APPLE__)
+		const vk::Bool32 bounds_test = depth.depth_bounds_test_enable ? VK_TRUE : VK_FALSE;
+		if (recorder.Update(shadow.depth_bounds_test_enable, bounds_test)) {
+			vk_buffer.setDepthBoundsTestEnable(bounds_test);
+		}
+		if (depth.depth_bounds_test_enable) {
+			const std::array<float, 2> bounds {depth.depth_min_bounds, depth.depth_max_bounds};
+			if (recorder.Update(shadow.depth_bounds, bounds, shadow.depth_bounds_valid)) {
+				vk_buffer.setDepthBounds(bounds[0], bounds[1]);
+				shadow.depth_bounds_valid = true;
+			}
+		}
+#endif
+	}
+
 #if defined(__APPLE__)
 	// MoltenVK has no VK_EXT_color_write_enable; the pipeline is created without the
 	// eColorWriteEnableEXT dynamic state and relies on the static colorWriteMask instead.

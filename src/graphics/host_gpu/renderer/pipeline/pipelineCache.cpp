@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
@@ -14,9 +15,11 @@
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/pipeline/stagePrepWorker.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -26,19 +29,28 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <filesystem>
 #include <fmt/format.h>
 #include <limits>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <shared_mutex>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <stop_token>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -107,6 +119,239 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
 	message += '\n';
 	Log::WriteToConsoleAndLog(message);
+}
+
+// Cache file layout: DriverCacheSignature text, XXH3-64 of the payload, payload
+// (vkGetPipelineCacheData output). Fills `payload` and returns true only for a complete,
+// matching file within MaxDriverCacheFileSize.
+bool ReadDriverCacheFile(const std::filesystem::path& file_path, const std::string& signature,
+                         std::vector<uint8_t>& payload, bool log_invalid) {
+	payload.clear();
+	const auto   path = Common::PathToString(file_path);
+	Common::File file(file_path, Common::File::Mode::Read);
+	const auto   file_size = file.IsInvalid() ? 0 : file.Size();
+	if (file_size < signature.size() + sizeof(uint64_t) || file_size > MaxDriverCacheFileSize) {
+		file.Close();
+		if (log_invalid) {
+			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
+		}
+		return false;
+	}
+	std::string cached_signature(signature.size(), '\0');
+	uint64_t    payload_hash = 0;
+	payload.resize(file_size - signature.size() - sizeof(payload_hash));
+	uint32_t signature_read = 0;
+	uint32_t hash_read      = 0;
+	uint32_t payload_read   = 0;
+	file.Read(cached_signature.data(), static_cast<uint32_t>(cached_signature.size()),
+	          &signature_read);
+	file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
+	file.Read(payload.data(), static_cast<uint32_t>(payload.size()), &payload_read);
+	file.Close();
+	if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
+	    payload_read != payload.size() || cached_signature != signature ||
+	    XXH3_64bits(payload.data(), payload.size()) != payload_hash) {
+		payload.clear();
+		if (log_invalid) {
+			PipelineCacheLog(
+			    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)", path);
+		}
+		return false;
+	}
+	return true;
+}
+
+uint64_t EnvU64(const char* name, uint64_t default_value) {
+	const auto* value = std::getenv(name);
+	if (value == nullptr || *value == '\0') {
+		return default_value;
+	}
+	char*      end    = nullptr;
+	const auto parsed = std::strtoull(value, &end, 10);
+	return end != value ? parsed : default_value;
+}
+
+// When the background saver writes the driver cache (KYTY_PIPELINE_CACHE_SAVE=0 disables it and
+// leaves only the save at exit). A save needs at least MIN_NEW (32) pipelines created since the
+// last one and no new pipeline for SETTLE (2 s), so it does not compete with a compile burst; then
+// it runs when INTERVAL_S (60 s) have passed since the last save, or when a burst has ended
+// (QUIET_S = 10 s without new pipelines, at least 15 s after the last save: level loads and area
+// transitions). A steady trickle is saved after 3 intervals regardless of calm, and fewer than
+// MIN_NEW new pipelines after 5 intervals.
+struct DriverCacheSaveSettings {
+	bool     enabled     = true;
+	uint64_t min_new     = 32;
+	uint64_t interval_ns = 60'000'000'000ull;
+	uint64_t quiet_ns    = 10'000'000'000ull;
+	uint64_t settle_ns   = 2'000'000'000ull;
+
+	static const DriverCacheSaveSettings& Get() {
+		static const DriverCacheSaveSettings settings = [] {
+			DriverCacheSaveSettings s;
+			s.enabled     = EnvU64("KYTY_PIPELINE_CACHE_SAVE", 1) != 0;
+			s.min_new     = std::max<uint64_t>(1, EnvU64("KYTY_PIPELINE_CACHE_SAVE_MIN_NEW", 32));
+			s.interval_ns = EnvU64("KYTY_PIPELINE_CACHE_SAVE_INTERVAL_S", 60) * 1'000'000'000ull;
+			s.quiet_ns    = EnvU64("KYTY_PIPELINE_CACHE_SAVE_QUIET_S", 10) * 1'000'000'000ull;
+			return s;
+		}();
+		return settings;
+	}
+};
+
+// Compile-time accounting (stutter attribution). Every new program permutation and pipeline is
+// timed per phase and reported three ways: per compile in the hang trace (compiles.csv, and
+// per-second summary.csv columns), as Tracy aggregate FrameWaits, and as process totals printed
+// once when the cache is destroyed. Only compile (miss) paths read the clock.
+uint64_t CompileClockNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+struct CompileTotals {
+	std::atomic<uint64_t> programs {0};
+	std::atomic<uint64_t> translate_ns {0};
+	std::atomic<uint64_t> clone_ns {0};
+	std::atomic<uint64_t> translation_reuses {0};
+	std::atomic<uint64_t> emit_ns {0};
+	std::atomic<uint64_t> validate_ns {0};
+	std::atomic<uint64_t> validate_async {0};
+	std::atomic<uint64_t> validate_async_ns {0};
+	std::atomic<uint64_t> module_ns {0};
+	std::atomic<uint64_t> gfx_pipelines {0};
+	std::atomic<uint64_t> gfx_pipeline_ns {0};
+	std::atomic<uint64_t> gfx_new {0};
+	std::atomic<uint64_t> gfx_permutation {0};
+	std::atomic<uint64_t> gfx_variant {0};
+	std::atomic<uint64_t> cs_pipelines {0};
+	std::atomic<uint64_t> cs_pipeline_ns {0};
+	std::atomic<uint64_t> stalls {0};
+	std::atomic<uint64_t> stall_ns {0};
+	std::atomic<uint64_t> stall_max_ns {0};
+	// Pipeline libraries (6/7).
+	std::atomic<uint64_t> gpl_cache_hits {0};
+	std::atomic<uint64_t> gpl_links {0};
+	std::atomic<uint64_t> gpl_link_ns {0};
+	std::atomic<uint64_t> gpl_monolithic {0};
+	std::atomic<uint64_t> gpl_libraries {0};
+	std::atomic<uint64_t> gpl_library_ns {0};
+	std::atomic<uint64_t> gpl_optimized {0};
+	std::atomic<uint64_t> gpl_optimize_ns {0};
+};
+CompileTotals g_compile_totals;
+
+void AtomicMax(std::atomic<uint64_t>& target, uint64_t value) {
+	auto current = target.load(std::memory_order_relaxed);
+	while (value > current &&
+	       !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+	}
+}
+
+// Compile time this thread spent for the draw or dispatch it is preparing. Program compiles add
+// to it; the pipeline lookup that completes the draw adds its own compile and reports the sum as
+// one stall, so compile_stall_max_us is the worst per-draw hitch rather than per compile.
+thread_local uint64_t t_pending_compile_stall_ns = 0;
+
+void AddCompileStall(uint64_t ns) {
+	t_pending_compile_stall_ns += ns;
+}
+
+void FlushCompileStall() {
+	const auto ns = t_pending_compile_stall_ns;
+	if (ns == 0) {
+		return;
+	}
+	t_pending_compile_stall_ns = 0;
+	g_compile_totals.stalls.fetch_add(1, std::memory_order_relaxed);
+	g_compile_totals.stall_ns.fetch_add(ns, std::memory_order_relaxed);
+	AtomicMax(g_compile_totals.stall_max_ns, ns);
+	HangTrace::RecordCompileStall(ns);
+}
+
+// Phase times of one new program permutation. clone_ns is the copy of a kept translation (reused)
+// or the copy kept after translating (item 5, KYTY_TRANSLATION_CACHE).
+struct ProgramCompileTimes {
+	uint64_t translate_ns = 0;
+	uint64_t clone_ns     = 0;
+	uint64_t emit_ns      = 0;
+	uint64_t validate_ns  = 0;
+	uint64_t module_ns    = 0;
+	uint64_t spirv_words  = 0;
+	bool     reused       = false;
+};
+
+void RecordProgramCompile(const char* stage_name, uint64_t guest_hash, uint64_t id,
+                          const ProgramCompileTimes& times, uint64_t total_ns,
+                          std::string_view detail) {
+	auto& totals = g_compile_totals;
+	totals.programs.fetch_add(1, std::memory_order_relaxed);
+	totals.translate_ns.fetch_add(times.translate_ns, std::memory_order_relaxed);
+	totals.clone_ns.fetch_add(times.clone_ns, std::memory_order_relaxed);
+	if (times.reused) totals.translation_reuses.fetch_add(1, std::memory_order_relaxed);
+	totals.emit_ns.fetch_add(times.emit_ns, std::memory_order_relaxed);
+	totals.validate_ns.fetch_add(times.validate_ns, std::memory_order_relaxed);
+	totals.module_ns.fetch_add(times.module_ns, std::memory_order_relaxed);
+	Profiler::AddFrameWait(Profiler::FrameWait::ShaderTranslate, 1, times.translate_ns);
+	Profiler::AddFrameWait(Profiler::FrameWait::ShaderEmit, 1, times.emit_ns);
+	if (times.validate_ns != 0) {
+		Profiler::AddFrameWait(Profiler::FrameWait::ShaderValidate, 1, times.validate_ns);
+	}
+	Profiler::AddFrameWait(Profiler::FrameWait::ShaderModuleCreate, 1, times.module_ns);
+	if (HangTrace::Enabled()) {
+		HangTrace::RecordCompile({.kind         = HangTrace::CompileKind::Program,
+		                          .stage        = stage_name,
+		                          .guest_hash   = guest_hash,
+		                          .id           = id,
+		                          .translate_ns = times.translate_ns,
+		                          .emit_ns      = times.emit_ns,
+		                          .validate_ns  = times.validate_ns,
+		                          .module_ns    = times.module_ns,
+		                          .total_ns     = total_ns,
+		                          .spirv_words  = times.spirv_words,
+		                          .detail       = detail,
+		                          .clone_ns     = times.clone_ns,
+		                          .reused       = times.reused});
+	}
+}
+
+double LoadMs(const std::atomic<uint64_t>& ns) {
+	return static_cast<double>(ns.load(std::memory_order_relaxed)) / 1.0e6;
+}
+
+void LogCompileTotals() {
+	const auto& t        = g_compile_totals;
+	const auto  ms       = LoadMs;
+	const auto programs  = t.programs.load(std::memory_order_relaxed);
+	const auto pipelines = t.gfx_pipelines.load(std::memory_order_relaxed);
+	const auto compute   = t.cs_pipelines.load(std::memory_order_relaxed);
+	if (programs == 0 && pipelines == 0 && compute == 0) {
+		return;
+	}
+	PipelineCacheLog("Compile totals: {} programs (translate {:.1f} ms, {} reused translations, "
+	                 "copies {:.1f} ms, emit {:.1f} ms, validate {:.1f} ms, background validation "
+	                 "{} in {:.1f} ms, module {:.1f} ms); {} graphics pipelines in {:.1f} ms (new "
+	                 "{}, permutation {}, variant {}); {} compute pipelines in {:.1f} ms; {} stalls "
+	                 "totalling {:.1f} ms, worst {:.1f} ms",
+	                 programs, ms(t.translate_ns),
+	                 t.translation_reuses.load(std::memory_order_relaxed), ms(t.clone_ns),
+	                 ms(t.emit_ns), ms(t.validate_ns),
+	                 t.validate_async.load(std::memory_order_relaxed), ms(t.validate_async_ns),
+	                 ms(t.module_ns), pipelines, ms(t.gfx_pipeline_ns),
+	                 t.gfx_new.load(std::memory_order_relaxed),
+	                 t.gfx_permutation.load(std::memory_order_relaxed),
+	                 t.gfx_variant.load(std::memory_order_relaxed), compute, ms(t.cs_pipeline_ns),
+	                 t.stalls.load(std::memory_order_relaxed), ms(t.stall_ns), ms(t.stall_max_ns));
+	const auto links      = t.gpl_links.load(std::memory_order_relaxed);
+	const auto cache_hits = t.gpl_cache_hits.load(std::memory_order_relaxed);
+	const auto monolithic = t.gpl_monolithic.load(std::memory_order_relaxed);
+	if (links != 0 || cache_hits != 0 || monolithic != 0) {
+		PipelineCacheLog("Pipeline libraries: {} linked ({:.1f} ms), {} driver-cache hits, {} "
+		                 "monolithic, {} libraries ({:.1f} ms), {} optimized in background "
+		                 "({:.1f} ms)",
+		                 links, ms(t.gpl_link_ns), cache_hits, monolithic,
+		                 t.gpl_libraries.load(std::memory_order_relaxed), ms(t.gpl_library_ns),
+		                 t.gpl_optimized.load(std::memory_order_relaxed), ms(t.gpl_optimize_ns));
+	}
 }
 
 struct ShaderReadAttempt {
@@ -648,6 +893,83 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+// Background spirv-val (KYTY_SHADER_VALIDATION_ASYNC, default on; only when
+// shader_validation_enabled is set). spirv-val cost 11.7 ms per shader on average (median 5.2 ms,
+// up to 235 ms for a 1.45 MB module) over 248 SPIR-V modules dumped from Astro Bot, and grows
+// with module size, which the mip-statistics instrumentation raised. It ran on the compiling
+// draw's thread before vkCreateShaderModule. Here the compile path creates the module and hands
+// the words to this thread, which validates them in order and stops the emulator on the first
+// invalid module exactly as before (same log, dump and EXIT message). Validation still covers
+// every module; the difference is that the driver may receive an invalid module before the
+// report. KYTY_SHADER_VALIDATION_ASYNC=0 validates synchronously again.
+class SpirvValidator {
+public:
+	SpirvValidator() {
+		m_thread = std::jthread([this](std::stop_token stop) { Run(stop); });
+	}
+	~SpirvValidator() {
+		// Pending modules are abandoned at shutdown.
+		m_thread.request_stop();
+		m_wake.notify_all();
+	}
+	SpirvValidator(const SpirvValidator&)            = delete;
+	SpirvValidator& operator=(const SpirvValidator&) = delete;
+
+	static bool AsyncEnabled() {
+		static const bool enabled = EnvU64("KYTY_SHADER_VALIDATION_ASYNC", 1) != 0;
+		return enabled;
+	}
+
+	void Submit(const char* label, const char* stage_name, uint64_t shader_hash,
+	            std::vector<uint32_t> spirv) {
+		{
+			std::scoped_lock lock(m_mutex);
+			m_jobs.push_back({label, stage_name, shader_hash, std::move(spirv)});
+		}
+		m_wake.notify_one();
+	}
+
+private:
+	struct Job {
+		const char*           label      = nullptr; // string literals
+		const char*           stage_name = nullptr;
+		uint64_t              shader_hash = 0;
+		std::vector<uint32_t> spirv;
+	};
+
+	void Run(const std::stop_token& stop) {
+		Profiler::SetThreadName("SpirvValidator");
+		for (;;) {
+			Job job;
+			{
+				std::unique_lock lock(m_mutex);
+				if (!m_wake.wait(lock, stop, [this] { return !m_jobs.empty(); })) {
+					return;
+				}
+				job = std::move(m_jobs.front());
+				m_jobs.pop_front();
+			}
+			const auto begin = CompileClockNs();
+			const bool valid = ValidateShaderSpirv(job.label, job.shader_hash, job.spirv);
+			const auto ns    = CompileClockNs() - begin;
+			g_compile_totals.validate_async.fetch_add(1, std::memory_order_relaxed);
+			g_compile_totals.validate_async_ns.fetch_add(ns, std::memory_order_relaxed);
+			Profiler::AddFrameWait(Profiler::FrameWait::ShaderValidate, 1, ns);
+			HangTrace::RecordShaderValidation(ns);
+			if (!valid) {
+				DumpShaderSpirv(job.stage_name, job.shader_hash, job.spirv);
+				EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", job.label,
+				     job.shader_hash);
+			}
+		}
+	}
+
+	std::mutex                  m_mutex;
+	std::condition_variable_any m_wake;
+	std::deque<Job>             m_jobs;
+	std::jthread                m_thread; // Last: joined before the members it uses go away.
+};
+
 } // namespace
 
 struct PipelineCache::Permutation {
@@ -660,10 +982,13 @@ struct PipelineCache::Permutation {
 
 // Program preparation is split into a shared lookup (FindSource), a pure per-draw
 // materialization into caller-owned StagePrep (MaterializeStage), a lock-free permutation
-// lookup (FindPermutation) and an exclusive compile path (CompileAndPublish). Get composes them
-// serially. Invariants:
+// lookup (FindPermutation) and a compile path (CompileAndPublish) that takes m_programs_mutex
+// exclusively only around its lookups, its in-flight registration and its publication, and
+// translates and compiles unlocked. Get composes them serially. Invariants:
 // - `programs` nodes are never erased or moved, so a SourceEntry* stays valid for the cache
 //   lifetime. Finds take m_programs_mutex shared; inserts take it exclusively.
+// - A source or permutation being compiled is listed in `in_flight`; other threads needing the
+//   same one wait for it (compile_done) instead of compiling a second copy.
 // - A SourceEntry's plan, key and dependency list are immutable once inserted.
 // - Permutations are append-only with stable addresses (PermutationList).
 // - Only the O15 reuse state (KYTY_RESOURCE_REUSE) mutates an entry after insertion; it is
@@ -756,6 +1081,72 @@ struct PipelineCache::ProgramCache {
 		size_t                       next_victim = 0;
 	};
 
+	// Translation reuse (KYTY_TRANSLATION_CACHE, default on). TranslateProgram is a function of
+	// the guest code and the ProgramKey fields (the static key covers every input-info field it
+	// reads, which is also what makes reusing a source's permutations across draws exact), so a
+	// source's first translation, kept unmodified, can stand in for translating it again: each
+	// further permutation specializes a deep copy (IR::CloneProgram) instead of re-running decode,
+	// CFG structurization, IR translation and the IR passes. Kept translations are bounded by
+	// KYTY_TRANSLATION_CACHE_MB (default 256) of estimated IR, least recently used evicted first.
+	struct KeptTranslation {
+		ShaderRecompiler::TranslateResult translated;
+		size_t                            bytes = 0;
+	};
+
+	static bool TranslationCacheEnabled() {
+		static const bool enabled = EnvU64("KYTY_TRANSLATION_CACHE", 1) != 0;
+		return enabled;
+	}
+
+	// KYTY_TRANSLATION_CACHE_VERIFY: unset/0 off; 1 compiles every reused permutation also from a
+	// fresh translation and compares SPIR-V and shader metadata, using the fresh one and dropping
+	// the source's kept translation on a difference; "exit" stops the emulator on the first.
+	static int TranslationVerifyMode() {
+		static const int mode = [] {
+			const auto* value = std::getenv("KYTY_TRANSLATION_CACHE_VERIFY");
+			if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) return 0;
+			return std::strcmp(value, "exit") == 0 ? 2 : 1;
+		}();
+		return mode;
+	}
+
+	static size_t TranslationCacheBudget() {
+		static const size_t bytes = EnvU64("KYTY_TRANSLATION_CACHE_MB", 256) * 1024u * 1024u;
+		return bytes;
+	}
+
+	// Deep copy of a translation; false when the program cannot be copied (see CloneProgram).
+	static bool CopyTranslation(const ShaderRecompiler::TranslateResult& from,
+	                            ShaderRecompiler::TranslateResult&       to) {
+		if (!ShaderRecompiler::IR::CloneProgram(from.program, to.program)) return false;
+		to.decoded_dump  = from.decoded_dump;
+		to.cfg_dump      = from.cfg_dump;
+		to.skip_dispatch = from.skip_dispatch;
+		return true;
+	}
+
+	// Approximate heap footprint of a kept translation, for the budget.
+	static size_t EstimateTranslationBytes(const ShaderRecompiler::TranslateResult& translated) {
+		using namespace ShaderRecompiler::IR;
+		const auto& program = translated.program;
+		const auto  inst_bytes = [](const Inst& inst) {
+			return sizeof(Inst) + 2 * sizeof(void*) + inst.NumArgs() * sizeof(Value) +
+			       inst.UseCount() * sizeof(Use) + inst.NumPhiBlocks() * sizeof(Block*);
+		};
+		size_t bytes = sizeof(KeptTranslation) + translated.decoded_dump.size() +
+		               translated.cfg_dump.size();
+		for (const auto& block: program.block_storage) {
+			bytes += sizeof(Block);
+			for (const auto& inst: *block) bytes += inst_bytes(inst);
+		}
+		for (const auto& inst: program.value_storage) bytes += inst_bytes(inst);
+		bytes += program.descriptor_sources.size() * sizeof(DescriptorSource) +
+		         program.block_info.size() * sizeof(BlockInfo) +
+		         program.memory_info.size() * sizeof(MemoryInfo) +
+		         program.evaluation_recipes.size() * sizeof(ResourcePlan::EvaluationRecipe);
+		return bytes;
+	}
+
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
 		    : resource_plan(std::move(plan)) {
@@ -794,6 +1185,12 @@ struct PipelineCache::ProgramCache {
 		std::atomic<bool>                  skip_dispatch {false};
 		// Mutated in place by reuse-mode refreshes; only touched under m_reuse_mutex.
 		mutable ReuseState                 reuse;
+		// The source's unmodified translation for further permutations (KYTY_TRANSLATION_CACHE),
+		// and its place in kept_lru. Guarded by m_programs_mutex; readers copy the pointer.
+		std::shared_ptr<const KeptTranslation> kept_translation;
+		std::list<SourceEntry*>::iterator      kept_position;
+		// Set when a reused translation failed verification: always translate this source.
+		bool                                   kept_disabled = false;
 	};
 
 	// The last source found per stage by this thread and the permutation it last matched.
@@ -931,42 +1328,75 @@ struct PipelineCache::ProgramCache {
 
 	static constexpr std::size_t MaxStaticKeyWords = 13 + ShaderVertexInputInfo::RES_MAX * 13;
 
+	static const char* ProgramStageName(ShaderType stage) {
+		switch (stage) {
+			case ShaderType::Vertex: return "vs";
+			case ShaderType::Mesh: return "ms";
+			case ShaderType::Local: return "ls";
+			case ShaderType::TessellationControl: return "hs";
+			case ShaderType::TessellationEvaluation: return "ds";
+			case ShaderType::Pixel: return "ps";
+			case ShaderType::Compute: return "cs";
+			default: EXIT("invalid pipeline shader stage\n");
+		}
+		return "";
+	}
+
 	Permutation CompilePermutation(const ShaderParams&                          params,
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword,
-	                               std::span<const uint32_t> static_state) {
-		const char* stage_name = nullptr;
-		switch (options.stage) {
-			case ShaderType::Vertex: stage_name = "vs"; break;
-			case ShaderType::Mesh: stage_name = "ms"; break;
-			case ShaderType::Local: stage_name = "ls"; break;
-			case ShaderType::TessellationControl: stage_name = "hs"; break;
-			case ShaderType::TessellationEvaluation: stage_name = "ds"; break;
-			case ShaderType::Pixel: stage_name = "ps"; break;
-			case ShaderType::Compute: stage_name = "cs"; break;
-			default: EXIT("invalid pipeline shader stage\n");
+	                               std::span<const uint32_t> static_state,
+	                               ProgramCompileTimes&      times) {
+		const char* stage_name = ProgramStageName(options.stage);
+		const auto  emit_begin = CompileClockNs();
+		ShaderRecompiler::CompileResult result;
+		{
+			KYTY_PROFILER_BLOCK("Shader::Emit");
+			result = ShaderRecompiler::CompileProgram(std::move(translated), options,
+			                                          specialization, push_data_start_dword);
 		}
-		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-		                                               specialization, push_data_start_dword);
+		times.emit_ns     = CompileClockNs() - emit_begin;
+		times.spirv_words = result.spirv.size();
 		DumpMatchedShaderInputs(params, options, stage_name, static_state,
 		                        push_data_start_dword, result.spirv, result.ir_dump);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
-			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
-			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
-			     options.shader_hash);
+		if (validator == nullptr) {
+			const auto validate_begin = CompileClockNs();
+			bool       valid          = false;
+			{
+				KYTY_PROFILER_BLOCK("Shader::Validate");
+				valid = ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv);
+			}
+			if (Config::ShaderValidationEnabled()) {
+				times.validate_ns = CompileClockNs() - validate_begin;
+			}
+			if (!valid) {
+				DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+				EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n",
+				     options.dump_label, options.shader_hash);
+			}
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
-		const auto module = CompileSPV(result.spirv, device);
+		const auto       module_begin = CompileClockNs();
+		vk::ShaderModule module       = nullptr;
+		{
+			KYTY_PROFILER_BLOCK("Shader::CreateModule");
+			module = CompileSPV(result.spirv, device);
+		}
+		times.module_ns = CompileClockNs() - module_begin;
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
-		const auto id = ++next_shader_id;
+		if (validator != nullptr) {
+			validator->Submit(options.dump_label, stage_name, options.shader_hash,
+			                  std::move(result.spirv));
+		}
+		const auto id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
 		GpuOpProfiler::RegisterShader(id, stage_name, options.shader_hash);
 		return {
 		    .specialization = std::move(specialization),
@@ -1163,10 +1593,166 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
+	// A compile running outside m_programs_mutex. While `source` is null the thread is translating
+	// a source that is not in `programs` yet (covers every request with an equal key); once it is
+	// set and `specialization_known`, it covers only that permutation request, and before that
+	// every permutation of the source. Records live on the compiling thread's stack and are
+	// listed in `in_flight`, both guarded by m_programs_mutex.
+	struct InFlightCompile {
+		ProgramKey                                   key;
+		const SourceEntry*                           source               = nullptr;
+		bool                                         specialization_known = false;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		uint32_t                                     push_data_cursor = 0;
+
+		[[nodiscard]] bool CoversSource(const ProgramKey& other) const {
+			return source == nullptr && key == other;
+		}
+		[[nodiscard]] bool CoversPermutation(
+		    const SourceEntry* other, const ShaderRecompiler::IR::ResourceSpecialization& spec,
+		    uint32_t cursor) const {
+			return source == other &&
+			       (!specialization_known ||
+			        (push_data_cursor == cursor && specialization == spec));
+		}
+	};
+
+	// Requires m_programs_mutex exclusively (held by `lock`). Waits while `covered` holds for an
+	// in-flight compile and returns whether it waited (the caller then repeats its lookup).
+	template <typename Covered>
+	bool WaitForInFlight(std::unique_lock<std::shared_mutex>& lock, Covered&& covered) {
+		const auto busy = [&] {
+			return std::any_of(in_flight.begin(), in_flight.end(),
+			                   [&](const InFlightCompile* record) { return covered(*record); });
+		};
+		if (!busy()) {
+			return false;
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ProgramCompileWaits);
+		compile_done.wait(lock, [&] { return !busy(); });
+		return true;
+	}
+
+	// Translations dropped under m_programs_mutex. The caller frees them after releasing the lock:
+	// freeing a large IR program takes long enough to delay shared-lock readers (draw-prep
+	// workers' FindSource) if done under it.
+	using DroppedTranslations = std::vector<std::shared_ptr<const KeptTranslation>>;
+
+	// Requires m_programs_mutex exclusively. Keeps `kept` for `source` (unless it already has one
+	// or verification disabled it) and evicts least recently used translations over the budget.
+	void KeepTranslation(SourceEntry& source, std::shared_ptr<const KeptTranslation> kept,
+	                     DroppedTranslations& dropped) {
+		if (kept == nullptr) return;
+		if (source.kept_translation != nullptr || source.kept_disabled) {
+			dropped.push_back(std::move(kept));
+			return;
+		}
+		kept_bytes += kept->bytes;
+		source.kept_translation = std::move(kept);
+		source.kept_position    = kept_lru.insert(kept_lru.end(), &source);
+		while (kept_bytes > TranslationCacheBudget() && !kept_lru.empty()) {
+			ForgetTranslation(*kept_lru.front(), dropped);
+		}
+	}
+
+	// Requires m_programs_mutex exclusively. Threads already copying it keep their reference.
+	void ForgetTranslation(SourceEntry& source, DroppedTranslations& dropped) {
+		if (source.kept_translation == nullptr) return;
+		kept_bytes -= source.kept_translation->bytes;
+		dropped.push_back(std::move(source.kept_translation)); // Leaves it empty.
+		kept_lru.erase(source.kept_position);
+	}
+
+	// Requires m_programs_mutex exclusively.
+	void TouchTranslation(SourceEntry& source) {
+		kept_lru.splice(kept_lru.end(), kept_lru, source.kept_position);
+	}
+
+	// KYTY_TRANSLATION_CACHE_VERIFY: compiles the permutation from a copy of `kept` and from a
+	// fresh translation and compares the outputs that reach the GPU and the renderer.
+	bool VerifyKeptTranslation(const ShaderParams& params,
+	                           const ShaderRecompiler::CompileOptions& options,
+	                           const KeptTranslation& kept,
+	                           const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                           uint32_t push_data_cursor) {
+		ShaderRecompiler::TranslateResult copy;
+		if (!CopyTranslation(kept.translated, copy)) return false;
+		auto reused = ShaderRecompiler::CompileProgram(std::move(copy), options, specialization,
+		                                               push_data_cursor);
+		auto fresh_translation = ShaderRecompiler::TranslateProgram(params.code, options);
+		auto fresh = ShaderRecompiler::CompileProgram(std::move(fresh_translation), options,
+		                                              specialization, push_data_cursor);
+		const auto a    = std::move(reused.program).TakeCompiledInfo();
+		const auto b    = std::move(fresh.program).TakeCompiledInfo();
+		const bool same = reused.spirv == fresh.spirv && a.stage == b.stage &&
+		                  a.shader_hash == b.shader_hash && a.wave_size == b.wave_size &&
+		                  a.user_data_base == b.user_data_base &&
+		                  a.user_data_count == b.user_data_count &&
+		                  a.scratch_dwords == b.scratch_dwords &&
+		                  a.param_export_mask == b.param_export_mask &&
+		                  a.has_address_writes == b.has_address_writes && a.info == b.info &&
+		                  a.bindings == b.bindings && a.write_ranges == b.write_ranges;
+		if (same) {
+			return true;
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TranslationVerifyMismatches);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+			PipelineCacheLog("Translation cache: reused translation of {} 0x{:016x} differs from a "
+			                 "fresh one (SPIR-V {} vs {} words); using the fresh translation",
+			                 ProgramStageName(options.stage), options.shader_hash,
+			                 reused.spirv.size(), fresh.spirv.size());
+		}
+		if (TranslationVerifyMode() == 2) {
+			EXIT("Translation cache: reused translation differs from a fresh one (0x%016" PRIx64
+			     ")\n",
+			     options.shader_hash);
+		}
+		return false;
+	}
+
+	// Requires m_programs_mutex exclusively. Idempotent.
+	void FinishInFlight(InFlightCompile& record) {
+		if (std::erase(in_flight, &record) != 0) {
+			compile_done.notify_all();
+		}
+	}
+
+	// Unregisters `record` on every exit from the unlocked compile (including unwinding), so a
+	// waiter can never observe a record whose owner is gone.
+	struct InFlightScope {
+		InFlightScope(ProgramCache& owner, InFlightCompile& compile,
+		              std::unique_lock<std::shared_mutex>& programs_lock)
+		    : cache(owner), record(compile), lock(programs_lock) {}
+		ProgramCache&                        cache;
+		InFlightCompile&                     record;
+		std::unique_lock<std::shared_mutex>& lock;
+		~InFlightScope() {
+			if (!lock.owns_lock()) {
+				lock.lock();
+			}
+			cache.FinishInFlight(record);
+		}
+		InFlightScope(const InFlightScope&)            = delete;
+		InFlightScope& operator=(const InFlightScope&) = delete;
+	};
+
 	// The compile path: translates, inserts a new source, materializes it into `prep` when
 	// `prep` was not prepared from an existing entry, compiles and publishes the permutation.
-	// Holds m_programs_mutex exclusively throughout, which serializes all compiles. Returns
-	// null for skip-dispatch shaders and for a failed materialization.
+	// Returns null for skip-dispatch shaders and for a failed materialization.
+	//
+	// Locking (draw-prep S2 noted that compiles held m_programs_mutex exclusively throughout,
+	// blocking every FindSource): the exclusive lock is now held only to look up, to register the
+	// compile in `in_flight`, and to insert the new source and publish the permutation.
+	// Translation, resource-plan extraction, materialization, SPIR-V emission, validation and
+	// module creation run unlocked, so FindSource on other threads (draw-prep workers) proceeds
+	// and independent compiles run in parallel. A second thread that needs the same source or
+	// permutation waits for the first (compile_done) instead of compiling it again. Publication
+	// re-checks FindPermutation, so permutations stay unique per (specialization, push start),
+	// which LookupMemo relies on. No mutex was added: the lock order stays m_reuse_mutex (reuse
+	// mode only, held by the caller for the whole Get) before m_programs_mutex; the wait releases
+	// m_programs_mutex. In reuse mode m_reuse_mutex serializes all preparation, so no other
+	// thread can own an in-flight record there and nothing ever waits.
 	template <typename InputInfo>
 	const Permutation* CompileAndPublish(const ShaderParams& params, InputInfo& input_info,
 	                                     uint32_t push_data_cursor, const ProgramKey& key,
@@ -1177,25 +1763,69 @@ struct PipelineCache::ProgramCache {
 		// Cache hits returned before this. This covers translation through native shader-module
 		// creation; readiness failures can retry, so count successful creations separately.
 		Profiler::ScopedFrameWait shader_miss(Profiler::FrameWait::ShaderProgramMiss);
-		std::unique_lock lock(m_programs_mutex);
+		// Everything from here on, lock and in-flight waits included, is compile time of the
+		// waiting draw.
+		struct StallScope {
+			uint64_t begin = CompileClockNs();
+			~StallScope() { AddCompileStall(CompileClockNs() - begin); }
+		} stall;
 		const auto publish_index = [&](const SourceEntry& source, const Permutation& permutation) {
 			if (ResourceReuseEnabled()) source.reuse.current.permutation_index = permutation.index;
 			return &permutation;
 		};
-		// Another preparer may have inserted or compiled this source since the shared lookup.
-		auto entry = programs.find(key);
-		if (entry != programs.end()) {
-			if (entry->second.skip_dispatch.load(std::memory_order_relaxed)) return nullptr;
-			if (!prep_materialized &&
-			    !Materialize(entry->second, runtime, evaluation, scratch, prep, read_attempt)) {
-				return nullptr;
+		// Declared before `lock`, so destroyed after it is released on every return.
+		DroppedTranslations dropped;
+		std::unique_lock    lock(m_programs_mutex);
+		SourceEntry*        source = nullptr;
+		for (;;) {
+			// Another preparer may have inserted or compiled this source since the shared lookup.
+			const auto entry = programs.find(key);
+			if (entry == programs.end()) {
+				if (WaitForInFlight(lock, [&](const InFlightCompile& record) {
+					    return record.CoversSource(key);
+				    })) {
+					continue;
+				}
+				break;
 			}
-			prep_materialized = true;
-			if (const auto* published = FindPermutation(entry->second, prep.specialization,
-			                                            push_data_cursor, true)) {
-				return publish_index(entry->second, *published);
+			source = &entry->second;
+			if (source->skip_dispatch.load(std::memory_order_relaxed)) return nullptr;
+			if (!prep_materialized) {
+				// The plan is sealed and never mutated here (reuse-mode state is guarded by
+				// m_reuse_mutex, held by the caller), so this needs no programs lock.
+				lock.unlock();
+				const bool materialized =
+				    Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
+				lock.lock();
+				if (!materialized) return nullptr;
+				prep_materialized = true;
 			}
+			if (const auto* published =
+			        FindPermutation(*source, prep.specialization, push_data_cursor, true)) {
+				return publish_index(*source, *published);
+			}
+			if (WaitForInFlight(lock, [&](const InFlightCompile& record) {
+				    return record.CoversPermutation(source, prep.specialization, push_data_cursor);
+			    })) {
+				continue;
+			}
+			break;
 		}
+		InFlightCompile record;
+		record.key.stage           = key.stage;
+		record.key.hash            = key.hash;
+		record.key.user_data_count = key.user_data_count;
+		record.key.code_size       = key.code_size;
+		record.key.static_state    = key.static_state;
+		record.source              = source;
+		record.push_data_cursor    = push_data_cursor;
+		if (source != nullptr) {
+			record.specialization       = prep.specialization;
+			record.specialization_known = true;
+		}
+		in_flight.push_back(&record);
+		const InFlightScope in_flight_scope(*this, record, lock);
+		lock.unlock();
 
 		const auto stage = key.stage;
 		ShaderStageInputInfo stage_input {};
@@ -1237,38 +1867,164 @@ struct PipelineCache::ProgramCache {
 		} else {
 			options.wave_size = input_info.wave_size;
 		}
-		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
-		if (translated.skip_dispatch) {
-			entry = programs.try_emplace(key, ShaderRecompiler::IR::ResourcePlan {}).first;
-			entry->second.skip_dispatch.store(true, std::memory_order_relaxed);
-			return nullptr;
+		ProgramCompileTimes               times;
+		ShaderRecompiler::TranslateResult translated;
+		// An existing source's kept translation replaces translating the guest code again.
+		std::shared_ptr<const KeptTranslation> kept;
+		if (source != nullptr && TranslationCacheEnabled()) {
+			lock.lock();
+			kept = source->kept_translation;
+			if (kept != nullptr) TouchTranslation(*source);
+			lock.unlock();
 		}
-		if (entry == programs.end()) {
-			entry = programs.try_emplace(key,
-			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			if (!Materialize(entry->second, runtime, evaluation, scratch, prep, read_attempt)) {
-				return nullptr;
+		if (kept != nullptr) {
+			const auto clone_begin = CompileClockNs();
+			{
+				KYTY_PROFILER_BLOCK("Shader::CopyTranslation");
+				times.reused = CopyTranslation(kept->translated, translated);
+			}
+			if (times.reused && TranslationVerifyMode() != 0 &&
+			    !VerifyKeptTranslation(params, options, *kept, prep.specialization,
+			                           push_data_cursor)) {
+				times.reused = false;
+				lock.lock();
+				ForgetTranslation(*source, dropped);
+				source->kept_disabled = true;
+				lock.unlock();
+			}
+			times.clone_ns = CompileClockNs() - clone_begin;
+		}
+		// Released unlocked: it may be the last reference to a translation evicted meanwhile.
+		const bool had_kept = kept != nullptr;
+		kept.reset();
+		std::shared_ptr<KeptTranslation> keep;
+		if (!times.reused) {
+			const auto translate_begin = CompileClockNs();
+			{
+				KYTY_PROFILER_BLOCK("Shader::Translate");
+				translated = ShaderRecompiler::TranslateProgram(params.code, options);
+			}
+			times.translate_ns = CompileClockNs() - translate_begin;
+			// Keep an unmodified copy for this source's later permutations, taken before
+			// anything below (plan extraction, specialization) reads or changes the program.
+			if (TranslationCacheEnabled() && !had_kept && !translated.skip_dispatch) {
+				const auto copy_begin = CompileClockNs();
+				auto       copy       = std::make_shared<KeptTranslation>();
+				if (CopyTranslation(translated, copy->translated)) {
+					copy->bytes = EstimateTranslationBytes(copy->translated);
+					keep        = std::move(copy);
+				}
+				times.clone_ns = CompileClockNs() - copy_begin;
 			}
 		}
-		const auto& permutation = entry->second.permutations.Append(CompilePermutation(
-		    params, options, std::move(translated), prep.specialization, push_data_cursor,
-		    entry->first.static_state));
-		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderProgramsCreated);
-
-		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
-		for (const auto& [program_key, source]: programs) {
-			counts[static_cast<size_t>(program_key.stage)] += source.permutations.Size();
+		if (translated.skip_dispatch) {
+			lock.lock();
+			// An existing source never reaches here: it would have skip_dispatch set already.
+			const auto entry = programs.try_emplace(key, ShaderRecompiler::IR::ResourcePlan {}).first;
+			entry->second.skip_dispatch.store(true, std::memory_order_relaxed);
+			FinishInFlight(record);
+			return nullptr;
 		}
+		if (source == nullptr) {
+			// Pure function of the translated program; no lock needed.
+			auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			lock.lock();
+			// Nobody else inserts this key while `record` covers it.
+			source        = &programs.try_emplace(key, std::move(plan)).first->second;
+			record.source = source; // Still covers every permutation of it.
+			KeepTranslation(*source, std::move(keep), dropped);
+			lock.unlock();
+			dropped.clear();
+			const bool materialized =
+			    Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
+			lock.lock();
+			if (!materialized) {
+				FinishInFlight(record);
+				return nullptr;
+			}
+			// No other thread can have compiled a permutation of this source: they all waited on
+			// `record`, which covered the whole source until now.
+			record.specialization       = prep.specialization;
+			record.specialization_known = true;
+			compile_done.notify_all(); // Other permutations of the source may proceed.
+			lock.unlock();
+		}
+		auto compiled = CompilePermutation(params, options, std::move(translated),
+		                                   prep.specialization, push_data_cursor,
+		                                   key.static_state, times);
+		lock.lock();
+		// An existing source that had none kept. Anything dropped is freed after the lock.
+		KeepTranslation(*source, std::move(keep), dropped);
+		if (const auto* published =
+		        FindPermutation(*source, prep.specialization, push_data_cursor, true)) {
+			// Only possible when another cursor mapped to the same push-data start (both
+			// NoStart): keep permutations unique and drop this equal copy.
+			device.destroyShaderModule(compiled.handle.module, nullptr);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ProgramCompileDuplicates);
+			FinishInFlight(record);
+			return publish_index(*source, *published);
+		}
+		// Why this permutation was needed (compiles.csv): the source's first, only another
+		// push-data start of an existing specialization, or a new specialization.
+		bool same_specialization = false;
+		source->permutations.ForEach([&](const Permutation& existing) {
+			same_specialization |= existing.specialization == prep.specialization;
+		});
+		const char* reason = source->permutations.Size() == 0 ? "first"
+		                     : same_specialization            ? "push"
+		                                                      : "spec";
+		const auto& permutation = source->permutations.Append(std::move(compiled));
+		FinishInFlight(record);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderProgramsCreated);
+		if (times.reused) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TranslationReuses);
+		}
+		const auto detail = fmt::format("{}{}", reason, times.reused ? "+reused" : "");
+		RecordProgramCompile(ProgramStageName(stage), params.hash, permutation.handle.id, times,
+		                     CompileClockNs() - stall.begin, detail);
+		CountCompiledPermutation(stage);
+		return publish_index(*source, permutation);
+	}
+
+	// Per-stage totals of compiled permutations (equal to the sum of every source's
+	// permutations, which the console line used to recount under the exclusive lock).
+	static constexpr size_t StageCountSlots =
+	    static_cast<size_t>(ShaderType::TessellationEvaluation) + 1;
+	std::array<std::atomic<size_t>, StageCountSlots> compiled_per_stage {};
+
+	// The "Shaders: VS n | PS n | ..." console line after every compile. std::printf to a Windows
+	// console costs milliseconds per line and the counts were recomputed over every source while
+	// the exclusive programs lock was held, so it is off unless KYTY_SHADER_COUNT_LOG=1 or shader
+	// logging is enabled (shader_log_direction). The compile totals line at shutdown and the hang
+	// trace (compiles.csv) report the same information.
+	static bool ShaderCountLogEnabled() {
+		static const bool enabled = [] {
+			const auto* value = std::getenv("KYTY_SHADER_COUNT_LOG");
+			if (value != nullptr && *value != '\0') {
+				return std::strcmp(value, "0") != 0;
+			}
+			return Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+		}();
+		return enabled;
+	}
+
+	void CountCompiledPermutation(ShaderType stage) {
+		const auto slot = static_cast<size_t>(stage);
+		if (slot < compiled_per_stage.size()) {
+			compiled_per_stage[slot].fetch_add(1, std::memory_order_relaxed);
+		}
+		if (!ShaderCountLogEnabled()) {
+			return;
+		}
+		const auto count = [&](ShaderType type) {
+			return compiled_per_stage[static_cast<size_t>(type)].load(std::memory_order_relaxed);
+		};
 		// Guest geometry shaders are compiled through the host mesh stage.
 		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
-		            counts[static_cast<size_t>(ShaderType::Vertex)],
-		            counts[static_cast<size_t>(ShaderType::Pixel)],
-		            counts[static_cast<size_t>(ShaderType::Compute)],
-		            counts[static_cast<size_t>(ShaderType::Mesh)],
-		            counts[static_cast<size_t>(ShaderType::Local)],
-		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
-		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
-		return publish_index(entry->second, permutation);
+		            count(ShaderType::Vertex), count(ShaderType::Pixel), count(ShaderType::Compute),
+		            count(ShaderType::Mesh), count(ShaderType::Local),
+		            count(ShaderType::TessellationControl),
+		            count(ShaderType::TessellationEvaluation));
 	}
 
 	// Serial composition of the pieces above for one stage. On success `input_info.stage`
@@ -1467,7 +2223,11 @@ struct PipelineCache::ProgramCache {
 		return Result::Ok;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {}
+	explicit ProgramCache(vk::Device device): device(device) {
+		if (Config::ShaderValidationEnabled() && SpirvValidator::AsyncEnabled()) {
+			validator = std::make_unique<SpirvValidator>();
+		}
+	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
@@ -1483,16 +2243,279 @@ struct PipelineCache::ProgramCache {
 	std::mutex                                                  m_reuse_mutex;
 	size_t history_bytes = 0; // Guarded by m_reuse_mutex.
 	vk::Device                                                  device;
-	uint64_t next_shader_id = 0; // Guarded by the exclusive m_programs_mutex.
+	// Assigned by compiles running outside m_programs_mutex.
+	std::atomic<uint64_t> next_shader_id {0};
+	// Compiles in progress outside the lock and their completion signal (m_programs_mutex).
+	std::vector<InFlightCompile*> in_flight;
+	std::condition_variable_any   compile_done;
+	// Kept translations, least recently used first, and their estimated bytes (m_programs_mutex).
+	std::list<SourceEntry*> kept_lru;
+	size_t                  kept_bytes = 0;
+	// Background spirv-val; null when validation is off or synchronous.
+	std::unique_ptr<SpirvValidator> validator;
 };
 
+// Classifies each new graphics pipeline for stutter attribution: whether a pipeline already existed
+// for the same program ids (and which key groups differ from the closest one), only for the same
+// guest shaders compiled as other program permutations, or for neither. Guarded by m_mutex.
+struct PipelineCache::PipelineDiagnostics {
+	using Ids = std::array<uint64_t, 4>; // vertex program ids (or guest hashes), pixel last
+	struct IdsHash {
+		std::size_t operator()(const Ids& ids) const {
+			std::size_t hash = 0;
+			for (const auto id: ids) {
+				PipelineKeyHash::Mix(hash, static_cast<std::size_t>(id));
+			}
+			return hash;
+		}
+	};
+
+	enum Group : uint32_t {
+		Rendering   = 1u << 0u,
+		VertexInput = 1u << 1u,
+		Topology    = 1u << 2u,
+		Raster      = 1u << 3u,
+		Cull        = 1u << 4u,
+		DepthBounds = 1u << 5u,
+		ColorMask   = 1u << 6u,
+		Blend       = 1u << 7u,
+		Multisample = 1u << 8u,
+	};
+
+	static uint32_t Difference(const GraphicsPipelineKey& a, const GraphicsPipelineKey& b) {
+		const auto& x    = a.static_params;
+		const auto& y    = b.static_params;
+		uint32_t    mask = 0;
+		const auto  differ = [](const auto& left, const auto& right) {
+			return std::memcmp(&left, &right, sizeof(left)) != 0;
+		};
+		if (!(a.rendering == b.rendering)) mask |= Rendering;
+		if (!(a.vertex_input == b.vertex_input)) mask |= VertexInput;
+		if (x.topology != y.topology || x.primitive_restart_enable != y.primitive_restart_enable) {
+			mask |= Topology;
+		}
+		if (x.negative_one_to_one != y.negative_one_to_one ||
+		    x.depth_clip_enable != y.depth_clip_enable || x.polygon_mode != y.polygon_mode ||
+		    x.provoking_vtx_last != y.provoking_vtx_last) {
+			mask |= Raster;
+		}
+		if (x.cull_front != y.cull_front || x.cull_back != y.cull_back || x.face != y.face) {
+			mask |= Cull;
+		}
+		const float x_bounds[] {x.depth_min_bounds, x.depth_max_bounds};
+		const float y_bounds[] {y.depth_min_bounds, y.depth_max_bounds};
+		if (x.depth_bounds_test_enable != y.depth_bounds_test_enable ||
+		    differ(x_bounds, y_bounds)) {
+			mask |= DepthBounds;
+		}
+		if (differ(x.color_mask, y.color_mask)) mask |= ColorMask;
+		if (differ(x.color_srcblend, y.color_srcblend) ||
+		    differ(x.color_comb_fcn, y.color_comb_fcn) ||
+		    differ(x.color_destblend, y.color_destblend) ||
+		    differ(x.alpha_srcblend, y.alpha_srcblend) ||
+		    differ(x.alpha_comb_fcn, y.alpha_comb_fcn) ||
+		    differ(x.alpha_destblend, y.alpha_destblend) ||
+		    differ(x.separate_alpha_blend, y.separate_alpha_blend) ||
+		    differ(x.blend_enable, y.blend_enable)) {
+			mask |= Blend;
+		}
+		if (x.samples != y.samples || x.sample_shading_enable != y.sample_shading_enable) {
+			mask |= Multisample;
+		}
+		return mask;
+	}
+
+	static std::string Describe(uint32_t mask) {
+		static constexpr std::array<const char*, 9> names {
+		    "rt", "vi", "topo", "raster", "cull", "dbounds", "mask", "blend", "ms"};
+		std::string text;
+		for (uint32_t bit = 0; bit < names.size(); ++bit) {
+			if ((mask & (1u << bit)) != 0) {
+				if (!text.empty()) text += '+';
+				text += names[bit];
+			}
+		}
+		return text.empty() ? std::string("same") : text;
+	}
+
+	// Classifies `key` (not yet inserted) and records it; `key` must be the map's stored copy.
+	HangTrace::PipelineOrigin Classify(const GraphicsPipelineKey& key, const Ids& guest,
+	                                   std::string& detail) {
+		const Ids programs {key.vertex_shader_ids[0], key.vertex_shader_ids[1],
+		                    key.vertex_shader_ids[2], key.ps_shader_id};
+		auto&     siblings = by_programs[programs];
+		auto      origin   = HangTrace::PipelineOrigin::New;
+		if (!siblings.empty()) {
+			uint32_t best = UINT32_MAX;
+			for (const auto* sibling: siblings) {
+				const auto mask = Difference(*sibling, key);
+				if (std::popcount(mask) < std::popcount(best)) best = mask;
+			}
+			origin = HangTrace::PipelineOrigin::Variant;
+			detail = Describe(best);
+		} else if (by_guest[guest] != 0) {
+			origin = HangTrace::PipelineOrigin::Permutation;
+		}
+		siblings.push_back(&key);
+		by_guest[guest]++;
+		return origin;
+	}
+
+	std::unordered_map<Ids, std::vector<const GraphicsPipelineKey*>, IdsHash> by_programs;
+	std::unordered_map<Ids, uint32_t, IdsHash>                                  by_guest;
+};
+
+// Graphics pipeline libraries (item 6/7, KYTY_PIPELINE_LIBRARY): the library cache and the
+// background threads that compile the optimized monolithic pipeline for every fast-linked one.
+struct PipelineCache::LibraryState {
+	explicit LibraryState(PipelineCache& owner)
+	    : cache(owner), library(owner.m_graphics),
+	      optimize(EnvU64("KYTY_PIPELINE_LIBRARY_OPTIMIZE", 1) != 0) {
+		const auto count = std::clamp<uint64_t>(EnvU64("KYTY_PIPELINE_LIBRARY_THREADS", 2), 1, 8);
+		if (optimize) {
+			for (uint64_t i = 0; i < count; ++i) {
+				threads.emplace_back([this](std::stop_token stop) { Run(stop); });
+			}
+		}
+	}
+	~LibraryState() { Stop(); }
+	LibraryState(const LibraryState&)            = delete;
+	LibraryState& operator=(const LibraryState&) = delete;
+
+	struct Job {
+		const GraphicsPipelineKey*                key    = nullptr; // map node: never erased
+		vk::Pipeline                              linked = nullptr;
+		std::unique_ptr<GraphicsPipelineSnapshot> snapshot;
+	};
+
+	void Enqueue(Job job) {
+		{
+			std::scoped_lock lock(mutex);
+			if (stopped) return; // after Save(): the linked pipeline stays
+			jobs.push_back(std::move(job));
+		}
+		wake.notify_one();
+	}
+
+	// Joins the threads; queued compiles are dropped (their linked pipelines stay in use). Must
+	// run before the driver cache they use is destroyed.
+	void Stop() {
+		{
+			std::scoped_lock lock(mutex);
+			stopped = true;
+			jobs.clear();
+		}
+		for (auto& thread: threads) {
+			thread.request_stop();
+		}
+		wake.notify_all();
+		for (auto& thread: threads) {
+			if (thread.joinable()) thread.join();
+		}
+		threads.clear();
+	}
+
+	void Run(const std::stop_token& stop) {
+		Profiler::SetThreadName("PipelineOptimizer");
+		for (;;) {
+			Job job;
+			{
+				std::unique_lock lock(mutex);
+				if (!wake.wait(lock, stop, [this] { return !jobs.empty(); })) {
+					return;
+				}
+				job = std::move(jobs.front());
+				jobs.pop_front();
+			}
+			// Exactly the create info the renderer builds without libraries (a verified deep copy),
+			// so the result is the pipeline it would have created.
+			const auto   begin     = CompileClockNs();
+			vk::Pipeline optimized = nullptr;
+			const auto   result    = cache.m_graphics.device.createGraphicsPipelines(
+			    cache.m_driver_cache, 1, &job.snapshot->Info(), nullptr, &optimized);
+			const auto ns = CompileClockNs() - begin;
+			Profiler::AddFrameWait(Profiler::FrameWait::PipelineOptimize, 1, ns);
+			HangTrace::RecordPipelineLibraryEvent(HangTrace::PipelineLibraryEvent::Optimized, ns);
+			if (result != vk::Result::eSuccess || optimized == nullptr) {
+				// The linked pipeline stays; it renders the same state.
+				continue;
+			}
+			g_compile_totals.gpl_optimized.fetch_add(1, std::memory_order_relaxed);
+			g_compile_totals.gpl_optimize_ns.fetch_add(ns, std::memory_order_relaxed);
+			cache.ReplaceLinkedPipeline(job.key, job.linked, optimized);
+		}
+	}
+
+	PipelineCache&          cache;
+	GraphicsPipelineLibrary library; // guarded by PipelineCache::m_mutex
+	const bool              optimize;
+	// Linked pipelines replaced by their optimized builds; other threads may still hold a
+	// reference, and recorded command buffers may use them, so they live until the cache goes
+	// (guarded by PipelineCache::m_mutex).
+	std::vector<std::unique_ptr<Pipeline>> retired;
+	std::mutex                             mutex;
+	std::condition_variable_any            wake;
+	std::deque<Job>                        jobs;
+	bool                                   stopped = false;
+	std::vector<std::jthread>              threads; // Last: joined before the rest is destroyed.
+};
+
+void PipelineCache::ReplaceLinkedPipeline(const GraphicsPipelineKey* key, vk::Pipeline linked,
+                                          vk::Pipeline optimized) {
+	Common::LockGuard lock(m_mutex);
+	auto              entry = m_graphics_pipelines.find(*key);
+	if (entry == m_graphics_pipelines.end() || entry->second->pipeline != linked) {
+		m_graphics.device.destroyPipeline(optimized, nullptr);
+		return;
+	}
+	// A new object, not a changed handle: threads that already hold the old Pipeline& keep a
+	// consistent (still valid) pipeline; the generation makes their memos look it up again.
+	auto replacement      = std::make_unique<Pipeline>(*entry->second);
+	replacement->pipeline = optimized;
+	m_library->retired.push_back(std::move(entry->second));
+	entry->second = std::move(replacement);
+	GpuOpProfiler::RegisterGraphicsPipeline(optimized, key->vertex_shader_ids.data(),
+	                                        static_cast<uint32_t>(key->vertex_shader_ids.size()),
+	                                        key->ps_shader_id);
+	m_pipeline_generation.fetch_add(1, std::memory_order_release);
+}
+
+namespace {
+// Numbers PipelineCache instances for their generation ranges (see the constructor).
+std::atomic<uint64_t> g_pipeline_cache_instances {0};
+} // namespace
+
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)),
+      m_diagnostics(std::make_unique<PipelineDiagnostics>()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// Each cache counts its generations in its own range, so a per-thread lookup memo left by a
+	// destroyed cache can never match a later cache allocated at the same address (tests create
+	// several render contexts in one process).
+	m_pipeline_generation.store(
+	    (g_pipeline_cache_instances.fetch_add(1, std::memory_order_relaxed) + 1) << 32u,
+	    std::memory_order_relaxed);
 	InitializeDriverCache();
+	if (m_driver_cache != nullptr && DriverCacheSaveSettings::Get().enabled) {
+		m_saver = std::make_unique<DriverCacheSaver>(*this);
+	}
+	if (GraphicsPipelineLibrary::Enabled(m_graphics)) {
+		m_library = std::make_unique<LibraryState>(*this);
+		PipelineCacheLog("Graphics pipeline libraries: enabled (fast link, {})",
+		                 m_library->optimize ? "optimized in background" : "linked pipelines kept");
+		if (ShaderRecompiler::GetCodegenOptions().mad_mode == ShaderRecompiler::MadMode::Fused) {
+			// See pipelineLibrary.h: identical positions rely on the Invariant position.
+			PipelineCacheLog("Graphics pipeline libraries: KYTY_MAD_MODE=fused drops the Invariant "
+			                 "position; a linked pipeline and its optimized build may rasterize "
+			                 "different depths");
+		}
+	} else if (PipelineLibraryRequested()) {
+		PipelineCacheLog("Graphics pipeline libraries: requested but not supported by the device");
+	}
 }
 
 PipelineCache::~PipelineCache() {
+	LogCompileTotals();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -1505,6 +2528,16 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	if (m_library != nullptr) {
+		// Replaced linked pipelines: only their handles. Their layouts are the live entries'
+		// (copied with the entry), released once above.
+		for (const auto& retired: m_library->retired) {
+			m_graphics.device.destroyPipeline(retired->pipeline, nullptr);
+		}
+		// Libraries after every pipeline linked from them, and before the interned layouts they
+		// were created with.
+		m_library.reset();
+	}
 	DestroyInternedPipelineLayouts(m_graphics);
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
@@ -1521,43 +2554,28 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	m_driver_cache_path    = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
-	const auto path         = Common::PathToString(m_driver_cache_path);
+	auto path               = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
 		PipelineCacheLog("Vulkan pipeline cache: loading {}", path);
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initializing {}", path);
 	}
+	const auto           signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	std::vector<uint8_t> initial_data;
 	if (cache_exists) {
-		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
-		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
-		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-		if (file_size >= signature.size() + sizeof(uint64_t) &&
-		    file_size <= MaxDriverCacheFileSize) {
-			std::string cached_signature(signature.size(), '\0');
-			uint64_t    payload_hash = 0;
-			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
-			uint32_t signature_read = 0;
-			uint32_t hash_read      = 0;
-			uint32_t payload_read   = 0;
-			file.Read(cached_signature.data(), static_cast<uint32_t>(cached_signature.size()),
-			          &signature_read);
-			file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
-			file.Read(initial_data.data(), static_cast<uint32_t>(initial_data.size()),
-			          &payload_read);
-			file.Close();
-			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
-			    payload_read != initial_data.size() || cached_signature != signature ||
-			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
-				initial_data.clear();
-				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
-				    path);
-			}
-		} else {
-			file.Close();
-			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
+		ReadDriverCacheFile(m_driver_cache_path, signature, initial_data, true);
+	}
+	if (initial_data.empty()) {
+		// A save writes "<file>.tmp" and then renames it over the file. Earlier builds deleted the
+		// file before that rename, so a run killed in between left only the complete temporary
+		// file. Its payload hash rejects a partially written one.
+		auto temp_path = m_driver_cache_path;
+		temp_path += ".tmp";
+		if (Common::File::IsFileExisting(temp_path) &&
+		    ReadDriverCacheFile(temp_path, signature, initial_data, false)) {
+			path = Common::PathToString(temp_path);
+			PipelineCacheLog("Vulkan pipeline cache: recovered the interrupted save {}", path);
 		}
 	}
 
@@ -1586,41 +2604,152 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
-void PipelineCache::Save() {
-	Common::LockGuard lock(m_mutex);
-	if (m_driver_cache == nullptr) {
-		return;
+// Background saver of the driver pipeline cache. The cache used to be written only by the clean
+// exit (window close), so every killed, crashed or stalled run threw away all pipelines it had
+// compiled and the next boot compiled them again. The thread wakes once a second and saves by the
+// DriverCacheSaveSettings rules; the command processor only bumps two atomics per new pipeline.
+struct PipelineCache::DriverCacheSaver {
+	explicit DriverCacheSaver(PipelineCache& owner): cache(owner), last_save_ns(CompileClockNs()) {
+		thread = std::jthread([this](std::stop_token stop) { Run(stop); });
+	}
+	~DriverCacheSaver() { Stop(); }
+	DriverCacheSaver(const DriverCacheSaver&)            = delete;
+	DriverCacheSaver& operator=(const DriverCacheSaver&) = delete;
+
+	// Returns once no periodic save is running or can start.
+	void Stop() {
+		if (thread.joinable()) {
+			thread.request_stop();
+			thread.join();
+		}
 	}
 
-	size_t               size = 0;
-	vk::Result           result;
+	void NoteCreated() {
+		last_created_ns.store(CompileClockNs(), std::memory_order_relaxed);
+		created.fetch_add(1, std::memory_order_release);
+	}
+
+	[[nodiscard]] bool Due(uint64_t now) const {
+		const auto& settings = DriverCacheSaveSettings::Get();
+		const auto  pending  = created.load(std::memory_order_acquire) - saved_created;
+		if (pending == 0 || oversized || now < retry_after_ns) {
+			return false;
+		}
+		const auto since_save   = now - last_save_ns;
+		const auto last_created = last_created_ns.load(std::memory_order_relaxed);
+		const auto since_create = now > last_created ? now - last_created : 0;
+		if (pending < settings.min_new) {
+			return since_save >= 5 * settings.interval_ns && since_create >= settings.settle_ns;
+		}
+		return (since_save >= settings.interval_ns && since_create >= settings.settle_ns) ||
+		       (since_create >= settings.quiet_ns && since_save >= 15'000'000'000ull) ||
+		       since_save >= 3 * settings.interval_ns;
+	}
+
+	void Run(const std::stop_token& stop) {
+		Profiler::SetThreadName("PipelineCacheSaver");
+		std::mutex                  mutex;
+		std::condition_variable_any wake;
+		std::unique_lock            lock(mutex);
+		while (!stop.stop_requested()) {
+			wake.wait_for(lock, stop, std::chrono::seconds(1), [] { return false; });
+			if (stop.stop_requested() || !Due(CompileClockNs())) {
+				continue;
+			}
+			// Count only what the serialized data can contain: pipelines created before it.
+			const auto covered = created.load(std::memory_order_acquire);
+			const auto written = cache.WriteDriverCache(true);
+			const auto now     = CompileClockNs();
+			last_save_ns       = now;
+			if (written == WriteOversized) {
+				// It only grows: stop serializing it every interval. Exit still saves it.
+				oversized = true;
+			} else if (written == 0) {
+				retry_after_ns = now + DriverCacheSaveSettings::Get().interval_ns;
+			} else {
+				saved_created = covered;
+			}
+		}
+	}
+
+	// WriteDriverCache result of a periodic save skipped for exceeding MaxDriverCacheFileSize.
+	static constexpr uint64_t WriteOversized = UINT64_MAX;
+
+	PipelineCache&        cache;
+	std::atomic<uint64_t> created {0};
+	std::atomic<uint64_t> last_created_ns {0};
+	// Saver thread only, then Save() after Stop().
+	uint64_t saved_created  = 0;
+	uint64_t last_save_ns   = 0;
+	uint64_t retry_after_ns = 0;
+	bool     oversized      = false;
+	// While a save runs vkGetPipelineCacheData; pipelines created meanwhile are counted as overlaps.
+	std::atomic<bool> serializing {false};
+	std::jthread      thread; // Last: stopped before the members it uses are destroyed.
+};
+
+void PipelineCache::NotePipelineCreated(uint64_t create_ns) {
+	if (m_saver == nullptr) {
+		return;
+	}
+	m_saver->NoteCreated();
+	if (m_saver->serializing.load(std::memory_order_relaxed)) {
+		HangTrace::RecordPipelineCacheSaveOverlap(create_ns);
+	}
+}
+
+uint64_t PipelineCache::WriteDriverCache(bool periodic) {
+	const auto begin = CompileClockNs();
+	// Synchronization: vkGetPipelineCacheData has no externally synchronized parameter (vk.xml
+	// declares none for pipelineCache), and m_driver_cache is created without
+	// VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT, so vkCreate*Pipelines on the command
+	// processor may use the cache concurrently: the implementation synchronizes internally. No
+	// emulator lock is taken here, so a draw never waits for this serialization or the file I/O
+	// below; at worst a pipeline created meanwhile waits inside the driver
+	// (pcache_save_overlaps). vkDestroyPipelineCache, the only externally synchronized use, runs
+	// in Save() after the saver has stopped. The handle itself is written only before the saver
+	// starts and after it stops.
 	std::vector<uint8_t> payload;
-	for (uint32_t attempt = 0; attempt < 3; attempt++) {
+	size_t               size   = 0;
+	vk::Result           result = vk::Result::eIncomplete;
+	if (m_saver != nullptr) m_saver->serializing.store(true, std::memory_order_relaxed);
+	for (uint32_t attempt = 0; attempt < 3 && result == vk::Result::eIncomplete; attempt++) {
 		size   = 0;
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
 		if (result != vk::Result::eSuccess || size == 0 ||
 		    size > std::numeric_limits<uint32_t>::max()) {
 			break;
 		}
-		payload.resize(size);
+		// Pipelines created between the two calls grow the data; leave room for them. Whatever
+		// is returned is valid initial data, but only complete data replaces the file.
+		payload.resize(size + size / 8u + 1024u * 1024u);
+		size   = payload.size();
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
-		if (result != vk::Result::eIncomplete) {
-			break;
-		}
 	}
+	if (m_saver != nullptr) m_saver->serializing.store(false, std::memory_order_relaxed);
+	const auto serialized = CompileClockNs();
+	const char* kind      = periodic ? "periodic" : "exit";
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
-		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
+		PipelineCacheLog("Vulkan pipeline cache: {} save failed ({}, {} bytes)", kind,
 		                 vk::to_string(result), size);
-		return;
+		return 0;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
+	if (periodic && prefix.size() + payload.size() > MaxDriverCacheFileSize) {
+		// The loader rejects such a file and starts over; keep the last file that it accepts.
+		// The exit save still writes it, which is what resets an overgrown cache.
+		PipelineCacheLog("Vulkan pipeline cache: {} bytes exceed the {} byte cap; periodic saves "
+		                 "stop, the exit save still writes it",
+		                 payload.size(), MaxDriverCacheFileSize);
+		return DriverCacheSaver::WriteOversized;
+	}
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return 0;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -1633,19 +2762,153 @@ void PipelineCache::Save() {
 	}
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();
+	// std::filesystem::rename replaces the destination in one step (MoveFileExW with
+	// MOVEFILE_REPLACE_EXISTING on Windows, rename(2) elsewhere): a kill at any point leaves
+	// either the previous or the new complete file. Common::File::RenameFile deleted the old
+	// file first, so a kill between the delete and the move lost the cache.
+	std::error_code error;
+	if (prefix_written == prefix.size() && payload_written == payload.size() && flushed) {
+		std::filesystem::rename(temp_path, m_driver_cache_path, error);
+	}
 	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
-	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
-		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
-		                 Common::PathToString(m_driver_cache_path));
+	    error) {
+		PipelineCacheLog("Vulkan pipeline cache: failed to write {}{}",
+		                 Common::PathToString(m_driver_cache_path),
+		                 error ? " (" + error.message() + ")" : std::string());
+		return 0;
+	}
+	const auto written = CompileClockNs();
+	HangTrace::RecordPipelineCacheSave(payload.size(), serialized - begin, written - serialized);
+	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {} ({}, serialize {:.1f} ms, write "
+	                 "{:.1f} ms)",
+	                 payload.size(), Common::PathToString(m_driver_cache_path), kind,
+	                 static_cast<double>(serialized - begin) / 1.0e6,
+	                 static_cast<double>(written - serialized) / 1.0e6);
+	return payload.size();
+}
+
+void PipelineCache::Save() {
+	// From here on no periodic save runs, so destroying the driver cache below is safe.
+	if (m_saver != nullptr) {
+		m_saver->Stop();
+	}
+	// Background optimized compiles use the driver cache too; linked pipelines stay in use.
+	if (m_library != nullptr) {
+		m_library->Stop();
+	}
+	Common::LockGuard lock(m_mutex);
+	if (m_driver_cache == nullptr) {
 		return;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
-	                 Common::PathToString(m_driver_cache_path));
+	if (m_saver != nullptr && m_saver->saved_created != 0 &&
+	    m_saver->created.load(std::memory_order_acquire) == m_saver->saved_created) {
+		PipelineCacheLog("Vulkan pipeline cache: no new pipelines since the last save");
+	} else if (WriteDriverCache(false) == 0) {
+		return;
+	}
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	m_driver_cache = nullptr;
 }
 
+bool PipelineDynamicRasterStateEnabled() {
+	static const bool enabled = EnvU64("KYTY_PIPELINE_DYNAMIC_STATE", 1) != 0;
+	return enabled;
+}
+
 namespace {
+
+bool PipelineKeyNormalizationEnabled() {
+	static const bool enabled = EnvU64("KYTY_PIPELINE_KEY_NORMALIZE", 1) != 0;
+	return enabled;
+}
+
+// Accounts one graphics pipeline created through the library path and names the path in the
+// compiles.csv detail.
+void RecordLibraryPipeline(const GraphicsPipelineLibrary::Result& result, std::string& detail) {
+	auto& totals = g_compile_totals;
+	if (result.libraries_created != 0) {
+		totals.gpl_libraries.fetch_add(result.libraries_created, std::memory_order_relaxed);
+		totals.gpl_library_ns.fetch_add(result.libraries_ns, std::memory_order_relaxed);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineLibrariesCreated,
+		                          result.libraries_created);
+		HangTrace::RecordPipelineLibraryEvent(HangTrace::PipelineLibraryEvent::Library,
+		                                      result.libraries_ns, result.libraries_created);
+	}
+	const char* path = "gpl-monolithic";
+	switch (result.path) {
+		case GraphicsPipelineLibrary::Path::CacheHit:
+			path = "gpl-cache-hit";
+			totals.gpl_cache_hits.fetch_add(1, std::memory_order_relaxed);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineLibraryCacheHits);
+			HangTrace::RecordPipelineLibraryEvent(HangTrace::PipelineLibraryEvent::CacheHit, 0);
+			break;
+		case GraphicsPipelineLibrary::Path::Linked:
+			path = "gpl-linked";
+			totals.gpl_links.fetch_add(1, std::memory_order_relaxed);
+			totals.gpl_link_ns.fetch_add(result.link_ns, std::memory_order_relaxed);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineLibraryLinks);
+			HangTrace::RecordPipelineLibraryEvent(HangTrace::PipelineLibraryEvent::Linked,
+			                                      result.link_ns);
+			break;
+		default: totals.gpl_monolithic.fetch_add(1, std::memory_order_relaxed); break;
+	}
+	detail += detail.empty() ? "" : "|";
+	detail += fmt::format("{} libs={}", path, result.libraries_created);
+	if (result.fallback != nullptr) {
+		detail += fmt::format(" ({})", result.fallback);
+	}
+}
+
+// Zeroes pipeline-key fields that cannot change the pipeline CreatePipelineInternal creates, so
+// draws that differ only in them share one pipeline instead of compiling identical copies.
+// KYTY_PIPELINE_KEY_NORMALIZE=0 keeps them. Each rule and why the field is unused:
+// - Blend factors and ops of an attachment with blending off: they only feed the blend equation
+//   of VkPipelineColorBlendAttachmentState, which Vulkan ignores when blendEnable is VK_FALSE.
+//   0 is BlendFactor::kZero / BlendOp::kAdd, which GetBlendFactor/GetBlendOp accept.
+// - Alpha factors and op with separate alpha blending off: CreatePipelineInternal then copies the
+//   color factors and op into the alpha ones and never reads these.
+// - The depth-bounds test without a depth/stencil attachment: CreatePipelineInternal passes no
+//   VkPipelineDepthStencilStateCreateInfo at all (pDepthStencilState is null).
+// - Depth-bounds min/max while the test is disabled: they are only inputs of that test.
+// Not normalized: the clip-space viewport transform in the vertex-program key
+// (BuildStageStaticKey). The emitter bakes scale, offset and half extent into the SPIR-V as
+// constants (ConvertPositionToClipSpace), so each value is a different shader; moving them to
+// push constants would also turn the power-of-two division into a runtime division, which is not
+// guaranteed to be bit-identical.
+// With KYTY_PIPELINE_DYNAMIC_STATE, cull mode, front face and the depth-bounds state are dynamic
+// (set per draw from the same registers) and leave the key entirely.
+void NormalizePipelineKey(PipelineStaticParameters& params, bool with_depth) {
+	if (PipelineKeyNormalizationEnabled()) {
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if (!params.blend_enable[slot]) {
+				params.color_srcblend[slot]       = 0;
+				params.color_comb_fcn[slot]       = 0;
+				params.color_destblend[slot]      = 0;
+				params.separate_alpha_blend[slot] = false;
+			}
+			if (!params.blend_enable[slot] || !params.separate_alpha_blend[slot]) {
+				params.alpha_srcblend[slot]  = 0;
+				params.alpha_comb_fcn[slot]  = 0;
+				params.alpha_destblend[slot] = 0;
+			}
+		}
+		if (!with_depth) {
+			params.depth_bounds_test_enable = false;
+		}
+		if (!params.depth_bounds_test_enable) {
+			params.depth_min_bounds = 0.0f;
+			params.depth_max_bounds = 0.0f;
+		}
+	}
+	if (PipelineDynamicRasterStateEnabled()) {
+		params.cull_front               = false;
+		params.cull_back                = false;
+		params.face                     = false;
+		params.depth_bounds_test_enable = false;
+		params.depth_min_bounds         = 0.0f;
+		params.depth_max_bounds         = 0.0f;
+	}
+}
 
 // KYTY_STAGE_PREP_VERIFY: 0 (default) off; 1 reruns the serial preparation after every parallel
 // one and logs and counts differences; "exit" also stops the emulator on the first difference.
@@ -2033,6 +3296,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
+	NormalizePipelineKey(static_params, with_depth);
 
 	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
 		EXIT_IF(vs_input_info.buffers_num < 0 ||
@@ -2062,31 +3326,39 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 
 	// Last-key memo (KYTY_PIPELINE_MEMO): most draws use their predecessor's pipeline. Exact:
-	// the comparison is the map's own key equality, and pipelines are never erased or moved
-	// before the cache is destroyed.
+	// the comparison is the map's own key equality, and pipeline objects are never destroyed
+	// before the cache is; an object replaced by an optimized build (pipeline libraries) bumps
+	// m_pipeline_generation, which invalidates every memo.
 	static const bool memo_enabled = [] {
 		const auto* value = std::getenv("KYTY_PIPELINE_MEMO");
 		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
 	struct LastPipeline {
-		const PipelineCache* cache    = nullptr;
-		Pipeline*            pipeline = nullptr;
+		const PipelineCache* cache      = nullptr;
+		Pipeline*            pipeline   = nullptr;
+		uint64_t             generation = 0;
 		GraphicsPipelineKey  key {};
 	};
 	static thread_local LastPipeline last;
 	if (memo_enabled) {
-		if (last.cache == this && last.pipeline != nullptr && last.key == key) {
+		if (last.cache == this && last.pipeline != nullptr &&
+		    last.generation == m_pipeline_generation.load(std::memory_order_acquire) &&
+		    last.key == key) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineMemoHits);
+			FlushCompileStall();
 			return *last.pipeline;
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineMemoMisses);
 	}
+	// Called with m_mutex held, so the generation read matches the object found.
 	const auto remember = [&](Pipeline& pipeline) -> Pipeline& {
 		if (memo_enabled) {
-			last.cache    = this;
-			last.pipeline = &pipeline;
-			last.key      = key;
+			last.cache      = this;
+			last.pipeline   = &pipeline;
+			last.generation = m_pipeline_generation.load(std::memory_order_relaxed);
+			last.key        = key;
 		}
+		FlushCompileStall();
 		return pipeline;
 	};
 
@@ -2094,6 +3366,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		return remember(*iter->second);
 	}
+	const auto create_begin = CompileClockNs();
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(vs_input_info);
@@ -2107,10 +3380,23 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	// Pipeline libraries (6/7): the monolithic create info goes to the library path, which may
+	// fast-link it and hand back the create info for the background optimized compile.
+	GraphicsPipelineLibrary::Result library_result;
+	GraphicsPipelineCreateHook      library_hook;
+	if (m_library != nullptr) {
+		library_hook = [&](const vk::GraphicsPipelineCreateInfo& info,
+		                   std::span<const uint32_t> layout_signature, vk::Pipeline* pipeline) {
+			library_result = m_library->library.Create(info, layout_signature, m_driver_cache);
+			*pipeline      = library_result.pipeline;
+			return library_result.result;
+		};
+	}
 	{
 		Profiler::ScopedFrameWait pipeline_create(Profiler::FrameWait::GraphicsPipelineCreate);
 		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-		                       ps_input_info, programs, static_params, m_driver_cache);
+		                       ps_input_info, programs, static_params, m_driver_cache,
+		                       m_library != nullptr ? &library_hook : nullptr);
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
@@ -2121,9 +3407,46 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	                                        static_cast<uint32_t>(key.vertex_shader_ids.size()),
 	                                        ps_id);
 
-	auto [iter, inserted] = m_graphics_pipelines.emplace(key, std::move(cached));
+	const auto created_pipeline = cached->pipeline;
+	auto [iter, inserted]       = m_graphics_pipelines.emplace(key, std::move(cached));
 	EXIT_IF(!inserted);
+	if (library_result.path == GraphicsPipelineLibrary::Path::Linked && m_library->optimize) {
+		m_library->Enqueue({.key      = &iter->first,
+		                    .linked   = created_pipeline,
+		                    .snapshot = std::move(library_result.optimize)});
+	}
 
+	const auto create_ns = CompileClockNs() - create_begin;
+	PipelineDiagnostics::Ids guest {};
+	for (size_t i = 0; i < vertex_info.size() && i < 3; ++i) {
+		guest[i] = vertex_info[i].stage.program->shader_hash;
+	}
+	guest[3] = ps_active ? ps_input_info->stage.program->shader_hash : 0;
+	std::string detail;
+	const auto  origin = m_diagnostics->Classify(iter->first, guest, detail);
+	if (m_library != nullptr) {
+		RecordLibraryPipeline(library_result, detail);
+	}
+	auto&       totals = g_compile_totals;
+	totals.gfx_pipelines.fetch_add(1, std::memory_order_relaxed);
+	totals.gfx_pipeline_ns.fetch_add(create_ns, std::memory_order_relaxed);
+	auto* origin_total = origin == HangTrace::PipelineOrigin::New           ? &totals.gfx_new
+	                     : origin == HangTrace::PipelineOrigin::Permutation ? &totals.gfx_permutation
+	                                                                         : &totals.gfx_variant;
+	origin_total->fetch_add(1, std::memory_order_relaxed);
+	if (HangTrace::Enabled()) {
+		HangTrace::RecordCompile({.kind        = HangTrace::CompileKind::GraphicsPipeline,
+		                          .origin      = origin,
+		                          .stage       = "gfx",
+		                          .guest_hash  = guest[0],
+		                          .id          = vs_id,
+		                          .id2         = ps_id,
+		                          .pipeline_ns = create_ns,
+		                          .total_ns    = create_ns,
+		                          .detail      = detail});
+	}
+	AddCompileStall(create_ns);
+	NotePipelineCreated(create_ns);
 	return remember(*iter->second);
 }
 
@@ -2138,8 +3461,10 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
+		FlushCompileStall();
 		return *iter->second;
 	}
+	const auto create_begin = CompileClockNs();
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(input_info);
@@ -2155,6 +3480,22 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
 
+	const auto create_ns = CompileClockNs() - create_begin;
+	g_compile_totals.cs_pipelines.fetch_add(1, std::memory_order_relaxed);
+	g_compile_totals.cs_pipeline_ns.fetch_add(create_ns, std::memory_order_relaxed);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::ComputePipelinesCreated);
+	Profiler::AddFrameWait(Profiler::FrameWait::ComputePipelineCreate, 1, create_ns);
+	if (HangTrace::Enabled()) {
+		HangTrace::RecordCompile({.kind        = HangTrace::CompileKind::ComputePipeline,
+		                          .stage       = "cs",
+		                          .guest_hash  = input_info.stage.program->shader_hash,
+		                          .id          = compute_program.id,
+		                          .pipeline_ns = create_ns,
+		                          .total_ns    = create_ns});
+	}
+	AddCompileStall(create_ns);
+	FlushCompileStall();
+	NotePipelineCreated(create_ns);
 	return *iter->second;
 }
 } // namespace Libs::Graphics

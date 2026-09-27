@@ -27,6 +27,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1507,6 +1508,41 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
+// Pipeline-cache translation reuse (KYTY_TRANSLATION_CACHE): specializing a deep
+// copy of a translation (IR::CloneProgram), taken before anything reads the
+// program, must emit exactly the SPIR-V and metadata of the translation itself.
+class TranslationCopyCheck {
+public:
+  explicit TranslationCopyCheck(
+      const ShaderRecompiler::TranslateResult &translated) {
+    m_cloned = ShaderRecompiler::IR::CloneProgram(translated.program,
+                                                  m_copy.program);
+    m_copy.decoded_dump = translated.decoded_dump;
+    m_copy.cfg_dump = translated.cfg_dump;
+  }
+
+  void Verify(const char *name, const ShaderRecompiler::CompileOptions &options,
+              const ShaderRecompiler::IR::ResourceSpecialization &specialization,
+              const ShaderRecompiler::CompileResult &original) {
+    Require(name, "translation copy", m_cloned,
+            "CloneProgram refused the translation");
+    auto copy = ShaderRecompiler::CompileProgram(std::move(m_copy), options,
+                                                 specialization);
+    Require(name, "translation copy", copy.spirv == original.spirv,
+            "SPIR-V of the copied translation differs");
+    Require(name, "translation copy",
+            copy.program.info == original.program.info &&
+                copy.program.bindings == original.program.bindings &&
+                copy.program.write_ranges == original.program.write_ranges &&
+                copy.program.scratch_dwords == original.program.scratch_dwords,
+            "shader metadata of the copied translation differs");
+  }
+
+private:
+  ShaderRecompiler::TranslateResult m_copy;
+  bool m_cloned = false;
+};
+
 CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
@@ -1537,6 +1573,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
 
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
+  TranslationCopyCheck copy_check(translated);
   auto resource_plan =
       ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -1553,6 +1590,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
           "translated resources could not be materialized");
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
+  copy_check.Verify(test.name, options, specialization, result);
   for (const auto &[text, expected] : test.decoded_counts) {
     const auto actual = CountText(result.decoded_dump, text);
     Require(test.name, "decoded RDNA2", actual == expected,
@@ -1706,6 +1744,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
 
   auto translated =
       ShaderRecompiler::TranslateProgram(test.fragment_code, options);
+  TranslationCopyCheck copy_check(translated);
   auto resource_plan =
       ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -1720,6 +1759,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
           "translated resources could not be materialized");
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
+  copy_check.Verify(test.name, options, specialization, result);
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
@@ -14059,6 +14099,25 @@ public:
       const vk::Bool32 write = true;
       cmd.setColorWriteEnableEXT(1, &write);
       cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      if (PipelineDynamicRasterStateEnabled()) {
+        // Dynamic in every renderer pipeline (KYTY_PIPELINE_DYNAMIC_STATE); the
+        // draw path records them from the same registers the key used to hold.
+        const auto &mode = registers.GetModeControl();
+        vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
+        if (mode.cull_back) {
+          cull_mode |= vk::CullModeFlagBits::eBack;
+        }
+        if (mode.cull_front) {
+          cull_mode |= vk::CullModeFlagBits::eFront;
+        }
+        cmd.setCullMode(cull_mode);
+        cmd.setFrontFace(mode.face ? vk::FrontFace::eClockwise
+                                   : vk::FrontFace::eCounterClockwise);
+        cmd.setDepthBoundsTestEnable(depth.depth_bounds_test_enable);
+        if (depth.depth_bounds_test_enable) {
+          cmd.setDepthBounds(depth.depth_min_bounds, depth.depth_max_bounds);
+        }
+      }
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
       cmd.draw(vertex_count, 1, 0, 0);
@@ -15939,6 +15998,8 @@ private:
     m_runtime_context.queue = m_queue;
     m_runtime_context.attachment_feedback_loop_enabled = true;
     m_runtime_context.provoking_vertex_last_enabled = true;
+    m_runtime_context.pipeline_library_enabled = m_pipeline_library;
+    m_runtime_context.pipeline_creation_cache_control_enabled = m_pipeline_library;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -16181,7 +16242,7 @@ private:
     device_features.fillModeNonSolid = true;
     device_features.tessellationShader = true;
     device_info.pEnabledFeatures = &device_features;
-    constexpr const char *device_extensions[] = {
+    std::vector<const char *> device_extensions = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
         VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
         VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
@@ -16191,11 +16252,27 @@ private:
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME,
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
         VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
-        VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
-        VK_EXT_ROBUSTNESS_2_EXTENSION_NAME};
-    device_info.enabledExtensionCount =
-        static_cast<u32>(std::size(device_extensions) - (robustness2_supported ? 0u : 1u));
-    device_info.ppEnabledExtensionNames = device_extensions;
+        VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+    if (robustness2_supported) {
+      device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    }
+    // KYTY_PIPELINE_LIBRARY=1 runs the renderer's pipeline creation through graphics pipeline
+    // libraries (pipelineLibrary.h), as on a production device that supports them. Checks that
+    // compare pipeline handles need KYTY_PIPELINE_LIBRARY_OPTIMIZE=0 (a background build replaces
+    // a linked pipeline's handle), and KYTY_PIPELINE_LIBRARY_PROBE=0 links even pipelines that
+    // the driver's cache already holds.
+    vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT pipeline_library{};
+    if (PipelineLibraryRequested()) {
+      pipeline_library.pNext = const_cast<void *>(device_info.pNext);
+      pipeline_library.graphicsPipelineLibrary = true;
+      device_info.pNext = &pipeline_library;
+      device_features13.pipelineCreationCacheControl = true;
+      device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+      device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+      m_pipeline_library = true;
+    }
+    device_info.enabledExtensionCount = static_cast<u32>(device_extensions.size());
+    device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
@@ -16533,6 +16610,7 @@ private:
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
   GraphicContext m_runtime_context{};
+  bool m_pipeline_library = false;
   std::unique_ptr<RenderContext> m_renderer;
 };
 

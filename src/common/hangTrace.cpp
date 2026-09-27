@@ -277,8 +277,44 @@ struct Totals {
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(MemoryCounter::Count)> memory {};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(TransferKind::Count)> transfer_count {};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(TransferKind::Count)> transfer_bytes {};
+	std::atomic<uint64_t> compile_programs {0};
+	std::atomic<uint64_t> compile_translate_ns {0};
+	std::atomic<uint64_t> compile_emit_ns {0};
+	std::atomic<uint64_t> compile_validate_ns {0};
+	std::atomic<uint64_t> compile_module_ns {0};
+	std::atomic<uint64_t> compile_gfx_pipelines {0};
+	std::atomic<uint64_t> compile_gfx_pipeline_ns {0};
+	std::atomic<uint64_t> compile_cs_pipelines {0};
+	std::atomic<uint64_t> compile_cs_pipeline_ns {0};
+	std::atomic<uint64_t> compile_stall_ns {0};
+	std::atomic<uint64_t> compile_stall_max_ns {0};
+	std::atomic<uint64_t> compile_gfx_new {0};
+	std::atomic<uint64_t> compile_gfx_perm {0};
+	std::atomic<uint64_t> compile_gfx_variant {0};
+	std::atomic<uint64_t> pcache_saves {0};
+	std::atomic<uint64_t> pcache_save_bytes {0};
+	std::atomic<uint64_t> pcache_save_serialize_ns {0};
+	std::atomic<uint64_t> pcache_save_write_ns {0};
+	std::atomic<uint64_t> pcache_save_overlaps {0};
+	std::atomic<uint64_t> pcache_save_overlap_ns {0};
+	std::atomic<uint64_t> compile_translation_reuses {0};
+	std::atomic<uint64_t> compile_clone_ns {0};
+	std::atomic<uint64_t> validate_async {0};
+	std::atomic<uint64_t> validate_async_ns {0};
+	using PerLibraryEvent =
+	    std::array<std::atomic<uint64_t>, static_cast<size_t>(PipelineLibraryEvent::Count)>;
+	PerLibraryEvent gpl_count {};
+	PerLibraryEvent gpl_ns {};
 };
 Totals g_totals;
+
+constexpr uint64_t       kCompileRowLimit = 1'000'000;
+constexpr const char*    kCompileKindNames[] = {"program", "graphics-pipeline", "compute-pipeline"};
+static_assert(std::size(kCompileKindNames) == static_cast<size_t>(CompileKind::Count));
+constexpr const char*    kPipelineOriginNames[] = {"", "new", "permutation", "variant"};
+std::mutex               g_compile_mutex;
+std::vector<std::string> g_pending_compile_rows;
+uint64_t                 g_compile_rows_total = 0;
 
 struct MemoryCounterColumn {
 	const char* name;
@@ -316,6 +352,12 @@ constexpr std::array<MemoryCounterColumn, static_cast<size_t>(MemoryCounter::Cou
     }};
 static_assert(kMemoryCounterColumns.back().name != nullptr,
               "memory counter columns must match HangTrace::MemoryCounter");
+// summary.csv emits the memory counters that existed when the compile columns were appended
+// after them in that position; any later MemoryCounter goes to the end of the row, so every
+// existing column keeps its index.
+constexpr size_t kMemoryColumnsBeforeCompile =
+    static_cast<size_t>(MemoryCounter::WrittenUploadLatePages) + 1;
+static_assert(kMemoryColumnsBeforeCompile <= kMemoryCounterColumns.size());
 
 std::mutex                  g_publish_mutex;
 std::condition_variable_any g_publish_condition;
@@ -337,6 +379,7 @@ struct Files {
 	std::FILE* occlusion     = nullptr;
 	std::FILE* lodreports    = nullptr;
 	std::FILE* transfers     = nullptr;
+	std::FILE* compiles      = nullptr;
 };
 Files g_files;
 
@@ -616,6 +659,12 @@ void Publish() {
 	}
 	WriteRows(g_files.transfers, rows);
 
+	{
+		std::scoped_lock lock(g_compile_mutex);
+		rows.swap(g_pending_compile_rows);
+	}
+	WriteRows(g_files.compiles, rows);
+
 	if (g_files.tex != nullptr) {
 		for (uint32_t id = 0; id < 256; id++) {
 			const auto count = g_tex_count[id].exchange(0, std::memory_order_relaxed);
@@ -715,17 +764,57 @@ void Publish() {
 		}
 		line += fmt::format(",{},{}", take(g_totals.gpu_rendering_ends),
 		                    take(g_totals.gpu_draw_write_sinks));
-		for (size_t counter = 0; counter < kMemoryCounterColumns.size(); counter++) {
-			line += fmt::format(",{}", take(g_totals.memory[counter]) /
-			                               kMemoryCounterColumns[counter].divisor);
-		}
+		const auto memory_columns = [&](size_t begin, size_t end) {
+			for (size_t counter = begin; counter < end; counter++) {
+				line += fmt::format(",{}", take(g_totals.memory[counter]) /
+				                               kMemoryCounterColumns[counter].divisor);
+			}
+		};
+		memory_columns(0, kMemoryColumnsBeforeCompile);
+		// Compile columns (appended after the memory columns).
+		line += fmt::format(",{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+		                    take(g_totals.compile_programs),
+		                    take(g_totals.compile_translate_ns) / 1000u,
+		                    take(g_totals.compile_emit_ns) / 1000u,
+		                    take(g_totals.compile_validate_ns) / 1000u,
+		                    take(g_totals.compile_module_ns) / 1000u,
+		                    take(g_totals.compile_gfx_pipelines),
+		                    take(g_totals.compile_gfx_pipeline_ns) / 1000u,
+		                    take(g_totals.compile_cs_pipelines),
+		                    take(g_totals.compile_cs_pipeline_ns) / 1000u,
+		                    take(g_totals.compile_stall_ns) / 1000u,
+		                    take(g_totals.compile_stall_max_ns) / 1000u,
+		                    take(g_totals.compile_gfx_new), take(g_totals.compile_gfx_perm),
+		                    take(g_totals.compile_gfx_variant));
+		line += fmt::format(",{},{},{},{},{},{}", take(g_totals.pcache_saves),
+		                    take(g_totals.pcache_save_bytes) / 1024u,
+		                    take(g_totals.pcache_save_serialize_ns) / 1000u,
+		                    take(g_totals.pcache_save_write_ns) / 1000u,
+		                    take(g_totals.pcache_save_overlaps),
+		                    take(g_totals.pcache_save_overlap_ns) / 1000u);
+		line += fmt::format(",{},{}", take(g_totals.compile_translation_reuses),
+		                    take(g_totals.compile_clone_ns) / 1000u);
+		line += fmt::format(",{},{}", take(g_totals.validate_async),
+		                    take(g_totals.validate_async_ns) / 1000u);
+		const auto gpl = [&](PipelineLibraryEvent event, bool with_time) {
+			const auto index = static_cast<size_t>(event);
+			line += fmt::format(",{}", take(g_totals.gpl_count[index]));
+			const auto ns = take(g_totals.gpl_ns[index]);
+			if (with_time) line += fmt::format(",{}", ns / 1000u);
+		};
+		gpl(PipelineLibraryEvent::CacheHit, false);
+		gpl(PipelineLibraryEvent::Linked, true);
+		gpl(PipelineLibraryEvent::Library, true);
+		gpl(PipelineLibraryEvent::Optimized, true);
+		// Memory counters added after the compile columns (none yet).
+		memory_columns(kMemoryColumnsBeforeCompile, kMemoryCounterColumns.size());
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
 
 	for (auto* file: {g_files.summary, g_files.apr, g_files.imports, g_files.imports_index,
 	                  g_files.lod, g_files.tex, g_files.modules, g_files.queues, g_files.readbacks,
-	                  g_files.images, g_files.lodwatch, g_files.transfers}) {
+	                  g_files.images, g_files.lodwatch, g_files.transfers, g_files.compiles}) {
 		if (file != nullptr) {
 			std::fflush(file);
 		}
@@ -796,11 +885,29 @@ void Initialize() {
 	                  "xfer_buffer_upload_bytes,xfer_image_copies,xfer_image_copy_bytes,"
 	                  "xfer_alias_syncs,xfer_alias_sync_bytes";
 	summary_header += ",gpu_rendering_ends,gpu_draw_write_sinks";
-	for (const auto& column: kMemoryCounterColumns) {
-		summary_header += ',';
-		summary_header += column.name;
-	}
+	const auto memory_header = [&](size_t begin, size_t end) {
+		for (size_t counter = begin; counter < end; counter++) {
+			summary_header += ',';
+			summary_header += kMemoryCounterColumns[counter].name;
+		}
+	};
+	memory_header(0, kMemoryColumnsBeforeCompile);
+	summary_header += ",compile_programs,compile_translate_us,compile_emit_us,compile_validate_us,"
+	                  "compile_module_us,compile_gfx_pipelines,compile_gfx_pipeline_us,"
+	                  "compile_cs_pipelines,compile_cs_pipeline_us,compile_stall_us,"
+	                  "compile_stall_max_us,compile_gfx_new,compile_gfx_perm,compile_gfx_variant";
+	summary_header += ",pcache_saves,pcache_save_kb,pcache_save_serialize_us,pcache_save_write_us,"
+	                  "pcache_save_overlaps,pcache_save_overlap_us";
+	summary_header += ",compile_translation_reuses,compile_clone_us";
+	summary_header += ",validate_async_count,validate_async_us";
+	summary_header += ",gpl_cache_hits,gpl_links,gpl_link_us,gpl_libraries,gpl_library_us,"
+	                  "gpl_optimized,gpl_optimize_us";
+	memory_header(kMemoryColumnsBeforeCompile, kMemoryCounterColumns.size());
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
+	g_files.compiles = OpenFile("compiles.csv",
+	                            "t_ms,kind,stage,guest_hash,id,id2,origin,translate_us,emit_us,"
+	                            "validate_us,module_us,pipeline_us,total_us,spirv_words,host_tid,"
+	                            "detail,clone_us");
 	g_files.transfers = OpenFile("transfers.csv",
 	                             "t_ms,kind,reason,detail,address,format,width,height,count,bytes,"
 	                             "span_bytes");
@@ -868,7 +975,7 @@ void Shutdown() {
 	for (auto** file: {&g_files.summary, &g_files.apr, &g_files.imports, &g_files.imports_index,
 	                   &g_files.lod, &g_files.tex, &g_files.modules, &g_files.queues,
 	                   &g_files.readbacks, &g_files.images, &g_files.lodwatch,
-	                   &g_files.transfers}) {
+	                   &g_files.transfers, &g_files.compiles}) {
 		if (*file != nullptr) {
 			std::fclose(*file);
 			*file = nullptr;
@@ -1447,6 +1554,100 @@ void RecordGpuOpCounts(const GpuOpCounts& counts) {
 	                                         std::memory_order_relaxed);
 	g_totals.gpu_rendering_ends.fetch_add(counts.rendering_ends, std::memory_order_relaxed);
 	g_totals.gpu_draw_write_sinks.fetch_add(counts.draw_write_sinks, std::memory_order_relaxed);
+}
+
+void RecordCompile(const CompileEvent& event) {
+	if (!Enabled() || event.kind >= CompileKind::Count) {
+		return;
+	}
+	const auto add = [](std::atomic<uint64_t>& total, uint64_t value) {
+		total.fetch_add(value, std::memory_order_relaxed);
+	};
+	switch (event.kind) {
+		case CompileKind::Program:
+			add(g_totals.compile_programs, 1);
+			add(g_totals.compile_translate_ns, event.translate_ns);
+			add(g_totals.compile_clone_ns, event.clone_ns);
+			if (event.reused) add(g_totals.compile_translation_reuses, 1);
+			add(g_totals.compile_emit_ns, event.emit_ns);
+			add(g_totals.compile_validate_ns, event.validate_ns);
+			add(g_totals.compile_module_ns, event.module_ns);
+			break;
+		case CompileKind::GraphicsPipeline:
+			add(g_totals.compile_gfx_pipelines, 1);
+			add(g_totals.compile_gfx_pipeline_ns, event.pipeline_ns);
+			switch (event.origin) {
+				case PipelineOrigin::New: add(g_totals.compile_gfx_new, 1); break;
+				case PipelineOrigin::Permutation: add(g_totals.compile_gfx_perm, 1); break;
+				case PipelineOrigin::Variant: add(g_totals.compile_gfx_variant, 1); break;
+				default: break;
+			}
+			break;
+		case CompileKind::ComputePipeline:
+			add(g_totals.compile_cs_pipelines, 1);
+			add(g_totals.compile_cs_pipeline_ns, event.pipeline_ns);
+			break;
+		default: break;
+	}
+	const auto origin = static_cast<size_t>(event.origin) < std::size(kPipelineOriginNames)
+	                        ? kPipelineOriginNames[static_cast<size_t>(event.origin)]
+	                        : "";
+	auto row = fmt::format("{},{},{},0x{:016x},{},{},{},{},{},{},{},{},{},{},{},{},{}", NowMs(),
+	                       kCompileKindNames[static_cast<size_t>(event.kind)],
+	                       event.stage != nullptr ? event.stage : "", event.guest_hash, event.id,
+	                       event.id2, origin, event.translate_ns / 1000u, event.emit_ns / 1000u,
+	                       event.validate_ns / 1000u, event.module_ns / 1000u,
+	                       event.pipeline_ns / 1000u, event.total_ns / 1000u, event.spirv_words,
+	                       OsThreadId(), CsvEscape(event.detail), event.clone_ns / 1000u);
+	std::scoped_lock lock(g_compile_mutex);
+	if (g_compile_rows_total >= kCompileRowLimit) {
+		return;
+	}
+	g_compile_rows_total++;
+	g_pending_compile_rows.push_back(std::move(row));
+}
+
+void RecordCompileStall(uint64_t stall_ns) {
+	if (!Enabled() || stall_ns == 0) {
+		return;
+	}
+	g_totals.compile_stall_ns.fetch_add(stall_ns, std::memory_order_relaxed);
+	UpdateMax(g_totals.compile_stall_max_ns, stall_ns);
+}
+
+void RecordPipelineCacheSave(uint64_t bytes, uint64_t serialize_ns, uint64_t write_ns) {
+	if (!Enabled()) {
+		return;
+	}
+	g_totals.pcache_saves.fetch_add(1, std::memory_order_relaxed);
+	g_totals.pcache_save_bytes.fetch_add(bytes, std::memory_order_relaxed);
+	g_totals.pcache_save_serialize_ns.fetch_add(serialize_ns, std::memory_order_relaxed);
+	g_totals.pcache_save_write_ns.fetch_add(write_ns, std::memory_order_relaxed);
+}
+
+void RecordPipelineLibraryEvent(PipelineLibraryEvent event, uint64_t ns, uint64_t count) {
+	if (!Enabled() || event >= PipelineLibraryEvent::Count) {
+		return;
+	}
+	const auto index = static_cast<size_t>(event);
+	g_totals.gpl_count[index].fetch_add(count, std::memory_order_relaxed);
+	g_totals.gpl_ns[index].fetch_add(ns, std::memory_order_relaxed);
+}
+
+void RecordShaderValidation(uint64_t validate_ns) {
+	if (!Enabled()) {
+		return;
+	}
+	g_totals.validate_async.fetch_add(1, std::memory_order_relaxed);
+	g_totals.validate_async_ns.fetch_add(validate_ns, std::memory_order_relaxed);
+}
+
+void RecordPipelineCacheSaveOverlap(uint64_t create_ns) {
+	if (!Enabled()) {
+		return;
+	}
+	g_totals.pcache_save_overlaps.fetch_add(1, std::memory_order_relaxed);
+	g_totals.pcache_save_overlap_ns.fetch_add(create_ns, std::memory_order_relaxed);
 }
 
 } // namespace HangTrace

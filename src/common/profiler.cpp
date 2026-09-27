@@ -338,6 +338,14 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.DrawPrepCommitWaits.Cumulative",
     "FrameEvent.DrawPrepLogWouldReject.Cumulative",
     "FrameEvent.DrawPrepLogMissed.Cumulative",
+    "FrameEvent.ComputePipelinesCreated.Cumulative",
+    "FrameEvent.ProgramCompileWaits.Cumulative",
+    "FrameEvent.ProgramCompileDuplicates.Cumulative",
+    "FrameEvent.TranslationReuses.Cumulative",
+    "FrameEvent.TranslationVerifyMismatches.Cumulative",
+    "FrameEvent.PipelineLibraryLinks.Cumulative",
+    "FrameEvent.PipelineLibraryCacheHits.Cumulative",
+    "FrameEvent.PipelineLibrariesCreated.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
@@ -382,6 +390,13 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.DrawPrepCommitWait.Calls.Cumulative",
     "FrameWait.DrawPrepPrepare.Calls.Cumulative",
     "FrameWait.DrawPrepValidate.Calls.Cumulative",
+    "FrameWait.ShaderTranslate.Calls.Cumulative",
+    "FrameWait.ShaderEmit.Calls.Cumulative",
+    "FrameWait.ShaderValidate.Calls.Cumulative",
+    "FrameWait.ShaderModuleCreate.Calls.Cumulative",
+    "FrameWait.GraphicsPipelineDriver.Calls.Cumulative",
+    "FrameWait.ComputePipelineCreate.Calls.Cumulative",
+    "FrameWait.PipelineOptimize.Calls.Cumulative",
 };
 static_assert(kFrameWaitCallNames.back() != nullptr, "FrameWait names must match the enum");
 constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
@@ -419,6 +434,13 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.DrawPrepCommitWait.Nanoseconds.Cumulative",
     "FrameWait.DrawPrepPrepare.Nanoseconds.Cumulative",
     "FrameWait.DrawPrepValidate.Nanoseconds.Cumulative",
+    "FrameWait.ShaderTranslate.Nanoseconds.Cumulative",
+    "FrameWait.ShaderEmit.Nanoseconds.Cumulative",
+    "FrameWait.ShaderValidate.Nanoseconds.Cumulative",
+    "FrameWait.ShaderModuleCreate.Nanoseconds.Cumulative",
+    "FrameWait.GraphicsPipelineDriver.Nanoseconds.Cumulative",
+    "FrameWait.ComputePipelineCreate.Nanoseconds.Cumulative",
+    "FrameWait.PipelineOptimize.Nanoseconds.Cumulative",
 };
 static_assert(kFrameWaitTimeNames.back() != nullptr, "FrameWait names must match the enum");
 

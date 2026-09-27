@@ -990,7 +990,9 @@ std::vector<u32> CompilePixelShader(const char *name, const std::vector<u32> &co
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Pixel;
   options.input_info.pixel = &pixel;
-  options.user_data = MakeNativeUserData(nullptr);
+  // options.user_data is a view: keep the array it points at alive for the whole compile.
+  const auto user_data = MakeNativeUserData(nullptr);
+  options.user_data = user_data;
   auto translated = ShaderRecompiler::TranslateProgram(code, options);
   auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;

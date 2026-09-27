@@ -407,6 +407,12 @@ struct GraphicsDynamicStateShadow {
 	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write {};
 	bool                 feedback_valid = false;
 	vk::ImageAspectFlags feedback;
+	// KYTY_PIPELINE_DYNAMIC_STATE (PipelineDynamicRasterStateEnabled).
+	vk::CullModeFlags    cull_mode;
+	vk::FrontFace        front_face               = vk::FrontFace::eCounterClockwise;
+	vk::Bool32           depth_bounds_test_enable = VK_FALSE;
+	bool                 depth_bounds_valid       = false;
+	std::array<float, 2> depth_bounds {};
 };
 
 class RenderExecutor {

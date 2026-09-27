@@ -20,6 +20,7 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <span>
 #include <vector>
@@ -210,7 +211,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const ShaderPixelInputInfo*            ps_input_info,
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache) {
+                            vk::PipelineCache                      driver_cache,
+                            const GraphicsPipelineCreateHook*      create_hook) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -481,6 +483,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
 #endif
+	if (PipelineDynamicRasterStateEnabled()) {
+		// Core Vulkan 1.3 (no feature bit). The key holds zeroes for these fields; the draw records
+		// the values from the same registers (SetGraphicsDynamicParams).
+		dynamic_states.push_back(vk::DynamicState::eCullMode);
+		dynamic_states.push_back(vk::DynamicState::eFrontFace);
+#if !defined(__APPLE__)
+		dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
+		dynamic_states.push_back(vk::DynamicState::eDepthBounds);
+#endif
+	}
 	if (graphics.attachment_feedback_loop_enabled) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
 	}
@@ -524,8 +536,48 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
-	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
-	                                                 &pipeline.pipeline);
+	const auto driver_begin = std::chrono::steady_clock::now();
+	if (create_hook != nullptr) {
+		// The pipeline-library path shares libraries only between identically defined layouts.
+		// Interned (pipelineLayoutCache.h): pipelines with equal canonical signatures get the same
+		// layout handles, so that signature identifies the definition. Not interned: each pipeline
+		// creates its layout from these bindings in this order, so the key keeps the order.
+		std::vector<uint32_t> layout_signature;
+		layout_signature.reserve(descriptor_bindings.size() * 4u + 4u);
+		if (PipelineLayoutInterningEnabled()) {
+			const auto canonical = MakePipelineLayoutSignature(
+			    descriptor_bindings, graphics_stages, ShaderRecompiler::IR::NativePushConstantSize,
+			    graphics.max_push_descriptors);
+			layout_signature.push_back(1u);
+			layout_signature.push_back(canonical.push_descriptors ? 1u : 0u);
+			layout_signature.push_back(canonical.push_stages);
+			layout_signature.push_back(canonical.push_size);
+			for (const auto& binding: canonical.bindings) {
+				layout_signature.insert(layout_signature.end(), binding.begin(), binding.end());
+			}
+		} else {
+			layout_signature.push_back(0u);
+			layout_signature.push_back(pipeline.uses_push_descriptors ? 1u : 0u);
+			layout_signature.push_back(
+			    static_cast<vk::ShaderStageFlags::MaskType>(graphics_stages));
+			layout_signature.push_back(ShaderRecompiler::IR::NativePushConstantSize);
+			for (const auto& binding: descriptor_bindings) {
+				layout_signature.push_back(binding.binding);
+				layout_signature.push_back(static_cast<uint32_t>(binding.descriptorType));
+				layout_signature.push_back(binding.descriptorCount);
+				layout_signature.push_back(
+				    static_cast<vk::ShaderStageFlags::MaskType>(binding.stageFlags));
+			}
+		}
+		result = (*create_hook)(pipeline_info, layout_signature, &pipeline.pipeline);
+	} else {
+		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
+		                                                 &pipeline.pipeline);
+	}
+	Profiler::AddFrameWait(Profiler::FrameWait::GraphicsPipelineDriver, 1,
+	                       static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                                 std::chrono::steady_clock::now() - driver_begin)
+	                                                 .count()));
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
