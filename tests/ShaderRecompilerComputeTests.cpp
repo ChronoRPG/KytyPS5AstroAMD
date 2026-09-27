@@ -79,6 +79,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -1733,6 +1734,157 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
           std::move(resources), std::move(packed_user_data)};
 }
 
+// Compiles one guest shader dump from Profiling/analysis/guest-shader-diagnostic (a CS or PS,
+// by file name) with null resources: every descriptor read is zero. Resource access code differs
+// from a real binding, the ALU and control-flow mix does not. Returns "ok", "skip" (another
+// stage) or the failing step.
+const char *CompileCorpusShader(const char *path, ShaderRecompiler::CompileResult *result) {
+  std::FILE *file = std::fopen(path, "rb");
+  if (file == nullptr) {
+    return "open";
+  }
+  std::vector<u32> code;
+  u32 word = 0;
+  while (std::fread(&word, sizeof(word), 1, file) == 1) {
+    code.push_back(word);
+  }
+  std::fclose(file);
+  const std::string name = path;
+  ShaderRecompiler::CompileOptions options;
+  ShaderComputeInputInfo compute{};
+  ShaderPixelInputInfo pixel{};
+  if (name.find("_cs_") != std::string::npos) {
+    options.stage = ShaderType::Compute;
+    compute.threads_num[0] = 64;
+    compute.threads_num[1] = 1;
+    compute.threads_num[2] = 1;
+    compute.thread_ids_num = 3;
+    compute.lds_size_dwords = 16384;
+    compute.host_subgroup_size = 32;
+    compute.wave_size = 64;
+    options.input_info.compute = &compute;
+    options.wave_size = 64;
+  } else if (name.find("_ps_") != std::string::npos) {
+    options.stage = ShaderType::Pixel;
+    pixel.input_num = 32;
+    for (u32 i = 0; i < 32; i++) {
+      pixel.interpolator_settings[i] = i;
+    }
+    pixel.ps_perspective_center_vgpr = 0;
+    pixel.ps_system_input_base = 2;
+    for (auto &mode : pixel.target_output_mode) {
+      mode = 4;
+    }
+    options.input_info.pixel = &pixel;
+  } else {
+    return "skip";
+  }
+  const auto user_data = MakeNativeUserData(nullptr);
+  options.user_data = user_data;
+  // The emulator's device state on the RTX 3090 (driver 610.74): robustBufferAccess2 with 1-byte
+  // storage alignment, shaderResourceMinLod, independent denormal modes with f16 preservation
+  // only (no f32 flush-to-zero, no f64 preservation).
+  ShaderRecompiler::Spirv::SetHostBufferRobustness({.storage_dword_loads_return_zero = true});
+  ShaderRecompiler::Spirv::SetHostFloatControls({.denorm_flush_f32 = false,
+                                                 .denorm_preserve_f16 = true,
+                                                 .denorm_preserve_f64 = false});
+  ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = true});
+  auto translated = ShaderRecompiler::TranslateProgram(code, options);
+  auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = options.user_data,
+      .shader_base = reinterpret_cast<uint64_t>(code.data()),
+      .read_memory = [](void *, uint64_t, std::span<u32> values) {
+        std::fill(values.begin(), values.end(), 0u);
+        return true;
+      },
+  };
+  if (!ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization)) {
+    return "materialize";
+  }
+  *result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+  return "ok";
+}
+
+// CPU only (--corpus-spirv-stats <file.bin> [out.spvasm]): prints one CSV line of the SPIR-V
+// instruction mix of a corpus shader (CompileCorpusShader), optionally with its disassembly and
+// IR dump. Run it once per file: a shader the recompiler rejects stops only its own process.
+int CorpusSpirvStats(const char *path, const char *disassembly_path = nullptr) {
+  ShaderRecompiler::CompileResult result;
+  const std::string status = CompileCorpusShader(path, &result);
+  if (status != "ok") {
+    std::printf("%s,%s,%s\n", path, status == "skip" ? "skip" : "error", status.c_str());
+    return status == "skip" ? 0 : 1;
+  }
+  const auto &spirv = result.spirv;
+  if (disassembly_path != nullptr) {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string text;
+    if (tools.Disassemble(spirv, &text, SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES)) {
+      if (std::FILE *out = std::fopen(disassembly_path, "wb"); out != nullptr) {
+        std::fwrite(text.data(), 1, text.size(), out);
+        std::fclose(out);
+      }
+    }
+    const std::string ir_path = std::string(disassembly_path) + ".ir";
+    if (std::FILE *out = std::fopen(ir_path.c_str(), "wb"); out != nullptr) {
+      std::fwrite(result.ir_dump.data(), 1, result.ir_dump.size(), out);
+      std::fclose(out);
+    }
+  }
+  std::map<u32, size_t> opcodes;
+  std::map<u32, size_t> condition_uses;
+  size_t total = 0;
+  bool in_function = false;
+  for (size_t i = 5; i < spirv.size();) {
+    const auto count = spirv[i] >> 16u;
+    const auto opcode = spirv[i] & 0xffffu;
+    if (count == 0) {
+      break;
+    }
+    if (opcode == spv::OpFunction) {
+      in_function = true;
+    }
+    if (in_function) {
+      total++;
+      opcodes[opcode]++;
+      if (opcode == spv::OpSelect && i + 3 < spirv.size()) {
+        condition_uses[spirv[i + 3]]++;
+      }
+    }
+    i += count;
+  }
+  size_t shared_condition_selects = 0;
+  for (const auto &[condition, uses] : condition_uses) {
+    if (uses >= 8u) {
+      shared_condition_selects += uses;
+    }
+  }
+  const auto count = [&](spv::Op op) {
+    const auto it = opcodes.find(op);
+    return it == opcodes.end() ? size_t{0} : it->second;
+  };
+  std::printf("%s,ok,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu\n", path, total,
+              count(spv::OpSelect), shared_condition_selects, count(spv::OpBitcast),
+              count(spv::OpIEqual) + count(spv::OpINotEqual) + count(spv::OpBitwiseAnd) +
+                  count(spv::OpULessThan) + count(spv::OpLogicalAnd),
+              count(spv::OpLabel) + count(spv::OpBranch) + count(spv::OpBranchConditional) +
+                  count(spv::OpSelectionMerge) + count(spv::OpPhi),
+              count(spv::OpBranchConditional), count(spv::OpArrayLength),
+              count(spv::OpFMul) + count(spv::OpFAdd) + count(spv::OpFSub) +
+                  count(spv::OpFDiv) + count(spv::OpFNegate),
+              count(spv::OpExtInst), count(spv::OpLoad), count(spv::OpStore),
+              count(spv::OpAccessChain), count(spv::OpCompositeExtract) +
+                  count(spv::OpCompositeConstruct),
+              count(spv::OpImageSampleExplicitLod) + count(spv::OpImageSampleImplicitLod) +
+                  count(spv::OpImageSampleDrefExplicitLod) +
+                  count(spv::OpImageSampleDrefImplicitLod) + count(spv::OpImageFetch) +
+                  count(spv::OpImageGather));
+  return 0;
+}
+
 std::array<u32, 64> MakeStructuredStorageBufferData(u32 stride_bytes,
                                                     u32 num_records,
                                                     bool add_tid = false,
@@ -1971,6 +2123,7 @@ public:
     m_physical_device.getProperties2(&properties);
     return subgroup.subgroupSize;
   }
+
   // Whether the device can flush f32 denormals independently (the emulator then declares
   // DenormFlushToZero 32, see ConfigureShaderFloatControls).
   [[nodiscard]] bool DenormFlushF32Supported() const {
@@ -15067,12 +15220,15 @@ public:
     return ret;
   }
 
+  // `repeats` > 1 records the dispatch that many times; with `elapsed_us`, timestamps around
+  // them give the GPU time per dispatch (benchmarks only).
   void Dispatch(const TestCase &test, const CompiledShader &compiled,
                 const Buffer &buffer, const Buffer *gds_buffer = nullptr,
                 const Image *sampled_image = nullptr,
                 const Image *storage_image = nullptr,
                 const Image *storage_image_uint = nullptr,
-                vk::Sampler sampler = nullptr) {
+                vk::Sampler sampler = nullptr, u32 repeats = 1,
+                double *elapsed_us = nullptr) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
     auto Binding = [&](Kind kind) {
@@ -15483,7 +15639,23 @@ public:
       cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                         sizeof(push_data), push_data.dwords.data());
     }
-    cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
+    vk::QueryPool timestamps = nullptr;
+    if (elapsed_us != nullptr) {
+      vk::QueryPoolCreateInfo query_info{};
+      query_info.queryType = vk::QueryType::eTimestamp;
+      query_info.queryCount = 2;
+      RequireVk(test.name, "dispatch",
+                m_device.createQueryPool(&query_info, nullptr, &timestamps),
+                "vkCreateQueryPool");
+      cmd.resetQueryPool(timestamps, 0, 2);
+      cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, timestamps, 0);
+    }
+    for (u32 repeat = 0; repeat < std::max(repeats, 1u); repeat++) {
+      cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
+    }
+    if (elapsed_us != nullptr) {
+      cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, timestamps, 1);
+    }
 
     if (buffers != nullptr) {
       vk::BufferMemoryBarrier barrier{};
@@ -15516,6 +15688,18 @@ public:
                           &barrier, 0, nullptr);
     }
     EndSubmitAndFree(test.name, "dispatch", cmd);
+    if (elapsed_us != nullptr) {
+      std::array<uint64_t, 2> stamps{};
+      RequireVk(test.name, "timestamps",
+                m_device.getQueryPoolResults(
+                    timestamps, 0, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+                    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                "vkGetQueryPoolResults");
+      const double period = m_physical_device.getProperties().limits.timestampPeriod;
+      *elapsed_us = static_cast<double>(stamps[1] - stamps[0]) * period / 1000.0 /
+                    std::max(repeats, 1u);
+      m_device.destroyQueryPool(timestamps, nullptr);
+    }
     if (flattened_buffer.buffer != nullptr) {
       DestroyBuffer(&flattened_buffer);
     }
@@ -15527,6 +15711,69 @@ public:
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
     m_device.destroyShaderModule(module, nullptr);
+  }
+
+  // Milliseconds vkCreateComputePipelines spends on `spirv` (benchmarks). The module's ID bound is
+  // raised by `nonce` so that driver shader caches never recognise it.
+  double TimeComputePipeline(const char *name, std::vector<u32> spirv,
+                             const ShaderRecompiler::IR::BindingLayout &layout, u32 nonce) {
+    spirv[3] += nonce;
+    vk::ShaderModuleCreateInfo module_info{};
+    module_info.codeSize = spirv.size() * sizeof(u32);
+    module_info.pCode = spirv.data();
+    vk::ShaderModule module = nullptr;
+    RequireVk(name, "pipeline timing", m_device.createShaderModule(&module_info, nullptr, &module),
+              "vkCreateShaderModule");
+    std::vector<vk::DescriptorSetLayoutBinding> bindings;
+    for (const auto &binding : layout.descriptors) {
+      const auto count = NativeDescriptorCount(binding);
+      if (count == 0) {
+        continue;
+      }
+      vk::DescriptorSetLayoutBinding item{};
+      item.binding = ShaderRecompiler::IR::NativeBinding(ShaderType::Compute, binding.kind);
+      item.descriptorType = NativeDescriptorType(binding.kind);
+      item.descriptorCount = count;
+      item.stageFlags = vk::ShaderStageFlagBits::eCompute;
+      bindings.push_back(item);
+    }
+    vk::DescriptorSetLayoutCreateInfo set_info{};
+    set_info.bindingCount = static_cast<u32>(bindings.size());
+    set_info.pBindings = bindings.empty() ? nullptr : bindings.data();
+    vk::DescriptorSetLayout set_layout = nullptr;
+    RequireVk(name, "pipeline timing",
+              m_device.createDescriptorSetLayout(&set_info, nullptr, &set_layout),
+              "vkCreateDescriptorSetLayout");
+    vk::PipelineLayoutCreateInfo pipeline_layout_info{};
+    pipeline_layout_info.setLayoutCount = 1;
+    pipeline_layout_info.pSetLayouts = &set_layout;
+    vk::PushConstantRange push_range{};
+    if (layout.UsesPushData()) {
+      push_range.stageFlags = vk::ShaderStageFlagBits::eCompute;
+      push_range.size = ShaderRecompiler::IR::NativePushConstantSize;
+      pipeline_layout_info.pushConstantRangeCount = 1;
+      pipeline_layout_info.pPushConstantRanges = &push_range;
+    }
+    vk::PipelineLayout pipeline_layout = nullptr;
+    RequireVk(name, "pipeline timing",
+              m_device.createPipelineLayout(&pipeline_layout_info, nullptr, &pipeline_layout),
+              "vkCreatePipelineLayout");
+    vk::ComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    pipeline_info.stage.module = module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = pipeline_layout;
+    vk::Pipeline pipeline = nullptr;
+    const auto begin = std::chrono::steady_clock::now();
+    RequireVk(name, "pipeline timing",
+              m_device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+              "vkCreateComputePipelines");
+    const auto end = std::chrono::steady_clock::now();
+    m_device.destroyPipeline(pipeline, nullptr);
+    m_device.destroyPipelineLayout(pipeline_layout, nullptr);
+    m_device.destroyDescriptorSetLayout(set_layout, nullptr);
+    m_device.destroyShaderModule(module, nullptr);
+    return std::chrono::duration<double, std::milli>(end - begin).count();
   }
 
   void CheckRasterization(bool depth_feedback, bool packed_vertex_color = false) {
@@ -37064,6 +37311,10 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--corpus-spirv-stats") == 0) {
+    EnsureConfigInitialized();
+    return CorpusSpirvStats(argv[2], argc == 4 ? argv[3] : nullptr);
+  }
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
@@ -37596,6 +37847,16 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--readlane-key-guard-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--corpus-pipeline-times") == 0) {
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    return CodegenTests::CorpusPipelineTimes(&vulkan, argv[2]);
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--exec-selects-bench") == 0) {
+    VulkanHarness vulkan;
+    CodegenTests::BenchExecSelects(&vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--codegen-only") == 0) {

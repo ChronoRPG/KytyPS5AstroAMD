@@ -60,6 +60,9 @@ struct CodegenOptions {
 	// CodegenTranscendentalDenormInputs with "host FTZ declared" (the RTX 3090 on driver 610.74
 	// has no f32 flush-to-zero, so it never applies there).
 	bool host_ftz_inputs = false;
+	// KYTY_EXEC_SELECTS=0: keep every EXEC-masked VGPR merge Select(exec, new, old) instead of
+	// replacing the ones whose old value no lane can observe (IR::EliminateExecSelects).
+	bool exec_selects = true;
 };
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();

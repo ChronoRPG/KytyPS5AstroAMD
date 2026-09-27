@@ -204,6 +204,15 @@ inline const ShaderWorkgroupInputInfo* ShaderWorkgroupInput(ShaderType          
 	}
 }
 
+// Guest lanes per host invocation: a wave64 workgroup shader on a 32-wide host subgroup runs two
+// lanes (the SPIR-V emitter's halves) in each invocation and branches on the whole wave.
+inline uint32_t ShaderLanesPerInvocation(ShaderType stage, uint32_t wave_size,
+                                         ShaderStageInputInfo input) {
+	const auto* workgroup = ShaderWorkgroupInput(stage, input);
+	return workgroup != nullptr && wave_size == 64u && workgroup->host_subgroup_size == 32u ? 2u
+	                                                                                      : 1u;
+}
+
 uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input);
 uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input);
