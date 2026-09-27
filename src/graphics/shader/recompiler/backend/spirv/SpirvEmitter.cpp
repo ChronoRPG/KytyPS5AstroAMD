@@ -21,6 +21,7 @@ enum HostFloatControlBits : uint32_t {
 
 std::atomic_uint32_t g_host_float_controls {0};
 std::atomic_bool     g_storage_dword_loads_return_zero {false};
+std::atomic_bool     g_image_min_lod {false};
 
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
@@ -360,6 +361,14 @@ HostBufferRobustness GetHostBufferRobustness() {
 	            g_storage_dword_loads_return_zero.load(std::memory_order_relaxed)};
 }
 
+void SetHostImageFeatures(const HostImageFeatures& features) {
+	g_image_min_lod.store(features.min_lod, std::memory_order_relaxed);
+}
+
+HostImageFeatures GetHostImageFeatures() {
+	return {.min_lod = g_image_min_lod.load(std::memory_order_relaxed)};
+}
+
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
                                   ShaderStageInputInfo input_info, bool mip_stats_records) {
 	using namespace Emitter;
@@ -378,11 +387,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
 	state.mip_stats_records = mip_stats_records;
-	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
-	state.lane_count =
-	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
-	        ? 2u
-	        : 1u;
+	state.lane_count = ShaderLanesPerInvocation(program.stage, program.wave_size, input_info);
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,

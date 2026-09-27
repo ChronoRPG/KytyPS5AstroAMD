@@ -1055,6 +1055,27 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 }
 
+// The binding range is stride * NUM_RECORDS (NUM_RECORDS bytes without a stride) whatever the
+// V# OOB_SELECT (RDNA2 ISA 8.1.5, Table 35: 0 also checks offset < stride, 1 checks the index
+// only, 2 disables the check, 3 counts NUM_RECORDS in bytes). Log each OOB_SELECT / stride /
+// swizzle / ADD_TID combination once so a run shows which modes a title uses.
+static void NoteBufferOutOfBoundsMode(const ShaderBufferResource& descriptor, uint64_t address) {
+	static std::atomic<uint32_t> seen {0};
+	const auto combination = static_cast<uint32_t>(descriptor.OutOfBounds()) |
+	                         (descriptor.Stride() != 0 ? 4u : 0u) |
+	                         (descriptor.SwizzleEnabled() ? 8u : 0u) | (descriptor.AddTid() ? 16u : 0u);
+	const auto bit = 1u << combination;
+	if ((seen.load(std::memory_order_relaxed) & bit) != 0u ||
+	    (seen.fetch_or(bit, std::memory_order_relaxed) & bit) != 0u) {
+		return;
+	}
+	LOGF("Buffer: V# OOB_SELECT=%u stride=%u swizzle=%u add_tid=%u num_records=%u first bound at "
+	     "0x%016" PRIx64 "\n",
+	     static_cast<uint32_t>(descriptor.OutOfBounds()), static_cast<uint32_t>(descriptor.Stride()),
+	     descriptor.SwizzleEnabled() ? 1u : 0u, descriptor.AddTid() ? 1u : 0u,
+	     descriptor.NumRecords(), address);
+}
+
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -1068,6 +1089,7 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
 		const auto address = descriptor.Base48();
 		const auto requested_size = descriptor.GetSize();
+		NoteBufferOutOfBoundsMode(descriptor, address);
 		if (address == 0 || requested_size == 0) {
 			prepared.buffer_sources.push_back({});
 			continue;

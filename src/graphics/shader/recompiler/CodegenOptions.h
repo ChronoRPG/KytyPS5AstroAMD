@@ -48,6 +48,21 @@ struct CodegenOptions {
 	// perspective (NoPerspective on all inputs when LINEAR_CENTER is enabled) instead of per input
 	// from the I/J pair its V_INTERP_P2 reads use (centroid, sample, linear).
 	bool interp_modes = true;
+	// KYTY_SAMPLE_OFFSETS=0: ignore the texel offsets of IMAGE_SAMPLE*_O (the behaviour before
+	// U50) instead of applying them.
+	bool sample_offsets = true;
+	// KYTY_SAMPLE_LOD_CLAMP=0: ignore the LOD clamp of IMAGE_SAMPLE*_CL (the behaviour before U50)
+	// instead of applying it as the sample's minimum LOD.
+	bool sample_lod_clamp = true;
+	// KYTY_HOST_FTZ_INPUTS=1: when the module declares DenormFlushToZero 32, leave the denormal
+	// inputs of rcp/rsq/sqrt/exp/log to the host instead of flushing them in the shader. Vulkan
+	// only says such operands "may" be flushed, so this is opt-in for hosts that pass
+	// CodegenTranscendentalDenormInputs with "host FTZ declared" (the RTX 3090 on driver 610.74
+	// has no f32 flush-to-zero, so it never applies there).
+	bool host_ftz_inputs = false;
+	// KYTY_EXEC_SELECTS=0: keep every EXEC-masked VGPR merge Select(exec, new, old) instead of
+	// replacing the ones whose old value no lane can observe (IR::EliminateExecSelects).
+	bool exec_selects = true;
 };
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();

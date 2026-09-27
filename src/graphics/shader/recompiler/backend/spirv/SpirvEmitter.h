@@ -32,6 +32,15 @@ struct HostBufferRobustness {
 void                 SetHostBufferRobustness(const HostBufferRobustness& robustness);
 HostBufferRobustness GetHostBufferRobustness();
 
+// Optional image features of the device (set once by the device layer).
+struct HostImageFeatures {
+	// shaderResourceMinLod: the MinLod image operand, used for IMAGE_SAMPLE*_CL.
+	bool min_lod = false;
+};
+
+void              SetHostImageFeatures(const HostImageFeatures& features);
+HostImageFeatures GetHostImageFeatures();
+
 // mip_stats_records=false emits the plain variant of a GET_LOD_STATS-instrumented pixel shader:
 // the same bindings and code, without the per-sample feedback (and so without its storage-buffer
 // atomics, which force depth/stencil tests after the shader for a shader that can discard).

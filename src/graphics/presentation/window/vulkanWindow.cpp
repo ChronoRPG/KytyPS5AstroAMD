@@ -706,6 +706,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.multi_draw_indirect_enabled =
 	    supported_features2.features.multiDrawIndirect == VK_TRUE;
 	graphics.draw_indirect_count_enabled = supported_features12.drawIndirectCount == VK_TRUE;
+	graphics.sampler_filter_minmax_enabled = supported_features12.samplerFilterMinmax == VK_TRUE;
+	LOGF("Vulkan sampler min/max reduction: %s\n",
+	     graphics.sampler_filter_minmax_enabled ? "true" : "false");
 	graphics.index_type_uint8_enabled =
 	    index_type_uint8_extension && supported_index_type_uint8.indexTypeUint8 == VK_TRUE;
 	LOGF("Vulkan indirect draws: firstInstance=%s multiDraw=%s count=%s indexUint8=%s\n",
@@ -752,6 +755,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		     static_cast<uint64_t>(robustness2_properties.robustStorageBufferAccessSizeAlignment),
 		     robustness.storage_dword_loads_return_zero ? "device" : "shader");
 	}
+	// Optional: IMAGE_SAMPLE*_CL clamps become the MinLod image operand.
+	const bool shader_resource_min_lod =
+	    supported_features2.features.shaderResourceMinLod == VK_TRUE;
+	ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = shader_resource_min_lod});
+	LOGF("Vulkan shaderResourceMinLod (IMAGE_SAMPLE*_CL): %s\n",
+	     shader_resource_min_lod ? "true" : "false");
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
@@ -801,6 +810,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.storage_image_read_without_format_enabled =
 	    device_features.shaderStorageImageReadWithoutFormat == VK_TRUE;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
+	device_features.shaderResourceMinLod = shader_resource_min_lod ? VK_TRUE : VK_FALSE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;
@@ -868,6 +878,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		create_info.pNext = &provoking_vertex;
 	}
 	features12.drawIndirectCount = graphics.draw_indirect_count_enabled ? VK_TRUE : VK_FALSE;
+	features12.samplerFilterMinmax = graphics.sampler_filter_minmax_enabled ? VK_TRUE : VK_FALSE;
 	vk::PhysicalDeviceIndexTypeUint8FeaturesKHR index_type_uint8 {};
 	if (graphics.index_type_uint8_enabled) {
 		index_type_uint8.indexTypeUint8 = VK_TRUE;

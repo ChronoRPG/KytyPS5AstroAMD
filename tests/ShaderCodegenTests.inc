@@ -1139,7 +1139,354 @@ void CheckInterpolationModes() {
   std::printf("[codegen] %-32s ok\n", name);
 }
 
+// V_RCP/RSQ/SQRT/EXP/LOG_F32 flush denormal inputs to zeros of the same sign ("denormals are
+// flushed"; rcp(-0) = -INF, sqrt(-0) = -0). With DenormFlushToZero 32 declared, the shader-side
+// flush is left to the host (KYTY_HOST_FTZ_INPUTS); both variants must agree bit for bit, and
+// denormal inputs must give the signed-zero results.
+void CheckTranscendentalDenormInputs(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenTranscendentalDenormInputs";
+  using O = ShaderOpcode;
+  const auto saved = ShaderRecompiler::Spirv::GetHostFloatControls();
+  auto controls = saved;
+  controls.denorm_flush_f32 = vulkan->DenormFlushF32Supported();
+  ShaderRecompiler::Spirv::SetHostFloatControls(controls);
+  std::vector<std::vector<u32>> inputs(1);
+  for (const auto value : SpecialF32()) {
+    inputs[0].push_back(value);
+  }
+  uint64_t state = 0x7f3a1c5bu;
+  while (inputs[0].size() < 8192u) {
+    const auto r = NextRandom(state);
+    // Half denormals of either sign, half arbitrary bit patterns.
+    inputs[0].push_back((r & 1u) != 0u ? (r & 0x807fffffu) : NextRandom(state));
+  }
+  const auto body = [](std::vector<u32> *code) {
+    code->push_back(EncodeVop1(0x2a, 10, Vgpr(2))); // v_rcp_f32
+    code->push_back(EncodeVop1(0x2e, 11, Vgpr(2))); // v_rsq_f32
+    code->push_back(EncodeVop1(0x33, 12, Vgpr(2))); // v_sqrt_f32
+    code->push_back(EncodeVop1(0x25, 13, Vgpr(2))); // v_exp_f32
+    code->push_back(EncodeVop1(0x27, 14, Vgpr(2))); // v_log_f32
+  };
+  const auto bulk = MakeBulkCase(name, 1, 5, inputs, body,
+                                 {O::V_RCP_F32, O::V_RSQ_F32, O::V_SQRT_F32, O::V_EXP_F32,
+                                  O::V_LOG_F32});
+  CodegenOptions host = GetCodegenOptions();
+  host.host_ftz_inputs = true;
+  CodegenOptions shader = host;
+  shader.host_ftz_inputs = false;
+  const auto fast = RunBulk(vulkan, bulk, host);
+  const auto slow = RunBulk(vulkan, bulk, shader);
+  static const char *const names[] = {"rcp", "rsq", "sqrt", "exp", "log"};
+  // Only denormal inputs have an exact reference; the rest must match the shader-side flush.
+  const auto denormal = [&](u32 e) {
+    const auto bits = bulk.test.initial[e];
+    return (bits & 0x7fffffffu) != 0u && (bits & 0x7fffffffu) < 0x00800000u;
+  };
+  const auto reference = [&](u32 output, u32 e) -> u32 {
+    const auto negative = (bulk.test.initial[e] & 0x80000000u) != 0u;
+    switch (output) {
+      case 0:
+      case 1: return negative ? 0xff800000u : 0x7f800000u;
+      case 2: return negative ? 0x80000000u : 0u;
+      case 3: return 0x3f800000u;
+      default: return 0xff800000u;
+    }
+  };
+  size_t checked = 0;
+  for (u32 e = 0; e < bulk.count; e++) {
+    checked += denormal(e) ? 1u : 0u;
+  }
+  CompareBulk(name, bulk, fast, slow, {}, names);
+  CompareBulk(name, bulk, fast, slow, reference, names,
+              [&](u32, u32 e) { return !denormal(e); });
+  const auto flushes = [](const std::vector<u32> &spirv) {
+    return CountSpirv(spirv, "OpULessThan");
+  };
+  ShaderRecompiler::Spirv::SetHostFloatControls(saved);
+  std::printf("[codegen] %-32s ok (%u elements, %zu denormal, host FTZ %s, OpULessThan %zu -> %zu)\n",
+              name, bulk.count, checked, controls.denorm_flush_f32 ? "declared" : "unavailable",
+              flushes(slow.spirv), flushes(fast.spirv));
+}
+
+// A compressed export to a SNORM16_ABGR target (SPI_SHADER_COL_FORMAT 6) carries
+// V_CVT_PKNORM_I16_F32 pairs; they were unpacked as FP16.
+void CheckCompressedSnormExport() {
+  constexpr const char *name = "CodegenCompressedSnormExport";
+  std::vector<u32> code;
+  code.push_back(EncodeExp0(1, 0xf, true, true, true)); // exp mrt1 compr done vm
+  code.push_back(EncodeExp1(0, 1, 2, 3));
+  AppendEnd(&code);
+  const auto compile = [&](uint8_t mode) {
+    ShaderPixelInputInfo pixel{};
+    pixel.target_output_mode[1] = mode;
+    return CompilePixelShader(name, code, pixel);
+  };
+  const auto snorm = compile(6);
+  const auto half = compile(4);
+  Require(name, "SNORM16 compressed export",
+          CountSpirv(snorm, "UnpackSnorm2x16") == 2u && CountSpirv(snorm, "UnpackHalf2x16") == 0u &&
+              CountSpirv(half, "UnpackHalf2x16") == 2u,
+          "SNORM16: UnpackSnorm2x16 " + std::to_string(CountSpirv(snorm, "UnpackSnorm2x16")) +
+              ", UnpackHalf2x16 " + std::to_string(CountSpirv(snorm, "UnpackHalf2x16")));
+  std::printf("[codegen] %-32s ok\n", name);
+}
+
+// EXEC-masked VGPR merges (IR::EliminateExecSelects, KYTY_EXEC_SELECTS). Region A is entered
+// through s_cbranch_execz, region B is a plain EXEC-masked stretch. Both write VGPRs twice under
+// one EXEC, keep temporaries and leave values live after EXEC is restored (inactive lanes keep
+// their old values). Region B reads lane 5 of a merged VGPR with V_READLANE_B32, which sees the
+// old value when lane 5 is inactive. Wave64 runs two lanes per host invocation (wave-uniform
+// branches), wave32 one (branches taken per invocation).
+void CheckExecSelects(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenExecSelects";
+  using O = ShaderOpcode;
+  constexpr u32 Count = 4096;
+  std::vector<std::vector<u32>> inputs(2);
+  uint64_t state = 0x5eed0e5eu;
+  for (u32 e = 0; e < Count; e++) {
+    inputs[0].push_back(NextRandom(state));
+    // Equal pairs take neither region.
+    inputs[1].push_back((NextRandom(state) & 7u) == 0u ? inputs[0].back() : NextRandom(state));
+  }
+  std::string summary;
+  for (const u32 wave : {64u, 32u}) {
+    const bool w64 = wave == 64u;
+    const auto save_exec = [&](u32 sdst) {
+      return w64 ? EncodeSop1(0x24, sdst, 106)  // s_and_saveexec_b64 s[sdst:sdst+1], vcc
+                 : EncodeSop1(0x3c, sdst, 106); // s_and_saveexec_b32 sdst, vcc_lo
+    };
+    const auto restore_exec = [&](u32 ssrc) {
+      return w64 ? EncodeSop2(0x11, 126, 126, ssrc)  // s_or_b64 exec, exec, s[ssrc:ssrc+1]
+                 : EncodeSop2(0x10, 126, 126, ssrc); // s_or_b32 exec_lo, exec_lo, ssrc
+    };
+    const auto body = [&](std::vector<u32> *code) {
+      code->push_back(EncodeVop1(0x01, 10, Vgpr(2))); // v_mov_b32 v10, v2
+      code->push_back(EncodeVop1(0x01, 11, Vgpr(3))); // v_mov_b32 v11, v3
+      AppendVMovLiteral(code, 12, 0x12345678u);
+      AppendVMovLiteral(code, 13, 0x0badf00du);
+      AppendVMovLiteral(code, 14, 0x55aa55aau);
+      // Region A: x > y.
+      code->push_back(EncodeVopc(0xc4, Vgpr(2), 3)); // v_cmp_gt_u32 vcc, v2, v3
+      code->push_back(save_exec(60));
+      const auto skip = code->size();
+      code->push_back(0);                                  // s_cbranch_execz, patched below
+      code->push_back(EncodeVop2(0x25, 20, Vgpr(2), 3));   // v_add_nc_u32 v20, v2, v3
+      code->push_back(EncodeVop2(0x1d, 20, Vgpr(20), 2));  // v_xor_b32 v20, v20, v2
+      AppendVop3(code, 0x169, 21, Vgpr(20), Vgpr(3));      // v_mul_lo_u32 v21, v20, v3
+      code->push_back(EncodeVop2(0x26, 10, Vgpr(21), 2));  // v_sub_nc_u32 v10, v21, v2
+      code->push_back(EncodeVop2(0x25, 21, Vgpr(21), 20)); // v_add_nc_u32 v21, v21, v20
+      code->push_back(EncodeVop2(0x1d, 11, Vgpr(21), 11)); // v_xor_b32 v11, v21, v11
+      (*code)[skip] = EncodeSopp(0x08, static_cast<u32>(code->size() - skip - 1));
+      code->push_back(restore_exec(60));
+      // Region B: x < y, no branch.
+      code->push_back(EncodeVopc(0xc1, Vgpr(2), 3)); // v_cmp_lt_u32 vcc, v2, v3
+      code->push_back(save_exec(62));
+      code->push_back(EncodeVop2(0x25, 13, InlineU32(7), 2));   // v_add_nc_u32 v13, 7, v2
+      code->push_back(EncodeVop2(0x1d, 13, Vgpr(13), 3));       // v_xor_b32 v13, v13, v3
+      AppendVop3(code, 0x360, 70, Vgpr(13), InlineU32(5));      // v_readlane_b32 s70, v13, 5
+      code->push_back(EncodeVop1(0x01, 12, 70));                // v_mov_b32 v12, s70
+      code->push_back(EncodeVop2(0x25, 22, Vgpr(13), 2));       // v_add_nc_u32 v22, v13, v2
+      code->push_back(EncodeVop2(0x1a, 14, InlineU32(3), 22));  // v_lshlrev_b32 v14, 3, v22
+      code->push_back(restore_exec(62));
+    };
+    auto bulk = MakeBulkCase(
+        name, 2, 5, inputs, body,
+        {O::V_MOV_B32, O::V_CMP_GT_U32, O::V_CMP_LT_U32,
+         w64 ? O::S_AND_SAVEEXEC_B64 : O::S_AND_SAVEEXEC_B32, O::S_CBRANCH_EXECZ,
+         O::V_ADD_NC_U32, O::V_XOR_B32, O::V_MUL_LO_U32, O::V_SUB_NC_U32,
+         w64 ? O::S_OR_B64 : O::S_OR_B32, O::V_READLANE_B32, O::V_LSHLREV_B32});
+    bulk.test.compute_info.wave_size = wave;
+    CodegenOptions merged = GetCodegenOptions();
+    merged.exec_selects   = true;
+    CodegenOptions legacy = merged;
+    legacy.exec_selects   = false;
+    const auto fast = RunBulk(vulkan, bulk, merged);
+    const auto slow = RunBulk(vulkan, bulk, legacy);
+    const auto region_b = [&](u32 i) { return inputs[0][i] < inputs[1][i]; };
+    const auto t13 = [&](u32 i) { return (inputs[0][i] + 7u) ^ inputs[1][i]; };
+    const auto reference = [&](u32 output, u32 e) -> u32 {
+      const u32 x = inputs[0][e];
+      const u32 y = inputs[1][e];
+      const u32 t20 = (x + y) ^ x;
+      const u32 t21 = t20 * y;
+      // Lane 5 of the wave that runs element e (the workgroup's 64 threads are 64/wave waves).
+      const u32 source = e - e % wave + 5u;
+      switch (output) {
+        case 0: return x > y ? t21 - x : x;
+        case 1: return x > y ? (t21 + t20) ^ y : y;
+        case 2: return region_b(e) ? (region_b(source) ? t13(source) : 0x0badf00du) : 0x12345678u;
+        case 3: return region_b(e) ? t13(e) : 0x0badf00du;
+        default: return region_b(e) ? (t13(e) + x) << 3u : 0x55aa55aau;
+      }
+    };
+    static const char *const names[] = {"region A v10", "region A v11", "readlane v12",
+                                        "region B v13", "region B v14"};
+    CompareBulk(name, bulk, fast, slow, reference, names);
+    const auto fast_selects = CountSpirv(fast.spirv, "OpSelect");
+    const auto slow_selects = CountSpirv(slow.spirv, "OpSelect");
+    Require(name, "select count", fast_selects < slow_selects,
+            "wave" + std::to_string(wave) + ": OpSelect " + std::to_string(slow_selects) +
+                " -> " + std::to_string(fast_selects));
+    summary += (summary.empty() ? "" : ", ") + std::string("wave") + std::to_string(wave) +
+               " OpSelect " + std::to_string(slow_selects) + " -> " +
+               std::to_string(fast_selects);
+  }
+  std::printf("[codegen] %-32s ok (%u elements, %s)\n", name, Count, summary.c_str());
+}
+
+// --exec-selects-bench: GPU time of an EXEC region covering half the lanes (a straight-line
+// chain of 4096 integer VALU ops over eight VGPR temporaries, folded into one value that is
+// stored only when it matches a magic number) with KYTY_EXEC_SELECTS on and off, in wave64 (two
+// lanes per host invocation) and wave32. Every workgroup reads the same 64 dwords, so memory
+// stays out of the timing. Timing only: CodegenExecSelects checks the results.
+void BenchExecSelects(VulkanHarness *vulkan) {
+  constexpr const char *name = "ExecSelectsBench";
+  constexpr u32 Ops = 4096;
+  constexpr u32 Groups = 8192;
+  constexpr u32 Repeats = 20;
+  constexpr u32 Rounds = 6;
+  for (const u32 wave : {64u, 32u}) {
+    const bool w64 = wave == 64u;
+    TestCase test;
+    test.name = name;
+    auto &code = test.code;
+    code.push_back(EncodeVop2(0x1a, 1, InlineU32(2), 0)); // v_lshlrev_b32 v1, 2, v0
+    code.push_back(EncodeMubuf0(0x0c));                   // buffer_load_dword v2, v1, s[0:3], 0
+    code.push_back(EncodeMubuf1(2, 0, 1));
+    code.push_back(EncodeSopp(0x0c, 0)); // s_waitcnt 0
+    for (u32 r = 0; r < 8; r++) {
+      code.push_back(EncodeVop2(0x25, 20 + r, InlineU32(r + 1), 2)); // v_add_nc_u32
+    }
+    code.push_back(EncodeVop2(0x1b, 3, InlineU32(1), 2)); // v_and_b32 v3, 1, v2
+    code.push_back(EncodeVopc(0xc5, InlineU32(0), 3));    // v_cmp_ne_u32 vcc, 0, v3
+    code.push_back(w64 ? EncodeSop1(0x24, 60, 106) : EncodeSop1(0x3c, 60, 106));
+    const auto skip = code.size();
+    code.push_back(0); // s_cbranch_execz, patched below
+    static constexpr u32 opcodes[] = {0x25, 0x1d, 0x26, 0x1d}; // add, xor, sub, xor
+    for (u32 i = 0; i < Ops; i++) {
+      code.push_back(EncodeVop2(opcodes[i % 4u], 20 + i % 8u, Vgpr(20 + (i * 3u + 1u) % 8u),
+                                20 + (i * 5u + 2u) % 8u));
+    }
+    for (u32 r = 1; r < 8; r++) {
+      code.push_back(EncodeVop2(0x1d, 20, Vgpr(20), 20 + r)); // v_xor_b32 v20, v20, v(20+r)
+    }
+    // Store only lanes whose result is a (practically never seen) magic value: every lane has to
+    // compute the chain, and the host compiler cannot sink it into the store.
+    code.push_back(EncodeVopc(0xc2, 255, 20)); // v_cmp_eq_u32 vcc, lit, v20
+    code.push_back(0x13579bdfu);
+    code.push_back(w64 ? EncodeSop1(0x24, 62, 106) : EncodeSop1(0x3c, 62, 106));
+    code.push_back(EncodeMubuf0(0x1c, 256)); // buffer_store_dword v20, v1, s[0:3], 0 offset:256
+    code.push_back(EncodeMubuf1(20, 0, 1));
+    code.push_back(w64 ? EncodeSop2(0x11, 126, 126, 62) : EncodeSop2(0x10, 126, 126, 62));
+    code[skip] = EncodeSopp(0x08, static_cast<u32>(code.size() - skip - 1));
+    code.push_back(w64 ? EncodeSop2(0x11, 126, 126, 60) : EncodeSop2(0x10, 126, 126, 60));
+    AppendEnd(&code);
+    uint64_t state = 0xbe7c4u + wave;
+    test.initial.resize(128);
+    for (u32 i = 0; i < 64; i++) {
+      test.initial[i] = NextRandom(state);
+    }
+    test.compute_info.threads_num[0] = 64;
+    test.compute_info.threads_num[1] = 1;
+    test.compute_info.threads_num[2] = 1;
+    test.compute_info.thread_ids_num = 1;
+    test.compute_info.wave_size = wave;
+    test.has_compute_info = true;
+    test.dispatch_x = Groups;
+    struct Variant {
+      CompiledShader compiled;
+      std::vector<u32> result;
+      double best_us = 1e30;
+    };
+    std::array<Variant, 2> variants;
+    for (u32 v = 0; v < 2; v++) {
+      CodegenOptions options = GetCodegenOptions();
+      options.exec_selects = v == 1;
+      ScopedCodegenOptions scope(options);
+      variants[v].compiled = CompileCase(test, vulkan->SubgroupSize());
+    }
+    // The first round only raises the clocks.
+    for (u32 round = 0; round <= Rounds; round++) {
+      for (auto &variant : variants) {
+        auto buffer = vulkan->CreateStorageBuffer(name, test.initial, test.initial.size());
+        double us = 0.0;
+        vulkan->Dispatch(test, variant.compiled, buffer, nullptr, nullptr, nullptr, nullptr,
+                         nullptr, Repeats, &us);
+        if (round != 0) {
+          variant.best_us = std::min(variant.best_us, us);
+        }
+        variant.result = vulkan->ReadBuffer(name, buffer, test.initial.size());
+        vulkan->DestroyBuffer(&buffer);
+      }
+    }
+    RequireEqualWords(name, "results", variants[0].result, variants[1].result);
+    std::printf("[bench]   %-32s wave%u: OpSelect %zu -> %zu, SPIR-V %zu -> %zu words, "
+                "%.1f us -> %.1f us per dispatch (%u groups)\n",
+                name, wave, CountSpirv(variants[0].compiled.spirv, "OpSelect"),
+                CountSpirv(variants[1].compiled.spirv, "OpSelect"),
+                variants[0].compiled.spirv.size(), variants[1].compiled.spirv.size(),
+                variants[0].best_us, variants[1].best_us, Groups);
+  }
+}
+
+// --corpus-pipeline-times <dir>: for every compute shader dump in `dir` (CompileCorpusShader),
+// SPIR-V size and vkCreateComputePipelines time with KYTY_EXEC_SELECTS off and on, best of three
+// cache-proof compiles each, as CSV plus totals.
+int CorpusPipelineTimes(VulkanHarness *vulkan, const char *directory) {
+  std::vector<std::filesystem::path> files;
+  for (const auto &entry : std::filesystem::directory_iterator(directory)) {
+    const auto file = entry.path().filename().string();
+    if (entry.path().extension() == ".bin" && file.find("_cs_") != std::string::npos) {
+      files.push_back(entry.path());
+    }
+  }
+  std::sort(files.begin(), files.end());
+  std::printf("shader,words_off,words_on,ms_off,ms_on\n");
+  double total_off = 0.0;
+  double total_on = 0.0;
+  size_t words_off = 0;
+  size_t words_on = 0;
+  u32 nonce = 1;
+  for (const auto &file : files) {
+    const auto path = file.string();
+    std::array<ShaderRecompiler::CompileResult, 2> results;
+    bool ok = true;
+    for (u32 v = 0; v < 2 && ok; v++) {
+      CodegenOptions options = GetCodegenOptions();
+      options.exec_selects = v == 1;
+      ScopedCodegenOptions scope(options);
+      ok = std::string(CompileCorpusShader(path.c_str(), &results[v])) == "ok";
+    }
+    if (!ok) {
+      continue;
+    }
+    std::array<double, 2> best{1e30, 1e30};
+    for (u32 round = 0; round < 3; round++) {
+      for (u32 v = 0; v < 2; v++) {
+        const auto index = (round % 2u == 0u) ? v : 1u - v;
+        best[index] = std::min(best[index],
+                               vulkan->TimeComputePipeline("CorpusPipelineTimes",
+                                                           results[index].spirv,
+                                                           results[index].program.bindings,
+                                                           nonce++));
+      }
+    }
+    std::printf("%s,%zu,%zu,%.2f,%.2f\n", file.filename().string().c_str(),
+                results[0].spirv.size(), results[1].spirv.size(), best[0], best[1]);
+    std::fflush(stdout);
+    total_off += best[0];
+    total_on += best[1];
+    words_off += results[0].spirv.size();
+    words_on += results[1].spirv.size();
+  }
+  std::printf("total,%zu,%zu,%.1f,%.1f\n", words_off, words_on, total_off, total_on);
+  return 0;
+}
+
 void RunAll(VulkanHarness *vulkan) {
+  CheckCompressedSnormExport();
+  CheckTranscendentalDenormInputs(vulkan);
+  CheckExecSelects(vulkan);
   CheckInterpolationModes();
   CheckMadPositionSlice();
   CheckMadModes(vulkan);

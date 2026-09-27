@@ -80,6 +80,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -1765,6 +1766,157 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
           std::move(resources), std::move(packed_user_data)};
 }
 
+// Compiles one guest shader dump from Profiling/analysis/guest-shader-diagnostic (a CS or PS,
+// by file name) with null resources: every descriptor read is zero. Resource access code differs
+// from a real binding, the ALU and control-flow mix does not. Returns "ok", "skip" (another
+// stage) or the failing step.
+const char *CompileCorpusShader(const char *path, ShaderRecompiler::CompileResult *result) {
+  std::FILE *file = std::fopen(path, "rb");
+  if (file == nullptr) {
+    return "open";
+  }
+  std::vector<u32> code;
+  u32 word = 0;
+  while (std::fread(&word, sizeof(word), 1, file) == 1) {
+    code.push_back(word);
+  }
+  std::fclose(file);
+  const std::string name = path;
+  ShaderRecompiler::CompileOptions options;
+  ShaderComputeInputInfo compute{};
+  ShaderPixelInputInfo pixel{};
+  if (name.find("_cs_") != std::string::npos) {
+    options.stage = ShaderType::Compute;
+    compute.threads_num[0] = 64;
+    compute.threads_num[1] = 1;
+    compute.threads_num[2] = 1;
+    compute.thread_ids_num = 3;
+    compute.lds_size_dwords = 16384;
+    compute.host_subgroup_size = 32;
+    compute.wave_size = 64;
+    options.input_info.compute = &compute;
+    options.wave_size = 64;
+  } else if (name.find("_ps_") != std::string::npos) {
+    options.stage = ShaderType::Pixel;
+    pixel.input_num = 32;
+    for (u32 i = 0; i < 32; i++) {
+      pixel.interpolator_settings[i] = i;
+    }
+    pixel.ps_perspective_center_vgpr = 0;
+    pixel.ps_system_input_base = 2;
+    for (auto &mode : pixel.target_output_mode) {
+      mode = 4;
+    }
+    options.input_info.pixel = &pixel;
+  } else {
+    return "skip";
+  }
+  const auto user_data = MakeNativeUserData(nullptr);
+  options.user_data = user_data;
+  // The emulator's device state on the RTX 3090 (driver 610.74): robustBufferAccess2 with 1-byte
+  // storage alignment, shaderResourceMinLod, independent denormal modes with f16 preservation
+  // only (no f32 flush-to-zero, no f64 preservation).
+  ShaderRecompiler::Spirv::SetHostBufferRobustness({.storage_dword_loads_return_zero = true});
+  ShaderRecompiler::Spirv::SetHostFloatControls({.denorm_flush_f32 = false,
+                                                 .denorm_preserve_f16 = true,
+                                                 .denorm_preserve_f64 = false});
+  ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = true});
+  auto translated = ShaderRecompiler::TranslateProgram(code, options);
+  auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = options.user_data,
+      .shader_base = reinterpret_cast<uint64_t>(code.data()),
+      .read_memory = [](void *, uint64_t, std::span<u32> values) {
+        std::fill(values.begin(), values.end(), 0u);
+        return true;
+      },
+  };
+  if (!ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization)) {
+    return "materialize";
+  }
+  *result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+  return "ok";
+}
+
+// CPU only (--corpus-spirv-stats <file.bin> [out.spvasm]): prints one CSV line of the SPIR-V
+// instruction mix of a corpus shader (CompileCorpusShader), optionally with its disassembly and
+// IR dump. Run it once per file: a shader the recompiler rejects stops only its own process.
+int CorpusSpirvStats(const char *path, const char *disassembly_path = nullptr) {
+  ShaderRecompiler::CompileResult result;
+  const std::string status = CompileCorpusShader(path, &result);
+  if (status != "ok") {
+    std::printf("%s,%s,%s\n", path, status == "skip" ? "skip" : "error", status.c_str());
+    return status == "skip" ? 0 : 1;
+  }
+  const auto &spirv = result.spirv;
+  if (disassembly_path != nullptr) {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string text;
+    if (tools.Disassemble(spirv, &text, SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES)) {
+      if (std::FILE *out = std::fopen(disassembly_path, "wb"); out != nullptr) {
+        std::fwrite(text.data(), 1, text.size(), out);
+        std::fclose(out);
+      }
+    }
+    const std::string ir_path = std::string(disassembly_path) + ".ir";
+    if (std::FILE *out = std::fopen(ir_path.c_str(), "wb"); out != nullptr) {
+      std::fwrite(result.ir_dump.data(), 1, result.ir_dump.size(), out);
+      std::fclose(out);
+    }
+  }
+  std::map<u32, size_t> opcodes;
+  std::map<u32, size_t> condition_uses;
+  size_t total = 0;
+  bool in_function = false;
+  for (size_t i = 5; i < spirv.size();) {
+    const auto count = spirv[i] >> 16u;
+    const auto opcode = spirv[i] & 0xffffu;
+    if (count == 0) {
+      break;
+    }
+    if (opcode == spv::OpFunction) {
+      in_function = true;
+    }
+    if (in_function) {
+      total++;
+      opcodes[opcode]++;
+      if (opcode == spv::OpSelect && i + 3 < spirv.size()) {
+        condition_uses[spirv[i + 3]]++;
+      }
+    }
+    i += count;
+  }
+  size_t shared_condition_selects = 0;
+  for (const auto &[condition, uses] : condition_uses) {
+    if (uses >= 8u) {
+      shared_condition_selects += uses;
+    }
+  }
+  const auto count = [&](spv::Op op) {
+    const auto it = opcodes.find(op);
+    return it == opcodes.end() ? size_t{0} : it->second;
+  };
+  std::printf("%s,ok,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu\n", path, total,
+              count(spv::OpSelect), shared_condition_selects, count(spv::OpBitcast),
+              count(spv::OpIEqual) + count(spv::OpINotEqual) + count(spv::OpBitwiseAnd) +
+                  count(spv::OpULessThan) + count(spv::OpLogicalAnd),
+              count(spv::OpLabel) + count(spv::OpBranch) + count(spv::OpBranchConditional) +
+                  count(spv::OpSelectionMerge) + count(spv::OpPhi),
+              count(spv::OpBranchConditional), count(spv::OpArrayLength),
+              count(spv::OpFMul) + count(spv::OpFAdd) + count(spv::OpFSub) +
+                  count(spv::OpFDiv) + count(spv::OpFNegate),
+              count(spv::OpExtInst), count(spv::OpLoad), count(spv::OpStore),
+              count(spv::OpAccessChain), count(spv::OpCompositeExtract) +
+                  count(spv::OpCompositeConstruct),
+              count(spv::OpImageSampleExplicitLod) + count(spv::OpImageSampleImplicitLod) +
+                  count(spv::OpImageSampleDrefExplicitLod) +
+                  count(spv::OpImageSampleDrefImplicitLod) + count(spv::OpImageFetch) +
+                  count(spv::OpImageGather));
+  return 0;
+}
+
 std::array<u32, 64> MakeStructuredStorageBufferData(u32 stride_bytes,
                                                     u32 num_records,
                                                     bool add_tid = false,
@@ -2006,6 +2158,18 @@ public:
     properties.pNext = &subgroup;
     m_physical_device.getProperties2(&properties);
     return subgroup.subgroupSize;
+  }
+
+  // Whether the device can flush f32 denormals independently (the emulator then declares
+  // DenormFlushToZero 32, see ConfigureShaderFloatControls).
+  [[nodiscard]] bool DenormFlushF32Supported() const {
+    vk::PhysicalDeviceVulkan12Properties properties12{};
+    vk::PhysicalDeviceProperties2 properties{};
+    properties.pNext = &properties12;
+    m_physical_device.getProperties2(&properties);
+    return properties12.denormBehaviorIndependence !=
+               vk::ShaderFloatControlsIndependence::eNone &&
+           properties12.shaderDenormFlushToZeroFloat32 == VK_TRUE;
   }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
@@ -12552,6 +12716,383 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Astro Bot's streamed textures start as "heads": only the GFX10 mip tail block is loaded
+  // and the T# MIN_LOD is the first tail level (4.0 for a 2048^2 BC7 head). The streamer
+  // promotes a texture when the hardware counter reports samples finer than MIN_LOD. Here a
+  // 512^2 R32F chain with 64 KiB swizzle (first tail level 3), whose guest levels hold 1, 2, 4
+  // and 8 (tail). A head sampled at any LOD finer than MIN_LOD must return the MIN_LOD level
+  // from the uploaded tail, never a non-resident finer level (poisoned here). Finer MIN_LODs on
+  // the same memory extend residency. Gathers and texel fetches of a head read level 0, which
+  // Vulkan makes zero below the view's minimum LOD; those results are printed, not required.
+  void CheckStreamedHeadMinLod(const char *name, uintptr_t base, RenderContext &context,
+                               TextureCache &texture_cache, RenderExecutor &executor) {
+    auto &scheduler = context.GetCommandScheduler();
+    constexpr uint64_t head_offset = 0x180000;
+    constexpr uint32_t head_side = 512;
+    constexpr uint32_t head_last_level = 9;
+    constexpr uint64_t tail_bytes = 0x10000;    // levels 3..9, one 64 KiB block
+    constexpr uint64_t level2_bytes = 0x10000;  // 128x128x4
+    constexpr uint64_t level1_bytes = 0x40000;  // 256x256x4
+    constexpr uint64_t level0_bytes = 0x100000; // 512x512x4
+    const uint64_t head_address = base + head_offset;
+    const auto fill = [&](uint64_t offset, uint64_t bytes, float value) {
+      std::fill_n(reinterpret_cast<float *>(head_address + offset), bytes / sizeof(float),
+                  value);
+    };
+    fill(0, tail_bytes, 8.0f);
+    fill(tail_bytes, level2_bytes, 4.0f);
+    fill(tail_bytes + level2_bytes, level1_bytes, 2.0f);
+    fill(tail_bytes + level2_bytes + level1_bytes, level0_bytes, 1.0f);
+    const auto head_descriptor = [&](uint32_t min_lod) {
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      value.dwords = {
+          static_cast<uint32_t>(head_address >> 8u),
+          static_cast<uint32_t>(head_address >> 40u) | (min_lod << 8u) |
+              (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+              (((head_side - 1u) & 3u) << 30u),
+          ((head_side - 1u) >> 2u) | ((head_side - 1u) << 14u),
+          DstSel(4, 5, 6, 7) | (head_last_level << 16u) |
+              (static_cast<uint32_t>(Prospero::TileMode::kStandard64KB) << 20u) |
+              (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+          0,
+          0x00700000u | (head_last_level << 4u),
+          0,
+          0};
+      return value;
+    };
+    // Trilinear, LOD range 0..15.99.
+    const ShaderSamplerResource head_sampler{
+        {0, 0xfffu << 12u,
+         (1u << 20u) | (1u << 22u) |
+             (static_cast<uint32_t>(Prospero::SamplerMipFilter::kLinear) << 26u),
+         0}};
+    const auto sampler = context.GetSamplerCache().GetSampler(head_sampler);
+    const auto make_case = [&](const char *case_name, uint32_t outputs) {
+      TestCase test;
+      test.name = case_name;
+      test.has_user_data = true;
+      const auto initial = head_descriptor(3u * 256u);
+      std::copy_n(initial.dwords.begin(), 8, test.user_data.begin());
+      std::copy_n(head_sampler.fields, 4, test.user_data.begin() + 8);
+      test.user_data[50] = outputs * static_cast<u32>(sizeof(uint32_t));
+      return test;
+    };
+
+    constexpr std::array lods{0.0f, 1.0f, 2.0f, 3.0f, 3.5f, 6.0f};
+    auto sample_test =
+        make_case("StreamedHeadSampleBelowMinLod", static_cast<uint32_t>(lods.size()));
+    sample_test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                           ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+    sample_test.required_spirv = {"OpImageSampleExplicitLod"};
+    AppendVMovLiteral(&sample_test.code, 20, std::bit_cast<uint32_t>(0.5f));
+    AppendVMovLiteral(&sample_test.code, 21, std::bit_cast<uint32_t>(0.5f));
+    for (u32 index = 0; index < lods.size(); ++index) {
+      AppendVMovLiteral(&sample_test.code, 22, std::bit_cast<uint32_t>(lods[index]));
+      sample_test.code.push_back(EncodeMimg0(0x24, 1)); // IMAGE_SAMPLE_L
+      sample_test.code.push_back(EncodeMimg1(index, 20, 0, 2));
+    }
+    for (u32 index = 0; index < lods.size(); ++index) {
+      AppendStoreVgpr(&sample_test.code, index, index);
+    }
+    AppendEnd(&sample_test.code);
+    const auto sample_program = CompileCase(sample_test, SubgroupSize());
+
+    auto gather_test = make_case("StreamedHeadGather4Lz", 4);
+    gather_test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_GATHER4_LZ,
+                           ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+    AppendVMovLiteral(&gather_test.code, 20, std::bit_cast<uint32_t>(0.5f));
+    AppendVMovLiteral(&gather_test.code, 21, std::bit_cast<uint32_t>(0.5f));
+    gather_test.code.push_back(EncodeMimg0(0x47, 1));
+    gather_test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+    for (u32 index = 0; index < 4u; ++index) {
+      AppendStoreVgpr(&gather_test.code, index, index);
+    }
+    AppendEnd(&gather_test.code);
+    const auto gather_program = CompileCase(gather_test, SubgroupSize());
+
+    auto fetch_test = make_case("StreamedHeadLoadMip", 2);
+    fetch_test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_LOAD_MIP,
+                          ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+    AppendVMovU32(&fetch_test.code, 20, 1);
+    AppendVMovU32(&fetch_test.code, 21, 1);
+    AppendVMovU32(&fetch_test.code, 22, 0);
+    fetch_test.code.push_back(EncodeMimg0(0x01, 1)); // IMAGE_LOAD_MIP, mip 0
+    fetch_test.code.push_back(EncodeMimg1(0, 20, 0));
+    AppendVMovU32(&fetch_test.code, 22, 3);
+    fetch_test.code.push_back(EncodeMimg0(0x01, 1)); // IMAGE_LOAD_MIP, mip 3 (tail)
+    fetch_test.code.push_back(EncodeMimg1(1, 20, 0));
+    AppendStoreVgpr(&fetch_test.code, 0, 0);
+    AppendStoreVgpr(&fetch_test.code, 1, 1);
+    AppendEnd(&fetch_test.code);
+    const auto fetch_program = CompileCase(fetch_test, SubgroupSize());
+
+    const auto resolve = [&](const CompiledShader &program, uint32_t min_lod) {
+      return RenderExecutorTestAccess::ResolveTexture(executor, program.program.info.images[0],
+                                                      head_descriptor(min_lod));
+    };
+    // Runs `program` against the view of `binding` and returns its output words.
+    const auto run = [&](const TestCase &test, const CompiledShader &program,
+                         const TextureBinding &binding, size_t outputs,
+                         bool poison_below_resident) {
+      const auto view = texture_cache.FindTexture(binding.image_id, binding.desc);
+      auto &image = texture_cache.GetImage(binding.image_id);
+      if (poison_below_resident && image.resident_first != 0) {
+        // Stand-in for the undefined contents of non-resident levels.
+        image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+                      {}, scheduler.Current().Handle());
+        vk::ClearColorValue poison{};
+        poison.float32[0] = -7.0f;
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0,
+                                              image.resident_first, 0, 1};
+        scheduler.Current().Handle().clearColorImage(
+            image.backing.image, vk::ImageLayout::eTransferDstOptimal, &poison, 1, &range);
+      }
+      image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
+                    scheduler.Current().Handle());
+      Image sampled;
+      sampled.view = view;
+      sampled.layout = image.backing.state.layout;
+      scheduler.Finish();
+      auto output = CreateStorageBuffer(test.name, {}, outputs);
+      Dispatch(test, program, output, nullptr, &sampled, nullptr, nullptr, sampler);
+      auto words = ReadBuffer(test.name, output, outputs);
+      DestroyBuffer(&output);
+      return words;
+    };
+    const auto as_floats = [](const std::vector<u32> &words) {
+      std::vector<float> values;
+      for (const auto word : words) {
+        values.push_back(std::bit_cast<float>(word));
+      }
+      return values;
+    };
+    const auto describe = [&](const std::vector<float> &values) {
+      std::string text;
+      for (const auto value : values) {
+        char buffer[32] = {};
+        std::snprintf(buffer, sizeof(buffer), "%s%g", text.empty() ? "" : ",",
+                      static_cast<double>(value));
+        text += buffer;
+      }
+      return text;
+    };
+
+    // The head: only the tail is resident, and every LOD returns the tail's level 3.
+    const auto head = resolve(sample_program, 3u * 256u);
+    {
+      const auto *owner = TextureCacheTestAccess::Owner(texture_cache, head.image_id);
+      Require(name, "streamed head residency",
+              owner != nullptr && owner->resident_first == 3 &&
+                  owner->live.address == head_address && owner->live.size == tail_bytes &&
+                  owner->info.data.size == tail_bytes + level2_bytes + level1_bytes +
+                                               level0_bytes,
+              "a MIN_LOD 3.0 head did not keep exactly its mip tail resident");
+    }
+    const auto head_values =
+        as_floats(run(sample_test, sample_program, head, lods.size(), true));
+    Require(name, "streamed head samples below MIN_LOD",
+            std::ranges::all_of(head_values, [](float value) { return value == 8.0f; }),
+            "head sampled at LOD 0,1,2,3,3.5,6 returned " + describe(head_values) +
+                " instead of the MIN_LOD level (8) everywhere");
+    const auto gather_values = as_floats(
+        run(gather_test, gather_program, resolve(gather_program, 3u * 256u), 4, false));
+    const auto fetch_values = as_floats(
+        run(fetch_test, fetch_program, resolve(fetch_program, 3u * 256u), 2, false));
+    std::printf("[gpu]     %-32s gather4_lz=%s load_mip0,3=%s (level 0 is below MIN_LOD)\n",
+                "StreamedHeadGatherFetch", describe(gather_values).c_str(),
+                describe(fetch_values).c_str());
+    Require(name, "streamed head fetch at MIN_LOD",
+            fetch_values.size() == 2 && fetch_values[1] == 8.0f,
+            "IMAGE_LOAD_MIP of the head's MIN_LOD level returned " + describe(fetch_values));
+
+    // A fractional MIN_LOD makes floor(MIN_LOD) resident; Vulkan may floor the view clamp.
+    const auto half = resolve(sample_program, 2u * 256u + 128u);
+    Require(name, "fractional MIN_LOD residency",
+            half.image_id == head.image_id &&
+                TextureCacheTestAccess::Owner(texture_cache, half.image_id)->resident_first == 2,
+            "MIN_LOD 2.5 did not extend the same image to level 2");
+    const auto half_values =
+        as_floats(run(sample_test, sample_program, half, lods.size(), false));
+    const auto clamp_level = [](float value) { return value == 6.0f || value == 4.0f; };
+    Require(name, "fractional MIN_LOD samples",
+            clamp_level(half_values[0]) && clamp_level(half_values[1]) &&
+                clamp_level(half_values[2]) && half_values[3] == 8.0f &&
+                half_values[4] == 8.0f && half_values[5] == 8.0f,
+            "MIN_LOD 2.5 samples returned " + describe(half_values));
+
+    // Promotion in place: MIN_LOD 0 makes the whole chain resident from guest memory.
+    const auto full = resolve(sample_program, 0);
+    const auto full_values =
+        as_floats(run(sample_test, sample_program, full, lods.size(), false));
+    Require(name, "promoted chain samples",
+            full.image_id == head.image_id &&
+                full_values == std::vector<float>{1.0f, 2.0f, 4.0f, 8.0f, 8.0f, 8.0f},
+            "MIN_LOD 0 samples returned " + describe(full_values));
+
+    // IMAGE_SAMPLE_CL / IMAGE_SAMPLE_D_CL: the last address component is a minimum LOD.
+    // Outside pixel shaders the implicit LOD is 0, so _CL 2.0 reads level 2 (4); _D_CL with zero
+    // gradients and clamp 2.5 blends levels 2 and 3 (6); _CL 0 reads level 0 (1).
+    auto clamp_test = make_case("SampleLodClamp", 3);
+    clamp_test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                          ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+    const auto clamp_descriptor = head_descriptor(0);
+    std::copy_n(clamp_descriptor.dwords.begin(), 8, clamp_test.user_data.begin());
+    AppendVMovLiteral(&clamp_test.code, 20, std::bit_cast<uint32_t>(0.5f));
+    AppendVMovLiteral(&clamp_test.code, 21, std::bit_cast<uint32_t>(0.5f));
+    AppendVMovLiteral(&clamp_test.code, 22, std::bit_cast<uint32_t>(2.0f));
+    clamp_test.code.push_back(EncodeMimg0(0x21, 1)); // IMAGE_SAMPLE_CL
+    clamp_test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+    for (u32 reg = 23; reg < 27; ++reg) {
+      AppendVMovU32(&clamp_test.code, reg, 0);
+    }
+    AppendVMovLiteral(&clamp_test.code, 27, std::bit_cast<uint32_t>(0.5f));
+    AppendVMovLiteral(&clamp_test.code, 28, std::bit_cast<uint32_t>(0.5f));
+    AppendVMovLiteral(&clamp_test.code, 29, std::bit_cast<uint32_t>(2.5f));
+    clamp_test.code.push_back(EncodeMimg0(0x23, 1)); // IMAGE_SAMPLE_D_CL
+    clamp_test.code.push_back(EncodeMimg1(1, 23, 0, 2));
+    AppendVMovU32(&clamp_test.code, 22, 0);
+    clamp_test.code.push_back(EncodeMimg0(0x21, 1)); // IMAGE_SAMPLE_CL, clamp 0
+    clamp_test.code.push_back(EncodeMimg1(2, 20, 0, 2));
+    for (u32 index = 0; index < 3; ++index) {
+      AppendStoreVgpr(&clamp_test.code, index, index);
+    }
+    AppendEnd(&clamp_test.code);
+    const auto clamp_program = CompileCase(clamp_test, SubgroupSize());
+    const auto clamp_values = as_floats(run(clamp_test, clamp_program,
+                                            resolve(clamp_program, 0), 3, false));
+    Require(name, "sample LOD clamp",
+            clamp_values == std::vector<float>{4.0f, 6.0f, 1.0f},
+            "IMAGE_SAMPLE_CL 2 / _D_CL 2.5 / _CL 0 returned " + describe(clamp_values) +
+                " instead of 4,6,1");
+    RenderExecutorTestAccess::ResetBindings(executor);
+    std::printf("[gpu]     %-32s ok\n", "StreamedHeadMinLodResidency");
+  }
+
+  // S# FILTER_MODE (bits 29..30): 0 blends the bilinear footprint, 1 and 2 return its minimum
+  // and maximum texel (RDNA2 ISA 8.2.7). A 4x4 linear R32F texture holds 1 + x + 4y; its center
+  // lies between texels 6, 7, 10 and 11.
+  void CheckSamplerFilterMode(const char *name, uintptr_t base, RenderContext &context,
+                              TextureCache &texture_cache, RenderExecutor &executor) {
+    if (!m_sampler_filter_minmax) {
+      std::printf("[gpu]     %-32s skipped (no samplerFilterMinmax)\n", "SamplerFilterMode");
+      return;
+    }
+    auto &scheduler = context.GetCommandScheduler();
+    const uint64_t address = base + 0x2f0000;
+    constexpr uint32_t pitch = 64; // 256-byte linear rows
+    for (uint32_t y = 0; y < 4; ++y) {
+      for (uint32_t x = 0; x < 4; ++x) {
+        reinterpret_cast<float *>(address)[y * pitch + x] = static_cast<float>(1 + x + 4 * y);
+      }
+    }
+    ShaderRecompiler::IR::DescriptorValue descriptor{};
+    descriptor.dword_count = 8;
+    descriptor.dwords = {
+        static_cast<uint32_t>(address >> 8u),
+        static_cast<uint32_t>(address >> 40u) |
+            (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) | (3u << 30u),
+        3u << 14u,
+        DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(Prospero::TileMode::kLinear) << 20u) |
+            (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+        0,
+        0x00700000u,
+        0,
+        0};
+    const auto make_sampler = [](uint32_t filter_mode) {
+      // Clamp to edge, bilinear, no mip filter.
+      return ShaderSamplerResource{
+          {2u | (2u << 3u) | (2u << 6u) | (filter_mode << 29u), 0, (1u << 20u) | (1u << 22u),
+           0}};
+    };
+    TestCase test;
+    test.name = "SamplerFilterMode";
+    test.has_user_data = true;
+    std::copy_n(descriptor.dwords.begin(), 8, test.user_data.begin());
+    const auto blend_sampler = make_sampler(0);
+    std::copy_n(blend_sampler.fields, 4, test.user_data.begin() + 8);
+    test.user_data[50] = sizeof(uint32_t);
+    test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                    ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+    AppendVMovLiteral(&test.code, 20, std::bit_cast<uint32_t>(0.5f));
+    AppendVMovLiteral(&test.code, 21, std::bit_cast<uint32_t>(0.5f));
+    test.code.push_back(EncodeMimg0(0x27, 1)); // IMAGE_SAMPLE_LZ
+    test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+    AppendStoreVgpr(&test.code, 0, 0);
+    AppendEnd(&test.code);
+    const auto program = CompileCase(test, SubgroupSize());
+    const auto binding = RenderExecutorTestAccess::ResolveTexture(
+        executor, program.program.info.images[0], descriptor);
+    const auto view = texture_cache.FindTexture(binding.image_id, binding.desc);
+    auto &image = texture_cache.GetImage(binding.image_id);
+    image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
+                  scheduler.Current().Handle());
+    Image sampled;
+    sampled.view = view;
+    sampled.layout = image.backing.state.layout;
+    scheduler.Finish();
+    std::array<float, 3> results{};
+    for (uint32_t mode = 0; mode < 3; ++mode) {
+      const auto sampler = context.GetSamplerCache().GetSampler(make_sampler(mode));
+      auto output = CreateStorageBuffer(test.name, {}, 1);
+      Dispatch(test, program, output, nullptr, &sampled, nullptr, nullptr, sampler);
+      results[mode] = std::bit_cast<float>(ReadBuffer(test.name, output, 1)[0]);
+      DestroyBuffer(&output);
+    }
+    Require(name, "sampler filter mode",
+            results[0] == 8.5f && results[1] == 6.0f && results[2] == 11.0f,
+            "blend/min/max samples returned " + std::to_string(results[0]) + "/" +
+                std::to_string(results[1]) + "/" + std::to_string(results[2]) +
+                " instead of 8.5/6/11");
+
+    // IMAGE_SAMPLE_LZ_O (RDNA2 8.2.5): six-bit signed texel offsets in the first address dword.
+    // From texel (1,1): (+1,0) 7, (0,+1) 10, (-1,-1) 1, (+9,0) clamps to x=3 (8; outside the
+    // ConstOffset range every device supports, so the coordinate moves), (-8,0) clamps to x=0 (5).
+    {
+      constexpr std::array<uint32_t, 5> offsets{0x0001u, 0x0100u, 0x3f3fu, 0x0009u, 0x0038u};
+      constexpr std::array<float, 5> expected{7.0f, 10.0f, 1.0f, 8.0f, 5.0f};
+      TestCase offset_test;
+      offset_test.name = "SampleLzOffsets";
+      offset_test.has_user_data = true;
+      std::copy_n(descriptor.dwords.begin(), 8, offset_test.user_data.begin());
+      // Clamp to edge, point filtering.
+      const ShaderSamplerResource point_sampler{{2u | (2u << 3u) | (2u << 6u), 0, 0, 0}};
+      std::copy_n(point_sampler.fields, 4, offset_test.user_data.begin() + 8);
+      offset_test.user_data[50] = static_cast<u32>(offsets.size() * sizeof(uint32_t));
+      offset_test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                             ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+      offset_test.required_spirv = {"ConstOffset"};
+      AppendVMovLiteral(&offset_test.code, 21, std::bit_cast<uint32_t>(0.375f));
+      AppendVMovLiteral(&offset_test.code, 22, std::bit_cast<uint32_t>(0.375f));
+      for (u32 index = 0; index < offsets.size(); ++index) {
+        AppendVMovU32(&offset_test.code, 20, offsets[index]);
+        offset_test.code.push_back(EncodeMimg0(0x37, 1)); // IMAGE_SAMPLE_LZ_O
+        offset_test.code.push_back(EncodeMimg1(index, 20, 0, 2));
+      }
+      for (u32 index = 0; index < offsets.size(); ++index) {
+        AppendStoreVgpr(&offset_test.code, index, index);
+      }
+      AppendEnd(&offset_test.code);
+      const auto offset_program = CompileCase(offset_test, SubgroupSize());
+      const auto sampler = context.GetSamplerCache().GetSampler(point_sampler);
+      auto output = CreateStorageBuffer(offset_test.name, {}, offsets.size());
+      Dispatch(offset_test, offset_program, output, nullptr, &sampled, nullptr, nullptr, sampler);
+      const auto words = ReadBuffer(offset_test.name, output, offsets.size());
+      DestroyBuffer(&output);
+      std::string actual;
+      bool        match = true;
+      for (size_t index = 0; index < offsets.size(); ++index) {
+        const auto value = std::bit_cast<float>(words[index]);
+        match = match && value == expected[index];
+        actual += (index == 0 ? "" : ",") + std::to_string(value);
+      }
+      Require(name, "sample texel offsets", match,
+              "IMAGE_SAMPLE_LZ_O returned " + actual + " instead of 7,10,1,8,5");
+    }
+    RenderExecutorTestAccess::ResetBindings(executor);
+    std::printf("[gpu]     %-32s ok\n", "SamplerFilterMode+SampleLzOffsets");
+  }
+
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
@@ -13136,6 +13677,8 @@ public:
         DestroyBuffer(&output);
         RenderExecutorTestAccess::ResetBindings(executor);
       }
+      CheckStreamedHeadMinLod(name, base, context, texture_cache, executor);
+      CheckSamplerFilterMode(name, base, context, texture_cache, executor);
 
       auto srgb_storage = storage;
       constexpr auto srgb_format =
@@ -15584,12 +16127,15 @@ public:
     return ret;
   }
 
+  // `repeats` > 1 records the dispatch that many times; with `elapsed_us`, timestamps around
+  // them give the GPU time per dispatch (benchmarks only).
   void Dispatch(const TestCase &test, const CompiledShader &compiled,
                 const Buffer &buffer, const Buffer *gds_buffer = nullptr,
                 const Image *sampled_image = nullptr,
                 const Image *storage_image = nullptr,
                 const Image *storage_image_uint = nullptr,
-                vk::Sampler sampler = nullptr) {
+                vk::Sampler sampler = nullptr, u32 repeats = 1,
+                double *elapsed_us = nullptr) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
     auto Binding = [&](Kind kind) {
@@ -16000,7 +16546,23 @@ public:
       cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                         sizeof(push_data), push_data.dwords.data());
     }
-    cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
+    vk::QueryPool timestamps = nullptr;
+    if (elapsed_us != nullptr) {
+      vk::QueryPoolCreateInfo query_info{};
+      query_info.queryType = vk::QueryType::eTimestamp;
+      query_info.queryCount = 2;
+      RequireVk(test.name, "dispatch",
+                m_device.createQueryPool(&query_info, nullptr, &timestamps),
+                "vkCreateQueryPool");
+      cmd.resetQueryPool(timestamps, 0, 2);
+      cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, timestamps, 0);
+    }
+    for (u32 repeat = 0; repeat < std::max(repeats, 1u); repeat++) {
+      cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
+    }
+    if (elapsed_us != nullptr) {
+      cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, timestamps, 1);
+    }
 
     if (buffers != nullptr) {
       vk::BufferMemoryBarrier barrier{};
@@ -16033,6 +16595,18 @@ public:
                           &barrier, 0, nullptr);
     }
     EndSubmitAndFree(test.name, "dispatch", cmd);
+    if (elapsed_us != nullptr) {
+      std::array<uint64_t, 2> stamps{};
+      RequireVk(test.name, "timestamps",
+                m_device.getQueryPoolResults(
+                    timestamps, 0, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+                    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                "vkGetQueryPoolResults");
+      const double period = m_physical_device.getProperties().limits.timestampPeriod;
+      *elapsed_us = static_cast<double>(stamps[1] - stamps[0]) * period / 1000.0 /
+                    std::max(repeats, 1u);
+      m_device.destroyQueryPool(timestamps, nullptr);
+    }
     if (flattened_buffer.buffer != nullptr) {
       DestroyBuffer(&flattened_buffer);
     }
@@ -16044,6 +16618,69 @@ public:
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
     m_device.destroyShaderModule(module, nullptr);
+  }
+
+  // Milliseconds vkCreateComputePipelines spends on `spirv` (benchmarks). The module's ID bound is
+  // raised by `nonce` so that driver shader caches never recognise it.
+  double TimeComputePipeline(const char *name, std::vector<u32> spirv,
+                             const ShaderRecompiler::IR::BindingLayout &layout, u32 nonce) {
+    spirv[3] += nonce;
+    vk::ShaderModuleCreateInfo module_info{};
+    module_info.codeSize = spirv.size() * sizeof(u32);
+    module_info.pCode = spirv.data();
+    vk::ShaderModule module = nullptr;
+    RequireVk(name, "pipeline timing", m_device.createShaderModule(&module_info, nullptr, &module),
+              "vkCreateShaderModule");
+    std::vector<vk::DescriptorSetLayoutBinding> bindings;
+    for (const auto &binding : layout.descriptors) {
+      const auto count = NativeDescriptorCount(binding);
+      if (count == 0) {
+        continue;
+      }
+      vk::DescriptorSetLayoutBinding item{};
+      item.binding = ShaderRecompiler::IR::NativeBinding(ShaderType::Compute, binding.kind);
+      item.descriptorType = NativeDescriptorType(binding.kind);
+      item.descriptorCount = count;
+      item.stageFlags = vk::ShaderStageFlagBits::eCompute;
+      bindings.push_back(item);
+    }
+    vk::DescriptorSetLayoutCreateInfo set_info{};
+    set_info.bindingCount = static_cast<u32>(bindings.size());
+    set_info.pBindings = bindings.empty() ? nullptr : bindings.data();
+    vk::DescriptorSetLayout set_layout = nullptr;
+    RequireVk(name, "pipeline timing",
+              m_device.createDescriptorSetLayout(&set_info, nullptr, &set_layout),
+              "vkCreateDescriptorSetLayout");
+    vk::PipelineLayoutCreateInfo pipeline_layout_info{};
+    pipeline_layout_info.setLayoutCount = 1;
+    pipeline_layout_info.pSetLayouts = &set_layout;
+    vk::PushConstantRange push_range{};
+    if (layout.UsesPushData()) {
+      push_range.stageFlags = vk::ShaderStageFlagBits::eCompute;
+      push_range.size = ShaderRecompiler::IR::NativePushConstantSize;
+      pipeline_layout_info.pushConstantRangeCount = 1;
+      pipeline_layout_info.pPushConstantRanges = &push_range;
+    }
+    vk::PipelineLayout pipeline_layout = nullptr;
+    RequireVk(name, "pipeline timing",
+              m_device.createPipelineLayout(&pipeline_layout_info, nullptr, &pipeline_layout),
+              "vkCreatePipelineLayout");
+    vk::ComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    pipeline_info.stage.module = module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = pipeline_layout;
+    vk::Pipeline pipeline = nullptr;
+    const auto begin = std::chrono::steady_clock::now();
+    RequireVk(name, "pipeline timing",
+              m_device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+              "vkCreateComputePipelines");
+    const auto end = std::chrono::steady_clock::now();
+    m_device.destroyPipeline(pipeline, nullptr);
+    m_device.destroyPipelineLayout(pipeline_layout, nullptr);
+    m_device.destroyDescriptorSetLayout(set_layout, nullptr);
+    m_device.destroyShaderModule(module, nullptr);
+    return std::chrono::duration<double, std::milli>(end - begin).count();
   }
 
   void CheckRasterization(bool depth_feedback, bool packed_vertex_color = false) {
@@ -18914,6 +19551,7 @@ private:
     m_runtime_context.provoking_vertex_last_enabled = true;
     m_runtime_context.storage_image_read_without_format_enabled =
         m_storage_image_read_without_format;
+    m_runtime_context.sampler_filter_minmax_enabled = m_sampler_filter_minmax;
     m_runtime_context.pipeline_library_enabled = m_pipeline_library;
     m_runtime_context.pipeline_creation_cache_control_enabled = m_pipeline_library;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
@@ -19130,6 +19768,9 @@ private:
     device_features12.timelineSemaphore = true;
     device_features12.bufferDeviceAddress = true;
     device_features12.shaderOutputLayer = true;
+    // Optional, as in the emulator: S# FILTER_MODE min/max reduction.
+    device_features12.samplerFilterMinmax = available_features12.samplerFilterMinmax;
+    m_sampler_filter_minmax = available_features12.samplerFilterMinmax == VK_TRUE;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
@@ -19184,6 +19825,7 @@ private:
     m_storage_image_read_without_format =
         available_features.shaderStorageImageReadWithoutFormat == VK_TRUE;
     device_features.shaderImageGatherExtended = true;
+    device_features.shaderResourceMinLod = available_features.shaderResourceMinLod;
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
     device_features.fillModeNonSolid = true;
@@ -19239,6 +19881,8 @@ private:
               : 0u;
       ShaderRecompiler::Spirv::SetHostBufferRobustness(
           {.storage_dword_loads_return_zero = m_robust_storage_alignment == 1u});
+      ShaderRecompiler::Spirv::SetHostImageFeatures(
+          {.min_lod = available_features.shaderResourceMinLod == VK_TRUE});
     }
 
     vk::CommandPoolCreateInfo pool_info{};
@@ -19564,6 +20208,7 @@ private:
   GraphicContext m_runtime_context{};
   bool m_pipeline_library = false;
   bool m_storage_image_read_without_format = false;
+  bool m_sampler_filter_minmax = false;
   std::unique_ptr<RenderContext> m_renderer;
 };
 
@@ -24379,6 +25024,67 @@ TestCase VectorDppRowXmask() {
   test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 8;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// DPP_ROW_SHARE (GFX10 dpp_ctrl 0x150-0x15F): every lane reads lane `ctrl & 15` of its row.
+TestCase VectorDppRowShare() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 2, 250, 1));
+  code.push_back(EncodeVop2Dpp(0, 0x153));
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDppRowShare";
+  test.code = code;
+  for (u32 lane = 0; lane < 32; ++lane) {
+    test.expected.push_back(100u + ((lane & ~15u) | 3u));
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// DPP8 on a VOP2 (src0 = 233): each group of eight lanes reads lane 7 - i of the group.
+TestCase VectorDpp8Vop2() {
+  using O = ShaderOpcode;
+
+  u32 selects = 0;
+  for (u32 lane = 0; lane < 8; ++lane) {
+    selects |= (7u - lane) << (lane * 3u);
+  }
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 2, 233, 1));
+  code.push_back(selects << 8u); // src0 = v0
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDpp8Vop2";
+  test.code = code;
+  for (u32 lane = 0; lane < 32; ++lane) {
+    test.expected.push_back(100u + ((lane & ~7u) | (7u - (lane & 7u))));
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{".dpp8(", 1}};
+  test.compute_info.threads_num[0] = 32;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
@@ -30639,8 +31345,7 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
-  AppendVMovU32(&code, 20,
-                1); // Non-constant +1 X offset is not a SPIR-V ConstOffset.
+  AppendVMovU32(&code, 20, 1); // +1 X texel offset, a full 32-bit dword even with A16.
   AppendVMovLiteral(&code, 21, 0x36003900u); // x=0.625, y=0.375 packed as f16.
   AppendVMovU32(&code, 22, 0);
   code.push_back(EncodeMimg0(0x30, 0xf));
@@ -30650,8 +31355,11 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   }
   AppendEnd(&code);
 
+  // The coordinates select texel (2,1); the offset moves the read to texel (3,1).
   auto image = MakeRgbaImage(4, 4);
-  SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
+  SetRgbaPixel(&image, 4, 2, 1, 0x40a00000u, 0x40c00000u, 0x40e00000u,
+               0x41000000u);
+  SetRgbaPixel(&image, 4, 3, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
                0x40800000u);
 
   TestCase test;
@@ -30661,7 +31369,8 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
-  test.required_spirv = {"UnpackHalf2x16"};
+  // The offset written under the result's EXEC is the literal: a ConstOffset.
+  test.required_spirv = {"UnpackHalf2x16", "ConstOffset"};
   test.forbidden_spirv = {"OpBitFieldSExtract"};
   return test;
 }
@@ -32497,6 +33206,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(VectorDpp8Captured(true));
   AddCase(VectorDppQuadPermuteReverse);
   AddCase(VectorDppRowXmask);
+  AddCase(VectorDppRowShare);
+  AddCase(VectorDpp8Vop2);
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
@@ -37612,6 +38323,10 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--corpus-spirv-stats") == 0) {
+    EnsureConfigInitialized();
+    return CorpusSpirvStats(argv[2], argc == 4 ? argv[3] : nullptr);
+  }
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
@@ -37630,6 +38345,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorDpp8Captured(true));
     RunCase(&vulkan, VectorDppQuadPermuteReverse());
     RunCase(&vulkan, VectorDppRowXmask());
+    RunCase(&vulkan, VectorDppRowShare());
+    RunCase(&vulkan, VectorDpp8Vop2());
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
     RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
     return 0;
@@ -38170,6 +38887,16 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--readlane-key-guard-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--corpus-pipeline-times") == 0) {
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    return CodegenTests::CorpusPipelineTimes(&vulkan, argv[2]);
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--exec-selects-bench") == 0) {
+    VulkanHarness vulkan;
+    CodegenTests::BenchExecSelects(&vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--codegen-only") == 0) {

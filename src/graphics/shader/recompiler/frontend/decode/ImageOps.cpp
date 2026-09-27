@@ -70,6 +70,10 @@ constexpr uint32_t ImageSampleAddressComponents(uint32_t flags, ImageDimension d
 	if ((flags & ImageSampleFlagLod) != 0) {
 		components++;
 	}
+	// The _CL clamp follows the body (RDNA2 ISA 8.2.4, Table 43).
+	if ((flags & ImageSampleFlagLodClamp) != 0) {
+		components++;
+	}
 	if ((flags & ImageSampleFlagDerivative) != 0) {
 		components += ImageGradientComponents(dimension) * 2u;
 	}
