@@ -217,6 +217,68 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	done.acquire();
 }
 
+bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	Common::LockGuard lock(m_queue_mutex);
+	if (!m_accepting) {
+		return false;
+	}
+	m_commands.push_back(std::move(command));
+	m_pending_commands.fetch_add(1, std::memory_order_release);
+	m_work_available.Signal();
+	return true;
+}
+
+void GuestGpu::NotifyProgress() {
+	Common::LockGuard lock(m_queue_mutex);
+	for (auto& queue: m_queues) {
+		if (!queue.empty()) {
+			queue.front().blocked = false;
+		}
+	}
+	m_work_available.Signal();
+}
+
+void GuestGpu::AddDeferredLabel(uint64_t address, uint32_t size, uint64_t tick) {
+	Common::LockGuard lock(m_queue_mutex);
+	m_deferred_labels.push_back({address, size, tick});
+	m_deferred_label_count.store(static_cast<uint32_t>(m_deferred_labels.size()),
+	                             std::memory_order_release);
+}
+
+void GuestGpu::RemoveDeferredLabel(uint64_t address, uint64_t tick) {
+	Common::LockGuard lock(m_queue_mutex);
+	const auto found = std::find_if(m_deferred_labels.begin(), m_deferred_labels.end(),
+	                                [address, tick](const DeferredLabel& label) {
+		                                return label.address == address && label.tick == tick;
+	                                });
+	EXIT_IF(found == m_deferred_labels.end());
+	m_deferred_labels.erase(found);
+	m_deferred_label_count.store(static_cast<uint32_t>(m_deferred_labels.size()),
+	                             std::memory_order_release);
+	// A queue suspended on this label (WAIT_REG_MEM) can make progress now.
+	for (auto& queue: m_queues) {
+		if (!queue.empty()) {
+			queue.front().blocked = false;
+		}
+	}
+	m_work_available.Signal();
+}
+
+uint64_t GuestGpu::DeferredLabelTick(uint64_t address, uint64_t size) {
+	if (!HasDeferredLabels()) {
+		return 0;
+	}
+	Common::LockGuard lock(m_queue_mutex);
+	uint64_t          tick = 0;
+	for (const auto& label: m_deferred_labels) {
+		if (label.address < address + size && address < label.address + label.size) {
+			tick = std::max(tick, label.tick);
+		}
+	}
+	return tick;
+}
+
 void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
                       std::span<const uint32_t> constant_commands) {
 	if (draw_commands.empty()) {
@@ -424,6 +486,20 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	(void)poll;
 	const auto value = ReadGuestForCp<T>(reinterpret_cast<uint64_t>(addr));
 	if (!TestWaitRegMemValue(value, ref, mask, func)) {
+		// Waiting on a deferred label: it is written only after its tick completes, so that
+		// tick must be submitted before this queue suspends (the slice-end flush would do it
+		// too; flushing here also covers a label recorded earlier in this slice).
+		if (g_gpu_state != nullptr) {
+			if (const auto tick =
+			        g_gpu_state->DeferredLabelTick(reinterpret_cast<uint64_t>(addr), sizeof(T));
+			    tick != 0) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::WaitRegMemDeferredLabel);
+				if (tick >= GetScheduler().CurrentTick()) {
+					Profiler::CountFrameEvent(Profiler::FrameEvent::WaitRegMemDeferredLabelFlushes);
+					BufferFlush();
+				}
+			}
+		}
 		SuspendPm4();
 	}
 }
@@ -607,6 +683,9 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 		if (should_stop) {
 			gpu->m_gfx_cp->BufferWait();
+			// Deferred label writes still queued on the completion runner write the backing
+			// directly once commands are refused; finish them while this GuestGpu exists.
+			gpu->m_renderer.GetCommandScheduler().DrainPriorityOperations();
 			g_gpu_state  = nullptr;
 			g_gpu_thread = false;
 			return;
@@ -938,6 +1017,10 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			    m_renderer.GetOcclusionCounter().HasUnpublishedDumps()) {
 				Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitOcclusion);
 				BufferWait();
+				if (OcclusionCounter::PriorityPublication()) {
+					// Publications run on the completion runner: wait for them too.
+					GetScheduler().WaitPriorityOperations(GetScheduler().CurrentTick());
+				}
 			}
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
@@ -961,6 +1044,14 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			if (wait_op != 0) {
 				Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitPredication);
 				BufferFlushAndWait();
+				// Labels deferred to completion (defer-label / KYTY_LABEL_MODE=completion) are
+				// written by commands the completion runner posts: run them before reading.
+				if (g_gpu_state != nullptr &&
+				    g_gpu_state->DeferredLabelTick(reinterpret_cast<uint64_t>(address),
+				                                   sizeof(uint64_t)) != 0) {
+					GetScheduler().WaitPriorityOperations(GetScheduler().CurrentTick());
+					g_gpu_state->ProcessCommands();
+				}
 			}
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			value = ReadGuestForCp<uint64_t>(reinterpret_cast<uint64_t>(address));
@@ -1375,6 +1466,74 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 	                                      static_cast<int>(display_buffer_index));
 }
 
+// KYTY_LABEL_MODE=completion writes every end-of-pipe label (RELEASE_MEM / EVENT_WRITE_EOP data
+// writes) only after its tick has completed, in order, like hardware; the default ("record")
+// writes them when the packet is recorded and defers only visibility-proxy labels.
+static bool LabelCompletionMode() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_LABEL_MODE");
+		const bool  on    = value != nullptr && std::strcmp(value, "completion") == 0;
+		std::printf("Kyty end-of-pipe labels: written at %s (KYTY_LABEL_MODE)\n",
+		            on ? "completion" : "record time");
+		return on;
+	}();
+	return enabled;
+}
+
+bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, bool interrupt,
+                                     uint32_t interrupt_context_id) {
+	const auto address = reinterpret_cast<uint64_t>(dst);
+	auto&      gpu     = m_renderer.GetGpu();
+	const bool proxy   = m_defer_next_label;
+	const bool all     = LabelCompletionMode();
+	// A later label to an address whose older label is still deferred must not overtake it.
+	const bool ordered = !proxy && !all && gpu.DeferredLabelTick(address, size) != 0;
+	if (!proxy && !all && !ordered) {
+		return false;
+	}
+	m_defer_next_label = false;
+	auto&      scheduler = GetScheduler();
+	const auto tick      = scheduler.CurrentTick();
+	gpu.AddDeferredLabel(address, size, tick);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::LabelWritesDeferred);
+	if (proxy) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::LabelWritesDeferredProxy);
+	} else if (ordered) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::LabelWritesDeferredOrdered);
+	}
+	auto*     renderer = &m_renderer;
+	const int event_id = m_interrupt_event_id;
+	// Runs on the completion runner once `tick` has completed, after every priority operation
+	// registered before it (FIFO), including this tick's occlusion publications. The write itself
+	// is handed to the GPU thread: a label page may be protected by resource tracking, and only
+	// the GPU thread may take the resulting fault/readback. The interrupt follows the write.
+	scheduler.DeferPriorityOperation(
+	    [renderer, &gpu, address, value, size, tick, interrupt, event_id, interrupt_context_id] {
+		    const bool sent = gpu.TrySendCommand([renderer, &gpu, address, value, size, tick,
+		                                          interrupt, event_id, interrupt_context_id] {
+			    {
+				    KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteDeferredLabel");
+				    std::memcpy(reinterpret_cast<void*>(address), &value, size);
+			    }
+			    gpu.RemoveDeferredLabel(address, tick);
+			    if (interrupt) {
+				    renderer->TriggerInterrupt(event_id, interrupt_context_id);
+			    }
+		    });
+		    if (!sent) {
+			    // Shutdown: the GPU thread no longer runs commands. Best-effort direct write.
+			    (void)LibKernel::Memory::TryWriteBacking(address, &value, size);
+			    gpu.RemoveDeferredLabel(address, tick);
+			    if (interrupt) {
+				    renderer->TriggerInterrupt(event_id, interrupt_context_id);
+			    }
+		    }
+	    },
+	    interrupt ? CommandScheduler::PriorityOperationKind::EopInterrupt
+	              : CommandScheduler::PriorityOperationKind::Generic);
+	return true;
+}
+
 template <typename T>
 void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest,
                                         uint32_t eop_event_type, uint32_t cache_action,
@@ -1427,6 +1586,15 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
+		if (TryDeferLabel(dst, data, sizeof(data), with_interrupt, interrupt_context_id)) {
+			// The deferred write raises the interrupt itself, after the label is visible.
+			if (with_writeback) {
+				Sync::WriteAtEndOfPipeWithWriteBack32(m_submit_id, command, dst, data);
+			} else {
+				Sync::WriteAtEndOfPipe32(m_submit_id, command, dst, data);
+			}
+			return;
+		}
 		{
 			// Guest label pages can be protected by resource tracking. Attribute any
 			// resulting fault separately from the end-of-pipe submission/interrupt work.
@@ -1487,6 +1655,17 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
+					if (TryDeferLabel(dst, value, sizeof(value), with_interrupt,
+					                  interrupt_context_id)) {
+						// The deferred write raises the interrupt itself, after the label.
+						if (with_writeback) {
+							Sync::WriteAtEndOfPipeWithWriteBack64(m_submit_id, command, dst,
+							                                      value);
+						} else {
+							Sync::WriteAtEndOfPipe64(m_submit_id, command, dst, value);
+						}
+						return;
+					}
 					{
 						KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel64");
 						std::memcpy(dst, &value, sizeof(value));
@@ -1705,10 +1884,19 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 					sync = m_renderer.GetOcclusionCounter().Dump(event_address);
 				}
 				if (sync) {
-					// Publish this visibility-proxy result (KYTY_OCCLUSION_SYNC_PROXY, default on) before the
-					// CP processes the label that follows it (labels are written at record time).
-					Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitOcclusion);
-					BufferWait();
+					Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionProxyDumps);
+					if (OcclusionCounter::GetProxyMode() == OcclusionCounter::ProxyMode::Sync) {
+						// Publish this visibility-proxy result before the CP processes the label
+						// that follows it (labels are written at record time).
+						Profiler::ScopedGpuWaitReason wait_reason(
+						    Profiler::FrameWait::GpuWaitOcclusion);
+						BufferWait();
+					} else {
+						// defer-label: the next end-of-pipe label is written only after this
+						// dump's tick completed and its publication (queued above on the same
+						// completion runner) has run. See TryDeferLabel.
+						m_defer_next_label = true;
+					}
 				}
 				break;
 			}

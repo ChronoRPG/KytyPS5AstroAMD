@@ -166,6 +166,12 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	// Defers an end-of-pipe label (and its interrupt) to the completion of the current tick when
+	// a visibility-proxy dump armed it (KYTY_OCCLUSION_PROXY_MODE=defer-label), every label is
+	// deferred (KYTY_LABEL_MODE=completion), or an older deferred label to the same address is
+	// still pending (write order). Returns false when the label must be written now.
+	[[nodiscard]] bool TryDeferLabel(void* dst, uint64_t value, uint32_t size, bool interrupt,
+	                                 uint32_t interrupt_context_id);
 	[[nodiscard]] bool  TryDrawIndirectNative(DrawIndirectSource source);
 	void                ValidateIndirectSource(const DrawIndirectSource& source);
 	[[nodiscard]] uint32_t NumInstances();
@@ -212,6 +218,8 @@ private:
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
 	uint32_t  m_deferred_eop_flushes        = 0;
+	// A visibility-proxy end dump was recorded: defer the next end-of-pipe label (defer-label).
+	bool      m_defer_next_label            = false;
 };
 
 } // namespace Libs::Graphics

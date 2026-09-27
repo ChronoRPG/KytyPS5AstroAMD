@@ -41,7 +41,29 @@ public:
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
+	// Like SendCommand, but returns false (dropping nothing: the caller keeps the command's
+	// work) once the GPU no longer accepts external commands (shutdown). Any thread.
+	[[nodiscard]] bool TrySendCommand(Common::UniqueFunction<void>&& command);
+	// Something a suspended (blocked) queue may wait for has changed: clear the blocked marks so
+	// the scheduler retries them now, and wake it. Any thread.
+	void NotifyProgress();
+
+	// End-of-pipe labels whose guest write is deferred to their tick's completion (see
+	// CommandProcessor::TryDeferLabel). Registration and completion run on the GPU thread.
+	void AddDeferredLabel(uint64_t address, uint32_t size, uint64_t tick);
+	void RemoveDeferredLabel(uint64_t address, uint64_t tick);
+	[[nodiscard]] bool HasDeferredLabels() const noexcept {
+		return m_deferred_label_count.load(std::memory_order_acquire) != 0;
+	}
+	// Newest tick of a pending deferred label overlapping the range, or 0.
+	[[nodiscard]] uint64_t DeferredLabelTick(uint64_t address, uint64_t size);
+
 private:
+	struct DeferredLabel {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint64_t tick    = 0;
+	};
 	static constexpr uint32_t ComputePipeCount     = 7;
 	static constexpr uint32_t QueuesPerComputePipe = 8;
 	static constexpr uint32_t ComputeQueueCount    = ComputePipeCount * QueuesPerComputePipe;
@@ -82,6 +104,8 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
+	std::deque<DeferredLabel>                      m_deferred_labels; // m_queue_mutex
+	std::atomic_uint32_t                           m_deferred_label_count {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;

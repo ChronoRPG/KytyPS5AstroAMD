@@ -278,6 +278,16 @@ enum class FrameEvent : uint32_t {
 	ReadbackGpuThreadDrains,
 	// Side copies submitted to the second queue of the family (KYTY_SIDE_QUEUE).
 	ReadbackSideQueueCopies,
+	// Visibility-proxy end dumps (KYTY_OCCLUSION_PROXY_MODE); end-of-pipe labels deferred to their
+	// tick's completion (all, armed by a proxy dump, kept behind an older deferred label to the
+	// same address); WAIT_REG_MEM suspensions on a pending deferred label, and those that first
+	// flushed the recording holding it.
+	OcclusionProxyDumps,
+	LabelWritesDeferred,
+	LabelWritesDeferredProxy,
+	LabelWritesDeferredOrdered,
+	WaitRegMemDeferredLabel,
+	WaitRegMemDeferredLabelFlushes,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

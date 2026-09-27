@@ -218,13 +218,37 @@ void OcclusionCounter::Dispatch(uint32_t mode, vk::Buffer output, uint64_t offse
 }
 
 // Astro Bot reads a visibility proxy's result right after the label that follows its end dump.
-// Kyty writes labels at record time, so the result must be published before the CP continues
-// (verified 2026-09-27: the Sky Garden water renders only then). KYTY_OCCLUSION_SYNC_PROXY=0
-// restores asynchronous publication.
+// Kyty writes labels at record time, so either the result must be published before the CP
+// continues (sync; verified 2026-09-27: the Sky Garden water renders only then), or that label
+// must be written only after the publication (defer-label). KYTY_OCCLUSION_SYNC_PROXY=0 restores
+// plain asynchronous publication.
+OcclusionCounter::ProxyMode OcclusionCounter::GetProxyMode() {
+	static const ProxyMode mode = [] {
+		const auto* legacy = std::getenv("KYTY_OCCLUSION_SYNC_PROXY");
+		if (legacy != nullptr && legacy[0] == '0') {
+			return ProxyMode::Off;
+		}
+		const auto* value = std::getenv("KYTY_OCCLUSION_PROXY_MODE");
+		const auto  mode  = value != nullptr && std::strcmp(value, "sync") == 0 ? ProxyMode::Sync
+		                                                                        : ProxyMode::DeferLabel;
+		if (Enabled()) {
+			std::printf("Occlusion counter: visibility-proxy mode %s (KYTY_OCCLUSION_PROXY_MODE)\n",
+			            mode == ProxyMode::Sync ? "sync" : "defer-label");
+		}
+		return mode;
+	}();
+	return mode;
+}
+
 bool OcclusionCounter::SyncProxyDumps() {
+	return GetProxyMode() != ProxyMode::Off;
+}
+
+bool OcclusionCounter::PriorityPublication() {
 	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_OCCLUSION_SYNC_PROXY");
-		return value == nullptr || value[0] != '0';
+		const auto* label_mode = std::getenv("KYTY_LABEL_MODE");
+		return GetProxyMode() == ProxyMode::DeferLabel ||
+		       (label_mode != nullptr && std::strcmp(label_mode, "completion") == 0);
 	}();
 	return enabled;
 }
@@ -237,9 +261,15 @@ bool OcclusionCounter::Dump(uint64_t address) {
 	// Reduce into a private slot. A slot is reused only after its previous publication's tick
 	// has completed (1024 dumps in flight never happens in practice; the wait bounds it).
 	const auto slot = static_cast<uint32_t>(m_issued % PublishSlots);
-	if (m_issued >= PublishSlots && !scheduler.IsFree(m_slot_ticks[slot])) {
+	if (m_issued >= PublishSlots) {
+		// The slot's previous publication must have read it, not only its GPU work completed.
 		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitOcclusion);
-		scheduler.Wait(m_slot_ticks[slot]);
+		if (!scheduler.IsFree(m_slot_ticks[slot])) {
+			scheduler.Wait(m_slot_ticks[slot]);
+		}
+		if (PriorityPublication()) {
+			scheduler.WaitPriorityOperations(m_slot_ticks[slot]);
+		}
 	}
 	const uint64_t slot_offset = uint64_t {slot} * PublishSlotSize;
 	scheduler.EndRendering();
@@ -248,7 +278,7 @@ bool OcclusionCounter::Dump(uint64_t address) {
 	++m_issued;
 	// The shader writes the first qword of each of the 16 interleaved begin/end pairs and leaves
 	// the other member untouched; publish exactly those qwords.
-	scheduler.DeferOperation([this, address, slot_offset] {
+	auto publish = [this, address, slot_offset] {
 		m_publish->Invalidate(slot_offset, 248);
 		const auto* source = m_publish->Mapped().data() + slot_offset;
 		for (uint32_t db = 0; db < 16u; db++) {
@@ -265,7 +295,13 @@ bool OcclusionCounter::Dump(uint64_t address) {
 			HangTrace::RecordOcclusion(event);
 		}
 		m_published.fetch_add(1, std::memory_order_release);
-	});
+	};
+	if (PriorityPublication()) {
+		// TryWriteBacking and the host-visible slot are safe on the completion runner.
+		scheduler.DeferPriorityOperation(std::move(publish));
+	} else {
+		scheduler.DeferOperation(std::move(publish));
+	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionDumps);
 	// Rendering has ended above and the value is published from everything counted so far: a
 	// begin opens its pair for the instances that follow, an end closes it after its snapshot.
