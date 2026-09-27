@@ -286,11 +286,40 @@ void GuestGpu::NotifyProgress() {
 bool GuestGpu::HasRunnableComputeWork() {
 	Common::LockGuard lock(m_queue_mutex);
 	for (uint32_t id = 1; id < QueueCount; id++) {
-		if (!m_queues[id].empty() && !m_queues[id].front().blocked) {
+		if (!m_queues[id].empty() && !m_queues[id].front().blocked &&
+		    FrameFencePassed(m_queues[id].front())) {
 			return true;
 		}
 	}
 	return false;
+}
+
+// KYTY_FRAME_FENCE=0 lets a submission admitted after sceAgcSuspendPoint (bounded Done) start
+// while submissions admitted before that Done are still pending on other queues. By default the
+// CP scheduler holds it until they have completed, which keeps the cross-queue frame order the
+// idle Done gave (only the scheduler waits, the guest thread does not). Without it, Astro Bot's
+// async-compute copy into memory that the previous frame's water draw still samples ran between
+// that frame's refraction copy and water draw once graphics slices could yield
+// (KYTY_GFX_SLICE_DRAWS): white or opaque water.
+static bool FrameFenceEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_FRAME_FENCE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// A front held this long by the fence runs anyway (logged once): a hang would be worse.
+constexpr uint64_t FrameFenceTimeoutNs = 2'000'000'000;
+
+bool GuestGpu::FrameFencePassed(const Submission& submission) const {
+	// m_in_flight holds the submission itself (a larger sequence), so its first element exceeds
+	// the fence exactly when every submission admitted before that Done has completed. A started
+	// submission (blocked or yielded since) passed the fence already.
+	return submission.frame_fence == 0 || submission.started || m_in_flight.empty() ||
+	       *m_in_flight.begin() > submission.frame_fence ||
+	       (submission.fence_hold_ns != 0 &&
+	        CpNowNs() - submission.fence_hold_ns > FrameFenceTimeoutNs);
 }
 
 void GuestGpu::AddDeferredLabel(uint64_t address, uint32_t size, uint64_t tick) {
@@ -876,7 +905,8 @@ void GuestGpu::Enqueue(Submission submission) {
 	}
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
-	submission.sequence = m_next_submission_sequence++;
+	submission.sequence    = m_next_submission_sequence++;
+	submission.frame_fence = FrameFenceEnabled() ? m_done_boundary : 0;
 	m_in_flight.insert(submission.sequence);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
@@ -924,13 +954,36 @@ void GuestGpu::ThreadRun(void* data) {
 				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 				gpu->m_processing = true;
 			} else {
-				int selected_queue = -1;
+				int  selected_queue = -1;
+				bool fence_held     = false;
 				for (uint32_t offset = 0; offset < QueueCount; offset++) {
-					const auto id = (gpu->m_next_queue + offset) % QueueCount;
-					if (!gpu->m_queues[id].empty() && !gpu->m_queues[id].front().blocked) {
-						selected_queue = static_cast<int>(id);
-						break;
+					const auto id    = (gpu->m_next_queue + offset) % QueueCount;
+					auto&      queue = gpu->m_queues[id];
+					if (queue.empty() || queue.front().blocked) {
+						continue;
 					}
+					if (!gpu->FrameFencePassed(queue.front())) {
+						if (queue.front().fence_hold_ns == 0) {
+							queue.front().fence_hold_ns = CpNowNs();
+						}
+						fence_held = true;
+						continue;
+					}
+					if (queue.front().fence_hold_ns != 0 &&
+					    CpNowNs() - queue.front().fence_hold_ns > FrameFenceTimeoutNs) {
+						static std::atomic_bool logged {false};
+						if (!logged.exchange(true)) {
+							LOGF("CP frame fence: queue %u waited over 2 s for the previous frame; "
+							     "running it anyway (KYTY_FRAME_FENCE)\n",
+							     id);
+						}
+					}
+					selected_queue = static_cast<int>(id);
+					break;
+				}
+				if (fence_held && selected_queue >= 0) {
+					// The fence changed which queue runs next.
+					Profiler::CountFrameEvent(Profiler::FrameEvent::FrameFenceHolds);
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;

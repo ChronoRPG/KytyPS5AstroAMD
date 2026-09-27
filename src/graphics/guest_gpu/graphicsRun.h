@@ -91,6 +91,11 @@ private:
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  enqueue_ns        = 0;
 		uint64_t                  sequence          = 0; // admission order (m_queue_mutex)
+		// Last sequence admitted before the latest Done at admission (KYTY_FRAME_FENCE): the
+		// submission starts only after all of those have completed. 0 = no fence.
+		uint64_t frame_fence = 0;
+		// When the scheduler first passed this front over for the fence (safety timeout), or 0.
+		uint64_t fence_hold_ns = 0;
 	};
 
 	void              Enqueue(Submission submission);
@@ -100,6 +105,9 @@ private:
 		return m_pending_commands.load(std::memory_order_acquire) != 0;
 	}
 	bool              Process(Submission& submission);
+	// The submission may start (or continue) now as far as the frame fence is concerned.
+	// Requires m_queue_mutex.
+	[[nodiscard]] bool FrameFencePassed(const Submission& submission) const;
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 

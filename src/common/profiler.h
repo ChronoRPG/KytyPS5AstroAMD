@@ -369,6 +369,9 @@ enum class FrameEvent : uint32_t {
 	// AgcSuspendPoint calls in bounded mode (KYTY_AGC_DONE_MODE) that had to wait for the previous
 	// frame's submissions.
 	AgcDoneBoundedWaits,
+	// Queue fronts the CP scheduler passed over because an earlier guest frame's submissions had
+	// not completed yet (KYTY_FRAME_FENCE), counted once per scheduling pass.
+	FrameFenceHolds,
 	// Texture binding identity memo (KYTY_TEXTURE_BINDING_MEMO, pipeline/textureBindingMemo.h).
 	// ResolveTexture answered from an entry (Hits), with no entry for the key (Misses), or with an
 	// entry that a texture-cache structure change or the image's live state ruled out (Stale: new

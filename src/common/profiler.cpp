@@ -249,6 +249,7 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.WriteDataGpu.Cumulative",
     "FrameEvent.WriteDataCpu.Cumulative",
     "FrameEvent.AgcDoneBoundedWaits.Cumulative",
+    "FrameEvent.FrameFenceHolds.Cumulative",
     "FrameEvent.TextureBindingMemoHits.Cumulative",
     "FrameEvent.TextureBindingMemoMisses.Cumulative",
     "FrameEvent.TextureBindingMemoStale.Cumulative",
