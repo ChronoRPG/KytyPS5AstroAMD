@@ -420,6 +420,8 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.DrawBindingRepeatTextures.Cumulative",
     "FrameEvent.DrawBindingRepeatResources.Cumulative",
     "FrameEvent.DrawBindingRepeatAll.Cumulative",
+    "FrameEvent.TextureBindingMemoRevalidated.Cumulative",
+    "FrameEvent.TextureBindingMemoRevalidateMismatches.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 

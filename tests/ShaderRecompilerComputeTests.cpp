@@ -513,6 +513,23 @@ struct RenderExecutorTestAccess {
     return executor.ResolveTexture(resource, value);
   }
 
+  // The full resolution without the texture binding memo (neither looked up nor recorded).
+  static TextureBinding
+  ResolveTextureFull(RenderExecutor &executor,
+                     const ShaderRecompiler::IR::ImageResource &resource,
+                     const ShaderRecompiler::IR::DescriptorValue &value) {
+    const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+    const auto key = TextureBindingMemo::MakeKey(resource, descriptor.fields);
+    TextureBinding binding;
+    executor.ResolveTextureFull(resource, descriptor, key, TextureBindingMemo::Hash(key), false,
+                                binding);
+    return binding;
+  }
+
+  static TextureBindingMemo::Totals TextureMemoTotals(const RenderExecutor &executor) {
+    return executor.m_texture_memo.GetTotals();
+  }
+
   static auto PrepareGraphicsBindings(RenderExecutor &executor,
                                       const ShaderStageRuntime &vertex,
                                       const ShaderStageRuntime &pixel,
@@ -9659,6 +9676,135 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "color direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // KYTY_TEXTURE_MEMO_REVALIDATE: a texture binding memo entry whose first 1 MiB page gets a new
+  // owner (another image registered on it) is revalidated with FindImage's own lookup and stays
+  // usable, same entry and view, while that lookup still returns the recorded image; the answer
+  // equals the full resolution. With the switch off the entry is dropped and re-recorded.
+  void CheckTextureMemoRevalidation() {
+    constexpr const char *name = "TextureMemoRevalidation";
+    constexpr uintptr_t base = 0x0000000206800000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint32_t width = 64;
+    constexpr uint32_t height = 64;
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "texture-memo direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "texture-memo fixed mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+    {
+      auto &executor = context.GetRenderExecutor();
+      auto &texture_cache = context.GetTextureCache();
+      context.MapMemory(base, allocation_size);
+      ShaderTextureResource descriptor{{
+          static_cast<uint32_t>(base >> 8u),
+          (static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8Srgb) << 20u) |
+              (((width - 1u) & 3u) << 30u),
+          ((width - 1u) >> 2u) | ((height - 1u) << 14u),
+          DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0, 0}};
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      const auto totals = [&] { return RenderExecutorTestAccess::TextureMemoTotals(executor); };
+      const auto resolve = [&] {
+        return RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      };
+
+      const auto first = resolve(); // full resolution, recorded
+      const auto t0 = totals();
+      const auto second = resolve();
+      Require(name, "memo hit",
+              first.image_id && second.image_id == first.image_id &&
+                  second.memo_tag != 0 && totals().hits == t0.hits + 1,
+              "an unchanged texture binding did not hit the memo");
+
+      // Another image registers on the same 1 MiB page (disjoint bytes).
+      ImageDesc other{};
+      other.type = BindingType::Texture;
+      other.info.data = {base + 0x80000, 16 * 16 * 4};
+      other.info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+      other.info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
+      other.info.type = Prospero::ImageType::kColor2D;
+      other.info.extent = {16, 16, 1};
+      other.info.resources = {1, 1};
+      other.info.pitch = 16;
+      other.info.bytes_per_block = 4;
+      other.info.samples = 1;
+      other.info.tile_mode = Prospero::TileMode::kLinear;
+      other.info.mip_layout[0] = {0, 16 * 16 * 4, 16, 16};
+      other.view_info.format = vk::Format::eR8G8B8A8Unorm;
+      other.view_info.type = vk::ImageViewType::e2D;
+      other.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      other.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto other_id = texture_cache.FindImage(other);
+      Require(name, "second image", other_id && other_id != first.image_id,
+              "the disjoint image was not created");
+
+      const char *setting = std::getenv("KYTY_TEXTURE_MEMO_REVALIDATE");
+      const bool revalidate = setting == nullptr || std::strcmp(setting, "0") != 0;
+      const auto t1 = totals();
+      const auto third = resolve();
+      const auto full = RenderExecutorTestAccess::ResolveTextureFull(executor, resource, value);
+      Require(name, "answer after the page changed",
+              third.image_id == first.image_id && full.image_id == first.image_id &&
+                  third.desc.view_info == full.desc.view_info &&
+                  third.desc.info.data == full.desc.info.data,
+              "the binding resolved to another image or description after an unrelated image "
+              "registered on its page");
+      if (revalidate) {
+        Require(name, "revalidated entry",
+                totals().revalidated == t1.revalidated + 1 && totals().hits == t1.hits + 1 &&
+                    third.memo_tag == second.memo_tag,
+                "the entry was not revalidated in place (same entry, same view)");
+        const auto t2 = totals();
+        (void)resolve();
+        Require(name, "plain hit at the new version",
+                totals().hits == t2.hits + 1 && totals().revalidated == t2.revalidated,
+                "a revalidated entry was not a plain hit at its new page version");
+      } else {
+        Require(name, "dropped entry",
+                totals().stale == t1.stale + 1 && totals().revalidated == t1.revalidated &&
+                    third.memo_tag != second.memo_tag,
+                "with revalidation off the entry was kept");
+      }
+      scheduler.Finish();
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "texture-memo mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "texture-memo allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -37313,6 +37459,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferRangeMemo();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--texture-memo-revalidate-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTextureMemoRevalidation();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--draw-prep-code-cert-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDrawPrepCertifiedShaderHash();
@@ -37515,6 +37666,7 @@ int main(int argc, char **argv) {
   vulkan.CheckDrawPrepCertifiedShaderHash();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckDrawPrepEngineDraw();
+  vulkan.CheckTextureMemoRevalidation();
   vulkan.CheckRenderExecutorColorDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
   vulkan.CheckRenderExecutorDccFixedClearFloat();

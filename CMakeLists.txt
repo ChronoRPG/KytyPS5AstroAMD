@@ -502,7 +502,7 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(resource_materialization_tests common fmt::fmt)
+target_link_libraries(resource_materialization_tests common fmt::fmt xxhash)
 if(LINUX)
 	# The shared-plan evaluation case runs std::thread workers.
 	target_link_libraries(resource_materialization_tests Threads::Threads)
@@ -718,6 +718,17 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
 	set_tests_properties(buffer_range_memo_off PROPERTIES
 		ENVIRONMENT "KYTY_BUFFER_RANGE_MEMO=0;KYTY_HOT_PAGE_CHECK_LIMIT=0")
+	# KYTY_TEXTURE_MEMO_REVALIDATE: default, verify mode, off.
+	add_test(NAME texture_memo_revalidate
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)
+	add_test(NAME texture_memo_revalidate_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)
+	set_tests_properties(texture_memo_revalidate_verify PROPERTIES
+		ENVIRONMENT "KYTY_TEXTURE_MEMO_REVALIDATE_VERIFY=exit")
+	add_test(NAME texture_memo_revalidate_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)
+	set_tests_properties(texture_memo_revalidate_off PROPERTIES
+		ENVIRONMENT "KYTY_TEXTURE_MEMO_REVALIDATE=0")
 	# Draw-prep end to end: serial vs command-processor draws, in each engine mode.
 	add_test(NAME draw_prep_engine
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)

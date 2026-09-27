@@ -678,6 +678,11 @@ enum class FrameEvent : uint32_t {
 	DrawBindingRepeatTextures,
 	DrawBindingRepeatResources,
 	DrawBindingRepeatAll,
+	// KYTY_TEXTURE_MEMO_REVALIDATE: texture binding memo entries whose first page changed its owner
+	// list and that the redone lookup confirmed (counted as hits too), and the verify mode's
+	// disagreements with the full resolution.
+	TextureBindingMemoRevalidated,
+	TextureBindingMemoRevalidateMismatches,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

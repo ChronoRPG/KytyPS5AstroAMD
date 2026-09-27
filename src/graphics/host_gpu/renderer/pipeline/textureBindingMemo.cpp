@@ -5,6 +5,8 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -29,9 +31,74 @@ struct TextureBindingMemo::Entry {
 	// SyncAliasFromOwner may copy into this one unless it owns the bytes.
 	bool                    has_partner = false;
 	bool                    null_image  = false;
+	// FindImage's exact_format for the description (KYTY_TEXTURE_MEMO_REVALIDATE).
+	bool                    exact_format = false;
 	vk::ImageView           view        = nullptr;
 	TextureCache::ImageDesc desc;
 };
+
+namespace {
+
+// KYTY_TEXTURE_MEMO_REVALIDATE (default on; =0 off): an entry whose first page changed its owner
+// list (the page version moved: an image registered or unregistered there, often a transient
+// render target sharing the 1 MiB page) is checked again instead of being dropped: the lookup
+// FindImage makes (FindImageWithSameBacking on the recorded description), the alias-partner scan
+// and the version are redone exactly as Record() does them, under the same lock. If the lookup
+// still returns the recorded image, the entry (and its view) stay valid for the new version.
+bool RevalidateEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_TEXTURE_MEMO_REVALIDATE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// KYTY_TEXTURE_MEMO_REVALIDATE_VERIFY=1|exit: every revalidated hit is followed by the full
+// resolution (RenderExecutor::ResolveTexture), and a different image or description is counted
+// (TextureBindingMemoRevalidateMismatches; exit stops on the first).
+int RevalidateVerifyMode() {
+	static const int mode = [] {
+		const auto* value = std::getenv("KYTY_TEXTURE_MEMO_REVALIDATE_VERIFY");
+		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
+			return 0;
+		}
+		return std::strcmp(value, "exit") == 0 ? 2 : 1;
+	}();
+	return mode;
+}
+
+} // namespace
+
+bool TextureBindingMemo::HasPartner(const TextureCache& cache, uint64_t page, ImageId found,
+                                    const Image& image) {
+	bool partner = false;
+	if (const auto* owners = cache.m_image_page_table.Find(page); owners != nullptr) {
+		owners->ForEach([&](ImageId id) {
+			const auto* other = cache.m_slot_images.try_get(id);
+			if (id != found && other != nullptr && other->registered &&
+			    other->info.data == image.info.data && other->info.extent == image.info.extent &&
+			    other->backing.samples == image.backing.samples) {
+				partner = true;
+			}
+		});
+	}
+	return partner;
+}
+
+bool TextureBindingMemo::RevalidateVerify() {
+	return RevalidateVerifyMode() != 0;
+}
+
+void TextureBindingMemo::ReportRevalidateMismatch() {
+	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoRevalidateMismatches);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::fprintf(stderr, "TextureMemoRevalidateVerify: a revalidated entry resolved differently\n");
+	}
+	if (RevalidateVerifyMode() == 2) {
+		EXIT("TextureMemoRevalidateVerify: a revalidated entry resolved differently\n");
+	}
+}
 
 TextureBindingMemo::TextureBindingMemo() = default;
 TextureBindingMemo::~TextureBindingMemo() = default;
@@ -95,6 +162,7 @@ void TextureBindingMemo::Forget(TextureBinding& binding) {
 
 bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_t hash,
                                     TextureBinding& binding) {
+	m_last_revalidated = false;
 	if (!m_entries) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoMisses);
 		return false;
@@ -105,19 +173,38 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoMisses);
 		return false;
 	}
+	bool revalidated = false;
 	if (!entry.null_image) {
 		std::scoped_lock lock {cache.m_lock};
 		auto*            image = cache.m_slot_images.try_get(entry.image);
-		// A structural change on the description's first page may alter what FindImage returns;
-		// a stencil association redirects the binding; a pending rebind, a copy from the alias
+		const auto       stale = [&] {
+            Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoStale);
+            m_totals.stale++;
+            return false;
+		};
+		// A stencil association redirects the binding; a pending rebind, a copy from the alias
 		// owner and a residency extension (resident levels changed, or fewer than the view
 		// samples) are FindImage/RebindImages work: all take the full resolution.
-		if (entry.page_version != cache.PageVersion(entry.page) || image == nullptr ||
-		    !image->registered || image->depth_id ||
-		    image->binding.needs_rebind || entry.requested_first < image->resident_first ||
-		    (entry.has_partner && !image->alias_owner && !image->info.HasStencil())) {
-			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoStale);
-			return false;
+		if (image == nullptr || !image->registered || image->depth_id ||
+		    image->binding.needs_rebind || entry.requested_first < image->resident_first) {
+			return stale();
+		}
+		// A structural change on the description's first page may alter what FindImage returns:
+		// redo its lookup and the partner scan for the new owner list (RevalidateEnabled).
+		if (const auto version = cache.PageVersion(entry.page); entry.page_version != version) {
+			if (!RevalidateEnabled() ||
+			    cache.FindImageWithSameBacking(entry.desc.info, entry.exact_format) !=
+			        entry.image) {
+				return stale();
+			}
+			entry.has_partner  = HasPartner(cache, entry.page, entry.image, *image);
+			entry.page_version = version;
+			revalidated        = true;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoRevalidated);
+			m_totals.revalidated++;
+		}
+		if (entry.has_partner && !image->alias_owner && !image->info.HasStencil()) {
+			return stale();
 		}
 		// FindImage's access bookkeeping for the returned image.
 		image->tick_accessed_last = cache.m_scheduler.CurrentTick();
@@ -132,6 +219,8 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 		binding.memo_slot = slot;
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoHits);
+	m_totals.hits++;
+	m_last_revalidated = revalidated;
 	return true;
 }
 
@@ -181,17 +270,7 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 			// and sample count; they start on the same indexed page as this one. Their flags
 			// (alias owner, GPU-modified, stencil) are not considered: any such image makes the
 			// entry usable only while this image owns the bytes.
-			if (const auto* owners = cache.m_image_page_table.Find(pages.first); owners != nullptr) {
-				owners->ForEach([&](ImageId id) {
-					const auto* other = cache.m_slot_images.try_get(id);
-					if (id != found && other != nullptr && other->registered &&
-					    other->info.data == image->info.data &&
-					    other->info.extent == image->info.extent &&
-					    other->backing.samples == image->backing.samples) {
-						has_partner = true;
-					}
-				});
-			}
+			has_partner  = HasPartner(cache, pages.first, found, *image);
 			page         = pages.first;
 			page_version = cache.PageVersion(page);
 		}
@@ -209,6 +288,7 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 	entry.requested_first = requested_first;
 	entry.has_partner     = has_partner;
 	entry.null_image      = null_image;
+	entry.exact_format    = exact_format;
 	entry.view            = nullptr;
 	entry.desc            = desc;
 	binding.memo_tag      = entry.tag;
