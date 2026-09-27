@@ -75,6 +75,10 @@ public:
 	void            BufferInit();
 	void            BufferFlush();
 	void            BufferFlushAndWait();
+	// Flush requested by an end-of-pipe interrupt. Interrupts fire when their tick completes, so
+	// only every KYTY_EOP_FLUSH_BATCH-th request flushes (default 8; 1 = flush every time); a
+	// slice always ends with a flush, so a pending interrupt is submitted before the CP blocks.
+	void            BufferFlushForEop();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
@@ -207,6 +211,7 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	uint32_t  m_deferred_eop_flushes        = 0;
 };
 
 } // namespace Libs::Graphics

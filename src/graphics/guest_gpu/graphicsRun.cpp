@@ -332,7 +332,19 @@ void CommandProcessor::BufferInit() {
 
 void CommandProcessor::BufferFlush() {
 	KYTY_PROFILER_DETAIL_FUNCTION();
+	m_deferred_eop_flushes = 0;
 	GetScheduler().Flush();
+}
+
+void CommandProcessor::BufferFlushForEop() {
+	static const uint32_t batch = [] {
+		const char* value = std::getenv("KYTY_EOP_FLUSH_BATCH");
+		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 8ul;
+		return static_cast<uint32_t>(std::clamp(parsed, 1ul, 1024ul));
+	}();
+	if (++m_deferred_eop_flushes >= batch) {
+		BufferFlush();
+	}
 }
 
 void CommandProcessor::BufferFlushAndWait() {
