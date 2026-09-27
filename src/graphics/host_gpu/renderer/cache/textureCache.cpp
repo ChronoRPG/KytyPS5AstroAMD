@@ -507,6 +507,36 @@ bool TextureCache::SafeToDownload(const Image& image) {
 	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
 }
 
+// KYTY_IMAGE_SUPERSEDES_GPU_DIRTY=0 keeps refusing texel-read syncs of a GPU-modified image whose
+// range holds any GPU-dirty buffer bytes (the previous behaviour).
+static bool ImageSupersedesGpuDirtyEnabled() {
+	static const bool enabled = EnvNotZero("KYTY_IMAGE_SUPERSEDES_GPU_DIRTY");
+	return enabled;
+}
+
+bool TextureCache::SupersedesGpuDirtyBytes(const Image& image) {
+	// Every bounded GPU buffer write (storage bindings, fills, copies, GPU-timeline WRITE_DATA,
+	// image writebacks) clears the GPU ownership of the images it overlaps
+	// (InvalidateMemoryFromGPU). An image that is GPU-modified now was therefore written after all
+	// of them, and after every unbounded writer bound before its content serial was issued.
+	// (An adopted serial is never newer than the image's own last write, so this stays exact
+	// or conservative.) GPU-dirty bytes in its range are then stale copies: the image downloads
+	// over them. Without this, one image writeback (which leaves the whole moved range GPU-dirty
+	// until a readback) blocks every later texel-read sync of a newer render target there: Astro
+	// Bot's water copies its scene colour target with a compute memcpy that read stale bytes.
+	return ImageSupersedesGpuDirtyEnabled() && image.IsGpuModified() &&
+	       image.ContentSerial() > m_buffer_cache.UnboundedWriteSerial();
+}
+
+bool TextureCache::SafeToSyncIntoBuffer(const Image& image) {
+	if (!image.SafeToDownload() || !image.FullyResident()) {
+		return false;
+	}
+	const auto range = image.info.data;
+	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size) ||
+	       SupersedesGpuDirtyBytes(image);
+}
+
 ImageId TextureCache::InsertImage(const ImageInfo& info, uint32_t resident_first,
                                   uint64_t resident_prefix) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
@@ -2896,7 +2926,8 @@ void TextureCache::UpdateImage(ImageId id) {
 	RefreshImage(id);
 }
 
-ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
+ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid,
+                                         bool buffer_sync) {
 	if (!GuestRange {address, size}.Valid()) {
 		return {};
 	}
@@ -2910,7 +2941,8 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		if (ensure_valid && owner->depth_id) {
 			owner = m_slot_images.try_get(owner->depth_id);
 		}
-		if (owner == nullptr || (ensure_valid && !SafeToDownload(*owner))) {
+		if (owner == nullptr ||
+		    (ensure_valid && !(buffer_sync ? SafeToSyncIntoBuffer(*owner) : SafeToDownload(*owner)))) {
 			continue;
 		}
 		matches.push_back(id);
@@ -3398,7 +3430,7 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size);
+	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size, true, true);
 	if (!selected) {
 		return false;
 	}
@@ -3409,8 +3441,12 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		std::scoped_lock lock {m_texture_cache.m_lock};
 		auto&            image = m_texture_cache.m_slot_images[selected];
 		// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
-		if (!m_texture_cache.SafeToDownload(image)) {
+		if (!m_texture_cache.SafeToSyncIntoBuffer(image)) {
 			return false;
+		}
+		if (HasGpuDirtyBytes(image.info.data.address, image.info.data.size)) {
+			// The image supersedes stale GPU-dirty bytes in its range (SupersedesGpuDirtyBytes).
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TexelImageSyncOverGpuDirty);
 		}
 		const bool track_texel_sync = m_texture_cache.m_texel_sync_skip && GuestGpu::IsGpuThread();
 		bool       skipped          = false;

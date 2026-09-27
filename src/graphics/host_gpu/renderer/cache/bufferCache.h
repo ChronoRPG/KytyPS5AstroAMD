@@ -124,6 +124,9 @@ public:
 	// Invalidate retained results before commands whose writes cannot be bounded to one buffer.
 	// Also disables side readbacks until the current recording is submitted.
 	void InvalidateContentRevisions();
+	// Image content serial (Image::NextContentSerial) taken when the latest unbounded writer was
+	// bound: an image whose ContentSerial is larger was written after it.
+	[[nodiscard]] uint64_t UnboundedWriteSerial() const noexcept { return m_unbounded_write_serial; }
 	// Publications can outlive cache ownership. Registration is on the GPU thread; completion
 	// is on the priority worker, and these queries never wait for GPU work or backing writes.
 	[[nodiscard]] uint64_t BeginBackingPublication(std::span<const GuestRange> ranges,
@@ -309,6 +312,7 @@ private:
 	size_t       m_write_tick_prune_size = 1024;
 	// Recording tick that holds an unbounded (address) GPU writer; 0 when none.
 	uint64_t     m_unbounded_write_tick  = 0;
+	uint64_t     m_unbounded_write_serial = 0;
 	std::unique_ptr<SideReadbackState> m_side;
 };
 

@@ -105,8 +105,12 @@ void Image::NoteContentWrite() noexcept {
 	NotePossibleWrite();
 }
 
+uint64_t Image::NextContentSerial() noexcept {
+	return g_content_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 void Image::NotePossibleWrite() noexcept {
-	m_content_serial = g_content_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+	m_content_serial = NextContentSerial();
 	// Every native write (copy, clear, draw/dispatch binding, upload) ends the guarantee that
 	// clean chunks match guest memory; a guest-sourced upload sets it again afterwards.
 	m_partial_valid = false;

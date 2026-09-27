@@ -1744,6 +1744,9 @@ void BufferCache::InvalidateContentRevisions() {
 	SettleHotPages(0, 0);
 	// Their bytes carry no writer tick, so no readback may skip this recording.
 	m_unbounded_write_tick = m_scheduler.CurrentTick();
+	// Nor do they clear the GPU ownership of images they may overwrite: order them against image
+	// writes instead (TextureCache::SupersedesGpuDirtyBytes).
+	m_unbounded_write_serial = Image::NextContentSerial();
 }
 
 uint64_t BufferCache::BeginBackingPublication(std::span<const GuestRange> ranges, uint64_t tick) {

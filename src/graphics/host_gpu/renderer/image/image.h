@@ -87,6 +87,9 @@ public:
 	void                   NoteContentWrite() noexcept;
 	void                   NotePossibleWrite() noexcept;
 	void AdoptContentSerial(uint64_t serial) noexcept { m_content_serial = serial; }
+	// A fresh serial from the same sequence, for ordering other writers against image writes
+	// (BufferCache::InvalidateContentRevisions stamps unbounded buffer writers with it).
+	[[nodiscard]] static uint64_t NextContentSerial() noexcept;
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (ImageRangeOverlaps(live.address, live.size, vaddr, size)) {

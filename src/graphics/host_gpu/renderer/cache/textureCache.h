@@ -56,8 +56,11 @@ public:
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
 	void                        UpdateImage(ImageId id);
+	// buffer_sync: the caller copies the image into the buffer at its own range (texel reads),
+	// where GPU-dirty bytes it supersedes do not block it (SafeToSyncIntoBuffer).
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
-	                                               bool ensure_valid = true);
+	                                               bool ensure_valid = true,
+	                                               bool buffer_sync  = false);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
@@ -205,6 +208,10 @@ private:
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 	[[nodiscard]] bool               SafeToDownload(const Image& image);
+	// The image's native contents are newer than every GPU-dirty buffer byte in its range.
+	[[nodiscard]] bool SupersedesGpuDirtyBytes(const Image& image);
+	// SafeToDownload for a copy of the image into the buffer at its own range (texel reads).
+	[[nodiscard]] bool SafeToSyncIntoBuffer(const Image& image);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,

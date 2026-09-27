@@ -301,6 +301,8 @@ enum class FrameEvent : uint32_t {
 	// changed since the previous one (KYTY_TEXEL_SYNC_SKIP).
 	TexelImageSyncDownloads,
 	TexelImageSyncSkips,
+	// Texel-read syncs of an image over stale GPU-dirty buffer bytes (KYTY_IMAGE_SUPERSEDES_GPU_DIRTY).
+	TexelImageSyncOverGpuDirty,
 	// Resident mip levels (KYTY_TEXTURE_RESIDENT_MIPS): images created holding only the levels
 	// their views can sample and the levels left out, guest bytes their refreshes did not
 	// upload, residency extensions (a finer MIN_LOD, or any non-sampling use), extensions to
