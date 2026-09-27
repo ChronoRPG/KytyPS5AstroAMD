@@ -153,6 +153,10 @@ public:
 	// holds; otherwise it only writes vertex_info[0].
 	[[nodiscard]] static bool TessellationActive(const HW::UserConfig& user_config);
 
+	// KYTY_LOD_STATS_PLAIN_VARIANT: the prepared pixel program compiled without GET_LOD_STATS
+	// feedback (same bindings and pipeline layout), or an empty program when it has none.
+	[[nodiscard]] static ShaderProgram PlainPixelProgram(const StagePrep& prep);
+
 	GraphicsPrograms
 	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
 	                    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,

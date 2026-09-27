@@ -53,6 +53,11 @@ struct PreparedBindings {
 	// by workgroup ids. Unknown for draws and indirect dispatches.
 	std::array<uint32_t, 3>               dispatch_groups {};
 	bool                                  has_dispatch_groups = false;
+	// GET_LOD_STATS: some image of the stage has a mip-statistics counter (its per-draw field lacks
+	// the no-counter flag), set with the fields in RebindBuffers. mip_stats_canary: bind the
+	// verify canary instead of the counters (KYTY_LOD_STATS_PLAIN_VARIANT=verify, draw path).
+	bool                                  mip_stats_active = false;
+	bool                                  mip_stats_canary = false;
 };
 
 [[nodiscard]] vk::DescriptorType

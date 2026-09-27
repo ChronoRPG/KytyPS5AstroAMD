@@ -976,6 +976,11 @@ struct PipelineCache::Permutation {
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	ShaderRecompiler::IR::CompiledShaderInfo     program;
 	ShaderProgram                                handle;
+	// KYTY_LOD_STATS_PLAIN_VARIANT: the same pixel program without GET_LOD_STATS feedback, for
+	// draws in which no image has a mip-statistics counter (then the feedback code records nothing,
+	// but its atomics alone make the driver run the depth/stencil tests after a shader that can
+	// discard). Empty for programs without the instrumentation.
+	ShaderProgram                                plain;
 	// Position in the owning source's PermutationList, fixed when it is published.
 	uint32_t                                     index = 0;
 };
@@ -1398,10 +1403,31 @@ struct PipelineCache::ProgramCache {
 		}
 		const auto id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
 		GpuOpProfiler::RegisterShader(id, stage_name, options.shader_hash);
+		ShaderProgram plain {};
+		if (!result.spirv_plain.empty()) {
+			if (validator == nullptr) {
+				if (!ValidateShaderSpirv(options.dump_label, options.shader_hash,
+				                         result.spirv_plain)) {
+					DumpShaderSpirv(stage_name, options.shader_hash, result.spirv_plain);
+					EXIT("%s failed hash=0x%016" PRIx64 ": plain variant SPIR-V validation failed\n",
+					     options.dump_label, options.shader_hash);
+				}
+			}
+			const auto plain_module = CompileSPV(result.spirv_plain, device);
+			EXIT_IF(plain_module == nullptr);
+			if (validator != nullptr) {
+				validator->Submit(options.dump_label, stage_name, options.shader_hash,
+				                  std::move(result.spirv_plain));
+			}
+			const auto plain_id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
+			GpuOpProfiler::RegisterShader(plain_id, stage_name, options.shader_hash);
+			plain = {.id = plain_id, .module = plain_module};
+		}
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
 		    .handle         = {.id = id, .module = module},
+		    .plain          = plain,
 		};
 	}
 
@@ -1856,6 +1882,8 @@ struct PipelineCache::ProgramCache {
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.plain_mip_stats_variant =
+		    stage == ShaderType::Pixel && LodStatsCounter::PlainVariant() != LodStatsCounter::Plain::Off;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -1960,6 +1988,9 @@ struct PipelineCache::ProgramCache {
 			// Only possible when another cursor mapped to the same push-data start (both
 			// NoStart): keep permutations unique and drop this equal copy.
 			device.destroyShaderModule(compiled.handle.module, nullptr);
+			if (compiled.plain.module != nullptr) {
+				device.destroyShaderModule(compiled.plain.module, nullptr);
+			}
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ProgramCompileDuplicates);
 			FinishInFlight(record);
 			return publish_index(*source, *published);
@@ -2233,6 +2264,9 @@ struct PipelineCache::ProgramCache {
 			(void)key;
 			entry.permutations.ForEach([&](const Permutation& permutation) {
 				device.destroyShaderModule(permutation.handle.module, nullptr);
+				if (permutation.plain.module != nullptr) {
+					device.destroyShaderModule(permutation.plain.module, nullptr);
+				}
 			});
 		}
 	}
@@ -3182,6 +3216,10 @@ void PipelineCache::PipelineKeyHash::MixStaticParams(std::size_t& hash,
 	}
 	const auto* bytes = reinterpret_cast<const uint8_t*>(&params);
 	for (std::size_t i = 0; i < sizeof(params); ++i) Mix(hash, bytes[i]);
+}
+
+ShaderProgram PipelineCache::PlainPixelProgram(const StagePrep& prep) {
+	return prep.permutation != nullptr ? prep.permutation->plain : ShaderProgram {};
 }
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(

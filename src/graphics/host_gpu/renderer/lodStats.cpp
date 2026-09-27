@@ -59,6 +59,25 @@ bool LodStatsCounter::CountClamped() {
 	return clamped;
 }
 
+LodStatsCounter::Plain LodStatsCounter::PlainVariant() {
+	static const Plain mode = [] {
+		const auto* value = std::getenv("KYTY_LOD_STATS_PLAIN_VARIANT");
+		Plain result = Plain::On;
+		if (value != nullptr && value[0] != 0) {
+			result = std::strcmp(value, "0") == 0        ? Plain::Off
+			         : std::strcmp(value, "verify") == 0 ? Plain::Verify
+			                                             : Plain::On;
+		}
+		if (Enabled()) {
+			std::printf("GET_LOD_STATS plain variant: %s\n", result == Plain::Off  ? "off"
+			                                                  : result == Plain::On ? "on"
+			                                                                        : "verify");
+		}
+		return result;
+	}();
+	return mode;
+}
+
 LodStatsCounter::LodStatsCounter(RenderContext& context): m_context(context) {}
 
 LodStatsCounter::~LodStatsCounter() = default;
@@ -75,6 +94,36 @@ Buffer& LodStatsCounter::CounterBuffer() {
 		                                      MemoryUsage::DeviceLocal, 0, usage, CounterBytes);
 	}
 	return *m_counters;
+}
+
+Buffer& LodStatsCounter::CanaryBuffer() {
+	EXIT_IF(m_canary == nullptr);
+	return *m_canary;
+}
+
+void LodStatsCounter::CheckCanary(uint64_t slot_offset) {
+	m_canary_publish->Invalidate(slot_offset, CounterBytes);
+	const auto* words =
+	    reinterpret_cast<const uint32_t*>(m_canary_publish->Mapped().data() + slot_offset);
+	uint32_t changed = 0;
+	uint32_t first   = UINT32_MAX;
+	for (uint32_t counter = 0; counter < Entries; counter++) {
+		if (words[counter] != Unsampled || words[Entries + counter] != 0u) {
+			changed++;
+			first = std::min(first, counter);
+		}
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::LodStatsCanaryChecks);
+	if (changed != 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::LodStatsCanaryMismatches, changed);
+		const auto total = m_canary_mismatches.fetch_add(changed, std::memory_order_relaxed) + changed;
+		if (m_canary_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("GET_LOD_STATS plain-variant verify: %u counters recorded by draws classified "
+			            "as counter-free (first %u: finest=0x%08x count=%u), %llu so far\n",
+			            changed, first, words[first], words[Entries + first],
+			            static_cast<unsigned long long>(total));
+		}
+	}
 }
 
 void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t control) {
@@ -161,9 +210,23 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 		const vk::BufferCopy copy {0, slot_offset, CounterBytes};
 		native.copyBuffer(counters.Handle(), m_publish->Handle(), 1, &copy);
 	}
+	// KYTY_LOD_STATS_PLAIN_VARIANT=verify: everything that draws classified as counter-free
+	// recorded since the previous report went into the canary, which must still be in its reset
+	// state. Checked with the report's copy, then re-armed.
+	const bool verify       = PlainVariant() == Plain::Verify;
+	const bool check_canary = verify && m_canary_ready && publish;
+	if (check_canary) {
+		if (m_canary_publish == nullptr) {
+			m_canary_publish = std::make_unique<Buffer>(
+			    m_context.GetGraphics(), scheduler, MemoryUsage::Download, 0,
+			    vk::BufferUsageFlagBits::eTransferDst, PublishSlots * PublishSlotSize);
+		}
+		const vk::BufferCopy copy {0, slot_offset, CounterBytes};
+		native.copyBuffer(m_canary->Handle(), m_canary_publish->Handle(), 1, &copy);
+	}
 
 	const bool reset = !m_initialized || reset_requested;
-	if (reset && publish) {
+	if ((reset && publish) || check_canary) {
 		// The reset overwrites the counters the copy above reads (write-after-read hazard found
 		// by synchronization validation): the fills must not start before the copy has read.
 		vk::MemoryBarrier war {};
@@ -177,6 +240,20 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 		constexpr uint64_t MinBytes = uint64_t {Entries} * sizeof(uint32_t);
 		native.fillBuffer(counters.Handle(), 0, MinBytes, Unsampled);
 		native.fillBuffer(counters.Handle(), MinBytes, MinBytes, 0u);
+	}
+	if (verify && (!m_canary_ready || check_canary)) {
+		if (m_canary == nullptr) {
+			const auto usage = vk::BufferUsageFlagBits::eStorageBuffer |
+			                   vk::BufferUsageFlagBits::eTransferSrc |
+			                   vk::BufferUsageFlagBits::eTransferDst;
+			m_canary = std::make_unique<Buffer>(m_context.GetGraphics(), scheduler,
+			                                    MemoryUsage::DeviceLocal, 0, usage, CounterBytes);
+		}
+		constexpr uint64_t MinBytes = uint64_t {Entries} * sizeof(uint32_t);
+		native.fillBuffer(m_canary->Handle(), 0, MinBytes, Unsampled);
+		native.fillBuffer(m_canary->Handle(), MinBytes, MinBytes, 0u);
+		// Draws recorded after the barrier below may bind it.
+		m_canary_ready = true;
 	}
 	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
@@ -193,7 +270,10 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 	++m_issued;
 	const auto write_size = writes_report ? std::min<uint32_t>(size, ReportSize) : 0u;
 	scheduler.DeferOperation([this, slot_offset, destination, mode, writes_report, write_size,
-	                          record_time_report, control] {
+	                          record_time_report, control, check_canary] {
+		if (check_canary) {
+			CheckCanary(slot_offset);
+		}
 		m_publish->Invalidate(slot_offset, CounterBytes);
 		const auto* words = reinterpret_cast<const uint32_t*>(m_publish->Mapped().data() + slot_offset);
 		if (mode == Publish::Completion) {

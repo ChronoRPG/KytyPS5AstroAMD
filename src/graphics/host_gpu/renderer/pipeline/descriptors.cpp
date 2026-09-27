@@ -1213,9 +1213,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		return !(value != nullptr && value[0] == '0');
 	}();
 	const bool count_clamped = LodStatsCounter::CountClamped();
+	prepared.mip_stats_active = false;
+	prepared.mip_stats_canary = false;
 	for (uint32_t i = 0; i < layout.mip_stats_count; i++) {
-		prepared.shader_data[layout.MipStatsOffsetDword() + i] = LodStatsReport::ImageField(
-		    snapshot.images.at(i).dwords.data(), absolute_levels, count_clamped);
+		const auto field = LodStatsReport::ImageField(snapshot.images.at(i).dwords.data(),
+		                                              absolute_levels, count_clamped);
+		prepared.shader_data[layout.MipStatsOffsetDword() + i] = field;
+		prepared.mip_stats_active |= (field & LodStatsReport::NoCounterFlag) == 0u;
 	}
 	// Upload sites: stage type and table kind (the dedup checks the site's last entry first).
 	const auto site = static_cast<uint32_t>(program.stage) * 2u;
@@ -1516,7 +1520,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						break;
 					}
 					case BindingKind::MipStats: {
-						auto& counters = m_context.GetLodStats().CounterBuffer();
+						auto& lod_stats = m_context.GetLodStats();
+						auto& counters  = descriptors.mip_stats_canary ? lod_stats.CanaryBuffer()
+						                                               : lod_stats.CounterBuffer();
 						m_descriptor_buffers.emplace_back(counters.Handle(), 0, counters.Size());
 						break;
 					}

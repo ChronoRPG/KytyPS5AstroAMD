@@ -658,6 +658,13 @@ enum class FrameEvent : uint32_t {
 	// KYTY_DEPTH_LAYOUT_STABLE: draws whose unsampled depth target kept its current layout where
 	// the per-draw layout would have transitioned it (and ended the rendering instance).
 	DepthLayoutTransitionsAvoided,
+	// KYTY_LOD_STATS_PLAIN_VARIANT: draws of GET_LOD_STATS-instrumented pixel programs that used the
+	// plain (feedback-free) variant because no image had a counter, and those that needed the
+	// instrumented one; verify mode: canary checks at GET_LOD_STATS and counters found changed.
+	LodStatsPlainDraws,
+	LodStatsInstrumentedDraws,
+	LodStatsCanaryChecks,
+	LodStatsCanaryMismatches,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

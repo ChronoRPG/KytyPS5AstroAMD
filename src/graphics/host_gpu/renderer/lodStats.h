@@ -50,6 +50,23 @@ public:
 	[[nodiscard]] static bool CompletionWriteEnabled();
 	// KYTY_LOD_STATS_COUNT (read once): clamp (default) or samples.
 	[[nodiscard]] static bool CountClamped();
+	// KYTY_LOD_STATS_PLAIN_VARIANT (read once). An instrumented pixel shader records feedback only
+	// for images whose T# has a counter (the per-draw field, LodStatsReport::ImageField); a draw
+	// in which no image has one records nothing. Its storage-buffer atomics still make the driver
+	// run the depth/stencil tests after the shader whenever the shader can discard (no early
+	// rejection of occluded fragments), which a U49 Sky Garden replay measured at 0.8-1.4 ms per
+	// frame, all in the late-Z shaders.
+	//   1 (default) such draws use the same program compiled without the feedback (plain);
+	//   verify      they keep the instrumented program, bound to a canary counter buffer that
+	//               GET_LOD_STATS checks is still in its reset state (any change: a draw classified
+	//               as counter-free did record, LodStatsCanary* frame events and a log line);
+	//   0           every draw uses the instrumented program (U26..U49).
+	enum class Plain : uint8_t { Off, On, Verify };
+	[[nodiscard]] static Plain PlainVariant();
+	// Verify mode: the counter buffer bound to draws classified as counter-free. Valid only after
+	// the first report (CanaryReady()); before that such draws keep the real counters.
+	[[nodiscard]] bool    CanaryReady() const noexcept { return m_canary_ready; }
+	[[nodiscard]] Buffer& CanaryBuffer();
 	// The device-local counter buffer bound to instrumented shaders.
 	[[nodiscard]] Buffer& CounterBuffer();
 	// Records a report at the current command position. Must be outside rendering.
@@ -63,6 +80,13 @@ private:
 	std::unique_ptr<Buffer>                m_counters;
 	std::unique_ptr<Buffer>                m_publish;
 	std::array<uint64_t, PublishSlots>     m_slot_ticks {};
+	// KYTY_LOD_STATS_PLAIN_VARIANT=verify.
+	void                                   CheckCanary(uint64_t slot_offset);
+	std::unique_ptr<Buffer>                m_canary;
+	std::unique_ptr<Buffer>                m_canary_publish;
+	bool                                   m_canary_ready = false;
+	std::atomic<uint64_t>                  m_canary_mismatches {0};
+	std::atomic<uint32_t>                  m_canary_logged {0};
 	uint64_t                               m_issued      = 0;
 	bool                                   m_initialized = false;
 	// Publish::Rewrite / Publish::Record: the newest report packed from completed GPU counters,

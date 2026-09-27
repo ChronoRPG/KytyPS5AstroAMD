@@ -1347,6 +1347,8 @@ struct CompiledShader {
   ShaderRecompiler::IR::Program program;
   ShaderRecompiler::IR::ResourceSnapshot resources;
   std::vector<u32> packed_user_data;
+  // CompileOptions::plain_mip_stats_variant (KYTY_LOD_STATS_PLAIN_VARIANT).
+  std::vector<u32> spirv_plain;
 };
 
 std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
@@ -1768,7 +1770,7 @@ std::string StorageUint2DImageBindingName(bool atomic) {
   return "image_" + std::to_string(static_cast<uint32_t>(*binding));
 }
 
-CompiledShader CompileFragmentCase(const GraphicsCase &test) {
+CompiledShader CompileFragmentCase(const GraphicsCase &test, bool plain_variant = false) {
   const auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   ShaderPixelInputInfo pixel_info{};
@@ -1798,6 +1800,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
+  options.plain_mip_stats_variant = plain_variant;
 
   auto translated =
       ShaderRecompiler::TranslateProgram(test.fragment_code, options);
@@ -1826,8 +1829,11 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
         resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
+  if (!result.spirv_plain.empty()) {
+    ValidateSpirv(test.name, result.spirv_plain);
+  }
   return {std::move(result.spirv), std::move(result.program),
-          std::move(resources), std::move(packed_user_data)};
+          std::move(resources), std::move(packed_user_data), std::move(result.spirv_plain)};
 }
 
 std::array<u32, 64> MakeSampledTextureData(Prospero::BufferFormat format) {
@@ -37380,6 +37386,7 @@ int main(int argc, char **argv) {
   // CPU only: compiles and validates the GET_LOD_STATS instrumentation.
   if (argc == 2 && std::strcmp(argv[1], "--lod-stats-codegen-only") == 0) {
     CodegenTests::CheckLodStatsGate();
+    CodegenTests::CheckLodStatsPlainVariant();
     return 0;
   }
   // Only the recompiler semantic cases (compute and graphics), without the host/runtime
