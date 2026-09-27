@@ -32392,6 +32392,49 @@ void CheckStorageTextureVolumeMipRegions() {
   std::printf("[host]    %-32s ok\n", "StorageTextureVolumeMipRegions");
 }
 
+// GpuTilerCpuParity compares the GPU tiler shaders with TileGetBlockOffset at every in-block
+// position, so both share any error in the per-family bit equations. Check the equations
+// themselves: one block's elements must map onto distinct, element-aligned offsets that fill
+// the block exactly, for every family and bytes-per-element the tiler admits.
+void CheckTileBlockBijection() {
+  constexpr const char *name = "TileBlockBijection";
+  uint32_t layouts = 0;
+  for (uint32_t family = 0;
+       family < static_cast<uint32_t>(TileBlockFamily::Count); ++family) {
+    for (uint32_t bpe = 1; bpe <= 16; bpe <<= 1u) {
+      TileBlockLayout block{};
+      if (!TileGetBlockLayout(static_cast<TileBlockFamily>(family), bpe,
+                              block)) {
+        continue;
+      }
+      std::vector<uint8_t> seen(block.block_size / bpe, 0);
+      for (uint32_t z = 0; z < block.block_depth; ++z) {
+        for (uint32_t y = 0; y < block.block_height; ++y) {
+          for (uint32_t x = 0; x < block.block_width; ++x) {
+            uint32_t offset = UINT32_MAX;
+            const bool valid = TileGetBlockOffset(block, x, y, z, offset) &&
+                               offset < block.block_size && offset % bpe == 0;
+            if (!valid || seen[offset / bpe] != 0) {
+              std::ostringstream out;
+              out << "family=" << family << " bpe=" << bpe << " element (" << x
+                  << "," << y << "," << z << ") -> 0x" << std::hex << offset
+                  << (valid ? " collides with another element"
+                            : " is outside the block or misaligned");
+              Fail(name, "in-block offset", out.str());
+            }
+            seen[offset / bpe] = 1;
+          }
+        }
+      }
+      ++layouts;
+    }
+  }
+  // Eight families admit 1..16 bytes per element; Depth64KB admits 1..8.
+  Require(name, "coverage", layouts == 8 * 5 + 4,
+          "a tile block family lost an admitted element size");
+  std::printf("[host]    %-32s ok (%u layouts)\n", name, layouts);
+}
+
 // TileManager::Detile does not clear its linear scratch (KYTY_TILER_CLEAR_SCRATCH), and
 // TileManager::TileImage never cleared the scratch it downloads the image into. Both rely on
 // one contract: the buffer<->image copies of a tiled transfer touch exactly the linear bytes
@@ -34917,7 +34960,14 @@ int main(int argc, char **argv) {
     vulkan.CheckStreamBufferRing();
     return 0;
   }
+  // Host-only tile layout checks; no Vulkan device.
+  if (argc == 2 && std::strcmp(argv[1], "--tile-layout-only") == 0) {
+    CheckTileBlockBijection();
+    CheckDetileCopyCoverage();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
+    CheckTileBlockBijection();
     CheckDetileCopyCoverage();
     VulkanHarness vulkan;
     vulkan.CheckGpuTilerCpuParity();
@@ -35291,6 +35341,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGraphicsPushConstantBank();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
+  CheckTileBlockBijection();
   CheckDetileCopyCoverage();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
