@@ -106,6 +106,7 @@ public:
 		m_cpu_dirty.Fill();
 		m_writable.Fill();
 		m_readable.Fill();
+		PublishCpuMirror();
 	}
 
 	KYTY_CLASS_NO_COPY(RegionManager);
@@ -117,6 +118,14 @@ public:
 	// starts at 1, so an existing region always contributes to a signature.
 	[[nodiscard]] uint64_t Serial() const noexcept {
 		return m_serial.load(std::memory_order_acquire);
+	}
+	// Dirtying serial (MemoryTracker::RangeDirtiedSignature): advanced, under `lock` and before the
+	// bits change, by every transition that can turn a page of this region CPU-dirty (write
+	// faults, including hot promotion and fault-ahead, and explicit CPU-dirty marks). Uploads and
+	// other clears never advance it, so a verify mode can tell a page dirtied after a moment from
+	// one that was already dirty then.
+	[[nodiscard]] uint64_t Dirtied() const noexcept {
+		return m_dirtied.load(std::memory_order_acquire);
 	}
 
 	template <DirtySource source>
@@ -145,6 +154,14 @@ public:
 		}
 		return true;
 	}
+	// IsModified<Cpu> without `lock`, on the lock-free mirror of the CPU-dirty bits, republished
+	// under `lock` after every change of those bits (PublishCpuMirror).
+	[[nodiscard]] bool IsCpuModifiedRelaxed(uint64_t offset, uint64_t size) const noexcept {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		return RegionBits::AnyInRange(start, end, [this](size_t word) {
+			return m_cpu_mirror[word].load(std::memory_order_relaxed);
+		});
+	}
 
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
@@ -167,11 +184,17 @@ public:
 			                RegionBits(m_readback_pending, start, end).Any())) {
 				Bump();
 			}
+			if (source == DirtySource::Cpu && enable && changes) {
+				BumpDirtied();
+			}
 		}
 		if constexpr (enable) {
 			bits.SetRange(start, end);
 		} else {
 			bits.UnsetRange(start, end);
+		}
+		if constexpr (source == DirtySource::Cpu) {
+			PublishCpuMirror();
 		}
 		if constexpr (source == DirtySource::Gpu) {
 			// Any GPU ownership transition supersedes an outstanding side readback: a newer
@@ -198,6 +221,7 @@ public:
 			}
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
+				PublishCpuMirror();
 				UpdateProtection<true, false>();
 			} else {
 				m_readback_pending.UnsetRange(start, end);
@@ -243,6 +267,7 @@ public:
 		FaultResult result;
 		// Dirty bits (and possibly the hot set) change below.
 		Bump();
+		BumpDirtied();
 		// Only pages this tracker protected fault through it; already CPU-dirty pages fault for
 		// another watcher (an image) and are not part of a fault/reprotect cycle.
 		const RegionBits already_dirty(m_cpu_dirty, start, end);
@@ -262,6 +287,8 @@ public:
 				on_ahead(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 			}
 		}
+		// Published before the pages become writable: a guest write can only land after it.
+		PublishCpuMirror();
 		UpdateProtection<false, false>();
 		if (policy.hot_frames == 0) {
 			return result;
@@ -330,6 +357,7 @@ public:
 		const RegionBits normal = RegionBits(m_cpu_dirty, start, end) & ~hot;
 		if (normal.Any()) {
 			m_cpu_dirty ^= normal;
+			PublishCpuMirror();
 			UpdateProtection<true, false>();
 		}
 		for (const auto [first, last]: normal) {
@@ -372,6 +400,7 @@ public:
 		m_hot ^= hot;
 		hot_count.fetch_sub(settled, std::memory_order_relaxed);
 		m_cpu_dirty ^= hot;
+		PublishCpuMirror();
 		UpdateProtection<true, false>();
 		for (const auto [first, last]: hot) {
 			for (auto page = first; page < last; page++) {
@@ -456,11 +485,20 @@ public:
 private:
 	// Callers hold `lock`: the serial advances before the bits it describes change.
 	void Bump() noexcept { m_serial.fetch_add(1, std::memory_order_release); }
+	// Callers hold `lock`, before pages become CPU-dirty (Dirtied).
+	void BumpDirtied() noexcept { m_dirtied.fetch_add(1, std::memory_order_release); }
 
 	// Callers hold `lock`, after changing m_gpu_dirty (IsGpuModifiedRelaxed).
 	void PublishGpuMirror() noexcept {
 		for (size_t word = 0; word < RegionBits::Words; word++) {
 			m_gpu_mirror[word].store(m_gpu_dirty.Word(word), std::memory_order_relaxed);
+		}
+	}
+	// Callers hold `lock` (or construct), after changing m_cpu_dirty and before any page this
+	// makes CPU-dirty becomes writable (IsCpuModifiedRelaxed).
+	void PublishCpuMirror() noexcept {
+		for (size_t word = 0; word < RegionBits::Words; word++) {
+			m_cpu_mirror[word].store(m_cpu_dirty.Word(word), std::memory_order_relaxed);
 		}
 	}
 
@@ -522,8 +560,10 @@ private:
 	RegionBits                    m_hot;
 	std::unique_ptr<FaultHistory> m_history;
 	std::atomic<uint64_t>         m_serial {1};
-	// Lock-free copy of m_gpu_dirty (PublishGpuMirror), on its own cache lines.
+	std::atomic<uint64_t>         m_dirtied {1};
+	// Lock-free copies of m_gpu_dirty and m_cpu_dirty (Publish*Mirror), on their own cache lines.
 	alignas(64) std::array<std::atomic<uint64_t>, RegionBits::Words> m_gpu_mirror {};
+	alignas(64) std::array<std::atomic<uint64_t>, RegionBits::Words> m_cpu_mirror {};
 };
 
 } // namespace Libs::Graphics

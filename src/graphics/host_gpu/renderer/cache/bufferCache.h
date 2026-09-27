@@ -225,6 +225,10 @@ private:
 	// KYTY_BDA_HOT_SYNC_VERIFY: the full scan after a hot pass that relied on these epochs.
 	void VerifyBdaHotPass(const RangeSet& mapped_ranges, uint64_t fault_epoch,
 	                      uint64_t structure_epoch);
+	// The BDA synchronization pass itself (SynchronizeBdaBuffers decides whether it runs).
+	void SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges);
+	// KYTY_BDA_SYNC_EPOCH_VERIFY: the full scan a skipped pass replaced.
+	void VerifyBdaEpochSkip(const RangeSet& mapped_ranges);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer,
 	                                     BdaSyncStats* stats = nullptr,
@@ -244,6 +248,12 @@ private:
 	// equally miss. Direct-mapped, GPU thread only.
 	// KYTY_BUFFER_RANGE_MEMO_VERIFY=1|exit re-evaluates every hit the normal way (uploading whatever
 	// it finds) and counts disagreements (BufferRangeMemoVerifyMismatches; exit stops on the first).
+	// The hit acted at its lock-free signature read, the re-evaluation happens later under the
+	// region locks: a guest write fault in between (the re-evaluation often waits for the region
+	// lock that very fault holds) dirties a page the hit legitimately did not see. Such a
+	// difference counts as a race (BufferRangeMemoVerifyRaces), told apart by the range's
+	// dirtying serials (MemoryTracker::RangeDirtiedSignature) read before the lookup; only a
+	// difference no dirtying after that moment explains is a mismatch.
 	enum class RangeFact : uint8_t { Clean, Stream };
 	struct RangeMemo {
 		uint64_t  vaddr     = 0;
@@ -262,6 +272,85 @@ private:
 	// ring to the copy engine (UploadDma) and returns the source the graphics copies then read
 	// (the DMA ring, with the copies' source offsets rebased); otherwise `source` unchanged.
 	[[nodiscard]] vk::Buffer StageUploadDma(vk::Buffer source, std::span<vk::BufferCopy> copies);
+	// A verify-mode difference that only pages turned CPU-dirty since the lookup can cause: a race
+	// when the range's dirtying serials moved since `dirtied_before` (0: unknown, a race), a
+	// mismatch otherwise.
+	void ClassifyRangeMemoDifference(const char* what, uint64_t vaddr, uint64_t size,
+	                                 uint64_t dirtied_before);
+	// Tests only: runs right after a range-memo hit in verify mode, before its re-evaluation, so a
+	// test can land a transition exactly in that window.
+	using RangeMemoVerifyHook = void (*)(void* context, uint64_t vaddr, uint64_t size);
+	static inline RangeMemoVerifyHook s_range_memo_verify_hook    = nullptr;
+	static inline void*               s_range_memo_verify_context = nullptr;
+	static void RunRangeMemoVerifyHook(uint64_t vaddr, uint64_t size) {
+		if (s_range_memo_verify_hook != nullptr) {
+			s_range_memo_verify_hook(s_range_memo_verify_context, vaddr, size);
+		}
+	}
+	// KYTY_TRACKER_RELAXED_QUERIES (GPU thread): the range's dirty snapshot from the tracker's
+	// lock-free mirrors (false: not available, use the locked queries); and whether a read-only
+	// synchronization of the range would collect nothing (no CPU-dirty page).
+	[[nodiscard]] bool RelaxedDirtySnapshot(uint64_t vaddr, uint64_t size,
+	                                        MemoryTracker::DirtyState& state);
+	[[nodiscard]] bool RelaxedNothingToUpload(uint64_t vaddr, uint64_t size);
+	bool VerifyRelaxedSnapshot(uint64_t vaddr, uint64_t size,
+	                           const MemoryTracker::DirtyState& relaxed,
+	                           const MemoryTracker::DirtyState& locked, uint64_t signature);
+	// KYTY_BINDING_EPOCH_MEMO (default on; =0 off; off with KYTY_SYNC_EPOCH=0). The result of a read
+	// binding (ObtainBuffer: not written, not a texel read; GPU thread) of [vaddr, vaddr + size) is
+	// reused by later read bindings of exactly that range while
+	//  - the sync epoch is the one it was obtained in (syncEpoch.h): a guest CPU write since then
+	//    races the draws, which may read the bytes from before it or after it;
+	//  - the range's MemoryTracker::RangeSignature is unchanged: no tracker transition in the
+	//    range's regions (uploads, GPU-dirty marks, readbacks, hot-page changes, write faults), so
+	//    every tracker bit the binding's decision and synchronization read is the same;
+	//  - a cache-buffer result: the buffer structure is unchanged (m_bda_structure_epoch moves on
+	//    every Register/Unregister), so the range is in the same buffer at the same offset. It is
+	//    recorded with the signature taken after its synchronization, and for a small read only
+	//    when the tracker bits then do not make the next one a stream copy. Pages that
+	//    synchronization would upload now are hot pages written since, or pages a guest write
+	//    fault dirtied before the signature was taken: guest writes racing the draws;
+	//  - a stream copy: the signature is the one taken before the decision and after the copy, and
+	//    the stream buffer's tick is the one it was copied in (the ring never overwrites an
+	//    allocation during its tick). Bytes written since race the draws.
+	// A hit returns the same buffer and offset (touching a cache buffer's LRU entry): no dirty
+	// query, page-table lookup, synchronization or stream copy. Every ordered change within an
+	// epoch is a GPU-thread tracker transition or buffer registration; the emulator's own writes
+	// of guest bytes (labels, WRITE_DATA, DMA, LOD and occlusion results) happen in fence packets,
+	// which start a new epoch first, or complete asynchronously like GPU writes.
+	// KYTY_BINDING_EPOCH_MEMO_VERIFY=1|exit: every hit also runs the normal path and returns its
+	// result. A different decision (a stream copy against a cache buffer) or a different buffer or
+	// offset while no tracker transition raced the check is a mismatch (exit stops on the first);
+	// a stream copy whose bytes changed, or a cache-buffer range with CPU-dirty pages the normal
+	// path uploads, counts as a race (BindingEpochMemoVerifyRaces).
+	enum class BindingMemoKind : uint8_t { Empty, Stream, Cached };
+	struct BindingMemo {
+		uint64_t        vaddr     = 0;
+		uint64_t        size      = 0;
+		uint64_t        epoch     = 0;
+		uint64_t        signature = 0;
+		uint64_t        guard     = 0; // stream: tick; cached: buffer structure epoch
+		uint64_t        offset    = 0;
+		BufferId        id;
+		BindingMemoKind kind = BindingMemoKind::Empty;
+	};
+	static constexpr size_t BindingMemoSlots = 2048;
+	[[nodiscard]] BindingMemo& BindingMemoSlot(uint64_t vaddr, uint64_t size) noexcept {
+		const auto hash = (vaddr >> 4u) * 0x9e3779b97f4a7c15ull ^ size * 0xc2b2ae3d27d4eb4full;
+		return m_binding_memo[static_cast<size_t>(hash >> 53u) & (BindingMemoSlots - 1)];
+	}
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainReadBinding(uint64_t vaddr, uint64_t size,
+	                                                             BufferId id);
+	// The binding without the memo; *obtained receives the cache buffer's id (unchanged for a
+	// stream copy).
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferNow(uint64_t vaddr, uint64_t size,
+	                                                           bool is_written, bool is_texel_buffer,
+	                                                           BufferId id, BufferId* obtained);
+	void RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, uint64_t before,
+	                   const std::pair<Buffer*, uint64_t>& result, BufferId id);
+	[[nodiscard]] std::pair<Buffer*, uint64_t> VerifyBindingHit(const BindingMemo& memo,
+	                                                            std::pair<Buffer*, uint64_t> hit,
+	                                                            BufferId id);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size, size_t guest_copies = SIZE_MAX,
 	                                      const uint8_t* host_data = nullptr,
@@ -393,12 +482,36 @@ private:
 	std::unique_ptr<RangeMemo[]>                      m_range_memo;
 	// Always counted (GPU thread; the BufferRangeMemo* frame events need a connected profiler).
 	struct RangeMemoTotals {
-		uint64_t clean_hits  = 0;
-		uint64_t stream_hits = 0;
-		uint64_t records     = 0;
-		uint64_t settles     = 0;
+		uint64_t clean_hits        = 0;
+		uint64_t stream_hits       = 0;
+		uint64_t records           = 0;
+		uint64_t settles           = 0;
+		uint64_t verify_checks     = 0;
+		uint64_t verify_mismatches = 0;
+		uint64_t verify_races      = 0;
 	};
 	RangeMemoTotals                                   m_range_memo_totals;
+	int                                               m_range_memo_verify = 0; // RangeMemoVerifyMode
+	// KYTY_TRACKER_RELAXED_QUERIES outcomes, always counted (tests read them).
+	struct RelaxedTotals {
+		uint64_t queries    = 0; // lock-free dirty snapshots taken
+		uint64_t sync_skips = 0; // read synchronizations found empty without a lock
+		uint64_t mismatches = 0; // verify mode
+	};
+	RelaxedTotals                                     m_relaxed_totals;
+	bool                                              m_relaxed_queries = false;
+	// KYTY_BINDING_EPOCH_MEMO (nullptr when disabled; GPU thread) and its outcomes (tests read them).
+	std::unique_ptr<BindingMemo[]>                    m_binding_memo;
+	int                                               m_binding_memo_verify = 0;
+	struct BindingMemoTotals {
+		uint64_t stream_hits       = 0;
+		uint64_t cached_hits       = 0;
+		uint64_t records           = 0;
+		uint64_t verify_checks     = 0;
+		uint64_t verify_mismatches = 0;
+		uint64_t verify_races      = 0;
+	};
+	BindingMemoTotals                                 m_binding_memo_totals;
 	uint32_t                                          m_upload_batch_depth = 0;
 	uint32_t                                          m_hot_sweep_frame  = 0;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};
@@ -409,6 +522,20 @@ private:
 	// thread). Valid while the epochs of that pass hold: a page can only become hot through a
 	// write fault, which changes the fault epoch, and buffers only change with the structure one.
 	std::vector<BdaHotRange>                          m_bda_hot_ranges;
+	// KYTY_BDA_SYNC_EPOCH (SynchronizeBdaBuffers): the sync, BDA structure and fault epochs taken
+	// before the last completed pass (GPU thread; 0: none yet), and the outcomes (tests read them).
+	bool     m_bda_epoch_skip        = false;
+	int      m_bda_epoch_verify      = 0;
+	uint64_t m_bda_synced_epoch      = 0;
+	uint64_t m_bda_synced_structure  = 0;
+	uint64_t m_bda_synced_fault      = 0;
+	struct BdaEpochTotals {
+		uint64_t passes                = 0;
+		uint64_t skips                 = 0;
+		uint64_t verify_checks         = 0;
+		uint64_t verify_mismatch_pages = 0;
+	};
+	BdaEpochTotals m_bda_epoch_totals;
 	StreamBuffer                                      m_staging_buffer;
 	// After the staging ring: destroyed first, waiting for its copies that read the ring.
 	std::unique_ptr<UploadDma>                        m_upload_dma;

@@ -457,6 +457,22 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.DrawPrepLogUnknown.Cumulative",
     "FrameEvent.DrawPrepLogOverflows.Cumulative",
     "FrameEvent.DrawPrepLogValueRescues.Cumulative",
+    "FrameEvent.BufferRangeMemoVerifyRaces.Cumulative",
+    "FrameEvent.TrackerRelaxedQueries.Cumulative",
+    "FrameEvent.TrackerRelaxedSyncSkips.Cumulative",
+    "FrameEvent.TrackerRelaxedVerifyChecks.Cumulative",
+    "FrameEvent.TrackerRelaxedVerifyMismatches.Cumulative",
+    "FrameEvent.TrackerRelaxedVerifyRaces.Cumulative",
+    "FrameEvent.SyncEpochAdvances.Cumulative",
+    "FrameEvent.BdaSyncEpochSkips.Cumulative",
+    "FrameEvent.BdaSyncEpochVerifyChecks.Cumulative",
+    "FrameEvent.BdaSyncEpochVerifyMismatches.Cumulative",
+    "FrameEvent.BindingEpochMemoStreamHits.Cumulative",
+    "FrameEvent.BindingEpochMemoCachedHits.Cumulative",
+    "FrameEvent.BindingEpochMemoRecords.Cumulative",
+    "FrameEvent.BindingEpochMemoVerifyChecks.Cumulative",
+    "FrameEvent.BindingEpochMemoVerifyMismatches.Cumulative",
+    "FrameEvent.BindingEpochMemoVerifyRaces.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 

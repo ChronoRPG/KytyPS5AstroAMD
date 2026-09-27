@@ -829,6 +829,39 @@ void TestFenceKinds() {
 	      "dispatch, indirect-draw, context-control, marker and other fences");
 }
 
+// KYTY_SYNC_EPOCH: every fence advances the synchronization epoch except register loads from
+// memory; window-safe packets and direct draws never do.
+void TestSyncEpochPackets() {
+	using DrawPrep::AdvancesSyncEpoch;
+	namespace Pm4 = Libs::Graphics::Pm4;
+	const std::array<uint32_t, 4> no_body {};
+	const auto advances = [&](uint32_t len, uint32_t op, uint32_t r = 0) {
+		return AdvancesSyncEpoch(KYTY_PM4(len, op, r), no_body.data(), len);
+	};
+	for (const auto op: {Pm4::IT_WAIT_REG_MEM, Pm4::IT_WAIT_REG_MEM_64, Pm4::IT_ACQUIRE_MEM,
+	                     Pm4::IT_SURFACE_SYNC, Pm4::IT_WRITE_DATA, Pm4::IT_DMA_DATA,
+	                     Pm4::IT_COPY_DATA, Pm4::IT_EVENT_WRITE, Pm4::IT_EVENT_WRITE_EOP,
+	                     Pm4::IT_EVENT_WRITE_EOS, Pm4::IT_RELEASE_MEM, Pm4::IT_DUMP_CONST_RAM,
+	                     Pm4::IT_DISPATCH_DIRECT, Pm4::IT_DRAW_INDEX_INDIRECT,
+	                     Pm4::IT_GET_LOD_STATS, Pm4::IT_REWIND}) {
+		Check(advances(5, op), "a synchronization or memory-writing packet advances the epoch");
+	}
+	for (const auto r: {Pm4::R_RELEASE_MEM, Pm4::R_ACQUIRE_MEM, Pm4::R_WRITE_DATA,
+	                    Pm4::R_WAIT_FLIP_DONE, Pm4::R_FLIP}) {
+		Check(advances(8, Pm4::IT_NOP, r), "a custom synchronization operation advances the epoch");
+	}
+	for (const auto op: {Pm4::IT_SET_SH_REG_INDIRECT, Pm4::IT_SET_CONTEXT_REG_INDIRECT,
+	                     Pm4::IT_SET_UCONFIG_REG_INDIRECT}) {
+		Check(!advances(5, op), "a register load from memory does not advance the epoch");
+	}
+	for (const auto op: {Pm4::IT_SET_SH_REG, Pm4::IT_SET_CONTEXT_REG, Pm4::IT_INDEX_BASE,
+	                     Pm4::IT_DRAW_INDEX_2, Pm4::IT_DRAW_INDEX_AUTO}) {
+		Check(!advances(5, op), "a register write or a direct draw does not advance the epoch");
+	}
+	Check(!advances(4, Pm4::IT_INDIRECT_BUFFER) && advances(14, Pm4::IT_INDIRECT_BUFFER),
+	      "an indirect call does not advance the epoch, a conditional branch on memory does");
+}
+
 void TestRegisterIndirectPairs() {
 	using DrawPrep::RegisterIndirectPairs;
 	using DrawPrep::RegisterIndirectRange;
@@ -879,6 +912,7 @@ int main() {
 	TestRecordScopeNests();
 	TestPacketClassification();
 	TestFenceKinds();
+	TestSyncEpochPackets();
 	TestRegisterIndirectPairs();
 	TestWindowSingleThread();
 	TestWindowConcurrent(4, 8, 200000);  // tiny window: constant wrap-around and races

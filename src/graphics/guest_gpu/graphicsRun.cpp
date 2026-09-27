@@ -13,10 +13,12 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
+#include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
@@ -253,6 +255,9 @@ void GuestGpu::ProcessCommands() {
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
 		command();
+		// Service commands (mapping changes, readbacks, deferred label writes) change guest
+		// memory outside the command stream (syncEpoch.h).
+		SyncEpoch::Advance();
 	}
 }
 
@@ -1105,6 +1110,7 @@ void GuestGpu::ThreadRun(void* data) {
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
 			command();
+			SyncEpoch::Advance();
 			spin_deadline = 0;
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
@@ -1173,6 +1179,8 @@ void GuestGpu::ThreadRun(void* data) {
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto& cp = GetProcessor(submission.queue_id);
+	// A new submission, or a slice after other queues ran (syncEpoch.h).
+	SyncEpoch::Advance();
 
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();
@@ -1422,6 +1430,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		// KYTY_SYNC_EPOCH (syncEpoch.h): every fence but a register load from memory is a point
+		// where guest CPU writes must become visible to the GPU work that follows it.
+		if (SyncEpoch::Enabled() &&
+		    DrawPrep::AdvancesSyncEpoch(packet_header & ~1u, packet + 1, remaining_dw)) {
+			SyncEpoch::Advance();
+		}
 		if (DrawPrep::PacketHookActive()) [[unlikely]] {
 			// Window fences commit every pending draw before their handler runs.
 			if (auto* engine = DrawPrepEngine(); engine != nullptr) {

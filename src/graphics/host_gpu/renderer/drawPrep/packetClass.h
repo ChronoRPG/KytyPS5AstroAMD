@@ -165,6 +165,15 @@ struct RegisterIndirectRange {
 	return FenceKind::Other;
 }
 
+// KYTY_SYNC_EPOCH (syncEpoch.h): whether guest CPU writes must be visible to the GPU work after
+// this packet, so the synchronization epoch advances before it. Every fence does, except a
+// register load from memory (SET_*_REG_INDIRECT), which only reads guest memory.
+[[nodiscard]] inline bool AdvancesSyncEpoch(uint32_t header, const uint32_t* body,
+                                            uint32_t remaining_dw) {
+	return ClassifyPacket(header, body, remaining_dw) == PacketClass::Fence &&
+	       ClassifyFence(header) != FenceKind::RegIndirect;
+}
+
 } // namespace Libs::Graphics::DrawPrep
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_PACKETCLASS_H_

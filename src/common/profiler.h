@@ -746,6 +746,31 @@ enum class FrameEvent : uint32_t {
 	DrawPrepLogUnknown,
 	DrawPrepLogOverflows,
 	DrawPrepLogValueRescues,
+	// KYTY_BUFFER_RANGE_MEMO_VERIFY: differences explained by a page turned CPU-dirty after the
+	// memo hit (a guest write fault racing the re-evaluation), not counted as mismatches.
+	BufferRangeMemoVerifyRaces,
+	// KYTY_TRACKER_RELAXED_QUERIES: small-read decisions and read synchronizations skipped from
+	// the lock-free dirty mirrors; KYTY_TRACKER_RELAXED_VERIFY checks (Races: another thread's
+	// transition separated the two answers).
+	TrackerRelaxedQueries,
+	TrackerRelaxedSyncSkips,
+	TrackerRelaxedVerifyChecks,
+	TrackerRelaxedVerifyMismatches,
+	TrackerRelaxedVerifyRaces,
+	// KYTY_SYNC_EPOCH: epoch advances; KYTY_BDA_SYNC_EPOCH: BDA passes skipped within an epoch and
+	// their verify mode (Mismatches: pages a skip missed that no guest write explains).
+	SyncEpochAdvances,
+	BdaSyncEpochSkips,
+	BdaSyncEpochVerifyChecks,
+	BdaSyncEpochVerifyMismatches,
+	// KYTY_BINDING_EPOCH_MEMO: read bindings reused within a sync epoch (a stream copy or a cache
+	// buffer), results recorded, and the verify mode's checks, mismatches and races.
+	BindingEpochMemoStreamHits,
+	BindingEpochMemoCachedHits,
+	BindingEpochMemoRecords,
+	BindingEpochMemoVerifyChecks,
+	BindingEpochMemoVerifyMismatches,
+	BindingEpochMemoVerifyRaces,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
