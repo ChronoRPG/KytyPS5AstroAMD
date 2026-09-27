@@ -532,6 +532,14 @@ add_executable(ampr_counter_bank_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(ampr_counter_bank_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+# Pure helpers of the texture/descriptor binding path; no Vulkan device is created.
+add_executable(binding_path_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BindingPathTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.cpp"
+)
+target_link_libraries(binding_path_tests common fmt::fmt xxhash Vulkan::Headers)
+target_include_directories(binding_path_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -584,6 +592,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME image_cache_gc_policy COMMAND $<TARGET_FILE:image_cache_gc_policy_tests>)
 	add_test(NAME ampr_counter_bank COMMAND $<TARGET_FILE:ampr_counter_bank_tests>)
+	add_test(NAME binding_path COMMAND $<TARGET_FILE:binding_path_tests>)
 	add_test(NAME image_exact_lookup
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-exact-lookup-only)
 	add_test(NAME image_pressure_retirement
@@ -657,6 +666,7 @@ if(BUILD_TESTING)
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
+		binding_path_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests

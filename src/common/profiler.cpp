@@ -205,6 +205,22 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.TextureViewMemoMisses.Cumulative",
     "FrameEvent.TextureBindingDescCopiesAvoided.Cumulative",
     "FrameEvent.TextureCacheStructureChanges.Cumulative",
+    "FrameEvent.PipelineLayoutsCreated.Cumulative",
+    "FrameEvent.PipelineLayoutsShared.Cumulative",
+    "FrameEvent.PushConstantUpdates.Cumulative",
+    "FrameEvent.PushConstantUpdatesAvoided.Cumulative",
+    "FrameEvent.DescriptorPushes.Cumulative",
+    "FrameEvent.DescriptorPushMissLayout.Cumulative",
+    "FrameEvent.DescriptorPushMissShape.Cumulative",
+    "FrameEvent.DescriptorPushMissImage.Cumulative",
+    "FrameEvent.DescriptorPushMissSampler.Cumulative",
+    "FrameEvent.DescriptorPushMissBuffer.Cumulative",
+    "FrameEvent.DescriptorPushMissUpload.Cumulative",
+    "FrameEvent.DescriptorPushMissOther.Cumulative",
+    "FrameEvent.DescriptorSetsWritten.Cumulative",
+    "FrameEvent.DescriptorSetsReused.Cumulative",
+    "FrameEvent.DescriptorSetBindsAvoided.Cumulative",
+    "FrameEvent.ShaderUploadLastHits.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
