@@ -384,7 +384,7 @@ struct Files {
 };
 Files g_files;
 
-constexpr uint64_t       kCpRowLimit = 4'000'000;
+constexpr uint64_t       kCpRowLimit = 60'000'000; // ~6 GB at most; rows are flushed to disk
 std::mutex               g_cp_mutex;
 std::vector<std::string> g_pending_cp_rows;
 uint64_t                 g_cp_rows_total = 0;
