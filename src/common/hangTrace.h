@@ -161,8 +161,9 @@ void RecordOcclusion(const OcclusionEvent& event);
 //   Completion rows (pending_copies = UINT64_MAX): has_latest = 1 when the guest slot was written,
 //   sampled_counters = counters with a finest mip, total_samples = summed counts (bits 0..23).
 //   drawn_counters / counted_counters (completion rows): counters with a finest mip ("Drawn" in
-//   the guest's debug view) and counters with a non-zero count ("MipClamp", which the streamer
-//   requires before it promotes a texture to full resolution).
+//   the guest's debug view) and counters with a non-zero count ("MipClamp": with
+//   KYTY_LOD_STATS_COUNT=clamp, textures sampled finer than their T# MIN_LOD, which the streamer
+//   promotes to full resolution).
 enum class LodReportKind : uint8_t { Record, Completion };
 struct LodReportEvent {
 	uint64_t      destination      = 0;

@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/lodStats.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1203,21 +1204,18 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               buffer_offset, written));
 		pack_memory_offset(i, buffer_offset);
 	}
-	// GET_LOD_STATS counter per image, 16 bits: MipStatsCntId (T# dword 6 bits 0..7) in bits 0..7,
-	// BASE_LEVEL (dword 3 bits 12..15) in bits 8..11 so the shader reports absolute mip levels,
-	// and bit 15 set when MipStatsCntEn (dword 5 bit 25) is clear.
+	// GET_LOD_STATS field per image, 32 bits (LodStatsReport::ImageField): MipStatsCntId, the
+	// BASE_LEVEL added to recorded levels, a no-counter flag and the LOD threshold below which a
+	// sample is counted (the T# MIN_LOD with KYTY_LOD_STATS_COUNT=clamp, every sample otherwise).
 	// KYTY_MIP_STATS_BASE_LEVEL=0 reports levels relative to BASE_LEVEL (the U27 behaviour).
-	static const uint32_t base_level_mask = [] {
+	static const bool absolute_levels = [] {
 		const char* value = std::getenv("KYTY_MIP_STATS_BASE_LEVEL");
-		return value != nullptr && value[0] == '0' ? 0u : 0xfu;
+		return !(value != nullptr && value[0] == '0');
 	}();
+	const bool count_clamped = LodStatsCounter::CountClamped();
 	for (uint32_t i = 0; i < layout.mip_stats_count; i++) {
-		const auto& words = snapshot.images.at(i).dwords;
-		const uint32_t id =
-		    ((words[5] >> 25u) & 1u) != 0u
-		        ? (words[6] & 0xffu) | (((words[3] >> 12u) & base_level_mask) << 8u)
-		        : 0x8000u;
-		prepared.shader_data[layout.MipStatsOffsetDword() + i / 2u] |= id << ((i & 1u) * 16u);
+		prepared.shader_data[layout.MipStatsOffsetDword() + i] = LodStatsReport::ImageField(
+		    snapshot.images.at(i).dwords.data(), absolute_levels, count_clamped);
 	}
 	// Upload sites: stage type and table kind (the dedup checks the site's last entry first).
 	const auto site = static_cast<uint32_t>(program.stage) * 2u;

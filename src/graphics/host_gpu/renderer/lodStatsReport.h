@@ -1,16 +1,16 @@
 #ifndef KYTY_RENDERER_LODSTATSREPORT_H_
 #define KYTY_RENDERER_LODSTATSREPORT_H_
 
-// GET_LOD_STATS report layout, free of Vulkan so it can be tested on the CPU. Used by
-// LodStatsCounter (lodStats.h).
+// GET_LOD_STATS report layout and the per-image counting field, free of Vulkan so they can be
+// tested on the CPU. Used by LodStatsCounter (lodStats.h) and the per-draw descriptor data.
 //
 // Report, as Astro Bot's streamer reads it (parser eboot+0x479d40, lookup eboot+0x7022e40,
 // per-texture update eboot+0x7021120, debug view eboot+0x7020180):
 //   64-byte header; dword 0 non-zero marks the report complete.
 //   256 64-bit entries, one per mip-statistics counter:
-//     bits 0..23   the counter's count. The guest's debug view labels this field "MipClamp"; its
-//                  streamer promotes a texture to full resolution only while the field is
-//                  non-zero, and refuses to evict it while it is non-zero.
+//     bits 0..23   samples whose LOD the T# MIN_LOD clamp raised. The guest's debug view labels
+//                  this field "MipClamp". Its streamer promotes a texture to full resolution only
+//                  while the field is non-zero, and refuses to evict it while it is non-zero.
 //     bits 24..31  the counter id (the debug view draws the texture in that column).
 //     bits 56..59  finest mip level sampled; 0xF when nothing was sampled ("Drawn" = not 0xF).
 
@@ -52,6 +52,56 @@ enum class Publish : uint8_t {
 		return Publish::Record;
 	}
 	return Publish::Completion;
+}
+
+// KYTY_LOD_STATS_COUNT: "clamp" (default) counts samples below the T# MIN_LOD, "samples" counts
+// every sample (U25..U47).
+[[nodiscard]] inline bool ParseCountClamped(const char* value) {
+	return value == nullptr || std::strcmp(value, "samples") != 0;
+}
+
+// The 32-bit per-image field of an instrumented shader's data, from the image's T# dwords:
+//   bits 0..7   MipStatsCntId (dword 6 bits 0..7)
+//   bits 8..11  BASE_LEVEL (dword 3 bits 12..15) when absolute_levels: recorded levels are
+//               absolute (KYTY_MIP_STATS_BASE_LEVEL=0 keeps them relative, the U27 behaviour)
+//   bit 15      set when MipStatsCntEn (dword 5 bit 25) is clear
+//   bits 16..27 U4.8 LOD threshold in the recorded level space: a sample finer than it counts.
+//               count_clamped: MIN_LOD (dword 1 bits 8..19); otherwise 0xfff, beyond the finest
+//               level the shader records (14), so every sample counts.
+[[nodiscard]] inline uint32_t ImageField(const uint32_t* tsharp, bool absolute_levels,
+                                         bool count_clamped) {
+	if (((tsharp[5] >> 25u) & 1u) == 0u) {
+		return 0x8000u;
+	}
+	const uint32_t id         = tsharp[6] & 0xffu;
+	const uint32_t base_level = (tsharp[3] >> 12u) & 0xfu;
+	uint32_t       threshold  = 0xfffu;
+	if (count_clamped) {
+		// MIN_LOD and BASE_LEVEL are absolute levels.
+		const uint32_t min_lod = (tsharp[1] >> 8u) & 0xfffu;
+		threshold = absolute_levels ? min_lod
+		                            : (min_lod > base_level * 256u ? min_lod - base_level * 256u
+		                                                           : 0u);
+	}
+	return id | ((absolute_levels ? base_level : 0u) << 8u) | (threshold << 16u);
+}
+
+// CPU model of one sample recorded by the instrumented shader (EmitMipStatsSample and
+// EmitGatedMipStatsRecord): `lod` is the unclamped LOD relative to the view's base level.
+// `words` is the counter buffer (Entries finest-level words, then Entries counts).
+inline void RecordSample(uint32_t* words, uint32_t field, float lod) {
+	if ((field & 0x8000u) != 0u) {
+		return;
+	}
+	const uint32_t counter   = field & 0xffu;
+	const float    absolute  = lod + static_cast<float>((field >> 8u) & 0xfu);
+	const float    clamped   = std::clamp(absolute, 0.0f, 14.0f);
+	const auto     level     = static_cast<uint32_t>(clamped); // floor: clamped is not negative
+	const float    threshold = static_cast<float>((field >> 16u) & 0xfffu) / 256.0f;
+	words[counter]           = std::min(words[counter], level);
+	if (clamped < threshold) {
+		words[Entries + counter]++;
+	}
 }
 
 // One report entry from a counter's finest-level and count words.

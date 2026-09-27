@@ -19,7 +19,7 @@ class RenderContext;
 // Instrumented pixel shaders record, per T# mip-statistics counter (MipStatsCntId), the finest
 // mip level sampled and a count in a device-local buffer. A GET_LOD_STATS packet copies the
 // counters into a private host-visible slot in command order and resets them; the report layout
-// is in lodStatsReport.h.
+// and the counting rule are in lodStatsReport.h.
 //
 // Astro Bot keeps 16 buckets of 256 counters, each with a ring of 16 reports, and reports one
 // bucket per frame: DMA_DATA clears the slot header, GET_LOD_STATS writes the report,
@@ -48,6 +48,8 @@ public:
 	// True unless KYTY_LOD_REPORT_PUBLISH=record (or the U33 switch
 	// KYTY_LOD_REPORT_COMPLETION_WRITE=0): a completed copy writes the guest slot.
 	[[nodiscard]] static bool CompletionWriteEnabled();
+	// KYTY_LOD_STATS_COUNT (read once): clamp (default) or samples.
+	[[nodiscard]] static bool CountClamped();
 	// The device-local counter buffer bound to instrumented shaders.
 	[[nodiscard]] Buffer& CounterBuffer();
 	// Records a report at the current command position. Must be outside rendering.

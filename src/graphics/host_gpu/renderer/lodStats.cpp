@@ -50,6 +50,15 @@ bool LodStatsCounter::CompletionWriteEnabled() {
 	return PublishMode() != Publish::Record;
 }
 
+bool LodStatsCounter::CountClamped() {
+	static const bool clamped = [] {
+		const bool result = LodStatsReport::ParseCountClamped(std::getenv("KYTY_LOD_STATS_COUNT"));
+		std::printf("GET_LOD_STATS count: %s\n", result ? "clamp" : "samples");
+		return result;
+	}();
+	return clamped;
+}
+
 LodStatsCounter::LodStatsCounter(RenderContext& context): m_context(context) {}
 
 LodStatsCounter::~LodStatsCounter() = default;
