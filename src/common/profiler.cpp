@@ -354,6 +354,22 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.TilerImageVerifyChecks.Cumulative",
     "FrameEvent.TilerImageVerifyMismatches.Cumulative",
     "FrameEvent.DepthFeedbackBarriersAvoided.Cumulative",
+    "FrameEvent.BarrierRequestsGuest.Cumulative",
+    "FrameEvent.BarrierRequestsShaderAccess.Cumulative",
+    "FrameEvent.BarrierRequestsShaderWrite.Cumulative",
+    "FrameEvent.BarrierRequestsShaderWriteHazard.Cumulative",
+    "FrameEvent.BarrierRequestsIndirectArgs.Cumulative",
+    "FrameEvent.BarrierRequestsGds.Cumulative",
+    "FrameEvent.BarrierRequestsImage.Cumulative",
+    "FrameEvent.BarrierRequestsUpload.Cumulative",
+    "FrameEvent.ImageBarrierSameImageFlushes.Cumulative",
+    "FrameEvent.ImageBarrierSameImageRenderEnds.Cumulative",
+    "FrameEvent.SampledColorAttachmentBindings.Cumulative",
+    "FrameEvent.SampledDepthAttachmentBindings.Cumulative",
+    "FrameEvent.DepthFeedbackKeepMissWrite.Cumulative",
+    "FrameEvent.DepthFeedbackKeepMissInstance.Cumulative",
+    "FrameEvent.DepthFeedbackKeepMissSerial.Cumulative",
+    "FrameEvent.DepthFeedbackKeepMissState.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 

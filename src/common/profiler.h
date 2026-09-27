@@ -558,6 +558,32 @@ enum class FrameEvent : uint32_t {
 	// KYTY_DEPTH_FEEDBACK_KEEP: attachment <-> attachment+shader-read barriers of a sampled,
 	// unwritten depth attachment left out inside one rendering instance.
 	DepthFeedbackBarriersAvoided,
+	// Why rendering instances end and barriers appear between draws (aggregate mode):
+	// - barrier requests queued in the batcher, by origin (BarrierOrigin order, render.h);
+	// - a second barrier of an image already pending, which records the pending batch first
+	//   (ImageBarrierSameImageFlushes), and those of them that ended an active instance;
+	// - draw bindings sampling an image that is also a color or depth attachment of the draw
+	//   (a feedback read: its access toggles with the attachment's between such draws);
+	// - sampled depth attachments that did not take KYTY_DEPTH_FEEDBACK_KEEP: the draw writes the
+	//   attachment, no read-only proof for the active instance (first draw of an instance, or an
+	//   earlier draw of it wrote), the contents changed since the proof, or the tracked
+	//   layout/access/range differ.
+	BarrierRequestsGuest,
+	BarrierRequestsShaderAccess,
+	BarrierRequestsShaderWrite,
+	BarrierRequestsShaderWriteHazard,
+	BarrierRequestsIndirectArgs,
+	BarrierRequestsGds,
+	BarrierRequestsImage,
+	BarrierRequestsUpload,
+	ImageBarrierSameImageFlushes,
+	ImageBarrierSameImageRenderEnds,
+	SampledColorAttachmentBindings,
+	SampledDepthAttachmentBindings,
+	DepthFeedbackKeepMissWrite,
+	DepthFeedbackKeepMissInstance,
+	DepthFeedbackKeepMissSerial,
+	DepthFeedbackKeepMissState,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

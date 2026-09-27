@@ -805,11 +805,22 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		                   view.level_count == image.info.resources.levels &&
 		                   view.layer_count == image.info.resources.layers;
 		const auto& tracked = image.backing.state;
-		if (DepthFeedbackKeepEnabled() && !draw_writes && whole &&
-		    image.backing.subresource_states.empty() && image.feedback_instance != 0 &&
-		    image.feedback_instance == buffer.ActiveRenderingSerial() &&
-		    image.feedback_serial == image.ContentSerial() && tracked.layout == layout &&
-		    (tracked.access_mask == access || tracked.access_mask == sampled)) {
+		const bool  proof_instance = image.feedback_instance != 0 &&
+		                            image.feedback_instance == buffer.ActiveRenderingSerial();
+		const bool  proof_serial   = image.feedback_serial == image.ContentSerial();
+		const bool  state_matches  = whole && image.backing.subresource_states.empty() &&
+		                            tracked.layout == layout &&
+		                            (tracked.access_mask == access || tracked.access_mask == sampled);
+		if (DepthFeedbackKeepEnabled() && sampled_aspects &&
+		    (draw_writes || !proof_instance || !proof_serial || !state_matches)) {
+			// Aggregate profile: why a sampled depth attachment keeps its per-draw toggles.
+			Profiler::CountFrameEvent(draw_writes      ? Profiler::FrameEvent::DepthFeedbackKeepMissWrite
+			                          : !proof_instance ? Profiler::FrameEvent::DepthFeedbackKeepMissInstance
+			                          : !proof_serial   ? Profiler::FrameEvent::DepthFeedbackKeepMissSerial
+			                                            : Profiler::FrameEvent::DepthFeedbackKeepMissState);
+		}
+		if (DepthFeedbackKeepEnabled() && !draw_writes && proof_instance && proof_serial &&
+		    state_matches) {
 			// Without the keep: a barrier back to the attachment scope when the previous draw
 			// sampled, and one to the sampled scope when this draw samples.
 			const uint64_t avoided = (tracked.access_mask == sampled ? 1u : 0u) +

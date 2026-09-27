@@ -155,6 +155,17 @@ constexpr uint32_t OriginBit(BarrierOrigin origin) {
 	return 1u << static_cast<uint32_t>(origin);
 }
 
+// Aggregate profile: one queued barrier request of `origin` (FrameEvent.BarrierRequests*).
+void CountOriginRequest(BarrierOrigin origin) {
+	static_assert(static_cast<uint32_t>(Profiler::FrameEvent::BarrierRequestsUpload) -
+	                      static_cast<uint32_t>(Profiler::FrameEvent::BarrierRequestsGuest) + 1 ==
+	                  static_cast<uint32_t>(BarrierOrigin::Count),
+	              "one BarrierRequests counter per BarrierOrigin, in order");
+	Profiler::CountFrameEvent(static_cast<Profiler::FrameEvent>(
+	    static_cast<uint32_t>(Profiler::FrameEvent::BarrierRequestsGuest) +
+	    static_cast<uint32_t>(origin)));
+}
+
 } // namespace
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
@@ -238,6 +249,7 @@ void CommandBuffer::RequestMemoryBarrier(vk::PipelineStageFlags2 src_stages,
 		m_pending.has_memory = true;
 	}
 	m_pending.origins |= OriginBit(origin);
+	CountOriginRequest(origin);
 }
 
 void CommandBuffer::RequestBufferBarrier(const vk::BufferMemoryBarrier2& barrier,
@@ -257,6 +269,7 @@ void CommandBuffer::RequestBufferBarrier(const vk::BufferMemoryBarrier2& barrier
 	}
 	m_pending.buffers.push_back(barrier);
 	m_pending.origins |= OriginBit(origin);
+	CountOriginRequest(origin);
 }
 
 bool CommandBuffer::BatchImageBarriers(std::span<const vk::ImageMemoryBarrier2> barriers,
@@ -276,10 +289,15 @@ bool CommandBuffer::BatchImageBarriers(std::span<const vk::ImageMemoryBarrier2> 
 		if (std::ranges::any_of(m_pending.images, [&barrier](const auto& pending) {
 			    return pending.image == barrier.image;
 		    })) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ImageBarrierSameImageFlushes);
+			if (m_rendering) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ImageBarrierSameImageRenderEnds);
+			}
 			FlushBarriers();
 		}
 		m_pending.images.push_back(barrier);
 		m_pending.origins |= OriginBit(BarrierOrigin::Image);
+		CountOriginRequest(BarrierOrigin::Image);
 	}
 	if (!deferrable) {
 		FlushBarriers();
@@ -323,6 +341,7 @@ void CommandBuffer::RequestUploadCopy(vk::Buffer source, vk::Buffer destination,
 	m_pending.upload_regions.insert(m_pending.upload_regions.end(), regions.begin(),
 	                                regions.end());
 	m_pending.origins |= OriginBit(BarrierOrigin::Upload);
+	CountOriginRequest(BarrierOrigin::Upload);
 }
 
 void CommandBuffer::RecordPendingUploads() const {
