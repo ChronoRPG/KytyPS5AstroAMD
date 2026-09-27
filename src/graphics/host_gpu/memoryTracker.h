@@ -61,6 +61,27 @@ public:
 	[[nodiscard]] uint64_t FaultMutationEpoch() const noexcept {
 		return m_cpu_mutation_epoch.load(std::memory_order_acquire);
 	}
+	// The sum of the mutation serials (RegionManager::Serial) of the regions [vaddr, vaddr + size)
+	// spans, or 0 when one of them does not exist yet (or the range is invalid). Serials only grow,
+	// so while this sum is unchanged no CPU-dirty, GPU-dirty, hot or readback-pending bit of any
+	// page of the range changed. Lock-free: a transition takes the region lock and advances the
+	// serial before it changes a bit, so a signature read now describes the bits as they are now
+	// (a transition still waiting for the lock has not happened yet). Any thread.
+	[[nodiscard]] uint64_t RangeSignature(uint64_t vaddr, uint64_t size) const noexcept {
+		if (size == 0 || vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
+			return 0;
+		}
+		uint64_t   signature = 0;
+		const auto last      = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+		for (auto index = vaddr / TRACKER_REGION_SIZE; index <= last; index++) {
+			const auto* manager = m_regions[index].load(std::memory_order_acquire);
+			if (manager == nullptr) {
+				return 0;
+			}
+			signature += manager->Serial();
+		}
+		return signature;
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {

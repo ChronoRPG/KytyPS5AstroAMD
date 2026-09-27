@@ -193,6 +193,16 @@ struct BufferCacheTestAccess {
                                uint64_t size) {
     cache.m_gpu_modified_ranges.Subtract(address, size);
   }
+
+  // KYTY_BUFFER_RANGE_MEMO / KYTY_HOT_PAGE_CHECK_LIMIT.
+  static bool RangeMemoEnabled(const BufferCache &cache) {
+    return cache.m_range_memo != nullptr;
+  }
+  static uint32_t HotCheckLimit(const BufferCache &cache) { return cache.m_hot_check_limit; }
+  static BufferCache::RangeMemoTotals RangeMemoTotals(const BufferCache &cache) {
+    return cache.m_range_memo_totals;
+  }
+  static MemoryTracker &Tracker(BufferCache &cache) { return cache.m_memory_tracker; }
 };
 
 // Sets (or with nullptr removes) an environment switch read when a cache is constructed.
@@ -5135,6 +5145,200 @@ public:
             "eager-disabled direct-memory allocation release failed");
     SetEnvironment("KYTY_READBACK_EAGER", nullptr);
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // KYTY_BUFFER_RANGE_MEMO: read bindings of a range whose tracker bits did not change skip the
+  // tracker work (a clean range's synchronization, a small range's stream decision) and still
+  // bind what the full path binds; every CPU write fault makes them look again.
+  // KYTY_HOT_PAGE_CHECK_LIMIT: a hot page that many uploads in a row found unchanged returns to
+  // fault tracking, clean; a write while it is hot, and after it settled, still reaches the GPU.
+  // Both adapt to their switches being off (then only the contents are checked).
+  void CheckBufferRangeMemo() {
+    constexpr const char *name = "BufferRangeMemo";
+    constexpr uintptr_t base = 0x0000000206400000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t large_offset = 0x10000;
+    constexpr uint64_t large_size = 0x8000; // above CACHING_PAGESIZE: never a stream copy
+    constexpr uint64_t small_offset = 0x40000;
+    constexpr uint64_t small_size = 0x100;
+    constexpr uint64_t hot_offset = large_offset + 0x2000;
+    static_assert(large_size > BufferCache::CACHING_PAGESIZE &&
+                  small_size <= BufferCache::CACHING_PAGESIZE);
+
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "range-memo direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "range-memo fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    for (uint64_t index = 0; index < allocation_size; index++) {
+      memory[index] = static_cast<uint8_t>((index * 13 + index / 4096) & 0xffu);
+    }
+
+    {
+      auto &cache = context.GetBufferCache();
+      auto &tracker = BufferCacheTestAccess::Tracker(cache);
+      context.MapMemory(base, allocation_size);
+      const bool memo_on = BufferCacheTestAccess::RangeMemoEnabled(cache);
+      const auto limit = BufferCacheTestAccess::HotCheckLimit(cache);
+      const auto totals = [&] { return BufferCacheTestAccess::RangeMemoTotals(cache); };
+      const auto read_native = [&](const Libs::Graphics::Buffer &buffer, uint64_t offset,
+                                   uint64_t bytes) {
+        auto readback = CreateHostBuffer(name, bytes, vk::BufferUsageFlagBits::eTransferDst, {0});
+        const vk::BufferCopy copy{offset, 0, bytes};
+        scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                                     vk::PipelineStageFlagBits::eHost, {}, 0,
+                                                     nullptr, 1, &barrier, 0, nullptr);
+        scheduler.Finish();
+        auto words = ReadBuffer(name, readback, static_cast<uint32_t>(bytes / 4));
+        DestroyBuffer(&readback);
+        return words;
+      };
+      // The native bytes of [base + offset, + bytes) as a read binding of the large range sees
+      // them, compared with guest memory.
+      const auto large_matches = [&](const char *stage) {
+        const auto [buffer, offset] =
+            cache.ObtainBuffer(base + large_offset, large_size, false, false);
+        const auto words = read_native(*buffer, offset, large_size);
+        Require(name, stage,
+                std::memcmp(words.data(), memory + large_offset, large_size) == 0,
+                "the bound range lost a CPU write or kept stale bytes");
+        return std::pair{buffer, offset};
+      };
+      const auto cpu_write = [&](uint64_t offset, uint32_t value) {
+        // As the guest does: the write faults on the protected page, then lands.
+        Require(name, "write fault",
+                context.HandleFault(PageFaultAccess::Write, base + offset),
+                "a CPU write to a tracked page did not fault through the tracker");
+        std::memcpy(memory + offset, &value, sizeof(value));
+      };
+
+      // A clean range: the first synchronization uploads, the second finds nothing and records
+      // it, the third skips it.
+      const auto first = large_matches("initial upload");
+      const auto records0 = totals().records;
+      const auto [second_buffer, second_offset] =
+          cache.ObtainBuffer(base + large_offset, large_size, false, false);
+      const auto hits0 = totals().clean_hits;
+      const auto [third_buffer, third_offset] =
+          cache.ObtainBuffer(base + large_offset, large_size, false, false);
+      Require(name, "clean range reuse",
+              second_buffer == first.first && second_offset == first.second &&
+                  third_buffer == first.first && third_offset == first.second &&
+                  (!memo_on || (totals().records == records0 + 1 &&
+                                totals().clean_hits == hits0 + 1)),
+              "a clean range was not recorded once and then skipped, or bound elsewhere");
+
+      // A CPU write moves the signature: uploaded, then clean again.
+      cpu_write(large_offset + 0x100, 0x5a5aa5a5u);
+      const auto hits1 = totals().clean_hits;
+      (void)large_matches("write after a skipped synchronization");
+      Require(name, "write invalidates the fact", totals().clean_hits == hits1,
+              "a synchronization after a CPU write was skipped");
+      (void)cache.ObtainBuffer(base + large_offset, large_size, false, false);
+      (void)cache.ObtainBuffer(base + large_offset, large_size, false, false);
+      Require(name, "clean again", !memo_on || totals().clean_hits == hits1 + 1,
+              "the range was not skipped again once clean");
+
+      // A small CPU-dirty range is a stream copy every time; the decision is reused, the bytes
+      // are not.
+      auto &stream = cache.GetUtilityBuffer(Libs::Graphics::MemoryUsage::Stream);
+      const auto stream_read = [&](const char *stage) {
+        const auto [buffer, offset] =
+            cache.ObtainBuffer(base + small_offset, small_size, false, false);
+        Require(name, stage,
+                buffer == &stream &&
+                    std::memcmp(stream.Mapped().data() + offset, memory + small_offset,
+                                small_size) == 0,
+                "a small CPU-dirty read did not copy the current bytes");
+      };
+      const auto stream_hits0 = totals().stream_hits;
+      stream_read("first stream copy");
+      memory[small_offset + 7] ^= 0xffu; // CPU-dirty, hence writable: no fault
+      stream_read("stream copy after a write");
+      Require(name, "stream decision reuse",
+              !memo_on || totals().stream_hits == stream_hits0 + 1,
+              "a small CPU-dirty read did not reuse its stream decision");
+
+      // A hot page: a write fault in three consecutive frames promotes it (the third upload is
+      // its first hot one, which creates its shadow).
+      for (uint32_t frame = 0; frame < 3; frame++) {
+        cpu_write(hot_offset, 0x1000u + frame);
+        (void)large_matches("hot promotion frame");
+        cache.AdvanceFrame();
+      }
+      Require(name, "hot promotion",
+              tracker.HotPageCount() == 1 && tracker.IsRegionHot(base + hot_offset, 4096),
+              "three faulting frames did not promote the page");
+      if (limit != 0) {
+        const auto settles0 = totals().settles;
+        const auto unchanged_uploads = [&](uint32_t count) {
+          for (uint32_t check = 0; check < count; check++) {
+            (void)cache.ObtainBuffer(base + large_offset, large_size, false, false);
+          }
+        };
+        // limit - 1 unchanged uploads keep it hot; a write while hot (no fault) is uploaded
+        // and restarts the count.
+        unchanged_uploads(limit - 1);
+        Require(name, "hot below the limit",
+                tracker.HotPageCount() == 1 && totals().settles == settles0,
+                "a hot page settled before its unchanged-upload limit");
+        std::memcpy(memory + hot_offset, "HOT!", 4);
+        (void)large_matches("write to a hot page");
+        unchanged_uploads(limit - 1);
+        Require(name, "hot count restarts",
+                tracker.HotPageCount() == 1 && totals().settles == settles0,
+                "a change did not restart the unchanged-upload count");
+        unchanged_uploads(1);
+        Require(name, "hot page settles",
+                tracker.HotPageCount() == 0 && totals().settles == settles0 + 1 &&
+                    !tracker.IsRegionCpuModified(base + hot_offset, 4096),
+                "an unchanged hot page did not return to clean tracking at the limit");
+        // Settled pages are write-protected again: the next write faults and is uploaded.
+        cpu_write(hot_offset, 0x3000u);
+        (void)large_matches("write after settling");
+      }
+      scheduler.Finish();
+      context.UnmapMemory(base, allocation_size);
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "range-memo direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "range-memo direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok (memo %s, hot check limit %u)\n", name,
+                BufferCacheTestAccess::RangeMemoEnabled(context.GetBufferCache()) ? "on" : "off",
+                BufferCacheTestAccess::HotCheckLimit(context.GetBufferCache()));
   }
 
   void CheckComputeMetaClearClassification() {
@@ -37096,6 +37300,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-range-memo-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBufferRangeMemo();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--draw-prep-code-cert-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDrawPrepCertifiedShaderHash();
@@ -37311,6 +37520,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRasterization(false);
   vulkan.CheckRasterization(false, true);
   vulkan.CheckBufferCacheDirtyGarbageCollection();
+  vulkan.CheckBufferRangeMemo();
   vulkan.CheckEagerReadback();
 #endif
   vulkan.CheckUnifiedImageViewCache();

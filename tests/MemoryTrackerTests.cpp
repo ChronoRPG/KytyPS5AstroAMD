@@ -1124,6 +1124,147 @@ void TestHotPageSettle() {
   Release(memory);
 }
 
+// MemoryTracker::RangeSignature (BufferCache::RangeMemo, KYTY_BUFFER_RANGE_MEMO): it must move on
+// every change of a dirty, hot or readback-pending bit of the range, and stay put for queries and
+// for transitions that change nothing (a clean range synchronized again, a hot page kept hot).
+void TestRangeSignature() {
+  MemoryTracker::FaultPolicy policy;
+  policy.hot_frames = 1;
+  policy.hot_max = 8;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto signature = [&] { return tracker.RangeSignature(address, page_size * 4); };
+
+  Check(signature() == 0 && tracker.RangeSignature(address, 0) == 0 &&
+            tracker.RangeSignature(TRACKER_ADDRESS_SIZE - 1, 2) == 0,
+        "a range without a region (or an invalid range) has a signature");
+  Check(tracker.IsRegionCpuModified(address, page_size), "new region was not CPU-dirty");
+  const auto created = signature();
+  Check(created != 0, "an existing region has no signature");
+
+  // Queries change nothing; uploads change the bits once.
+  (void)tracker.IsRegionGpuModified(address, page_size * 4);
+  Check(signature() == created, "a query moved the signature");
+  UploadAll(tracker, address, page_size * 4);
+  const auto uploaded = signature();
+  Check(uploaded > created, "an upload that cleared pages kept the signature");
+  UploadAll(tracker, address, page_size * 4);
+  const auto [normal, hot] = UploadHotAware(tracker, address, page_size * 4);
+  Check(normal == 0 && hot == 0 && signature() == uploaded,
+        "synchronizing a clean range again moved the signature");
+
+  // A write fault dirties a page.
+  WriteFault(tracker, address + page_size);
+  const auto faulted = signature();
+  Check(faulted > uploaded, "a write fault kept the signature");
+  // Marking a dirty page dirty again changes nothing; the upload does.
+  tracker.MarkRegionAsCpuModified(address + page_size, 8);
+  Check(signature() == faulted, "a no-op CPU-dirty mark moved the signature");
+  UploadAll(tracker, address, page_size * 4);
+  const auto clean_again = signature();
+  Check(clean_again > faulted, "clearing the fault's pages kept the signature");
+
+  // GPU ownership, readback marks and downloads.
+  tracker.ForEachUploadRange(
+      address + page_size * 3, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  const auto gpu_owned = signature();
+  Check(gpu_owned > clean_again, "a written upload kept the signature");
+  tracker.MarkRegionAsGpuModified(address + page_size * 3, page_size);
+  Check(signature() == gpu_owned, "a no-op GPU-dirty mark moved the signature");
+  tracker.MarkReadbackPending(address + page_size * 3, page_size);
+  const auto pending = signature();
+  Check(pending > gpu_owned, "a readback mark kept the signature");
+  const auto unmarked = tracker.UnmarkReadbackPending(address + page_size * 3, page_size);
+  const auto published = signature();
+  Check(unmarked.unmarked_pages == 1 && published > pending &&
+            !tracker.IsRegionGpuModified(address + page_size * 3, page_size),
+        "a completed readback kept the signature");
+  tracker.UnmarkRegionAsGpuModified(address + page_size * 3, page_size);
+  tracker.ForEachDownloadRange<true>(address, page_size * 4,
+                                     [](uint64_t, uint64_t) noexcept {});
+  Check(signature() == published, "no-op GPU transitions moved the signature");
+  tracker.MarkRegionAsGpuModified(address + page_size * 2, page_size);
+  const auto remarked = signature();
+  tracker.ForEachDownloadRange<false>(address, page_size * 4,
+                                      [](uint64_t, uint64_t) noexcept {});
+  Check(remarked > published && signature() == remarked,
+        "a GPU-dirty mark kept, or a non-clearing download moved, the signature");
+  tracker.ForEachDownloadRange<true>(address, page_size * 4,
+                                     [](uint64_t, uint64_t) noexcept {});
+  const auto downloaded = signature();
+  Check(downloaded > remarked, "a clearing download kept the signature");
+
+  // Hot pages: promotion moves it; hot-aware uploads and fault-free writes do not; settling,
+  // demotion and the idle sweep do.
+  UploadAll(tracker, address, page_size * 4);
+  tracker.AdvanceFrame();
+  WriteFault(tracker, address);
+  const auto promoted = signature();
+  Check(tracker.HotPageCount() == 1 && promoted > downloaded, "promotion kept the signature");
+  const auto [normal2, hot2] = UploadHotAware(tracker, address, page_size * 4);
+  memory[24] = 0x42;
+  const auto [normal3, hot3] = UploadHotAware(tracker, address, page_size * 4);
+  Check(normal2 == 0 && hot2 == 1 && normal3 == 0 && hot3 == 1 && signature() == promoted,
+        "keeping a hot page hot (or writing it) moved the signature");
+  Check(tracker.SettleHotPages(address, page_size).size() == 1 && signature() > promoted,
+        "settling a hot page kept the signature");
+  const auto settled = signature();
+  tracker.AdvanceFrame();
+  WriteFault(tracker, address);
+  tracker.DemoteHotPages(address, page_size * 4);
+  const auto demoted = signature();
+  Check(tracker.HotPageCount() == 0 && demoted > settled, "demotion kept the signature");
+  tracker.DemoteHotPages(address, page_size * 4);
+  Check(signature() == demoted, "demoting a range without hot pages moved the signature");
+  UploadAll(tracker, address, page_size * 4);
+  tracker.AdvanceFrame();
+  WriteFault(tracker, address);
+  UploadHotAware(tracker, address, page_size * 4);
+  const auto before_sweep = signature();
+  for (int frame = 0; frame < 5; frame++) {
+    tracker.AdvanceFrame();
+  }
+  tracker.SweepHotPages(3);
+  Check(tracker.HotPageCount() == 0 && signature() > before_sweep,
+        "the idle sweep kept the signature");
+
+  tracker.UntrackMemory(address, page_size * 4);
+  Release(memory);
+}
+
+// A signature over two regions moves when either region changes.
+void TestRangeSignatureAcrossRegions() {
+  constexpr uintptr_t base = 0x0000000204000000ull;
+  constexpr uint64_t region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = static_cast<uint8_t *>(
+      VirtualAlloc(reinterpret_cast<void *>(base), region_size * 2,
+                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
+  const auto boundary = base + region_size;
+  const auto span = [&] { return tracker.RangeSignature(boundary - page_size, page_size * 2); };
+  (void)tracker.IsRegionCpuModified(boundary - page_size, page_size);
+  Check(span() == 0, "a range with a missing region has a signature");
+  UploadAll(tracker, boundary - page_size, page_size * 2);
+  const auto both = span();
+  Check(both != 0, "a range over two existing regions has no signature");
+  const auto first_only = tracker.RangeSignature(boundary - page_size, page_size);
+  WriteFault(tracker, boundary + 8);
+  const auto second = span();
+  Check(second > both && tracker.RangeSignature(boundary - page_size, page_size) == first_only,
+        "a change in the second region kept the two-region signature or moved the first's");
+  WriteFault(tracker, boundary - page_size + 8);
+  Check(span() > second, "a change in the first region kept the signature");
+  tracker.UntrackMemory(base, region_size * 2);
+  Release(memory);
+}
+
 void TestCrossRegionUpload() {
   constexpr uintptr_t base = 0x0000000200010000ull;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
@@ -1805,6 +1946,8 @@ int main(int argc, char **argv) {
   TestForeignWatcherFaultsDoNotPromote();
   TestWrittenUploadCopiesOutsideLock();
   TestHotPageSettle();
+  TestRangeSignature();
+  TestRangeSignatureAcrossRegions();
   TestCoherenceLogTrackerTransitions();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX

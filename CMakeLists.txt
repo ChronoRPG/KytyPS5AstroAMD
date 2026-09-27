@@ -701,6 +701,17 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	add_test(NAME draw_prep_code_cert
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-code-cert-only)
+	# KYTY_BUFFER_RANGE_MEMO and KYTY_HOT_PAGE_CHECK_LIMIT: default, verify mode, both off.
+	add_test(NAME buffer_range_memo
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
+	add_test(NAME buffer_range_memo_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
+	set_tests_properties(buffer_range_memo_verify PROPERTIES
+		ENVIRONMENT "KYTY_BUFFER_RANGE_MEMO_VERIFY=exit")
+	add_test(NAME buffer_range_memo_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
+	set_tests_properties(buffer_range_memo_off PROPERTIES
+		ENVIRONMENT "KYTY_BUFFER_RANGE_MEMO=0;KYTY_HOT_PAGE_CHECK_LIMIT=0")
 	# Draw-prep end to end: serial vs command-processor draws, in each engine mode.
 	add_test(NAME draw_prep_engine
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)

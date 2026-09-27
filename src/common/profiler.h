@@ -655,6 +655,19 @@ enum class FrameEvent : uint32_t {
 	DrawIndirectFallbackQuadList,
 	DrawIndirectFallbackRestart,
 	DrawIndirectFallbackMesh,
+	// KYTY_BUFFER_RANGE_MEMO (bufferCache.h): read-only synchronizations skipped because the
+	// range's tracker bits did not change since one that found nothing to upload; small read
+	// bindings that reused their stream-copy decision; facts recorded; and the verify mode's
+	// checks and mismatches (a skipped synchronization that would have uploaded, or a changed
+	// decision).
+	BufferRangeMemoCleanHits,
+	BufferRangeMemoStreamHits,
+	BufferRangeMemoRecords,
+	BufferRangeMemoVerifyChecks,
+	BufferRangeMemoVerifyMismatches,
+	// KYTY_HOT_PAGE_CHECK_LIMIT: hot pages returned to normal tracking (settled clean) after that
+	// many consecutive uploads found them unchanged.
+	HotPageCheckSettles,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

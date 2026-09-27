@@ -111,6 +111,14 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+	// Mutation serial (MemoryTracker::RangeSignature). Every change of this region's CPU-dirty,
+	// GPU-dirty, hot or readback-pending bits advances it, under `lock` and before the bits change,
+	// so it never goes back and an unchanged value means the bits did not change in between. It
+	// starts at 1, so an existing region always contributes to a signature.
+	[[nodiscard]] uint64_t Serial() const noexcept {
+		return m_serial.load(std::memory_order_acquire);
+	}
+
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
@@ -132,6 +140,14 @@ public:
 			}
 		}
 		auto& bits = GetBits<source>();
+		{
+			const RegionBits current(bits, start, end);
+			const bool       changes = enable ? current.Count() != end - start : current.Any();
+			if (changes || (source == DirtySource::Gpu &&
+			                RegionBits(m_readback_pending, start, end).Any())) {
+				Bump();
+			}
+		}
 		if constexpr (enable) {
 			bits.SetRange(start, end);
 		} else {
@@ -155,6 +171,10 @@ public:
 		auto&      bits         = GetBits<source>();
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
+			if (mask.Any() ||
+			    (source == DirtySource::Gpu && RegionBits(m_readback_pending, start, end).Any())) {
+				Bump();
+			}
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
 				UpdateProtection<true, false>();
@@ -199,6 +219,8 @@ public:
 			EXIT("CPU dirty state conflicts with GPU dirty state\n");
 		}
 		FaultResult result;
+		// Dirty bits (and possibly the hot set) change below.
+		Bump();
 		// Only pages this tracker protected fault through it; already CPU-dirty pages fault for
 		// another watcher (an image) and are not part of a fault/reprotect cycle.
 		const RegionBits already_dirty(m_cpu_dirty, start, end);
@@ -263,6 +285,11 @@ public:
 		const auto [start, end] = GetPageRange(vaddr, size);
 		RegionBits hot(m_hot, start, end);
 		uint32_t   demoted = 0;
+		// Hot pages stay as they are (keep_hot) or return to normal tracking; CPU-dirty pages that
+		// are not hot are cleared. Recording which hot pages an upload visited changes no bits.
+		if ((hot.Any() && !keep_hot) || (RegionBits(m_cpu_dirty, start, end) & ~hot).Any()) {
+			Bump();
+		}
 		if (hot.Any()) {
 			if (keep_hot) {
 				for (const auto [first, last]: hot) {
@@ -299,6 +326,7 @@ public:
 		const RegionBits hot(m_hot, start, end);
 		const auto       demoted = static_cast<uint32_t>(hot.Count());
 		if (demoted != 0) {
+			Bump();
 			m_hot ^= hot;
 			hot_count.fetch_sub(demoted, std::memory_order_relaxed);
 		}
@@ -318,6 +346,7 @@ public:
 		if (settled == 0) {
 			return 0;
 		}
+		Bump();
 		m_hot ^= hot;
 		hot_count.fetch_sub(settled, std::memory_order_relaxed);
 		m_cpu_dirty ^= hot;
@@ -347,6 +376,7 @@ public:
 		}
 		const auto demoted = static_cast<uint32_t>(idle.Count());
 		if (demoted != 0) {
+			Bump();
 			m_hot ^= idle;
 			hot_count.fetch_sub(demoted, std::memory_order_relaxed);
 		}
@@ -364,6 +394,9 @@ public:
 	void MarkReadbackPending(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		const RegionBits dirty(m_gpu_dirty, start, end);
+		if (dirty.Any()) {
+			Bump();
+		}
 		for (const auto [first, last]: dirty) {
 			m_readback_pending.SetRange(first, last);
 		}
@@ -374,6 +407,9 @@ public:
 		const auto [start, end] = GetPageRange(vaddr, size);
 		const RegionBits pending(m_readback_pending, start, end);
 		uint64_t         cleared = 0;
+		if (pending.Any()) {
+			Bump();
+		}
 		for (const auto [first, last]: pending) {
 			m_gpu_dirty.UnsetRange(first, last);
 			m_readback_pending.UnsetRange(first, last);
@@ -393,6 +429,9 @@ public:
 	TrackingSpinLock lock;
 
 private:
+	// Callers hold `lock`: the serial advances before the bits it describes change.
+	void Bump() noexcept { m_serial.fetch_add(1, std::memory_order_release); }
+
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
@@ -450,6 +489,7 @@ private:
 	// Hot pages: always a subset of m_cpu_dirty (never GPU-dirty).
 	RegionBits                    m_hot;
 	std::unique_ptr<FaultHistory> m_history;
+	std::atomic<uint64_t>         m_serial {1};
 };
 
 } // namespace Libs::Graphics

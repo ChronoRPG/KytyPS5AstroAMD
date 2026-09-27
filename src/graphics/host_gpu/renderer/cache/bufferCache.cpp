@@ -157,6 +157,28 @@ uint32_t HotPageQuietFrames() {
 	    std::clamp<uint64_t>(ParseEnvU64("KYTY_HOT_PAGE_QUIET_FRAMES", 8), 1, 1000));
 }
 
+// BufferCache::m_hot_check_limit (0 disables).
+uint32_t HotPageCheckLimit() {
+	return static_cast<uint32_t>(
+	    std::min<uint64_t>(ParseEnvU64("KYTY_HOT_PAGE_CHECK_LIMIT", 64), 1u << 20u));
+}
+
+// BufferCache::RangeMemo (bufferCache.h).
+bool RangeMemoEnabled() {
+	return ParseEnvU64("KYTY_BUFFER_RANGE_MEMO", 1) != 0;
+}
+
+int RangeMemoVerifyMode() {
+	static const int mode = [] {
+		const auto* value = std::getenv("KYTY_BUFFER_RANGE_MEMO_VERIFY");
+		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
+			return 0;
+		}
+		return std::strcmp(value, "exit") == 0 ? 2 : 1;
+	}();
+	return mode;
+}
+
 // Readback window of guest write faults on GPU-owned pages, in bytes: a power of two between
 // 4 KiB (only the faulting page) and 512 KiB (default, the read-drain window). Every page of the
 // window loses GPU ownership, so a smaller window downloads fewer bytes per fault but makes a
@@ -502,6 +524,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_bda_hot_sync(m_bda_incremental_sync && BdaHotSyncEnabled()),
       m_memory_tracker(page_manager, m_bda_incremental_sync, BufferFaultPolicy()),
       m_hot_quiet_frames(HotPageQuietFrames()),
+      m_hot_check_limit(HotPageCheckLimit()),
+      m_range_memo(RangeMemoEnabled() ? std::make_unique<RangeMemo[]>(RangeMemoSlots) : nullptr),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
@@ -644,7 +668,7 @@ void BufferCache::MaintainHotPages() {
 
 void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> hot_ranges,
                                   std::vector<vk::BufferCopy>& copies, uint64_t& total_size,
-                                  std::vector<uint64_t>& demote) {
+                                  std::vector<uint64_t>& demote, std::vector<uint64_t>& settle) {
 	uint64_t hot_bytes = 0;
 	for (const auto& range: hot_ranges) {
 		hot_bytes += range.size;
@@ -657,10 +681,18 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 	uint64_t   staged    = 0;
 	uint64_t   visited   = 0;
 	uint64_t   skipped   = 0;
+	uint64_t   settled   = 0;
 	for (const auto& range: hot_ranges) {
+		// The shadows of a run's pages, in address order: one lookup per run instead of one per
+		// page. `next` stays the first shadow above the current page (an emplace below inserts
+		// before it and keeps it valid).
+		auto next = m_hot_shadows.lower_bound(range.address);
 		for (auto page = range.address; page < range.End(); page += TRACKER_PAGE_SIZE) {
 			visited++;
-			auto       shadow    = m_hot_shadows.find(page);
+			auto shadow = m_hot_shadows.end();
+			if (next != m_hot_shadows.end() && next->first == page) {
+				shadow = next++;
+			}
 			const auto unchanged = [&](const void* contents) {
 				return shadow != m_hot_shadows.end() &&
 				       std::memcmp(shadow->second.data.get(), contents, TRACKER_PAGE_SIZE) == 0;
@@ -679,9 +711,16 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 			}
 			if (same) {
 				skipped++;
-				shadow->second.last_use = frame;
-				if (frame - shadow->second.last_change > m_hot_quiet_frames) {
+				auto& state    = shadow->second;
+				state.last_use = frame;
+				if (frame - state.last_change > m_hot_quiet_frames) {
 					demote.push_back(page);
+				} else if (m_hot_check_limit != 0 && ++state.unchanged_checks >= m_hot_check_limit) {
+					// Checked far more often than written: back to fault tracking, clean (the
+					// buffer holds exactly the shadow, which SettleHotPages compares again once the
+					// page is write-protected).
+					settle.push_back(page);
+					settled++;
 				}
 				continue;
 			}
@@ -696,8 +735,9 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 			}
 			if (shadow != m_hot_shadows.end()) {
 				std::memcpy(shadow->second.data.get(), snapshot, TRACKER_PAGE_SIZE);
-				shadow->second.last_change = frame;
-				shadow->second.last_use    = frame;
+				shadow->second.last_change      = frame;
+				shadow->second.last_use         = frame;
+				shadow->second.unchanged_checks = 0;
 			}
 			copies.emplace_back(total_size, buffer.Offset(page), TRACKER_PAGE_SIZE);
 			total_size += TRACKER_PAGE_SIZE;
@@ -706,6 +746,10 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 	}
 	MemoryStats::Count(MemoryStats::Counter::HotUploadPages, visited);
 	MemoryStats::Count(MemoryStats::Counter::HotUploadSkipped, skipped);
+	if (settled != 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::HotPageCheckSettles, settled);
+		m_range_memo_totals.settles += settled;
+	}
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -1539,6 +1583,26 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
                                     bool is_texel_buffer, BdaSyncStats* stats,
                                     const char* upload_reason) {
 	KYTY_GPU_OP_SITE("buffercache.upload");
+	// KYTY_BUFFER_RANGE_MEMO: a read-only synchronization of a range that is still Clean does
+	// nothing (bufferCache.h). Texel reads also download GPU-written images (not tracker state);
+	// the BDA hot-pass verification scans in full.
+	uint64_t memo_signature = 0;
+	bool     memo_verify    = false;
+	const bool memo_applies = !is_written && !is_texel_buffer && m_range_memo != nullptr &&
+	                          (stats == nullptr || stats->verify_fault_epoch == 0);
+	if (memo_applies) {
+		memo_signature = m_memory_tracker.RangeSignature(vaddr, size);
+		const auto& memo = RangeMemoSlot(vaddr, size);
+		if (memo_signature != 0 && memo.signature == memo_signature && memo.vaddr == vaddr &&
+		    memo.size == size && memo.fact == RangeFact::Clean) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::BufferRangeMemoCleanHits);
+			m_range_memo_totals.clean_hits++;
+			if (RangeMemoVerifyMode() == 0) {
+				return false;
+			}
+			memo_verify = true;
+		}
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -1558,6 +1622,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	// they differ from the shadow of the last copy this buffer received (CollectHotPages).
 	std::vector<GuestRange> hot_ranges;
 	std::vector<uint64_t>   demote_hot;
+	std::vector<uint64_t>   settle_hot;
 	size_t                guest_copies = 0;
 	uint64_t              host_base    = 0;
 	// Written uploads with KYTY_UPLOAD_COPY_OUTSIDE_LOCK: pages re-dirtied by a racing guest write
@@ -1593,7 +1658,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		guest_copies = copies.size();
 		host_base    = total_size;
 		if (!hot_ranges.empty()) {
-			CollectHotPages(buffer, hot_ranges, copies, total_size, demote_hot);
+			CollectHotPages(buffer, hot_ranges, copies, total_size, demote_hot, settle_hot);
 		}
 		if (reserved != nullptr && total_size <= reserved_size && guest_copies == copies.size()) {
 			for (auto& copy: copies) {
@@ -1632,9 +1697,26 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	} else {
 		m_memory_tracker.ForEachUploadRange(vaddr, size, is_written, collect, upload);
 	}
+	if (memo_applies) {
+		// Nothing collected: no page of the range was CPU-dirty (hot pages are CPU-dirty too).
+		const bool collected = !copies.empty() || !hot_ranges.empty();
+		if (memo_verify) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::BufferRangeMemoVerifyChecks);
+			if (collected) {
+				ReportRangeMemoMismatch("a skipped synchronization found pages to upload", vaddr,
+				                        size);
+			}
+		} else if (!collected && memo_signature != 0 &&
+		           m_memory_tracker.RangeSignature(vaddr, size) == memo_signature) {
+			RecordRangeFact(vaddr, size, memo_signature, RangeFact::Clean);
+		}
+	}
 	for (const auto page: demote_hot) {
 		m_memory_tracker.DemoteHotPages(page, TRACKER_PAGE_SIZE);
 		EraseHotShadows(page, TRACKER_PAGE_SIZE);
+	}
+	for (const auto page: settle_hot) {
+		SettleHotPages(page, TRACKER_PAGE_SIZE);
 	}
 	if (reserved != nullptr && source && !reserved_committed) {
 		// Source copying and GPU ownership publication stayed consistent (under the tracker locks,
@@ -1768,6 +1850,31 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return handle;
 }
 
+void BufferCache::RecordRangeFact(uint64_t vaddr, uint64_t size, uint64_t signature,
+                                  RangeFact fact) {
+	auto& memo     = RangeMemoSlot(vaddr, size);
+	memo.vaddr     = vaddr;
+	memo.size      = size;
+	memo.signature = signature;
+	memo.fact      = fact;
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BufferRangeMemoRecords);
+	m_range_memo_totals.records++;
+}
+
+void BufferCache::ReportRangeMemoMismatch(const char* what, uint64_t vaddr, uint64_t size) {
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BufferRangeMemoVerifyMismatches);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::fprintf(stderr,
+		             "BufferRangeMemoVerify: %s: addr=0x%016" PRIx64 " size=0x%" PRIx64 "\n", what,
+		             vaddr, size);
+	}
+	if (RangeMemoVerifyMode() == 2) {
+		EXIT("BufferRangeMemoVerify: %s: addr=0x%016" PRIx64 " size=0x%" PRIx64 "\n", what, vaddr,
+		     size);
+	}
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
@@ -1776,15 +1883,53 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
-	if (!is_written && size <= CACHING_PAGESIZE &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
-		const auto alignment = std::max<uint64_t>(
-		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
-		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
-		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
-			m_stream_buffer.Commit();
-			return {&m_stream_buffer, offset};
+	if (!is_written && size <= CACHING_PAGESIZE) {
+		// A small read of a CPU-dirty range that is not GPU-dirty is copied into the stream buffer.
+		// KYTY_BUFFER_RANGE_MEMO: the decision depends only on the range's tracker bits, so a
+		// Stream or Clean fact recorded under the current signature decides it without the two
+		// locked queries (the bytes are copied again every time).
+		const auto decide = [&] {
+			return !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
+			       m_memory_tracker.IsRegionCpuModified(vaddr, size);
+		};
+		bool stream = false;
+		if (m_range_memo != nullptr) {
+			const auto  signature = m_memory_tracker.RangeSignature(vaddr, size);
+			const auto& memo      = RangeMemoSlot(vaddr, size);
+			if (signature != 0 && memo.signature == signature && memo.vaddr == vaddr &&
+			    memo.size == size) {
+				// Clean: no page is CPU-dirty, so not a stream copy.
+				stream = memo.fact == RangeFact::Stream;
+				if (stream) {
+					Profiler::CountFrameEvent(Profiler::FrameEvent::BufferRangeMemoStreamHits);
+					m_range_memo_totals.stream_hits++;
+				}
+				if (RangeMemoVerifyMode() != 0) {
+					Profiler::CountFrameEvent(Profiler::FrameEvent::BufferRangeMemoVerifyChecks);
+					if (decide() != stream) {
+						ReportRangeMemoMismatch("a small read binding changed its stream decision",
+						                        vaddr, size);
+						stream = !stream;
+					}
+				}
+			} else {
+				stream = decide();
+				if (stream && signature != 0 &&
+				    m_memory_tracker.RangeSignature(vaddr, size) == signature) {
+					RecordRangeFact(vaddr, size, signature, RangeFact::Stream);
+				}
+			}
+		} else {
+			stream = decide();
+		}
+		if (stream) {
+			const auto alignment = std::max<uint64_t>(
+			    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
+			auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+			if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
+				m_stream_buffer.Commit();
+				return {&m_stream_buffer, offset};
+			}
 		}
 	}
 

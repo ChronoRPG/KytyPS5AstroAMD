@@ -225,16 +225,46 @@ private:
 	                                     bool is_written, bool is_texel_buffer,
 	                                     BdaSyncStats* stats = nullptr,
 	                                     const char* upload_reason = nullptr);
+	// KYTY_BUFFER_RANGE_MEMO (default on; =0 off). Facts about the tracker bits of a guest range,
+	// valid while the range's MemoryTracker::RangeSignature is unchanged (no CPU-dirty, GPU-dirty,
+	// hot or readback-pending bit of the range changed since):
+	//  - Clean: no page of the range is CPU-dirty (normal or hot). A read-only synchronization
+	//    (SynchronizeBuffer, not written, not a texel read) of such a range collects nothing and
+	//    does nothing else, whatever buffer it is for, so it is skipped. Recorded when one found
+	//    nothing to upload and the signature was the same before and after it.
+	//  - Stream: a small read binding's range is CPU-dirty and not GPU-dirty, so ObtainBuffer copies
+	//    it into the stream buffer (ObtainBuffer re-reads the bytes every time; only the decision
+	//    is reused). Recorded when the signature was the same before and after the two queries.
+	// A fact recorded while a transition was in progress fails the before/after comparison; a
+	// transition after the lookup is a CPU write racing the draw, which the normal path would
+	// equally miss. Direct-mapped, GPU thread only.
+	// KYTY_BUFFER_RANGE_MEMO_VERIFY=1|exit re-evaluates every hit the normal way (uploading whatever
+	// it finds) and counts disagreements (BufferRangeMemoVerifyMismatches; exit stops on the first).
+	enum class RangeFact : uint8_t { Clean, Stream };
+	struct RangeMemo {
+		uint64_t  vaddr     = 0;
+		uint64_t  size      = 0;
+		uint64_t  signature = 0; // 0: empty
+		RangeFact fact      = RangeFact::Clean;
+	};
+	static constexpr size_t RangeMemoSlots = 8192;
+	[[nodiscard]] RangeMemo& RangeMemoSlot(uint64_t vaddr, uint64_t size) noexcept {
+		const auto hash = (vaddr >> 4u) * 0x9e3779b97f4a7c15ull ^ size * 0xc2b2ae3d27d4eb4full;
+		return m_range_memo[static_cast<size_t>(hash >> 51u) & (RangeMemoSlots - 1)];
+	}
+	void RecordRangeFact(uint64_t vaddr, uint64_t size, uint64_t signature, RangeFact fact);
+	void ReportRangeMemoMismatch(const char* what, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size, size_t guest_copies = SIZE_MAX,
 	                                      const uint8_t* host_data = nullptr,
 	                                      uint64_t       host_base = 0);
 	// Hot pages (GPU thread). Snapshots each hot page of hot_ranges, appends a copy (reading
 	// m_hot_scratch from the first appended srcOffset on) for those that differ from their
-	// shadow, and lists pages to return to normal tracking.
+	// shadow, and lists pages to return to normal tracking: `demote` (still CPU-dirty) and
+	// `settle` (KYTY_HOT_PAGE_CHECK_LIMIT; SettleHotPages after the upload collection).
 	void CollectHotPages(Buffer& buffer, std::span<const GuestRange> hot_ranges,
 	                     std::vector<vk::BufferCopy>& copies, uint64_t& total_size,
-	                     std::vector<uint64_t>& demote);
+	                     std::vector<uint64_t>& demote, std::vector<uint64_t>& settle);
 	void EraseHotShadows(uint64_t vaddr, uint64_t size);
 	// Before (or right after recording) a GPU-side write of the range that tracked GPU ownership
 	// does not cover (image downloads into the buffer, unbounded address writers; size 0 = all):
@@ -338,10 +368,29 @@ private:
 		std::unique_ptr<uint8_t[]> data;
 		uint32_t                   last_change = 0;
 		uint32_t                   last_use    = 0;
+		// Uploads in a row that found the page unchanged (KYTY_HOT_PAGE_CHECK_LIMIT).
+		uint32_t                   unchanged_checks = 0;
 	};
 	std::map<uint64_t, HotShadow>                     m_hot_shadows;
 	std::vector<uint8_t>                              m_hot_scratch;
 	uint32_t                                          m_hot_quiet_frames = 8;
+	// KYTY_HOT_PAGE_CHECK_LIMIT (default 64; 0 disables): a hot page that this many uploads in a
+	// row found unchanged returns to normal tracking as a clean, write-protected page
+	// (SettleHotPages, which compares it with its shadow once more after protecting it). Its next
+	// write then faults as for any tracked page. Hot pages suit pages written between most
+	// uploads; a page every BDA draw re-examines but the CPU rewrites about once a frame costs
+	// hundreds of 4 KiB compares per frame instead of one fault.
+	uint32_t                                          m_hot_check_limit  = 64;
+	// KYTY_BUFFER_RANGE_MEMO (nullptr when disabled).
+	std::unique_ptr<RangeMemo[]>                      m_range_memo;
+	// Always counted (GPU thread; the BufferRangeMemo* frame events need a connected profiler).
+	struct RangeMemoTotals {
+		uint64_t clean_hits  = 0;
+		uint64_t stream_hits = 0;
+		uint64_t records     = 0;
+		uint64_t settles     = 0;
+	};
+	RangeMemoTotals                                   m_range_memo_totals;
 	uint32_t                                          m_upload_batch_depth = 0;
 	uint32_t                                          m_hot_sweep_frame  = 0;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};
