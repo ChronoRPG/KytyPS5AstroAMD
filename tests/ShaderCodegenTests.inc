@@ -491,10 +491,134 @@ void CheckFloatClampConstants(VulkanHarness *vulkan) {
               fast_run.spirv.size());
 }
 
+// CPU port of EmitF32ToF16RtzBits (the legacy V_CVT_PKRTZ_F16_F32 half conversion).
+u32 RefF32ToF16Rtz(u32 bits) {
+  const u32 sign = (bits >> 16u) & 0x8000u;
+  const u32 exp = (bits >> 23u) & 0xffu;
+  const u32 mant = bits & 0x007fffffu;
+  if (exp == 255u) {
+    return mant == 0u ? (sign | 0x7c00u) : (sign | 0x7c00u | (mant >> 13u) | 0x0200u);
+  }
+  if (exp >= 143u) {
+    return sign | 0x7bffu;
+  }
+  if (exp < 103u) {
+    return sign;
+  }
+  if (exp <= 112u) {
+    const u32 shift = exp > 112u ? 14u : 126u - exp;
+    return sign | ((mant | 0x00800000u) >> shift);
+  }
+  return (sign | ((exp - 112u) << 10u) | (mant >> 13u)) & 0xffffu;
+}
+
+// CPU model of EmitFastF32ToF16RtzBits, op for op.
+u32 FastF32ToF16Rtz(u32 bits) {
+  const u32 abs = bits & 0x7fffffffu;
+  const u32 sign = (bits >> 16u) & 0x8000u;
+  const u32 high13 = abs >> 13u;
+  const u32 normal = std::min(high13 - (112u << 10u), 0x7bffu);
+  const u32 exponent = abs >> 23u;
+  const u32 shift = std::min(126u - exponent, 31u);
+  const u32 subnormal = ((abs & 0x007fffffu) | 0x00800000u) >> shift;
+  u32 result = abs < 0x38800000u ? subnormal : normal;
+  const u32 special = (high13 & 0x7fffu) | (abs > 0x7f800000u ? 0x0200u : 0u);
+  result = abs >= 0x7f800000u ? special : result;
+  return result | sign;
+}
+
+// The integer formulation against the legacy one for all 2^32 inputs (CPU, a few seconds).
+void CheckPackRtzExhaustive() {
+  constexpr const char *name = "CodegenCvtPkrtzExhaustive";
+  constexpr u32 Threads = 8;
+  std::array<std::atomic<uint64_t>, Threads> mismatch{};
+  std::vector<std::thread> workers;
+  for (u32 t = 0; t < Threads; t++) {
+    workers.emplace_back([t, &mismatch] {
+      const uint64_t begin = (uint64_t{1} << 32u) / Threads * t;
+      const uint64_t end = (uint64_t{1} << 32u) / Threads * (t + 1u);
+      uint64_t first = UINT64_MAX;
+      for (uint64_t value = begin; value < end; value++) {
+        const auto bits = static_cast<u32>(value);
+        if (FastF32ToF16Rtz(bits) != RefF32ToF16Rtz(bits)) {
+          first = value;
+          break;
+        }
+      }
+      mismatch[t] = first;
+    });
+  }
+  for (auto &worker : workers) {
+    worker.join();
+  }
+  for (const auto &value : mismatch) {
+    if (value != UINT64_MAX) {
+      const auto bits = static_cast<u32>(value.load());
+      Fail(name, "exhaustive", "input " + Hex(bits) + ": fast " + Hex(FastF32ToF16Rtz(bits)) +
+                                   ", legacy " + Hex(RefF32ToF16Rtz(bits)));
+    }
+  }
+  std::printf("[codegen] %-32s ok (2^32 inputs)\n", name);
+}
+
+void CheckPackRtz(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenCvtPkrtzF16F32";
+  using O = ShaderOpcode;
+  std::vector<std::vector<u32>> inputs(2);
+  // Every exponent and sign with mantissas around the f16 rounding points, then random bits.
+  const u32 mantissas[] = {0x000000u, 0x000001u, 0x000fffu, 0x001000u, 0x001001u, 0x001fffu,
+                           0x002000u, 0x002001u, 0x3fe000u, 0x3fffffu, 0x400000u, 0x7fe000u,
+                           0x7fefffu, 0x7ff000u, 0x7fffffu, 0x555555u};
+  uint64_t seed = 0x0badc0ffee123457ull;
+  for (u32 sign = 0; sign < 2u; sign++) {
+    for (u32 exp = 0; exp < 256u; exp++) {
+      for (const auto mant : mantissas) {
+        inputs[0].push_back((sign << 31u) | (exp << 23u) | mant);
+        inputs[1].push_back(RandomF32(seed));
+      }
+    }
+  }
+  for (const auto value : SpecialF32()) {
+    inputs[0].push_back(value);
+    inputs[1].push_back(value ^ 0x80000000u);
+  }
+  while (inputs[0].size() < (1u << 19u)) {
+    inputs[0].push_back(RandomF32(seed));
+    inputs[1].push_back(NextRandom(seed));
+  }
+  inputs[0].resize(inputs[0].size() / 64u * 64u);
+  inputs[1].resize(inputs[0].size());
+  const auto bulk = MakeBulkCase(
+      name, 2, 2, inputs,
+      [](std::vector<u32> *code) {
+        code->push_back(EncodeVop2(0x2f, 10, Vgpr(2), 3)); // v_cvt_pkrtz_f16_f32 v10, v2, v3
+        code->push_back(EncodeVop2(0x2f, 11, Vgpr(3), 2)); // v_cvt_pkrtz_f16_f32 v11, v3, v2
+      },
+      {O::V_CVT_PKRTZ_F16_F32});
+  CodegenOptions fast = GetCodegenOptions();
+  fast.fast_pkrtz = true;
+  CodegenOptions slow = fast;
+  slow.fast_pkrtz = false;
+  const auto fast_run = RunBulk(vulkan, bulk, fast);
+  const auto slow_run = RunBulk(vulkan, bulk, slow);
+  static const char *const names[] = {"pkrtz(x,y)", "pkrtz(y,x)"};
+  CompareBulk(name, bulk, fast_run, slow_run,
+              [&](u32 o, u32 e) -> u32 {
+                const auto lo = inputs[o][e];
+                const auto hi = inputs[1u - o][e];
+                return RefF32ToF16Rtz(lo) | (RefF32ToF16Rtz(hi) << 16u);
+              },
+              names);
+  std::printf("[codegen] %-32s ok (%u pairs, SPIR-V %zu -> %zu words)\n", name, bulk.count,
+              slow_run.spirv.size(), fast_run.spirv.size());
+}
+
 void RunAll(VulkanHarness *vulkan) {
   CheckMoveRelValueSet(vulkan);
   CheckFloatMinMax(vulkan);
   CheckFloatClampConstants(vulkan);
+  CheckPackRtzExhaustive();
+  CheckPackRtz(vulkan);
 }
 
 } // namespace CodegenTests

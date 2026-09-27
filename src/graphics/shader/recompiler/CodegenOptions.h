@@ -16,6 +16,9 @@ struct CodegenOptions {
 	// KYTY_FAST_FMINMAX=0: emulate f32 min/max/min3/max3/med3 with two bit classifications per
 	// min/max instead of one compare-and-select plus a single two-zeros test.
 	bool fast_float_min_max = true;
+	// KYTY_FAST_PKRTZ=0: convert V_CVT_PKRTZ_F16_F32 halves with the original select chain instead
+	// of the shorter integer formulation.
+	bool fast_pkrtz = true;
 };
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();

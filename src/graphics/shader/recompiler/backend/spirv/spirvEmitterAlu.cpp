@@ -407,7 +407,62 @@ uint32_t EmitCompositeExtractU64(EmitterState& state, uint32_t arg0, IR::Value a
 	return EmitNative<spv::OpCompositeExtract, IR::Type::U32>(state, arg0, arg1.U32());
 }
 
+namespace {
+
+// One V_CVT_PKRTZ_F16_F32 half, exactly as EmitF32ToF16RtzBits computes it, with fewer selects:
+//  - |x| >= 2^-14 (f32 exponent >= 113): the truncated f16 magnitude is (|bits| >> 13) - (112 << 10).
+//    Finite values past the f16 range (exponent >= 143) give at least 0x7c00 there, so
+//    UMin(., 0x7bff) produces the RTZ saturation.
+//  - |x| < 2^-14 (exponent <= 112): the f16 subnormal (mantissa | hidden) >> (126 - exponent),
+//    shift limited to 31; exponents <= 102, including f32 zeros and denormals, shift everything
+//    out and leave the signed zero.
+//  - Infinity and NaN (exponent 255): (|bits| >> 13) & 0x7fff is 0x7c00 plus the top ten payload
+//    bits; NaNs also get the quiet bit 0x0200.
+// Pure integer arithmetic on the input bits, so the result does not depend on host rounding,
+// denormal handling or NaN canonicalization. (A PackHalf2x16-plus-correction variant was not
+// exact on NVIDIA: the driver folds UnpackHalf2x16(PackHalf2x16(x)) back to x, which hides the
+// rounding direction.)
+uint32_t EmitFastF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
+	const auto bits   = EmitBitcastF32ToU32(state, f32);
+	const auto abs    = EmitAndConstant(state, bits, 0x7fffffffu);
+	const auto sign   = EmitAndConstant(state, EmitShiftRightConstant(state, bits, 16), 0x8000u);
+	const auto high13 = EmitShiftRightConstant(state, abs, 13);
+	const auto normal = EmitMinMaxU32Value(
+	    state, Binary(state, spv::OpISub, TypeU32(state), high13, ConstantU32(state, 112u << 10u)),
+	    ConstantU32(state, 0x7bffu), false);
+	const auto exponent = EmitShiftRightConstant(state, abs, 23);
+	const auto shift    = EmitMinMaxU32Value(state, EmitSubConstantMinusU32(state, 126, exponent),
+	                                         ConstantU32(state, 31), false);
+	const auto subnormal = Binary(
+	    state, spv::OpShiftRightLogical, TypeU32(state),
+	    EmitOrU32(state, EmitAndConstant(state, abs, 0x007fffffu), ConstantU32(state, 0x00800000u)),
+	    shift);
+	auto result =
+	    EmitSelectValueU32(state, EmitCompareU32Constant(state, spv::OpULessThan, abs, 0x38800000u),
+	                       subnormal, normal);
+	const auto quiet = EmitSelectValueU32(
+	    state, EmitCompareU32Constant(state, spv::OpUGreaterThan, abs, 0x7f800000u),
+	    ConstantU32(state, 0x0200u), ConstantU32(state, 0u));
+	const auto special = EmitOrU32(state, EmitAndConstant(state, high13, 0x7fffu), quiet);
+	result = EmitSelectValueU32(
+	    state, EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, abs, 0x7f800000u), special,
+	    result);
+	return EmitOrU32(state, result, sign);
+}
+
+uint32_t EmitFastPackFloat2x16Rtz(EmitterState& state, uint32_t x, uint32_t y) {
+	const auto low  = EmitFastF32ToF16RtzBits(state, x);
+	const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+	                         EmitFastF32ToF16RtzBits(state, y), ConstantU32(state, 16));
+	return EmitOrU32(state, low, high);
+}
+
+} // namespace
+
 uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	if (GetCodegenOptions().fast_pkrtz) {
+		return EmitFastPackFloat2x16Rtz(state, arg0, arg1);
+	}
 	const auto low  = EmitF32ToF16RtzBits(state, arg0);
 	const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
 	                         EmitF32ToF16RtzBits(state, arg1), ConstantU32(state, 16));
