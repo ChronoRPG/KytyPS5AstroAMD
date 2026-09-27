@@ -105,6 +105,15 @@ std::mutex                                        g_apr_mutex;
 std::unordered_map<AprKey, AprInfo, AprKeyHash>   g_apr_keys;
 std::vector<std::string>                          g_pending_apr_rows;
 uint64_t                                          g_apr_rows_total = 0;
+// Size of each file's latest read from offset 0 (guarded by g_apr_mutex). A streamer that
+// re-reads a texture file's prefix to drop mips and the whole file to add them (Astro Bot: 128 KiB
+// head <-> full file) shows its residency changes as size changes here.
+std::unordered_map<uint32_t, uint64_t>            g_apr_offset0_size;
+// The same for reads by texture-streamer threads (name contains "TextureStreamer", Astro Bot's
+// GfxTextureStreamerThread), and their sum: an estimate of the streamed-texture footprint. Other
+// threads' offset-0 reads are level data (about 7 GiB over a U48 run).
+std::unordered_map<uint32_t, uint64_t>            g_apr_stream_size;
+uint64_t                                          g_apr_stream_bytes = 0;
 
 std::mutex               g_lod_mutex;
 std::vector<std::string> g_pending_lod_rows;
@@ -246,6 +255,10 @@ struct Totals {
 	std::atomic<uint64_t> apr_bytes {0};
 	std::atomic<uint64_t> apr_repeats {0};
 	std::atomic<uint64_t> apr_errors {0};
+	std::atomic<uint64_t> apr_grow_reads {0};
+	std::atomic<uint64_t> apr_shrink_reads {0};
+	std::atomic<uint64_t> apr_shrinks_since_flip {0}; // not reset by the summary
+	std::atomic<uint64_t> apr_shrink_max_per_flip {0};
 	std::atomic<uint64_t> lod_packets {0};
 	std::atomic<uint64_t> lod_prior_nonzero {0};
 	std::atomic<uint64_t> tex_total {0};
@@ -831,6 +844,14 @@ void Publish() {
 		gpl(PipelineLibraryEvent::Optimized, true);
 		// Memory counters added after the compile columns (none yet).
 		memory_columns(kMemoryColumnsBeforeCompile, kMemoryCounterColumns.size());
+		uint64_t stream_bytes = 0;
+		{
+			std::scoped_lock apr_lock(g_apr_mutex);
+			stream_bytes = g_apr_stream_bytes;
+		}
+		line += fmt::format(",{},{},{},{}", take(g_totals.apr_grow_reads),
+		                    take(g_totals.apr_shrink_reads),
+		                    take(g_totals.apr_shrink_max_per_flip), stream_bytes >> 20u);
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
@@ -961,6 +982,10 @@ void Initialize() {
 	summary_header += ",gpl_cache_hits,gpl_links,gpl_link_us,gpl_libraries,gpl_library_us,"
 	                  "gpl_optimized,gpl_optimize_us";
 	memory_header(kMemoryColumnsBeforeCompile, kMemoryCounterColumns.size());
+	// Reads from offset 0 that grew or shrank the file's previous offset-0 read, the most shrink
+	// reads between two flips, and the texture-streamer footprint (MiB): streamed-texture
+	// residency changes.
+	summary_header += ",apr_grow_reads,apr_shrink_reads,apr_shrink_max_per_flip,apr_stream_mib";
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.compiles = OpenFile("compiles.csv",
 	                            "t_ms,kind,stage,guest_hash,id,id2,origin,translate_us,emit_us,"
@@ -978,7 +1003,8 @@ void Initialize() {
 	                             "depth_format,depth_address,condition,skip,detail");
 	g_files.lodreports = OpenFile("lodreports.csv",
 	                              "t_ms,destination,control,has_latest,sampled_counters,"
-	                              "total_samples,mean_finest_mip,pending_copies");
+	                              "total_samples,mean_finest_mip,pending_copies,drawn_counters,"
+	                              "counted_counters");
 	if (CpTraceEnabled()) {
 		g_files.cp = OpenFile("cp.csv", "t_us,row,host_tid,queue,seq,event,address,value,ref,mask,"
 		                                "aux,size");
@@ -1143,6 +1169,21 @@ void RecordAprRead(uint32_t file_id, std::string_view host_path, uint64_t file_o
 	const auto callers = scan ? CaptureGuestCallers() : std::string();
 
 	std::scoped_lock lock(g_apr_mutex);
+	if (file_offset == 0 && result == 0 && bytes_read != 0) {
+		auto& last = g_apr_offset0_size[file_id];
+		if (last != 0 && bytes_read > last) {
+			g_totals.apr_grow_reads.fetch_add(1, std::memory_order_relaxed);
+		} else if (bytes_read < last) {
+			g_totals.apr_shrink_reads.fetch_add(1, std::memory_order_relaxed);
+			g_totals.apr_shrinks_since_flip.fetch_add(1, std::memory_order_relaxed);
+		}
+		last = bytes_read;
+		if (thread_name.find("TextureStreamer") != std::string_view::npos) {
+			auto& stream = g_apr_stream_size[file_id];
+			g_apr_stream_bytes = g_apr_stream_bytes - stream + bytes_read;
+			stream             = bytes_read;
+		}
+	}
 	auto& info = g_apr_keys[AprKey {file_id, file_offset, size}];
 	const auto previous_destination = info.last_dest;
 	if (info.count == 0) {
@@ -1437,9 +1478,13 @@ void RecordLodReport(const LodReportEvent& event) {
 	if (!Enabled()) {
 		return;
 	}
-	auto row = fmt::format("{},0x{:x},0x{:x},{},{},{},{:.2f},{}", NowMs(), event.destination,
+	// Completion rows keep the UINT64_MAX pending_copies marker of the U33 format.
+	const auto pending =
+	    event.kind == LodReportKind::Completion ? ~uint64_t {0} : event.pending_copies;
+	auto row = fmt::format("{},0x{:x},0x{:x},{},{},{},{:.2f},{},{},{}", NowMs(), event.destination,
 	                       event.control, event.has_latest ? 1 : 0, event.sampled_counters,
-	                       event.total_samples, event.mean_finest_mip, event.pending_copies);
+	                       event.total_samples, event.mean_finest_mip, pending,
+	                       event.drawn_counters, event.counted_counters);
 	std::scoped_lock lock(g_occlusion_mutex);
 	if (g_lodreport_rows_total >= kOcclusionRowLimit) {
 		return;
@@ -1584,6 +1629,8 @@ void RecordFlip() {
 		return;
 	}
 	g_totals.flips.fetch_add(1, std::memory_order_relaxed);
+	UpdateMax(g_totals.apr_shrink_max_per_flip,
+	          g_totals.apr_shrinks_since_flip.exchange(0, std::memory_order_relaxed));
 }
 
 void RecordGpuFrame(const GpuFrame& frame) {

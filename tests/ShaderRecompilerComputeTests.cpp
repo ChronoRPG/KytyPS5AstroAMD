@@ -37137,6 +37137,11 @@ int main(int argc, char **argv) {
     CodegenTests::RunAll(&vulkan);
     return 0;
   }
+  // CPU only: compiles and validates the GET_LOD_STATS instrumentation.
+  if (argc == 2 && std::strcmp(argv[1], "--lod-stats-codegen-only") == 0) {
+    CodegenTests::CheckLodStatsGate();
+    return 0;
+  }
   // Only the recompiler semantic cases (compute and graphics), without the host/runtime
   // checks that precede them in the default run.
   if (argc == 2 && std::strcmp(argv[1], "--cases-only") == 0) {

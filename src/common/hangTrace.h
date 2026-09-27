@@ -56,6 +56,14 @@
 // gpl_cache_hits, gpl_links, gpl_link_us, gpl_libraries, gpl_library_us, gpl_optimized,
 // gpl_optimize_us. Memory counters added to MemoryCounter after mem_written_upload_late_pages
 // follow at the end of the row (kMemoryColumnsBeforeCompile in hangTrace.cpp).
+// Last, apr_grow_reads / apr_shrink_reads: reads from file offset 0 larger / smaller than the same
+// file's previous offset-0 read (Astro Bot's texture streamer promoting a texture from its 128 KiB
+// head to the full file / demoting it back); apr_shrink_max_per_flip: the most shrink reads
+// between two flips (its eviction pass stops at 32 textures); apr_stream_mib: the sum of the
+// latest offset-0 read of every file a "TextureStreamer" thread read, an estimate of the
+// streamed-texture footprint (its pool holds 4.5 GiB = 4608 MiB and evicts above 85%). Level
+// unloads issue no reads, so the estimate keeps a previous level's files: compare it within one
+// level visit.
 // New columns are only ever appended.
 //
 //   compiles.csv       one row per new shader program permutation or pipeline: phase times, the
@@ -158,17 +166,28 @@ struct OcclusionEvent {
 };
 void RecordOcclusion(const OcclusionEvent& event);
 
-// lodreports.csv (KYTY_LOD_STATS_MODE=gpu): one row per GET_LOD_STATS report written to the
-// guest: counters reported as sampled, their summed sample counts and mean finest mip, whether
-// any completed statistics existed yet, and GPU copies issued but not yet completed (report age).
+// lodreports.csv (KYTY_LOD_STATS_MODE=gpu): rows for each GET_LOD_STATS report.
+//   Record rows (when the packet is recorded): whether statistics were written now (has_latest;
+//   only KYTY_LOD_REPORT_PUBLISH=rewrite/record write at record time), their sampled counters,
+//   summed counts and mean finest mip, and GPU copies issued but not completed (report age).
+//   Completion rows (pending_copies = UINT64_MAX): has_latest = 1 when the guest slot was written,
+//   sampled_counters = counters with a finest mip, total_samples = summed counts (bits 0..23).
+//   drawn_counters / counted_counters (completion rows): counters with a finest mip ("Drawn" in
+//   the guest's debug view) and counters with a non-zero count ("MipClamp": with
+//   KYTY_LOD_STATS_COUNT=clamp, textures sampled finer than their T# MIN_LOD, which the streamer
+//   promotes to full resolution).
+enum class LodReportKind : uint8_t { Record, Completion };
 struct LodReportEvent {
-	uint64_t destination      = 0;
-	uint32_t control          = 0;
-	bool     has_latest       = false;
-	uint32_t sampled_counters = 0;
-	uint64_t total_samples    = 0;
-	double   mean_finest_mip  = 0.0;
-	uint64_t pending_copies   = 0;
+	uint64_t      destination      = 0;
+	uint32_t      control          = 0;
+	bool          has_latest       = false;
+	uint32_t      sampled_counters = 0;
+	uint64_t      total_samples    = 0;
+	double        mean_finest_mip  = 0.0;
+	uint64_t      pending_copies   = 0;
+	LodReportKind kind             = LodReportKind::Record;
+	uint32_t      drawn_counters   = 0;
+	uint32_t      counted_counters = 0;
 };
 void RecordLodReport(const LodReportEvent& event);
 

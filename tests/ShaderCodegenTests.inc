@@ -663,7 +663,8 @@ void CheckFloatToIntSaturation(VulkanHarness *vulkan) {
 }
 
 // GET_LOD_STATS instrumentation of a pixel-shader sample: compile-only (the graphics harness has
-// no mip-statistics buffer), SPIR-V validation and structure in both modes.
+// no mip-statistics buffer), SPIR-V validation and structure in both modes. Needs no GPU
+// (--lod-stats-codegen-only).
 void CheckLodStatsGate() {
   constexpr const char *name = "CodegenLodStatsGate";
   GraphicsCase test;
@@ -693,17 +694,28 @@ void CheckLodStatsGate() {
     ScopedCodegenOptions scope(legacy);
     legacy_spirv = CompileFragmentCase(test).spirv;
   }
+  ValidateSpirv(name, gated_spirv);
+  ValidateSpirv(name, legacy_spirv);
   const auto count = [](const std::vector<u32> &spirv, const char *op) {
     return CountSpirv(spirv, op);
   };
+  // Both modes: the finest level (subgroup UMin, one AtomicUMin) and the count, added only when a
+  // lane's LOD is below the field's threshold (FOrdLessThan, subgroup UMax, one AtomicIAdd in its
+  // own branch). The gate adds the has-counter and smaller-than-stored branches.
   Require(name, "instrumentation",
           count(legacy_spirv, "OpImageQueryLod") == 1u &&
               count(legacy_spirv, "OpAtomicUMin") == 1u &&
+              count(legacy_spirv, "OpAtomicIAdd") == 1u &&
               count(legacy_spirv, "OpAtomicLoad") == 0u &&
+              count(legacy_spirv, "OpGroupNonUniformUMin") == 1u &&
+              count(legacy_spirv, "OpGroupNonUniformUMax") == 1u &&
+              count(legacy_spirv, "OpFOrdLessThan") >= 1u &&
               count(gated_spirv, "OpImageQueryLod") == 1u &&
               count(gated_spirv, "OpAtomicUMin") == 1u &&
               count(gated_spirv, "OpAtomicIAdd") == 1u &&
               count(gated_spirv, "OpAtomicLoad") == 1u &&
+              count(gated_spirv, "OpGroupNonUniformUMin") == 1u &&
+              count(gated_spirv, "OpGroupNonUniformUMax") == 1u &&
               count(gated_spirv, "OpSelectionMerge") ==
                   count(legacy_spirv, "OpSelectionMerge") + 2u,
           "unexpected GET_LOD_STATS instrumentation structure");

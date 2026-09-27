@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -19,7 +20,9 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t CounterBytes = uint64_t {LodStatsCounter::Entries} * 2u * sizeof(uint32_t);
-constexpr uint64_t NoData       = 0x0F00000000000000ull;
+using LodStatsReport::PackEntry;
+using LodStatsReport::PackReport;
+using LodStatsReport::Unsampled;
 
 } // namespace
 
@@ -31,15 +34,29 @@ bool LodStatsCounter::Enabled() {
 	return enabled;
 }
 
-// After a report's GPU copy completes, rewrite its guest slot with that packet's own interval
-// (hardware semantics) when the guest has not touched it yet. KYTY_LOD_REPORT_COMPLETION_WRITE=0
-// keeps only the record-time write of older statistics (U26-U32 behaviour).
-bool LodStatsCounter::CompletionWriteEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_LOD_REPORT_COMPLETION_WRITE");
-		return value == nullptr || value[0] != '0';
+LodStatsCounter::Publish LodStatsCounter::PublishMode() {
+	static const Publish mode = [] {
+		const auto result = LodStatsReport::ParsePublish(
+		    std::getenv("KYTY_LOD_REPORT_PUBLISH"), std::getenv("KYTY_LOD_REPORT_COMPLETION_WRITE"));
+		std::printf("GET_LOD_STATS reports: %s\n", result == Publish::Completion ? "completion"
+		                                           : result == Publish::Rewrite  ? "rewrite"
+		                                                                         : "record");
+		return result;
 	}();
-	return enabled;
+	return mode;
+}
+
+bool LodStatsCounter::CompletionWriteEnabled() {
+	return PublishMode() != Publish::Record;
+}
+
+bool LodStatsCounter::CountClamped() {
+	static const bool clamped = [] {
+		const bool result = LodStatsReport::ParseCountClamped(std::getenv("KYTY_LOD_STATS_COUNT"));
+		std::printf("GET_LOD_STATS count: %s\n", result ? "clamp" : "samples");
+		return result;
+	}();
+	return clamped;
 }
 
 LodStatsCounter::LodStatsCounter(RenderContext& context): m_context(context) {}
@@ -62,6 +79,20 @@ Buffer& LodStatsCounter::CounterBuffer() {
 
 void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t control) {
 	KYTY_GPU_OP_SITE("lodstats.report");
+	const auto mode = PublishMode();
+	// GET_LOD_STATS control bit 19 reports and resets, bit 18 forces a reset.
+	const bool reset_requested = ((control >> 18u) & 3u) != 0u;
+	// Completion publication writes up to the report size into any buffer that holds the
+	// header; the record-time modes keep their U26..U47 rule (only complete reports).
+	const bool writes_report = destination != 0 &&
+	                           (mode == Publish::Completion ? size >= sizeof(uint32_t)
+	                                                        : size >= ReportSize);
+	// Astro Bot probes with an empty GET_LOD_STATS (no buffer, no reset) before each report: no
+	// memory is written and the counters keep counting. The record-time modes also folded it
+	// into their newest statistics.
+	if (mode == Publish::Completion && m_initialized && !writes_report && !reset_requested) {
+		return;
+	}
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
 	auto& counters = CounterBuffer();
@@ -71,12 +102,12 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 		                                     MemoryUsage::Download, 0, usage,
 		                                     PublishSlots * PublishSlotSize);
 	}
-	// The guest may read this report as soon as the packet is recorded (EOP labels are written at
-	// record time). Write the newest completed statistics now; until the first GPU copy has
-	// completed, write an unready report ("no data yet").
-	const bool writes_report = destination != 0 && size >= ReportSize;
+	// Record-time modes: the guest may read this report as soon as the packet is recorded (EOP
+	// labels are written at record time). Write the newest completed statistics now; until the
+	// first GPU copy has completed, write an unready report ("no data yet").
+	const bool record_write       = mode != Publish::Completion && writes_report;
 	auto       record_time_report = std::make_shared<std::array<uint8_t, ReportSize>>();
-	if (writes_report) {
+	if (record_write) {
 		auto&                     report = *record_time_report;
 		HangTrace::LodReportEvent event;
 		{
@@ -97,6 +128,12 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 			event.pending_copies = m_issued - m_completed.load(std::memory_order_acquire);
 			HangTrace::RecordLodReport(event);
 		}
+	} else if (writes_report && HangTrace::Enabled()) {
+		// Completion publication: nothing is written now; the row marks the packet's position.
+		HangTrace::RecordLodReport({.destination    = destination,
+		                            .control        = control,
+		                            .pending_copies = m_issued -
+		                                              m_completed.load(std::memory_order_acquire)});
 	}
 
 	auto native = scheduler.Current().Handle();
@@ -108,7 +145,9 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &barrier, 0, nullptr, 0,
 	                       nullptr);
 
-	const bool publish = m_initialized;
+	// Completion publication copies only for reports it writes; the record-time modes copy every
+	// packet (each completed copy becomes their newest statistics).
+	const bool publish     = m_initialized && (mode != Publish::Completion || writes_report);
 	uint64_t   slot_offset = 0;
 	if (publish) {
 		const auto slot = static_cast<uint32_t>(m_issued % PublishSlots);
@@ -123,8 +162,7 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 		native.copyBuffer(counters.Handle(), m_publish->Handle(), 1, &copy);
 	}
 
-	// GET_LOD_STATS control bit 19 reports and resets, bit 18 forces a reset.
-	const bool reset = !m_initialized || ((control >> 18u) & 3u) != 0u;
+	const bool reset = !m_initialized || reset_requested;
 	if (reset && publish) {
 		// The reset overwrites the counters the copy above reads (write-after-read hazard found
 		// by synchronization validation): the fills must not start before the copy has read.
@@ -137,7 +175,7 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 	}
 	if (reset) {
 		constexpr uint64_t MinBytes = uint64_t {Entries} * sizeof(uint32_t);
-		native.fillBuffer(counters.Handle(), 0, MinBytes, 0xffffffffu);
+		native.fillBuffer(counters.Handle(), 0, MinBytes, Unsampled);
 		native.fillBuffer(counters.Handle(), MinBytes, MinBytes, 0u);
 	}
 	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -153,30 +191,44 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 	}
 	m_slot_ticks[m_issued % PublishSlots] = scheduler.CurrentTick();
 	++m_issued;
-	const bool completion_write = writes_report && CompletionWriteEnabled();
-	scheduler.DeferOperation([this, slot_offset, destination, completion_write,
+	const auto write_size = writes_report ? std::min<uint32_t>(size, ReportSize) : 0u;
+	scheduler.DeferOperation([this, slot_offset, destination, mode, writes_report, write_size,
 	                          record_time_report, control] {
 		m_publish->Invalidate(slot_offset, CounterBytes);
 		const auto* words = reinterpret_cast<const uint32_t*>(m_publish->Mapped().data() + slot_offset);
+		if (mode == Publish::Completion) {
+			// The packet's own interval, visible once the GPU has produced it: the guest's
+			// consumer skips the current slot while its header is zero.
+			std::array<uint8_t, ReportSize> exact {};
+			const auto summary = PackReport(words, exact.data());
+			if (writes_report) {
+				(void)LibKernel::Memory::TryWriteBacking(destination, exact.data(), write_size);
+				Coherence::NoteContentWrite(destination, write_size,
+				                            Coherence::Source::LodStatsWrite);
+			}
+			if (HangTrace::Enabled()) {
+				HangTrace::RecordLodReport({.destination      = destination,
+				                            .control          = control,
+				                            .has_latest       = writes_report,
+				                            .sampled_counters = summary.drawn,
+				                            .total_samples    = summary.count_total,
+				                            .mean_finest_mip  = summary.mean_finest,
+				                            .kind             = HangTrace::LodReportKind::Completion,
+				                            .drawn_counters   = summary.drawn,
+				                            .counted_counters = summary.counted});
+			}
+			m_completed.fetch_add(1, std::memory_order_release);
+			return;
+		}
 		std::array<uint8_t, ReportSize> report {};
 		const uint32_t valid = 1;
 		std::memcpy(report.data(), &valid, sizeof(valid));
-		if (completion_write) {
+		if (mode == Publish::Rewrite && writes_report) {
 			// This packet's own interval is now known. The record-time write had to use older
 			// statistics; replace them with what hardware writes at this packet, unless the guest
 			// has already consumed or rewritten the slot (then a late write would look new).
-			std::array<uint8_t, ReportSize> exact = report;
-			uint32_t                        exact_sampled = 0;
-			for (uint32_t counter = 0; counter < Counters; counter++) {
-				const auto count = words[Entries + counter];
-				uint64_t   entry = NoData;
-				if (count != 0) {
-					entry = (uint64_t {std::min<uint32_t>(words[counter], 14u)} << 56u) |
-					        std::min<uint32_t>(count, 0xffffffu);
-					exact_sampled++;
-				}
-				std::memcpy(exact.data() + 64 + counter * sizeof(uint64_t), &entry, sizeof(entry));
-			}
+			std::array<uint8_t, ReportSize> exact {};
+			const auto summary = PackReport(words, exact.data());
 			std::array<uint8_t, ReportSize> current {};
 			const bool unchanged =
 			    LibKernel::Memory::TryReadBacking(destination, current.data(), current.size()) &&
@@ -187,13 +239,15 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 				                            Coherence::Source::LodStatsWrite);
 			}
 			if (HangTrace::Enabled()) {
-				HangTrace::LodReportEvent event;
-				event.destination      = destination;
-				event.control          = control;
-				event.has_latest       = unchanged; // completion rows: 1 = slot rewritten
-				event.sampled_counters = exact_sampled;
-				event.pending_copies   = ~0ull;     // marks a completion row
-				HangTrace::RecordLodReport(event);
+				HangTrace::RecordLodReport({.destination      = destination,
+				                            .control          = control,
+				                            .has_latest       = unchanged, // 1 = slot rewritten
+				                            .sampled_counters = summary.drawn,
+				                            .total_samples    = summary.count_total,
+				                            .mean_finest_mip  = summary.mean_finest,
+				                            .kind             = HangTrace::LodReportKind::Completion,
+				                            .drawn_counters   = summary.drawn,
+				                            .counted_counters = summary.counted});
 			}
 		}
 		std::scoped_lock lock(m_latest_mutex);
@@ -207,10 +261,8 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 			const auto count  = words[Entries + counter] + m_previous_count[counter];
 			m_previous_finest[counter] = words[counter];
 			m_previous_count[counter]  = words[Entries + counter];
-			uint64_t   entry  = NoData;
-			if (count != 0) {
-				entry = (uint64_t {std::min<uint32_t>(finest, 14u)} << 56u) |
-				        std::min<uint32_t>(count, 0xffffffu);
+			const auto entry = PackEntry(finest, count, counter);
+			if (finest != Unsampled) {
 				sampled++;
 				samples += count;
 				finest_total += std::min<uint32_t>(finest, 14u);

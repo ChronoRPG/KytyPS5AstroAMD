@@ -563,26 +563,29 @@ spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
 
 } // namespace
 
-// GET_LOD_STATS feedback. The per-draw shader data holds each image's mip-statistics counter
-// id (16 bits, 0xffff when the T# has MipStatsCntEn clear). The mip_stats buffer holds 257
-// finest-mip words followed by 257 sample counts; entry 256 absorbs images without a counter.
-// The id is uniform per draw, so one atomic pair per subgroup records the subgroup minimum.
+// GET_LOD_STATS feedback. The per-draw shader data holds one field per image
+// (LodStatsReport::ImageField). The mip_stats buffer holds 257 finest-mip words followed by 257
+// counts; entry 256 absorbs images without a counter. The field is uniform per draw, so one lane
+// per subgroup records the subgroup's finest level and whether any lane counts.
 constexpr uint32_t MipStatsEntries = 257;
 
-// 16-bit field: counter id in bits 0..7, T# BASE_LEVEL in bits 8..11, bit 15 = no counter. The
-// upper half of the returned word may hold the neighbouring image's field.
+// 32-bit field: counter id in bits 0..7, T# BASE_LEVEL in bits 8..11, bit 15 = no counter, U4.8
+// count threshold in bits 16..27.
 uint32_t LoadMipStatsId(EmitterState& state, uint32_t resource) {
-	auto id = EmitShaderDataDwordLoad(state,
-	                                  state.program.bindings.MipStatsOffsetDword() + resource / 2u);
-	if ((resource & 1u) != 0u) {
-		id = Binary(state, spv::OpShiftRightLogical, TypeU32(state), id, ConstantU32(state, 16));
-	}
-	return id;
+	return EmitShaderDataDwordLoad(state, state.program.bindings.MipStatsOffsetDword() + resource);
 }
 
+struct MipStatsSample {
+	uint32_t finest  = 0; // subgroup minimum of the absolute mip level
+	uint32_t counted = 0; // 1 when a lane's level is below the field's threshold
+};
+
 // The finest mip a sample wanted, as an absolute level: floor of the unclamped LOD plus the view's
-// BASE_LEVEL, limited to 0..14, reduced to the subgroup minimum.
-uint32_t EmitMipStatsFinestLevel(EmitterState& state, uint32_t id, uint32_t lod) {
+// BASE_LEVEL, limited to 0..14, reduced to the subgroup minimum. A lane counts when that LOD is
+// below the field's threshold: the T# MIN_LOD, i.e. the resident-level clamp raised the sample
+// (reported in bits 0..23, "MipClamp" in Astro Bot's streamer), or every sample with
+// KYTY_LOD_STATS_COUNT=samples (threshold beyond level 14).
+MipStatsSample EmitMipStatsSample(EmitterState& state, uint32_t id, uint32_t lod) {
 	state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	const auto base_level = Binary(
@@ -591,6 +594,7 @@ uint32_t EmitMipStatsFinestLevel(EmitterState& state, uint32_t id, uint32_t lod)
 	    ConstantU32(state, 0xfu));
 	const auto base_f32 = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), base_f32, base_level);
+	// The query LOD is relative to the view's base level (T# BASE_LEVEL); report absolute mips.
 	const auto absolute = Binary(state, spv::OpFAdd, TypeF32(state), lod, base_f32);
 	const auto clamped  = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
@@ -601,11 +605,30 @@ uint32_t EmitMipStatsFinestLevel(EmitterState& state, uint32_t id, uint32_t lod)
 	                          GLSLstd450Floor, clamped);
 	const auto level = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), level, floored);
-	const auto finest = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformUMin, TypeU32(state), finest,
+	MipStatsSample sample;
+	sample.finest = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformUMin, TypeU32(state), sample.finest,
 	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
 	                          level);
-	return finest;
+	// Threshold in U4.8. Compared with the level clamped to 0..14, so that magnification (a LOD
+	// below 0) is not a MIN_LOD clamp of a texture whose MIN_LOD is 0.
+	const auto threshold_fixed = Binary(
+	    state, spv::OpBitwiseAnd, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), id, ConstantU32(state, 16)),
+	    ConstantU32(state, 0xfffu));
+	const auto threshold_f32 = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), threshold_f32, threshold_fixed);
+	const auto threshold = Binary(state, spv::OpFMul, TypeF32(state), threshold_f32,
+	                              ConstantF32Value(state, 1.0f / 256.0f));
+	const auto below = Binary(state, spv::OpFOrdLessThan, TypeBool(state), clamped, threshold);
+	const auto below_u32 = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), below_u32, below,
+	                          ConstantU32(state, 1), ConstantU32(state, 0));
+	sample.counted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformUMax, TypeU32(state), sample.counted,
+	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
+	                          below_u32);
+	return sample;
 }
 
 uint32_t MipStatsElement(EmitterState& state, uint32_t index) {
@@ -615,38 +638,14 @@ uint32_t MipStatsElement(EmitterState& state, uint32_t index) {
 	return pointer;
 }
 
-// KYTY_LOD_STATS_GATE (default): recording for an image whose T# has a counter (checked by the
-// caller, uniformly per draw). Per subgroup, one lane
-//  - issues the finest-level AtomicUMin only when a relaxed atomic load shows a larger value.
-//    The finest words only ever decrease between resets (UMin is the only writer; the resets
-//    are transfer fills ordered before and after every draw by pipeline barriers), so a value
-//    at or below `finest` stays at or below it and the skipped UMin would not change the word.
-//    A stale larger value just issues the UMin as before.
-//  - adds 1 to the sample count, unchanged (one per subgroup and sample instruction).
-// Images without a counter recorded into entry 256, which the host never reads; they now record
-// nothing.
-void EmitGatedMipStatsRecord(EmitterState& state, uint32_t id, uint32_t lod) {
-	const auto counter =
-	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 0xffu));
-	const auto finest  = EmitMipStatsFinestLevel(state, id, lod);
-	const auto elected = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformElect, TypeBool(state), elected,
-	                          ConstantU32(state, spv::ScopeSubgroup));
-	EmitIfCondition(state, elected, [&]() {
-		const auto finest_pointer = MipStatsElement(state, counter);
-		const auto current        = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), current, finest_pointer,
-		                          ConstantU32(state, spv::ScopeDevice),
-		                          ConstantU32(state, spv::MemorySemanticsMaskNone));
-		const auto lower = Binary(state, spv::OpULessThan, TypeBool(state), finest, current);
-		EmitIfCondition(state, lower, [&]() {
-			const auto min_result = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpAtomicUMin, TypeU32(state), min_result, finest_pointer,
-			                          ConstantU32(state, spv::ScopeDevice),
-			                          ConstantU32(state, spv::MemorySemanticsMaskNone), finest);
-		});
+// Adds 1 to entry `index`'s count when a lane of the subgroup counted (one per subgroup and
+// sample instruction; the guest only tests the count for zero).
+void EmitMipStatsCount(EmitterState& state, uint32_t index, uint32_t counted) {
+	const auto any =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), counted, ConstantU32(state, 0));
+	EmitIfCondition(state, any, [&]() {
 		const auto count_index =
-		    Binary(state, spv::OpIAdd, TypeU32(state), counter, ConstantU32(state, MipStatsEntries));
+		    Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, MipStatsEntries));
 		const auto add_result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), add_result,
 		                          MipStatsElement(state, count_index),
@@ -656,15 +655,48 @@ void EmitGatedMipStatsRecord(EmitterState& state, uint32_t id, uint32_t lod) {
 	});
 }
 
+// KYTY_LOD_STATS_GATE (default): recording for an image whose T# has a counter (checked by the
+// caller, uniformly per draw). Per subgroup, one lane
+//  - issues the finest-level AtomicUMin only when a relaxed atomic load shows a larger value.
+//    The finest words only ever decrease between resets (UMin is the only writer; the resets
+//    are transfer fills ordered before and after every draw by pipeline barriers), so a value
+//    at or below `finest` stays at or below it and the skipped UMin would not change the word.
+//    A stale larger value just issues the UMin as before.
+//  - adds 1 to the count when a lane counted (EmitMipStatsCount).
+// Images without a counter recorded into entry 256, which the host never reads; they now record
+// nothing.
+void EmitGatedMipStatsRecord(EmitterState& state, uint32_t id, uint32_t lod) {
+	const auto counter =
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 0xffu));
+	const auto sample  = EmitMipStatsSample(state, id, lod);
+	const auto elected = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformElect, TypeBool(state), elected,
+	                          ConstantU32(state, spv::ScopeSubgroup));
+	EmitIfCondition(state, elected, [&]() {
+		const auto finest_pointer = MipStatsElement(state, counter);
+		const auto current        = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), current, finest_pointer,
+		                          ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+		const auto lower =
+		    Binary(state, spv::OpULessThan, TypeBool(state), sample.finest, current);
+		EmitIfCondition(state, lower, [&]() {
+			const auto min_result = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAtomicUMin, TypeU32(state), min_result, finest_pointer,
+			                          ConstantU32(state, spv::ScopeDevice),
+			                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+			                          sample.finest);
+		});
+		EmitMipStatsCount(state, counter, sample.counted);
+	});
+}
+
 void EmitMipStatsRecord(EmitterState& state, uint32_t resource, uint32_t lod) {
 	if (state.mip_stats_variable == 0 || resource >= state.program.bindings.mip_stats_count) {
 		return;
 	}
 	constexpr uint32_t Entries = MipStatsEntries;
-	state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
-	state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	const auto id = LoadMipStatsId(state, resource);
-	// 16-bit field: counter id in bits 0..7, T# BASE_LEVEL in bits 8..11, bit 15 = no counter.
 	const auto disabled = Binary(state, spv::OpBitwiseAnd, TypeU32(state), id,
 	                             ConstantU32(state, 0x8000u));
 	const auto has_counter =
@@ -674,51 +706,16 @@ void EmitMipStatsRecord(EmitterState& state, uint32_t resource, uint32_t lod) {
 	const auto slot = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelect, TypeU32(state), slot, has_counter, counter,
 	                          ConstantU32(state, Entries - 1u));
-	const auto base_level = Binary(
-	    state, spv::OpBitwiseAnd, TypeU32(state),
-	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), id, ConstantU32(state, 8)),
-	    ConstantU32(state, 0xfu));
-	const auto base_f32 = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), base_f32, base_level);
-	// The query LOD is relative to the view's base level (T# BASE_LEVEL); report absolute mips.
-	const auto absolute = Binary(state, spv::OpFAdd, TypeF32(state), lod, base_f32);
-
-	// Finest level this sample wanted: floor of the unclamped LOD, limited to 0..14.
-	const auto clamped = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
-	                          GLSLstd450FClamp, absolute, ConstantF32Value(state, 0.0f),
-	                          ConstantF32Value(state, 14.0f));
-	const auto floored = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floored, GlslStd450(state),
-	                          GLSLstd450Floor, clamped);
-	const auto level = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), level, floored);
-	const auto finest = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformUMin, TypeU32(state), finest,
-	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
-	                          level);
+	const auto sample  = EmitMipStatsSample(state, id, lod);
 	const auto elected = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformElect, TypeBool(state), elected,
 	                          ConstantU32(state, spv::ScopeSubgroup));
 	EmitIfCondition(state, elected, [&]() {
-		const auto Element = [&](uint32_t index) {
-			const auto pointer = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
-			                          pointer, state.mip_stats_variable, ConstantU32(state, 0),
-			                          index);
-			return pointer;
-		};
 		const auto min_result = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAtomicUMin, TypeU32(state), min_result, Element(slot),
-		                          ConstantU32(state, spv::ScopeDevice),
-		                          ConstantU32(state, spv::MemorySemanticsMaskNone), finest);
-		const auto count_index =
-		    Binary(state, spv::OpIAdd, TypeU32(state), slot, ConstantU32(state, Entries));
-		const auto add_result = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), add_result,
-		                          Element(count_index), ConstantU32(state, spv::ScopeDevice),
-		                          ConstantU32(state, spv::MemorySemanticsMaskNone),
-		                          ConstantU32(state, 1));
+		state.builder.AddFunction(spv::OpAtomicUMin, TypeU32(state), min_result,
+		                          MipStatsElement(state, slot), ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone), sample.finest);
+		EmitMipStatsCount(state, slot, sample.counted);
 	});
 }
 
