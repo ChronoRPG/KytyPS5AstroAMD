@@ -217,6 +217,8 @@ private:
 	void                                              ForgetKnownFillsLocked(uint64_t vaddr, uint64_t size);
 	mutable std::mutex                                m_known_fill_mutex;
 	std::vector<KnownFillRange>                       m_known_fills;
+	// m_known_fills is nonempty; written under m_known_fill_mutex, read without it.
+	std::atomic<bool>                                 m_has_known_fills {false};
 	const bool                                        m_bda_incremental_sync;
 	MemoryTracker                                     m_memory_tracker;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};

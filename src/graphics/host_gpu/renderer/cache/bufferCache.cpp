@@ -62,6 +62,27 @@ uint64_t SideReadbackWindow() {
 	return kib * 1024;
 }
 
+// Readback window of guest write faults on GPU-owned pages, in bytes: a power of two between
+// 4 KiB (only the faulting page) and 512 KiB (default, the read-drain window). Every page of the
+// window loses GPU ownership, so a smaller window downloads fewer bytes per fault but makes a
+// CPU writer walking a larger GPU-written range drain the GPU once per window instead.
+uint64_t WriteFaultWindow() {
+	static const uint64_t window = [] {
+		constexpr uint64_t Default = 512 * 1024;
+		const auto*        value   = std::getenv("KYTY_WRITE_FAULT_WINDOW_KB");
+		if (value == nullptr) {
+			return Default;
+		}
+		char*      end = nullptr;
+		const auto kib = std::strtoull(value, &end, 10);
+		if (end == value || *end != '\0' || kib < 4 || kib > 512 || (kib & (kib - 1)) != 0) {
+			return Default;
+		}
+		return kib * 1024;
+	}();
+	return window;
+}
+
 } // namespace
 
 // One side-copy readback: the exact GPU-dirty bytes of a tracker-page-aligned window, copied
@@ -493,7 +514,7 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
 	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
 	// Widen nearby CPU reads so they share one GPU drain.
-	constexpr uint64_t WindowSize   = 512 * 1024;
+	const uint64_t     WindowSize   = is_write ? WriteFaultWindow() : 512 * 1024;
 	const auto         buffer_begin = buffer.CpuAddress();
 	const auto         buffer_end   = buffer_begin + buffer.Size();
 	const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
@@ -1182,6 +1203,7 @@ void BufferCache::RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value)
 		m_known_fills.erase(m_known_fills.begin());
 	}
 	m_known_fills.push_back({vaddr, size, value});
+	m_has_known_fills.store(true, std::memory_order_release);
 }
 
 std::optional<uint32_t> BufferCache::KnownFill(uint64_t vaddr, uint64_t size) const {
@@ -1206,13 +1228,25 @@ std::optional<uint32_t> BufferCache::KnownFill(uint64_t vaddr, uint64_t size) co
 }
 
 void BufferCache::ForgetKnownFills(uint64_t vaddr, uint64_t size) {
+	// Every guest write fault and writable binding lands here; almost always nothing is known.
+	// A fill recorded concurrently with this check is ordered after this write either way.
+	if (!m_has_known_fills.load(std::memory_order_acquire)) {
+		return;
+	}
 	std::scoped_lock lock(m_known_fill_mutex);
 	ForgetKnownFillsLocked(vaddr, size);
 }
 
 void BufferCache::ForgetKnownFillsLocked(uint64_t vaddr, uint64_t size) {
 	// Keep the parts of each fill outside the written range.
-	const uint64_t              end = vaddr + size;
+	const uint64_t end      = vaddr + size;
+	const bool     overlaps = std::any_of(
+        m_known_fills.begin(), m_known_fills.end(), [vaddr, end](const KnownFillRange& fill) {
+            return vaddr < fill.address + fill.size && fill.address < end;
+        });
+	if (!overlaps) {
+		return;
+	}
 	std::vector<KnownFillRange> kept;
 	kept.reserve(m_known_fills.size() + 1);
 	for (const auto& fill: m_known_fills) {
@@ -1229,6 +1263,7 @@ void BufferCache::ForgetKnownFillsLocked(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	m_known_fills.swap(kept);
+	m_has_known_fills.store(!m_known_fills.empty(), std::memory_order_release);
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
