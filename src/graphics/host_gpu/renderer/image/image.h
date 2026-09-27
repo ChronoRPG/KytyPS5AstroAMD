@@ -349,6 +349,18 @@ public:
 		bool           valid    = false;
 	};
 	TexelSyncMark    texel_sync;
+	// Depth attachments (KYTY_DEPTH_FEEDBACK_KEEP, RenderExecutor::NoteDepthFeedback): the
+	// rendering instance this image is attached to with no attachment write since it began, the
+	// content serial at that point (0: none), and the last instance it was attached to at all.
+	uint64_t         feedback_instance = 0;
+	uint64_t         feedback_serial   = 0;
+	uint64_t         feedback_attached = 0;
+	// Replaces the tracked state without recording a barrier. Only for callers that proved no
+	// access pair of the old and new scopes can conflict (see KYTY_DEPTH_FEEDBACK_KEEP).
+	void AdoptState(vk::PipelineStageFlags2 stage, vk::AccessFlags2 access,
+	                vk::ImageLayout layout) noexcept {
+		backing.state = {stage, access, layout};
+	}
 
 private:
 	friend struct ImageTestAccess;

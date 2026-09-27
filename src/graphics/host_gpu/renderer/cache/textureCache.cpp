@@ -1904,6 +1904,12 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		}
 		// Resident levels only: the source holds the resident prefix (image.live) of the chain.
 		RestrictToResidentLevels(image, transfer);
+		// KYTY_TILER_IMAGE_DIRECT: detile straight into the image, no linear scratch and copy.
+		if (!transfer.tiles.empty() && !transfer.swap_bgra16 &&
+		    m_tiler.DetileToImage(destination, source.Handle(), source_offset, image.live.size,
+		                          transfer.LinearSize(), transfer.tiles, transfer.regions)) {
+			return;
+		}
 		TileManager::Result linear {source.Handle(), source_offset, image.live.size};
 		if (!transfer.tiles.empty()) {
 			linear = m_tiler.Detile(source.Handle(), source_offset, image.live.size,
@@ -2272,11 +2278,15 @@ TextureCache::PartialUploadResult TextureCache::TryPartialUpload(Image& image) {
 		tiled_offset   = offset;
 		tiled_capacity = packed_total;
 	}
-	const auto linear = m_tiler.Detile(tiled_buffer, tiled_offset, tiled_capacity, linear_total, tiles);
-	for (auto& region: regions) {
-		region.bufferOffset += linear.offset;
+	if (!m_tiler.DetileToImage(image, tiled_buffer, tiled_offset, tiled_capacity, linear_total,
+	                           tiles, regions)) {
+		const auto linear =
+		    m_tiler.Detile(tiled_buffer, tiled_offset, tiled_capacity, linear_total, tiles);
+		for (auto& region: regions) {
+			region.bufferOffset += linear.offset;
+		}
+		image.Upload(regions, linear.buffer, linear.offset, linear.size);
 	}
-	image.Upload(regions, linear.buffer, linear.offset, linear.size);
 	result.done        = true;
 	result.bytes       = tiled_bytes;
 	result.dirty_bytes = static_cast<uint64_t>(chunks.dirty_count) << chunks.shift;
@@ -2313,6 +2323,10 @@ bool TextureCache::TryAsyncFullUpload(Image& image) {
 	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureUploadBytesAsync, size);
 	m_staging_copier->Enqueue({{base, mapped, size}}, &staging, offset, size);
 	// The detile barrier includes host writes; the submission waits for the copy on the GPU.
+	if (m_tiler.DetileToImage(image, staging.Handle(), offset, size, transfer.LinearSize(),
+	                          transfer.tiles, transfer.regions)) {
+		return true;
+	}
 	const auto linear =
 	    m_tiler.Detile(staging.Handle(), offset, size, transfer.LinearSize(), transfer.tiles);
 	for (auto& region: transfer.regions) {
@@ -3461,6 +3475,12 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 		return;
 	}
 
+	// KYTY_TILER_IMAGE_DIRECT: tile straight from the image, no image->buffer copy.
+	if (transform == TileManager::ColorTransform::None &&
+	    m_tiler.TileFromImage(image, texture.regions, destination.Handle(), destination_offset,
+	                          destination_size, texture.LinearSize(), texture.tiles)) {
+		return;
+	}
 	m_tiler.TileImage(image, texture.regions, destination.Handle(), destination_offset,
 	                  destination_size, texture.LinearSize(), texture.tiles, transform);
 }

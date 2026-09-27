@@ -1449,6 +1449,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			} else if (image.binding.is_target) {
 				const auto layout = image.binding.attachment_layout;
 				EXIT_IF(layout == vk::ImageLayout::eUndefined);
+				Profiler::CountFrameEvent(image.info.IsDepth()
+				                              ? Profiler::FrameEvent::SampledDepthAttachmentBindings
+				                              : Profiler::FrameEvent::SampledColorAttachmentBindings);
 				if (image.info.IsDepth()) {
 					const auto host_view =
 					    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);

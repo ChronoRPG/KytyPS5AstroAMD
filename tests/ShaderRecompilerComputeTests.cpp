@@ -643,6 +643,14 @@ struct RenderExecutorTestAccess {
     executor.ResetBindings();
   }
 
+  // What ExecutePreparedDraw does right after BeginRendering (KYTY_DEPTH_FEEDBACK_KEEP).
+  static void NoteDepthFeedback(RenderExecutor &executor,
+                                const CommandBuffer &buffer) {
+    if (executor.m_depth_feedback.valid) {
+      executor.NoteDepthFeedback(buffer);
+    }
+  }
+
   static bool BoundImagesInOrder(const RenderExecutor &executor, ImageId first,
                                  ImageId second) {
     return executor.m_bound_images.size() == 2 &&
@@ -10747,6 +10755,196 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // KYTY_DEPTH_FEEDBACK_KEEP: draws of one rendering instance that sample their read-only depth
+  // attachment continue the instance (no access toggle barrier); a depth write, a load clear or
+  // the end of the instance restores the ordering.
+  void CheckDepthFeedbackKeep() {
+    constexpr const char *name = "DepthFeedbackKeep";
+    constexpr uintptr_t base = 0x0000000205800000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+    Require(name, "switch", DepthFeedbackKeepEnabled(),
+            "KYTY_DEPTH_FEEDBACK_KEEP is disabled in the test environment");
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    context.InitializeGpu(nullptr);
+    scheduler.Begin(registers, user_config, shaders);
+    auto &texture_cache = context.GetTextureCache();
+    auto &executor = context.GetRenderExecutor();
+    context.MapMemory(base, allocation_size);
+    std::vector<PipelineCache::Pipeline> descriptor_pipelines;
+
+    ShaderRecompiler::IR::Program sampled_program{};
+    sampled_program.stage = ShaderType::Pixel;
+    sampled_program.resource_tracking_complete = true;
+    ShaderRecompiler::IR::ImageResource sampled_resource{};
+    sampled_resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+    sampled_resource.numeric_class = Prospero::TextureNumericClass::Float;
+    sampled_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    sampled_resource.read = true;
+    sampled_program.info.images.push_back(sampled_resource);
+    sampled_program.shader_info_complete = true;
+    ShaderRecompiler::IR::AllocateBindings(sampled_program);
+    ShaderRecompiler::IR::ResourceSnapshot sampled_snapshot{};
+    ShaderRecompiler::IR::DescriptorValue sampled_descriptor{};
+    sampled_descriptor.dword_count = 8;
+    sampled_snapshot.images.push_back(sampled_descriptor);
+    ShaderRecompiler::IR::CompiledShaderInfo sampled_info{};
+    sampled_info.stage = sampled_program.stage;
+    sampled_info.info = std::move(sampled_program.info);
+    sampled_info.bindings = std::move(sampled_program.bindings);
+    ShaderStageRuntime sampled_runtime{&sampled_info, &sampled_snapshot};
+
+    ImageDesc depth_desc{};
+    depth_desc.type = BindingType::DepthTarget;
+    depth_desc.info.data = {base + 0x10000, 4 * 4 * sizeof(float)};
+    depth_desc.info.pixel_format = vk::Format::eD32Sfloat;
+    depth_desc.info.guest_format = Prospero::BufferFormat::k32Float;
+    depth_desc.info.type = Prospero::ImageType::kColor2D;
+    depth_desc.info.extent = {4, 4, 1};
+    depth_desc.info.resources = {1, 1};
+    depth_desc.info.pitch = 4;
+    depth_desc.info.bytes_per_block = 4;
+    depth_desc.info.samples = 1;
+    depth_desc.info.tile_mode = Prospero::TileMode::kLinear;
+    depth_desc.info.mip_layout[0] = {0, 64, 4, 4};
+    depth_desc.view_info.format = vk::Format::eD32Sfloat;
+    depth_desc.view_info.type = vk::ImageViewType::e2D;
+    depth_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+    depth_desc.view_info.level_count = 1;
+    depth_desc.view_info.layer_count = 1;
+    depth_desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    const auto depth_id = texture_cache.FindImage(depth_desc);
+    auto sampled_desc = depth_desc;
+    sampled_desc.type = BindingType::Texture;
+    sampled_desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+    const auto sampled_view = texture_cache.FindTexture(depth_id, sampled_desc);
+    Require(name, "sampled view", sampled_view != nullptr, "no sampled depth view");
+
+    // One draw: attach the depth target (writes or not), sample it, begin its instance.
+    const auto draw = [&](bool depth_write, bool sample, bool load_clear = false) {
+      RenderDepthInfo depth{};
+      depth.desc = depth_desc;
+      depth.image_id = depth_id;
+      depth.depth_test_enable = true;
+      depth.depth_write_enable = depth_write;
+      depth.depth_clear_enable = load_clear;
+      depth.depth_compare_op = vk::CompareOp::eLessOrEqual;
+      PreparedBindings binding{};
+      binding.runtime = &sampled_runtime;
+      if (sample) {
+        binding.images.push_back({depth_id, sampled_view, sampled_desc});
+      }
+      RenderExecutorTestAccess::BindRenderTarget(executor, depth_id);
+      std::array<PreparedBindings *, 1> stages{&binding};
+      RenderColorInfo no_color{};
+      const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &no_color, 0, depth,
+          sample ? std::span<PreparedBindings *const>(stages)
+                 : std::span<PreparedBindings *const>{});
+      if (sample) {
+        descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+            executor, scheduler.Current(), binding));
+      }
+      scheduler.BeginRendering(rendering);
+      RenderExecutorTestAccess::NoteDepthFeedback(executor, scheduler.Current());
+      RenderExecutorTestAccess::ResetBindings(executor);
+      return scheduler.Current().ActiveRenderingSerial();
+    };
+    const auto &image = texture_cache.GetImage(depth_id);
+    const auto sampled_access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                                vk::AccessFlagBits2::eShaderRead;
+
+    const auto first = draw(false, true);
+    const auto second = draw(false, true);
+    const auto third = draw(false, false);
+    const auto fourth = draw(false, true);
+    Require(name, "read-only sampling continues the instance",
+            first != 0 && second == first && third == first && fourth == first &&
+                image.backing.state.access_mask == sampled_access &&
+                scheduler.Current().PendingImageBarriers() == 0,
+            "sampling draws of an unwritten depth attachment split the instance");
+
+    const auto writing = draw(true, false);
+    const auto after_write = draw(false, true);
+    const auto after_write_again = draw(false, true);
+    Require(name, "a depth write orders later sampling",
+            writing != first && after_write != writing &&
+                after_write_again == after_write,
+            "sampling after a depth write shared the writing instance, or read-only "
+            "sampling after it split again");
+
+    // A load clear writes the attachment like a depth write does.
+    const auto clearing = draw(false, true, true);
+    const auto after_clear = draw(false, true);
+    const auto after_clear_again = draw(false, true);
+    Require(name, "a load clear orders later sampling",
+            clearing != after_write && after_clear != clearing &&
+                after_clear_again == after_clear,
+            "sampling after a load clear shared the clearing instance");
+
+    // Any other content change since the proof (what an upload, copy or clear records) makes
+    // the next sampling draw of the same instance order after it.
+    texture_cache.GetImage(depth_id).NoteContentWrite();
+    const auto after_content = draw(false, true);
+    const auto after_content_again = draw(false, true);
+    Require(name, "a content change orders later sampling",
+            after_content != after_clear && after_content_again == after_content,
+            "a sampling draw after a content change kept the unchanged-contents proof");
+
+    // The keep is taken inside the active instance; ending that instance before the next one
+    // begins must queue the left-out ordering for the image.
+    {
+      RenderDepthInfo depth{};
+      depth.desc = depth_desc;
+      depth.image_id = depth_id;
+      depth.depth_test_enable = true;
+      depth.depth_compare_op = vk::CompareOp::eLessOrEqual;
+      PreparedBindings binding{};
+      binding.runtime = &sampled_runtime;
+      binding.images.push_back({depth_id, sampled_view, sampled_desc});
+      RenderExecutorTestAccess::BindRenderTarget(executor, depth_id);
+      std::array<PreparedBindings *, 1> stages{&binding};
+      RenderColorInfo no_color{};
+      (void)RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &no_color, 0, depth, stages);
+      descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+          executor, scheduler.Current(), binding));
+      const size_t pending_before = scheduler.Current().PendingImageBarriers();
+      scheduler.Current().EndRendering();
+      Require(name, "ended instance queues the ordering",
+              pending_before == 0 && scheduler.Current().PendingImageBarriers() == 1,
+              "ending the instance after a kept depth access queued no barrier");
+      scheduler.Current().FlushBarriers();
+      RenderExecutorTestAccess::ResetBindings(executor);
+    }
+    scheduler.Finish();
+    RenderExecutorTestAccess::DestroyDescriptorPipelines(executor, descriptor_pipelines);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
@@ -16398,6 +16596,506 @@ public:
                 case_index, format_cases);
   }
 
+  // KYTY_TILER_IMAGE_DIRECT: TileManager::DetileToImage / TileFromImage must leave exactly the
+  // bytes the buffer paths leave (Detile + Image::Upload, TileImage): image texels compared
+  // through a buffer->image readback, tiled bytes compared over the whole range including the
+  // bytes no element covers. Also checks partial-band regions and the fallback rules.
+  void CheckTilerImageDirect() {
+    constexpr const char *name = "TilerImageDirect";
+    EnsureRuntimeContext();
+    CommandScheduler scheduler(Renderer(), m_runtime_context,
+                               CommandScheduler::Role::Guest);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    StreamBuffer parameters(m_runtime_context, scheduler, MemoryUsage::Stream,
+                            1u << 20);
+    TileManager tile_manager(m_runtime_context, scheduler, parameters);
+    Require(name, "switch", TileManager::ImageDirectEnabled(),
+            "KYTY_TILER_IMAGE_DIRECT is disabled in the test environment");
+    const bool downloads = m_runtime_context.storage_image_read_without_format_enabled;
+
+    const auto fill = [](std::vector<u32> *words, u32 salt) {
+      for (size_t i = 0; i < words->size(); i++) {
+        uint64_t value = i * 0x9e3779b97f4a7c15ull + salt;
+        value = (value ^ (value >> 31u)) * 0xbf58476d1ce4e5b9ull;
+        (*words)[i] = static_cast<u32>(value >> 29u);
+      }
+    };
+    const auto read_back = [&](Libs::Graphics::Image &image,
+                               std::span<const vk::BufferImageCopy> regions,
+                               uint64_t linear_size) {
+      const uint64_t words = (linear_size + 3u) / 4u;
+      auto readback = CreateHostBuffer(
+          name, words * sizeof(u32), AllFlags,
+          std::vector<u32>(static_cast<size_t>(words), 0xcdcdcdcdu));
+      image.Download(regions, readback.buffer, 0, readback.size);
+      vk::BufferMemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = readback.buffer;
+      barrier.offset = 0;
+      barrier.size = VK_WHOLE_SIZE;
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eAllCommands,
+          vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0,
+          nullptr);
+      scheduler.Finish();
+      auto texels = ReadBuffer(name, readback, static_cast<size_t>(words));
+      DestroyBuffer(&readback);
+      return texels;
+    };
+    const auto host_barrier = [&](vk::Buffer buffer) {
+      vk::BufferMemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = buffer;
+      barrier.offset = 0;
+      barrier.size = VK_WHOLE_SIZE;
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eAllCommands,
+          vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0,
+          nullptr);
+    };
+
+    // One parity check: upload (direct vs buffer path) of `tiled`, then download of the
+    // direct image back into two tiled buffers (direct vs TileImage).
+    u32 checked = 0;
+    const auto check = [&](const std::string &label, const ImageInfo &info,
+                           const std::vector<u32> &tiled_words,
+                           std::span<const GpuTileInfo> infos,
+                           std::span<const vk::BufferImageCopy> regions,
+                           uint64_t linear_size) {
+      const uint64_t tiled_size = tiled_words.size() * sizeof(u32);
+      auto tiled = CreateHostBuffer(name, tiled_size, AllFlags, tiled_words);
+      Libs::Graphics::Image direct(m_runtime_context, scheduler, info);
+      Libs::Graphics::Image buffered(m_runtime_context, scheduler, info);
+      Require(name, (label + " eligible").c_str(),
+              tile_manager.DetileToImage(direct, tiled.buffer, 0, tiled_size,
+                                         linear_size, infos, regions),
+              "the direct upload declined an eligible image");
+      const auto linear = tile_manager.Detile(tiled.buffer, 0, tiled_size,
+                                              linear_size, infos);
+      std::vector<vk::BufferImageCopy> copies(regions.begin(), regions.end());
+      for (auto &copy : copies) {
+        copy.bufferOffset += linear.offset;
+      }
+      buffered.Upload(copies, linear.buffer, linear.offset, linear.size);
+      const auto direct_texels = read_back(direct, regions, linear_size);
+      const auto buffered_texels = read_back(buffered, regions, linear_size);
+      if (direct_texels != buffered_texels) {
+        const auto mismatch = std::mismatch(direct_texels.begin(),
+                                            direct_texels.end(),
+                                            buffered_texels.begin());
+        std::ostringstream out;
+        out << "first differing dword " << (mismatch.first - direct_texels.begin())
+            << " of " << direct_texels.size();
+        Fail(name, (label + " upload texels").c_str(), out.str());
+      }
+      if (downloads) {
+        std::vector<u32> prefill(tiled_words.size());
+        fill(&prefill, 0x5a5a0000u + checked);
+        auto direct_tiled = CreateHostBuffer(name, tiled_size, AllFlags, prefill);
+        auto buffered_tiled = CreateHostBuffer(name, tiled_size, AllFlags, prefill);
+        Require(name, (label + " download eligible").c_str(),
+                tile_manager.TileFromImage(direct, regions, direct_tiled.buffer, 0,
+                                           tiled_size, linear_size, infos),
+                "the direct download declined an eligible image");
+        tile_manager.TileImage(direct, regions, buffered_tiled.buffer, 0,
+                               tiled_size, linear_size, infos);
+        host_barrier(direct_tiled.buffer);
+        host_barrier(buffered_tiled.buffer);
+        scheduler.Finish();
+        const auto direct_bytes = ReadBuffer(name, direct_tiled, tiled_words.size());
+        const auto buffered_bytes =
+            ReadBuffer(name, buffered_tiled, tiled_words.size());
+        if (direct_bytes != buffered_bytes) {
+          const auto mismatch = std::mismatch(direct_bytes.begin(),
+                                              direct_bytes.end(),
+                                              buffered_bytes.begin());
+          std::ostringstream out;
+          out << "first differing dword " << (mismatch.first - direct_bytes.begin())
+              << " of " << direct_bytes.size();
+          Fail(name, (label + " download bytes").c_str(), out.str());
+        }
+        DestroyBuffer(&buffered_tiled);
+        DestroyBuffer(&direct_tiled);
+      }
+      scheduler.Finish();
+      DestroyBuffer(&tiled);
+      ++checked;
+    };
+
+    struct Case {
+      const char *label;
+      Prospero::BufferFormat guest;
+      vk::Format host;
+      Prospero::TileMode tile;
+      u32 width, height, levels, layers;
+      bool depth_tile;
+    };
+    const Case cases[] = {
+        {"rt rgba16f layers", Prospero::BufferFormat::k16_16_16_16Float,
+         vk::Format::eR16G16B16A16Sfloat, Prospero::TileMode::kRenderTarget, 97,
+         61, 1, 2, true},
+        {"rt rg8", Prospero::BufferFormat::k16UNorm, vk::Format::eR8G8Unorm,
+         Prospero::TileMode::kRenderTarget, 130, 70, 1, 1, true},
+        {"rt r8", Prospero::BufferFormat::k8UNorm, vk::Format::eR8Unorm,
+         Prospero::TileMode::kRenderTarget, 70, 33, 1, 1, true},
+        {"rt r32f", Prospero::BufferFormat::k32Float, vk::Format::eR32Sfloat,
+         Prospero::TileMode::kRenderTarget, 129, 65, 1, 3, true},
+        {"std64 rgba8 mips", Prospero::BufferFormat::k8_8_8_8UNorm,
+         vk::Format::eR8G8B8A8Unorm, Prospero::TileMode::kStandard64KB, 256, 256,
+         9, 1, false},
+        {"std4 rgba32f mips", Prospero::BufferFormat::k32_32_32_32Float,
+         vk::Format::eR32G32B32A32Sfloat, Prospero::TileMode::kStandard4KB, 67, 51,
+         3, 1, false},
+        {"std256 r8 mips", Prospero::BufferFormat::k8UNorm, vk::Format::eR8Unorm,
+         Prospero::TileMode::kStandard256B, 67, 51, 2, 1, false},
+        {"prt rgba16f mips", Prospero::BufferFormat::k16_16_16_16Float,
+         vk::Format::eR16G16B16A16Sfloat, Prospero::TileMode::kPrt, 300, 200, 4, 1,
+         false},
+        {"depth-tiled r32f layers", Prospero::BufferFormat::k32Float,
+         vk::Format::eR32Sfloat, Prospero::TileMode::kDepth, 129, 65, 1, 3, true},
+    };
+    u32 salt = 1;
+    for (const auto &c : cases) {
+      if (!TextureUploadLayoutSupported(c.guest, c.width, c.height, c.levels,
+                                        c.layers, c.tile, c.depth_tile, false)) {
+        Fail(name, c.label, "the case's layout is not supported");
+      }
+      TileSizeAlign total{};
+      TileGetTextureTotalSize(c.guest, c.width, c.height, c.layers, c.levels,
+                              c.tile, false, total);
+      const auto layout =
+          TextureCalcUploadLayout(c.guest, c.width, c.height, c.levels, c.layers,
+                                  c.tile, total.size, c.depth_tile, false, name);
+      const auto regions = TextureBuildImageCopies(layout);
+      std::vector<GpuTileInfo> infos;
+      Require(name, c.label,
+              TextureBuildGpuTileInfos(total.size, regions, layout, c.levels,
+                                       infos) &&
+                  infos.size() == regions.size(),
+              "no tile infos for the case");
+      uint64_t linear_size = 0;
+      for (const auto &info : infos) {
+        linear_size = std::max(linear_size, info.linear_offset + info.linear_size);
+      }
+      ImageInfo info{};
+      info.pixel_format = c.host;
+      info.guest_format = c.guest;
+      info.type = Prospero::ImageType::kColor2D;
+      info.extent = {c.width, c.height, 1};
+      info.resources = {c.levels, c.layers};
+      info.pitch = layout.pitch;
+      info.bytes_per_block = infos.front().bytes_per_element;
+      info.samples = 1;
+      info.tile_mode = c.tile;
+      std::vector<u32> tiled((total.size + 3u) / 4u);
+      fill(&tiled, salt++);
+      check(c.label, info, tiled, infos, regions, linear_size);
+
+      // A partial band (TextureCache::TryPartialUpload): block rows [1, 3) of level 0,
+      // placed at a nonzero image row.
+      TileBlockLayout block{};
+      const auto &tile0 = infos.front();
+      const bool bands = c.tile != Prospero::TileMode::kRenderTarget &&
+                         c.tile != Prospero::TileMode::kDepth && !tile0.tail &&
+                         TileGetBlockLayout(tile0.family, tile0.bytes_per_element,
+                                            block) &&
+                         tile0.height > 3 * block.block_height;
+      if (bands) {
+        const u32 tiled_width = tile0.tiled_width != 0 ? tile0.tiled_width : tile0.pitch;
+        const uint64_t row_bytes =
+            static_cast<uint64_t>((tiled_width + block.block_width - 1) /
+                                  block.block_width) *
+            block.block_size;
+        GpuTileInfo band = tile0;
+        band.tiled_offset = tile0.tiled_offset + row_bytes;
+        band.tiled_size = 2 * row_bytes;
+        band.height = 2 * block.block_height;
+        band.tiled_height = 2 * block.block_height;
+        band.linear_offset = 0;
+        band.linear_size = static_cast<uint64_t>(band.height) * tile0.pitch *
+                           tile0.bytes_per_element;
+        auto band_region = regions.front();
+        band_region.bufferOffset = 0;
+        band_region.imageOffset.y = static_cast<int32_t>(block.block_height);
+        band_region.imageExtent.height = band.height;
+        std::vector<u32> band_tiled((total.size + 3u) / 4u);
+        fill(&band_tiled, salt++);
+        check(std::string(c.label) + " band", info, band_tiled,
+              std::span<const GpuTileInfo>(&band, 1),
+              std::span<const vk::BufferImageCopy>(&band_region, 1),
+              band.linear_size);
+      }
+    }
+
+    // Fallbacks: block-compressed images have no storage usage; a transfer whose element
+    // size differs from the texel size is declined.
+    {
+      constexpr auto format = Prospero::BufferFormat::kBc1UNorm;
+      TileSizeAlign total{};
+      TileGetTextureTotalSize(format, 64, 64, 1, 1,
+                              Prospero::TileMode::kStandard64KB, false, total);
+      const auto layout =
+          TextureCalcUploadLayout(format, 64, 64, 1, 1,
+                                  Prospero::TileMode::kStandard64KB, total.size,
+                                  false, false, name);
+      const auto regions = TextureBuildImageCopies(layout);
+      std::vector<GpuTileInfo> infos;
+      Require(name, "bc1 infos",
+              TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos),
+              "no BC1 tile infos");
+      ImageInfo info{};
+      info.pixel_format = vk::Format::eBc1RgbaUnormBlock;
+      info.guest_format = format;
+      info.type = Prospero::ImageType::kColor2D;
+      info.extent = {64, 64, 1};
+      info.resources = {1, 1};
+      info.pitch = layout.pitch;
+      info.bytes_per_block = 8;
+      info.samples = 1;
+      info.tile_mode = Prospero::TileMode::kStandard64KB;
+      Libs::Graphics::Image bc1(m_runtime_context, scheduler, info);
+      auto tiled = CreateHostBuffer(name, (total.size + 3u) & ~uint64_t{3u}, AllFlags,
+                                    std::vector<u32>((total.size + 3u) / 4u, 0));
+      Require(name, "bc1 fallback",
+              !tile_manager.DetileToImage(bc1, tiled.buffer, 0, total.size,
+                                          total.size, infos, regions),
+              "a block-compressed image took the direct path");
+
+      ImageInfo wide = info;
+      wide.pixel_format = vk::Format::eR32G32B32A32Sfloat;
+      wide.guest_format = Prospero::BufferFormat::k32_32_32_32Float;
+      wide.bytes_per_block = 16;
+      Libs::Graphics::Image rgba32(m_runtime_context, scheduler, wide);
+      Require(name, "size mismatch fallback",
+              !tile_manager.DetileToImage(rgba32, tiled.buffer, 0, total.size,
+                                          total.size, infos, regions),
+              "an 8-byte element transfer wrote a 16-byte texel image");
+      scheduler.Finish();
+      DestroyBuffer(&tiled);
+    }
+    std::printf("[gpu]     %-32s ok (%u parity checks, downloads %s)\n", name,
+                checked, downloads ? "checked" : "unsupported");
+  }
+
+  // --tiler-image-bench: GPU time per 1920x1080 render-target upload and download, buffer path
+  // (Detile + buffer->image copy; image->buffer copy + tile pass, with their barriers) versus
+  // the direct path (KYTY_TILER_IMAGE_DIRECT). Timing only; parity is CheckTilerImageDirect.
+  void BenchTilerImageDirect() {
+    constexpr const char *name = "TilerImageBench";
+    EnsureRuntimeContext();
+    CommandScheduler scheduler(Renderer(), m_runtime_context,
+                               CommandScheduler::Role::Guest);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    StreamBuffer parameters(m_runtime_context, scheduler, MemoryUsage::Stream,
+                            4u << 20);
+    TileManager tile_manager(m_runtime_context, scheduler, parameters);
+    const double period =
+        m_runtime_context.physical_device_properties.limits.timestampPeriod;
+    vk::QueryPoolCreateInfo query_info{};
+    query_info.queryType = vk::QueryType::eTimestamp;
+    query_info.queryCount = 8;
+    vk::QueryPool pool = nullptr;
+    RequireVk(name, "query pool",
+              m_device.createQueryPool(&query_info, nullptr, &pool),
+              "vkCreateQueryPool");
+    struct Case {
+      const char *label;
+      Prospero::BufferFormat transfer;
+      vk::Format host;
+    };
+    const Case cases[] = {
+        {"rgba16f", Prospero::BufferFormat::k16_16_16_16Float,
+         vk::Format::eR16G16B16A16Sfloat},
+        {"r11g11b10", Prospero::BufferFormat::k32Float,
+         vk::Format::eB10G11R11UfloatPack32},
+        {"rg8", Prospero::BufferFormat::k16UNorm, vk::Format::eR8G8Unorm},
+    };
+    constexpr u32 width = 1920, height = 1080, iterations = 16;
+    for (const auto &c : cases) {
+      TileSizeAlign total{};
+      TileGetTextureTotalSize(c.transfer, width, height, 1, 1,
+                              Prospero::TileMode::kRenderTarget, false, total);
+      const auto layout =
+          TextureCalcUploadLayout(c.transfer, width, height, 1, 1,
+                                  Prospero::TileMode::kRenderTarget, total.size,
+                                  true, false, name);
+      const auto regions = TextureBuildImageCopies(layout);
+      std::vector<GpuTileInfo> infos;
+      Require(name, c.label,
+              TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos),
+              "no tile infos");
+      uint64_t linear_size = 0;
+      for (const auto &info : infos) {
+        linear_size = std::max(linear_size, info.linear_offset + info.linear_size);
+      }
+      const uint64_t tiled_size = (total.size + 3u) & ~uint64_t{3u};
+      auto tiled = CreateDeviceBuffer(name, tiled_size, AllFlags);
+      ImageInfo info{};
+      info.pixel_format = c.host;
+      info.guest_format = c.transfer;
+      info.type = Prospero::ImageType::kColor2D;
+      info.extent = {width, height, 1};
+      info.resources = {1, 1};
+      info.pitch = layout.pitch;
+      info.bytes_per_block = infos.front().bytes_per_element;
+      info.samples = 1;
+      info.tile_mode = Prospero::TileMode::kRenderTarget;
+      Libs::Graphics::Image image(m_runtime_context, scheduler, info);
+      const auto buffer_upload = [&] {
+        const auto linear = tile_manager.Detile(tiled.buffer, 0, tiled_size,
+                                                linear_size, infos);
+        std::vector<vk::BufferImageCopy> copies(regions.begin(), regions.end());
+        for (auto &copy : copies) {
+          copy.bufferOffset += linear.offset;
+        }
+        image.Upload(copies, linear.buffer, linear.offset, linear.size);
+      };
+      const auto direct_upload = [&] {
+        Require(name, c.label,
+                tile_manager.DetileToImage(image, tiled.buffer, 0, tiled_size,
+                                           linear_size, infos, regions),
+                "direct upload declined");
+      };
+      const auto buffer_download = [&] {
+        tile_manager.TileImage(image, regions, tiled.buffer, 0, tiled_size,
+                               linear_size, infos);
+      };
+      const auto direct_download = [&] {
+        Require(name, c.label,
+                tile_manager.TileFromImage(image, regions, tiled.buffer, 0,
+                                           tiled_size, linear_size, infos),
+                "direct download declined");
+      };
+      // Warm up pipelines, views and scratch pools.
+      buffer_upload();
+      direct_upload();
+      buffer_download();
+      direct_download();
+      scheduler.Finish();
+      const std::array<std::function<void()>, 4> runs{
+          buffer_upload, direct_upload, buffer_download, direct_download};
+      std::array<double, 4> us{};
+      for (size_t run = 0; run < runs.size(); ++run) {
+        auto command = scheduler.Current().Handle();
+        command.resetQueryPool(pool, 0, 2);
+        command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, 0);
+        for (u32 i = 0; i < iterations; ++i) {
+          runs[run]();
+        }
+        scheduler.Current().Handle().writeTimestamp2(
+            vk::PipelineStageFlagBits2::eAllCommands, pool, 1);
+        scheduler.Finish();
+        std::array<uint64_t, 2> stamps{};
+        RequireVk(name, "timestamps",
+                  m_device.getQueryPoolResults(
+                      pool, 0, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+                      vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                  "vkGetQueryPoolResults");
+        us[run] = static_cast<double>(stamps[1] - stamps[0]) * period / 1000.0 /
+                  iterations;
+      }
+      std::printf("[gpu]     %-32s %-10s upload buffer %8.1f us direct %8.1f us | "
+                  "download buffer %8.1f us direct %8.1f us\n",
+                  name, c.label, us[0], us[1], us[2], us[3]);
+      DestroyBuffer(&tiled);
+    }
+
+    // Block-compressed textures only have the buffer path: detile alone against detile plus
+    // the buffer->image copy shows what the copy costs for them.
+    struct BlockCase {
+      const char *label;
+      Prospero::BufferFormat format;
+      vk::Format host;
+      u32 block_bytes;
+    };
+    const BlockCase block_cases[] = {
+        {"bc7 2048", Prospero::BufferFormat::kBc7UNorm, vk::Format::eBc7UnormBlock, 16},
+        {"bc1 2048", Prospero::BufferFormat::kBc1UNorm, vk::Format::eBc1RgbaUnormBlock, 8},
+    };
+    for (const auto &c : block_cases) {
+      constexpr u32 side = 2048;
+      constexpr auto tile = Prospero::TileMode::kStandard64KB;
+      TileSizeAlign total{};
+      TileGetTextureTotalSize(c.format, side, side, 1, 1, tile, false, total);
+      const auto layout = TextureCalcUploadLayout(c.format, side, side, 1, 1, tile,
+                                                  total.size, false, false, name);
+      const auto regions = TextureBuildImageCopies(layout);
+      std::vector<GpuTileInfo> infos;
+      Require(name, c.label,
+              TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos),
+              "no tile infos");
+      uint64_t linear_size = 0;
+      for (const auto &info : infos) {
+        linear_size = std::max(linear_size, info.linear_offset + info.linear_size);
+      }
+      const uint64_t tiled_size = (total.size + 3u) & ~uint64_t{3u};
+      auto tiled = CreateDeviceBuffer(name, tiled_size, AllFlags);
+      ImageInfo info{};
+      info.pixel_format = c.host;
+      info.guest_format = c.format;
+      info.type = Prospero::ImageType::kColor2D;
+      info.extent = {side, side, 1};
+      info.resources = {1, 1};
+      info.pitch = layout.pitch;
+      info.bytes_per_block = c.block_bytes;
+      info.samples = 1;
+      info.tile_mode = tile;
+      Libs::Graphics::Image image(m_runtime_context, scheduler, info);
+      const auto detile_only = [&] {
+        (void)tile_manager.Detile(tiled.buffer, 0, tiled_size, linear_size, infos);
+      };
+      const auto detile_upload = [&] {
+        const auto linear = tile_manager.Detile(tiled.buffer, 0, tiled_size,
+                                                linear_size, infos);
+        std::vector<vk::BufferImageCopy> copies(regions.begin(), regions.end());
+        for (auto &copy : copies) {
+          copy.bufferOffset += linear.offset;
+        }
+        image.Upload(copies, linear.buffer, linear.offset, linear.size);
+      };
+      detile_only();
+      detile_upload();
+      scheduler.Finish();
+      const std::array<std::function<void()>, 2> runs{detile_only, detile_upload};
+      std::array<double, 2> us{};
+      for (size_t run = 0; run < runs.size(); ++run) {
+        auto command = scheduler.Current().Handle();
+        command.resetQueryPool(pool, 0, 2);
+        command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, 0);
+        for (u32 i = 0; i < iterations; ++i) {
+          runs[run]();
+        }
+        scheduler.Current().Handle().writeTimestamp2(
+            vk::PipelineStageFlagBits2::eAllCommands, pool, 1);
+        scheduler.Finish();
+        std::array<uint64_t, 2> stamps{};
+        RequireVk(name, "timestamps",
+                  m_device.getQueryPoolResults(
+                      pool, 0, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+                      vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                  "vkGetQueryPoolResults");
+        us[run] = static_cast<double>(stamps[1] - stamps[0]) * period / 1000.0 /
+                  iterations;
+      }
+      std::printf("[gpu]     %-32s %-10s detile %8.1f us detile+copy %8.1f us (%.1f MB)\n",
+                  name, c.label, us[0], us[1], static_cast<double>(total.size) / 1e6);
+      DestroyBuffer(&tiled);
+    }
+    m_device.destroyQueryPool(pool, nullptr);
+  }
+
 private:
   RenderContext &Renderer() {
     EXIT_IF(m_renderer == nullptr);
@@ -16432,6 +17130,8 @@ private:
     m_runtime_context.queue = m_queue;
     m_runtime_context.attachment_feedback_loop_enabled = true;
     m_runtime_context.provoking_vertex_last_enabled = true;
+    m_runtime_context.storage_image_read_without_format_enabled =
+        m_storage_image_read_without_format;
     m_runtime_context.pipeline_library_enabled = m_pipeline_library;
     m_runtime_context.pipeline_creation_cache_control_enabled = m_pipeline_library;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
@@ -16670,6 +17370,11 @@ private:
     vk::PhysicalDeviceFeatures device_features{};
     device_features.robustBufferAccess = robustness2_supported;
     device_features.shaderStorageImageWriteWithoutFormat = true;
+    // Optional, as in the emulator: TileManager::TileFromImage reads through format-less views.
+    device_features.shaderStorageImageReadWithoutFormat =
+        available_features.shaderStorageImageReadWithoutFormat;
+    m_storage_image_read_without_format =
+        available_features.shaderStorageImageReadWithoutFormat == VK_TRUE;
     device_features.shaderImageGatherExtended = true;
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
@@ -17045,6 +17750,7 @@ private:
   Buffer m_fault_buffer;
   GraphicContext m_runtime_context{};
   bool m_pipeline_library = false;
+  bool m_storage_image_read_without_format = false;
   std::unique_ptr<RenderContext> m_renderer;
 };
 
@@ -35305,6 +36011,19 @@ int main(int argc, char **argv) {
     CheckDetileCopyCoverage();
     VulkanHarness vulkan;
     vulkan.CheckGpuTilerCpuParity();
+    vulkan.CheckTilerImageDirect();
+    return 0;
+  }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-keep-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDepthFeedbackKeep();
+    return 0;
+  }
+#endif
+  if (argc == 2 && std::strcmp(argv[1], "--tiler-image-bench") == 0) {
+    VulkanHarness vulkan;
+    vulkan.BenchTilerImageDirect();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
@@ -35683,6 +36402,7 @@ int main(int argc, char **argv) {
   CheckTileBlockBijection();
   CheckDetileCopyCoverage();
   vulkan.CheckGpuTilerCpuParity();
+  vulkan.CheckTilerImageDirect();
   vulkan.CheckNativeIndirectDispatch();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckRenderExecutorColorDiscovery();
@@ -35692,6 +36412,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
+  vulkan.CheckDepthFeedbackKeep();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBgra16Readback();
   vulkan.CheckRasterization(false);
