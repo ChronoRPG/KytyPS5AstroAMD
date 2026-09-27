@@ -51,6 +51,9 @@ static void LogUnmodelledSamplerFields(const ShaderSamplerResource& r, bool redu
 	add("lod_bias_sec", r.LodBiasSec(), r.LodBiasSec() != 0u);
 	add("mip_point_preclamp", 1u, r.PointPreclamp());
 	add("blend_zero_prt", 1u, r.BlendZeroPrt());
+	// Modelled for implicit LOD only: Vulkan also adds mipLodBias to explicit-LOD samples
+	// (IMAGE_SAMPLE_L/_LZ), which the texture unit most likely does not.
+	add("lod_bias_s6.8", r.LodBias(), r.LodBias() != 0u);
 	if (fields.empty() || logged.fetch_add(1, std::memory_order_relaxed) >= MaxLogged) {
 		return;
 	}
