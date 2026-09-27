@@ -32,6 +32,16 @@ bool TargetDescMemoEnabled() {
 	return enabled;
 }
 
+// KYTY_CMASK_FAST_CLEAR=0 ignores CMASK fast clears as before: the target keeps its previous
+// contents wherever the game fast-cleared it.
+bool CmaskFastClearEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CMASK_FAST_CLEAR");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 	switch (info.format) {
 		case Prospero::ChannelLayout::k10_10_10_2:
@@ -348,6 +358,20 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		desc.info.metadata.dcc_clear_word           = rt.clear_word0.word0;
 		desc.info.metadata.dcc_clear_register_valid = true;
 		desc.info.metadata.dcc_alpha_msb            = DccAlphaOnMsb(rt.info);
+	}
+	// CMASK fast clears (CB_COLORn_INFO.FAST_CLEAR): a CMASK tile marked cleared reads as the
+	// CLEAR_WORD colour to the colour block and is written with it by the fast-clear eliminate.
+	// The host image holds expanded texels, so the texture cache applies a pending clear when the
+	// target is bound (TextureCache::MaterializeCmaskClear). Single-sample, single-mip 2D targets.
+	if (!has_dcc && CmaskFastClearEnabled() && rt.info.cmask_fast_clear_enable &&
+	    rt.cmask.addr != 0 && tile && !texture_tile && !volume && samples == 1 && levels == 1) {
+		TileSizeAlign cmask_size {};
+		if (TileGetCmaskSize(width, height, view.image_layers, cmask_size)) {
+			desc.cmask.range       = {rt.cmask.addr, cmask_size.size};
+			desc.cmask.clear_word0 = rt.clear_word0.word0;
+			desc.cmask.clear_word1 = rt.clear_word1.word1;
+			desc.cmask.valid       = true;
+		}
 	}
 	for (uint32_t level = 0; level < levels; level++) {
 		if (volume) {
