@@ -25,7 +25,8 @@ public:
 	void ReinterpretColorAsMsDepth(Image& source, Image& destination);
 
 	// Single-pass, bit-exact replacements for Image::CopyImageWithBuffer between a D32 depth
-	// image and a 32-bit color image (both single-sampled 2D images with equal base extents).
+	// image (D32_SFLOAT or the depth aspect of D32_SFLOAT_S8_UINT, whose stencil is preserved)
+	// and a 32-bit color image (both single-sampled 2D images with equal base extents).
 	// The color side is accessed through an R32_UINT storage view (images are MUTABLE_FORMAT),
 	// the depth side is sampled (depth -> color, compute) or written as gl_FragDepth
 	// (color -> depth, fullscreen draw). Copies min(levels) levels and min(layers) layers.

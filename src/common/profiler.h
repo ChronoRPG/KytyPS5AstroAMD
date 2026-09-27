@@ -309,6 +309,9 @@ enum class FrameEvent : uint32_t {
 	// Written-upload pages a racing guest write re-dirtied while they were copied outside the
 	// tracker locks (KYTY_UPLOAD_COPY_OUTSIDE_LOCK), copied again under the locks.
 	WrittenUploadLatePages,
+	// Image::CopyImageWithBuffer rounds (barrier, image->buffer copy of all packed regions,
+	// barrier, buffer->image copy); ImageCopyViaBuffer counts the copies themselves.
+	ImageCopyViaBufferRounds,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

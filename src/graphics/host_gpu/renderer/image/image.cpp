@@ -13,11 +13,24 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <numeric>
+#include <vector>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
 
 namespace {
+
+// KYTY_COPY_VIA_BUFFER_BATCH=0: Image::CopyImageWithBuffer copies one region per barrier pair.
+bool CopyViaBufferBatchEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_COPY_VIA_BUFFER_BATCH");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
 
 [[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
 	switch (type) {
@@ -512,6 +525,41 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	// Regions are packed at distinct buffer offsets and copied as one round: one barrier, one
+	// vkCmdCopyImageToBuffer with every region, one barrier, one vkCmdCopyBufferToImage. A new
+	// round starts only when the buffer is full (each region alone always fits: rows_per_copy).
+	// Offsets are multiples of the texel block size and of 4 (depth aspects); regions never
+	// overlap in the buffer or in the destination image, and every region's bytes are copied
+	// exactly as the former one-region-per-round loop copied them.
+	// KYTY_COPY_VIA_BUFFER_BATCH=0 restores one region per round.
+	const uint64_t offset_alignment = std::lcm<uint64_t>(source_bytes, 16);
+	const size_t   max_regions      = CopyViaBufferBatchEnabled() ? SIZE_MAX : 1;
+	std::vector<vk::BufferImageCopy> source_copies;
+	std::vector<vk::BufferImageCopy> destination_copies;
+	uint64_t                         used = 0;
+	const auto                       flush_round = [&] {
+		if (source_copies.empty()) {
+			return;
+		}
+		barrier.size          = used;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		command.pipelineBarrier2(dependency);
+		command.copyImageToBuffer(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                          buffer.Handle(), static_cast<uint32_t>(source_copies.size()),
+		                          source_copies.data());
+		barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		command.pipelineBarrier2(dependency);
+		command.copyBufferToImage(buffer.Handle(), backing.image,
+		                          vk::ImageLayout::eTransferDstOptimal,
+		                          static_cast<uint32_t>(destination_copies.size()),
+		                          destination_copies.data());
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageCopyViaBufferRounds);
+		source_copies.clear();
+		destination_copies.clear();
+		used = 0;
+	};
 	for (uint32_t level = 0; level < levels; level++) {
 		const auto width             = std::max(source.backing.extent.width >> level, 1u);
 		const auto height            = std::max(source.backing.extent.height >> level, 1u);
@@ -548,21 +596,21 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 				    backing.image_type == vk::ImageType::e3D ? 0u : slice, 1};
 				destination_copy.imageOffset.z =
 				    backing.image_type == vk::ImageType::e3D ? static_cast<int32_t>(slice) : 0;
-				barrier.size          = copy_size;
-				barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
-				barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
-				command.pipelineBarrier2(dependency);
-				command.copyImageToBuffer(source.backing.image,
-				                          vk::ImageLayout::eTransferSrcOptimal, buffer.Handle(),
-				                          source_copy);
-				barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-				barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
-				command.pipelineBarrier2(dependency);
-				command.copyBufferToImage(buffer.Handle(), backing.image,
-				                          vk::ImageLayout::eTransferDstOptimal, destination_copy);
+				auto offset = (used + offset_alignment - 1) / offset_alignment * offset_alignment;
+				if (source_copies.size() >= max_regions || offset > buffer.Size() ||
+				    copy_size > buffer.Size() - offset) {
+					flush_round();
+					offset = 0;
+				}
+				source_copy.bufferOffset      = offset;
+				destination_copy.bufferOffset = offset;
+				source_copies.push_back(source_copy);
+				destination_copies.push_back(destination_copy);
+				used = offset + copy_size;
 			}
 		}
 	}
+	flush_round();
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }

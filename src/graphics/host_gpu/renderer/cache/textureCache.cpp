@@ -83,16 +83,40 @@ static bool AliasSyncSkipEnabled() {
 	return enabled;
 }
 
-// VK_KHR_maintenance8 "depth/stencil to color" copy compatibility, restricted to depth-only
-// images and to the color formats listed for their depth aspect.
+// KYTY_DIRECT_IMAGE_COPY_WIDE=0 restores the depth-only format lists of the maintenance8 copy
+// and the D32-only color -> depth shader copy (no combined depth/stencil formats, no R16 SFLOAT /
+// SNORM partners of D16).
+static bool DirectImageCopyWideEnabled() {
+	static const bool enabled = EnvNotZero("KYTY_DIRECT_IMAGE_COPY_WIDE");
+	return enabled;
+}
+
+// VK_KHR_maintenance8 "compatible depth-stencil and color formats" (formats-compatible-zs-color):
+// the DEPTH aspect of D32_SFLOAT and D32_SFLOAT_S8_UINT is size-compatible with R32_SFLOAT /
+// R32_SINT / R32_UINT, that of D16_UNORM and D16_UNORM_S8_UINT with R16_SFLOAT / R16_UNORM /
+// R16_SNORM / R16_UINT / R16_SINT. The copy moves raw depth-aspect bits (the stencil aspect of a
+// combined format is neither read nor written), exactly what Image::CopyImageWithBuffer moves
+// through its buffer. 24-bit depth is left out: its copies leave the padding bits undefined.
 [[nodiscard]] bool Maintenance8CopyCompatible(vk::Format depth, vk::Format color) {
+	const bool wide = DirectImageCopyWideEnabled();
 	switch (depth) {
+		case vk::Format::eD32SfloatS8Uint:
+			if (!wide) {
+				return false;
+			}
+			[[fallthrough]];
 		case vk::Format::eD32Sfloat:
 			return color == vk::Format::eR32Sfloat || color == vk::Format::eR32Uint ||
 			       color == vk::Format::eR32Sint;
+		case vk::Format::eD16UnormS8Uint:
+			if (!wide) {
+				return false;
+			}
+			[[fallthrough]];
 		case vk::Format::eD16Unorm:
 			return color == vk::Format::eR16Unorm || color == vk::Format::eR16Uint ||
-			       color == vk::Format::eR16Sint;
+			       color == vk::Format::eR16Sint ||
+			       (wide && (color == vk::Format::eR16Sfloat || color == vk::Format::eR16Snorm));
 		default: return false;
 	}
 }
@@ -835,7 +859,8 @@ const char* TextureCache::TryDirectReinterpret(Image& destination, Image& source
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageCopyShaderDepthToColor);
 		return "shader-depth-to-color";
 	}
-	if (!source_depth && m_blit_helper.SupportsColor32ToDepth(source, destination)) {
+	if (!source_depth && m_blit_helper.SupportsColor32ToDepth(source, destination) &&
+	    (destination.backing.format == vk::Format::eD32Sfloat || DirectImageCopyWideEnabled())) {
 		m_blit_helper.CopyColor32ToDepth(source, destination);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageCopyShaderColorToDepth);
 		return "shader-color-to-depth";
