@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <atomic>
@@ -480,6 +481,13 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
 		selected = ir.Select(match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected);
+	}
+	// RDNA2 3.6.1: an out-of-range source VGPR reads VGPR0. VGPRs at or above the highest one the
+	// program names are never written, so reading VGPR0 there is as valid as any value. Constant
+	// propagation drops this select when the M0 value set stays below the limit.
+	if (GetCodegenOptions().movrel_range && base != 0u && base < current_vector_limit) {
+		const auto in_range = ir.ULessThan(m0, IR::U32(IR::Value(current_vector_limit - base)));
+		selected = ir.Select(in_range, selected, ir.GetVectorReg(static_cast<IR::VectorReg>(0)));
 	}
 	WriteOperand(DestinationOperand(inst), selected);
 }

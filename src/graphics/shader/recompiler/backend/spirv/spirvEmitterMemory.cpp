@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include <algorithm>
 
@@ -283,9 +285,26 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits, bool sign_extend);
 
+// Plain dword loads from storage-buffer descriptors can rely on the device's bounds check: with
+// robustBufferAccess2 and a 1-byte robustness alignment (HostBufferRobustness) a dword load with any
+// byte past the descriptor range returns 0, which is exactly "index < OpArrayLength" failing (the
+// range is "size + adjustment" bytes, OpArrayLength its whole dwords). Every guest OOB_SELECT mode
+// is modelled today by that same descriptor-range check, so nothing changes for any mode. LDS,
+// GDS, scratch, formatted (all-or-nothing) accesses, stores and atomics keep their explicit checks.
+// KYTY_ROBUST_BUFFER_LOADS=0 keeps the explicit check everywhere.
+bool DeviceChecksDwordLoad(const MemoryResourceAccess& resource) {
+	return (resource.kind == IR::ResourceKind::Buffer ||
+	        resource.kind == IR::ResourceKind::ScalarBuffer) &&
+	       GetCodegenOptions().robust_buffer_loads &&
+	       GetHostBufferRobustness().storage_dword_loads_return_zero;
+}
+
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
+	if (DeviceChecksDwordLoad(resource)) {
+		return LoadWordInBounds(ctx, resource, index);
+	}
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
@@ -305,6 +324,9 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	const auto raw_index = Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	                              ConstantU32(ctx.state, 2));
 	const auto index     = EmitMemoryElementIndex(ctx.state, resource, raw_index);
+	if (DeviceChecksDwordLoad(resource)) {
+		return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
+	}
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
@@ -1158,6 +1180,11 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	const auto element   = EmitMemoryElementIndex(state, access, index);
+	if (DeviceChecksDwordLoad(access)) {
+		ctx.Define(inst, EmitNative<spv::OpLoad, IR::Type::U32>(
+		                     state, EmitMemoryElementPointer(state, access, element)));
+		return;
+	}
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
 	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
 		           return EmitNative<spv::OpLoad, IR::Type::U32>(

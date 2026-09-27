@@ -790,6 +790,22 @@ static void ShaderGetStaticInputInfoPS(
 	if ((active_inputs & 0x00000004u) != 0) {
 		ps_info.ps_perspective_centroid_vgpr = 2u * std::popcount(active_inputs & 0x3u);
 	}
+	// SPI_PS_INPUT_ADDR order: persp sample, center, centroid (2 VGPRs each), persp pull (3),
+	// linear sample, center, centroid (2 each).
+	if ((active_inputs & 0x00000001u) != 0) {
+		ps_info.ps_perspective_sample_vgpr = 0u;
+	}
+	const uint32_t linear_base = 2u * std::popcount(active_inputs & 0x7u) +
+	                             ((active_inputs & 0x00000008u) != 0 ? 3u : 0u);
+	if ((active_inputs & 0x00000010u) != 0) {
+		ps_info.ps_linear_sample_vgpr = linear_base;
+	}
+	if ((active_inputs & 0x00000020u) != 0) {
+		ps_info.ps_linear_center_vgpr = linear_base + 2u * std::popcount(active_inputs & 0x10u);
+	}
+	if ((active_inputs & 0x00000040u) != 0) {
+		ps_info.ps_linear_centroid_vgpr = linear_base + 2u * std::popcount(active_inputs & 0x30u);
+	}
 	for (uint32_t i = 0; i < data.num_input_semantics && i < ps_info.input_num && i < 32u; i++) {
 		const auto& semantic = data.input_semantics[i];
 		if (semantic.is_custom != 0 && semantic.is_f16 == 0) {
@@ -915,6 +931,10 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(info.custom_interpolation_mask);
 	key.push_back(info.ps_perspective_center_vgpr);
 	key.push_back(info.ps_perspective_centroid_vgpr);
+	key.push_back(info.ps_perspective_sample_vgpr);
+	key.push_back(info.ps_linear_sample_vgpr);
+	key.push_back(info.ps_linear_center_vgpr);
+	key.push_back(info.ps_linear_centroid_vgpr);
 	key.push_back(static_cast<uint32_t>(info.ps_pos_x));
 	key.push_back(static_cast<uint32_t>(info.ps_pos_y));
 	key.push_back(static_cast<uint32_t>(info.ps_pos_z));
