@@ -724,7 +724,17 @@ if(BUILD_TESTING)
 	add_test(NAME buffer_range_memo_separate_queries
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
 	set_tests_properties(buffer_range_memo_separate_queries PROPERTIES
-		ENVIRONMENT "KYTY_BUFFER_RANGE_MEMO=0;KYTY_BUFFER_DIRTY_QUERY_COMBINED=0")
+		ENVIRONMENT "KYTY_BUFFER_RANGE_MEMO=0;KYTY_BUFFER_DIRTY_QUERY_COMBINED=0;KYTY_TRACKER_RELAXED_QUERIES=0")
+	# KYTY_TRACKER_RELAXED_QUERIES: verify mode (every lock-free answer checked against the locked
+	# queries), and the locked queries with the range memo.
+	add_test(NAME buffer_range_memo_relaxed_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
+	set_tests_properties(buffer_range_memo_relaxed_verify PROPERTIES
+		ENVIRONMENT "KYTY_TRACKER_RELAXED_VERIFY=exit")
+	add_test(NAME buffer_range_memo_locked_queries
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
+	set_tests_properties(buffer_range_memo_locked_queries PROPERTIES
+		ENVIRONMENT "KYTY_TRACKER_RELAXED_QUERIES=0")
 	# KYTY_TEXTURE_MEMO_REVALIDATE: default, verify mode, off.
 	add_test(NAME texture_memo_revalidate
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)
@@ -764,7 +774,7 @@ if(BUILD_TESTING)
 	add_test(NAME draw_prep_engine_parallel_inplace_verify
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_inplace_verify PROPERTIES
-		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE_VERIFY=exit;KYTY_DRAW_PREP_LOCKFREE_HINT_VERIFY=exit")
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE_VERIFY=exit;KYTY_DRAW_PREP_LOCKFREE_HINT_VERIFY=exit;KYTY_TRACKER_RELAXED_VERIFY=exit")
 	add_test(NAME draw_prep_engine_parallel_copied
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_copied PROPERTIES

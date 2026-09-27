@@ -210,6 +210,11 @@ struct BufferCacheTestAccess {
     BufferCache::s_range_memo_verify_hook = hook;
     BufferCache::s_range_memo_verify_context = context;
   }
+  // KYTY_TRACKER_RELAXED_QUERIES.
+  static bool RelaxedQueriesEnabled(const BufferCache &cache) { return cache.m_relaxed_queries; }
+  static BufferCache::RelaxedTotals RelaxedTotals(const BufferCache &cache) {
+    return cache.m_relaxed_totals;
+  }
   static MemoryTracker &Tracker(BufferCache &cache) { return cache.m_memory_tracker; }
 };
 
@@ -5229,9 +5234,19 @@ public:
       auto &cache = context.GetBufferCache();
       auto &tracker = BufferCacheTestAccess::Tracker(cache);
       context.MapMemory(base, allocation_size);
-      const bool memo_on = BufferCacheTestAccess::RangeMemoEnabled(cache);
+      // KYTY_TRACKER_RELAXED_QUERIES decides clean synchronizations and small reads before the
+      // range memo is consulted, so the memo's own counters move only without it.
+      const bool relaxed_on = BufferCacheTestAccess::RelaxedQueriesEnabled(cache);
+      const bool memo_on = BufferCacheTestAccess::RangeMemoEnabled(cache) && !relaxed_on;
       const auto limit = BufferCacheTestAccess::HotCheckLimit(cache);
       const auto totals = [&] { return BufferCacheTestAccess::RangeMemoTotals(cache); };
+      const auto relaxed = [&] { return BufferCacheTestAccess::RelaxedTotals(cache); };
+      // The product binds on the guest GPU thread, where the relaxed queries apply
+      // (KYTY_TRACKER_RELAXED_QUERIES); this thread blocks meanwhile, like a guest thread.
+      const auto obtain = [&](uint64_t vaddr, uint64_t size, bool written, bool texel) {
+        return OnGpuThread(context,
+                           [&] { return cache.ObtainBuffer(vaddr, size, written, texel); });
+      };
       const auto read_native = [&](const Libs::Graphics::Buffer &buffer, uint64_t offset,
                                    uint64_t bytes) {
         auto readback = CreateHostBuffer(name, bytes, vk::BufferUsageFlagBits::eTransferDst, {0});
@@ -5256,12 +5271,22 @@ public:
       // them, compared with guest memory.
       const auto large_matches = [&](const char *stage) {
         const auto [buffer, offset] =
-            cache.ObtainBuffer(base + large_offset, large_size, false, false);
+            obtain(base + large_offset, large_size, false, false);
         const auto words = read_native(*buffer, offset, large_size);
         Require(name, stage,
                 std::memcmp(words.data(), memory + large_offset, large_size) == 0,
                 "the bound range lost a CPU write or kept stale bytes");
         return std::pair{buffer, offset};
+      };
+      // The same, binding on this thread: not the GPU thread, so the relaxed queries never
+      // apply and the range memo decides whenever it is enabled.
+      const auto direct_matches = [&](const char *stage) {
+        const auto [buffer, offset] =
+            cache.ObtainBuffer(base + large_offset, large_size, false, false);
+        const auto words = read_native(*buffer, offset, large_size);
+        Require(name, stage,
+                std::memcmp(words.data(), memory + large_offset, large_size) == 0,
+                "the bound range lost a CPU write or kept stale bytes");
       };
       const auto cpu_write = [&](uint64_t offset, uint32_t value) {
         // As the guest does: the write faults on the protected page, then lands.
@@ -5275,27 +5300,33 @@ public:
       // it, the third skips it.
       const auto first = large_matches("initial upload");
       const auto records0 = totals().records;
+      const auto skips0 = relaxed().sync_skips;
       const auto [second_buffer, second_offset] =
-          cache.ObtainBuffer(base + large_offset, large_size, false, false);
+          obtain(base + large_offset, large_size, false, false);
       const auto hits0 = totals().clean_hits;
       const auto [third_buffer, third_offset] =
-          cache.ObtainBuffer(base + large_offset, large_size, false, false);
+          obtain(base + large_offset, large_size, false, false);
       Require(name, "clean range reuse",
               second_buffer == first.first && second_offset == first.second &&
                   third_buffer == first.first && third_offset == first.second &&
                   (!memo_on || (totals().records == records0 + 1 &&
-                                totals().clean_hits == hits0 + 1)),
+                                totals().clean_hits == hits0 + 1)) &&
+                  (!relaxed_on || relaxed().sync_skips == skips0 + 2),
               "a clean range was not recorded once and then skipped, or bound elsewhere");
 
       // A CPU write moves the signature: uploaded, then clean again.
       cpu_write(large_offset + 0x100, 0x5a5aa5a5u);
       const auto hits1 = totals().clean_hits;
+      const auto skips1 = relaxed().sync_skips;
       (void)large_matches("write after a skipped synchronization");
-      Require(name, "write invalidates the fact", totals().clean_hits == hits1,
+      Require(name, "write invalidates the fact",
+              totals().clean_hits == hits1 && relaxed().sync_skips == skips1,
               "a synchronization after a CPU write was skipped");
-      (void)cache.ObtainBuffer(base + large_offset, large_size, false, false);
-      (void)cache.ObtainBuffer(base + large_offset, large_size, false, false);
-      Require(name, "clean again", !memo_on || totals().clean_hits == hits1 + 1,
+      (void)obtain(base + large_offset, large_size, false, false);
+      (void)obtain(base + large_offset, large_size, false, false);
+      Require(name, "clean again",
+              (!memo_on || totals().clean_hits == hits1 + 1) &&
+                  (!relaxed_on || relaxed().sync_skips == skips1 + 2),
               "the range was not skipped again once clean");
 
       // A write from another host thread (guest threads and the command processor's label
@@ -5316,7 +5347,8 @@ public:
       // for that region's lock; U50 check run, ~1 per 30 s at the Sky Garden start) dirties a
       // page the hit legitimately did not see: a race, never a mismatch. The hook lands one in
       // exactly that window, for a skipped synchronization and for a small read's decision.
-      if (memo_on && BufferCacheTestAccess::RangeMemoVerify(cache) != 0) {
+      if (BufferCacheTestAccess::RangeMemoEnabled(cache) &&
+          BufferCacheTestAccess::RangeMemoVerify(cache) != 0) {
         struct Race {
           std::function<void()> write;
           bool fired = false;
@@ -5332,7 +5364,7 @@ public:
         const auto mismatches0 = totals().verify_mismatches;
         race.write = [&] { cpu_write(large_offset + 0x300, 0x12345678u); };
         BufferCacheTestAccess::SetRangeMemoVerifyHook(fire, &race);
-        (void)large_matches("write racing a verified skipped synchronization");
+        direct_matches("write racing a verified skipped synchronization");
         BufferCacheTestAccess::SetRangeMemoVerifyHook(nullptr, nullptr);
         Require(name, "racing write is a race (synchronization)",
                 race.fired && totals().verify_races == races0 + 1 &&
@@ -5368,7 +5400,7 @@ public:
       auto &stream = cache.GetUtilityBuffer(Libs::Graphics::MemoryUsage::Stream);
       const auto stream_read = [&](const char *stage) {
         const auto [buffer, offset] =
-            cache.ObtainBuffer(base + small_offset, small_size, false, false);
+            obtain(base + small_offset, small_size, false, false);
         Require(name, stage,
                 buffer == &stream &&
                     std::memcmp(stream.Mapped().data() + offset, memory + small_offset,
@@ -5376,12 +5408,16 @@ public:
                 "a small CPU-dirty read did not copy the current bytes");
       };
       const auto stream_hits0 = totals().stream_hits;
+      const auto queries0 = relaxed().queries;
       stream_read("first stream copy");
       memory[small_offset + 7] ^= 0xffu; // CPU-dirty, hence writable: no fault
       stream_read("stream copy after a write");
       Require(name, "stream decision reuse",
-              !memo_on || totals().stream_hits == stream_hits0 + 1,
+              (!memo_on || totals().stream_hits == stream_hits0 + 1) &&
+                  (!relaxed_on || relaxed().queries >= queries0 + 2),
               "a small CPU-dirty read did not reuse its stream decision");
+      Require(name, "relaxed snapshots agree", relaxed().mismatches == 0,
+              "a lock-free dirty snapshot differed from the locked query (verify mode)");
 
       // A hot page: a write fault in three consecutive frames promotes it (the third upload is
       // its first hot one, which creates its shadow).
@@ -5397,7 +5433,7 @@ public:
         const auto settles0 = totals().settles;
         const auto unchanged_uploads = [&](uint32_t count) {
           for (uint32_t check = 0; check < count; check++) {
-            (void)cache.ObtainBuffer(base + large_offset, large_size, false, false);
+            (void)obtain(base + large_offset, large_size, false, false);
           }
         };
         // limit - 1 unchanged uploads keep it hot; a write while hot (no fault) is uploaded
@@ -5432,8 +5468,10 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
                                                                allocation_size) == 0,
             "range-memo direct-memory allocation release failed");
-    std::printf("[host]    %-32s ok (memo %s, hot check limit %u)\n", name,
+    std::printf("[host]    %-32s ok (memo %s, relaxed queries %s, hot check limit %u)\n", name,
                 BufferCacheTestAccess::RangeMemoEnabled(context.GetBufferCache()) ? "on" : "off",
+                BufferCacheTestAccess::RelaxedQueriesEnabled(context.GetBufferCache()) ? "on"
+                                                                                       : "off",
                 BufferCacheTestAccess::HotCheckLimit(context.GetBufferCache()));
   }
 

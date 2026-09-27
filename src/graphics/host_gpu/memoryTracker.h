@@ -38,6 +38,15 @@ public:
 		bool gpu = false;
 	};
 	[[nodiscard]] DirtyState QueryDirty(uint64_t vaddr, uint64_t size);
+	// QueryDirty without any region lock, on the regions' mirrors of their dirty bits (the GPU
+	// thread only). False (nothing decided) when a region of the range does not exist yet.
+	// Exact on the GPU thread: only that thread clears CPU-dirty bits (uploads, hot-page settles)
+	// and sets GPU-dirty bits (written uploads); other threads only set CPU-dirty bits (write
+	// faults, before the page becomes writable) and clear GPU-dirty bits (readback completion).
+	// So a page seen CPU-dirty stays CPU-dirty and one seen not GPU-dirty stays so while this
+	// runs, and every decision taken from the answer (`!gpu && cpu`, `!cpu`) equals the one a
+	// locked QueryDirty would give at some moment during the call.
+	[[nodiscard]] bool QueryDirtyRelaxed(uint64_t vaddr, uint64_t size, DirtyState& state) const;
 	// IsRegionGpuModified without the region locks, on the regions' lock-free mirrors of their
 	// GPU-dirty bits (RegionManager::IsGpuModifiedRelaxed). Any thread. A hint: a transition racing
 	// it may or may not be seen, as with a locked query made a moment earlier or later.

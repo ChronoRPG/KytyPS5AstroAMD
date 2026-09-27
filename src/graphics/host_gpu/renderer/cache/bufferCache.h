@@ -283,6 +283,15 @@ private:
 			s_range_memo_verify_hook(s_range_memo_verify_context, vaddr, size);
 		}
 	}
+	// KYTY_TRACKER_RELAXED_QUERIES (GPU thread): the range's dirty snapshot from the tracker's
+	// lock-free mirrors (false: not available, use the locked queries); and whether a read-only
+	// synchronization of the range would collect nothing (no CPU-dirty page).
+	[[nodiscard]] bool RelaxedDirtySnapshot(uint64_t vaddr, uint64_t size,
+	                                        MemoryTracker::DirtyState& state);
+	[[nodiscard]] bool RelaxedNothingToUpload(uint64_t vaddr, uint64_t size);
+	bool VerifyRelaxedSnapshot(uint64_t vaddr, uint64_t size,
+	                           const MemoryTracker::DirtyState& relaxed,
+	                           const MemoryTracker::DirtyState& locked, uint64_t signature);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size, size_t guest_copies = SIZE_MAX,
 	                                      const uint8_t* host_data = nullptr,
@@ -424,6 +433,14 @@ private:
 	};
 	RangeMemoTotals                                   m_range_memo_totals;
 	int                                               m_range_memo_verify = 0; // RangeMemoVerifyMode
+	// KYTY_TRACKER_RELAXED_QUERIES outcomes, always counted (tests read them).
+	struct RelaxedTotals {
+		uint64_t queries    = 0; // lock-free dirty snapshots taken
+		uint64_t sync_skips = 0; // read synchronizations found empty without a lock
+		uint64_t mismatches = 0; // verify mode
+	};
+	RelaxedTotals                                     m_relaxed_totals;
+	bool                                              m_relaxed_queries = false;
 	uint32_t                                          m_upload_batch_depth = 0;
 	uint32_t                                          m_hot_sweep_frame  = 0;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};

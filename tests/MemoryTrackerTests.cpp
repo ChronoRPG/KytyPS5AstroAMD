@@ -1136,7 +1136,27 @@ void TestRangeSignature() {
   const auto page_size = harness.page_manager.GetPageSize();
   auto *memory = Allocate(harness.page_manager, 4);
   const auto address = reinterpret_cast<uint64_t>(memory);
-  const auto signature = [&] { return tracker.RangeSignature(address, page_size * 4); };
+  const auto locked_signature = [&] { return tracker.RangeSignature(address, page_size * 4); };
+  // Every transition below also keeps the lock-free dirty mirrors equal to the locked bits
+  // (MemoryTracker::QueryDirtyRelaxed), page by page and over the whole range.
+  const auto mirrors_agree = [&] {
+    if (locked_signature() == 0) {
+      return;
+    }
+    for (uint64_t page = 0; page <= 4; page++) {
+      const auto start = page == 4 ? address : address + page * page_size;
+      const auto size = page == 4 ? page_size * 4 : page_size;
+      MemoryTracker::DirtyState relaxed;
+      Check(tracker.QueryDirtyRelaxed(start, size, relaxed) &&
+                relaxed.cpu == tracker.IsRegionCpuModified(start, size) &&
+                relaxed.gpu == tracker.IsRegionGpuModified(start, size),
+            "a lock-free dirty mirror differs from the locked bits");
+    }
+  };
+  const auto signature = [&] {
+    mirrors_agree();
+    return locked_signature();
+  };
 
   Check(signature() == 0 && tracker.RangeSignature(address, 0) == 0 &&
             tracker.RangeSignature(TRACKER_ADDRESS_SIZE - 1, 2) == 0,
@@ -1347,6 +1367,10 @@ void TestDirtyQueryAndGpuMirror() {
       boundary - page_size, page_size, true, [](uint64_t, uint64_t) noexcept {},
       []() noexcept {});
   Check(!second_exists(), "the second region exists too early");
+  MemoryTracker::DirtyState relaxed_missing;
+  Check(!tracker.QueryDirtyRelaxed(boundary - page_size, page_size * 2, relaxed_missing) &&
+            !second_exists(),
+        "a relaxed query decided (or created) a range with a missing region");
   const auto across = tracker.QueryDirty(boundary - page_size, page_size * 2);
   Check(across.gpu && !second_exists() &&
             tracker.IsRegionGpuModifiedRelaxed(boundary - page_size, page_size * 2),
@@ -1376,6 +1400,11 @@ void TestDirtyQueryAndGpuMirror() {
             what);
       const auto state = tracker.QueryDirty(address, size);
       Check(state.gpu == gpu && (gpu || state.cpu == tracker.IsRegionCpuModified(address, size)),
+            what);
+      // The lock-free snapshot (every region exists here) equals the locked one exactly.
+      MemoryTracker::DirtyState relaxed;
+      Check(tracker.QueryDirtyRelaxed(address, size, relaxed) && relaxed.gpu == gpu &&
+                relaxed.cpu == tracker.IsRegionCpuModified(address, size),
             what);
     }
   };

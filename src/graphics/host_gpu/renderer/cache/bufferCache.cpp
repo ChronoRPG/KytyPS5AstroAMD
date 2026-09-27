@@ -186,6 +186,28 @@ int RangeMemoVerifyMode() {
 	return mode;
 }
 
+// KYTY_TRACKER_RELAXED_QUERIES (default on): on the GPU thread, the small-read stream decision
+// and the "nothing to upload" test of read synchronizations use the tracker's lock-free dirty
+// mirrors (MemoryTracker::QueryDirtyRelaxed) instead of the region locks.
+bool RelaxedQueriesEnabled() {
+	static const bool enabled = ParseEnvU64("KYTY_TRACKER_RELAXED_QUERIES", 1) != 0;
+	return enabled;
+}
+
+// KYTY_TRACKER_RELAXED_VERIFY=1|exit: every relaxed answer is followed by the locked query. Only
+// the transitions other threads can make in between (a page turning CPU-dirty, a GPU-dirty page
+// published) may separate them, and only while the range's mutation serials moved.
+int RelaxedVerifyMode() {
+	static const int mode = [] {
+		const auto* value = std::getenv("KYTY_TRACKER_RELAXED_VERIFY");
+		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
+			return 0;
+		}
+		return std::strcmp(value, "exit") == 0 ? 2 : 1;
+	}();
+	return mode;
+}
+
 // Readback window of guest write faults on GPU-owned pages, in bytes: a power of two between
 // 4 KiB (only the faulting page) and 512 KiB (default, the read-drain window). Every page of the
 // window loses GPU ownership, so a smaller window downloads fewer bytes per fault but makes a
@@ -541,6 +563,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
 	m_range_memo_verify = m_range_memo != nullptr ? RangeMemoVerifyMode() : 0;
+	m_relaxed_queries = RelaxedQueriesEnabled();
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	if (m_upload_dma != nullptr) {
@@ -1600,6 +1623,13 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
                                     bool is_texel_buffer, BdaSyncStats* stats,
                                     const char* upload_reason) {
 	KYTY_GPU_OP_SITE("buffercache.upload");
+	// KYTY_TRACKER_RELAXED_QUERIES: a read-only synchronization of a range without a CPU-dirty
+	// page (hot pages are CPU-dirty too) collects and uploads nothing. Texel reads also download
+	// GPU-written images; the BDA hot-pass verification scans in full.
+	if (!is_written && !is_texel_buffer && (stats == nullptr || stats->verify_fault_epoch == 0) &&
+	    RelaxedNothingToUpload(vaddr, size)) {
+		return false;
+	}
 	// KYTY_BUFFER_RANGE_MEMO: a read-only synchronization of a range that is still Clean does
 	// nothing (bufferCache.h). Texel reads also download GPU-written images (not tracker state);
 	// the BDA hot-pass verification scans in full.
@@ -1966,6 +1996,81 @@ void BufferCache::ReportRangeMemoMismatch(const char* what, uint64_t vaddr, uint
 	}
 }
 
+bool BufferCache::RelaxedDirtySnapshot(uint64_t vaddr, uint64_t size,
+                                       MemoryTracker::DirtyState& state) {
+	if (!m_relaxed_queries || !GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	const bool verify    = RelaxedVerifyMode() != 0;
+	const auto signature = verify ? m_memory_tracker.RangeSignature(vaddr, size) : 0;
+	if (!m_memory_tracker.QueryDirtyRelaxed(vaddr, size, state)) {
+		return false;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::TrackerRelaxedQueries);
+	m_relaxed_totals.queries++;
+	if (verify) {
+		// Every region exists, so the locked query creates none.
+		const auto locked = m_memory_tracker.QueryDirty(vaddr, size);
+		VerifyRelaxedSnapshot(vaddr, size, state, locked, signature);
+	}
+	return true;
+}
+
+bool BufferCache::RelaxedNothingToUpload(uint64_t vaddr, uint64_t size) {
+	if (!m_relaxed_queries || !GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	const bool                verify    = RelaxedVerifyMode() != 0;
+	const auto                signature = verify ? m_memory_tracker.RangeSignature(vaddr, size) : 0;
+	MemoryTracker::DirtyState state;
+	if (!m_memory_tracker.QueryDirtyRelaxed(vaddr, size, state) || state.cpu) {
+		return false;
+	}
+	if (verify) {
+		const auto locked = m_memory_tracker.QueryDirty(vaddr, size);
+		if (!VerifyRelaxedSnapshot(vaddr, size, state, locked, signature) || locked.cpu) {
+			// A page turned CPU-dirty in between: synchronize it now, as the locked path would.
+			return false;
+		}
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::TrackerRelaxedSyncSkips);
+	m_relaxed_totals.sync_skips++;
+	return true;
+}
+
+bool BufferCache::VerifyRelaxedSnapshot(uint64_t vaddr, uint64_t size,
+                                        const MemoryTracker::DirtyState& relaxed,
+                                        const MemoryTracker::DirtyState& locked,
+                                        uint64_t                         signature) {
+	Profiler::CountFrameEvent(Profiler::FrameEvent::TrackerRelaxedVerifyChecks);
+	if (relaxed.cpu == locked.cpu && relaxed.gpu == locked.gpu) {
+		return true;
+	}
+	// Other threads only make pages CPU-dirty and publish GPU-dirty ones, and every such change
+	// advances the range's mutation serials first.
+	const bool forbidden = (relaxed.cpu && !locked.cpu) || (!relaxed.gpu && locked.gpu);
+	const bool quiet =
+	    signature != 0 && m_memory_tracker.RangeSignature(vaddr, size) == signature;
+	if (!forbidden && !quiet) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TrackerRelaxedVerifyRaces);
+		return true;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::TrackerRelaxedVerifyMismatches);
+	m_relaxed_totals.mismatches++;
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::fprintf(stderr,
+		             "TrackerRelaxedVerify: addr=0x%016" PRIx64 " size=0x%" PRIx64
+		             " relaxed cpu=%d gpu=%d, locked cpu=%d gpu=%d, serials %s\n",
+		             vaddr, size, relaxed.cpu, relaxed.gpu, locked.cpu, locked.gpu,
+		             quiet ? "unchanged" : "moved");
+	}
+	if (RelaxedVerifyMode() == 2) {
+		EXIT("TrackerRelaxedVerify: a lock-free dirty snapshot differs from the locked query\n");
+	}
+	return false;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
@@ -1990,8 +2095,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			return !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 			       m_memory_tracker.IsRegionCpuModified(vaddr, size);
 		};
-		bool stream = false;
-		if (m_range_memo != nullptr) {
+		bool                      stream = false;
+		MemoryTracker::DirtyState relaxed;
+		if (RelaxedDirtySnapshot(vaddr, size, relaxed)) {
+			// KYTY_TRACKER_RELAXED_QUERIES: the same decision from the lock-free mirrors.
+			stream = !relaxed.gpu && relaxed.cpu;
+		} else if (m_range_memo != nullptr) {
 			// Verify mode: dirtying serials before the lookup (ClassifyRangeMemoDifference).
 			const auto  dirtied = m_range_memo_verify != 0
 			                          ? m_memory_tracker.RangeDirtiedSignature(vaddr, size)

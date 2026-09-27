@@ -207,6 +207,27 @@ MemoryTracker::DirtyState MemoryTracker::QueryDirty(uint64_t vaddr, uint64_t siz
 	return state;
 }
 
+bool MemoryTracker::QueryDirtyRelaxed(uint64_t vaddr, uint64_t size, DirtyState& state) const {
+	ValidateRange(vaddr, size);
+	state             = {};
+	uint64_t remaining = size;
+	uint64_t index     = vaddr / TRACKER_REGION_SIZE;
+	uint64_t offset    = vaddr % TRACKER_REGION_SIZE;
+	while (remaining != 0) {
+		const auto  bytes   = std::min(TRACKER_REGION_SIZE - offset, remaining);
+		const auto* manager = m_regions[index].load(std::memory_order_acquire);
+		if (manager == nullptr) {
+			return false;
+		}
+		state.gpu = state.gpu || manager->IsGpuModifiedRelaxed(offset, bytes);
+		state.cpu = state.cpu || manager->IsCpuModifiedRelaxed(offset, bytes);
+		remaining -= bytes;
+		offset = 0;
+		index++;
+	}
+	return true;
+}
+
 bool MemoryTracker::IsRegionGpuModifiedRelaxed(uint64_t vaddr, uint64_t size) const {
 	ValidateRange(vaddr, size);
 	uint64_t remaining = size;

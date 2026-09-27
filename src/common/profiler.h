@@ -749,6 +749,14 @@ enum class FrameEvent : uint32_t {
 	// KYTY_BUFFER_RANGE_MEMO_VERIFY: differences explained by a page turned CPU-dirty after the
 	// memo hit (a guest write fault racing the re-evaluation), not counted as mismatches.
 	BufferRangeMemoVerifyRaces,
+	// KYTY_TRACKER_RELAXED_QUERIES: small-read decisions and read synchronizations skipped from
+	// the lock-free dirty mirrors; KYTY_TRACKER_RELAXED_VERIFY checks (Races: another thread's
+	// transition separated the two answers).
+	TrackerRelaxedQueries,
+	TrackerRelaxedSyncSkips,
+	TrackerRelaxedVerifyChecks,
+	TrackerRelaxedVerifyMismatches,
+	TrackerRelaxedVerifyRaces,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
