@@ -10,6 +10,11 @@ namespace Common {
 
 void InitializeThreads();
 
+// Raises the calling thread's scheduling priority for latency-critical emulator threads (the
+// command processor). KYTY_CP_PRIORITY: 0 = leave unchanged, 1 = above normal (default),
+// 2 = highest. Also opts the thread out of Windows power throttling (EcoQoS). No-op elsewhere.
+void RaiseCurrentThreadPriority();
+
 using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();
 

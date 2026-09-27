@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <span>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -1444,7 +1445,7 @@ int KYTY_SYSV_ABI AgcGetDataPacketPayloadAddress(uint32_t** addr, uint32_t* cmd,
 	PRINT_NAME();
 
 	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
 		LOGF("\t addr = 0x%016" PRIx64 "\n"
 		     "\t cmd  = 0x%016" PRIx64 "\n"
 		     "\t type = %d\n",
@@ -1468,7 +1469,7 @@ int KYTY_SYSV_ABI AgcGetDataPacketPayloadRange(MemoryRange* range, uint32_t* cmd
 	PRINT_NAME();
 
 	static std::atomic<uint32_t> log_count {0};
-	const bool                   should_log = (log_count.fetch_add(1) < 64);
+	const bool                   should_log = (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64);
 	if (should_log) {
 		LOGF("\t range = 0x%016" PRIx64 "\n"
 		     "\t cmd   = 0x%016" PRIx64 "\n"
@@ -1756,7 +1757,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_
 	PRINT_NAME();
 
 	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
 		LOGF("\t thread_group_x = %" PRIu32 "\n"
 		     "\t thread_group_y = %" PRIu32 "\n"
 		     "\t thread_group_z = %" PRIu32 "\n"
@@ -1848,7 +1849,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32
 	PRINT_NAME();
 
 	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
 		LOGF("\t buf        = 0x%016" PRIx64 "\n"
 		     "\t offset     = %" PRIx32 "\n"
 		     "\t values     = 0x%016" PRIx64 "\n"
@@ -1904,7 +1905,17 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                
 
 	buf->DbgDump();
 
-	std::vector<ShaderRegister> local_regs(num_regs);
+	// The copy guards against regs aliasing the command memory written below; short lists (the
+	// common case, called ~75k times per second) stay on the stack.
+	std::array<ShaderRegister, 64>  inline_regs {};
+	std::vector<ShaderRegister>     heap_regs;
+	std::span<ShaderRegister>       local_regs;
+	if (num_regs <= inline_regs.size()) {
+		local_regs = std::span<ShaderRegister>(inline_regs.data(), num_regs);
+	} else {
+		heap_regs.resize(num_regs);
+		local_regs = heap_regs;
+	}
 	for (uint32_t i = 0; i < num_regs; i++) {
 		local_regs[i].offset = regs[i].offset;
 		local_regs[i].value  = regs[i].value;
@@ -2039,7 +2050,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint
 	PRINT_NAME();
 
 	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
 		LOGF("\t action           = 0x%02" PRIx8 "\n"
 		     "\t gcr_cntl         = 0x%04" PRIx16 "\n"
 		     "\t dst              = %" PRIu8 "\n"
@@ -2971,7 +2982,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
 	PRINT_NAME();
 
 	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
 		LOGF("\t event_type = 0x%02" PRIx8 "\n"
 		     "\t address    = 0x%016" PRIx64 "\n",
 		     event_type, reinterpret_cast<uint64_t>(address));
@@ -3034,7 +3045,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 	PRINT_NAME();
 
 	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
 		LOGF("\t engine      = 0x%02" PRIx8 "\n"
 		     "\t cb_db_op    = 0x%08" PRIx32 "\n"
 		     "\t gcr_cntl    = 0x%08" PRIx32 "\n"
@@ -3050,7 +3061,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
 	static std::atomic<uint32_t> warning_log_count {0};
-	const bool                   log_warning = (warning_log_count.fetch_add(1) < 64);
+	const bool                   log_warning = (warning_log_count.load(std::memory_order_relaxed) < 64 && warning_log_count.fetch_add(1) < 64);
 	if (!no_size && (size_bytes & 0xffu) != 0) {
 		if (log_warning) {
 			LOGF_COLOR(Log::Color::Red, "\t warning: size_bytes is not 256-byte aligned\n");
