@@ -5065,10 +5065,18 @@ public:
       compatible_desc.info.guest_format = Prospero::BufferFormat::k8_8_8_8UInt;
       compatible_desc.view_info.format = compatible_desc.info.pixel_format;
       const auto compatible = texture_cache.FindImage(compatible_desc);
+      // A first-page hit resolves without a region query. Every FindImage then runs
+      // SyncAliasFromOwner, which scans the region once for a stale-alias owner while
+      // aliases age by frames (5acad01d; KYTY_IMAGE_ALIAS_AGE=ticks disables it), so the
+      // two hits cost exactly that many scans and no lookup scans.
+      const char *alias_age = std::getenv("KYTY_IMAGE_ALIAS_AGE");
+      const uint32_t alias_sync_scans =
+          alias_age == nullptr || std::strcmp(alias_age, "ticks") != 0 ? 1u : 0u;
       Require(name, "normalized FindImage",
               first && repeated == first && compatible == first &&
                   (!TextureCacheTestAccess::UsesFirstPageLookup(texture_cache) ||
-                   TextureCacheTestAccess::QueryEpoch(texture_cache) == exact_query_epoch) &&
+                   TextureCacheTestAccess::QueryEpoch(texture_cache) ==
+                       exact_query_epoch + 2u * alias_sync_scans) &&
                   TextureCacheTestAccess::LookupVerificationHealthy(texture_cache) &&
                   texture_cache.GetImage(first).info.pixel_format ==
                       vk::Format::eR8G8B8A8Srgb,
