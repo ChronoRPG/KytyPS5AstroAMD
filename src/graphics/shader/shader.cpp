@@ -171,6 +171,67 @@ static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
 	return nullptr;
 }
 
+// Draw-prep: the guest AGC metadata a stage preparation parses (the user-data header, its
+// direct-resource offsets and the input semantics) is copied through the recorder, and the
+// parsers consume the copies. A preparing worker therefore never dereferences guest memory, and
+// the certificate covers every parsed byte (and a little more: the whole header and all
+// semantics are copied even when fewer are used, which only costs occasional fallbacks).
+struct PreparationMetadata {
+	static constexpr uint32_t MaxEntries = 64;
+
+	ShaderUserData                           header {};
+	std::array<uint16_t, MaxEntries>        direct_offsets {};
+	std::array<ShaderSemantic, MaxEntries>  semantics {};
+};
+
+// Outside a preparation returns `data` unchanged. Inside one, returns a view whose pointers refer
+// to `copy`; false (the preparation failed) when a copy could not be read.
+static bool CopyMetadataForPreparation(const ShaderMappedData& data, PreparationMetadata& copy,
+                                       ShaderMappedData& view) {
+	view = data;
+	if (!DrawPrep::Speculative()) {
+		return true;
+	}
+	const auto read = [](const void* address, void* destination, uint64_t size) {
+		return size == 0 ||
+		       LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(address),
+		                                                destination, size);
+	};
+	if (data.user_data != nullptr) {
+		if (!read(data.user_data, &copy.header, sizeof(copy.header))) {
+			return false;
+		}
+		const uint32_t direct = copy.header.direct_resource_count;
+		if (direct > PreparationMetadata::MaxEntries) {
+			// Beyond every known domain: the parser would reject it; let the serial path.
+			DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+			return false;
+		}
+		if (direct != 0 && copy.header.direct_resource_offset != nullptr) {
+			if (!read(copy.header.direct_resource_offset, copy.direct_offsets.data(),
+			          uint64_t {direct} * sizeof(uint16_t))) {
+				return false;
+			}
+			copy.header.direct_resource_offset = copy.direct_offsets.data();
+		}
+		view.user_data = &copy.header;
+	}
+	if (data.input_semantics != nullptr) {
+		// The count lives in the host-side shader map entry.
+		const uint32_t count = data.num_input_semantics;
+		if (count > PreparationMetadata::MaxEntries) {
+			DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+			return false;
+		}
+		if (!read(data.input_semantics, copy.semantics.data(),
+		          uint64_t {count} * sizeof(ShaderSemantic))) {
+			return false;
+		}
+		view.input_semantics = copy.semantics.data();
+	}
+	return true;
+}
+
 static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 	static const bool use_clean_backing = [] {
 		const auto* value = std::getenv("KYTY_SHADER_METADATA_BACKING");
@@ -567,6 +628,10 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 	for (uint32_t i = 0; i < num_input_semantics; i++) {
 		const auto& in = input_semantics[i];
 
+		if (speculative && (in.static_vb_index == 1 || in.static_attribute == 1)) {
+			DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+			return;
+		}
 		EXIT_NOT_IMPLEMENTED(in.static_vb_index == 1 || in.static_attribute == 1);
 
 		uint32_t attribute = 0;
@@ -999,8 +1064,22 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		return params; // discarded; the serial path decides at commit
 	}
 	if (!merged) {
-		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
-		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
+		const auto static_info = [&](const ShaderMappedData& metadata) {
+			return ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
+			                                      regs.gs_regs.rsrc2.user_sgpr, sh, metadata, info);
+		};
+		bool prepared = false;
+		if (DrawPrep::Speculative()) {
+			PreparationMetadata metadata_copy;
+			ShaderMappedData    metadata = data;
+			if (!CopyMetadataForPreparation(data, metadata_copy, metadata)) {
+				return params;
+			}
+			prepared = static_info(metadata);
+		} else {
+			prepared = static_info(data);
+		}
+		if (!prepared) {
 			if (DrawPrep::Speculative()) {
 				DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
 				return params;
@@ -1128,7 +1207,17 @@ ShaderParams PrepareProgram(
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     ShaderPixelInputInfo&                               ps_info) {
 	const auto data = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
-	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
+	if (DrawPrep::Speculative()) {
+		PreparationMetadata metadata_copy;
+		ShaderMappedData    metadata = data;
+		if (DrawPrep::SpeculativeFailed() ||
+		    !CopyMetadataForPreparation(data, metadata_copy, metadata)) {
+			return {};
+		}
+		ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, metadata, ps_info);
+	} else {
+		ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
+	}
 	return GetShaderParams(
 	    regs.ps_regs.data_addr, "ShaderRecompiler PS", GetDeclaredShaderHash(regs.ps_regs.data_addr),
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);

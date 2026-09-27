@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_DRAWPREP_H_
 
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -92,11 +93,21 @@ struct PreparedDraw {
 	uint64_t                                            shader_map_generation = 0;
 };
 
+// Whether the draw path would reach its program preparation for a draw with these registers and
+// counts (renderDraw.cpp: the early returns before PrepareDrawRenderState, with target operations
+// as a superset). Only such draws are prepared, so a preparation never evaluates registers the
+// serial path would not have evaluated for that draw.
+[[nodiscard]] bool DrawReachesPrograms(const HW::Context& context, const HW::UserConfig& user_config,
+                                       const HW::Shader& shaders, uint32_t count,
+                                       uint32_t instance_count);
+
 // The pure preparation of one draw from a register snapshot. `exact`: the caller is the GPU
 // thread (exact clean predicate for reads); otherwise a DrawPrep worker. Never touches the
-// texture/buffer caches, the scheduler or Vulkan, and never faults on GPU-owned memory.
-void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, bool exact,
-             PreparedDraw& prepared);
+// texture/buffer caches, the scheduler or Vulkan, and never dereferences guest memory (every
+// read goes through the recorder). `eligible`: DrawReachesPrograms for the draw; otherwise the
+// preparation is skipped (Ineligible).
+void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, bool eligible,
+             bool exact, PreparedDraw& prepared);
 
 // GPU thread, at the point where the serial path would prepare the programs: whether the
 // prepared outputs equal what the serial preparation would produce now. Counts the committed
@@ -104,24 +115,15 @@ void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, b
 [[nodiscard]] bool Validate(PreparedDraw& prepared, bool pixel_active,
                             std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping);
 
-// KYTY_DRAW_PREP_VERIFY: compares committed outputs with a serial preparation's. Returns true
-// when equal; otherwise counts, logs and (exit mode) stops.
-bool VerifyCommitted(const PipelineCache::GraphicsPrograms& programs,
+// KYTY_DRAW_PREP_VERIFY: compares committed outputs with a serial preparation's (the pixel stage
+// only when it is active). Returns true when equal; otherwise counts, logs and (exit mode) stops.
+bool VerifyCommitted(bool pixel_active, const PipelineCache::GraphicsPrograms& programs,
                      const ShaderVertexInputInfo& vertex_info, const ShaderPixelInputInfo& pixel_info,
                      const PipelineCache::GraphicsStagePreps& preps,
                      const PipelineCache::GraphicsPrograms& serial_programs,
                      const ShaderVertexInputInfo&            serial_vertex_info,
                      const ShaderPixelInputInfo&             serial_pixel_info,
                      const PipelineCache::GraphicsStagePreps& serial_preps);
-
-// PM4 packet classes for the preparation window.
-enum class PacketClass : uint8_t {
-	WindowSafe, // only CP register/state writes, markers, control flow: no drain needed
-	Draw,       // direct draw
-	Fence,      // anything else: commit the window first
-};
-[[nodiscard]] PacketClass ClassifyPacket(uint32_t header, const uint32_t* body,
-                                         uint32_t remaining_dw);
 
 enum class DrawKind : uint8_t { Index, Auto };
 
@@ -133,9 +135,9 @@ enum class DrawKind : uint8_t { Index, Auto };
 // drains before every fence packet, before servicing commands from other threads, when a
 // draw's instance count may be GPU data, and at the end of every command-stream slice. A head
 // slot no worker has claimed yet is prepared by the command processor itself; a claimed one is
-// waited for (spinning, servicing commands from other threads so that a worker's page fault can
-// never deadlock). Workers never touch the caches, the scheduler or Vulkan; a failed preparation
-// or certificate runs the serial preparation at commit.
+// waited for (spinning; only after 2 ms, as a deadlock guard, does the wait service commands from
+// other threads). Workers never touch the caches, the scheduler or Vulkan, and never dereference
+// guest memory; a failed preparation or certificate runs the serial preparation at commit.
 class Engine {
 public:
 	// service_commands runs the GPU thread's pending cross-thread commands (used while waiting).

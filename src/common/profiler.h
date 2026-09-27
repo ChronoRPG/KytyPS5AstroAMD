@@ -291,6 +291,12 @@ enum class FrameEvent : uint32_t {
 	DrawPrepDrains,
 	DrawPrepWindowOccupancy,
 	DrawPrepCommitWaits,
+	// KYTY_DRAW_PREP_LOG_AUDIT=1 with value certificates: commits the log check would have
+	// refused although the bytes were unchanged (LogWouldReject), and certificates whose ranges
+	// were clean with no intersecting log entry but whose bytes had changed (LogMissed: the
+	// log-mode certificate would have accepted stale bytes).
+	DrawPrepLogWouldReject,
+	DrawPrepLogMissed,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

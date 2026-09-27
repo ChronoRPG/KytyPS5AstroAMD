@@ -417,6 +417,7 @@ void TestRecordedPreparationCertifies() {
            a.snapshot.images == b.snapshot.images &&
            a.snapshot.samplers == b.snapshot.samplers &&
            a.snapshot.user_data == b.snapshot.user_data &&
+           a.snapshot.uniform_fill == b.snapshot.uniform_fill &&
            a.specialization == b.specialization;
   };
   g_probe_memory = {};

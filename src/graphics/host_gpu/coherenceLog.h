@@ -5,7 +5,10 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <span>
+#include <thread>
 
 // Draw-prep S4: the coherence generation and its range log.
 //
@@ -85,6 +88,8 @@ struct CheckOutcome {
 class Log {
 public:
 	static constexpr uint64_t Capacity = uint64_t {1} << 14u;
+	// The counter starts at 1, so the first appended entry is generation 2.
+	static constexpr uint64_t FirstEntryGeneration = 2;
 
 	// Starts at 1: zero-initialized verdict table entries and zero sequence words never match.
 	[[nodiscard]] uint64_t Generation() const noexcept {
@@ -97,6 +102,17 @@ public:
 	uint64_t Append(Range range, Source source) noexcept {
 		const auto generation = m_generation.fetch_add(1, std::memory_order_seq_cst) + 1u;
 		auto&      entry      = m_entries[generation & (Capacity - 1u)];
+		// Slots are written in turn: the writer of this lap waits until the previous lap's writer
+		// of the slot has published (the slot starts at 0), so two writers never interleave on
+		// one slot and a reader can never accept a mix of two payloads.
+		const auto previous =
+		    generation >= Capacity + FirstEntryGeneration ? generation - Capacity : 0u;
+		for (uint32_t spins = 0; entry.sequence.load(std::memory_order_acquire) != previous;
+		     spins++) {
+			if (spins >= 64u) {
+				std::this_thread::yield();
+			}
+		}
 		// Seqlock write: invalidate, then the payload, then publish the generation.
 		entry.sequence.store(0, std::memory_order_relaxed);
 		std::atomic_thread_fence(std::memory_order_release);
@@ -198,6 +214,27 @@ inline uint64_t Append(Range range, Source source) noexcept {
 
 inline uint64_t Append(uint64_t address, uint64_t size, Source source) noexcept {
 	return g_log.Append(MakeRange(address, size), source);
+}
+
+// Emulator writes of backing bytes outside a publication change content, not cleanliness, so
+// only the log-mode draw-prep certificate (KYTY_DRAW_PREP_CERT=log, or its audit
+// KYTY_DRAW_PREP_LOG_AUDIT=1) needs them logged. Otherwise they do not touch the generation,
+// which the clean-verdict cache shares.
+[[nodiscard]] inline bool ContentWritesLogged() noexcept {
+	static const bool logged = [] {
+		const auto* cert  = std::getenv("KYTY_DRAW_PREP_CERT");
+		const auto* audit = std::getenv("KYTY_DRAW_PREP_LOG_AUDIT");
+		return (cert != nullptr && std::strcmp(cert, "log") == 0) ||
+		       (audit != nullptr && *audit != '\0' && std::strcmp(audit, "0") != 0);
+	}();
+	return logged;
+}
+
+// Call after the bytes are written.
+inline void NoteContentWrite(uint64_t address, uint64_t size, Source source) noexcept {
+	if (ContentWritesLogged()) {
+		Append(address, size, source);
+	}
 }
 
 } // namespace Libs::Graphics::Coherence

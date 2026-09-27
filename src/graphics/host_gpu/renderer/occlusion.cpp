@@ -191,7 +191,7 @@ bool OcclusionCounter::Dump(uint64_t address) {
 			                                         sizeof(uint64_t));
 		}
 		// Backing bytes changed outside a publication: logged after the write.
-		Coherence::Append(address, 248, Coherence::Source::OcclusionWrite);
+		Coherence::NoteContentWrite(address, 248, Coherence::Source::OcclusionWrite);
 		if (HangTrace::Enabled()) {
 			uint64_t db0 = 0;
 			std::memcpy(&db0, source, sizeof(db0));

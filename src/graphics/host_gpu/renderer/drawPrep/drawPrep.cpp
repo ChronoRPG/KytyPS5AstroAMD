@@ -143,6 +143,16 @@ CertMode GetCertMode() {
 	return mode;
 }
 
+// KYTY_DRAW_PREP_LOG_AUDIT=1: with value certificates, also evaluate the log check and count
+// where it would have decided differently (DrawPrepLogWouldReject, DrawPrepLogMissed).
+static bool LogAuditEnabled() {
+	static const bool enabled = [] {
+		const auto* value = EnvValue("KYTY_DRAW_PREP_LOG_AUDIT");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 bool PacketHookEnabled() {
 	static const bool enabled = [] {
 		const auto* value = EnvValue("KYTY_DRAW_PREP_HISTOGRAM");
@@ -151,14 +161,18 @@ bool PacketHookEnabled() {
 	return enabled;
 }
 
-void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, bool exact,
-             PreparedDraw& prepared) {
-	Profiler::ScopedFrameWait wait(Profiler::FrameWait::DrawPrepPrepare);
-	prepared.ok      = false;
-	prepared.failure = Failure::None;
-	prepared.programs = {};
+void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, bool eligible,
+             bool exact, PreparedDraw& prepared) {
+	prepared.ok         = false;
+	prepared.failure    = Failure::None;
+	prepared.programs   = {};
 	prepared.pixel_info = {};
 	prepared.reads.Reset();
+	if (!eligible) {
+		prepared.failure = Failure::Ineligible;
+		return;
+	}
+	Profiler::ScopedFrameWait wait(Profiler::FrameWait::DrawPrepPrepare);
 	// Loaded before any read: every coherence transition after this point is newer.
 	prepared.coherence_generation  = Coherence::Generation();
 	prepared.shader_map_generation = ShaderMapGeneration();
@@ -236,7 +250,20 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 		}
 	} else {
 		static thread_local std::vector<uint8_t> scratch;
-		switch (prepared.reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch)) {
+		const auto result = prepared.reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch);
+		if (LogAuditEnabled()) {
+			// Would the log-mode certificate have decided the same? (Unclean ranges fail both.)
+			const bool log_clean = Coherence::g_log
+			                           .Check(prepared.coherence_generation,
+			                                  Coherence::Generation(), ranges)
+			                           .result == Coherence::CheckResult::Clean;
+			if (log_clean && result == ValidateResult::Changed) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepLogMissed);
+			} else if (!log_clean && result == ValidateResult::Ok) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepLogWouldReject);
+			}
+		}
+		switch (result) {
 			case ValidateResult::Ok: break;
 			case ValidateResult::Unclean: return fail(Failure::CertUnclean);
 			case ValidateResult::Changed: return fail(Failure::CertChanged);
@@ -307,7 +334,7 @@ bool SamePixelInfo(const ShaderPixelInputInfo& a, const ShaderPixelInputInfo& b)
 
 } // namespace
 
-bool VerifyCommitted(const PipelineCache::GraphicsPrograms& programs,
+bool VerifyCommitted(bool pixel_active, const PipelineCache::GraphicsPrograms& programs,
                      const ShaderVertexInputInfo& vertex_info, const ShaderPixelInputInfo& pixel_info,
                      const PipelineCache::GraphicsStagePreps& preps,
                      const PipelineCache::GraphicsPrograms& serial_programs,
@@ -318,8 +345,10 @@ bool VerifyCommitted(const PipelineCache::GraphicsPrograms& programs,
 	const bool programs_equal = programs.pixel.id == serial_programs.pixel.id &&
 	                            programs.vertex[0].id == serial_programs.vertex[0].id &&
 	                            programs.vertex[1].id == serial_programs.vertex[1].id;
-	const bool pixel_equal = SamePrep(preps.pixel, serial_preps.pixel) &&
-	                         SamePixelInfo(pixel_info, serial_pixel_info);
+	// Without an active pixel shader neither path writes the pixel prep (the draw state keeps
+	// an earlier draw's, which nothing reads).
+	const bool pixel_equal = SamePixelInfo(pixel_info, serial_pixel_info) &&
+	                         (!pixel_active || SamePrep(preps.pixel, serial_preps.pixel));
 	const bool vertex_equal = SamePrep(preps.vertex[0], serial_preps.vertex[0]) &&
 	                          SameVertexInfo(vertex_info, serial_vertex_info);
 	if (programs_equal && pixel_equal && vertex_equal) {
@@ -339,51 +368,6 @@ bool VerifyCommitted(const PipelineCache::GraphicsPrograms& programs,
 	return false;
 }
 
-PacketClass ClassifyPacket(uint32_t header, const uint32_t* body, uint32_t remaining_dw) {
-	const auto opcode = (header >> 8u) & 0xffu;
-	switch (opcode) {
-		case Pm4::IT_SET_CONTEXT_REG:
-		case Pm4::IT_SET_SH_REG:
-		case Pm4::IT_SET_UCONFIG_REG:
-		case Pm4::IT_SET_UCONFIG_REG_INDEX:
-		case Pm4::IT_INDEX_TYPE:
-		case Pm4::IT_INDEX_BASE:
-		case Pm4::IT_INDEX_BUFFER_SIZE:
-		case Pm4::IT_NUM_INSTANCES:
-		case Pm4::IT_SET_BASE:
-		case Pm4::IT_CLEAR_STATE:
-		case Pm4::IT_PFP_SYNC_ME: return PacketClass::WindowSafe;
-		// A plain call/chain only moves the fetcher; the 14-dword form is a conditional branch
-		// that reads guest memory.
-		case Pm4::IT_INDIRECT_BUFFER:
-			return KYTY_PM4_LEN(header) == 4u ? PacketClass::WindowSafe : PacketClass::Fence;
-		case Pm4::IT_DRAW_INDEX_2:
-		case Pm4::IT_DRAW_INDEX_OFFSET_2:
-		case Pm4::IT_DRAW_INDEX_AUTO:
-		case Pm4::IT_DISPATCH_DRAW_PREAMBLE: return PacketClass::Draw;
-		case Pm4::IT_NOP: {
-			const auto r = KYTY_PM4_R(header);
-			if (r == Pm4::R_ZERO) {
-				if (remaining_dw >= 2 && (body[0] & 0xffff0000u) == 0x68750000u) {
-					// Markers: 0 (none), 0x4 and 0xd (user-data markers) only set CP state;
-					// the others are flips.
-					const auto id = body[0] & 0xfffu;
-					return id == 0x0u || id == 0x4u || id == 0xdu ? PacketClass::WindowSafe
-					                                               : PacketClass::Fence;
-				}
-				return PacketClass::WindowSafe;
-			}
-			// Context push/pop only copies register files (and counts a DE event that the
-			// constant engine observes only after this command stream yields).
-			return r == Pm4::R_CONTEXT_STATE || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER
-			           ? PacketClass::WindowSafe
-			           : PacketClass::Fence;
-		}
-		default: break;
-	}
-	return PacketClass::Fence;
-}
-
 // ---------------------------------------------------------------------------------------------
 // Engine
 
@@ -394,6 +378,7 @@ struct Engine::Slot {
 	DrawAutoArgs     auto_args {};
 	RegisterSnapshot registers;
 	PreparedDraw     prepared;
+	bool             eligible        = false; // DrawReachesPrograms, decided at submission
 	bool             worker_prepared = false;
 };
 
@@ -466,7 +451,7 @@ struct Engine::Workers {
 		while (!stop.load(std::memory_order_acquire)) {
 			uint64_t seq  = 0;
 			if (auto* slot = window.TryClaim(seq); slot != nullptr) {
-				Prepare(pipeline_cache, slot->registers, false, slot->prepared);
+				Prepare(pipeline_cache, slot->registers, slot->eligible, false, slot->prepared);
 				slot->worker_prepared = true;
 				window.Complete(seq);
 				idle_start = NowNs();
@@ -524,17 +509,24 @@ void Engine::FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index
                       const DrawAutoArgs* auto_args, const HW::Context& context,
                       const HW::UserConfig& user_config, const HW::Shader& shaders) {
 	slot.submit_id = submit_id;
+	uint32_t count = 0;
+	uint32_t instances = 0;
 	if (index_args != nullptr) {
 		slot.kind       = DrawKind::Index;
 		slot.index_args = *index_args;
+		count           = index_args->index_count;
+		instances       = index_args->instance_count;
 	} else {
 		slot.kind      = DrawKind::Auto;
 		slot.auto_args = *auto_args;
+		count          = auto_args->vertex_count;
+		instances      = auto_args->instance_count;
 	}
 	slot.registers.context     = context;
 	slot.registers.user_config = user_config;
 	slot.registers.shaders     = shaders;
-	slot.worker_prepared       = false;
+	slot.eligible        = DrawReachesPrograms(context, user_config, shaders, count, instances);
+	slot.worker_prepared = false;
 }
 
 bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
@@ -551,7 +543,7 @@ bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
 		// Inline: prepare on this thread from the snapshot, then commit at once.
 		auto& slot = *m_inline_slot;
 		FillSlot(slot, submit_id, index_args, auto_args, context, user_config, shaders);
-		Prepare(m_renderer.GetPipelineCache(), slot.registers, true, slot.prepared);
+		Prepare(m_renderer.GetPipelineCache(), slot.registers, slot.eligible, true, slot.prepared);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
 		Commit(slot);
 		return true;
@@ -574,17 +566,22 @@ void Engine::CommitHead() {
 	auto& slot = window.HeadPayload();
 	if (window.TryClaimHead()) {
 		// No worker has started it: prepare it here, with the exact clean predicate.
-		Prepare(m_renderer.GetPipelineCache(), slot.registers, true, slot.prepared);
+		Prepare(m_renderer.GetPipelineCache(), slot.registers, slot.eligible, true, slot.prepared);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
 	} else if (window.HeadDone()) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepReady);
 	} else {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaits);
 		Profiler::ScopedFrameWait wait(Profiler::FrameWait::DrawPrepCommitWait);
+		const auto wait_start = NowNs();
 		for (uint32_t spins = 1; !window.HeadDone(); spins++) {
 			CpuRelax();
-			// A worker blocked in a page fault waits for this thread to service it.
-			if ((spins & 1023u) == 0u && m_service_commands) {
+			// Workers never dereference guest memory, so they cannot page fault into a request
+			// this thread must service. Only as a last-resort deadlock guard, after 2 ms, pending
+			// cross-thread commands are serviced here; such a command then observes the window
+			// partially committed, as if it had arrived just before these draws were parsed.
+			if ((spins & 1023u) == 0u && m_service_commands &&
+			    NowNs() - wait_start > 2'000'000u) {
 				m_service_commands();
 			}
 		}

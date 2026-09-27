@@ -1,6 +1,7 @@
 // Draw-prep S4-S6 unit tests: the coherence log, read-set coalescing and certificate checks,
 // and (S6) the preparation window ring.
 #include "graphics/host_gpu/coherenceLog.h"
+#include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 
@@ -110,31 +111,73 @@ void TestLogOverflow() {
 	      "the newest entry is readable");
 }
 
-void TestLogConcurrentAppends() {
-	auto                    log     = std::make_unique<Coherence::Log>();
-	constexpr uint32_t      Threads = 8;
-	constexpr uint32_t      PerThread = 1000;
-	const auto              g0      = log->Generation();
-	std::vector<std::thread> threads;
-	std::atomic<uint32_t>   conflicts {0};
-	for (uint32_t t = 0; t < Threads; t++) {
-		threads.emplace_back([&, t] {
-			for (uint32_t i = 0; i < PerThread; i++) {
-				// Thread t writes only its own 1 MiB window.
-				const uint64_t base = (uint64_t {t} + 1u) << 20u;
-				log->Append(Coherence::MakeRange(base + i * 8u, 8), Coherence::Source::Test);
-				// Concurrent readers must see either complete entries or Unknown.
-				const std::array<Coherence::Range, 1> mine {{{base, base + (1u << 20u)}}};
-				const auto outcome = log->Check(log->Generation() - 1u, log->Generation(), mine);
-				if (outcome.result == Coherence::CheckResult::Conflict) {
-					conflicts.fetch_add(1, std::memory_order_relaxed);
+// Every entry thread t appends is [((t + 1) << 20) + 8 i, +8) with Source::Test: a torn read
+// (payload words from two appends) breaks this shape.
+bool WellFormedEntry(Coherence::Range range, Coherence::Source source, uint32_t threads) {
+	const auto window = range.begin >> 20u;
+	return source == Coherence::Source::Test && range.end == range.begin + 8u &&
+	       (range.begin & 7u) == 0u && window >= 1u && window <= threads &&
+	       ((range.begin - (window << 20u)) >> 3u) < (1u << 17u);
+}
+
+// Appenders on several threads while readers read recent generations concurrently. Readers must
+// only ever accept complete entries; with `laps` > 1 the ring wraps several times, so slots are
+// rewritten while being read.
+void RunConcurrentLog(Coherence::Log& log, uint32_t threads_count, uint32_t per_thread,
+                      std::atomic<uint32_t>& torn, std::atomic<uint64_t>& reads_ok) {
+	std::atomic<bool>        done {false};
+	std::vector<std::thread> readers;
+	for (uint32_t r = 0; r < 2; r++) {
+		readers.emplace_back([&, r] {
+			uint64_t salt = 0x9e3779b97f4a7c15ull * (r + 1u);
+			while (!done.load(std::memory_order_acquire)) {
+				const auto newest = log.Generation();
+				salt ^= salt << 13u;
+				salt ^= salt >> 7u;
+				salt ^= salt << 17u;
+				const auto back = salt % 64u;
+				if (newest < Coherence::Log::FirstEntryGeneration + back) {
+					continue;
+				}
+				Coherence::Range  range;
+				Coherence::Source source {};
+				if (log.Read(newest - back, range, source)) {
+					reads_ok.fetch_add(1, std::memory_order_relaxed);
+					if (!WellFormedEntry(range, source, threads_count)) {
+						torn.fetch_add(1, std::memory_order_relaxed);
+					}
 				}
 			}
 		});
 	}
-	for (auto& thread: threads) {
+	std::vector<std::thread> writers;
+	for (uint32_t t = 0; t < threads_count; t++) {
+		writers.emplace_back([&, t] {
+			const uint64_t base = (uint64_t {t} + 1u) << 20u;
+			for (uint32_t i = 0; i < per_thread; i++) {
+				log.Append(Coherence::MakeRange(base + uint64_t {i} * 8u, 8),
+				           Coherence::Source::Test);
+			}
+		});
+	}
+	for (auto& thread: writers) {
 		thread.join();
 	}
+	done.store(true, std::memory_order_release);
+	for (auto& thread: readers) {
+		thread.join();
+	}
+}
+
+void TestLogConcurrentAppends() {
+	auto                    log       = std::make_unique<Coherence::Log>();
+	constexpr uint32_t      Threads   = 8;
+	constexpr uint32_t      PerThread = 1000;
+	const auto              g0        = log->Generation();
+	std::atomic<uint32_t>   torn {0};
+	std::atomic<uint64_t>   reads_ok {0};
+	RunConcurrentLog(*log, Threads, PerThread, torn, reads_ok);
+	Check(torn.load() == 0, "concurrent readers never accept a torn entry");
 	const auto g1 = log->Generation();
 	Check(g1 - g0 == Threads * PerThread, "concurrent appends claim distinct generations");
 	// Afterwards every entry is readable and falls in exactly one window.
@@ -164,7 +207,30 @@ void TestLogConcurrentAppends() {
 		Check(log->Check(g0, g1, probe).result == Coherence::CheckResult::Conflict,
 		      "a concurrently appended entry is found by Check");
 	}
-	(void)conflicts;
+}
+
+void TestLogConcurrentWrap() {
+	// About five laps of the ring: slots are rewritten in turn while readers read them.
+	auto                  log        = std::make_unique<Coherence::Log>();
+	constexpr uint32_t    Threads    = 8;
+	constexpr uint32_t    PerThread  = static_cast<uint32_t>(Coherence::Log::Capacity * 5u / 8u);
+	const auto            g0         = log->Generation();
+	std::atomic<uint32_t> torn {0};
+	std::atomic<uint64_t> reads_ok {0};
+	RunConcurrentLog(*log, Threads, PerThread, torn, reads_ok);
+	Check(torn.load() == 0, "readers never accept a torn entry while the ring wraps");
+	const auto g1 = log->Generation();
+	Check(g1 - g0 == uint64_t {Threads} * PerThread, "wrapping appends claim distinct generations");
+	bool last_lap = true;
+	for (auto g = g1 - Coherence::Log::Capacity + 1u; g <= g1; g++) {
+		Coherence::Range  range;
+		Coherence::Source source {};
+		last_lap &= log->Read(g, range, source) && WellFormedEntry(range, source, Threads);
+	}
+	Check(last_lap, "the last lap of a wrapped ring is readable and intact");
+	Check(log->Check(g0, g1, std::array<Coherence::Range, 1> {{{0, 1}}}).result ==
+	          Coherence::CheckResult::Overflow,
+	      "an interval longer than the ring overflows");
 }
 
 void TestIntersectsAny() {
@@ -256,6 +322,26 @@ void TestReadSetCoalesces() {
 		      return memory.Read(address, tmp.data(), size);
 	      }),
 	      "AllClean on clean memory");
+}
+
+void TestReadSetPageBoundary() {
+	DrawPrep::ReadSet set;
+	const std::array<uint8_t, 16> bytes {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+	// Touching at a 4 KiB boundary: two ranges (two mappings may meet there).
+	Check(set.Record(0x20ff8, bytes.data(), 8), "record below the boundary");
+	Check(set.Record(0x21000, bytes.data() + 8, 8), "record above the boundary");
+	// Touching inside a page: one range.
+	Check(set.Record(0x21008, bytes.data(), 4), "record touching inside the page");
+	// One read across a boundary stays one range.
+	Check(set.Record(0x22ffc, bytes.data(), 8), "record across the next boundary");
+	Check(set.Finish(), "page-boundary reads finish");
+	const auto ranges = set.Ranges();
+	Check(ranges.size() == 3 && ranges[0] == Coherence::Range {0x20ff8, 0x21000} &&
+	          ranges[1] == Coherence::Range {0x21000, 0x2100c} &&
+	          ranges[2] == Coherence::Range {0x22ffc, 0x23004},
+	      "ranges split only at touching page boundaries");
+	Check(set.RangeBytes(1).size() == 12 && set.RangeBytes(1)[8] == 1,
+	      "bytes of a range merged inside a page");
 }
 
 void TestReadSetInconsistent() {
@@ -447,7 +533,93 @@ void TestWindowConcurrent(uint32_t capacity, uint32_t workers, uint64_t items) {
 	Check(order_ok, "items retire in publication order");
 	Check(result_ok, "every item is prepared exactly once with the right result");
 	Check(next_retire == items && self + by_workers == items, "every item retires once");
-	Check(by_workers > 0, "workers prepared some items");
+	// How many items the workers (rather than the producer) prepared depends on scheduling.
+	std::printf("  window %u x %u workers: %llu of %llu prepared by workers\n", capacity, workers,
+	            static_cast<unsigned long long>(by_workers), static_cast<unsigned long long>(items));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Packet classification (S0/S6)
+
+void TestPacketClassification() {
+	using DrawPrep::ClassifyPacket;
+	using DrawPrep::PacketClass;
+	namespace Pm4 = Libs::Graphics::Pm4;
+	const std::array<uint32_t, 4> no_body {};
+	const auto classify = [&](uint32_t len, uint32_t op, uint32_t r = 0,
+	                          const uint32_t* body = nullptr) {
+		return ClassifyPacket(KYTY_PM4(len, op, r), body != nullptr ? body : no_body.data(), len);
+	};
+	const std::array<uint32_t, 11> safe_ops {
+	    Pm4::IT_SET_CONTEXT_REG, Pm4::IT_SET_SH_REG,        Pm4::IT_SET_UCONFIG_REG,
+	    Pm4::IT_SET_UCONFIG_REG_INDEX, Pm4::IT_INDEX_TYPE,  Pm4::IT_INDEX_BASE,
+	    Pm4::IT_INDEX_BUFFER_SIZE, Pm4::IT_NUM_INSTANCES,   Pm4::IT_SET_BASE,
+	    Pm4::IT_CLEAR_STATE,       Pm4::IT_PFP_SYNC_ME};
+	for (const auto op: safe_ops) {
+		Check(classify(3, op) == PacketClass::WindowSafe, "register/state packet is window-safe");
+	}
+	const std::array<uint32_t, 4> draw_ops {Pm4::IT_DRAW_INDEX_2, Pm4::IT_DRAW_INDEX_OFFSET_2,
+	                                        Pm4::IT_DRAW_INDEX_AUTO,
+	                                        Pm4::IT_DISPATCH_DRAW_PREAMBLE};
+	for (const auto op: draw_ops) {
+		Check(classify(5, op) == PacketClass::Draw, "direct draw packet is a draw");
+	}
+	const std::array<uint32_t, 27> fence_ops {
+	    Pm4::IT_SET_CONTEXT_REG_INDIRECT, Pm4::IT_SET_SH_REG_INDIRECT,
+	    Pm4::IT_SET_UCONFIG_REG_INDIRECT, Pm4::IT_DRAW_INDIRECT,
+	    Pm4::IT_DRAW_INDEX_INDIRECT,      Pm4::IT_DRAW_INDIRECT_MULTI,
+	    Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, Pm4::IT_DISPATCH_DIRECT,
+	    Pm4::IT_DISPATCH_INDIRECT,        Pm4::IT_WRITE_DATA,
+	    Pm4::IT_WAIT_REG_MEM,             Pm4::IT_WAIT_REG_MEM_64,
+	    Pm4::IT_EVENT_WRITE,              Pm4::IT_EVENT_WRITE_EOP,
+	    Pm4::IT_EVENT_WRITE_EOS,          Pm4::IT_DMA_DATA,
+	    Pm4::IT_ACQUIRE_MEM,              Pm4::IT_COPY_DATA,
+	    Pm4::IT_COND_EXEC,                Pm4::IT_SET_PREDICATION,
+	    Pm4::IT_WRITE_CONST_RAM,          Pm4::IT_DUMP_CONST_RAM,
+	    Pm4::IT_INCREMENT_CE_COUNTER,     Pm4::IT_INCREMENT_DE_COUNTER,
+	    Pm4::IT_WAIT_ON_CE_COUNTER,       Pm4::IT_WAIT_ON_DE_COUNTER_DIFF,
+	    Pm4::IT_GET_LOD_STATS};
+	for (const auto op: fence_ops) {
+		Check(classify(5, op) == PacketClass::Fence, "packet with side effects is a fence");
+	}
+	Check(classify(5, Pm4::IT_REWIND) == PacketClass::Fence, "rewind is a fence");
+	// Every opcode outside the two short lists is a fence (unknown opcodes included).
+	uint32_t non_fences = 0;
+	for (uint32_t op = 0; op < 256; op++) {
+		if (op == Pm4::IT_NOP || op == Pm4::IT_INDIRECT_BUFFER) {
+			continue;
+		}
+		non_fences += classify(3, op) != PacketClass::Fence ? 1u : 0u;
+	}
+	Check(non_fences == safe_ops.size() + draw_ops.size(),
+	      "only the listed opcodes avoid draining the window");
+	// Indirect buffers: plain call/chain vs conditional branch.
+	Check(classify(4, Pm4::IT_INDIRECT_BUFFER) == PacketClass::WindowSafe,
+	      "indirect buffer call is window-safe");
+	Check(classify(14, Pm4::IT_INDIRECT_BUFFER) == PacketClass::Fence,
+	      "conditional indirect branch is a fence");
+	// NOPs, markers and custom R codes.
+	Check(classify(4, Pm4::IT_NOP) == PacketClass::WindowSafe, "plain NOP is window-safe");
+	const std::array<uint32_t, 3> marker_safe {0x68750000u, 0x68750004u, 0x6875000du};
+	for (const auto marker: marker_safe) {
+		const std::array<uint32_t, 4> body {marker, 0, 0, 0};
+		Check(classify(4, Pm4::IT_NOP, Pm4::R_ZERO, body.data()) == PacketClass::WindowSafe,
+		      "user-data marker is window-safe");
+	}
+	const std::array<uint32_t, 3> marker_flip {0x68750777u, 0x68750778u, 0x68750781u};
+	for (const auto marker: marker_flip) {
+		const std::array<uint32_t, 4> body {marker, 0, 0, 0};
+		Check(classify(4, Pm4::IT_NOP, Pm4::R_ZERO, body.data()) == PacketClass::Fence,
+		      "flip marker is a fence");
+	}
+	for (const auto r: {Pm4::R_CONTEXT_STATE, Pm4::R_PUSH_MARKER, Pm4::R_POP_MARKER}) {
+		Check(classify(3, Pm4::IT_NOP, r) == PacketClass::WindowSafe,
+		      "context state and markers are window-safe");
+	}
+	for (const auto r: {Pm4::R_RELEASE_MEM, Pm4::R_FLIP, Pm4::R_ACQUIRE_MEM,
+	                    Pm4::R_WAIT_FLIP_DONE, Pm4::R_DISPATCH_RESET}) {
+		Check(classify(8, Pm4::IT_NOP, r) == PacketClass::Fence, "custom operation is a fence");
+	}
 }
 
 } // namespace
@@ -458,11 +630,14 @@ int main() {
 	TestLogEmptyRangeNeverIntersects();
 	TestLogOverflow();
 	TestLogConcurrentAppends();
+	TestLogConcurrentWrap();
 	TestIntersectsAny();
 	TestReadSetCoalesces();
+	TestReadSetPageBoundary();
 	TestReadSetInconsistent();
 	TestReadSetLimits();
 	TestRecordScopeNests();
+	TestPacketClassification();
 	TestWindowSingleThread();
 	TestWindowConcurrent(4, 8, 200000);  // tiny window: constant wrap-around and races
 	TestWindowConcurrent(32, 6, 200000); // the default shape

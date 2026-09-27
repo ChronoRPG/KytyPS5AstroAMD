@@ -819,12 +819,16 @@ void CommandProcessor::SuspendPm4() {
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
-			// Draw-prep: service commands (readbacks, unmaps) observe every parsed draw.
-			if (m_draw_prep != nullptr && m_draw_prep->Pending() &&
-			    g_gpu_state->HasPendingCommands()) {
-				m_draw_prep->Drain();
+			if (m_draw_prep != nullptr && m_draw_prep->Pending()) {
+				// Draw-prep: service commands (readbacks, unmaps) observe every parsed draw, so
+				// they only run with an empty window.
+				if (g_gpu_state->HasPendingCommands()) {
+					m_draw_prep->Drain();
+					g_gpu_state->ProcessCommands();
+				}
+			} else {
+				g_gpu_state->ProcessCommands();
 			}
-			g_gpu_state->ProcessCommands();
 		}
 		auto& cursor = execution.m_buffer_stack.back();
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());

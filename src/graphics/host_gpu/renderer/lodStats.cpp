@@ -89,7 +89,7 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 			event.mean_finest_mip  = m_latest_mean_finest;
 		}
 		(void)LibKernel::Memory::TryWriteBacking(destination, report.data(), report.size());
-		Coherence::Append(destination, report.size(), Coherence::Source::LodStatsWrite);
+		Coherence::NoteContentWrite(destination, report.size(), Coherence::Source::LodStatsWrite);
 		if (HangTrace::Enabled()) {
 			event.destination    = destination;
 			event.control        = control;
@@ -169,7 +169,8 @@ void LodStatsCounter::Report(uint64_t destination, uint32_t size, uint32_t contr
 			    current == *record_time_report;
 			if (unchanged) {
 				(void)LibKernel::Memory::TryWriteBacking(destination, exact.data(), exact.size());
-				Coherence::Append(destination, exact.size(), Coherence::Source::LodStatsWrite);
+				Coherence::NoteContentWrite(destination, exact.size(),
+				                            Coherence::Source::LodStatsWrite);
 			}
 			if (HangTrace::Enabled()) {
 				HangTrace::LodReportEvent event;

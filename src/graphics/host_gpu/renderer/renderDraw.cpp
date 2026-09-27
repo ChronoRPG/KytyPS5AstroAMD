@@ -856,10 +856,11 @@ struct PreparedIndirectBuffers {
 // Pure superset of the ConsumeMetadataColorOperation, DepthStencilCopy and ResolveColorTargets
 // conditions. Those draws run an operation instead of drawing, but only when their CPU-visible
 // counts are nonzero, so indirect draws in these modes keep the CPU-read arguments.
-static bool DrawMayRunTargetOperation(const CommandBuffer& buffer) {
-	const auto& hw   = buffer.GetRegisters();
-	const auto  mode = hw.GetColorControl().mode;
-	if (ConsumeMetadataColorOperation(buffer) ||
+static bool MayRunTargetOperation(const HW::Context& hw) {
+	const auto mode = hw.GetColorControl().mode;
+	if (mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) ||
+	    mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
+	    mode == static_cast<uint8_t>(CbColorMode::DccDecompress) ||
 	    mode == static_cast<uint8_t>(CbColorMode::Resolve)) {
 		return true;
 	}
@@ -867,6 +868,10 @@ static bool DrawMayRunTargetOperation(const CommandBuffer& buffer) {
 	return mode == static_cast<uint8_t>(CbColorMode::Disable) &&
 	       ((override.force_z_dirty && override.force_z_valid) ||
 	        (override.force_stencil_dirty && override.force_stencil_valid));
+}
+
+static bool DrawMayRunTargetOperation(const CommandBuffer& buffer) {
+	return MayRunTargetOperation(buffer.GetRegisters());
 }
 
 // ResolvePrimitiveRestart without its index scan. nullopt when only a scan of CPU-visible
@@ -1146,6 +1151,16 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& t
 	return true;
 }
 
+// Draw-prep (drawPrep.h): the early returns of DrawIndex/DrawAuto before PrepareDrawRenderState,
+// evaluated on a register snapshot (target operations as their pure superset).
+bool DrawPrep::DrawReachesPrograms(const HW::Context& context, const HW::UserConfig& user_config,
+                                   const HW::Shader& shaders, uint32_t count,
+                                   uint32_t instance_count) {
+	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
+	return count != 0 && instance_count != 0 && !MayRunTargetOperation(context) &&
+	       DrawHasValidVertexShader(shaders) && GetDrawTopology(user_config, topology);
+}
+
 static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
                                     const DrawIndexBufferSource& source, bool allow_custom = false) {
 	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
@@ -1187,15 +1202,16 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 
 // Draw-prep: installs a validated preparation as if GetGraphicsPrograms had produced it. The
 // stage preps are swapped (the preparation keeps the old vectors' capacity) and the stage
-// runtimes re-pointed at the draw state's copies.
+// runtimes re-pointed at the draw state's copies. Like GetGraphicsPrograms, a draw without an
+// active pixel shader leaves the pixel prep untouched.
 static void ApplyPreparedDraw(DrawPrep::PreparedDraw& prepared, DrawRenderState& state) {
 	state.programs       = prepared.programs;
 	state.vertex_info[0] = prepared.vertex_info;
 	state.ps_input_info  = prepared.pixel_info;
 	std::swap(state.stage_preps.vertex[0], prepared.vertex_prep);
-	std::swap(state.stage_preps.pixel, prepared.pixel_prep);
 	state.vertex_info[0].stage.resources = &state.stage_preps.vertex[0].resources;
-	if (state.ps_input_info.stage.program != nullptr) {
+	if (prepared.pixel_active) {
+		std::swap(state.stage_preps.pixel, prepared.pixel_prep);
 		state.ps_input_info.stage.resources = &state.stage_preps.pixel.resources;
 	}
 }
@@ -1239,7 +1255,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 			const auto serial = pipeline_cache.GetGraphicsPrograms(
 			    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 			    target_export_mapping, state.ps_active, *vertex_copy, *pixel_copy, *prep_copy);
-			(void)DrawPrep::VerifyCommitted(state.programs, state.vertex_info[0],
+			(void)DrawPrep::VerifyCommitted(state.ps_active, state.programs, state.vertex_info[0],
 			                                state.ps_input_info, state.stage_preps, serial,
 			                                (*vertex_copy)[0], *pixel_copy, *prep_copy);
 		}

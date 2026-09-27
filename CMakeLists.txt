@@ -531,7 +531,7 @@ target_include_directories(image_cache_gc_policy_tests PRIVATE "${KYTY_SOURCE_DI
 add_executable(draw_prep_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DrawPrepTests.cpp"
 )
-target_include_directories(draw_prep_tests PRIVATE "${KYTY_SOURCE_DIR}")
+target_include_directories(draw_prep_tests PRIVATE ${inc_headers})
 if(LINUX)
 	target_link_libraries(draw_prep_tests Threads::Threads)
 endif()

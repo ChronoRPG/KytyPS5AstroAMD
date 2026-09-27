@@ -47,6 +47,7 @@ class ReadSet {
 public:
 	static constexpr uint32_t MaxReads = 2048;
 	static constexpr uint32_t MaxBytes = 64u * 1024u;
+	static constexpr uint64_t PageSize = 4096;
 
 	void Reset() noexcept {
 		m_reads.clear();
@@ -88,7 +89,9 @@ public:
 	[[nodiscard]] size_t      ReadCount() const noexcept { return m_reads.size(); }
 	[[nodiscard]] size_t      ByteCount() const noexcept { return m_bytes.size(); }
 
-	// Coalesces the recorded reads into sorted, non-overlapping ranges (touching reads merge).
+	// Coalesces the recorded reads into sorted, non-overlapping ranges. Overlapping reads merge,
+	// and so do touching ones unless they meet at a 4 KiB boundary (two guest mappings can meet
+	// there, and one read across it could fail where the two separate reads succeeded).
 	// Overlapping reads must agree on every shared byte, otherwise the preparation observed a
 	// concurrent change and fails (Inconsistent).
 	bool Finish() {
@@ -108,7 +111,9 @@ public:
 			const auto& read  = m_reads[index];
 			const auto* bytes = m_bytes.data() + read.offset;
 			const auto  end   = read.address + read.size;
-			if (!m_ranges.empty() && read.address <= m_ranges.back().end) {
+			if (!m_ranges.empty() &&
+			    (read.address < m_ranges.back().end ||
+			     (read.address == m_ranges.back().end && (read.address & (PageSize - 1u)) != 0))) {
 				auto&      range       = m_ranges.back();
 				const auto base        = m_range_offsets.back();
 				const auto overlap_end = std::min(end, range.end);
