@@ -1825,6 +1825,11 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	    },
 	    interrupt ? CommandScheduler::PriorityOperationKind::EopInterrupt
 	              : CommandScheduler::PriorityOperationKind::Generic);
+	if (proxy) {
+		// A guest thread is about to wait for this label: submit its tick now rather than at the
+		// next EOP batch or slice boundary, which can be most of a frame away.
+		BufferFlush();
+	}
 	return true;
 }
 
