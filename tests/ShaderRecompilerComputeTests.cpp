@@ -11645,6 +11645,223 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Astro Bot's streamed textures start as "heads": only the GFX10 mip tail block is loaded
+  // and the T# MIN_LOD is the first tail level (4.0 for a 2048^2 BC7 head). The streamer
+  // promotes a texture when the hardware counter reports samples finer than MIN_LOD. Here a
+  // 512^2 R32F chain with 64 KiB swizzle (first tail level 3), whose guest levels hold 1, 2, 4
+  // and 8 (tail). A head sampled at any LOD finer than MIN_LOD must return the MIN_LOD level
+  // from the uploaded tail, never a non-resident finer level (poisoned here). Finer MIN_LODs on
+  // the same memory extend residency. Gathers and texel fetches of a head read level 0, which
+  // Vulkan makes zero below the view's minimum LOD; those results are printed, not required.
+  void CheckStreamedHeadMinLod(const char *name, uintptr_t base, RenderContext &context,
+                               TextureCache &texture_cache, RenderExecutor &executor) {
+    auto &scheduler = context.GetCommandScheduler();
+    constexpr uint64_t head_offset = 0x180000;
+    constexpr uint32_t head_side = 512;
+    constexpr uint32_t head_last_level = 9;
+    constexpr uint64_t tail_bytes = 0x10000;    // levels 3..9, one 64 KiB block
+    constexpr uint64_t level2_bytes = 0x10000;  // 128x128x4
+    constexpr uint64_t level1_bytes = 0x40000;  // 256x256x4
+    constexpr uint64_t level0_bytes = 0x100000; // 512x512x4
+    const uint64_t head_address = base + head_offset;
+    const auto fill = [&](uint64_t offset, uint64_t bytes, float value) {
+      std::fill_n(reinterpret_cast<float *>(head_address + offset), bytes / sizeof(float),
+                  value);
+    };
+    fill(0, tail_bytes, 8.0f);
+    fill(tail_bytes, level2_bytes, 4.0f);
+    fill(tail_bytes + level2_bytes, level1_bytes, 2.0f);
+    fill(tail_bytes + level2_bytes + level1_bytes, level0_bytes, 1.0f);
+    const auto head_descriptor = [&](uint32_t min_lod) {
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      value.dwords = {
+          static_cast<uint32_t>(head_address >> 8u),
+          static_cast<uint32_t>(head_address >> 40u) | (min_lod << 8u) |
+              (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+              (((head_side - 1u) & 3u) << 30u),
+          ((head_side - 1u) >> 2u) | ((head_side - 1u) << 14u),
+          DstSel(4, 5, 6, 7) | (head_last_level << 16u) |
+              (static_cast<uint32_t>(Prospero::TileMode::kStandard64KB) << 20u) |
+              (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+          0,
+          0x00700000u | (head_last_level << 4u),
+          0,
+          0};
+      return value;
+    };
+    // Trilinear, LOD range 0..15.99.
+    const ShaderSamplerResource head_sampler{
+        {0, 0xfffu << 12u,
+         (1u << 20u) | (1u << 22u) |
+             (static_cast<uint32_t>(Prospero::SamplerMipFilter::kLinear) << 26u),
+         0}};
+    const auto sampler = context.GetSamplerCache().GetSampler(head_sampler);
+    const auto make_case = [&](const char *case_name, uint32_t outputs) {
+      TestCase test;
+      test.name = case_name;
+      test.has_user_data = true;
+      const auto initial = head_descriptor(3u * 256u);
+      std::copy_n(initial.dwords.begin(), 8, test.user_data.begin());
+      std::copy_n(head_sampler.fields, 4, test.user_data.begin() + 8);
+      test.user_data[50] = outputs * static_cast<u32>(sizeof(uint32_t));
+      return test;
+    };
+
+    constexpr std::array lods{0.0f, 1.0f, 2.0f, 3.0f, 3.5f, 6.0f};
+    auto sample_test =
+        make_case("StreamedHeadSampleBelowMinLod", static_cast<uint32_t>(lods.size()));
+    sample_test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                           ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+    sample_test.required_spirv = {"OpImageSampleExplicitLod"};
+    AppendVMovLiteral(&sample_test.code, 20, std::bit_cast<uint32_t>(0.5f));
+    AppendVMovLiteral(&sample_test.code, 21, std::bit_cast<uint32_t>(0.5f));
+    for (u32 index = 0; index < lods.size(); ++index) {
+      AppendVMovLiteral(&sample_test.code, 22, std::bit_cast<uint32_t>(lods[index]));
+      sample_test.code.push_back(EncodeMimg0(0x24, 1)); // IMAGE_SAMPLE_L
+      sample_test.code.push_back(EncodeMimg1(index, 20, 0, 2));
+    }
+    for (u32 index = 0; index < lods.size(); ++index) {
+      AppendStoreVgpr(&sample_test.code, index, index);
+    }
+    AppendEnd(&sample_test.code);
+    const auto sample_program = CompileCase(sample_test, SubgroupSize());
+
+    auto gather_test = make_case("StreamedHeadGather4Lz", 4);
+    gather_test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_GATHER4_LZ,
+                           ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+    AppendVMovLiteral(&gather_test.code, 20, std::bit_cast<uint32_t>(0.5f));
+    AppendVMovLiteral(&gather_test.code, 21, std::bit_cast<uint32_t>(0.5f));
+    gather_test.code.push_back(EncodeMimg0(0x47, 1));
+    gather_test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+    for (u32 index = 0; index < 4u; ++index) {
+      AppendStoreVgpr(&gather_test.code, index, index);
+    }
+    AppendEnd(&gather_test.code);
+    const auto gather_program = CompileCase(gather_test, SubgroupSize());
+
+    auto fetch_test = make_case("StreamedHeadLoadMip", 2);
+    fetch_test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_LOAD_MIP,
+                          ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+    AppendVMovU32(&fetch_test.code, 20, 1);
+    AppendVMovU32(&fetch_test.code, 21, 1);
+    AppendVMovU32(&fetch_test.code, 22, 0);
+    fetch_test.code.push_back(EncodeMimg0(0x01, 1)); // IMAGE_LOAD_MIP, mip 0
+    fetch_test.code.push_back(EncodeMimg1(0, 20, 0));
+    AppendVMovU32(&fetch_test.code, 22, 3);
+    fetch_test.code.push_back(EncodeMimg0(0x01, 1)); // IMAGE_LOAD_MIP, mip 3 (tail)
+    fetch_test.code.push_back(EncodeMimg1(1, 20, 0));
+    AppendStoreVgpr(&fetch_test.code, 0, 0);
+    AppendStoreVgpr(&fetch_test.code, 1, 1);
+    AppendEnd(&fetch_test.code);
+    const auto fetch_program = CompileCase(fetch_test, SubgroupSize());
+
+    const auto resolve = [&](const CompiledShader &program, uint32_t min_lod) {
+      return RenderExecutorTestAccess::ResolveTexture(executor, program.program.info.images[0],
+                                                      head_descriptor(min_lod));
+    };
+    // Runs `program` against the view of `binding` and returns its output words.
+    const auto run = [&](const TestCase &test, const CompiledShader &program,
+                         const TextureBinding &binding, size_t outputs,
+                         bool poison_below_resident) {
+      const auto view = texture_cache.FindTexture(binding.image_id, binding.desc);
+      auto &image = texture_cache.GetImage(binding.image_id);
+      if (poison_below_resident && image.resident_first != 0) {
+        // Stand-in for the undefined contents of non-resident levels.
+        image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+                      {}, scheduler.Current().Handle());
+        vk::ClearColorValue poison{};
+        poison.float32[0] = -7.0f;
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0,
+                                              image.resident_first, 0, 1};
+        scheduler.Current().Handle().clearColorImage(
+            image.backing.image, vk::ImageLayout::eTransferDstOptimal, &poison, 1, &range);
+      }
+      image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
+                    scheduler.Current().Handle());
+      Image sampled;
+      sampled.view = view;
+      sampled.layout = image.backing.state.layout;
+      scheduler.Finish();
+      auto output = CreateStorageBuffer(test.name, {}, outputs);
+      Dispatch(test, program, output, nullptr, &sampled, nullptr, nullptr, sampler);
+      auto words = ReadBuffer(test.name, output, outputs);
+      DestroyBuffer(&output);
+      return words;
+    };
+    const auto as_floats = [](const std::vector<u32> &words) {
+      std::vector<float> values;
+      for (const auto word : words) {
+        values.push_back(std::bit_cast<float>(word));
+      }
+      return values;
+    };
+    const auto describe = [&](const std::vector<float> &values) {
+      std::string text;
+      for (const auto value : values) {
+        char buffer[32] = {};
+        std::snprintf(buffer, sizeof(buffer), "%s%g", text.empty() ? "" : ",",
+                      static_cast<double>(value));
+        text += buffer;
+      }
+      return text;
+    };
+
+    // The head: only the tail is resident, and every LOD returns the tail's level 3.
+    const auto head = resolve(sample_program, 3u * 256u);
+    {
+      const auto *owner = TextureCacheTestAccess::Owner(texture_cache, head.image_id);
+      Require(name, "streamed head residency",
+              owner != nullptr && owner->resident_first == 3 &&
+                  owner->live.address == head_address && owner->live.size == tail_bytes &&
+                  owner->info.data.size == tail_bytes + level2_bytes + level1_bytes +
+                                               level0_bytes,
+              "a MIN_LOD 3.0 head did not keep exactly its mip tail resident");
+    }
+    const auto head_values =
+        as_floats(run(sample_test, sample_program, head, lods.size(), true));
+    Require(name, "streamed head samples below MIN_LOD",
+            std::ranges::all_of(head_values, [](float value) { return value == 8.0f; }),
+            "head sampled at LOD 0,1,2,3,3.5,6 returned " + describe(head_values) +
+                " instead of the MIN_LOD level (8) everywhere");
+    const auto gather_values = as_floats(
+        run(gather_test, gather_program, resolve(gather_program, 3u * 256u), 4, false));
+    const auto fetch_values = as_floats(
+        run(fetch_test, fetch_program, resolve(fetch_program, 3u * 256u), 2, false));
+    std::printf("[gpu]     %-32s gather4_lz=%s load_mip0,3=%s (level 0 is below MIN_LOD)\n",
+                "StreamedHeadGatherFetch", describe(gather_values).c_str(),
+                describe(fetch_values).c_str());
+    Require(name, "streamed head fetch at MIN_LOD",
+            fetch_values.size() == 2 && fetch_values[1] == 8.0f,
+            "IMAGE_LOAD_MIP of the head's MIN_LOD level returned " + describe(fetch_values));
+
+    // A fractional MIN_LOD makes floor(MIN_LOD) resident; Vulkan may floor the view clamp.
+    const auto half = resolve(sample_program, 2u * 256u + 128u);
+    Require(name, "fractional MIN_LOD residency",
+            half.image_id == head.image_id &&
+                TextureCacheTestAccess::Owner(texture_cache, half.image_id)->resident_first == 2,
+            "MIN_LOD 2.5 did not extend the same image to level 2");
+    const auto half_values =
+        as_floats(run(sample_test, sample_program, half, lods.size(), false));
+    const auto clamp_level = [](float value) { return value == 6.0f || value == 4.0f; };
+    Require(name, "fractional MIN_LOD samples",
+            clamp_level(half_values[0]) && clamp_level(half_values[1]) &&
+                clamp_level(half_values[2]) && half_values[3] == 8.0f &&
+                half_values[4] == 8.0f && half_values[5] == 8.0f,
+            "MIN_LOD 2.5 samples returned " + describe(half_values));
+
+    // Promotion in place: MIN_LOD 0 makes the whole chain resident from guest memory.
+    const auto full = resolve(sample_program, 0);
+    const auto full_values =
+        as_floats(run(sample_test, sample_program, full, lods.size(), false));
+    Require(name, "promoted chain samples",
+            full.image_id == head.image_id &&
+                full_values == std::vector<float>{1.0f, 2.0f, 4.0f, 8.0f, 8.0f, 8.0f},
+            "MIN_LOD 0 samples returned " + describe(full_values));
+    RenderExecutorTestAccess::ResetBindings(executor);
+    std::printf("[gpu]     %-32s ok\n", "StreamedHeadMinLodResidency");
+  }
+
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
@@ -12229,6 +12446,7 @@ public:
         DestroyBuffer(&output);
         RenderExecutorTestAccess::ResetBindings(executor);
       }
+      CheckStreamedHeadMinLod(name, base, context, texture_cache, executor);
 
       auto srgb_storage = storage;
       constexpr auto srgb_format =
