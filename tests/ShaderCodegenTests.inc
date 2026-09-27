@@ -1082,7 +1082,31 @@ void CheckInterpolationModes() {
   std::printf("[codegen] %-32s ok\n", name);
 }
 
+// A compressed export to a SNORM16_ABGR target (SPI_SHADER_COL_FORMAT 6) carries
+// V_CVT_PKNORM_I16_F32 pairs; they were unpacked as FP16.
+void CheckCompressedSnormExport() {
+  constexpr const char *name = "CodegenCompressedSnormExport";
+  std::vector<u32> code;
+  code.push_back(EncodeExp0(1, 0xf, true, true, true)); // exp mrt1 compr done vm
+  code.push_back(EncodeExp1(0, 1, 2, 3));
+  AppendEnd(&code);
+  const auto compile = [&](uint8_t mode) {
+    ShaderPixelInputInfo pixel{};
+    pixel.target_output_mode[1] = mode;
+    return CompilePixelShader(name, code, pixel);
+  };
+  const auto snorm = compile(6);
+  const auto half = compile(4);
+  Require(name, "SNORM16 compressed export",
+          CountSpirv(snorm, "UnpackSnorm2x16") == 2u && CountSpirv(snorm, "UnpackHalf2x16") == 0u &&
+              CountSpirv(half, "UnpackHalf2x16") == 2u,
+          "SNORM16: UnpackSnorm2x16 " + std::to_string(CountSpirv(snorm, "UnpackSnorm2x16")) +
+              ", UnpackHalf2x16 " + std::to_string(CountSpirv(snorm, "UnpackHalf2x16")));
+  std::printf("[codegen] %-32s ok\n", name);
+}
+
 void RunAll(VulkanHarness *vulkan) {
+  CheckCompressedSnormExport();
   CheckInterpolationModes();
   CheckMadPositionSlice();
   CheckMadModes(vulkan);

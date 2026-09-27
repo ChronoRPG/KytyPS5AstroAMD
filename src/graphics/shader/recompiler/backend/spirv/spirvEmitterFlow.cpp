@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -291,8 +292,19 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
                       bool uint_output) {
 	auto& state = ctx.state;
 	if (exp.compr && !uint_output) {
-		const auto unpack =
-		    MrtOutputMode(state, exp) == 5u ? GLSLstd450UnpackUnorm2x16 : GLSLstd450UnpackHalf2x16;
+		// SPI_SHADER_COL_FORMAT of a compressed export: 5 UNORM16_ABGR, 6 SNORM16_ABGR,
+		// 8 SINT16_ABGR (not modelled: it would need an integer output), otherwise FP16_ABGR.
+		const auto mode   = MrtOutputMode(state, exp);
+		const auto unpack = mode == 5u   ? GLSLstd450UnpackUnorm2x16
+		                    : mode == 6u ? GLSLstd450UnpackSnorm2x16
+		                                 : GLSLstd450UnpackHalf2x16;
+		if (mode == 8u) {
+			static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+			if (!warned.test_and_set(std::memory_order_relaxed)) {
+				std::fputs("Warning: SINT16_ABGR compressed color exports are unpacked as FP16.\n",
+				           stderr);
+			}
+		}
 		uint32_t f32[4] = {ConstantF32(state, 0), ConstantF32(state, 0), ConstantF32(state, 0),
 		                   ConstantF32(state, 0x3f800000u)};
 		for (uint32_t pair = 0; pair < 2u; pair++) {
