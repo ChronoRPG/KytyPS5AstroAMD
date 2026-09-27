@@ -6,6 +6,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
+#include "graphics/host_gpu/memoryStats.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -79,8 +80,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	const MemoryStats::ScopedTimer fault_timer(MemoryStats::Counter::FaultNs);
+	MemoryStats::Count(access == PageFaultAccess::Write ? MemoryStats::Counter::WriteFaults
+	                                                    : MemoryStats::Counter::ReadFaults);
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size, true);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);

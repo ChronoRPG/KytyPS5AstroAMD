@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/dccClear.h"
@@ -85,16 +86,40 @@ static bool AliasSyncSkipEnabled() {
 	return enabled;
 }
 
-// VK_KHR_maintenance8 "depth/stencil to color" copy compatibility, restricted to depth-only
-// images and to the color formats listed for their depth aspect.
+// KYTY_DIRECT_IMAGE_COPY_WIDE=0 restores the depth-only format lists of the maintenance8 copy
+// and the D32-only color -> depth shader copy (no combined depth/stencil formats, no R16 SFLOAT /
+// SNORM partners of D16).
+static bool DirectImageCopyWideEnabled() {
+	static const bool enabled = EnvNotZero("KYTY_DIRECT_IMAGE_COPY_WIDE");
+	return enabled;
+}
+
+// VK_KHR_maintenance8 "compatible depth-stencil and color formats" (formats-compatible-zs-color):
+// the DEPTH aspect of D32_SFLOAT and D32_SFLOAT_S8_UINT is size-compatible with R32_SFLOAT /
+// R32_SINT / R32_UINT, that of D16_UNORM and D16_UNORM_S8_UINT with R16_SFLOAT / R16_UNORM /
+// R16_SNORM / R16_UINT / R16_SINT. The copy moves raw depth-aspect bits (the stencil aspect of a
+// combined format is neither read nor written), exactly what Image::CopyImageWithBuffer moves
+// through its buffer. 24-bit depth is left out: its copies leave the padding bits undefined.
 [[nodiscard]] bool Maintenance8CopyCompatible(vk::Format depth, vk::Format color) {
+	const bool wide = DirectImageCopyWideEnabled();
 	switch (depth) {
+		case vk::Format::eD32SfloatS8Uint:
+			if (!wide) {
+				return false;
+			}
+			[[fallthrough]];
 		case vk::Format::eD32Sfloat:
 			return color == vk::Format::eR32Sfloat || color == vk::Format::eR32Uint ||
 			       color == vk::Format::eR32Sint;
+		case vk::Format::eD16UnormS8Uint:
+			if (!wide) {
+				return false;
+			}
+			[[fallthrough]];
 		case vk::Format::eD16Unorm:
 			return color == vk::Format::eR16Unorm || color == vk::Format::eR16Uint ||
-			       color == vk::Format::eR16Sint;
+			       color == vk::Format::eR16Sint ||
+			       (wide && (color == vk::Format::eR16Sfloat || color == vk::Format::eR16Snorm));
 		default: return false;
 	}
 }
@@ -1311,7 +1336,8 @@ const char* TextureCache::TryDirectReinterpret(Image& destination, Image& source
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageCopyShaderDepthToColor);
 		return "shader-depth-to-color";
 	}
-	if (!source_depth && m_blit_helper.SupportsColor32ToDepth(source, destination)) {
+	if (!source_depth && m_blit_helper.SupportsColor32ToDepth(source, destination) &&
+	    (destination.backing.format == vk::Format::eD32Sfloat || DirectImageCopyWideEnabled())) {
 		m_blit_helper.CopyColor32ToDepth(source, destination);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageCopyShaderColorToDepth);
 		return "shader-color-to-depth";
@@ -3356,14 +3382,50 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		return false;
 	}
 
-	std::scoped_lock lock {m_texture_cache.m_lock};
-	auto& image = m_texture_cache.m_slot_images[selected];
-	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
-	if (!m_texture_cache.SafeToDownload(image)) {
-		return false;
+	uint64_t image_address = 0;
+	uint64_t copied        = 0;
+	{
+		std::scoped_lock lock {m_texture_cache.m_lock};
+		auto&            image = m_texture_cache.m_slot_images[selected];
+		// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
+		if (!m_texture_cache.SafeToDownload(image)) {
+			return false;
+		}
+		const bool track_texel_sync = m_texture_cache.m_texel_sync_skip && GuestGpu::IsGpuThread();
+		bool       skipped          = false;
+		copied = RecordImageDownload(buffer, selected, track_texel_sync, &skipped);
+		if (copied == 0) {
+			return false;
+		}
+		if (skipped) {
+			// Nothing was written. (A skip needs a content revision for the whole range, which no
+			// CPU-dirty page, so no hot page, has: there is nothing to settle either.)
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TexelImageSyncSkips);
+			return true;
+		}
+		image_address = image.info.data.address;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TexelImageSyncDownloads);
+		if (track_texel_sync) {
+			if (const auto revision = GetContentRevision(image.info.data.address, copied);
+			    revision && &m_slot_buffers[revision->id] == &buffer) {
+				image.texel_sync = {revision->id, revision->write_revision, revision->global_epoch,
+				                    image.ContentSerial(), copied, true};
+			}
+		}
 	}
+	// The image bytes now in the buffer are not tracked as GPU-owned: hot pages there go back to
+	// the ordinary fault tracking (MemoryTracker hot pages, SettleHotPages). A page this re-dirties
+	// also withdraws the content revision recorded above (CPU-dirty ranges have none).
+	SettleHotPages(image_address, copied);
+	MemoryStats::Count(MemoryStats::Counter::BufferFromImageSyncs);
+	return true;
+}
+
+uint64_t BufferCache::RecordImageDownload(Buffer& buffer, ImageId id, bool skip_unchanged,
+                                          bool* skipped) {
+	auto& image = m_texture_cache.m_slot_images[id];
 	if (!buffer.IsInBounds(image.info.data.address, 1)) {
-		return false;
+		return 0;
 	}
 	const auto buf_offset = buffer.Offset(image.info.data.address);
 	const auto available  = buffer.Size() - buf_offset;
@@ -3373,7 +3435,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		// Volume mips contain strided block slices, so a mip's linear span cannot prove that
 		// every retained slice fits. Keep volume synchronization whole-image only.
 		if (!buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
-			return false;
+			return 0;
 		}
 		levels    = image.info.resources.levels;
 		copy_size = image.info.data.size;
@@ -3387,31 +3449,32 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		}
 	}
 	if (copy_size == 0) {
-		return false;
+		return 0;
 	}
 	// The buffer already holds this image's bytes when neither changed since the last download:
 	// the image's content serial is unchanged and the buffer's write revision (which every GPU
 	// or CPU-upload write to it advances, and which CPU-dirty pages invalidate) is the one that
 	// download produced.
-	const bool track_texel_sync = m_texture_cache.m_texel_sync_skip && GuestGpu::IsGpuThread();
-	if (track_texel_sync && image.texel_sync.valid && image.ContentSerial() != 0 &&
+	if (skip_unchanged && image.texel_sync.valid && image.ContentSerial() != 0 &&
 	    image.texel_sync.serial == image.ContentSerial() && image.texel_sync.size == copy_size) {
 		const auto revision = GetContentRevision(image.info.data.address, copy_size);
 		if (revision && revision->id == image.texel_sync.buffer &&
 		    revision->write_revision == image.texel_sync.revision &&
 		    revision->global_epoch == image.texel_sync.epoch &&
 		    &m_slot_buffers[revision->id] == &buffer) {
-			Profiler::CountFrameEvent(Profiler::FrameEvent::TexelImageSyncSkips);
-			return true;
+			if (skipped != nullptr) {
+				*skipped = true;
+			}
+			return copy_size;
 		}
 	}
 	image.texel_sync.valid = false;
 	auto transfer = m_texture_cache.BuildDownload(image);
 	if (!transfer.valid) {
-		return false;
+		return 0;
 	}
 	if (transfer.depth_target && copy_size != image.info.data.size) {
-		return false;
+		return 0;
 	}
 	if (!transfer.depth_target && levels < image.info.resources.levels) {
 		auto& texture = transfer.texture;
@@ -3419,28 +3482,127 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 			return region.imageSubresource.mipLevel >= levels;
 		});
 		if (texture.regions.empty()) {
-			return false;
+			return 0;
 		}
 		if (!texture.tiles.empty()) {
 			texture.tiles.clear();
 			if (!TextureBuildGpuTileInfos(copy_size, texture.regions, texture.layout, levels,
 			                              texture.tiles)) {
-				return false;
+				return 0;
 			}
 		}
 	}
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, std::move(transfer));
 	buffer.MarkContentWritten();
 	NoteBufferContentWrite(image.info.data.address, copy_size);
-	Profiler::CountFrameEvent(Profiler::FrameEvent::TexelImageSyncDownloads);
-	if (track_texel_sync) {
-		if (const auto revision = GetContentRevision(image.info.data.address, copy_size);
-		    revision && &m_slot_buffers[revision->id] == &buffer) {
-			image.texel_sync = {revision->id, revision->write_revision, revision->global_epoch,
-			                    image.ContentSerial(), copy_size, true};
+	return copy_size;
+}
+
+// KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE=0 restores the previous behaviour: a GPU write binding over a
+// GPU-modified image drops the image's contents (see PreserveImagesForGpuWrite).
+bool BufferCache::ImageWritebackOnGpuWriteEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+void BufferCache::PreserveImagesForGpuWrite(BufferId id, uint64_t vaddr, uint64_t size) {
+	if (!ImageWritebackOnGpuWriteEnabled()) {
+		return;
+	}
+	struct Candidate {
+		ImageId    id;
+		GuestRange range;
+	};
+	std::vector<Candidate> candidates;
+	auto&                  buffer       = m_slot_buffers[id];
+	const auto             buffer_begin = buffer.CpuAddress();
+	const auto             buffer_end   = buffer_begin + buffer.Size();
+	// Only an image whose native contents supersede every byte of its range (GPU-modified, no CPU
+	// write since, no newer buffer write) can be moved into the buffer as a whole. It must be
+	// fully resident: non-resident levels hold undefined native contents (GPU-written images are
+	// fully resident anyway, TextureCache::MarkImageGpuModified). Depth-associated color aliases
+	// publish through their depth image.
+	const auto movable_image = [](const Image& image) {
+		return !image.depth_id && image.SafeToDownload() && image.FullyResident();
+	};
+	{
+		std::scoped_lock lock {m_texture_cache.m_lock};
+		// Exactly the images TextureCache::InvalidateMemoryFromGPU takes GPU ownership from.
+		for (const auto image_id: m_texture_cache.FindImagesInRegion(vaddr, size, true)) {
+			const auto& image = m_texture_cache.m_slot_images[image_id];
+			if (!image.Overlaps(vaddr, size) || !image.IsGpuModified()) {
+				continue;
+			}
+			const auto image_range = image.info.data;
+			bool       movable     = movable_image(image) && image_range.address >= buffer_begin &&
+			                image_range.address < buffer_end;
+			const GuestRange range {image_range.address,
+			                        std::min(image_range.End(), buffer_end) - image_range.address};
+			if (movable) {
+				// The buffer will own the whole moved range. Another GPU-modified image there
+				// that this write does not already take ownership from would lose its contents
+				// to this one's: keep the previous behaviour in that (alias) case.
+				for (const auto other_id:
+				     m_texture_cache.FindImagesInRegion(range.address, range.size, true)) {
+					const auto& other = m_texture_cache.m_slot_images[other_id];
+					if (other_id != image_id && other.Overlaps(range.address, range.size) &&
+					    other.IsGpuModified() && !other.Overlaps(vaddr, size)) {
+						movable = false;
+						break;
+					}
+				}
+			}
+			if (!movable) {
+				MemoryStats::Count(MemoryStats::Counter::ImageWritebackSkips);
+				continue;
+			}
+			candidates.push_back({image_id, range});
 		}
 	}
-	return true;
+	for (const auto& candidate: candidates) {
+		const auto& range = candidate.range;
+		// Own the moved range exactly like a writable binding: upload its CPU-dirty pages (bytes
+		// the image download may not cover keep their guest values), take the tracker pages
+		// under their locks, then overwrite the image's bytes with its native contents.
+		(void)SynchronizeBuffer(buffer, range.address, range.size, true, false, nullptr,
+		                        "image-writeback");
+		uint64_t copied     = 0;
+		uint64_t image_size = 0;
+		{
+			std::scoped_lock lock {m_texture_cache.m_lock};
+			const auto*      image = m_texture_cache.m_slot_images.try_get(candidate.id);
+			// A guest thread may have dirtied the image since the scan. Its fault then waits for
+			// this GPU-thread command and reads back the buffer's (guest-valued) bytes.
+			if (image != nullptr && movable_image(*image) &&
+			    image->info.data.address == range.address) {
+				image_size = image->info.data.size;
+				copied     = RecordImageDownload(buffer, candidate.id);
+			}
+		}
+		if (copied != 0) {
+			MemoryStats::Count(MemoryStats::Counter::ImageWritebacks);
+			MemoryStats::Count(MemoryStats::Counter::ImageWritebackBytes, copied);
+			if (copied < image_size) {
+				MemoryStats::Count(MemoryStats::Counter::ImageWritebackPartial);
+			}
+		} else {
+			MemoryStats::Count(MemoryStats::Counter::ImageWritebackSkips);
+		}
+		// The tracker pages are GPU-owned now, so their bytes must be too (downloaded or not).
+		buffer.MarkContentWritten();
+		if (!m_gpu_modified_ranges.Contains(range.address, range.size)) {
+			CleanVerdict::Invalidate();
+		}
+		m_gpu_modified_ranges.Add(range.address, range.size);
+		NoteBufferContentWrite(range.address, range.size);
+		ForgetKnownFills(range.address, range.size);
+		HangTrace::NoteGpuWrite(range.address, range.size);
+		// As for any GPU buffer write: overlapping images are now rebuilt from the buffer.
+		m_texture_cache.InvalidateMemoryFromGPU(range.address, range.size);
+	}
 }
 
 bool TextureCache::DownloadImageMemory(ImageId id) {

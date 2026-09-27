@@ -418,6 +418,50 @@ enum class FrameEvent : uint32_t {
 	// Per-draw shader-data/flattened-SRT uploads answered by the previous upload of the same stage
 	// slot and kind before hashing (KYTY_UPLOAD_DEDUP); also counted in ShaderUploadReuseHits.
 	ShaderUploadLastHits,
+	// Guest memory tracking and buffer uploads (graphics/host_gpu/memoryStats.h, mirrored in the
+	// hang-trace mem_* columns): guest write/read faults handled by RenderContext and the time
+	// spent handling them (nanoseconds), host protection calls/pages removing write access and
+	// restoring read-write access and their time, contended region tracking lock acquisitions,
+	// tiler scratch buffer allocations (count, bytes, nanoseconds), SynchronizeBufferFromImage
+	// downloads, and the copy commands, pipeline barriers and rendering-instance ends recorded by
+	// CPU-dirty buffer uploads (BufferCache::SynchronizeBuffer).
+	GuestWriteFaults,
+	GuestReadFaults,
+	GuestFaultNanoseconds,
+	PageProtectCalls,
+	PageProtectPages,
+	PageUnprotectCalls,
+	PageUnprotectPages,
+	PageProtectNanoseconds,
+	TrackerLockContended,
+	TilerScratchAllocs,
+	TilerScratchBytes,
+	TilerScratchNanoseconds,
+	BufferFromImageSyncs,
+	BufferUploadCopies,
+	BufferUploadBarriers,
+	BufferUploadRenderSplits,
+	// GPU-modified images moved into a buffer before a GPU write took their ownership
+	// (BufferCache::PreserveImagesForGpuWrite): downloads, bytes, downloads covering only leading
+	// mips, and overlapping images that could not be moved (their contents are lost as before).
+	ImageWritebacks,
+	ImageWritebackBytes,
+	ImageWritebackPartial,
+	ImageWritebackSkips,
+	// Write-fault policy (KYTY_FAULT_AHEAD_KB, KYTY_HOT_PAGES, MemoryTracker): pages made CPU-dirty
+	// ahead of use by a write fault, pages entering and leaving hot (sticky-dirty, unprotected)
+	// tracking, hot pages visited by buffer uploads, and those skipped as unchanged.
+	FaultAheadPages,
+	HotPagePromotions,
+	HotPageDemotions,
+	HotPageUploads,
+	HotPageUploadsSkipped,
+	// Written-upload pages a racing guest write re-dirtied while they were copied outside the
+	// tracker locks (KYTY_UPLOAD_COPY_OUTSIDE_LOCK), copied again under the locks.
+	WrittenUploadLatePages,
+	// Image::CopyImageWithBuffer rounds (barrier, image->buffer copy of all packed regions,
+	// barrier, buffer->image copy); ImageCopyViaBuffer counts the copies themselves.
+	ImageCopyViaBufferRounds,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

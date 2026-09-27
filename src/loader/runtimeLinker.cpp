@@ -849,6 +849,55 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// Guest memory tracking faults (and hang-trace LOD watch hits). Never terminates: returns false
+// for every exception it does not resolve.
+static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo& exception_info) {
+	const auto* info = &exception_info;
+	if (info->type != Common::HostException::ExceptionType::AccessViolation) {
+		return false;
+	}
+	using CoreAccess = Common::HostException::AccessViolationType;
+	using GpuAccess  = Libs::Graphics::PageFaultAccess;
+	GpuAccess access;
+	switch (info->access_violation_type) {
+		case CoreAccess::Read: access = GpuAccess::Read; break;
+		case CoreAccess::Write: access = GpuAccess::Write; break;
+		case CoreAccess::Execute: access = GpuAccess::Execute; break;
+		default: return false;
+	}
+	if (HangTrace::Enabled()) {
+		char fault_thread[32] = "(host thread)";
+		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+			char name[64] {};
+			if (Libs::LibKernel::PthreadGetname(self, name) == 0) {
+				std::snprintf(fault_thread, sizeof(fault_thread), "%s", name);
+			}
+		}
+		const uint64_t gpr[16] = {info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi,
+		                          info->rbp, info->rsp, info->r8,  info->r9,  info->r10, info->r11,
+		                          info->r12, info->r13, info->r14, info->r15};
+		if (HangTrace::HandleLodWatchFault(info->access_violation_vaddr, access == GpuAccess::Write,
+		                                   info->exception_address, gpr, fault_thread)) {
+			return true;
+		}
+		HangTrace::SetFaultContext(info->exception_address, fault_thread);
+		HangTrace::SetReadbackKind(access == GpuAccess::Write ? HangTrace::ReadbackKind::FaultWrite
+		                                                      : HangTrace::ReadbackKind::FaultRead);
+	}
+	const bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+	if (HangTrace::Enabled()) {
+		HangTrace::ClearFaultContext();
+	}
+	return handled;
+}
+
+// KYTY_VEH_FIRST=0 leaves guest tracking faults to the last-registered handler only, so every
+// other process-wide vectored handler sees each tracking fault first (the previous behaviour).
+static bool FirstAccessHandlerEnabled() {
+	const auto* value = std::getenv("KYTY_VEH_FIRST");
+	return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -857,42 +906,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		return true;
 	}
 
-	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
-		using CoreAccess = Common::HostException::AccessViolationType;
-		using GpuAccess  = Libs::Graphics::PageFaultAccess;
-		GpuAccess access;
-		switch (info->access_violation_type) {
-			case CoreAccess::Read: access = GpuAccess::Read; break;
-			case CoreAccess::Write: access = GpuAccess::Write; break;
-			case CoreAccess::Execute: access = GpuAccess::Execute; break;
-			case CoreAccess::Unknown: return false;
-		}
-		if (HangTrace::Enabled()) {
-			char fault_thread[32] = "(host thread)";
-			if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
-				char name[64] {};
-				if (Libs::LibKernel::PthreadGetname(self, name) == 0) {
-					std::snprintf(fault_thread, sizeof(fault_thread), "%s", name);
-				}
-			}
-			const uint64_t gpr[16] = {info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi,
-			                          info->rbp, info->rsp, info->r8,  info->r9,  info->r10, info->r11,
-			                          info->r12, info->r13, info->r14, info->r15};
-			if (HangTrace::HandleLodWatchFault(info->access_violation_vaddr, access == GpuAccess::Write,
-			                                   info->exception_address, gpr, fault_thread)) {
-				return true;
-			}
-			HangTrace::SetFaultContext(info->exception_address, fault_thread);
-			HangTrace::SetReadbackKind(access == GpuAccess::Write ? HangTrace::ReadbackKind::FaultWrite
-			                                                      : HangTrace::ReadbackKind::FaultRead);
-		}
-		const bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
-		if (HangTrace::Enabled()) {
-			HangTrace::ClearFaultContext();
-		}
-		if (handled) {
-			return true;
-		}
+	if (TryHandleGuestAccessFault(exception_info)) {
+		return true;
+	}
+	if (info->type == Common::HostException::ExceptionType::AccessViolation &&
+	    info->access_violation_type == Common::HostException::AccessViolationType::Unknown) {
+		return false;
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
@@ -2162,6 +2181,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
+	}
+	if (FirstAccessHandlerEnabled()) {
+		// Guest tracking faults are the hot path: resolve them before any other vectored handler.
+		// Faults it does not resolve still reach KytyExceptionHandler, registered last.
+		(void)Common::HostException::InstallFirstAccessHandler(TryHandleGuestAccessFault);
 	}
 
 	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;

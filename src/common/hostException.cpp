@@ -82,20 +82,9 @@ bool InitializeThreadSignalStack() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
-static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
+// Fills the platform-neutral description of an access violation or illegal instruction.
+static bool DescribeException(PEXCEPTION_POINTERS exception, ExceptionInfo& info) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
-
-	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
-	    exception_record->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C) {
-		return EXCEPTION_CONTINUE_SEARCH;
-	}
-
-	if (exception_record->ExceptionCode == 0x406D1388) {
-		// Set a thread name.
-		return EXCEPTION_CONTINUE_EXECUTION;
-	}
-
-	ExceptionInfo info {};
 	info.exception_address = reinterpret_cast<uint64_t>(exception_record->ExceptionAddress);
 	info.native_code       = exception_record->ExceptionCode;
 	info.native_context    = exception->ContextRecord;
@@ -112,7 +101,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	} else if (exception_record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
-		return EXCEPTION_CONTINUE_SEARCH;
+		return false;
 	}
 
 	info.rax = exception->ContextRecord->Rax;
@@ -131,12 +120,49 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	info.r13 = exception->ContextRecord->R13;
 	info.r14 = exception->ContextRecord->R14;
 	info.r15 = exception->ContextRecord->R15;
+	return true;
+}
+
+static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
+	auto* exception_record = exception->ExceptionRecord;
+
+	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
+	    exception_record->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	if (exception_record->ExceptionCode == 0x406D1388) {
+		// Set a thread name.
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+
+	ExceptionInfo info {};
+	if (!DescribeException(exception, info)) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static std::atomic<Handler> g_first_handler {nullptr};
+
+// Registered at the front of the vectored handler list: resolves access violations the first
+// handler recognizes (guest memory tracking faults) before any other process-wide handler runs,
+// and passes everything else on unchanged, so the order seen by other exceptions is unaffected.
+static LONG WINAPI FirstExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
+	if (exception->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	const auto handler = g_first_handler.load(std::memory_order_acquire);
+	ExceptionInfo info {};
+	if (handler == nullptr || !DescribeException(exception, info)) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	return handler(info) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
 #elif defined(__APPLE__)
@@ -336,6 +362,27 @@ bool InstallHandler(Handler handler) {
 
 	g_install_state.store(2, std::memory_order_release);
 	return true;
+}
+
+bool InstallFirstAccessHandler(Handler handler) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (handler == nullptr) {
+		return false;
+	}
+	Handler expected = nullptr;
+	if (!g_first_handler.compare_exchange_strong(expected, handler, std::memory_order_acq_rel)) {
+		return expected == handler;
+	}
+	if (AddVectoredExceptionHandler(1, FirstExceptionFilter) == nullptr) {
+		g_first_handler.store(nullptr, std::memory_order_release);
+		printf("AddVectoredExceptionHandler(first) failed\n");
+		return false;
+	}
+	return true;
+#else
+	(void)handler;
+	return false;
+#endif
 }
 
 } // namespace Common::HostException
