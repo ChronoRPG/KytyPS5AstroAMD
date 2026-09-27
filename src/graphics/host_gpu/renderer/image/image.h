@@ -394,6 +394,10 @@ namespace ImageOps {
 
 void                                 Validate(const ImageInfo& info);
 [[nodiscard]] Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element);
+// KYTY_TILER_IMAGE_DIRECT_BC (default on; needs KYTY_TILER_IMAGE_DIRECT): block-compressed images
+// get storage usage (through block-texel-compatible uncompressed views, where the device supports
+// it) so that TileManager::DetileToImage can write their blocks directly.
+[[nodiscard]] bool BlockStorageUploadsEnabled();
 
 } // namespace ImageOps
 

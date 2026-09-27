@@ -621,6 +621,10 @@ enum class FrameEvent : uint32_t {
 	DepthFeedbackKeepMissInstance,
 	DepthFeedbackKeepMissSerial,
 	DepthFeedbackKeepMissState,
+	// KYTY_TILER_IMAGE_DIRECT_BC: direct uploads into block-compressed images (also counted in
+	// TilerImageUploads/UploadBytes).
+	TilerImageBlockUploads,
+	TilerImageBlockUploadBytes,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

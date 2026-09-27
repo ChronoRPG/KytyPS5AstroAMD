@@ -64,8 +64,23 @@ bool CopyViaBufferBatchEnabled() {
 
 [[nodiscard]] vk::ImageUsageFlags ImageUsageFlags(GraphicContext& graphics, const ImageInfo& info) {
 	if (info.IsBlock()) {
-		return vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
-		       vk::ImageUsageFlagBits::eSampled;
+		vk::ImageUsageFlags usage = vk::ImageUsageFlagBits::eTransferSrc |
+		                            vk::ImageUsageFlagBits::eTransferDst |
+		                            vk::ImageUsageFlagBits::eSampled;
+		// Storage through uncompressed block-texel views (the block format itself has no storage
+		// support): only when the device accepts that usage for this format and these flags.
+		if (graphics.supports_block_texel_view && info.samples == 1 && !info.IsVolume() &&
+		    ImageOps::BlockStorageUploadsEnabled()) {
+			const auto          storage = usage | vk::ImageUsageFlagBits::eStorage;
+			vk::ImageFormatProperties properties {};
+			if (graphics.GetImageFormatProperties(info.pixel_format, HostImageType(info.type),
+			                                      vk::ImageTiling::eOptimal, storage,
+			                                      ImageCreateFlags(graphics, info),
+			                                      &properties) == vk::Result::eSuccess) {
+				usage = storage;
+			}
+		}
+		return usage;
 	}
 	const auto properties = graphics.GetFormatProperties(info.pixel_format);
 	auto       usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
@@ -735,6 +750,17 @@ void Validate(const ImageInfo& info) {
 			}
 			break;
 	}
+}
+
+bool BlockStorageUploadsEnabled() {
+	static const bool enabled = [] {
+		const auto off = [](const char* name) {
+			const auto* value = std::getenv(name);
+			return value != nullptr && std::strcmp(value, "0") == 0;
+		};
+		return !off("KYTY_TILER_IMAGE_DIRECT") && !off("KYTY_TILER_IMAGE_DIRECT_BC");
+	}();
+	return enabled;
 }
 
 Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {

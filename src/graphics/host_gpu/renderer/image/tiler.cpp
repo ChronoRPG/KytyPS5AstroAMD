@@ -47,6 +47,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
 
@@ -223,7 +224,8 @@ void TileManager::ReleaseScratch(Scratch scratch) {
 void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
                           std::span<const GpuTileInfo> infos, uint64_t source_base,
                           uint64_t target_base, std::vector<Dispatch>& dispatches,
-                          std::span<const vk::BufferImageCopy> image_regions) {
+                          std::span<const vk::BufferImageCopy> image_regions,
+                          uint32_t image_texel, bool image_layer_views) {
 	EXIT_IF(infos.empty() || tiled_capacity == 0 || linear_capacity == 0 ||
 	        (!image_regions.empty() && image_regions.size() != infos.size()));
 	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
@@ -328,12 +330,15 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 		dispatch.push.tail_y           = info.tail_y;
 		dispatch.push.tail             = info.tail;
 		if (!image_regions.empty()) {
-			// Image variants: element (x, y) of this tile is texel imageOffset + (x, y) of the
-			// region's layer (ImageTransferEligible admits only uncompressed 2D regions).
-			const auto& region          = image_regions[dispatches.size()];
-			dispatch.push.image_x       = static_cast<uint32_t>(region.imageOffset.x);
-			dispatch.push.image_y       = static_cast<uint32_t>(region.imageOffset.y);
-			dispatch.push.image_layer   = region.imageSubresource.baseArrayLayer;
+			// Image variants: element (x, y) of this tile is view texel imageOffset / texel +
+			// (x, y) of the region's layer (ImageTransferEligible admits only 2D regions that
+			// start on a block).
+			EXIT_IF(image_texel == 0);
+			const auto& region        = image_regions[dispatches.size()];
+			dispatch.push.image_x     = static_cast<uint32_t>(region.imageOffset.x) / image_texel;
+			dispatch.push.image_y     = static_cast<uint32_t>(region.imageOffset.y) / image_texel;
+			dispatch.push.image_layer =
+			    image_layer_views ? 0u : region.imageSubresource.baseArrayLayer;
 		}
 		dispatches.push_back(dispatch);
 	}
@@ -686,6 +691,10 @@ vk::Format TileManager::ImageViewFormat(uint32_t bytes_per_element, bool load) {
 	return support == 1u ? format : vk::Format::eUndefined;
 }
 
+bool TileManager::ImageLayerViews(const Image& image) {
+	return image.info.IsBlock();
+}
+
 bool TileManager::ImageTransferEligible(const Image& image, bool load,
                                         std::span<const GpuTileInfo>         infos,
                                         std::span<const vk::BufferImageCopy> regions) {
@@ -693,20 +702,28 @@ bool TileManager::ImageTransferEligible(const Image& image, bool load,
 		return false;
 	}
 	const auto& backing = image.backing;
+	// Block-compressed images (KYTY_TILER_IMAGE_DIRECT_BC): uploads only, through uncompressed
+	// block-texel views whose texels are the image's 4x4 blocks (Image::ImageUsageFlags gives
+	// them storage usage only where the device supports it).
+	const bool block = image.info.IsBlock();
 	if (backing.image == nullptr || backing.samples != 1 || image.info.samples != 1 ||
 	    backing.image_type != vk::ImageType::e2D || image.info.IsVolume() ||
 	    !(backing.usage & vk::ImageUsageFlagBits::eStorage) ||
-	    DepthAspectTransferFormat(backing.format) != vk::Format::eUndefined) {
+	    DepthAspectTransferFormat(backing.format) != vk::Format::eUndefined ||
+	    (block && (load || !ImageOps::BlockStorageUploadsEnabled() ||
+	               !(backing.flags & vk::ImageCreateFlagBits::eBlockTexelViewCompatible)))) {
 		return false;
 	}
 	const uint32_t element     = infos.front().bytes_per_element;
 	const auto     view_format = ImageViewFormat(element, load);
-	// Same size class: the view texel is exactly the backing texel (block formats have no
-	// storage usage, and a view of another size would reinterpret the texel layout).
+	// Same size class: the view texel is exactly the backing texel, or for block formats exactly
+	// one compressed block (a view of another size would reinterpret the texel layout).
 	if (view_format == vk::Format::eUndefined ||
-	    !ImageViewOps::FormatsCompatible(backing.format, view_format)) {
+	    !ImageViewOps::FormatsCompatible(backing.format, view_format) ||
+	    (block && vk::blockSize(backing.format) != element)) {
 		return false;
 	}
+	const uint32_t texel = block ? 4u : 1u;
 	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	for (size_t index = 0; index < infos.size(); ++index) {
 		const auto& info   = infos[index];
@@ -721,21 +738,28 @@ bool TileManager::ImageTransferEligible(const Image& image, bool load,
 			default: return false;
 		}
 		const auto& subresource = region.imageSubresource;
+		// Element (x, y) of the tile is view texel (offset / texel + x, offset / texel + y): the
+		// region must start on a block and cover exactly the tile's elements.
 		if (info.bytes_per_element != element || info.depth != 1 || info.width == 0 ||
 		    info.height == 0 || subresource.aspectMask != vk::ImageAspectFlagBits::eColor ||
 		    subresource.layerCount != 1 || subresource.mipLevel >= backing.mip_levels ||
 		    subresource.baseArrayLayer >= backing.layers || region.imageOffset.x < 0 ||
 		    region.imageOffset.y < 0 || region.imageOffset.z != 0 ||
-		    region.imageExtent.depth != 1 || region.imageExtent.width != info.width ||
-		    region.imageExtent.height != info.height ||
+		    region.imageOffset.x % texel != 0 || region.imageOffset.y % texel != 0 ||
+		    region.imageExtent.depth != 1 ||
+		    (region.imageExtent.width + texel - 1u) / texel != info.width ||
+		    (region.imageExtent.height + texel - 1u) / texel != info.height ||
 		    (info.width + 7u) / 8u > limits.maxComputeWorkGroupCount[0] ||
 		    (info.height + 7u) / 8u > limits.maxComputeWorkGroupCount[1]) {
 			return false;
 		}
-		const uint32_t mip_width  = std::max(backing.extent.width >> subresource.mipLevel, 1u);
-		const uint32_t mip_height = std::max(backing.extent.height >> subresource.mipLevel, 1u);
-		if (static_cast<uint64_t>(region.imageOffset.x) + info.width > mip_width ||
-		    static_cast<uint64_t>(region.imageOffset.y) + info.height > mip_height) {
+		// The view's extent at this level, in view texels (blocks for block formats).
+		const uint32_t mip_width =
+		    (std::max(backing.extent.width >> subresource.mipLevel, 1u) + texel - 1u) / texel;
+		const uint32_t mip_height =
+		    (std::max(backing.extent.height >> subresource.mipLevel, 1u) + texel - 1u) / texel;
+		if (static_cast<uint64_t>(region.imageOffset.x) / texel + info.width > mip_width ||
+		    static_cast<uint64_t>(region.imageOffset.y) / texel + info.height > mip_height) {
 			return false;
 		}
 	}
@@ -855,23 +879,36 @@ void TileManager::RecordImage(Image& image, bool load, vk::Buffer tiled, uint64_
 	for (const auto& info: infos) {
 		pipelines.push_back(GetImagePipeline(load, info.family, info.bytes_per_element));
 	}
-	std::vector<std::pair<uint32_t, vk::ImageView>> views;
-	for (const auto& region: regions) {
+	// Uncompressed views of a block-compressed image must hold one level and one layer
+	// (block-texel view rules): one view per (level, layer) there, per level otherwise.
+	const bool layer_views = ImageLayerViews(image);
+	struct LevelView {
+		uint32_t      level = 0;
+		uint32_t      layer = 0;
+		vk::ImageView view  = nullptr;
+	};
+	std::vector<LevelView> views;
+	const auto find_view = [&](const vk::BufferImageCopy& region) {
 		const auto level = region.imageSubresource.mipLevel;
-		if (std::ranges::find(views, level, &std::pair<uint32_t, vk::ImageView>::first) !=
-		    views.end()) {
+		const auto layer = layer_views ? region.imageSubresource.baseArrayLayer : 0u;
+		return std::ranges::find_if(views, [&](const LevelView& entry) {
+			return entry.level == level && entry.layer == layer;
+		});
+	};
+	for (const auto& region: regions) {
+		if (find_view(region) != views.end()) {
 			continue;
 		}
 		ImageViewInfo view_info {};
 		view_info.format      = view_format;
 		view_info.type        = vk::ImageViewType::e2DArray;
 		view_info.aspect      = vk::ImageAspectFlagBits::eColor;
-		view_info.base_level  = level;
+		view_info.base_level  = region.imageSubresource.mipLevel;
 		view_info.level_count = 1;
-		view_info.base_layer  = 0;
-		view_info.layer_count = image.backing.layers;
+		view_info.base_layer  = layer_views ? region.imageSubresource.baseArrayLayer : 0u;
+		view_info.layer_count = layer_views ? 1u : image.backing.layers;
 		view_info.usage       = vk::ImageUsageFlagBits::eStorage;
-		views.emplace_back(level, image.FindView(view_info));
+		views.push_back({view_info.base_level, view_info.base_layer, image.FindView(view_info)});
 	}
 
 	m_scheduler.EndRendering();
@@ -915,9 +952,7 @@ void TileManager::RecordImage(Image& image, bool load, vk::Buffer tiled, uint64_
 	const vk::DescriptorBufferInfo tiled_info {tiled, tiled_descriptor_offset, tiled_range};
 	for (size_t index = 0; index < dispatches.size(); ++index) {
 		const auto& dispatch = dispatches[index];
-		const auto  level    = regions[index].imageSubresource.mipLevel;
-		const auto  view =
-		    std::ranges::find(views, level, &std::pair<uint32_t, vk::ImageView>::first)->second;
+		const auto  view     = find_view(regions[index])->view;
 		const vk::DescriptorImageInfo  image_info {nullptr, view, vk::ImageLayout::eGeneral};
 		const vk::DescriptorBufferInfo params_info {m_stream_buffer.Handle(),
 		                                            dispatch.params_offset, sizeof(Push)};
@@ -974,7 +1009,7 @@ bool TileManager::DetileToImage(Image& image, vk::Buffer tiled, uint64_t tiled_o
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
 	std::vector<Dispatch> dispatches;
 	Prepare(false, tiled_capacity, linear_capacity, infos, tiled_offset & (descriptor_alignment - 1),
-	        0, dispatches, regions);
+	        0, dispatches, regions, image.info.IsBlock() ? 4u : 1u, ImageLayerViews(image));
 	RecordImage(image, false, tiled, tiled_offset, tiled_capacity, infos, regions, dispatches);
 	uint64_t bytes = 0;
 	for (const auto& info: infos) {
@@ -982,6 +1017,10 @@ bool TileManager::DetileToImage(Image& image, vk::Buffer tiled, uint64_t tiled_o
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::TilerImageUploads);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::TilerImageUploadBytes, bytes);
+	if (image.info.IsBlock()) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TilerImageBlockUploads);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TilerImageBlockUploadBytes, bytes);
+	}
 	if (ImageDirectVerifyEnabled()) {
 		// Expected: the linear bytes the buffer path would copy into the image. Actual: the image
 		// read back with the same copies. Only the texel rows of each region are defined.
@@ -989,15 +1028,17 @@ bool TileManager::DetileToImage(Image& image, vk::Buffer tiled, uint64_t tiled_o
 		auto       actual   = AllocateScratch(Common::AlignUp(linear_capacity, 4));
 		image.Download(regions, actual.buffer, 0, actual.size);
 		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+		const uint32_t texel = image.info.IsBlock() ? 4u : 1u;
 		for (size_t index = 0; index < regions.size(); ++index) {
-			const auto&    region = regions[index];
+			const auto&    region  = regions[index];
 			const uint64_t element = infos[index].bytes_per_element;
-			const uint64_t pitch =
-			    (region.bufferRowLength != 0 ? region.bufferRowLength : region.imageExtent.width) *
-			    element;
-			for (uint32_t y = 0; y < region.imageExtent.height; ++y) {
-				ranges.emplace_back(region.bufferOffset + y * pitch,
-				                    region.imageExtent.width * element);
+			const uint64_t row_texels =
+			    region.bufferRowLength != 0 ? region.bufferRowLength : region.imageExtent.width;
+			const uint64_t pitch  = (row_texels + texel - 1u) / texel * element;
+			const uint64_t width  = (region.imageExtent.width + texel - 1u) / texel;
+			const uint64_t height = (region.imageExtent.height + texel - 1u) / texel;
+			for (uint64_t y = 0; y < height; ++y) {
+				ranges.emplace_back(region.bufferOffset + y * pitch, width * element);
 			}
 		}
 		VerifyOnCompletion("upload", image.info.data.address, expected.buffer, expected.offset,
@@ -1058,7 +1099,8 @@ bool TileManager::TileFromImage(Image& image, std::span<const vk::BufferImageCop
 	}
 	std::vector<Dispatch> dispatches;
 	Prepare(true, tiled_capacity, linear_capacity, infos, 0,
-	        tiled_offset & (descriptor_alignment - 1), dispatches, regions);
+	        tiled_offset & (descriptor_alignment - 1), dispatches, regions,
+	        image.info.IsBlock() ? 4u : 1u, ImageLayerViews(image));
 	RecordImage(image, true, tiled, tiled_offset, tiled_capacity, infos, regions, dispatches);
 	uint64_t bytes = 0;
 	for (const auto& info: infos) {
