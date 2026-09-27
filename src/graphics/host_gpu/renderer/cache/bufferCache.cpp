@@ -682,8 +682,12 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 	RequireVulkanSuccess(command.begin(&begin_info), "begin side-readback command buffer");
-	// The timeline wait below orders the producer. This barrier's first scope additionally
-	// covers every earlier submission on this queue, so the copy observes all submitted work.
+	// The timeline wait below orders the producer (and, on the side queue, the newest unbounded
+	// writer). On a shared queue this barrier's first scope additionally covers every earlier
+	// submission, so the copy observes all submitted work. On the side queue later queue-0 work
+	// can overwrite copied bytes while the copy runs; such a writer re-adds them as GPU-dirty
+	// and keeps their pages protected (UnmarkReadbackPending retains them), so the possibly
+	// torn published bytes are never read before a newer readback replaces them.
 	vk::BufferMemoryBarrier before {};
 	before.srcAccessMask       = vk::AccessFlagBits::eMemoryWrite;
 	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
@@ -711,6 +715,13 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	readback->value  = value;
 	slot.busy.store(true, std::memory_order_relaxed);
 
+	// On the separate side queue nothing but the timeline wait orders the copy after queue-0
+	// work, so it must also cover the newest unbounded (address) writer, whose bytes carry no
+	// writer tick. It is older than `current` here (checked above), hence already submitted.
+	const bool side_queue = m_graphics.side_queue != nullptr;
+	if (side_queue) {
+		producer = std::max(producer, m_unbounded_write_tick);
+	}
 	const auto                      master     = m_scheduler.GetMasterSemaphore().Handle();
 	const uint64_t                  wait_value = producer;
 	const vk::PipelineStageFlags    wait_stage = vk::PipelineStageFlagBits::eTransfer;
@@ -730,7 +741,20 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	submit.signalSemaphoreCount = 1;
 	submit.pSignalSemaphores    = &side.semaphore;
 	vk::Result submit_result;
-	{
+	if (side_queue) {
+		// Every tick older than the current recording was handed to queue 0 or to the submission
+		// broker. Drain the broker only if the producer has not reached the driver yet, so this
+		// wait is never submitted ahead of its signal.
+		const auto& progress = m_scheduler.GetMasterSemaphore().GetSubmissionProgress();
+		if (progress != nullptr &&
+		    progress->dispatched_tick.load(std::memory_order_acquire) < producer) {
+			Common::LockGuard lock(m_graphics.queue_mutex);
+			m_graphics.submission_queue.DrainPendingLocked();
+		}
+		Common::LockGuard lock(m_graphics.side_queue_mutex);
+		submit_result = m_graphics.side_queue.submit(1, &submit, nullptr);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackSideQueueCopies);
+	} else {
 		// Every tick older than the current recording was handed to the queue or to the
 		// submission broker (drained here first), so the producer is submitted before this
 		// copy waits on it. The current recording follows this copy in submission order.

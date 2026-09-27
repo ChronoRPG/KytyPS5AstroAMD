@@ -276,6 +276,8 @@ enum class FrameEvent : uint32_t {
 	// the GPU thread waited for, or by the drain path (fallback reason also counted above).
 	ReadbackGpuThreadSideCopies,
 	ReadbackGpuThreadDrains,
+	// Side copies submitted to the second queue of the family (KYTY_SIDE_QUEUE).
+	ReadbackSideQueueCopies,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
