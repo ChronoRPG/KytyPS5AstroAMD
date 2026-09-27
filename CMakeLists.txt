@@ -951,6 +951,40 @@ if(BUILD_TESTING)
 	add_cp_recorder_variants(compute_meta_clear_classification --compute-meta-clear-only)
 	add_cp_recorder_variants(buffer_cache_dirty_gc --buffer-cache-gc-only)
 	add_cp_recorder_variants(buffer_cache_eager_readback --readback-eager-only)
+	# The recorder under VK_LAYER_KHRONOS_validation (KYTY_TEST_VULKAN_VALIDATION=1: core and
+	# thread-safety checks, i.e. command-pool, descriptor-pool, command-buffer and queue use from
+	# two threads at once, and descriptor sets updated while a recorded or pending buffer binds
+	# them). Each test fails on any validation error; <name>_validation is the same mode with the
+	# recorder off (the baseline). Label: validation.
+	function(add_cp_recorder_validation test_name mode_arg)
+		set(off_env KYTY_CP_RECORDER=0 KYTY_TEST_VULKAN_VALIDATION=1 ${ARGN})
+		set(thread_env KYTY_CP_RECORDER=1 KYTY_CP_RECORDER_VERIFY=exit KYTY_SUBMISSION_MODE=queued
+			KYTY_TEST_VULKAN_VALIDATION=1 ${ARGN})
+		set(inline_env KYTY_CP_RECORDER=inline KYTY_CP_RECORDER_VERIFY=exit
+			KYTY_TEST_VULKAN_VALIDATION=1 ${ARGN})
+		# --cp-recorder-only needs a recorder: no baseline.
+		if(NOT test_name STREQUAL "cp_recorder_gpu")
+			add_test(NAME ${test_name}_validation
+				COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> ${mode_arg})
+			set_tests_properties(${test_name}_validation PROPERTIES
+				ENVIRONMENT "${off_env}" LABELS validation)
+		endif()
+		add_test(NAME ${test_name}_cp_recorder_validation
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> ${mode_arg})
+		set_tests_properties(${test_name}_cp_recorder_validation PROPERTIES
+			ENVIRONMENT "${thread_env}" LABELS validation)
+		add_test(NAME ${test_name}_cp_recorder_inline_validation
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> ${mode_arg})
+		set_tests_properties(${test_name}_cp_recorder_inline_validation PROPERTIES
+			ENVIRONMENT "${inline_env}" LABELS validation)
+	endfunction()
+	add_cp_recorder_validation(cp_recorder_gpu --cp-recorder-only)
+	add_cp_recorder_validation(draw_prep_engine --draw-prep-engine-only
+		KYTY_DRAW_PREP=parallel KYTY_DRAW_PREP_VERIFY=exit)
+	add_cp_recorder_validation(gpu_command_lane --gpu-command-lane-only)
+	add_cp_recorder_validation(stream_buffer_ring --stream-buffer-only)
+	add_cp_recorder_validation(texture_cache_layered_image --layered-image-only)
+	add_cp_recorder_validation(buffer_cache_eager_readback --readback-eager-only)
 
 	if(WIN32)
 		# These tests still depend on the Windows multisample-depth path.

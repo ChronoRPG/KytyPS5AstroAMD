@@ -72,7 +72,7 @@ public:
 	// Waits until the Submit packet of `tick` has been executed (handed to the broker or the
 	// queue). From the producer it first wakes the recorder; any thread may call it.
 	void WaitRecorded(uint64_t tick, bool from_producer);
-	// Waits until everything encoded so far has been executed, from any thread (no marker).
+	// The tick of the last Submit packet executed.
 	[[nodiscard]] uint64_t RecordedTick() const noexcept {
 		return m_recorded_tick.load(std::memory_order_acquire);
 	}
@@ -95,6 +95,7 @@ public:
 		return m_encoder.Stats();
 	}
 	[[nodiscard]] uint64_t Drains() const noexcept { return m_drains; }
+	[[nodiscard]] uint64_t IdleDrains() const noexcept { return m_idle_drains; }
 	[[nodiscard]] uint64_t DrainNs() const noexcept { return m_drain_ns; }
 	// Recorder-thread time replaying packets (read after a drain or Stop).
 	[[nodiscard]] uint64_t BusyNs() const noexcept {
@@ -157,6 +158,9 @@ private:
 	uint64_t m_drain_ns           = 0;
 	uint64_t m_drains_published   = 0;
 	uint64_t m_drain_ns_published = 0;
+	// Drains that found the recorder idle (no marker, no wake).
+	uint64_t m_idle_drains           = 0;
+	uint64_t m_idle_drains_published = 0;
 
 	// KYTY_CP_RECORDER_DRAIN_LOG: drain count per site (GpuOpProfiler::Site*) or caller address.
 	struct DrainKey {
@@ -170,8 +174,10 @@ private:
 		}
 	};
 	struct DrainStats {
-		uint64_t count = 0;
-		uint64_t ns    = 0;
+		uint64_t count     = 0;
+		uint64_t idle      = 0;
+		uint64_t ns        = 0;
+		uint64_t waited_ns = 0; // non-idle drains only
 	};
 	std::unordered_map<DrainKey, DrainStats, DrainKeyHash> m_drain_log;
 	uint64_t                                               m_drain_log_printed_ns = 0;
