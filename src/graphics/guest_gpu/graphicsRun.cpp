@@ -451,6 +451,55 @@ void CommandProcessor::BufferFlushForEop() {
 	}
 }
 
+// KYTY_IDLE_FLUSH_DRAWS (default 8, 0 disables): after at least that many draws/dispatches in
+// the current recording, submit it early when the GPU has finished everything already submitted
+// (KnownGpuTick >= CurrentTick - 1), e.g. after a drain, instead of leaving the GPU idle until
+// the next natural boundary. Inside an active rendering instance it waits for 4x the draws (or
+// the instance's end) to avoid splitting render passes.
+static uint32_t IdleFlushMinDraws() {
+	static const uint32_t draws = [] {
+		const char* value  = std::getenv("KYTY_IDLE_FLUSH_DRAWS");
+		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 8ul;
+		return static_cast<uint32_t>(std::min(parsed, 65536ul));
+	}();
+	return draws;
+}
+
+void CommandProcessor::MaybeFlushIdleGpu() {
+	const auto min_draws = IdleFlushMinDraws();
+	if (min_draws == 0) {
+		return;
+	}
+	auto&      scheduler = GetScheduler();
+	const auto current   = scheduler.CurrentTick();
+	if (current != m_idle_flush_tick) {
+		// Something else submitted since the last count: restart the bound.
+		m_idle_flush_tick  = current;
+		m_idle_flush_draws = 0;
+	}
+	if (++m_idle_flush_draws < min_draws) {
+		return;
+	}
+	const bool in_pass = CurrentBuffer().ActiveRenderingSerial() != 0;
+	if (in_pass && m_idle_flush_draws < min_draws * 4u) {
+		return;
+	}
+	auto& master = scheduler.GetMasterSemaphore();
+	if (master.KnownGpuTick() + 1u < current) {
+		// Refresh the timeline value only every few draws (a driver query).
+		if ((m_idle_flush_draws % 4u) != 0) {
+			return;
+		}
+		master.Refresh();
+		if (master.KnownGpuTick() + 1u < current) {
+			return;
+		}
+	}
+	Profiler::CountFrameEvent(in_pass ? Profiler::FrameEvent::IdleFlushesInPass
+	                                  : Profiler::FrameEvent::IdleFlushes);
+	BufferFlush();
+}
+
 void CommandProcessor::BufferFlushAndWait() {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	GetScheduler().FlushAndWait();
@@ -1163,6 +1212,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		     args.base_vertex, args.first_instance);
 	}
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	MaybeFlushIdleGpu();
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
@@ -1306,6 +1356,7 @@ bool CommandProcessor::TryDrawIndirectNative(DrawIndirectSource source) {
 		(void)NumInstances();
 	}
 	m_pending_num_instances.push_back(pending);
+	MaybeFlushIdleGpu();
 	return true;
 }
 
@@ -1480,6 +1531,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		// local_z        = std::max(cs.num_thread_z, 1u);
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
+		MaybeFlushIdleGpu();
 	}
 
 	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
@@ -1514,6 +1566,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
+	MaybeFlushIdleGpu();
 }
 
 void CommandProcessor::ReportLodStats(uint64_t destination, uint32_t size, uint32_t control) {
@@ -1527,6 +1580,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 		args.instance_count = NumInstances();
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	MaybeFlushIdleGpu();
 }
 
 // KYTY_FLIP_WAIT_MODE=block restores the blocking WAIT_FLIP_DONE, which stalled every guest

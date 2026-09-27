@@ -305,6 +305,10 @@ enum class FrameEvent : uint32_t {
 	// written at completion instead of draining the GPU (KYTY_GDS_EOP_MODE=defer).
 	GdsEopReads,
 	GdsEopReadsDeferred,
+	// Early submits because the GPU had finished all submitted work (KYTY_IDLE_FLUSH_DRAWS), outside
+	// and inside an active rendering instance.
+	IdleFlushes,
+	IdleFlushesInPass,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

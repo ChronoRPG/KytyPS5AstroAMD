@@ -80,6 +80,9 @@ public:
 	// slice always ends with a flush, so a pending interrupt is submitted before the CP blocks.
 	void            BufferFlushForEop();
 	void            BufferWait();
+	// Early submit when the GPU ran out of submitted work (KYTY_IDLE_FLUSH_DRAWS). Call after
+	// recording a draw or dispatch, at a packet boundary.
+	void            MaybeFlushIdleGpu();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { return m_sh_ctx; }
@@ -226,6 +229,9 @@ private:
 	bool      m_defer_next_label            = false;
 	// The current WAIT_FLIP_DONE packet already flushed and suspended (retries skip the flush).
 	bool      m_flip_wait_suspended         = false;
+	// MaybeFlushIdleGpu: recording tick being counted and its draws/dispatches so far.
+	uint64_t  m_idle_flush_tick             = 0;
+	uint32_t  m_idle_flush_draws            = 0;
 };
 
 } // namespace Libs::Graphics
