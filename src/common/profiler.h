@@ -319,6 +319,11 @@ enum class FrameEvent : uint32_t {
 	TextureResidencyFullFallbacks,
 	TextureResidencyUnmapFrees,
 	TextureResidencyViolations,
+	// Residency extensions whose newly registered bytes another registered image already covers,
+	// and those where that image is GPU-modified (the extended image's refresh then reads guest
+	// memory the other image's native contents supersede; expected 0).
+	TextureResidencyExtensionOverlaps,
+	TextureResidencyExtensionGpuOverlaps,
 	// Partially resident images retired after KYTY_TEXTURE_RESIDENT_IDLE_FRAMES unused frames.
 	TextureResidentIdleFrees,
 	// Headerless shader code hashed from a clean-backing copy (no fault possible) or in place

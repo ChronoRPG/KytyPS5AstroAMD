@@ -223,6 +223,8 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.TextureResidencyFullFallbacks.Cumulative",
     "FrameEvent.TextureResidencyUnmapFrees.Cumulative",
     "FrameEvent.TextureResidencyViolations.Cumulative",
+    "FrameEvent.TextureResidencyExtensionOverlaps.Cumulative",
+    "FrameEvent.TextureResidencyExtensionGpuOverlaps.Cumulative",
     "FrameEvent.TextureResidentIdleFrees.Cumulative",
     "FrameEvent.ShaderCodeHashBacking.Cumulative",
     "FrameEvent.ShaderCodeHashDirect.Cumulative",

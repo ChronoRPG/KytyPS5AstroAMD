@@ -631,6 +631,7 @@ void TextureCache::EnsureResidency(ImageId id, uint32_t first_level, bool sampli
 	// The registered range grows. For everything keyed on the page owner index (clean-page
 	// proofs, lookups, binding identity caches) this is an unregister and a register.
 	const bool registered = image.registered;
+	const auto old_end    = image.live.End();
 	if (registered) {
 		UnregisterImage(id);
 	}
@@ -638,6 +639,30 @@ void TextureCache::EnsureResidency(ImageId id, uint32_t first_level, bool sampli
 	image.live = new_first != 0 ? GuestRange {image.info.data.address, prefix} : image.info.data;
 	if (registered) {
 		RegisterImage(id);
+	}
+	// The newly registered bytes were outside every overlap resolution so far: an image created
+	// there meanwhile (the partially resident one was invisible to its lookup) now overlaps this
+	// one unresolved. Diagnostics only: a GPU-modified one holds the newest bytes, which the
+	// refresh below does not see (it reads guest memory).
+	if (registered && image.live.End() > old_end) {
+		for (const auto other_id: FindImagesInRegion(old_end, image.live.End() - old_end, false)) {
+			const auto* other = m_slot_images.try_get(other_id);
+			if (other_id == id || other == nullptr || !other->registered) {
+				continue;
+			}
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureResidencyExtensionOverlaps);
+			if (other->IsGpuModified()) {
+				Profiler::CountFrameEvent(
+				    Profiler::FrameEvent::TextureResidencyExtensionGpuOverlaps);
+				if (++m_residency_overlap_logs <= 16) {
+					LOGF("TextureCache: residency extension of 0x%016" PRIx64 " (levels from %u)"
+					     " covers GPU-modified image 0x%016" PRIx64 "+0x%" PRIx64
+					     "; its refresh reads guest memory there\n",
+					     image.info.data.address, new_first, other->info.data.address,
+					     other->info.data.size);
+				}
+			}
+		}
 	}
 	// Newly resident levels hold undefined contents: refresh every resident level before use
 	// (from the GPU-written buffer bytes when there are any, as for a new image).
