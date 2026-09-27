@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -83,7 +84,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 			uses_gds |= kind == IR::ResourceKind::Gds;
 		}
 	}
-	if (uses_gds) {
+	if (uses_gds || LoopGuardApplies(program.shader_hash)) {
 		Expect(Kind::Gds);
 	}
 	if (program.info.uses_dma) {
@@ -275,10 +276,19 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					requirements.subgroup_ballot              = true;
 					requirements.subgroup_shuffle             = true;
 					requirements.subgroup_local_invocation_id = true;
+					requirements.helper_invocation |=
+					    program.stage == ShaderType::Pixel &&
+					    GetCodegenOptions().ps_append_live_election;
 				}
 			}
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
+				case IR::ValueOpcode::IsHelperInvocation:
+					if (program.stage != ShaderType::Pixel) {
+						Fail(program, "helper-invocation query outside a pixel shader");
+					}
+					requirements.helper_invocation = true;
+					break;
 				case IR::ValueOpcode::DppMoveU32:
 				case IR::ValueOpcode::ReadFirstLane:
 				case IR::ValueOpcode::ReadLane: {

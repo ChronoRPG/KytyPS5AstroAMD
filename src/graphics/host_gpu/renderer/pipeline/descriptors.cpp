@@ -39,6 +39,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -1020,6 +1021,44 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+// KYTY_GDS_TRACE=1 logs the user SGPRs of the first draws or dispatches of every program that
+// binds GDS (up to 32 programs, 4 uses each). A DS_APPEND/DS_CONSUME takes its GDS range from
+// M0, which such programs load from a user SGPR (the GdsCounterRange direct resource: base in
+// bits 31:16, size in bits 15:0), so the log shows which counters a pass uses.
+static void NoteGdsProgram(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                           const ShaderRecompiler::IR::ResourceSnapshot&   snapshot) {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_GDS_TRACE");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	if (!enabled) {
+		return;
+	}
+	constexpr uint32_t          MaxPrograms = 32;
+	constexpr uint32_t          MaxUses     = 4;
+	static std::atomic<uint64_t> hashes[MaxPrograms] {};
+	static std::atomic<uint32_t> uses[MaxPrograms] {};
+	uint32_t                     slot        = MaxPrograms;
+	for (uint32_t i = 0; i < MaxPrograms; i++) {
+		auto expected = uint64_t {0};
+		if (hashes[i].load(std::memory_order_relaxed) == program.shader_hash ||
+		    hashes[i].compare_exchange_strong(expected, program.shader_hash)) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot == MaxPrograms || uses[slot].fetch_add(1, std::memory_order_relaxed) >= MaxUses) {
+		return;
+	}
+	std::string values;
+	const auto  count = std::min<size_t>(snapshot.user_data.size(), 24);
+	for (size_t i = 0; i < count; i++) {
+		values += fmt::format(" s{}=0x{:08x}", program.user_data_base + i, snapshot.user_data[i]);
+	}
+	LOGF("GDS trace: program stage=%u hash=0x%016" PRIx64 " user data:%s\n",
+	     static_cast<uint32_t>(program.stage), program.shader_hash, values.c_str());
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -1052,6 +1091,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
+		NoteGdsProgram(program, snapshot);
 	}
 }
 

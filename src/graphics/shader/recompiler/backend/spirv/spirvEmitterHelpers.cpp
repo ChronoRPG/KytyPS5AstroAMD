@@ -144,6 +144,16 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
 }
 
+uint32_t EmitIsHelperInvocation(EmitterState& state) {
+	if (state.helper_invocation_variable == 0) {
+		EXIT("HelperInvocation was not declared before SPIR-V function emission\n");
+	}
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeBool(state), value,
+	                          state.helper_invocation_variable);
+	return value;
+}
+
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind) {
 	for (const auto& input: state.inputs) {
 		if (input.kind == kind) {
