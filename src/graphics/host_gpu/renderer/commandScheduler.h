@@ -19,6 +19,20 @@ namespace Libs::Graphics {
 
 class GpuTimestampRing;
 
+// Host work that commands of the current recording read and that finishes after recording
+// (TextureCache staging copies made on a worker). Submit makes the batch wait for it on the
+// GPU through a host-signalled timeline semaphore, so the recording thread never blocks.
+class SubmitDependency {
+public:
+	virtual ~SubmitDependency() = default;
+	// A value of Semaphore() the next batch must wait for, or 0 when all work handed out so far
+	// has finished on the host (its writes then precede vkQueueSubmit).
+	[[nodiscard]] virtual uint64_t      PendingValue()    = 0;
+	[[nodiscard]] virtual vk::Semaphore Semaphore() const = 0;
+	// Host-side wait, used when the batch has no free wait slot.
+	virtual void WaitHost(uint64_t value) = 0;
+};
+
 class CommandScheduler {
 public:
 	// Diagnostic attribution only; both kinds retain the same completion boundary.
@@ -61,6 +75,10 @@ public:
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
+	// Recording-thread only; the owner clears it before it is destroyed.
+	void SetSubmitDependency(SubmitDependency* dependency) noexcept {
+		m_submit_dependency = dependency;
+	}
 
 private:
 	class CommandPool {
@@ -118,6 +136,7 @@ private:
 	std::unique_ptr<GpuTimestampRing> m_gpu_timing;
 	// Guest scheduler with KYTY_GPU_OP_PROFILE / counters enabled (gpuOpProfiler.h).
 	bool m_gpu_ops = false;
+	SubmitDependency* m_submit_dependency = nullptr;
 };
 
 } // namespace Libs::Graphics
