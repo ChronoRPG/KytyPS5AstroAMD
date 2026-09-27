@@ -156,6 +156,23 @@ public:
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
 	                    ShaderPixelInputInfo& pixel_info, GraphicsStagePreps& stage_preps);
+	// Draw-prep: the program preparation of one draw as GetGraphicsPrograms would do it, but
+	// speculative: every guest read goes through the active DrawPrep recorder (readSet.h), nothing
+	// is compiled, synchronized or read back, and only already published sources and permutations
+	// are used. Safe on any thread (the program cache is only read). Writes vertex_info (stage 0),
+	// pixel_info, the two stage preps and programs; outputs are meaningful only for Ok.
+	enum class SpeculativeResult : uint8_t {
+		Ok,
+		Ineligible,   // tessellation or O15 resource reuse: always serial
+		NotPublished, // a source or permutation is missing (the serial path compiles it)
+		ReadFailed,   // a read was refused; the recorder holds the reason
+	};
+	[[nodiscard]] SpeculativeResult PrepareGraphicsProgramsSpeculative(
+	    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+	    const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
+	    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+	    bool pixel_active, ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info,
+	    StagePrep& vertex_prep, StagePrep& pixel_prep, GraphicsPrograms& programs);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo& input_info, StagePrep& stage_prep);

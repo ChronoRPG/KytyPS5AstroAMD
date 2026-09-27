@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 
@@ -443,6 +444,8 @@ bool CommandScheduler::IsFree(uint64_t tick) {
 
 void CommandScheduler::CheckActive() const {
 	EXIT_IF(!Active());
+	// Draw-prep workers only prepare; recording belongs to the GPU thread.
+	EXIT_IF(DrawPrep::IsWorkerThread());
 }
 
 CommandBuffer& CommandScheduler::Current() {

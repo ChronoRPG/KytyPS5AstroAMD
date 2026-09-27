@@ -741,7 +741,8 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (!ImagePageTable::TryGetPageRange(image.live.address, image.live.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
-	InvalidateCleanImageProofs();
+	InvalidateCleanImageProofs(image.live.address, image.live.size,
+	                           Coherence::Source::ImageRegister);
 	NoteStructureChange(image);
 	ForEachPage(image.live.address, image.live.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
@@ -780,7 +781,8 @@ void TextureCache::UnregisterImage(ImageId id) {
 	if (!image.registered) {
 		return;
 	}
-	InvalidateCleanImageProofs();
+	InvalidateCleanImageProofs(image.live.address, image.live.size,
+	                           Coherence::Source::ImageUnregister);
 	NoteStructureChange(image);
 	UntrackImage(id);
 	ImagePageTable::PageRange pages {};
@@ -869,7 +871,8 @@ void TextureCache::FreeImage(ImageId id, HangTrace::ImageFreeReason reason) {
 	HangTrace::SetImageFreeReason(reason);
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
-		CleanVerdict::Invalidate();
+		CleanVerdict::Invalidate(image.live.address, image.live.size,
+		                         Coherence::Source::ImageGpuClear);
 		image.ClearGpuModified();
 	}
 	DeleteImage(id);
@@ -3104,7 +3107,8 @@ void TextureCache::CommitGpuWrite(Image& image) {
 			other->alias_owner = false;
 			if (other->IsGpuModified()) {
 				other->ClearGpuModified();
-				InvalidateCleanImageProofs();
+				InvalidateCleanImageProofs(other->live.address, other->live.size,
+				                           Coherence::Source::ImageGpuClear);
 			}
 		}
 		image.alias_owner = true;
@@ -3664,7 +3668,8 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		}
 		if (image.IsGpuModified()) {
 			// The buffer cache takes ownership of these bytes; its Add bumps as well.
-			CleanVerdict::Invalidate();
+			CleanVerdict::Invalidate(image.live.address, image.live.size,
+			                         Coherence::Source::ImageGpuClear);
 			image.ClearGpuModified();
 		}
 		image.MarkBufferModified();
@@ -3692,10 +3697,11 @@ uint32_t TextureCache::CountImagesOutsideGpuWrite(uint64_t address, uint64_t siz
 	return count;
 }
 
-void TextureCache::InvalidateCleanImageProofs() {
+void TextureCache::InvalidateCleanImageProofs(uint64_t address, uint64_t size,
+                                              Coherence::Source source) {
 	// Every image register/unregister and GPU-modified transition passes here, before the
 	// change is made under m_lock. Global clean-read verdicts depend on the same state.
-	CleanVerdict::Invalidate();
+	CleanVerdict::Invalidate(address, size, source);
 	if (!m_clean_image_proofs) {
 		return;
 	}
@@ -3717,7 +3723,9 @@ void TextureCache::MarkImageGpuModified(Image& image) {
 		}
 	}
 	if (!image.IsGpuModified()) {
-		InvalidateCleanImageProofs();
+		// The ownership predicate (IsRegionGpuModified) covers the registered range `live`.
+		InvalidateCleanImageProofs(image.live.address, image.live.size,
+		                           Coherence::Source::ImageGpuModified);
 	}
 	image.MarkGpuModified();
 	// Every GPU writer (draw targets, storage bindings, clears, helper passes, copies) passes

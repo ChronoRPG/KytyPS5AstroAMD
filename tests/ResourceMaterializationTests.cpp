@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <array>
@@ -369,6 +370,129 @@ void TestSpeculativeRuntimeMatchesSerial() {
   g_probe_memory = {};
 }
 
+// Draw-prep S5/S6 (readSet.h): a preparation that records every read certifies itself. While the
+// recorded ranges hold the recorded bytes, the recorded preparation equals the serial one; a
+// change to a read byte fails the certificate and a change elsewhere does not. Preparations run
+// concurrently on several threads, each with its own read set and scratch, as DrawPrep workers do.
+bool RecordingRead(void *userdata, uint64_t address, std::span<uint32_t> values) {
+  auto &reads = *static_cast<Libs::Graphics::DrawPrep::ReadSet *>(userdata);
+  if (values.empty()) {
+    return false;
+  }
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address),
+              values.size_bytes());
+  return reads.Record(address, values.data(), values.size_bytes());
+}
+
+void TestRecordedPreparationCertifies() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::DrawPrep::ReadSet;
+  using Libs::Graphics::DrawPrep::ValidateResult;
+  std::array<uint32_t, 4> table{0x40000u, 0x00400000u, 0x100u, 0x00027facu};
+  const auto plan = SharedEvaluationPlan(table.data());
+  const std::array<uint32_t, 1> user_data{0x66u};
+  const SrtRuntime serial{.user_data = user_data,
+                          .read_specialization_memory = StrictRead,
+                          .try_read_clean_backing = CleanProbe,
+                          .share_clean_values = true};
+  const auto recording_runtime = [&](ReadSet &reads) {
+    return SrtRuntime{.user_data = user_data,
+                      .read_memory = RecordingRead,
+                      .userdata = &reads,
+                      .read_specialization_memory = RecordingRead,
+                      .try_read_clean_backing = RecordingRead,
+                      .share_clean_values = false};
+  };
+  const auto read_now = [](uint64_t address, void *data, uint64_t size) {
+    std::memcpy(data, reinterpret_cast<const void *>(address), size);
+    return true;
+  };
+  struct Output {
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+  };
+  const auto same = [](const Output &a, const Output &b) {
+    return a.snapshot.flattened_srt == b.snapshot.flattened_srt &&
+           a.snapshot.buffers == b.snapshot.buffers &&
+           a.snapshot.images == b.snapshot.images &&
+           a.snapshot.samplers == b.snapshot.samplers &&
+           a.snapshot.user_data == b.snapshot.user_data &&
+           a.snapshot.uniform_fill == b.snapshot.uniform_fill &&
+           a.specialization == b.specialization;
+  };
+  g_probe_memory = {};
+  Output expected;
+  Check(MaterializeResources(plan, serial, expected.snapshot,
+                             expected.specialization),
+        "serial materialization for the certificate test failed");
+
+  ReadSet reads;
+  Output recorded;
+  EvaluationScratch scratch;
+  Check(MaterializeResources(plan, recording_runtime(reads), scratch,
+                             recorded.snapshot, recorded.specialization),
+        "recording materialization failed");
+  Check(same(expected, recorded), "recorded preparation differs from serial");
+  Check(reads.Finish() && !reads.Ranges().empty(), "read set did not finish");
+  bool covers_table = false;
+  for (const auto &range : reads.Ranges()) {
+    covers_table |= range.begin <= reinterpret_cast<uint64_t>(&table[0]) &&
+                    reinterpret_cast<uint64_t>(&table[0]) < range.end;
+  }
+  Check(covers_table, "the descriptor table read is not in the certificate");
+  std::vector<uint8_t> validation;
+  Check(reads.Validate(read_now, validation) == ValidateResult::Ok,
+        "unchanged memory did not validate");
+
+  // A read byte changes: the certificate fails (the serial result differs too).
+  table[0] ^= 0x1000u;
+  Check(reads.Validate(read_now, validation) == ValidateResult::Changed,
+        "a changed read byte validated");
+  Output changed;
+  Check(MaterializeResources(plan, serial, changed.snapshot,
+                             changed.specialization),
+        "serial materialization of changed memory failed");
+  Check(!same(changed, recorded),
+        "test premise: the changed byte must change the serial result");
+  table[0] ^= 0x1000u;
+  Check(reads.Validate(read_now, validation) == ValidateResult::Ok,
+        "restored memory did not validate");
+
+  // Concurrent preparations on shared memory, each certified and compared with the serial
+  // result. Plans are sealed (immutable); scratch and read sets are per thread.
+  constexpr uint32_t ThreadCount = 8;
+  constexpr uint32_t Iterations = 1000;
+  std::atomic<uint32_t> failures{0};
+  std::vector<std::thread> threads;
+  for (uint32_t thread = 0; thread < ThreadCount; thread++) {
+    threads.emplace_back([&] {
+      ReadSet thread_reads;
+      EvaluationScratch thread_scratch;
+      Output output;
+      std::vector<uint8_t> thread_validation;
+      for (uint32_t i = 0; i < Iterations; i++) {
+        thread_reads.Reset();
+        const bool ok = MaterializeResources(plan, recording_runtime(thread_reads),
+                                             thread_scratch, output.snapshot,
+                                             output.specialization) &&
+                        thread_reads.Finish() &&
+                        thread_reads.Validate(read_now, thread_validation) ==
+                            ValidateResult::Ok &&
+                        same(output, expected);
+        if (!ok) {
+          failures.fetch_add(1u, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+  for (auto &thread : threads) {
+    thread.join();
+  }
+  Check(failures.load() == 0,
+        "concurrent recorded preparations differed from serial or failed to certify");
+  g_probe_memory = {};
+}
+
 void TestMappedSrtUsesDirectReaderByDefault() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
@@ -495,6 +619,7 @@ int main() {
   TestMixedSamplerDuplicatesTheCorrectSnapshot();
   TestSealedPlanEvaluatesConcurrently();
   TestSpeculativeRuntimeMatchesSerial();
+  TestRecordedPreparationCertifies();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

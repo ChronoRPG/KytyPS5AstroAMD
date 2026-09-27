@@ -139,7 +139,7 @@ public:
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
 		if constexpr (clear) {
-			CleanVerdict::Invalidate();
+			CleanVerdict::Invalidate(vaddr, size, Coherence::Source::TrackerDownload);
 		}
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);

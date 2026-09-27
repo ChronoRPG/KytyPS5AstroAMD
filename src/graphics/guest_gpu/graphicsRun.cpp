@@ -11,6 +11,8 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/coherenceLog.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -454,6 +456,48 @@ CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 		processor = std::make_unique<CommandProcessor>(m_renderer, ComputeQueueBase + queue_id - 1);
 	}
 	return *processor;
+}
+
+CommandProcessor::~CommandProcessor() = default;
+
+void CommandProcessor::DrawPrepDeleter::operator()(DrawPrep::Engine* engine) const noexcept {
+	delete engine;
+}
+
+DrawPrep::Engine* CommandProcessor::DrawPrepEngine() {
+	// Only the graphics processor draws; compute queues would only dilute the S0 histogram.
+	if (!DrawPrep::PacketHookEnabled() || IsAsyncComputeQueue()) {
+		return nullptr;
+	}
+	if (m_draw_prep == nullptr) {
+		m_draw_prep.reset(new DrawPrep::Engine(
+		    m_renderer,
+		    [] {
+			    if (g_gpu_state != nullptr) {
+				    g_gpu_state->ProcessCommands();
+			    }
+		    },
+		    // After each committed (recorded) draw, with the live registers bound again: the
+		    // idle-GPU early submit counts recorded draws, exactly as after a serial draw.
+		    [this] { MaybeFlushIdleGpu(); }));
+	}
+	return m_draw_prep.get();
+}
+
+bool CommandProcessor::TrySubmitPreparedDraw(const DrawIndexArgs* index_args,
+                                             const DrawAutoArgs*  auto_args) {
+	if (DrawPrep::GetMode() == DrawPrep::Mode::Off) {
+		return false;
+	}
+	auto* engine = DrawPrepEngine();
+	return engine != nullptr &&
+	       engine->Submit(m_submit_id, index_args, auto_args, m_ctx, m_ucfg, m_sh_ctx);
+}
+
+void CommandProcessor::DrainPreparedDraws() {
+	if (m_draw_prep != nullptr) {
+		m_draw_prep->Drain();
+	}
 }
 
 void CommandProcessor::Reset() {
@@ -1114,6 +1158,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	} execution_scope(*this, execution);
 
 	ProcessPm4(execution);
+	// Draw-prep: every draw parsed in this slice is committed before the slice ends.
+	DrainPreparedDraws();
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
@@ -1133,7 +1179,16 @@ void CommandProcessor::SuspendPm4() {
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
-			g_gpu_state->ProcessCommands();
+			if (m_draw_prep != nullptr && m_draw_prep->Pending()) {
+				// Draw-prep: service commands (readbacks, unmaps) observe every parsed draw, so
+				// they only run with an empty window.
+				if (g_gpu_state->HasPendingCommands()) {
+					m_draw_prep->Drain();
+					g_gpu_state->ProcessCommands();
+				}
+			} else {
+				g_gpu_state->ProcessCommands();
+			}
 		}
 		auto& cursor = execution.m_buffer_stack.back();
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());
@@ -1212,6 +1267,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		if (DrawPrep::PacketHookEnabled()) [[unlikely]] {
+			// Window fences commit every pending draw before their handler runs.
+			if (auto* engine = DrawPrepEngine(); engine != nullptr) {
+				engine->OnPacket(
+				    DrawPrep::ClassifyPacket(packet_header & ~1u, packet + 1, remaining_dw));
+			}
+		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
@@ -1358,11 +1420,22 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
+		if (!m_pending_num_instances.empty()) {
+			// The inherited count may be GPU data an earlier (pending) draw writes.
+			DrainPreparedDraws();
+		}
 		args.instance_count = NumInstances();
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
+	}
+	if (TrySubmitPreparedDraw(&args, nullptr)) {
+		// Draw-prep: the engine runs MaybeFlushIdleGpu after it records (commits) each draw. The
+		// slice may count the draw now: a yield ends the slice after this packet, and the slice
+		// end commits the whole window before anything else runs.
+		MaybeYieldSlice();
+		return;
 	}
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 	MaybeFlushIdleGpu();
@@ -1732,7 +1805,15 @@ void CommandProcessor::ReportLodStats(uint64_t destination, uint32_t size, uint3
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
+		if (!m_pending_num_instances.empty()) {
+			DrainPreparedDraws();
+		}
 		args.instance_count = NumInstances();
+	}
+	if (TrySubmitPreparedDraw(nullptr, &args)) {
+		// See DrawIndex: idle flushes follow each commit, the slice counts the draw now.
+		MaybeYieldSlice();
+		return;
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 	MaybeFlushIdleGpu();
@@ -1827,6 +1908,8 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 				    KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteDeferredLabel");
 				    std::memcpy(reinterpret_cast<void*>(address), &value, size);
 			    }
+			    // Emulator write outside a fence position (draw-prep log certificate only).
+			    Coherence::NoteContentWrite(address, size, Coherence::Source::CpWrite);
 			    gpu.RemoveDeferredLabel(address, tick);
 			    if (interrupt) {
 				    renderer->TriggerInterrupt(event_id, interrupt_context_id);
@@ -1972,6 +2055,7 @@ bool CommandProcessor::TryDeferGdsRead(uint32_t* dst, uint32_t dw_offset, uint32
 			    } else {
 				    (void)LibKernel::Memory::TryWriteBacking(address, bytes.data(), bytes.size());
 			    }
+			    Coherence::NoteContentWrite(address, bytes.size(), Coherence::Source::CpWrite);
 			    gpu.RemoveDeferredLabel(address, tick);
 			    if (interrupt) {
 				    renderer->TriggerInterrupt(event_id, interrupt_context_id);

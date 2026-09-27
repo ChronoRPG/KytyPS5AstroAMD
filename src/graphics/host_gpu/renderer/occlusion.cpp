@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/profiler.h"
 #include "gpu_dcc_shaders/gpu_dcc_occlusion_spv.h"
+#include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
@@ -285,6 +286,8 @@ bool OcclusionCounter::Dump(uint64_t address) {
 			(void)LibKernel::Memory::TryWriteBacking(address + db * 16u, source + db * 16u,
 			                                         sizeof(uint64_t));
 		}
+		// Backing bytes changed outside a publication: logged after the write.
+		Coherence::NoteContentWrite(address, 248, Coherence::Source::OcclusionWrite);
 		if (HangTrace::Enabled()) {
 			uint64_t db0 = 0;
 			std::memcpy(&db0, source, sizeof(db0));

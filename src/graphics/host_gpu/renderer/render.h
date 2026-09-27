@@ -40,6 +40,11 @@ class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
 
+namespace DrawPrep {
+struct PreparedDraw;
+class Engine;
+} // namespace DrawPrep
+
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
 	DrawIndex,
@@ -257,9 +262,10 @@ public:
 	[[nodiscard]] vk::CommandBuffer StateHandle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
-	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
-	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
-	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
+	// Read-only: a committed draw-prep draw points these at its register snapshot.
+	[[nodiscard]] const HW::Context&    GetRegisters() const noexcept { return *m_registers; }
+	[[nodiscard]] const HW::UserConfig& GetUserConfig() const noexcept { return *m_user_config; }
+	[[nodiscard]] const HW::Shader&     GetShaders() const noexcept { return *m_shaders; }
 
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
@@ -422,6 +428,13 @@ public:
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
 
+	// Draw-prep: hands the committed draw's preparation to its program refresh (once).
+	[[nodiscard]] DrawPrep::PreparedDraw* TakePreparedDraw() noexcept {
+		auto* prepared  = m_prepared_draw;
+		m_prepared_draw = nullptr;
+		return prepared;
+	}
+
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
@@ -567,8 +580,12 @@ private:
 	};
 	DepthTargetDescMemo        m_depth_target_memo {};
 	GraphicsDynamicStateShadow m_dynamic_state {};
+	// Draw-prep (drawPrep.h): the preparation of the draw the engine is committing, taken by
+	// RefreshShaders in place of GetGraphicsPrograms when its certificate holds. Null otherwise.
+	DrawPrep::PreparedDraw* m_prepared_draw = nullptr;
 
 	friend class CommandProcessor;
+	friend class DrawPrep::Engine;
 	friend struct RenderExecutorTestAccess;
 };
 

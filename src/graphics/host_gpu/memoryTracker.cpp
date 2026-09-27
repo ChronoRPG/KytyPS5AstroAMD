@@ -189,7 +189,7 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	CleanVerdict::Invalidate();
+	CleanVerdict::Invalidate(vaddr, size, Coherence::Source::TrackerGpuMark);
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Gpu, true>(manager->GetCpuAddr() + offset, bytes);
@@ -198,7 +198,7 @@ void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	CleanVerdict::Invalidate();
+	CleanVerdict::Invalidate(vaddr, size, Coherence::Source::TrackerGpuUnmark);
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Gpu, false>(manager->GetCpuAddr() + offset, bytes);
@@ -217,7 +217,7 @@ void MemoryTracker::MarkReadbackPending(uint64_t vaddr, uint64_t size) {
 MemoryTracker::ReadbackUnmarkResult MemoryTracker::UnmarkReadbackPending(uint64_t vaddr,
                                                                          uint64_t size) {
 	CheckNotInUploadCallback();
-	CleanVerdict::Invalidate();
+	CleanVerdict::Invalidate(vaddr, size, Coherence::Source::TrackerReadbackUnmark);
 	ReadbackUnmarkResult result;
 	Iterate<false>(vaddr, size, [&result](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
