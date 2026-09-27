@@ -161,13 +161,23 @@ bool PacketHookEnabled() {
 	return enabled;
 }
 
+bool RegisterIndirectWindowEnabled() {
+	static const bool enabled = [] {
+		const auto* value = EnvValue("KYTY_DRAW_PREP_REG_INDIRECT_WINDOW");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 bool PacketHookActive() {
 	if (PacketHookEnabled()) {
 		return true;
 	}
+	// Opt-in: classifying every packet costs the command processor about 20-50 ns per packet,
+	// which would skew aggregate comparisons. Inline and parallel modes count fence kinds anyway.
 	static const bool passive = [] {
 		const auto* value = EnvValue("KYTY_DRAW_PREP_FENCE_HISTOGRAM");
-		return Profiler::AggregateEnabled() && (value == nullptr || std::strcmp(value, "0") != 0);
+		return Profiler::AggregateEnabled() && value != nullptr && std::strcmp(value, "0") != 0;
 	}();
 	return passive && tracy::ProfilerAvailable() && TracyIsConnected;
 }

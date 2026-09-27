@@ -392,6 +392,7 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.DepthFeedbackKeepMissSerial.Cumulative",
     "FrameEvent.DepthFeedbackKeepMissState.Cumulative",
     "FrameEvent.ShaderCodeHashCertified.Cumulative",
+    "FrameEvent.DrawPrepRegIndirectKept.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 

@@ -674,6 +674,35 @@ void TestFenceKinds() {
 	      "dispatch, indirect-draw, context-control, marker and other fences");
 }
 
+void TestRegisterIndirectPairs() {
+	using DrawPrep::RegisterIndirectPairs;
+	using DrawPrep::RegisterIndirectRange;
+	namespace Pm4 = Libs::Graphics::Pm4;
+	// As pm4Handlers.cpp decodes it: dword0 address low (4-byte aligned), dword1 high, dword3 low
+	// 14 bits the pair count.
+	const std::array<uint32_t, 4> body {0x12345677u, 0x2u, 0xdeadbeefu, 0xffffc003u};
+	for (const auto op: {Pm4::IT_SET_SH_REG_INDIRECT, Pm4::IT_SET_UCONFIG_REG_INDIRECT,
+	                     Pm4::IT_SET_CONTEXT_REG_INDIRECT}) {
+		RegisterIndirectRange range;
+		Check(RegisterIndirectPairs(KYTY_PM4(5, op, 0), body.data(), 5, range) &&
+		          range.address == 0x212345674ull && range.size == 3u * 8u,
+		      "register-indirect pairs decode");
+		Check(!RegisterIndirectPairs(KYTY_PM4(5, op, 0), body.data(), 4, range),
+		      "a truncated register-indirect packet is refused");
+		Check(!RegisterIndirectPairs(KYTY_PM4(6, op, 0), body.data(), 6, range),
+		      "an unexpected register-indirect length is refused");
+	}
+	const std::array<uint32_t, 4> empty {0x1000u, 0u, 0u, 0xffffc000u};
+	RegisterIndirectRange range;
+	Check(RegisterIndirectPairs(KYTY_PM4(5, Pm4::IT_SET_SH_REG_INDIRECT, 0), empty.data(), 5,
+	                            range) &&
+	          range.size == 0,
+	      "a register-indirect packet without pairs has an empty range");
+	Check(!RegisterIndirectPairs(KYTY_PM4(5, Pm4::IT_SET_SH_REG, 0), body.data(), 5, range) &&
+	          !RegisterIndirectPairs(KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), body.data(), 5, range),
+	      "other packets have no register-indirect range");
+}
+
 } // namespace
 
 int main() {
@@ -692,6 +721,7 @@ int main() {
 	TestRecordScopeNests();
 	TestPacketClassification();
 	TestFenceKinds();
+	TestRegisterIndirectPairs();
 	TestWindowSingleThread();
 	TestWindowConcurrent(4, 8, 200000);  // tiny window: constant wrap-around and races
 	TestWindowConcurrent(32, 6, 200000); // the default shape
