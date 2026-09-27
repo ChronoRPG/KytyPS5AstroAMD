@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/passes/WriteRangeAnalysis.h"
 
 #include <array>
 #include <bit>
@@ -2653,7 +2654,8 @@ void TestImageBindingAbi() {
             static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 47u &&
             static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 48u &&
             static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 49u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u,
+            static_cast<uint32_t>(DescriptorBindingKind::MipStats) == 50u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Count) == 51u,
         "native descriptor binding anchors changed");
 
   const std::array sampled_dimensions{
@@ -2870,6 +2872,150 @@ void TestMalformedMemoryKindsRejected() {
   }
 }
 
+void TestBufferWriteRanges() {
+  ShaderComputeInputInfo compute;
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = 1;
+  compute.threads_num[2] = 1;
+  Libs::Graphics::ShaderStageInputInfo input;
+  input.compute = &compute;
+
+  struct Options {
+    bool soffset_user_data = false;
+    bool loaded_offset = false;
+    bool counter = false;
+    bool atomic64 = false;
+  };
+  struct Result {
+    bool bounded = false;
+    std::vector<WriteRangeSpan> spans;
+    std::string description;
+  };
+  const auto Run = [&](Options options, WriteRangeInputs inputs,
+                       uint32_t packed_stride = 16u) {
+    Fixture fixture;
+    const auto buffer =
+        fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                        fixture.UserData(2), fixture.UserData(3)});
+    const auto local = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+         Value(0u)});
+    const auto group = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+    const auto index = fixture.Emit(
+        ValueOpcode::IAdd32,
+        {local, fixture.Emit(ValueOpcode::ShiftLeftLogical32, {group, Value(6u)})});
+    Value offset(0u);
+    if (options.loaded_offset) {
+      MemoryInfo load;
+      load.kind = ResourceKind::Buffer;
+      load.idxen = true;
+      offset = fixture.Emit(ValueOpcode::LoadBufferU32,
+                            {buffer, index, Value(0u), Value(0u), Value(true)},
+                            fixture.AddMemory(load, 4));
+    }
+    const Value soffset = options.soffset_user_data ? fixture.UserData(4) : Value(0u);
+    MemoryInfo store;
+    store.kind = ResourceKind::Buffer;
+    store.idxen = true;
+    store.offset = 4;
+    if (options.atomic64) {
+      store.data_dwords = 2;
+      fixture.Emit(ValueOpcode::BufferAtomicIAdd64,
+                   {buffer, index, offset, soffset, Value(uint64_t{1}), Value(true)},
+                   fixture.AddMemory(store, 8));
+    } else {
+      fixture.Emit(ValueOpcode::StoreBufferU32x2,
+                   {buffer, index, offset, soffset,
+                    fixture.Emit(ValueOpcode::CompositeConstructU32x2,
+                                 {Value(1u), Value(2u)}),
+                    Value(true)},
+                   fixture.AddMemory(store, 8));
+    }
+    if (options.counter) {
+      MemoryInfo counter;
+      counter.kind = ResourceKind::Buffer;
+      counter.offset = 0x100000;
+      fixture.Emit(ValueOpcode::BufferAtomicIAdd32,
+                   {buffer, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+                   fixture.AddMemory(counter, 12));
+    }
+    fixture.PlanAndTrack();
+    Check(fixture.program.info.buffers.size() == 1 &&
+              fixture.program.info.buffers[0].written,
+          "write-range fixture did not track one written buffer");
+    fixture.program.info.buffers[0].packed_stride = packed_stride;
+    AnalyzeBufferWriteRanges(fixture.program, input);
+    WriteRangeEvaluator evaluator;
+    evaluator.Evaluate(fixture.program.write_ranges, inputs);
+    Result result;
+    result.bounded = evaluator.Spans(fixture.program.write_ranges, 0, 0x400000,
+                                     result.spans);
+    result.description = evaluator.Describe(fixture.program.write_ranges, 0);
+    return result;
+  };
+  std::array<uint32_t, 8> user_data{0x200000u, 0u, 0x40000u, 0x14204u,
+                                    0x10000u, 0u, 0u, 0u};
+  const WriteRangeInputs dispatch{
+      .user_data = user_data, .groups = {10u, 1u, 1u}, .has_groups = true};
+
+  // Thread-id addressing: 640 records of 16 bytes, 8 bytes stored at +4.
+  auto result = Run({}, dispatch);
+  Check(result.bounded && result.spans.size() == 1 &&
+            result.spans[0] == WriteRangeSpan{0u, 639u * 16u + 8u + 12u},
+        "thread-id store range was not bounded by the dispatch size");
+
+  // A user-data SOFFSET moves the range.
+  result = Run({.soffset_user_data = true}, dispatch);
+  Check(result.bounded && result.spans.size() == 1 &&
+            result.spans[0] ==
+                WriteRangeSpan{0x10000u + 4u - 8u, 0x10000u + 639u * 16u + 8u + 12u},
+        "user-data SOFFSET was not applied to the write range");
+
+  // An address that depends on loaded memory is unbounded.
+  result = Run({.loaded_offset = true}, dispatch);
+  Check(!result.bounded && result.spans.empty() &&
+            result.description.find("LoadBufferU32") != std::string::npos,
+        "a memory-dependent store offset was treated as bounded");
+
+  // Workgroup ids are unknown without a direct dispatch size.
+  result = Run({}, WriteRangeInputs{.user_data = user_data});
+  Check(!result.bounded, "workgroup ids were bounded without a dispatch size");
+
+  // A SOFFSET that can wrap the 32-bit address is unbounded.
+  user_data[4] = 0xfffff000u;
+  result = Run({.soffset_user_data = true}, dispatch);
+  Check(!result.bounded, "a wrapping store address was treated as bounded");
+  user_data[4] = 0x10000u;
+
+  // Far-apart accesses keep separate spans; spans past the binding are clipped.
+  result = Run({.counter = true}, dispatch);
+  Check(result.bounded && result.spans.size() == 2 &&
+            result.spans[1] == WriteRangeSpan{0x100000u - 8u, 0x100000u + 12u},
+        "a constant-offset counter was not kept as its own span");
+
+  // Swizzled layouts (8 records per swizzle group here) are bounded from the operand upper
+  // bounds: (79 * 16 + 8) * 8 + 7 * 4 + 3 is the largest start address.
+  result = Run({}, dispatch, 16u | (1u << 14u));
+  Check(result.bounded && result.spans.size() == 1 &&
+            result.spans[0] == WriteRangeSpan{0u, (79u * 16u + 8u) * 8u + 7u * 4u + 3u + 12u},
+        "a swizzled store range was not bounded");
+
+  // 64-bit atomics cover their possibly misaligned element.
+  result = Run({.atomic64 = true}, dispatch);
+  Check(result.bounded && result.spans.size() == 1 &&
+            result.spans[0] == WriteRangeSpan{0u, 639u * 16u + 8u + 12u},
+        "a 64-bit atomic range was not bounded");
+
+  // ADD_TID adds the lane to the index.
+  result = Run({}, dispatch, 16u | (1u << 20u));
+  Check(result.bounded && result.spans.size() == 1 &&
+            result.spans[0].end == (639u + 63u) * 16u + 8u + 12u,
+        "ADD_TID lanes were not added to the store index");
+}
+
 } // namespace
 
 int main() {
@@ -2913,6 +3059,7 @@ int main() {
     Run("graphics push constants", TestGraphicsPushConstantLayout);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
+    Run("buffer write ranges", TestBufferWriteRanges);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;

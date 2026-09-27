@@ -505,6 +505,82 @@ struct ResourceBlock {
 	std::vector<uint32_t> sources;
 };
 
+// Static bounds of the bytes a shader may write through its descriptor-bound storage buffers
+// (passes/WriteRangeAnalysis.h). Nodes form a tape in dependency order: operands (a, b, c) index
+// earlier nodes. Leaves are compile-time ranges or record-time inputs (user data, flattened SRT
+// dwords, dispatch size); every node evaluates to an unsigned interval that contains each value
+// the shader can compute for it, and [0, UINT32_MAX] stands for "unknown".
+struct WriteRangeNode {
+	enum class Op : uint8_t {
+		Range,              // [lo, hi]
+		UserData,           // snapshot user data dword a
+		FlatSrt,            // flattened SRT dword a
+		WorkgroupId,        // [0, groups[a] - 1]
+		GlobalInvocationId, // [0, groups[a] * hi - 1]
+		Add,
+		Sub,
+		Mul,
+		Shl,
+		Shr,
+		Sar,
+		And,
+		Or,
+		Xor,
+		UMin,
+		UMax,
+		SMin,
+		SMax,
+		UDiv,
+		UMulHi,
+		BitExtract, // (value a, offset b, count c)
+		Union,
+	};
+	Op       op = Op::Range;
+	uint32_t a  = 0;
+	uint32_t b  = 0;
+	uint32_t c  = 0;
+	uint32_t lo = 0;
+	uint32_t hi = UINT32_MAX;
+
+	bool operator==(const WriteRangeNode& other) const = default;
+};
+
+// One buffer store or atomic: its bytes start at index * stride + offset + immediate + k + soffset
+// (swizzled when the specialized descriptor enables it) for k in [0, extent - 4].
+struct WriteRangeAccess {
+	uint32_t index     = 0; // node
+	uint32_t offset    = 0; // node
+	uint32_t soffset   = 0; // node
+	uint32_t immediate = 0;
+	uint32_t extent    = 4;
+
+	bool operator==(const WriteRangeAccess& other) const = default;
+};
+
+struct BufferWriteRange {
+	uint32_t                      buffer        = 0;
+	uint32_t                      packed_stride = 0; // Specialized ShaderBufferResource::PackedStride
+	bool                          bounded       = false;
+	std::vector<WriteRangeAccess> accesses;
+
+	bool operator==(const BufferWriteRange& other) const = default;
+};
+
+struct WriteRangeProgram {
+	std::vector<WriteRangeNode>   nodes;
+	std::vector<BufferWriteRange> buffers; // One entry per written buffer resource.
+
+	[[nodiscard]] const BufferWriteRange* Find(uint32_t buffer) const {
+		for (const auto& entry: buffers) {
+			if (entry.buffer == buffer) {
+				return &entry;
+			}
+		}
+		return nullptr;
+	}
+	bool operator==(const WriteRangeProgram& other) const = default;
+};
+
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
 	ShaderType                    stage               = ShaderType::Unknown;
@@ -517,6 +593,7 @@ struct CompiledShaderInfo {
 	bool                          has_address_writes  = false;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
+	WriteRangeProgram             write_ranges;
 };
 
 struct UniformFillPlan {
@@ -670,6 +747,7 @@ struct Program: ResourcePlan {
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
+	WriteRangeProgram             write_ranges;
 
 };
 

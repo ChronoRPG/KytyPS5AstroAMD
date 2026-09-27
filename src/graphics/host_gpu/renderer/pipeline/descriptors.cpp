@@ -29,6 +29,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/WriteRangeAnalysis.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
@@ -40,6 +41,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <span>
+#include <string>
 #include <vector>
 #include <xxhash.h>
 
@@ -130,10 +132,40 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+// KYTY_PRECISE_WRITE_RANGES=0 treats every writable storage binding as written in full (the
+// behaviour before write-range proofs).
+static bool PreciseWriteRangesEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PRECISE_WRITE_RANGES");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// KYTY_WRITE_RANGE_LOG=N logs the first N writable storage bindings: shader, guest range, the
+// proven written spans (or why the binding stays whole) and the evaluated address intervals.
+static uint32_t WriteRangeLogLimit() {
+	static const uint32_t limit = [] {
+		const auto* value = std::getenv("KYTY_WRITE_RANGE_LOG");
+		return value == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
+	return limit;
+}
+
+// KYTY_WRITE_RANGE_STATS=0 skips the image lookup behind FrameEvent.WriteRangeImagesSpared.
+static bool WriteRangeImageStatsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_WRITE_RANGE_STATS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
-                    uint32_t slot, uint32_t& buffer_offset) {
+                    uint32_t slot, uint32_t& buffer_offset,
+                    const std::vector<GuestRange>* written_ranges) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -145,8 +177,13 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
-	                                                              resource.formatted, id);
+	// A proven write range narrows what becomes GPU-owned and which images go stale; everything
+	// else about the binding (synchronization, descriptor range) is unchanged.
+	const bool narrowed = resource.written && written_ranges != nullptr;
+	auto [buffer, offset] =
+	    narrowed ? context.GetBufferCache().ObtainWrittenBuffer(address, size, *written_ranges, id)
+	             : context.GetBufferCache().ObtainBuffer(address, size, resource.written,
+	                                                     resource.formatted, id);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -155,7 +192,11 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
-	if (resource.written) {
+	if (narrowed) {
+		for (const auto& range: *written_ranges) {
+			context.GetTextureCache().InvalidateMemoryFromGPU(range.address, range.size);
+		}
+	} else if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
 	const char* access = "Read";
@@ -927,6 +968,125 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	}
 }
 
+namespace {
+
+struct WriteRangeScratch {
+	ShaderRecompiler::IR::WriteRangeEvaluator         evaluator;
+	std::vector<ShaderRecompiler::IR::WriteRangeSpan> spans;
+	std::vector<GuestRange>                           ranges;
+};
+
+WriteRangeScratch& ThreadWriteRangeScratch() {
+	thread_local WriteRangeScratch scratch;
+	return scratch;
+}
+
+// The descriptor's stride/swizzle/ADD_TID bits normalized exactly as the resource
+// specialization that selected the compiled program (BuildResourceSpecialization).
+uint32_t SpecializedPackedStride(const ShaderBufferResource& descriptor) {
+	auto       packed  = descriptor.PackedStride();
+	const auto stride  = packed & 0x3fffu;
+	const bool swizzle = stride != 0u && ((packed >> 14u) & 1u) != 0u;
+	if (stride == 0u) {
+		packed &= ~((1u << 14u) | (3u << 16u));
+	} else if (!swizzle) {
+		packed &= ~(3u << 16u);
+	}
+	return packed;
+}
+
+} // namespace
+
+// Guest ranges the shader can write through writable buffer `index`, or nullptr when the whole
+// binding must be treated as written (no proof, proof covers everything, or disabled).
+static const std::vector<GuestRange>* ResolveWrittenRanges(RenderContext&            context,
+                                                           const ShaderStageRuntime& runtime,
+                                                           const PreparedBindings&   prepared,
+                                                           uint32_t index, bool& evaluated,
+                                                           WriteRangeScratch& scratch) {
+	const auto& program  = *runtime.program;
+	const auto& snapshot = *runtime.resources;
+	const auto& resource = program.info.buffers[index];
+	const auto& source   = prepared.buffer_sources[index];
+	if (!resource.written || source.address == 0 || source.size == 0) {
+		return nullptr;
+	}
+	const auto* entry  = program.write_ranges.Find(index);
+	bool        proven = false;
+	const char* result = "unprovable";
+	if (!PreciseWriteRangesEnabled()) {
+		result = "disabled";
+	} else if (entry == nullptr || !entry->bounded) {
+		result = "unprovable";
+	} else if (index >= snapshot.buffers.size() ||
+	           SpecializedPackedStride(DecodeNativeDescriptor<ShaderBufferResource>(
+	               snapshot.buffers[index])) != entry->packed_stride) {
+		result = "stride-mismatch";
+	} else {
+		if (!evaluated) {
+			const ShaderRecompiler::IR::WriteRangeInputs inputs {
+			    .user_data     = snapshot.user_data,
+			    .flattened_srt = snapshot.flattened_srt,
+			    .groups        = prepared.dispatch_groups,
+			    .has_groups    = prepared.has_dispatch_groups,
+			};
+			scratch.evaluator.Evaluate(program.write_ranges, inputs);
+			evaluated = true;
+		}
+		proven = scratch.evaluator.Spans(program.write_ranges, index, source.size, scratch.spans);
+		result = proven ? "narrowed" : "unbounded";
+	}
+	uint64_t written_bytes = source.size;
+	scratch.ranges.clear();
+	if (proven) {
+		written_bytes = 0;
+		for (const auto& span: scratch.spans) {
+			scratch.ranges.push_back({source.address + span.begin, span.end - span.begin});
+			written_bytes += span.end - span.begin;
+		}
+	}
+	const bool narrowed = proven && written_bytes < source.size;
+	if (proven && !narrowed) {
+		result = "covers-binding";
+	}
+	uint32_t spared = 0;
+	if (narrowed) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::WriteRangeNarrowed);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::WriteRangeBytesAvoided,
+		                          source.size - written_bytes);
+		if (WriteRangeImageStatsEnabled()) {
+			spared = context.GetTextureCache().CountImagesOutsideGpuWrite(source.address,
+			                                                              source.size, scratch.ranges);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::WriteRangeImagesSpared, spared);
+		}
+	} else {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::WriteRangeWhole);
+	}
+
+	if (const auto limit = WriteRangeLogLimit(); limit != 0u) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < limit) {
+			std::string spans;
+			for (const auto& range: scratch.ranges) {
+				spans += fmt::format(" 0x{:x}+0x{:x}", range.address, range.size);
+			}
+			const auto detail =
+			    entry != nullptr && evaluated
+			        ? scratch.evaluator.Describe(program.write_ranges, index)
+			        : std::string(entry == nullptr ? "no-proof" : entry->bounded ? "" : "unprovable");
+			LOGF("WriteRange: stage=%s shader=0x%016" PRIx64 " slot=%u guest=0x%016" PRIx64
+			     " size=0x%" PRIx64 " read=%d atomic=%d groups=%s%ux%ux%u result=%s written=0x%" PRIx64
+			     " images_spared=%u spans:%s detail: %s\n",
+			     ShaderStageResourceName(program.stage), program.shader_hash, index, source.address,
+			     source.size, resource.read ? 1 : 0, resource.atomic ? 1 : 0,
+			     prepared.has_dispatch_groups ? "" : "unknown:", prepared.dispatch_groups[0],
+			     prepared.dispatch_groups[1], prepared.dispatch_groups[2], result, written_bytes,
+			     spared, spans.c_str(), detail.c_str());
+		}
+	}
+	return narrowed ? &scratch.ranges : nullptr;
+}
+
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -945,11 +1105,15 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
+	auto& write_scratch = ThreadWriteRangeScratch();
+	bool  write_ranges_evaluated = false;
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		uint32_t buffer_offset = 0;
+		uint32_t   buffer_offset = 0;
+		const auto* written      = ResolveWrittenRanges(m_context, *prepared.runtime, prepared, i,
+		                                                write_ranges_evaluated, write_scratch);
 		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
 		                                               program.info.buffers[i], program.stage, i,
-		                                               buffer_offset));
+		                                               buffer_offset, written));
 		pack_memory_offset(i, buffer_offset);
 	}
 	// GET_LOD_STATS counter per image, 16 bits: MipStatsCntId (T# dword 6 bits 0..7) in bits 0..7,

@@ -144,6 +144,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .has_address_writes = has_address_writes,
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
+	    .write_ranges    = std::move(write_ranges),
 	};
 	for (const auto& output: result.info.outputs) {
 		if (output.kind == StageOutputKind::Parameter && output.index < 32) {

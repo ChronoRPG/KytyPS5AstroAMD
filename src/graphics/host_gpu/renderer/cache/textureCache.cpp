@@ -2479,6 +2479,26 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	}
 }
 
+uint32_t TextureCache::CountImagesOutsideGpuWrite(uint64_t address, uint64_t size,
+                                                  std::span<const GuestRange> written) {
+	if (!GuestRange {address, size}.Valid()) {
+		return 0;
+	}
+	std::scoped_lock lock {m_lock};
+	uint32_t         count = 0;
+	for (const auto id: FindImagesInRegion(address, size, true)) {
+		const auto& image = m_slot_images[id];
+		if (!image.Overlaps(address, size)) {
+			continue;
+		}
+		const bool hit = std::any_of(written.begin(), written.end(), [&](const GuestRange& range) {
+			return image.Overlaps(range.address, range.size);
+		});
+		count += hit ? 0u : 1u;
+	}
+	return count;
+}
+
 void TextureCache::InvalidateCleanImageProofs() {
 	// Every image register/unregister and GPU-modified transition passes here, before the
 	// change is made under m_lock. Global clean-read verdicts depend on the same state.
