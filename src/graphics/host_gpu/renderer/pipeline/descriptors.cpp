@@ -882,21 +882,34 @@ vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledSh
 	if (!SamplerMemoEnabled()) {
 		return m_context.GetSamplerCache().GetSampler(descriptor);
 	}
-	// Keyed on exactly the SamplerCache key (the four final dwords).
+	// Keyed on exactly the SamplerCache key (the four final dwords). SamplerMemoWays entries per
+	// set, most recently used first: the desert stamps bind eight samplers per draw, two of which
+	// shared a direct-mapped slot and missed on every draw (1,815 misses per flip).
 	static_assert(sizeof(descriptor.fields) == sizeof(SamplerMemoEntry::fields));
 	const auto slot = (descriptor.fields[0] * 0x9e3779b1u ^ descriptor.fields[1] * 0x85ebca6bu ^
 	                   descriptor.fields[2] * 0xc2b2ae35u ^ descriptor.fields[3]) >>
 	                  26u;
-	auto& entry = m_sampler_memo[slot % m_sampler_memo.size()];
-	if (entry.sampler != nullptr &&
-	    std::memcmp(entry.fields.data(), descriptor.fields, sizeof(descriptor.fields)) == 0) {
-		Profiler::CountFrameEvent(Profiler::FrameEvent::SamplerMemoHits);
-		return entry.sampler;
+	constexpr uint32_t sets = static_cast<uint32_t>(std::tuple_size_v<decltype(m_sampler_memo)>) /
+	                          SamplerMemoWays;
+	auto* const set = m_sampler_memo.data() + (slot % sets) * SamplerMemoWays;
+	for (uint32_t way = 0; way < SamplerMemoWays; way++) {
+		auto& entry = set[way];
+		if (entry.sampler != nullptr &&
+		    std::memcmp(entry.fields.data(), descriptor.fields, sizeof(descriptor.fields)) == 0) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::SamplerMemoHits);
+			const auto sampler = entry.sampler;
+			if (way != 0) {
+				std::rotate(set, set + way, set + way + 1);
+			}
+			return sampler;
+		}
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::SamplerMemoMisses);
 	const auto sampler = m_context.GetSamplerCache().GetSampler(descriptor);
-	std::memcpy(entry.fields.data(), descriptor.fields, sizeof(descriptor.fields));
-	entry.sampler = sampler;
+	// The least recently used way makes room at the front.
+	std::rotate(set, set + SamplerMemoWays - 1, set + SamplerMemoWays);
+	std::memcpy(set[0].fields.data(), descriptor.fields, sizeof(descriptor.fields));
+	set[0].sampler = sampler;
 	return sampler;
 }
 
@@ -921,9 +934,18 @@ static bool UploadDedupEnabled() {
 }
 
 vk::DescriptorBufferInfo RenderExecutor::UploadShaderData(std::span<const uint32_t> data,
-                                                          uint32_t                  site) {
+                                                          uint32_t site, bool* fresh) {
 	// These shader tables are read-only and ring allocations live until their GPU
 	// tick retires. A wrap that reuses them must submit/wait and advance that tick.
+	if (fresh != nullptr) {
+		*fresh = true;
+	}
+	const auto reused = [fresh](const vk::DescriptorBufferInfo& allocation) {
+		if (fresh != nullptr) {
+			*fresh = false;
+		}
+		return allocation;
+	};
 	if (UploadDedupEnabled()) {
 		// Identical bytes uploaded earlier in the same tick (the same command buffer) reuse that
 		// allocation: the ring never overwrites a range during the tick that allocated it (a wrap
@@ -943,7 +965,7 @@ vk::DescriptorBufferInfo RenderExecutor::UploadShaderData(std::span<const uint32
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadReuseHits);
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadBytesAvoided,
 			                          data.size_bytes());
-			return last.allocation;
+			return reused(last.allocation);
 		}
 		const auto hash = XXH3_64bits(data.data(), data.size_bytes());
 		const auto slot = static_cast<uint32_t>(hash % m_upload_dedup.size());
@@ -954,7 +976,7 @@ vk::DescriptorBufferInfo RenderExecutor::UploadShaderData(std::span<const uint32
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadReuseHits);
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadBytesAvoided,
 			                          data.size_bytes());
-			return entry.allocation;
+			return reused(entry.allocation);
 		}
 		const auto allocation = NativeUpload(m_context, data);
 		entry.words.assign(data.begin(), data.end());
@@ -977,7 +999,7 @@ vk::DescriptorBufferInfo RenderExecutor::UploadShaderData(std::span<const uint32
 	    std::ranges::equal(data, cached.words)) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadReuseHits);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadBytesAvoided, data.size_bytes());
-		return cached.allocation;
+		return reused(cached.allocation);
 	}
 	const auto allocation = NativeUpload(m_context, data);
 	cached.words.assign(data.begin(), data.end());
@@ -1268,13 +1290,18 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 	// Upload sites: stage type and table kind (the dedup checks the site's last entry first).
 	const auto site = static_cast<uint32_t>(program.stage) * 2u;
+	prepared.fresh_upload = false;
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
-		prepared.flattened_srt = UploadShaderData(snapshot.flattened_srt, site);
+		bool fresh             = false;
+		prepared.flattened_srt = UploadShaderData(snapshot.flattened_srt, site, &fresh);
+		prepared.fresh_upload |= fresh;
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
-		prepared.shader_data_buffer = UploadShaderData(prepared.shader_data, site + 1u);
+		bool fresh                  = false;
+		prepared.shader_data_buffer = UploadShaderData(prepared.shader_data, site + 1u, &fresh);
+		prepared.fresh_upload |= fresh;
 	}
 }
 
@@ -1638,21 +1665,61 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data());
 			CountDescriptorPushMiss(result, m_descriptor_writes);
 		} else {
-			CommitDescriptorSet(buffer, pipeline_bind_point, pipeline);
+			const bool fresh = std::ranges::any_of(
+			    prepared_bindings, [](const auto* prepared) { return prepared->fresh_upload; });
+			CommitDescriptorSet(buffer, pipeline_bind_point, pipeline, fresh);
 		}
 	}
 }
 
+// KYTY_SET_REUSE_FRESH (default on; 0 off; verify): a descriptor set whose writes refer to a
+// shader-data or flattened-SRT range UploadShaderData allocated for this command skips the reuse
+// lookup and is not remembered. The reuse cache holds sets written during the current tick only,
+// and the stream ring never hands out a range twice during one tick (a wrap first submits and
+// completes the tick), so no remembered set refers to that range: the lookup cannot hit. Only a
+// later command whose upload the dedup resolves to this same range could have reused the set;
+// such commands carry byte-identical tables, which the desert stamps (a new SRT and user data per
+// draw, 933 sets written per flip) and U52's captures (no reuse hit in any scene) never showed.
+// verify: the lookup still runs and a hit is reported (it would contradict the argument above).
+static int SetReuseFreshMode() {
+	static const int mode = [] {
+		const auto* value = std::getenv("KYTY_SET_REUSE_FRESH");
+		if (value == nullptr || value[0] == '\0') {
+			return 1;
+		}
+		if (std::strcmp(value, "0") == 0) {
+			return 0;
+		}
+		return std::strcmp(value, "verify") == 0 || std::strcmp(value, "exit") == 0
+		           ? (std::strcmp(value, "exit") == 0 ? 3 : 2)
+		           : 1;
+	}();
+	return mode;
+}
+
 void RenderExecutor::CommitDescriptorSet(CommandBuffer& buffer, vk::PipelineBindPoint point,
-                                         const PipelineCache::Pipeline& pipeline) {
-	const auto        layout = pipeline.descriptor_set_layout;
-	const bool        reuse  = DescriptorSetReuseEnabled();
-	const auto        tick   = m_context.GetCommandScheduler().CurrentTick();
-	uint64_t          hash   = 0;
-	vk::DescriptorSet set    = nullptr;
-	if (reuse) {
+                                         const PipelineCache::Pipeline& pipeline, bool fresh) {
+	const auto        layout     = pipeline.descriptor_set_layout;
+	const bool        reuse      = DescriptorSetReuseEnabled();
+	const auto        fresh_mode = fresh && reuse ? SetReuseFreshMode() : 0;
+	const bool        lookup     = reuse && fresh_mode != 1;
+	const auto        tick       = m_context.GetCommandScheduler().CurrentTick();
+	uint64_t          hash       = 0;
+	vk::DescriptorSet set        = nullptr;
+	if (fresh_mode == 1) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorSetReuseSkippedFresh);
+	}
+	if (lookup) {
 		hash = DescriptorSetReuse::Hash(layout, m_descriptor_writes);
 		set  = m_descriptor_set_reuse.Find(tick, layout, m_descriptor_writes, hash);
+		if (set != nullptr && fresh_mode >= 2) {
+			m_set_reuse_fresh_mismatches++;
+			std::fprintf(stderr, "SetReuseFreshVerify: a set referring to a fresh upload was "
+			                     "found in the reuse cache\n");
+			if (fresh_mode == 3) {
+				EXIT("SetReuseFreshVerify: a set referring to a fresh upload was reused\n");
+			}
+		}
 	}
 	if (set != nullptr) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorSetsReused);
@@ -1665,7 +1732,7 @@ void RenderExecutor::CommitDescriptorSet(CommandBuffer& buffer, vk::PipelineBind
 		    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
 		    nullptr);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorSetsWritten);
-		if (reuse) {
+		if (lookup) {
 			m_descriptor_set_reuse.Insert(tick, layout, m_descriptor_writes, hash, set);
 		}
 	}

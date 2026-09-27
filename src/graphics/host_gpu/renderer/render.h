@@ -45,6 +45,10 @@ struct PreparedDraw;
 class Engine;
 } // namespace DrawPrep
 
+namespace MeshIndirect {
+class Converter;
+} // namespace MeshIndirect
+
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
 	DrawIndex,
@@ -527,11 +531,14 @@ private:
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
 	// `site` names the caller's stage and table kind; it only selects the entry checked first.
+	// *fresh (optional): set when the returned range was allocated by this call (no earlier upload
+	// of the current recording had these bytes), i.e. no descriptor written before refers to it.
 	[[nodiscard]] vk::DescriptorBufferInfo UploadShaderData(std::span<const uint32_t> data,
-	                                                        uint32_t                  site);
+	                                                        uint32_t site, bool* fresh = nullptr);
 	// Descriptor set for a layout beyond maxPushDescriptors: reused or written, then bound.
+	// fresh: the writes refer to an upload made for this command (KYTY_SET_REUSE_FRESH).
 	void CommitDescriptorSet(CommandBuffer& buffer, vk::PipelineBindPoint point,
-	                         const PipelineCache::Pipeline& pipeline);
+	                         const PipelineCache::Pipeline& pipeline, bool fresh);
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
@@ -564,6 +571,8 @@ private:
 	std::array<uint32_t, 32>           m_upload_last_slot {};
 	// KYTY_DESCRIPTOR_SET_REUSE: sets written earlier in the current command buffer.
 	DescriptorSetReuse m_descriptor_set_reuse;
+	// KYTY_SET_REUSE_FRESH=verify: reuse hits of sets that refer to a fresh upload (must stay 0).
+	uint64_t m_set_reuse_fresh_mismatches = 0;
 	// Rendering instance begun right after the last indirect-argument barrier. Buffer writes
 	// are recorded outside rendering, or end it (shader-write barrier), so while this instance
 	// stays active the barrier still covers every argument write.
@@ -608,12 +617,14 @@ private:
 	// KYTY_TEXTURE_BINDING_MEMO: (T# dwords, resource) -> resolved image, description and view.
 	TextureBindingMemo m_texture_memo;
 	// KYTY_SAMPLER_MEMO: final sampler dwords -> native sampler. The sampler cache never evicts,
-	// so a remembered handle stays the one GetSampler returns for those dwords.
+	// so a remembered handle stays the one GetSampler returns for those dwords. 64 sets of
+	// SamplerMemoWays entries, most recently used first (NativeSampler).
 	struct SamplerMemoEntry {
 		std::array<uint32_t, 4> fields {};
 		vk::Sampler             sampler = nullptr;
 	};
-	std::array<SamplerMemoEntry, 64> m_sampler_memo {};
+	static constexpr uint32_t SamplerMemoWays = 4;
+	std::array<SamplerMemoEntry, 64 * SamplerMemoWays> m_sampler_memo {};
 	// KYTY_TARGET_DESC_MEMO: target descriptions are pure functions of the target registers
 	// (and constant device format support). Keyed on the exact register bytes; FindImage and
 	// everything after it still run for every draw.
@@ -638,6 +649,8 @@ private:
 	// Draw-prep (drawPrep.h): the preparation of the draw the engine is committing, taken by
 	// RefreshShaders in place of GetGraphicsPrograms when its certificate holds. Null otherwise.
 	DrawPrep::PreparedDraw* m_prepared_draw = nullptr;
+	// KYTY_NATIVE_INDIRECT_MESH (meshIndirect.h): created by the first native indirect mesh draw.
+	std::unique_ptr<MeshIndirect::Converter> m_mesh_indirect;
 
 	friend class CommandProcessor;
 	friend class DrawPrep::Engine;

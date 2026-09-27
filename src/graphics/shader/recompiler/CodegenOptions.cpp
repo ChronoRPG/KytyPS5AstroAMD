@@ -29,6 +29,13 @@ CodegenOptions FromEnvironment() {
 	options.sample_lod_clamp = EnvFlag("KYTY_SAMPLE_LOD_CLAMP", options.sample_lod_clamp);
 	options.host_ftz_inputs  = EnvFlag("KYTY_HOST_FTZ_INPUTS", options.host_ftz_inputs);
 	options.exec_selects     = EnvFlag("KYTY_EXEC_SELECTS", options.exec_selects);
+	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit (renderer/meshIndirect.h: GPU-converted indirect
+	// mesh draws); unset, 0 and "empty" keep the pushed-dword-only mesh draw parameters.
+	if (const auto* mode = std::getenv("KYTY_NATIVE_INDIRECT_MESH"); mode != nullptr) {
+		options.mesh_indirect_params =
+		    std::strcmp(mode, "1") == 0 || std::strcmp(mode, "on") == 0 ||
+		    std::strcmp(mode, "verify") == 0 || std::strcmp(mode, "exit") == 0;
+	}
 	if (const auto* mode = std::getenv("KYTY_MAD_MODE"); mode != nullptr) {
 		if (std::strcmp(mode, "exact") == 0) {
 			options.mad_mode = MadMode::Exact;

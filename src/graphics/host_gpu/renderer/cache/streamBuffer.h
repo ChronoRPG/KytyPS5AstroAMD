@@ -103,8 +103,11 @@ private:
 
 class StreamBuffer final: public Buffer {
 public:
+	// extra_flags: usage beyond AllFlags (e.g. eShaderDeviceAddress for a ring whose ranges
+	// shaders reach by device address).
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	             uint64_t size, bool transfer_shared = false);
+	             uint64_t size, bool transfer_shared = false,
+	             vk::BufferUsageFlags extra_flags = {});
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);

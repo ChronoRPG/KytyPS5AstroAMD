@@ -8,6 +8,13 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
+bool UsesPhysicalAddresses(const EmitterState& state) {
+	// Guest address accesses (DMA), or a mesh program that may read its draw dwords from a native
+	// indirect draw's parameter block (CodegenOptions::mesh_indirect_params).
+	return state.program.info.uses_dma ||
+	       (state.program.stage == ShaderType::Mesh && GetCodegenOptions().mesh_indirect_params);
+}
+
 uint32_t TypeVoid(EmitterState& state) {
 	return state.builder.Type(spv::OpTypeVoid);
 }
@@ -707,7 +714,7 @@ void DefineModule(EmitterState& state) {
 
 	state.builder.RequireCapability(spv::CapabilityShader);
 	state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
-	if (state.program.info.uses_dma) {
+	if (UsesPhysicalAddresses(state)) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -761,7 +768,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel(state.program.info.uses_dma
+	state.builder.AddMemoryModel(UsesPhysicalAddresses(state)
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);

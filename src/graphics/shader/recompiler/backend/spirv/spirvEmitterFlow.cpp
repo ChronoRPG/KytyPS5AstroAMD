@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include "common/logging/log.h"
 
@@ -644,17 +645,48 @@ uint32_t EmitLaneId(EmitterState& state) {
 
 uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state  = ctx.state;
-	const auto result = state.builder.AllocateId();
 	const auto index  = inst.Arg(0).U32();
 	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
-	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
-	                          state.push_constant_variable, ConstantU32(state, 0),
-	                          ConstantU32(state, index));
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer);
-	return result;
+	const auto push_dword = [&](uint32_t dword) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
+		                          state.push_constant_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, dword));
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	const auto pushed = push_dword(index);
+	// KYTY_NATIVE_INDIRECT_MESH (renderer/meshIndirect.h): a native indirect mesh draw pushes
+	// MeshIndirectSentinel as dword 3 (the index size, never that value on the CPU path) and the
+	// device address of its parameter block, written on the GPU from the guest's argument record,
+	// as dwords 0-1. The branch is uniform (push constants). With the option the module declares
+	// 64-bit integers and physical addresses for every mesh program (UsesPhysicalAddresses).
+	if (!GetCodegenOptions().mesh_indirect_params || !UsesPhysicalAddresses(state)) {
+		return pushed;
+	}
+	const auto indirect = Binary(state, spv::OpIEqual, TypeBool(state), push_dword(3),
+	                             ConstantU32(state, IR::PushData::MeshIndirectSentinel));
+	return EmitValueOrDefaultIfCondition(state, indirect, TypeU32(state), pushed, [&]() {
+		const auto u64 = TypeScalarU64(state);
+		const auto low = Unary(state, spv::OpUConvert, u64, push_dword(0));
+		const auto high =
+		    Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, push_dword(1)),
+		           state.builder.Constant(spv::OpConstant, u64, 32u, 0u));
+		const auto address =
+		    Binary(state, spv::OpIAdd, u64, Binary(state, spv::OpBitwiseOr, u64, low, high),
+		           state.builder.Constant(spv::OpConstant, u64, index * 4u, 0u));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                          address);
+		const auto         value     = state.builder.AllocateId();
+		constexpr uint32_t alignment = sizeof(uint32_t);
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+		                          spv::MemoryAccessAlignedMask, alignment);
+		return value;
+	});
 }
 
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {

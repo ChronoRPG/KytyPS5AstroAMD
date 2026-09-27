@@ -63,6 +63,11 @@ struct CodegenOptions {
 	// KYTY_EXEC_SELECTS=0: keep every EXEC-masked VGPR merge Select(exec, new, old) instead of
 	// replacing the ones whose old value no lane can observe (IR::EliminateExecSelects).
 	bool exec_selects = true;
+	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit: mesh draw dword 3 equal to
+	// IR::PushData::MeshIndirectSentinel makes mesh shaders read their six draw dwords from the
+	// parameter block at the device address in dwords 0-1 (a GPU-converted indirect mesh draw,
+	// renderer/meshIndirect.h). Unset, 0 or "empty": the dwords are only ever pushed.
+	bool mesh_indirect_params = false;
 };
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();

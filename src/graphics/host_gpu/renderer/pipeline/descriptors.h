@@ -58,6 +58,9 @@ struct PreparedBindings {
 	// verify canary instead of the counters (KYTY_LOD_STATS_PLAIN_VARIANT=verify, draw path).
 	bool                                  mip_stats_active = false;
 	bool                                  mip_stats_canary = false;
+	// RebindBuffers: flattened_srt or shader_data_buffer was allocated for this binding (not a
+	// reused upload of the same recording), so no earlier descriptor set refers to it.
+	bool                                  fresh_upload = false;
 };
 
 [[nodiscard]] vk::DescriptorType
