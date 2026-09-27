@@ -5,6 +5,7 @@
 #include "common/rendererBatch.h"
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/parkingLock.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <algorithm>
@@ -31,6 +32,8 @@
 
 namespace Libs::Graphics {
 
+// Waiters spin, then park (ParkingSpinLock, KYTY_TRACKER_LOCK_PARK); with parking off they spin
+// as before: reading only with pause under KYTY_RENDERER_BATCH, else retrying back to back.
 class TrackingSpinLock final {
 public:
 	void lock() noexcept {
@@ -38,32 +41,12 @@ public:
 		if (m_owner.load(std::memory_order_relaxed) == thread) {
 			EXIT("recursive region tracking lock\n");
 		}
-		bool contended = false;
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
-			if (!contended) {
-				contended = true;
-				MemoryStats::Count(MemoryStats::Counter::TrackerLockContended);
-			}
+		if (!m_lock.try_lock()) [[unlikely]] {
+			MemoryStats::Count(MemoryStats::Counter::TrackerLockContended);
 			if (m_owner.load(std::memory_order_relaxed) == thread) {
 				EXIT("recursive region tracking lock while contended\n");
 			}
-			if (Common::RendererBatchEnabled()) {
-				// Wait using shared reads instead of continuously taking exclusive
-				// ownership of the cache line from its current owner.
-				while (m_lock.test(std::memory_order_relaxed)) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-					YieldProcessor();
-#elif defined(__x86_64__) || defined(__i386__)
-					__builtin_ia32_pause();
-#elif defined(__aarch64__)
-					__asm__ volatile("yield");
-#else
-					std::atomic_signal_fence(std::memory_order_seq_cst);
-#endif
-				}
-			} else {
-				std::atomic_signal_fence(std::memory_order_seq_cst);
-			}
+			(void)m_lock.LockContended(Common::RendererBatchEnabled());
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
@@ -72,7 +55,7 @@ public:
 			EXIT("region tracking lock released by non-owner\n");
 		}
 		m_owner.store(0, std::memory_order_relaxed);
-		m_lock.clear(std::memory_order_release);
+		m_lock.unlock();
 	}
 
 private:
@@ -90,7 +73,7 @@ private:
 #endif
 	}
 
-	std::atomic_flag     m_lock = ATOMIC_FLAG_INIT;
+	ParkingSpinLock      m_lock;
 	std::atomic_uint32_t m_owner {0};
 };
 
