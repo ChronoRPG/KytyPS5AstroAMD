@@ -13651,17 +13651,56 @@ public:
     auto *dma = BufferCacheTestAccess::Dma(cache);
     Require(name, "enabled", dma != nullptr, "the buffer cache has no upload DMA");
     const auto staged_before = dma->Staged();
+    const auto host_before = dma->HostCopyBytesQueued();
     const auto [buffer, buffer_offset] = cache.ObtainBuffer(base, upload_size, false, false);
     Require(name, "allocation", buffer != nullptr, "buffer allocation failed");
     Require(name, "staged through the copy engine", dma->Staged() > staged_before,
             "a 2 MiB CPU-dirty upload did not use the transfer queue");
+    const bool host_copy = UploadDmaHostCopyEnabled();
+    Require(name, "guest bytes left to the DMA worker",
+            (dma->HostCopyBytesQueued() - host_before >= upload_size) == host_copy,
+            host_copy ? "the command processor copied the staged guest bytes itself"
+                      : "KYTY_UPLOAD_DMA_HOST_COPY=0 still left guest bytes to the DMA worker");
     const auto words = read_back(buffer->Handle(), buffer_offset, upload_size);
+    Require(name, "host copies done", dma->HostCopyBytesDone() == dma->HostCopyBytesQueued(),
+            "a submission reading staged bytes ran before the DMA worker copied them");
     for (uint64_t i = 0; i < words.size(); i++) {
       if (words[i] != memory[i]) {
         std::fprintf(stderr, "word %llu: 0x%08x, expected 0x%08x\n",
                      static_cast<unsigned long long>(i), words[i], memory[i]);
         Require(name, "contents", false, "the DMA-staged upload changed the buffer contents");
       }
+    }
+
+    // KYTY_UPLOAD_DMA_HOST_COPY: the worker reads the guest bytes through the backing alias, so a
+    // page the tracker makes inaccessible after the upload (here a writable binding, which makes
+    // the range GPU-owned) is still copied. The worker is held until then.
+    if (host_copy) {
+      std::vector<uint32_t> expected(upload_size / sizeof(uint32_t));
+      for (uint64_t i = 0; i < expected.size(); i++) {
+        expected[i] = static_cast<uint32_t>(i * 0x9e3779b9u + 0x1234u);
+      }
+      // A guest write: the pages turn CPU-dirty, then take the new bytes.
+      Require(name, "guest write", context.InvalidateMemory(base, upload_size),
+              "the re-dirtied range is not mapped");
+      Libs::LibKernel::Memory::WriteBacking(base, expected.data(), upload_size);
+      dma->HoldWorkerForTest(true);
+      const auto queued = dma->HostCopyBytesQueued();
+      const auto [again, again_offset] = cache.ObtainBuffer(base, upload_size, false, false);
+      const auto left = dma->HostCopyBytesQueued() - queued;
+      (void)cache.ObtainBuffer(base, upload_size, true, false);
+      const bool gpu_owned = Libs::LibKernel::Memory::GuestBackingAlias(base, 16) != nullptr &&
+                             cache.HasGpuDirtyBytes(base, upload_size);
+      dma->HoldWorkerForTest(false);
+      Require(name, "second upload left to the worker", left >= upload_size && gpu_owned,
+              "the re-dirtied range was not staged for the worker, or not made GPU-owned");
+      const auto second = read_back(again->Handle(), again_offset, upload_size);
+      Require(name, "copied through the backing alias",
+              second == expected && dma->HostCopyBytesDone() == dma->HostCopyBytesQueued(),
+              "the worker's copy of pages made inaccessible meanwhile differs from the guest "
+              "bytes");
+      // Return the range to the CPU before the unmap below.
+      cache.ReadMemory(base, upload_size, false);
     }
 
     // A private ring of 1 MiB. The cache's dependency slot is borrowed and restored.

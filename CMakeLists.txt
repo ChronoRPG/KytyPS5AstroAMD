@@ -814,6 +814,14 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	set_tests_properties(draw_sequence_verify PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_SEQUENCE_VERIFY=exit;KYTY_RENDER_STATE_VERIFY=exit")
+	# KYTY_UPLOAD_DMA_HOST_COPY: the DMA worker copies staged guest bytes (default) or the command
+	# processor does.
+	add_test(NAME upload_dma
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --upload-dma-only)
+	add_test(NAME upload_dma_host_copy_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --upload-dma-only)
+	set_tests_properties(upload_dma_host_copy_off PROPERTIES
+		ENVIRONMENT "KYTY_UPLOAD_DMA_HOST_COPY=0")
 	# KYTY_RENDER_STATE_FAST: default and off.
 	add_test(NAME render_state
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --render-state-only)

@@ -870,6 +870,10 @@ enum class FrameEvent : uint32_t {
 	DescriptorSetAuditCommits,
 	DescriptorSetAuditRepeats,
 	DescriptorSetAuditDigestSlotHits,
+	// KYTY_UPLOAD_DMA_HOST_COPY (uploadDma.h): staged upload copies whose guest bytes the DMA
+	// worker copied into the staging ring instead of the command processor, and those bytes.
+	UploadDmaHostCopies,
+	UploadDmaHostCopyBytes,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

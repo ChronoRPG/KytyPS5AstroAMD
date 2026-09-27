@@ -28,6 +28,7 @@ struct GraphicContext;
 class CommandScheduler;
 class TextureCache;
 class UploadDma;
+struct UploadHostCopy;
 
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
@@ -293,7 +294,10 @@ private:
 	// KYTY_UPLOAD_DMA: moves the host -> VRAM part of the queued upload copies from the staging
 	// ring to the copy engine (UploadDma) and returns the source the graphics copies then read
 	// (the DMA ring, with the copies' source offsets rebased); otherwise `source` unchanged.
-	[[nodiscard]] vk::Buffer StageUploadDma(vk::Buffer source, std::span<vk::BufferCopy> copies);
+	// `host_copies` (KYTY_UPLOAD_DMA_HOST_COPY: staging bytes UploadCopies left unwritten) go to
+	// the DMA worker with the copy, or are performed here when the copy is not staged.
+	[[nodiscard]] vk::Buffer StageUploadDma(vk::Buffer source, std::span<vk::BufferCopy> copies,
+	                                        std::vector<UploadHostCopy>* host_copies = nullptr);
 	// A verify-mode difference that only pages turned CPU-dirty since the lookup can cause: a race
 	// when the range's dirtying serials moved since `dirtied_before` (0: unknown, a race), a
 	// mismatch otherwise.
@@ -373,10 +377,13 @@ private:
 	[[nodiscard]] std::pair<Buffer*, uint64_t> VerifyBindingHit(const BindingMemo& memo,
 	                                                            std::pair<Buffer*, uint64_t> hit,
 	                                                            BufferId id);
+	// `deferred` (KYTY_UPLOAD_DMA_HOST_COPY): guest copies with a backing alias are listed there
+	// instead of copied, for StageUploadDma; the staging ring space is reserved either way.
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size, size_t guest_copies = SIZE_MAX,
 	                                      const uint8_t* host_data = nullptr,
-	                                      uint64_t       host_base = 0);
+	                                      uint64_t       host_base = 0,
+	                                      std::vector<UploadHostCopy>* deferred = nullptr);
 	// Hot pages (GPU thread). Snapshots each hot page of hot_ranges, appends a copy (reading
 	// m_hot_scratch from the first appended srcOffset on) for those that differ from their
 	// shadow, and lists pages to return to normal tracking: `demote` (still CPU-dirty) and

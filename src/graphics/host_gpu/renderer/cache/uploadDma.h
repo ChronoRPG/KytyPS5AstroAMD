@@ -47,6 +47,28 @@ class Buffer;
 // staged host bytes taken when the copy was queued (UploadDmaVerifyChecks / UploadDmaVerifyMismatches
 // and a log line). The copy ends the active rendering instance, so verify runs are for correctness.
 [[nodiscard]] bool UploadDmaVerify();
+// KYTY_UPLOAD_DMA_HOST_COPY (default on; =0: the command processor copies as before). A staged
+// read upload's guest bytes are copied into the host staging ring by the DMA worker, just before
+// it submits the transfer that reads them, instead of by the command processor. The worker reads
+// them through the direct-memory backing alias (LibKernel::Memory::GuestBackingAlias), which
+// never faults whatever protection the tracker or the guest gives the guest view meanwhile.
+// Order and data are those of the command-processor copy: the pages were made clean and
+// write-protected before the copy is queued (MemoryTracker::ForEachUploadRange), so a guest write
+// after that point faults and makes them CPU-dirty again for the next upload, whether the copy
+// reads the bytes before or after it (a write racing the draws, as with the command-processor
+// copy made right after the protection). The graphics copies that read the staged bytes run in a
+// submission that waits for the transfer (PendingValue), which the worker submits after the
+// host copies. Ranges without an alias (not direct memory, or spanning mappings) are copied by
+// the command processor as before.
+[[nodiscard]] bool UploadDmaHostCopyEnabled();
+
+// A copy of host bytes into a staging buffer's mapping that the DMA worker performs before it
+// submits the transfer reading them (KYTY_UPLOAD_DMA_HOST_COPY).
+struct UploadHostCopy {
+	uint8_t*       destination = nullptr;
+	const uint8_t* source      = nullptr;
+	uint64_t       size        = 0;
+};
 
 class UploadDma final: public SubmitDependency {
 public:
@@ -62,9 +84,19 @@ public:
 	// Recording thread only. Queues the copy of [source_offset, source_offset + size) of `source`
 	// (host bytes written before this call, in a buffer shared with the transfer family) into the
 	// ring and returns the ring offset of the copy, or nullopt (too small, or no ring space that
-	// the current recording's tick may use).
+	// the current recording's tick may use). `host_copies` (taken only when the copy is queued)
+	// write parts of that range first, on the worker; the rest must be written already.
 	[[nodiscard]] std::optional<uint64_t> Stage(vk::Buffer source, uint64_t source_offset,
-	                                            uint64_t size);
+	                                            uint64_t                     size,
+	                                            std::vector<UploadHostCopy>* host_copies = nullptr);
+	// Host-copy totals (tests): bytes queued by Stage and bytes the worker has copied.
+	[[nodiscard]] uint64_t HostCopyBytesQueued() const noexcept { return m_host_bytes_queued; }
+	[[nodiscard]] uint64_t HostCopyBytesDone() const noexcept {
+		return m_host_bytes_done.load(std::memory_order_acquire);
+	}
+	// Tests: while held, the worker leaves queued jobs (host copies and transfers) alone. A
+	// submission waiting for them would wait until the hold ends.
+	void HoldWorkerForTest(bool hold);
 	[[nodiscard]] vk::Buffer RingHandle() const noexcept;
 	[[nodiscard]] uint64_t   RingSize() const noexcept { return m_ring_size; }
 	// Copies queued so far (recording thread).
@@ -81,12 +113,13 @@ public:
 
 private:
 	struct Job {
-		vk::Buffer source        = nullptr;
-		uint64_t   source_offset = 0;
-		uint64_t   ring_offset   = 0;
-		uint64_t   size          = 0;
-		uint64_t   value         = 0;
-		uint64_t   reuse_tick    = 0; // newest completed tick whose ring bytes were released
+		vk::Buffer            source        = nullptr;
+		uint64_t              source_offset = 0;
+		uint64_t              ring_offset   = 0;
+		uint64_t              size          = 0;
+		uint64_t              value         = 0;
+		uint64_t              reuse_tick    = 0; // newest completed tick whose ring bytes were released
+		std::vector<UploadHostCopy> host_copies; // performed by the worker before the transfer
 	};
 	struct Span {
 		uint64_t begin = 0;
@@ -116,6 +149,7 @@ private:
 	// every job carries it (the master semaphore is monotonic and that tick has completed).
 	uint64_t                m_reuse_tick  = 0;
 	uint64_t                m_enqueued    = 0;
+	uint64_t                m_host_bytes_queued = 0;
 	uint64_t                m_known_value = 0; // semaphore value observed by PendingValue
 	// Newest value staged while recording m_stage_tick. Only the submission of that tick reads
 	// its ring bytes (the graphics copies are recorded before the tick's End at the latest), so
@@ -125,11 +159,13 @@ private:
 	// Worker.
 	std::vector<Batch>      m_batches;
 	size_t                  m_next_batch = 0;
+	std::atomic<uint64_t>   m_host_bytes_done {0};
 	// Shared.
 	std::mutex              m_mutex;
 	std::condition_variable m_available;
 	std::vector<Job>        m_jobs;
 	bool                    m_stopping = false;
+	bool                    m_hold     = false; // HoldWorkerForTest
 	std::jthread            m_worker; // last: joined before the members it uses go away
 };
 
