@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -90,6 +91,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <xxhash.h>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <cerrno>
@@ -9629,6 +9631,133 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "indirect argument allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Draw-prep (KYTY_DRAW_PREP_CODE_CERT, shader.cpp): a speculative preparation hashes a shader
+  // without an AGC header hash through its recorder. The hash equals the serial one, the code
+  // bytes become part of the certificate, the certificate rejects any later change of a code
+  // byte, and code that is not clean for a backing read fails the preparation instead.
+  void CheckDrawPrepCertifiedShaderHash() {
+    constexpr const char *name = "DrawPrepCertifiedShaderHash";
+    constexpr uintptr_t base = 0x0000000206000000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t code_offset = 0x2100;
+    std::vector<u32> code;
+    for (u32 i = 0; i < 700; i++) {
+      // Any headerless words (the first is not the AGC header marker 0xbeeb03ff): the code is
+      // hashed, never translated here. 2.8 KiB crosses a 4 KiB page boundary.
+      code.push_back(0xbe800000u | (i & 0xffu));
+    }
+    AppendEnd(&code);
+    const auto code_address = base + code_offset;
+    const auto code_bytes = code.size() * sizeof(u32);
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "code allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "code mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    std::memcpy(memory + code_offset, code.data(), code_bytes);
+    ShaderMapUserData(code_address,
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<uint32_t>(code_bytes)});
+
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, allocation_size);
+      HW::ComputeShaderInfo regs{};
+      regs.cs_regs.data_addr = code_address;
+      regs.cs_regs.num_thread_x = 64;
+      regs.cs_regs.num_thread_y = 1;
+      regs.cs_regs.num_thread_z = 1;
+      const HW::ShaderRegisters sh{};
+      const auto expected = XXH3_64bits(code.data(), code_bytes);
+
+      ShaderComputeInputInfo serial_info{};
+      const auto serial = PrepareProgram(regs, sh, serial_info);
+      Require(name, "serial hash", serial.hash == expected,
+              "the serial path did not hash the code bytes");
+
+      const auto prepare = [&](DrawPrep::ReadSet &reads) {
+        DrawPrep::Recorder recorder{&reads, true};
+        ShaderComputeInputInfo info{};
+        const DrawPrep::RecordScope scope(recorder);
+        return PrepareProgram(regs, sh, info);
+      };
+      DrawPrep::ReadSet reads;
+      const auto speculative = prepare(reads);
+      Require(name, "certified hash",
+              !reads.Failed() && speculative.hash == expected && reads.Finish(),
+              "the speculative preparation failed or hashed other bytes");
+      bool covered = false;
+      for (const auto &range : reads.Ranges()) {
+        covered |= range.begin <= code_address && range.end >= code_address + code_bytes;
+      }
+      Require(name, "certificate covers the code", covered,
+              "no certified range covers every code byte");
+      std::vector<uint8_t> scratch;
+      Require(name, "unchanged certificate",
+              reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
+                  DrawPrep::ValidateResult::Ok,
+              "the certificate rejected unchanged code");
+
+      // One changed code byte, in the second page of the code.
+      auto &changed = memory[code_offset + code_bytes - 8];
+      changed ^= 0x40u;
+      Require(name, "changed certificate",
+              reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
+                  DrawPrep::ValidateResult::Changed,
+              "the certificate accepted changed code");
+      changed ^= 0x40u;
+      Require(name, "restored certificate",
+              reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
+                  DrawPrep::ValidateResult::Ok,
+              "the certificate rejected code restored to the recorded bytes");
+
+      // GPU-owned code bytes are not clean for a backing read: the preparation fails (the
+      // serial path would read them back) and the old certificate no longer validates.
+      auto &cache = context.GetBufferCache();
+      BufferCacheTestAccess::AddGpuDirty(cache, code_address + 0x40, 4);
+      // As every product transition of GPU-dirty ranges does (cleanVerdictCache.h).
+      CleanVerdict::Invalidate(code_address + 0x40, 4, Coherence::Source::Test);
+      DrawPrep::ReadSet unclean;
+      (void)prepare(unclean);
+      Require(name, "unclean code",
+              unclean.Failure() == DrawPrep::ReadFailure::Unclean &&
+                  reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
+                      DrawPrep::ValidateResult::Unclean,
+              "GPU-owned code bytes were certified");
+      BufferCacheTestAccess::SubtractGpuDirty(cache, code_address + 0x40, 4);
+      CleanVerdict::Invalidate(code_address + 0x40, 4, Coherence::Source::Test);
+      context.UnmapMemory(base, allocation_size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "code mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "code allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -36225,6 +36354,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--draw-prep-code-cert-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDrawPrepCertifiedShaderHash();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
@@ -36404,6 +36538,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckTilerImageDirect();
   vulkan.CheckNativeIndirectDispatch();
+  vulkan.CheckDrawPrepCertifiedShaderHash();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckRenderExecutorColorDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();

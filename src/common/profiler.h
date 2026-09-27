@@ -621,6 +621,9 @@ enum class FrameEvent : uint32_t {
 	DepthFeedbackKeepMissInstance,
 	DepthFeedbackKeepMissSerial,
 	DepthFeedbackKeepMissState,
+	// Draw-prep preparations that hashed headerless shader code through their recorder, making
+	// the code part of the certificate (KYTY_DRAW_PREP_CODE_CERT, shader.cpp).
+	ShaderCodeHashCertified,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

@@ -46,7 +46,9 @@ enum class ValidateResult : uint8_t {
 class ReadSet {
 public:
 	static constexpr uint32_t MaxReads = 2048;
-	static constexpr uint32_t MaxBytes = 64u * 1024u;
+	// Room for the code of both stages (headerless shaders are hashed through the recorder, see
+	// shader.cpp) besides the metadata and resource reads.
+	static constexpr uint32_t MaxBytes = 256u * 1024u;
 	static constexpr uint64_t PageSize = 4096;
 
 	void Reset() noexcept {
