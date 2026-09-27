@@ -10796,12 +10796,13 @@ public:
     Require(name, "sampled view", sampled_view != nullptr, "no sampled depth view");
 
     // One draw: attach the depth target (writes or not), sample it, begin its instance.
-    const auto draw = [&](bool depth_write, bool sample) {
+    const auto draw = [&](bool depth_write, bool sample, bool load_clear = false) {
       RenderDepthInfo depth{};
       depth.desc = depth_desc;
       depth.image_id = depth_id;
       depth.depth_test_enable = true;
       depth.depth_write_enable = depth_write;
+      depth.depth_clear_enable = load_clear;
       depth.depth_compare_op = vk::CompareOp::eLessOrEqual;
       PreparedBindings binding{};
       binding.runtime = &sampled_runtime;
@@ -10847,6 +10848,24 @@ public:
                 after_write_again == after_write,
             "sampling after a depth write shared the writing instance, or read-only "
             "sampling after it split again");
+
+    // A load clear writes the attachment like a depth write does.
+    const auto clearing = draw(false, true, true);
+    const auto after_clear = draw(false, true);
+    const auto after_clear_again = draw(false, true);
+    Require(name, "a load clear orders later sampling",
+            clearing != after_write && after_clear != clearing &&
+                after_clear_again == after_clear,
+            "sampling after a load clear shared the clearing instance");
+
+    // Any other content change since the proof (what an upload, copy or clear records) makes
+    // the next sampling draw of the same instance order after it.
+    texture_cache.GetImage(depth_id).NoteContentWrite();
+    const auto after_content = draw(false, true);
+    const auto after_content_again = draw(false, true);
+    Require(name, "a content change orders later sampling",
+            after_content != after_clear && after_content_again == after_content,
+            "a sampling draw after a content change kept the unchanged-contents proof");
 
     // The keep is taken inside the active instance; ending that instance before the next one
     // begins must queue the left-out ordering for the image.
