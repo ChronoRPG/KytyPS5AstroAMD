@@ -41,6 +41,14 @@ bool IncrementalBdaSyncEnabled() {
 	return value != nullptr && value[0] == '1' && value[1] == '\0';
 }
 
+// KYTY_BDA_HOT_SYNC=0 restores the U42 behaviour: any hot page disables incremental BDA
+// synchronization (every pass scans every mapped buffer) and hot pages are snapshotted before
+// their shadow compare. Only meaningful with KYTY_BDA_INCREMENTAL_SYNC=1.
+bool BdaHotSyncEnabled() {
+	const auto* value = std::getenv("KYTY_BDA_HOT_SYNC");
+	return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+}
+
 // Guest read faults copy GPU-owned bytes on a side command buffer unless this is "0".
 bool SideReadbackEnabled() {
 	const auto* value = std::getenv("KYTY_READBACK_SIDE_COPY");
@@ -409,6 +417,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
       m_bda_incremental_sync(IncrementalBdaSyncEnabled()),
+      m_bda_hot_sync(m_bda_incremental_sync && BdaHotSyncEnabled()),
       m_memory_tracker(page_manager, m_bda_incremental_sync, BufferFaultPolicy()),
       m_hot_quiet_frames(HotPageQuietFrames()),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
@@ -549,13 +558,24 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 	for (const auto& range: hot_ranges) {
 		for (auto page = range.address; page < range.End(); page += TRACKER_PAGE_SIZE) {
 			visited++;
-			// Snapshot the (writable) page once: the compare, the shadow and the upload all use
-			// this copy, so the shadow always equals what the buffer receives.
+			auto       shadow    = m_hot_shadows.find(page);
+			const auto unchanged = [&](const void* contents) {
+				return shadow != m_hot_shadows.end() &&
+				       std::memcmp(shadow->second.data.get(), contents, TRACKER_PAGE_SIZE) == 0;
+			};
 			auto* snapshot = m_hot_scratch.data() + staged;
-			std::memcpy(snapshot, reinterpret_cast<const void*>(page), TRACKER_PAGE_SIZE);
-			auto shadow = m_hot_shadows.find(page);
-			if (shadow != m_hot_shadows.end() &&
-			    std::memcmp(shadow->second.data.get(), snapshot, TRACKER_PAGE_SIZE) == 0) {
+			// KYTY_BDA_HOT_SYNC: nearly every visit finds the page unchanged, so compare the live
+			// (hot, hence never GPU-dirty and readable) page first and snapshot only one that
+			// differs. A write racing either compare is seen by the next upload, whose shadow still
+			// holds the old contents, exactly as a write landing right after a snapshot.
+			bool same = m_bda_hot_sync && unchanged(reinterpret_cast<const void*>(page));
+			if (!same) {
+				// Snapshot the (writable) page once: the compare, the shadow and the upload all use
+				// this copy, so the shadow always equals what the buffer receives.
+				std::memcpy(snapshot, reinterpret_cast<const void*>(page), TRACKER_PAGE_SIZE);
+				same = unchanged(snapshot);
+			}
+			if (same) {
 				skipped++;
 				shadow->second.last_use = frame;
 				if (frame - shadow->second.last_change > m_hot_quiet_frames) {
@@ -1200,6 +1220,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	const auto collect = [&](uint64_t address, uint64_t bytes, bool hot) noexcept {
 		if (hot) {
 			hot_ranges.push_back({address, bytes});
+			if (stats != nullptr && stats->hot_ranges != nullptr) {
+				// A full BDA pass remembers where its hot pages are (KYTY_BDA_HOT_SYNC).
+				stats->hot_ranges->push_back({stats->buffer_id, address, bytes});
+			}
 			return;
 		}
 		copies.emplace_back(total_size, buffer.Offset(address), bytes);
@@ -1886,23 +1910,52 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 	const bool collect = Profiler::AggregateEnabled();
 	// Read these before scanning: a fault to an already scanned page must force the NEXT
 	// pass, even if its dirty transition completed before this pass finished uploading.
-	const auto cpu_epoch = m_bda_incremental_sync ? m_memory_tracker.CpuMutationEpoch() : 0;
+	// CpuMutationEpoch() is saturated while any hot page exists (hot pages are written without
+	// faults), which used to make every pass a full scan. KYTY_BDA_HOT_SYNC uses the fault epoch
+	// instead and, while it and the structure epoch hold, re-examines exactly the pages the fault
+	// epoch does not cover: the hot page runs the last full pass found in the scanned buffers.
+	// Every other page of those buffers was uploaded (clean and write-protected) by that pass and
+	// can only become CPU-dirty again through a transition that changes one of the epochs,
+	// including the write fault that promotes a page to hot and a hot page's demotion.
+	const auto cpu_epoch = !m_bda_incremental_sync ? 0
+	                       : m_bda_hot_sync        ? m_memory_tracker.FaultMutationEpoch()
+	                                               : m_memory_tracker.CpuMutationEpoch();
 	const auto structure_epoch =
 	    m_bda_incremental_sync ? m_bda_structure_epoch.load(std::memory_order_acquire) : 0;
 	if (m_bda_incremental_sync && cpu_epoch != UINT64_MAX && structure_epoch != UINT64_MAX &&
 	    cpu_epoch == m_bda_scanned_cpu_epoch && structure_epoch == m_bda_scanned_structure_epoch) {
-		if (collect) {
-			Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncSkips);
+		if (m_bda_hot_ranges.empty()) {
+			if (collect) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncSkips);
+			}
+			return;
 		}
-		return;
+		BdaSyncStats stats;
+		if (SynchronizeBdaHotRanges(stats)) {
+			if (collect) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncHotPasses);
+				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncHotRanges,
+				                          m_bda_hot_ranges.size());
+				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncUploadBytes, stats.upload_bytes);
+				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncUploadCopies,
+				                          stats.upload_copies);
+			}
+			return;
+		}
+		// A recorded buffer is gone although the structure epoch held: scan everything.
 	}
 
 	BdaSyncStats stats;
+	if (m_bda_hot_sync) {
+		m_bda_hot_ranges.clear();
+		stats.hot_ranges = &m_bda_hot_ranges;
+	}
+	const bool keep_stats = collect || m_bda_hot_sync;
 	{
 		// Only uploads are recorded while scanning: all of them share one barrier pair.
 		const UploadBatch upload_batch(*this);
-		mapped_ranges.ForEach([this, collect, &stats](uint64_t start, uint64_t end) {
-			SynchronizeBuffersInRange(start, end - start, collect ? &stats : nullptr);
+		mapped_ranges.ForEach([this, keep_stats, &stats](uint64_t start, uint64_t end) {
+			SynchronizeBuffersInRange(start, end - start, keep_stats ? &stats : nullptr);
 		});
 	}
 	if (m_bda_incremental_sync) {
@@ -1915,6 +1968,23 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncUploadBytes, stats.upload_bytes);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncUploadCopies, stats.upload_copies);
 	}
+}
+
+bool BufferCache::SynchronizeBdaHotRanges(BdaSyncStats& stats) {
+	for (const auto& range: m_bda_hot_ranges) {
+		const auto* buffer = m_slot_buffers.try_get(range.id);
+		if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(range.address, range.size)) {
+			return false;
+		}
+	}
+	// A hot run that is no longer hot is synchronized like any range: a demoted page (still
+	// CPU-dirty) is uploaded and protected, a settled or re-owned one is left alone.
+	const UploadBatch upload_batch(*this);
+	for (const auto& range: m_bda_hot_ranges) {
+		(void)SynchronizeBuffer(m_slot_buffers[range.id], range.address, range.size, false, false,
+		                        &stats);
+	}
+	return true;
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSyncStats* stats) {
@@ -1930,6 +2000,7 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSy
 		if (start < finish) {
 			if (stats != nullptr) {
 				++stats->scanned_buffers;
+				stats->buffer_id = it->second;
 			}
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false, stats);
 		}

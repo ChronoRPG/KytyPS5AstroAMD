@@ -52,6 +52,15 @@ public:
 		}
 		return m_cpu_mutation_epoch.load(std::memory_order_acquire);
 	}
+	// The same token without the hot-page override (UINT64_MAX only when saturated). It changes
+	// on every transition that can make a page CPU-dirty and writable outside the hot set: write
+	// faults (including the ones promoting a page to hot), explicit CPU-dirty marks, new regions,
+	// untracking, and hot pages returning to normal tracking while still CPU-dirty (demotion,
+	// idle sweep). Hot pages themselves are written without faults and never change it: a caller
+	// relying on it must re-examine every hot page it has seen (BufferCache::SynchronizeBdaBuffers).
+	[[nodiscard]] uint64_t FaultMutationEpoch() const noexcept {
+		return m_cpu_mutation_epoch.load(std::memory_order_acquire);
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {

@@ -347,6 +347,8 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.PipelineLibraryLinks.Cumulative",
     "FrameEvent.PipelineLibraryCacheHits.Cumulative",
     "FrameEvent.PipelineLibrariesCreated.Cumulative",
+    "FrameEvent.BdaSyncHotPasses.Cumulative",
+    "FrameEvent.BdaSyncHotRanges.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 

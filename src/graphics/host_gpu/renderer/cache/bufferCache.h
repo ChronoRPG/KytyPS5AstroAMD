@@ -173,12 +173,25 @@ private:
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
+	// A run of hot pages a full BDA pass found inside one scanned buffer (KYTY_BDA_HOT_SYNC).
+	struct BdaHotRange {
+		BufferId id;
+		uint64_t address = 0;
+		uint64_t size    = 0;
+	};
 	struct BdaSyncStats {
 		uint64_t scanned_buffers = 0;
 		uint64_t upload_bytes    = 0;
 		uint64_t upload_copies   = 0;
+		// Full passes with KYTY_BDA_HOT_SYNC: the buffer being synchronized and where to record
+		// the hot page runs it reports.
+		BufferId                  buffer_id;
+		std::vector<BdaHotRange>* hot_ranges = nullptr;
 	};
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSyncStats* stats);
+	// KYTY_BDA_HOT_SYNC pass: re-synchronizes only the hot page runs the last full pass recorded.
+	// False (nothing done) when a recorded buffer is gone; the caller then scans fully.
+	[[nodiscard]] bool SynchronizeBdaHotRanges(BdaSyncStats& stats);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer,
 	                                     BdaSyncStats* stats = nullptr,
@@ -276,6 +289,11 @@ private:
 	// m_known_fills is nonempty; written under m_known_fill_mutex, read without it.
 	std::atomic<bool>                                 m_has_known_fills {false};
 	const bool                                        m_bda_incremental_sync;
+	// KYTY_BDA_HOT_SYNC (default on; needs KYTY_BDA_INCREMENTAL_SYNC=1): with hot pages present,
+	// a BDA pass whose fault and structure epochs are unchanged re-synchronizes only the hot page
+	// runs the last full pass recorded (m_bda_hot_ranges) instead of every mapped buffer, and hot
+	// pages are compared with their shadow in place before any snapshot is taken.
+	const bool                                        m_bda_hot_sync;
 	MemoryTracker                                     m_memory_tracker;
 	// Hot pages: exact copy of the last contents uploaded for each hot page (GPU thread only).
 	// While a page is hot its buffer bytes equal this copy: every other write of them either
@@ -296,6 +314,10 @@ private:
 	// GPU-thread-only snapshots taken BEFORE the last full scan, never after it.
 	uint64_t                                          m_bda_scanned_cpu_epoch = 0;
 	uint64_t                                          m_bda_scanned_structure_epoch = 0;
+	// Hot page runs inside the buffers the last full BDA pass scanned (KYTY_BDA_HOT_SYNC; GPU
+	// thread). Valid while the epochs of that pass hold: a page can only become hot through a
+	// write fault, which changes the fault epoch, and buffers only change with the structure one.
+	std::vector<BdaHotRange>                          m_bda_hot_ranges;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

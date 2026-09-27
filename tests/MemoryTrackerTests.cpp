@@ -845,6 +845,70 @@ void TestHotPageDemotionPaths() {
   Release(memory);
 }
 
+// The BDA hot pass (BufferCache::SynchronizeBdaBuffers, KYTY_BDA_HOT_SYNC) skips every page but
+// the hot ones while FaultMutationEpoch() holds: it must stay usable while hot pages exist, move on
+// every transition that leaves a page CPU-dirty and writable outside the hot set, and stay put
+// while hot pages are only written and uploaded.
+void TestFaultMutationEpochWithHotPages() {
+  MemoryTracker::FaultPolicy policy;
+  policy.hot_frames = 1;
+  policy.hot_max = 8;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  UploadAll(tracker, address, page_size * 4);
+  const auto clean = tracker.FaultMutationEpoch();
+  Check(clean != UINT64_MAX && clean == tracker.CpuMutationEpoch(),
+        "fault epoch differs from the CPU mutation epoch without hot pages");
+
+  // The fault that promotes a page moves the epoch; the hot page then saturates only the old
+  // token.
+  WriteFault(tracker, address);
+  const auto promoted = tracker.FaultMutationEpoch();
+  Check(tracker.HotPageCount() == 1 && promoted != clean && promoted != UINT64_MAX &&
+            tracker.CpuMutationEpoch() == UINT64_MAX,
+        "promotion did not move the fault epoch, or hot pages saturated it");
+
+  // Hot-aware uploads and fault-free writes of the hot page leave it alone.
+  const auto [normal, hot] = UploadHotAware(tracker, address, page_size * 4);
+  memory[16] = 0x3c;
+  const auto [normal2, hot2] = UploadHotAware(tracker, address, page_size * 4);
+  Check(normal == 0 && hot == 1 && normal2 == 0 && hot2 == 1 &&
+            tracker.FaultMutationEpoch() == promoted,
+        "hot-page uploads or writes moved the fault epoch");
+
+  // Demotion leaves the page CPU-dirty and writable outside the hot set: the epoch moves.
+  tracker.DemoteHotPages(address, page_size * 4);
+  const auto demoted = tracker.FaultMutationEpoch();
+  Check(tracker.HotPageCount() == 0 && demoted != promoted && IsWritable(memory) &&
+            tracker.IsRegionCpuModified(address, page_size),
+        "demotion did not move the fault epoch");
+  // Demoting a range without hot pages changes nothing.
+  UploadAll(tracker, address, page_size * 4);
+  tracker.AdvanceFrame();
+  WriteFault(tracker, address);
+  const auto repromoted = tracker.FaultMutationEpoch();
+  tracker.DemoteHotPages(address + page_size, page_size * 3);
+  Check(tracker.HotPageCount() == 1 && tracker.FaultMutationEpoch() == repromoted,
+        "demoting a range without hot pages moved the fault epoch");
+
+  // The idle sweep demotes as well.
+  UploadHotAware(tracker, address, page_size * 4);
+  for (int frame = 0; frame < 5; frame++) {
+    tracker.AdvanceFrame();
+  }
+  tracker.SweepHotPages(3);
+  Check(tracker.HotPageCount() == 0 && tracker.FaultMutationEpoch() != repromoted &&
+            tracker.IsRegionCpuModified(address, page_size),
+        "idle sweep did not move the fault epoch");
+
+  tracker.UntrackMemory(address, page_size * 4);
+  Release(memory);
+}
+
 void TestForeignWatcherFaultsDoNotPromote() {
   MemoryTracker::FaultPolicy policy;
   policy.hot_frames = 2;
@@ -1641,6 +1705,7 @@ int main(int argc, char **argv) {
   TestFaultAheadWindow();
   TestHotPagePromotionAndUpload();
   TestHotPageDemotionPaths();
+  TestFaultMutationEpochWithHotPages();
   TestForeignWatcherFaultsDoNotPromote();
   TestWrittenUploadCopiesOutsideLock();
   TestHotPageSettle();

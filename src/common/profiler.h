@@ -544,6 +544,11 @@ enum class FrameEvent : uint32_t {
 	PipelineLibraryLinks,
 	PipelineLibraryCacheHits,
 	PipelineLibrariesCreated,
+	// KYTY_BDA_HOT_SYNC (BufferCache::SynchronizeBdaBuffers): BDA passes that re-synchronized only
+	// the hot page runs of the last full pass (the fault and structure epochs held), and the runs
+	// they visited. BdaSyncPasses/BdaSyncScannedBuffers count the full passes only.
+	BdaSyncHotPasses,
+	BdaSyncHotRanges,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

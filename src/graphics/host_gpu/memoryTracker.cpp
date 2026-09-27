@@ -35,6 +35,11 @@ void MemoryTracker::DemoteHotPages(uint64_t vaddr, uint64_t size) {
 	uint32_t demoted = 0;
 	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
+		if (manager->IsHot(manager->GetCpuAddr() + offset, bytes)) {
+			// The demoted pages stay CPU-dirty and writable, now outside the hot set: publish
+			// before the change like every other transition FaultMutationEpoch() covers.
+			NotifyCpuMutation();
+		}
 		demoted += manager->DemoteHot(manager->GetCpuAddr() + offset, bytes, m_hot_count);
 	});
 	MemoryStats::Count(MemoryStats::Counter::HotDemotions, demoted);
@@ -87,6 +92,11 @@ void MemoryTracker::SweepHotPages(uint32_t idle_frames) {
 	uint32_t   demoted = 0;
 	for (auto* manager: managers) {
 		std::scoped_lock lock(manager->lock);
+		// Swept pages stay CPU-dirty and writable outside the hot set (see DemoteHotPages). A
+		// region without hot pages cannot change here; otherwise publish conservatively.
+		if (manager->IsHot(manager->GetCpuAddr(), TRACKER_REGION_SIZE)) {
+			NotifyCpuMutation();
+		}
 		demoted += manager->SweepHot(frame, idle_frames, m_hot_count);
 	}
 	MemoryStats::Count(MemoryStats::Counter::HotDemotions, demoted);
