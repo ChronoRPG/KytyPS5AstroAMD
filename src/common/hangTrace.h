@@ -264,6 +264,8 @@ void RecordGpuOpCounts(const GpuOpCounts& counts);
 //   mem_hot_promotions / _demotions      pages entering / leaving hot (sticky-dirty) tracking
 //   mem_hot_upload_pages                 hot pages visited by uploads (compared with a shadow)
 //   mem_hot_upload_skipped               of those, unchanged pages whose copy was skipped
+//   mem_written_upload_late_pages        written-upload pages a racing guest write re-dirtied
+//                                        while copied outside the tracker lock (copied again)
 enum class MemoryCounter : uint8_t {
 	WriteFaults,
 	ReadFaults,
@@ -290,6 +292,7 @@ enum class MemoryCounter : uint8_t {
 	HotDemotions,
 	HotUploadPages,
 	HotUploadSkipped,
+	WrittenUploadLatePages,
 	Count
 };
 void CountMemory(MemoryCounter counter, uint64_t amount = 1);

@@ -221,6 +221,7 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.HotPageDemotions.Cumulative",
     "FrameEvent.HotPageUploads.Cumulative",
     "FrameEvent.HotPageUploadsSkipped.Cumulative",
+    "FrameEvent.WrittenUploadLatePages.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 

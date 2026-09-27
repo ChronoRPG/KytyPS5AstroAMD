@@ -846,6 +846,67 @@ void TestForeignWatcherFaultsDoNotPromote() {
   Release(memory);
 }
 
+void TestWrittenUploadCopiesOutsideLock() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  Check(tracker.IsRegionCpuModified(address, page_size * 3),
+        "new pages were not CPU-dirty");
+
+  // A racing guest write fault during the unlocked copy re-dirties page 1; the late pass must
+  // protect it again before copying it, and the range still ends GPU-owned.
+  uint64_t main_pages = 0;
+  uint64_t late_pages = 0;
+  bool late_protected = false;
+  bool racer_done = false;
+  tracker.ForEachWrittenUploadRange(
+      address, page_size * 3,
+      [&](uint64_t, uint64_t bytes) noexcept { main_pages += bytes / page_size; },
+      [&]() noexcept {
+        Check(!IsWritable(memory + page_size),
+              "main copy ran on an unprotected page");
+        // Would deadlock if the region lock were held here.
+        std::jthread racer([&] {
+          tracker.InvalidateRegion(address + page_size + 8, 1, [] {}, true);
+          memory[page_size + 8] = 0x77;
+          racer_done = true;
+        });
+        racer.join();
+      },
+      [&](uint64_t range_address, uint64_t bytes) noexcept {
+        late_pages += bytes / page_size;
+        late_protected = range_address == address + page_size &&
+                         !IsWritable(memory + page_size);
+      },
+      []() noexcept {});
+  Check(racer_done && main_pages == 3 && late_pages == 1 && late_protected &&
+            tracker.IsRegionGpuModified(address, page_size * 3) &&
+            !tracker.IsRegionCpuModified(address, page_size * 3) &&
+            Protection(memory + page_size) == PAGE_NOACCESS,
+        "unlocked written upload lost a racing write or GPU ownership");
+
+  // Without a racing write the late pass reports nothing.
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 3);
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  main_pages = 0;
+  late_pages = 0;
+  tracker.ForEachWrittenUploadRange(
+      address, page_size * 3,
+      [&](uint64_t, uint64_t bytes) noexcept { main_pages += bytes / page_size; },
+      []() noexcept {},
+      [&](uint64_t, uint64_t bytes) noexcept { late_pages += bytes / page_size; },
+      []() noexcept {});
+  Check(main_pages == 1 && late_pages == 0 &&
+            tracker.IsRegionGpuModified(address, page_size * 3),
+        "unlocked written upload copied clean pages or reported late pages");
+
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 3);
+  tracker.UntrackMemory(address, page_size * 3);
+  Release(memory);
+}
+
 void TestCrossRegionUpload() {
   constexpr uintptr_t base = 0x0000000200010000ull;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
@@ -1395,6 +1456,7 @@ int main(int argc, char **argv) {
   TestHotPagePromotionAndUpload();
   TestHotPageDemotionPaths();
   TestForeignWatcherFaultsDoNotPromote();
+  TestWrittenUploadCopiesOutsideLock();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();

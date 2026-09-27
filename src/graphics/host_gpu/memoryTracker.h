@@ -181,6 +181,62 @@ public:
 		s_upload_owner = previous_upload_owner;
 	}
 
+	// A written upload (the range becomes GPU-owned) that copies its CPU-dirty pages WITHOUT the
+	// region locks held, for FaultPolicy::copy_outside_lock:
+	//  1. per region, under its lock: clear and write-protect the CPU-dirty pages, reporting them
+	//     to range_func, then release the lock;
+	//  2. upload_func() copies them with no tracker lock held. A guest write to one of them now
+	//     faults, and the fault marks it CPU-dirty again under the region lock;
+	//  3. all region locks are taken and held; pages that became CPU-dirty since step 1 are
+	//     cleared and write-protected again (only then can their contents no longer change) and
+	//     reported to late_range_func; late_upload_func() copies them under the locks;
+	//  4. the whole range becomes GPU-dirty and the locks are released.
+	// Pages not reported in step 3 stayed write-protected and clean from step 1 to step 4, so the
+	// step-2 copy is exact; step 3 and 4 are the single locked upload of ForEachUploadRange.
+	template <typename RangeFunc, typename UploadFunc, typename LateRangeFunc,
+	          typename LateUploadFunc>
+	void ForEachWrittenUploadRange(uint64_t vaddr, uint64_t size, RangeFunc&& range_func,
+	                               UploadFunc&& upload_func, LateRangeFunc&& late_range_func,
+	                               LateUploadFunc&& late_upload_func) {
+		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
+		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
+		static_assert(std::is_nothrow_invocable_v<LateRangeFunc&, uint64_t, uint64_t>);
+		static_assert(std::is_nothrow_invocable_v<LateUploadFunc&>);
+		CheckNotInUploadCallback();
+		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
+		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+		const auto  frame                 = Frame();
+		uint32_t    demoted               = 0;
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			demoted += manager->CollectUpload(
+			    manager->GetCpuAddr() + offset, bytes, false, frame, m_hot_count,
+			    [&](uint64_t address, uint64_t range_bytes, bool) noexcept {
+				    range_func(address, range_bytes);
+			    });
+		});
+		upload_func();
+		uint64_t late_pages = 0;
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			manager->lock.lock();
+			demoted += manager->CollectUpload(
+			    manager->GetCpuAddr() + offset, bytes, false, frame, m_hot_count,
+			    [&](uint64_t address, uint64_t range_bytes, bool) noexcept {
+				    late_pages += range_bytes / TRACKER_PAGE_SIZE;
+				    late_range_func(address, range_bytes);
+			    });
+		});
+		late_upload_func();
+		Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			manager->template ChangeState<DirtySource::Gpu, true>(manager->GetCpuAddr() + offset,
+			                                                      bytes);
+			manager->lock.unlock();
+		});
+		s_upload_owner = previous_upload_owner;
+		MemoryStats::Count(MemoryStats::Counter::HotDemotions, demoted);
+		MemoryStats::Count(MemoryStats::Counter::WrittenUploadLatePages, late_pages);
+	}
+
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;

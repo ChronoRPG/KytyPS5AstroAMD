@@ -312,6 +312,7 @@ constexpr std::array<MemoryCounterColumn, static_cast<size_t>(MemoryCounter::Cou
         {"mem_hot_demotions", 1},
         {"mem_hot_upload_pages", 1},
         {"mem_hot_upload_skipped", 1},
+        {"mem_written_upload_late_pages", 1},
     }};
 static_assert(kMemoryCounterColumns.back().name != nullptr,
               "memory counter columns must match HangTrace::MemoryCounter");

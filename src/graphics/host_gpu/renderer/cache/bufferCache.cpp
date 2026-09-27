@@ -82,6 +82,8 @@ uint64_t ParseEnvU64(const char* name, uint64_t fallback) {
 //                         KYTY_HOT_PAGE_QUIET_FRAMES frames (default 8) without a change or
 //                         without an upload, on a GPU write, or when its buffer goes away. At most
 //                         KYTY_HOT_PAGE_MAX pages (default 1024, 4 KiB shadow each) are hot.
+//   KYTY_UPLOAD_COPY_OUTSIDE_LOCK  0 copies written uploads with their region locks held (the
+//                         previous behaviour) instead of MemoryTracker::ForEachWrittenUploadRange.
 MemoryTracker::FaultPolicy BufferFaultPolicy() {
 	MemoryTracker::FaultPolicy policy;
 	const auto ahead_kib = ParseEnvU64("KYTY_FAULT_AHEAD_KB", 32);
@@ -97,6 +99,7 @@ MemoryTracker::FaultPolicy BufferFaultPolicy() {
 			policy.hot_frames = 0;
 		}
 	}
+	policy.copy_outside_lock = ParseEnvU64("KYTY_UPLOAD_COPY_OUTSIDE_LOCK", 1) != 0;
 	return policy;
 }
 
@@ -1086,56 +1089,84 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<uint64_t>   demote_hot;
 	size_t                guest_copies = 0;
 	uint64_t              host_base    = 0;
-	m_memory_tracker.ForEachUploadRange(
-	    vaddr, size, is_written,
-	    [&](uint64_t address, uint64_t bytes, bool hot) noexcept {
-		    if (hot) {
-			    hot_ranges.push_back({address, bytes});
-			    return;
-		    }
-		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-		    total_size += bytes;
-	    },
-	    [&]() noexcept {
-		    // A normal upload replaces whatever a hot page shadow described.
-		    for (const auto& copy: copies) {
-			    EraseHotShadows(buffer.CpuAddress() + copy.dstOffset, copy.size);
-		    }
-		    guest_copies = copies.size();
-		    host_base    = total_size;
-		    if (!hot_ranges.empty()) {
-			    CollectHotPages(buffer, hot_ranges, copies, total_size, demote_hot);
-		    }
-		    if (reserved != nullptr && total_size <= reserved_size && guest_copies == copies.size()) {
-			    for (auto& copy: copies) {
-				    std::memcpy(reserved + copy.srcOffset,
-				                reinterpret_cast<const void*>(buffer.CpuAddress() + copy.dstOffset),
-				                copy.size);
-				    copy.srcOffset += reserved_offset;
+	// Written uploads with KYTY_UPLOAD_COPY_OUTSIDE_LOCK: pages re-dirtied by a racing guest write
+	// while the main copy ran unlocked, copied again under the tracker locks.
+	std::vector<vk::BufferCopy> late_copies;
+	uint64_t                    late_size = 0;
+	vk::Buffer                  late_source;
+	bool                        reserved_committed = false;
+	const auto collect = [&](uint64_t address, uint64_t bytes, bool hot) noexcept {
+		if (hot) {
+			hot_ranges.push_back({address, bytes});
+			return;
+		}
+		copies.emplace_back(total_size, buffer.Offset(address), bytes);
+		total_size += bytes;
+	};
+	const auto upload = [&]() noexcept {
+		// A normal upload replaces whatever a hot page shadow described.
+		for (const auto& copy: copies) {
+			EraseHotShadows(buffer.CpuAddress() + copy.dstOffset, copy.size);
+		}
+		guest_copies = copies.size();
+		host_base    = total_size;
+		if (!hot_ranges.empty()) {
+			CollectHotPages(buffer, hot_ranges, copies, total_size, demote_hot);
+		}
+		if (reserved != nullptr && total_size <= reserved_size && guest_copies == copies.size()) {
+			for (auto& copy: copies) {
+				std::memcpy(reserved + copy.srcOffset,
+				            reinterpret_cast<const void*>(buffer.CpuAddress() + copy.dstOffset),
+				            copy.size);
+				copy.srcOffset += reserved_offset;
+			}
+			if (!copies.empty()) source = m_staging_buffer.Handle();
+		} else {
+			reserved = nullptr;
+			source   = UploadCopies(buffer, copies, total_size, guest_copies,
+			                        m_hot_scratch.data(), host_base);
+		}
+	};
+	if (is_written && m_memory_tracker.GetFaultPolicy().copy_outside_lock) {
+		m_memory_tracker.ForEachWrittenUploadRange(
+		    vaddr, size,
+		    [&](uint64_t address, uint64_t bytes) noexcept { collect(address, bytes, false); },
+		    upload,
+		    [&](uint64_t address, uint64_t bytes) noexcept {
+			    late_copies.emplace_back(late_size, buffer.Offset(address), bytes);
+			    late_size += bytes;
+		    },
+		    [&]() noexcept {
+			    if (late_copies.empty()) {
+				    return;
 			    }
-			    if (!copies.empty()) source = m_staging_buffer.Handle();
-		    } else {
-			    reserved = nullptr;
-			    source   = UploadCopies(buffer, copies, total_size, guest_copies,
-			                            m_hot_scratch.data(), host_base);
-		    }
-	    });
+			    if (reserved != nullptr && source) {
+				    // A staging Map() reuses the pending reservation until it is committed.
+				    m_staging_buffer.Commit();
+				    reserved_committed = true;
+			    }
+			    late_source = UploadCopies(buffer, late_copies, late_size);
+		    });
+	} else {
+		m_memory_tracker.ForEachUploadRange(vaddr, size, is_written, collect, upload);
+	}
 	for (const auto page: demote_hot) {
 		m_memory_tracker.DemoteHotPages(page, TRACKER_PAGE_SIZE);
 		EraseHotShadows(page, TRACKER_PAGE_SIZE);
 	}
-	if (reserved != nullptr && source) {
-		// Source copying and GPU ownership publication stayed atomic. Flush and ring
-		// bookkeeping need no tracker lock and finish before native copy recording.
+	if (reserved != nullptr && source && !reserved_committed) {
+		// Source copying and GPU ownership publication stayed consistent (under the tracker locks,
+		// or unlocked with the late pass). Flush and ring bookkeeping need no tracker lock and
+		// finish before native copy recording.
 		m_staging_buffer.Commit();
 		Profiler::CountFrameEvent(Profiler::FrameEvent::UploadReservationsOutsideLocks);
 	}
-	if (source) {
+	if (source || late_source) {
 		if (stats != nullptr) {
-			stats->upload_bytes += total_size;
-			stats->upload_copies += copies.size();
+			stats->upload_bytes += total_size + late_size;
+			stats->upload_copies += copies.size() + late_copies.size();
 		}
-		Profiler::CountFrameEvent(Profiler::FrameEvent::BufferUploadBytes, total_size);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BufferUploadBytes, total_size + late_size);
 		if (HangTrace::Enabled()) {
 			const char* reason = upload_reason;
 			if (reason == nullptr) {
@@ -1154,8 +1185,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		if (command.ActiveRenderingSerial() != 0) {
 			MemoryStats::Count(MemoryStats::Counter::UploadRenderSplits);
 		}
-		MemoryStats::Count(MemoryStats::Counter::UploadCopies);
-		MemoryStats::Count(MemoryStats::Counter::UploadBarriers, 2);
+		const bool both = source && late_source;
+		MemoryStats::Count(MemoryStats::Counter::UploadCopies, both ? 2 : 1);
+		MemoryStats::Count(MemoryStats::Counter::UploadBarriers, both ? 3 : 2);
 		command.EndRendering();
 		const auto native = command.Handle();
 		vk::BufferMemoryBarrier before {};
@@ -1171,8 +1203,23 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::PipelineStageFlagBits::eTransfer,
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
-		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
-		                  copies.data());
+		if (source) {
+			native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+			                  copies.data());
+		}
+		if (late_source) {
+			if (source) {
+				// The late copy rewrites pages of the first one: order the two writes.
+				auto between          = before;
+				between.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+				native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+				                       vk::PipelineStageFlagBits::eTransfer,
+				                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &between,
+				                       0, nullptr);
+			}
+			native.copyBuffer(late_source, buffer.Handle(),
+			                  static_cast<uint32_t>(late_copies.size()), late_copies.data());
+		}
 		buffer.MarkContentWritten();
 		auto after          = before;
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;

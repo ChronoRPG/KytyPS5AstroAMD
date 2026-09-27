@@ -181,6 +181,8 @@ public:
 		uint32_t ahead_pages = 1; // power of two dividing TRACKER_REGION_PAGES; 1 = off
 		uint32_t hot_frames  = 0; // 0 = hot pages off
 		uint32_t hot_max     = 0;
+		// Written uploads copy with no region lock held (MemoryTracker::ForEachWrittenUploadRange).
+		bool copy_outside_lock = false;
 	};
 	struct FaultResult {
 		uint64_t ahead_pages = 0;
