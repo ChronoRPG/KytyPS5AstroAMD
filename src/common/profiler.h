@@ -671,6 +671,13 @@ enum class FrameEvent : uint32_t {
 	// Bytes committed draw-prep certificates covered by digest (KYTY_DRAW_PREP_CODE_DIGEST: the
 	// code of headerless shaders; DrawPrepCertBytes counts the byte-compared ranges).
 	DrawPrepCertDigestBytes,
+	// Draws binding what the draw before them bound (renderDraw.cpp CountBindingRepeats, opt-in
+	// with KYTY_DRAW_BINDING_REPEAT_STATS=1): the same programs; and also the same images and
+	// samplers; and also the same buffers; and also the same user data and flattened SRT words.
+	DrawBindingRepeatPrograms,
+	DrawBindingRepeatTextures,
+	DrawBindingRepeatResources,
+	DrawBindingRepeatAll,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

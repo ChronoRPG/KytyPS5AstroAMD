@@ -1638,6 +1638,68 @@ static bool DrawIsBarrierSafe(std::span<PreparedBindings* const> stages,
 	return true;
 }
 
+// KYTY_DRAW_BINDING_REPEAT_STATS=1 (opt-in diagnostics, counted with aggregates only; it copies
+// every draw's descriptor words): how often a draw binds the same programs and descriptors as the
+// draw before it, the room a draw-level binding reuse would have for "stamps"
+// (FrameEvent.DrawBindingRepeat*: same programs; also the same images and samplers; also the same
+// buffers; also the same user data and flattened SRT words).
+static bool BindingRepeatStatsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DRAW_BINDING_REPEAT_STATS");
+		return Profiler::AggregateEnabled() && value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+static void CountBindingRepeats(std::span<const ShaderStageRuntime* const> stages) {
+	using ShaderRecompiler::IR::DescriptorValue;
+	struct Previous {
+		const void*                  program = nullptr;
+		std::vector<DescriptorValue> buffers;
+		std::vector<DescriptorValue> images;
+		std::vector<DescriptorValue> samplers;
+		std::vector<uint32_t>        user_data;
+		std::vector<uint32_t>        flattened_srt;
+	};
+	static thread_local std::vector<Previous> previous;
+	bool same_programs  = previous.size() == stages.size();
+	bool same_textures  = same_programs;
+	bool same_buffers   = same_programs;
+	bool same_constants = same_programs;
+	previous.resize(stages.size());
+	for (size_t i = 0; i < stages.size(); i++) {
+		const auto& stage     = *stages[i];
+		const auto& resources = *stage.resources;
+		auto&       old       = previous[i];
+		same_programs &= old.program == stage.program;
+		same_textures &= old.images == resources.images && old.samplers == resources.samplers;
+		same_buffers &= old.buffers == resources.buffers;
+		same_constants &=
+		    old.user_data == resources.user_data && old.flattened_srt == resources.flattened_srt;
+		old.program = stage.program;
+		old.buffers.assign(resources.buffers.begin(), resources.buffers.end());
+		old.images.assign(resources.images.begin(), resources.images.end());
+		old.samplers.assign(resources.samplers.begin(), resources.samplers.end());
+		old.user_data.assign(resources.user_data.begin(), resources.user_data.end());
+		old.flattened_srt.assign(resources.flattened_srt.begin(), resources.flattened_srt.end());
+	}
+	if (!same_programs) {
+		return;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawBindingRepeatPrograms);
+	if (!same_textures) {
+		return;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawBindingRepeatTextures);
+	if (!same_buffers) {
+		return;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawBindingRepeatResources);
+	if (same_constants) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawBindingRepeatAll);
+	}
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1724,6 +1786,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			(void)m_context.GetBufferCache().ObtainBuffer(index_source.address, index_source.size,
 			                                              false);
 		}
+	}
+	if (BindingRepeatStatsEnabled()) [[unlikely]] {
+		std::array<const ShaderStageRuntime*, 4> runtimes {};
+		uint32_t                                 runtime_count = 0;
+		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			runtimes[runtime_count++] = &state.vertex_info[i].stage;
+		}
+		if (state.ps_active) {
+			runtimes[runtime_count++] = &state.ps_input_info.stage;
+		}
+		CountBindingRepeats(std::span {runtimes.data(), runtime_count});
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
