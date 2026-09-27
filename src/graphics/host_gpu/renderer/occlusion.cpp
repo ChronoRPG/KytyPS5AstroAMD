@@ -238,6 +238,7 @@ bool OcclusionCounter::Dump(uint64_t address) {
 	// has completed (1024 dumps in flight never happens in practice; the wait bounds it).
 	const auto slot = static_cast<uint32_t>(m_issued % PublishSlots);
 	if (m_issued >= PublishSlots && !scheduler.IsFree(m_slot_ticks[slot])) {
+		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitOcclusion);
 		scheduler.Wait(m_slot_ticks[slot]);
 	}
 	const uint64_t slot_offset = uint64_t {slot} * PublishSlotSize;

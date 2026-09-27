@@ -304,6 +304,21 @@ enum class FrameWait : uint32_t {
 	// (StagePrepJoin), and helper-thread job time (StagePrepHelper, not on the GPU thread).
 	StagePrepJoin,
 	StagePrepHelper,
+	// GPU (CP) thread blocked in MasterSemaphore::Wait (submission dispatch plus timeline wait;
+	// waits that find the tick already complete are not counted), attributed to the caller that
+	// set a ScopedGpuWaitReason: ReadMemory drains, occlusion publication waits (sync proxy,
+	// predication on unpublished dumps, publish-slot reuse), stream-buffer wraps, LOD-stats slot
+	// reuse, unmaps, predication/boolean waits, GDS end-of-pipe reads, side-copy waits of GPU
+	// thread reads, and everything untagged (GpuWaitOther).
+	GpuWaitDrain,
+	GpuWaitOcclusion,
+	GpuWaitStreamWrap,
+	GpuWaitLodStats,
+	GpuWaitUnmap,
+	GpuWaitPredication,
+	GpuWaitGds,
+	GpuWaitSideCopy,
+	GpuWaitOther,
 	Count,
 };
 
@@ -334,6 +349,21 @@ private:
 // Adds externally measured totals (the GPU timeline entries above) with the same gating as
 // ScopedFrameWait: aggregate diagnostics enabled and a connected profiler.
 void AddFrameWait(FrameWait kind, uint64_t calls, uint64_t nanoseconds);
+
+// Per-thread attribution of GPU waits (the GpuWait* categories): the innermost scope wins.
+class ScopedGpuWaitReason {
+public:
+	explicit ScopedGpuWaitReason(FrameWait reason);
+	ScopedGpuWaitReason(const ScopedGpuWaitReason&)            = delete;
+	ScopedGpuWaitReason& operator=(const ScopedGpuWaitReason&) = delete;
+	ScopedGpuWaitReason(ScopedGpuWaitReason&&)                 = delete;
+	ScopedGpuWaitReason& operator=(ScopedGpuWaitReason&&)      = delete;
+	~ScopedGpuWaitReason();
+
+private:
+	FrameWait m_previous;
+};
+[[nodiscard]] FrameWait CurrentGpuWaitReason() noexcept;
 
 // Call immediately after the existing completed guest-flip marker. Snapshots
 // include workload and wait totals, and are cumulative so an on-demand connection

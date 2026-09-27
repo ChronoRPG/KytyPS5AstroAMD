@@ -225,6 +225,15 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.ReadbackSideWait.Calls.Cumulative",
     "FrameWait.StagePrepJoin.Calls.Cumulative",
     "FrameWait.StagePrepHelper.Calls.Cumulative",
+    "FrameWait.GpuWaitDrain.Calls.Cumulative",
+    "FrameWait.GpuWaitOcclusion.Calls.Cumulative",
+    "FrameWait.GpuWaitStreamWrap.Calls.Cumulative",
+    "FrameWait.GpuWaitLodStats.Calls.Cumulative",
+    "FrameWait.GpuWaitUnmap.Calls.Cumulative",
+    "FrameWait.GpuWaitPredication.Calls.Cumulative",
+    "FrameWait.GpuWaitGds.Calls.Cumulative",
+    "FrameWait.GpuWaitSideCopy.Calls.Cumulative",
+    "FrameWait.GpuWaitOther.Calls.Cumulative",
 };
 static_assert(kFrameWaitCallNames.back() != nullptr, "FrameWait names must match the enum");
 constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
@@ -247,6 +256,15 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.ReadbackSideWait.Nanoseconds.Cumulative",
     "FrameWait.StagePrepJoin.Nanoseconds.Cumulative",
     "FrameWait.StagePrepHelper.Nanoseconds.Cumulative",
+    "FrameWait.GpuWaitDrain.Nanoseconds.Cumulative",
+    "FrameWait.GpuWaitOcclusion.Nanoseconds.Cumulative",
+    "FrameWait.GpuWaitStreamWrap.Nanoseconds.Cumulative",
+    "FrameWait.GpuWaitLodStats.Nanoseconds.Cumulative",
+    "FrameWait.GpuWaitUnmap.Nanoseconds.Cumulative",
+    "FrameWait.GpuWaitPredication.Nanoseconds.Cumulative",
+    "FrameWait.GpuWaitGds.Nanoseconds.Cumulative",
+    "FrameWait.GpuWaitSideCopy.Nanoseconds.Cumulative",
+    "FrameWait.GpuWaitOther.Nanoseconds.Cumulative",
 };
 static_assert(kFrameWaitTimeNames.back() != nullptr, "FrameWait names must match the enum");
 
@@ -624,6 +642,22 @@ void AddFrameWait(FrameWait kind, uint64_t calls, uint64_t nanoseconds) {
 	auto& totals = g_frame_waits[static_cast<size_t>(kind)];
 	totals.nanoseconds.fetch_add(nanoseconds, std::memory_order_relaxed);
 	totals.calls.fetch_add(calls, std::memory_order_relaxed);
+}
+
+namespace {
+thread_local FrameWait g_gpu_wait_reason = FrameWait::GpuWaitOther;
+} // namespace
+
+ScopedGpuWaitReason::ScopedGpuWaitReason(FrameWait reason): m_previous(g_gpu_wait_reason) {
+	g_gpu_wait_reason = reason;
+}
+
+ScopedGpuWaitReason::~ScopedGpuWaitReason() {
+	g_gpu_wait_reason = m_previous;
+}
+
+FrameWait CurrentGpuWaitReason() noexcept {
+	return g_gpu_wait_reason;
 }
 
 void PublishFrameWork() {

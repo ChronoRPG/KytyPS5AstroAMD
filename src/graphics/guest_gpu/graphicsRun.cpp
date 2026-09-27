@@ -936,6 +936,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			// recorded dump visible before this CPU-side read.
 			if (OcclusionCounter::Enabled() &&
 			    m_renderer.GetOcclusionCounter().HasUnpublishedDumps()) {
+				Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitOcclusion);
 				BufferWait();
 			}
 			// One begin/end pair per DB; bit 63 marks each counter ready.
@@ -958,6 +959,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		} break;
 		case 0x03:
 			if (wait_op != 0) {
+				Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitPredication);
 				BufferFlushAndWait();
 			}
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
@@ -1453,6 +1455,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			if constexpr (sizeof(T) == sizeof(uint32_t)) {
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
+					Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitGds);
 					SynchronizeGpu();
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
@@ -1704,6 +1707,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				if (sync) {
 					// Publish this visibility-proxy result (KYTY_OCCLUSION_SYNC_PROXY, default on) before the
 					// CP processes the label that follows it (labels are written at record time).
+					Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitOcclusion);
 					BufferWait();
 				}
 				break;

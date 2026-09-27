@@ -502,7 +502,8 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
 	trace.size  = window_end - window_begin;
 	if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 		trace.downloaded = true;
-		const auto tick  = m_scheduler.CurrentTick();
+		const auto                    tick = m_scheduler.CurrentTick();
+		Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitDrain);
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
