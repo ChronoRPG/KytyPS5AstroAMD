@@ -1971,6 +1971,17 @@ public:
     m_physical_device.getProperties2(&properties);
     return subgroup.subgroupSize;
   }
+  // Whether the device can flush f32 denormals independently (the emulator then declares
+  // DenormFlushToZero 32, see ConfigureShaderFloatControls).
+  [[nodiscard]] bool DenormFlushF32Supported() const {
+    vk::PhysicalDeviceVulkan12Properties properties12{};
+    vk::PhysicalDeviceProperties2 properties{};
+    properties.pNext = &properties12;
+    m_physical_device.getProperties2(&properties);
+    return properties12.denormBehaviorIndependence !=
+               vk::ShaderFloatControlsIndependence::eNone &&
+           properties12.shaderDenormFlushToZeroFloat32 == VK_TRUE;
+  }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
     return m_runtime_context;

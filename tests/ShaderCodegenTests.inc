@@ -1082,6 +1082,75 @@ void CheckInterpolationModes() {
   std::printf("[codegen] %-32s ok\n", name);
 }
 
+// V_RCP/RSQ/SQRT/EXP/LOG_F32 flush denormal inputs to zeros of the same sign ("denormals are
+// flushed"; rcp(-0) = -INF, sqrt(-0) = -0). With DenormFlushToZero 32 declared, the shader-side
+// flush is left to the host (KYTY_HOST_FTZ_INPUTS); both variants must agree bit for bit, and
+// denormal inputs must give the signed-zero results.
+void CheckTranscendentalDenormInputs(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenTranscendentalDenormInputs";
+  using O = ShaderOpcode;
+  const auto saved = ShaderRecompiler::Spirv::GetHostFloatControls();
+  auto controls = saved;
+  controls.denorm_flush_f32 = vulkan->DenormFlushF32Supported();
+  ShaderRecompiler::Spirv::SetHostFloatControls(controls);
+  std::vector<std::vector<u32>> inputs(1);
+  for (const auto value : SpecialF32()) {
+    inputs[0].push_back(value);
+  }
+  uint64_t state = 0x7f3a1c5bu;
+  while (inputs[0].size() < 8192u) {
+    const auto r = NextRandom(state);
+    // Half denormals of either sign, half arbitrary bit patterns.
+    inputs[0].push_back((r & 1u) != 0u ? (r & 0x807fffffu) : NextRandom(state));
+  }
+  const auto body = [](std::vector<u32> *code) {
+    code->push_back(EncodeVop1(0x2a, 10, Vgpr(2))); // v_rcp_f32
+    code->push_back(EncodeVop1(0x2e, 11, Vgpr(2))); // v_rsq_f32
+    code->push_back(EncodeVop1(0x33, 12, Vgpr(2))); // v_sqrt_f32
+    code->push_back(EncodeVop1(0x25, 13, Vgpr(2))); // v_exp_f32
+    code->push_back(EncodeVop1(0x27, 14, Vgpr(2))); // v_log_f32
+  };
+  const auto bulk = MakeBulkCase(name, 1, 5, inputs, body,
+                                 {O::V_RCP_F32, O::V_RSQ_F32, O::V_SQRT_F32, O::V_EXP_F32,
+                                  O::V_LOG_F32});
+  CodegenOptions host = GetCodegenOptions();
+  host.host_ftz_inputs = true;
+  CodegenOptions shader = host;
+  shader.host_ftz_inputs = false;
+  const auto fast = RunBulk(vulkan, bulk, host);
+  const auto slow = RunBulk(vulkan, bulk, shader);
+  static const char *const names[] = {"rcp", "rsq", "sqrt", "exp", "log"};
+  // Only denormal inputs have an exact reference; the rest must match the shader-side flush.
+  const auto denormal = [&](u32 e) {
+    const auto bits = bulk.test.initial[e];
+    return (bits & 0x7fffffffu) != 0u && (bits & 0x7fffffffu) < 0x00800000u;
+  };
+  const auto reference = [&](u32 output, u32 e) -> u32 {
+    const auto negative = (bulk.test.initial[e] & 0x80000000u) != 0u;
+    switch (output) {
+      case 0:
+      case 1: return negative ? 0xff800000u : 0x7f800000u;
+      case 2: return negative ? 0x80000000u : 0u;
+      case 3: return 0x3f800000u;
+      default: return 0xff800000u;
+    }
+  };
+  size_t checked = 0;
+  for (u32 e = 0; e < bulk.count; e++) {
+    checked += denormal(e) ? 1u : 0u;
+  }
+  CompareBulk(name, bulk, fast, slow, {}, names);
+  CompareBulk(name, bulk, fast, slow, reference, names,
+              [&](u32, u32 e) { return !denormal(e); });
+  const auto flushes = [](const std::vector<u32> &spirv) {
+    return CountSpirv(spirv, "OpULessThan");
+  };
+  ShaderRecompiler::Spirv::SetHostFloatControls(saved);
+  std::printf("[codegen] %-32s ok (%u elements, %zu denormal, host FTZ %s, OpULessThan %zu -> %zu)\n",
+              name, bulk.count, checked, controls.denorm_flush_f32 ? "declared" : "unavailable",
+              flushes(slow.spirv), flushes(fast.spirv));
+}
+
 // A compressed export to a SNORM16_ABGR target (SPI_SHADER_COL_FORMAT 6) carries
 // V_CVT_PKNORM_I16_F32 pairs; they were unpacked as FP16.
 void CheckCompressedSnormExport() {
@@ -1107,6 +1176,7 @@ void CheckCompressedSnormExport() {
 
 void RunAll(VulkanHarness *vulkan) {
   CheckCompressedSnormExport();
+  CheckTranscendentalDenormInputs(vulkan);
   CheckInterpolationModes();
   CheckMadPositionSlice();
   CheckMadModes(vulkan);

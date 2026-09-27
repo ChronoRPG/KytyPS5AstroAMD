@@ -54,6 +54,12 @@ struct CodegenOptions {
 	// KYTY_SAMPLE_LOD_CLAMP=0: ignore the LOD clamp of IMAGE_SAMPLE*_CL (the behaviour before U50)
 	// instead of applying it as the sample's minimum LOD.
 	bool sample_lod_clamp = true;
+	// KYTY_HOST_FTZ_INPUTS=1: when the module declares DenormFlushToZero 32, leave the denormal
+	// inputs of rcp/rsq/sqrt/exp/log to the host instead of flushing them in the shader. Vulkan
+	// only says such operands "may" be flushed, so this is opt-in for hosts that pass
+	// CodegenTranscendentalDenormInputs with "host FTZ declared" (the RTX 3090 on driver 610.74
+	// has no f32 flush-to-zero, so it never applies there).
+	bool host_ftz_inputs = false;
 };
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();
