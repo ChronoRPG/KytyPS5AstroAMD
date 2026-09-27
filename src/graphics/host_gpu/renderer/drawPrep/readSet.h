@@ -198,6 +198,14 @@ struct Recorder {
 
 inline thread_local Recorder* t_recorder = nullptr;
 
+// Set on DrawPrep worker threads, which must never reach the scheduler or the caches
+// (CommandScheduler::CheckActive stops the emulator if one does).
+inline thread_local bool t_worker_thread = false;
+
+[[nodiscard]] inline bool IsWorkerThread() noexcept {
+	return t_worker_thread;
+}
+
 [[nodiscard]] inline Recorder* ActiveRecorder() noexcept {
 	return t_recorder;
 }

@@ -300,7 +300,11 @@ DrawPrep::Engine* CommandProcessor::DrawPrepEngine() {
 		return nullptr;
 	}
 	if (m_draw_prep == nullptr) {
-		m_draw_prep.reset(new DrawPrep::Engine(m_renderer));
+		m_draw_prep.reset(new DrawPrep::Engine(m_renderer, [] {
+			if (g_gpu_state != nullptr) {
+				g_gpu_state->ProcessCommands();
+			}
+		}));
 	}
 	return m_draw_prep.get();
 }

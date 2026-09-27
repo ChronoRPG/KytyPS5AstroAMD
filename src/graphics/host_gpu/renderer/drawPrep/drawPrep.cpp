@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/shader.h"
@@ -15,10 +16,17 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <thread>
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 namespace Libs::Graphics::DrawPrep {
 
@@ -386,28 +394,135 @@ struct Engine::Slot {
 	DrawAutoArgs     auto_args {};
 	RegisterSnapshot registers;
 	PreparedDraw     prepared;
+	bool             worker_prepared = false;
 };
 
-struct Engine::Shared {};
+namespace {
 
-Engine::Engine(RenderContext& renderer): m_renderer(renderer), m_mode(GetMode()) {
-	m_slots.push_back(std::make_unique<Slot>());
+uint32_t EnvUnsigned(const char* name, uint32_t fallback, uint32_t low, uint32_t high) {
+	const auto* value = EnvValue(name);
+	if (value == nullptr) {
+		return fallback;
+	}
+	const auto parsed = std::strtoul(value, nullptr, 10);
+	return static_cast<uint32_t>(std::clamp<unsigned long>(parsed, low, high));
 }
 
-Engine::~Engine() = default;
+void CpuRelax() {
+#if defined(_M_X64) || defined(__x86_64__)
+	_mm_pause();
+#else
+	std::this_thread::yield();
+#endif
+}
 
-bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
-                    const DrawAutoArgs* auto_args, const HW::Context& context,
-                    const HW::UserConfig& user_config, const HW::Shader& shaders) {
-	EXIT_IF(!GuestGpu::IsGpuThread());
-	EXIT_IF((index_args == nullptr) == (auto_args == nullptr));
-	if (m_mode == Mode::Off) {
-		return false;
+uint64_t NowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+} // namespace
+
+// The parallel-mode window and its DrawPrep#k threads. Workers only run Prepare on claimed
+// slots (register snapshot in, preparation out); everything else stays on the GPU thread.
+struct Engine::Workers {
+	Workers(PipelineCache& pipeline_cache, uint32_t window, uint32_t count, uint64_t spin_ns)
+	    : pipeline_cache(pipeline_cache), window(window), spin_ns(spin_ns) {
+		for (uint32_t index = 0; index < count; index++) {
+			threads.emplace_back([this, index] { Run(index); });
+		}
 	}
-	m_draws_since_fence++;
-	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSubmitted);
-	// Inline: prepare on this thread from the snapshot, then commit at once.
-	auto& slot     = *m_slots[0];
+
+	~Workers() {
+		stop.store(true, std::memory_order_seq_cst);
+		signal.fetch_add(1, std::memory_order_seq_cst);
+		signal.notify_all();
+		for (auto& thread: threads) {
+			thread.join();
+		}
+	}
+
+	Workers(const Workers&)            = delete;
+	Workers& operator=(const Workers&) = delete;
+
+	// Producer side, after Publish: wake parked workers. Paired with Run's sleepers increment
+	// and HasClaimable() reload (both seq_cst): either the worker sees the new slot before
+	// parking, or this thread sees it parking and changes the signal it waits on.
+	void Wake() {
+		if (sleepers.load(std::memory_order_seq_cst) != 0) {
+			signal.fetch_add(1, std::memory_order_seq_cst);
+			signal.notify_all();
+		}
+	}
+
+	void Run(uint32_t index) {
+		char name[32];
+		std::snprintf(name, sizeof(name), "DrawPrep#%u", index + 1u);
+		Profiler::SetThreadName(name);
+		t_worker_thread = true;
+		auto idle_start = NowNs();
+		uint32_t spins  = 0;
+		while (!stop.load(std::memory_order_acquire)) {
+			uint64_t seq  = 0;
+			if (auto* slot = window.TryClaim(seq); slot != nullptr) {
+				Prepare(pipeline_cache, slot->registers, false, slot->prepared);
+				slot->worker_prepared = true;
+				window.Complete(seq);
+				idle_start = NowNs();
+				spins      = 0;
+				continue;
+			}
+			CpuRelax();
+			if ((++spins & 255u) != 0u || NowNs() - idle_start < spin_ns) {
+				continue;
+			}
+			const auto observed = signal.load(std::memory_order_seq_cst);
+			sleepers.fetch_add(1, std::memory_order_seq_cst);
+			if (!window.HasClaimable() && !stop.load(std::memory_order_seq_cst)) {
+				signal.wait(observed, std::memory_order_seq_cst);
+			}
+			sleepers.fetch_sub(1, std::memory_order_seq_cst);
+			idle_start = NowNs();
+		}
+	}
+
+	PipelineCache&           pipeline_cache;
+	Window<Slot>             window;
+	uint64_t                 spin_ns = 0;
+	std::atomic<bool>        stop {false};
+	std::atomic<uint64_t>    signal {0};
+	std::atomic<uint32_t>    sleepers {0};
+	std::vector<std::thread> threads;
+};
+
+Engine::Engine(RenderContext& renderer, std::function<void()> service_commands)
+    : m_renderer(renderer), m_mode(GetMode()), m_service_commands(std::move(service_commands)),
+      m_inline_slot(std::make_unique<Slot>()) {
+	if (m_mode == Mode::Parallel) {
+		const auto window  = EnvUnsigned("KYTY_DRAW_PREP_WINDOW", 32, 2, 1024);
+		const auto workers = EnvUnsigned("KYTY_DRAW_PREP_WORKERS", 6, 1, 32);
+		const auto spin_us = EnvUnsigned("KYTY_DRAW_PREP_SPIN_US", 200, 0, 1000000);
+		m_workers = std::make_unique<Workers>(m_renderer.GetPipelineCache(), window, workers,
+		                                      uint64_t {spin_us} * 1000u);
+		LOGF("DrawPrep: parallel mode, window=%u workers=%u spin=%uus cert=%s verify=%d\n",
+		     m_workers->window.Capacity(), workers, spin_us,
+		     GetCertMode() == CertMode::Log ? "log" : "value", VerifyMode());
+	}
+}
+
+Engine::~Engine() {
+	// Pending draws at teardown are dropped with the stream (shutdown only).
+	m_workers.reset();
+}
+
+bool Engine::Pending() const noexcept {
+	return m_workers != nullptr && !m_workers->window.Empty();
+}
+
+void Engine::FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index_args,
+                      const DrawAutoArgs* auto_args, const HW::Context& context,
+                      const HW::UserConfig& user_config, const HW::Shader& shaders) {
 	slot.submit_id = submit_id;
 	if (index_args != nullptr) {
 		slot.kind       = DrawKind::Index;
@@ -419,10 +534,73 @@ bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
 	slot.registers.context     = context;
 	slot.registers.user_config = user_config;
 	slot.registers.shaders     = shaders;
-	Prepare(m_renderer.GetPipelineCache(), slot.registers, true, slot.prepared);
-	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
-	Commit(slot);
+	slot.worker_prepared       = false;
+}
+
+bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
+                    const DrawAutoArgs* auto_args, const HW::Context& context,
+                    const HW::UserConfig& user_config, const HW::Shader& shaders) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	EXIT_IF((index_args == nullptr) == (auto_args == nullptr));
+	if (m_mode == Mode::Off) {
+		return false;
+	}
+	m_draws_since_fence++;
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSubmitted);
+	if (m_workers == nullptr) {
+		// Inline: prepare on this thread from the snapshot, then commit at once.
+		auto& slot = *m_inline_slot;
+		FillSlot(slot, submit_id, index_args, auto_args, context, user_config, shaders);
+		Prepare(m_renderer.GetPipelineCache(), slot.registers, true, slot.prepared);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
+		Commit(slot);
+		return true;
+	}
+	auto& window = m_workers->window;
+	if (window.Full()) {
+		CommitHead();
+	}
+	FillSlot(window.Reserve(), submit_id, index_args, auto_args, context, user_config, shaders);
+	window.Publish();
+	m_workers->Wake();
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepPublished);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepWindowOccupancy, window.Occupancy());
 	return true;
+}
+
+void Engine::CommitHead() {
+	auto& window = m_workers->window;
+	EXIT_IF(window.Empty());
+	auto& slot = window.HeadPayload();
+	if (window.TryClaimHead()) {
+		// No worker has started it: prepare it here, with the exact clean predicate.
+		Prepare(m_renderer.GetPipelineCache(), slot.registers, true, slot.prepared);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
+	} else if (window.HeadDone()) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepReady);
+	} else {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaits);
+		Profiler::ScopedFrameWait wait(Profiler::FrameWait::DrawPrepCommitWait);
+		for (uint32_t spins = 1; !window.HeadDone(); spins++) {
+			CpuRelax();
+			// A worker blocked in a page fault waits for this thread to service it.
+			if ((spins & 1023u) == 0u && m_service_commands) {
+				m_service_commands();
+			}
+		}
+	}
+	Commit(slot);
+	window.Retire();
+}
+
+void Engine::Drain() {
+	if (!Pending()) {
+		return;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepDrains);
+	while (Pending()) {
+		CommitHead();
+	}
 }
 
 void Engine::Commit(Slot& slot) {
@@ -445,10 +623,6 @@ void Engine::Commit(Slot& slot) {
 	}
 	scheduler.RestoreRegisters(previous);
 }
-
-void Engine::CommitHead() {}
-
-void Engine::Drain() {}
 
 void Engine::NoteFence() {
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepFences);

@@ -2,6 +2,7 @@
 // and (S6) the preparation window ring.
 #include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
+#include "graphics/host_gpu/renderer/drawPrep/window.h"
 
 #include <array>
 #include <atomic>
@@ -319,6 +320,136 @@ void TestRecordScopeNests() {
 	std::thread([] { Check(!DrawPrep::Speculative(), "recorders are per thread"); }).join();
 }
 
+// ---------------------------------------------------------------------------------------------
+// Window (S6)
+
+struct Item {
+	uint64_t input  = 0;
+	uint64_t output = 0;
+	uint32_t prepared_by = 0; // 0 = producer, k = worker k
+	uint32_t preparations = 0;
+};
+
+uint64_t Work(uint64_t value) {
+	// Deterministic, a little expensive, so workers and the producer race for slots.
+	uint64_t x = value * 0x9e3779b97f4a7c15ull + 1u;
+	for (int i = 0; i < 64; i++) {
+		x ^= x >> 29u;
+		x *= 0xbf58476d1ce4e5b9ull;
+	}
+	return x;
+}
+
+void TestWindowSingleThread() {
+	DrawPrep::Window<Item> window(3);
+	Check(window.Capacity() == 4, "capacity rounds up to a power of two");
+	Check(window.Empty() && !window.Full(), "new window is empty");
+	for (uint64_t i = 0; i < 4; i++) {
+		window.Reserve().input = i;
+		window.Publish();
+	}
+	Check(window.Full() && window.Occupancy() == 4, "window fills to capacity");
+	uint64_t seq  = 0;
+	auto*    item = window.TryClaim(seq);
+	Check(item != nullptr && seq == 0 && item->input == 0, "a worker claims the oldest slot");
+	Check(!window.TryClaimHead(), "the producer cannot claim a worker's slot");
+	Check(!window.HeadDone(), "a claimed slot is not done");
+	window.Complete(seq);
+	Check(window.HeadDone(), "a completed head is done");
+	window.Retire();
+	Check(window.TryClaimHead(), "the producer claims an unclaimed head");
+	window.Retire();
+	auto* third = window.TryClaim(seq);
+	Check(third != nullptr && seq == 2, "workers skip positions the producer took");
+	window.Complete(seq);
+	Check(window.HeadDone(), "the third slot is done");
+	window.Retire();
+	Check(window.TryClaimHead(), "the last slot is claimable by the producer");
+	window.Retire();
+	Check(window.Empty(), "window drained");
+	Check(window.TryClaim(seq) == nullptr, "nothing to claim in an empty window");
+	// Reuse after wrap: the slot of position 4 is the slot of position 0.
+	window.Reserve().input = 42;
+	window.Publish();
+	auto* wrapped = window.TryClaim(seq);
+	Check(wrapped != nullptr && seq == 4 && wrapped->input == 42, "wrapped slot is claimable");
+	window.Complete(seq);
+	window.Retire();
+}
+
+void TestWindowConcurrent(uint32_t capacity, uint32_t workers, uint64_t items) {
+	DrawPrep::Window<Item> window(capacity);
+	std::atomic<bool>      stop {false};
+	std::vector<std::thread> threads;
+	for (uint32_t w = 0; w < workers; w++) {
+		threads.emplace_back([&, w] {
+			while (!stop.load(std::memory_order_acquire)) {
+				uint64_t seq  = 0;
+				auto*    item = window.TryClaim(seq);
+				if (item == nullptr) {
+					std::this_thread::yield();
+					continue;
+				}
+				item->output      = Work(item->input);
+				item->prepared_by = w + 1u;
+				item->preparations++;
+				window.Complete(seq);
+			}
+		});
+	}
+	uint64_t next_input   = 0;
+	uint64_t next_retire  = 0;
+	uint64_t self         = 0;
+	uint64_t by_workers   = 0;
+	bool     order_ok     = true;
+	bool     result_ok    = true;
+	const auto retire_head = [&] {
+		auto& item = window.HeadPayload();
+		if (window.TryClaimHead()) {
+			item.output      = Work(item.input);
+			item.prepared_by = 0;
+			item.preparations++;
+			self++;
+		} else {
+			while (!window.HeadDone()) {
+				std::this_thread::yield();
+			}
+			by_workers++;
+		}
+		order_ok &= item.input == next_retire;
+		result_ok &= item.output == Work(item.input) && item.preparations == 1;
+		next_retire++;
+		window.Retire();
+	};
+	while (next_input < items) {
+		if (window.Full()) {
+			retire_head();
+		}
+		auto& item        = window.Reserve();
+		item.input        = next_input++;
+		item.output       = 0;
+		item.preparations = 0;
+		window.Publish();
+		// Occasionally drain like a fence does.
+		if (next_input % 97u == 0u) {
+			while (!window.Empty()) {
+				retire_head();
+			}
+		}
+	}
+	while (!window.Empty()) {
+		retire_head();
+	}
+	stop.store(true, std::memory_order_release);
+	for (auto& thread: threads) {
+		thread.join();
+	}
+	Check(order_ok, "items retire in publication order");
+	Check(result_ok, "every item is prepared exactly once with the right result");
+	Check(next_retire == items && self + by_workers == items, "every item retires once");
+	Check(by_workers > 0, "workers prepared some items");
+}
+
 } // namespace
 
 int main() {
@@ -332,6 +463,10 @@ int main() {
 	TestReadSetInconsistent();
 	TestReadSetLimits();
 	TestRecordScopeNests();
+	TestWindowSingleThread();
+	TestWindowConcurrent(4, 8, 200000);  // tiny window: constant wrap-around and races
+	TestWindowConcurrent(32, 6, 200000); // the default shape
+	TestWindowConcurrent(32, 1, 50000);
 	if (g_failures != 0) {
 		std::fprintf(stderr, "DrawPrepTests: %d failure(s)\n", g_failures);
 		return 1;

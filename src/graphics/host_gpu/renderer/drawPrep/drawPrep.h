@@ -30,6 +30,11 @@
 // KYTY_DRAW_PREP_VERIFY=1|exit: after every committed preparation the serial preparation runs
 // on copies and the outputs are compared (logged and counted; "exit" stops on a difference).
 // KYTY_DRAW_PREP_CERT=value (default)|log: see Validate() in drawPrep.cpp.
+// KYTY_DRAW_PREP_WORKERS (default 6, 1..32), KYTY_DRAW_PREP_WINDOW (default 32 slots, rounded
+// up to a power of two), KYTY_DRAW_PREP_SPIN_US (default 200: how long an idle worker spins
+// before parking): parallel mode only.
+// KYTY_DRAW_PREP_HISTOGRAM=1: the S0 draws-per-fence histogram also in off mode (the packet
+// classification runs, nothing else changes).
 namespace Libs::Graphics {
 
 class RenderContext;
@@ -120,42 +125,55 @@ enum class PacketClass : uint8_t {
 
 enum class DrawKind : uint8_t { Index, Auto };
 
-// Owned by the graphics command processor; used only on the GPU thread.
+// Owned by the graphics command processor; its methods run only on the GPU thread.
+//
+// Parallel mode (S6): Submit publishes the draw (register snapshot + resolved arguments) into
+// the window, where KYTY_DRAW_PREP_WORKERS DrawPrep#k threads claim and prepare it. The command
+// processor keeps parsing. Drain commits every pending draw in guest order; the command processor
+// drains before every fence packet, before servicing commands from other threads, when a
+// draw's instance count may be GPU data, and at the end of every command-stream slice. A head
+// slot no worker has claimed yet is prepared by the command processor itself; a claimed one is
+// waited for (spinning, servicing commands from other threads so that a worker's page fault can
+// never deadlock). Workers never touch the caches, the scheduler or Vulkan; a failed preparation
+// or certificate runs the serial preparation at commit.
 class Engine {
 public:
-	explicit Engine(RenderContext& renderer);
+	// service_commands runs the GPU thread's pending cross-thread commands (used while waiting).
+	Engine(RenderContext& renderer, std::function<void()> service_commands);
 	~Engine();
 	Engine(const Engine&)            = delete;
 	Engine& operator=(const Engine&) = delete;
 
 	// Takes a direct draw whose arguments the command processor has fully resolved. Returns
-	// false when the caller must execute the draw serially now (the engine has committed every
-	// earlier draw first).
+	// false when the caller must execute the draw serially now (off mode).
 	[[nodiscard]] bool Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
 	                          const DrawAutoArgs* auto_args, const HW::Context& context,
 	                          const HW::UserConfig& user_config, const HW::Shader& shaders);
 	// Commits every pending draw in submission order.
 	void Drain();
-	[[nodiscard]] bool Pending() const noexcept { return m_head != m_tail; }
+	[[nodiscard]] bool Pending() const noexcept;
 
 	// Per-packet hook of the command processor (before the packet's handler runs).
 	void OnPacket(PacketClass packet_class);
 
-private:
 	struct Slot;
-	struct Shared;
+
+private:
+	struct Workers;
 
 	void Commit(Slot& slot);
 	void CommitHead();
 	void NoteFence();
+	void FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index_args,
+	              const DrawAutoArgs* auto_args, const HW::Context& context,
+	              const HW::UserConfig& user_config, const HW::Shader& shaders);
 
-	RenderContext&                     m_renderer;
-	Mode                               m_mode;
-	std::vector<std::unique_ptr<Slot>> m_slots;
-	uint64_t                           m_head = 0; // next slot to commit
-	uint64_t                           m_tail = 0; // next slot to publish
-	uint64_t                           m_draws_since_fence = 0;
-	std::shared_ptr<Shared>            m_shared;
+	RenderContext&           m_renderer;
+	Mode                     m_mode;
+	std::function<void()>    m_service_commands;
+	std::unique_ptr<Slot>    m_inline_slot;
+	std::unique_ptr<Workers> m_workers; // parallel mode: the window and its threads
+	uint64_t                 m_draws_since_fence = 0;
 };
 
 } // namespace DrawPrep
