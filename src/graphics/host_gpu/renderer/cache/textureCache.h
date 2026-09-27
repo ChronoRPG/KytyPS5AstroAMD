@@ -145,7 +145,21 @@ private:
 		}
 	}
 
-	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
+	// resident_first > 0: register only the prefix holding levels [resident_first, levels)
+	// (resident_prefix bytes, computed when 0); stays fully resident when not applicable.
+	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info, uint32_t resident_first = 0,
+	                                      uint64_t resident_prefix = 0);
+	// Resident mip levels (Image::live, KYTY_TEXTURE_RESIDENT_MIPS). Caller holds m_lock.
+	// The finest level a view of `desc` can read, for an image with `levels` levels.
+	[[nodiscard]] uint32_t    RequestedFirstLevel(const ImageDesc& desc, uint32_t levels) const;
+	[[nodiscard]] uint64_t    ResidentPrefixSize(const ImageInfo& info, uint32_t first_level) const;
+	// Makes levels >= first_level resident (re-registration; the next refresh uploads them).
+	// `sampling`: requested by a sampled view (counted as an extension, else a fallback).
+	void                      EnsureResidency(ImageId id, uint32_t first_level, bool sampling);
+	// Whole chain resident and refreshed now, before a non-sampling use records anything.
+	void                      RequireFullResidency(ImageId id);
+	void                      PoisonNonResidentLevels(Image& image);
+	void                      RetireIdlePartialImages();
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
@@ -209,6 +223,12 @@ private:
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
+	[[nodiscard]] static TextureTransfer BuildTextureTransfer(const ImageInfo& info,
+	                                                          uint32_t backing_samples,
+	                                                          BindingType binding,
+	                                                          TransferDirection direction);
+	// Drops the regions (and tiles) of non-resident levels and packs the detiled scratch.
+	void RestrictToResidentLevels(const Image& image, TextureTransfer& transfer) const;
 	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
@@ -297,6 +317,13 @@ private:
 	// (KYTY_TEXTURE_FAULT_FAST_PATH=0 always takes the lock).
 	std::unique_ptr<std::atomic<uint32_t>[]> m_image_page_counts;
 	bool                                     m_fault_fast_path = true;
+	enum class ResidencyMode : uint8_t { Off, On, Poison };
+	ResidencyMode                            m_residency            = ResidencyMode::On;
+	uint64_t                                 m_residency_violations = 0;
+	// Partially resident images (stale ids are dropped by the once-per-frame scan).
+	std::vector<ImageId>                     m_partial_images;
+	uint64_t                                 m_partial_scan_frame   = 0;
+	uint64_t                                 m_resident_idle_frames = 30;
 	// KYTY_TEXEL_SYNC_SKIP=0 downloads image contents for every texel-buffer read.
 	bool                                     m_texel_sync_skip = true;
 	[[nodiscard]] StreamBuffer& StagingRing();

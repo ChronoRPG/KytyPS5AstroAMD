@@ -213,6 +213,14 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.TextureInvalidateSkips.Cumulative",
     "FrameEvent.TexelImageSyncDownloads.Cumulative",
     "FrameEvent.TexelImageSyncSkips.Cumulative",
+    "FrameEvent.TextureResidentImages.Cumulative",
+    "FrameEvent.TextureResidentLevelsSkipped.Cumulative",
+    "FrameEvent.TextureResidentBytesSkipped.Cumulative",
+    "FrameEvent.TextureResidencyExtensions.Cumulative",
+    "FrameEvent.TextureResidencyFullFallbacks.Cumulative",
+    "FrameEvent.TextureResidencyUnmapFrees.Cumulative",
+    "FrameEvent.TextureResidencyViolations.Cumulative",
+    "FrameEvent.TextureResidentIdleFrees.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 

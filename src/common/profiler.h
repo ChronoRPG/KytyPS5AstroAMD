@@ -301,6 +301,20 @@ enum class FrameEvent : uint32_t {
 	// changed since the previous one (KYTY_TEXEL_SYNC_SKIP).
 	TexelImageSyncDownloads,
 	TexelImageSyncSkips,
+	// Resident mip levels (KYTY_TEXTURE_RESIDENT_MIPS): images created holding only the levels
+	// their views can sample and the levels left out, guest bytes their refreshes did not
+	// upload, residency extensions (a finer MIN_LOD, or any non-sampling use), extensions to
+	// the whole chain for non-sampling uses, partially resident images retired by an unmap of
+	// their non-resident bytes, and GPU writes that reached a partially resident image (0).
+	TextureResidentImages,
+	TextureResidentLevelsSkipped,
+	TextureResidentBytesSkipped,
+	TextureResidencyExtensions,
+	TextureResidencyFullFallbacks,
+	TextureResidencyUnmapFrees,
+	TextureResidencyViolations,
+	// Partially resident images retired after KYTY_TEXTURE_RESIDENT_IDLE_FRAMES unused frames.
+	TextureResidentIdleFrees,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

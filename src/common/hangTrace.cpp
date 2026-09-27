@@ -150,7 +150,7 @@ constexpr const char* kReadbackKindNames[] = {"invalidate", "fault-read", "fault
 constexpr const char* kImageFreeReasonNames[] = {
     "other",           "depth-association", "depth-recreate", "overlap-layout",
     "overlap-mip-merge", "overlap-stale",   "expand",         "smaller-resources",
-    "unmap",           "gc",                "pressure-gc"};
+    "unmap",           "gc",                "pressure-gc",    "resident-idle"};
 static_assert(std::size(kImageFreeReasonNames) == static_cast<size_t>(ImageFreeReason::Count));
 
 struct NativeImageKey {
