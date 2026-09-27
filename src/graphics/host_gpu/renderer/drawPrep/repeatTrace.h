@@ -40,7 +40,8 @@
 //                         3 ib-chain)} followed by the dwords
 // Bursts: KYTY_CP_REPEAT_BURST_FRAMES consecutive frames (default 4) every
 // KYTY_CP_REPEAT_BURST_PERIOD_MS (default 20000), at most KYTY_CP_REPEAT_BURSTS (default 30).
-// KYTY_CP_REPEAT_PAYLOAD=0 skips the payload hash (worker time: up to 64 KiB per V#).
+// Payload: the first KYTY_CP_REPEAT_PAYLOAD_PER_VSHARP bytes (default 4096) of every V# range, at
+// most KYTY_CP_REPEAT_PAYLOAD_LIMIT (default 16384) per draw; KYTY_CP_REPEAT_PAYLOAD=0 skips it.
 namespace Libs::Graphics {
 
 namespace HW {
@@ -78,7 +79,7 @@ enum Component : uint32_t {
 	UserData,  // user data of the resource snapshots
 	Reads,     // the preparation's read set: ranges and bytes
 	ReadBytes, // the read set's bytes only (content repetition at other addresses)
-	Payload,   // bytes behind the V#s (constant and vertex data), capped per V#
+	Payload,   // leading bytes behind every V# (constant and vertex data), content only
 	Count
 };
 

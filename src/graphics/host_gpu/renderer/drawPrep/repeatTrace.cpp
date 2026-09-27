@@ -458,8 +458,8 @@ struct Settings {
 	uint64_t burst_period   = 20000;
 	uint64_t max_bursts     = 30;
 	uint64_t dump_bursts    = 12;
-	uint64_t payload_per_vs = 64u * 1024u;
-	uint64_t payload_limit  = 256u * 1024u;
+	uint64_t payload_per_vs = 4096;
+	uint64_t payload_limit  = 16384;
 };
 
 const Settings& GetSettings() {
@@ -472,8 +472,8 @@ const Settings& GetSettings() {
 		s.burst_period   = EnvU64("KYTY_CP_REPEAT_BURST_PERIOD_MS", 20000);
 		s.max_bursts     = EnvU64("KYTY_CP_REPEAT_BURSTS", 30);
 		s.dump_bursts    = EnvU64("KYTY_CP_REPEAT_DCB_DUMP_BURSTS", 12);
-		s.payload_per_vs = EnvU64("KYTY_CP_REPEAT_PAYLOAD_PER_VSHARP", 64u * 1024u);
-		s.payload_limit  = EnvU64("KYTY_CP_REPEAT_PAYLOAD_LIMIT", 256u * 1024u);
+		s.payload_per_vs = EnvU64("KYTY_CP_REPEAT_PAYLOAD_PER_VSHARP", 4096);
+		s.payload_limit  = EnvU64("KYTY_CP_REPEAT_PAYLOAD_LIMIT", 16384);
 		return s;
 	}();
 	return settings;
