@@ -2260,6 +2260,179 @@ void TestLoopCycleEnteredThroughRuntimeValue() {
   BuildSrtPlan(fixture.program);
 }
 
+// A loop walks linked records, as a BVH traversal walks instance records: the record pointer is
+// loop-carried, and an S_BUFFER_LOAD reads through a V# stored in the current record.
+// KYTY_SRT_VARIANT_READS (variant_reads) must keep the record reads out of the flat SRT buffer,
+// which is evaluated before the dispatch, and read that V# through BDA.
+std::unique_ptr<Fixture> MakeLoopVariantRecordFixture(bool variant_reads) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  auto fixture = std::make_unique<Fixture>();
+  auto *entry = fixture->block;
+  auto *loop = fixture->AddBlock();
+  auto *exit = fixture->AddBlock();
+  entry->AddBranch(loop);
+  loop->AddBranch(loop);
+  loop->AddBranch(exit);
+  fixture->program.block_info[0].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                               .true_block = 1u};
+  fixture->program.block_info[1].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1u, .false_block = 2u};
+  fixture->program.block_info[2].terminator = {.kind = CFG::TerminatorKind::Return};
+
+  const auto root_low = fixture->UserData(0);
+  const auto root_high = fixture->UserData(1);
+  auto &low = loop->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  auto &high = loop->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  fixture->block = loop;
+  const auto record = fixture->Address(Value(&low), Value(&high), 0x10);
+  const auto read = [&](uint32_t offset, uint32_t pc) {
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarAddress;
+    scalar.offset = offset;
+    return fixture->Emit(ValueOpcode::LoadAddressU32,
+                         {record, Value(0u), Value(0u), Value(true)},
+                         fixture->AddMemory(scalar, pc));
+  };
+  const auto next_low = read(0u, 0x10);
+  const auto next_high = read(4u, 0x10);
+  const auto handle = fixture->Buffer(
+      {read(16u, 0x14), read(20u, 0x14), read(24u, 0x14), read(28u, 0x14)}, 0x18);
+  MemoryInfo scalar_buffer;
+  scalar_buffer.kind = ResourceKind::ScalarBuffer;
+  scalar_buffer.offset = 8u;
+  fixture->Emit(ValueOpcode::ReadConstBuffer, {handle, Value(0u)},
+                fixture->AddMemory(scalar_buffer, 0x18));
+  fixture->program.block_info[1].condition =
+      fixture->Emit(ValueOpcode::INotEqual32, {fixture->UserData(2), Value(0u)});
+  low.AddPhiOperand(entry, root_low);
+  low.AddPhiOperand(loop, next_low);
+  high.AddPhiOperand(entry, root_high);
+  high.AddPhiOperand(loop, next_high);
+  BuildSrtPlan(fixture->program, variant_reads);
+  return fixture;
+}
+
+void TestLoopVariantRecordReads() {
+  std::array<uint32_t, 3> user_data{0x1000u, 0u, 4u};
+  TestMemory memory;
+  SrtRuntime runtime{.user_data = user_data,
+                     .read_memory = ReadTestMemory,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadTestMemory};
+
+  // Default: the record reads get flat slots, whose evaluation before the dispatch cannot follow
+  // the loop, so the dispatch's resources never materialize (and it is dropped).
+  {
+    auto fixture = MakeLoopVariantRecordFixture(false);
+    Check(fixture->program.srt_reads.size() == 6u && fixture->program.dynamic_reads.empty(),
+          "loop-carried record reads were not flattened by default");
+    TrackResources(fixture->program);
+    Check(fixture->program.info.buffers.size() == 1u,
+          "flattened record V# was not a bound buffer by default");
+    const auto plan = ExtractResourcePlan(fixture->program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "a flat slot behind a loop-variant pointer materialized");
+  }
+
+  // Variant reads: no flat slot depends on the loop, the S_BUFFER_LOAD needs a runtime V#, and
+  // tracking without indirect scalar buffers rejects it as before.
+  {
+    auto fixture = MakeLoopVariantRecordFixture(true);
+    Check(fixture->program.srt_reads.empty() && fixture->program.dynamic_reads.size() == 6u,
+          "loop-carried record reads were flattened with variant reads");
+    CheckFatal([&] { TrackResources(fixture->program); }, "not a valid runtime value",
+               "a runtime S_BUFFER_LOAD V# was accepted without indirect scalar buffers");
+  }
+  {
+    auto fixture = MakeLoopVariantRecordFixture(true);
+    Check(TrackResources(fixture->program, true) == UINT32_MAX,
+          "a runtime S_BUFFER_LOAD V# was reported unresolved");
+    const auto read = std::ranges::find_if(fixture->program.memory_info, [](const MemoryInfo &m) {
+      return m.offset == 8u && m.data_bits == 32u && m.kind == ResourceKind::IndirectBuffer;
+    });
+    Check(read != fixture->program.memory_info.end() && fixture->program.info.buffers.empty() &&
+              fixture->program.descriptor_sources.empty() && fixture->program.info.uses_dma,
+          "runtime S_BUFFER_LOAD V# did not become a BDA read");
+    const auto plan = ExtractResourcePlan(fixture->program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    memory.reads = 0u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.reads == 0u,
+          "loop-variant record reads were evaluated before the dispatch");
+    ShaderComputeInputInfo compute{};
+    CollectShaderInfo(fixture->program, {.compute = &compute});
+    AllocateBindings(fixture->program);
+    Check(FindBinding(fixture->program.bindings, DescriptorBindingKind::FlattenedSrt) == nullptr &&
+              FindBinding(fixture->program.bindings, DescriptorBindingKind::BdaPagetable) !=
+                  nullptr,
+          "runtime record reads received the wrong resource bindings");
+  }
+}
+
+// Variant reads with a T# read from a loop-carried record: images have no BDA path, so tracking
+// reports the first such use and the program is dropped (as its failing flat slots dropped it
+// before), instead of failing.
+void TestLoopVariantImageIsDropped() {
+  auto fixture = MakeLoopVariantRecordFixture(true);
+  auto &loop = *fixture->program.blocks[1];
+  fixture->block = &loop;
+  const auto *record =
+      fixture->program.dynamic_reads.front().ResolveInstruction()->Arg(0).ResolveInstruction();
+  std::array<Value, 8> words;
+  for (uint32_t word = 0; word < words.size(); ++word) {
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarAddress;
+    scalar.offset = 32u + word * sizeof(uint32_t);
+    words[word] = fixture->Emit(ValueOpcode::LoadAddressU32,
+                                {Value(const_cast<Inst *>(record)), Value(0u), Value(0u), Value(true)},
+                                fixture->AddMemory(scalar, 0x40));
+  }
+  MemoryInfo load;
+  load.kind = ResourceKind::Image;
+  load.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture->Emit(ValueOpcode::ImageRead,
+                {fixture->Image(words, 0x44), fixture->ImageAddress(), Value(true)},
+                fixture->AddMemory(load, 0x44));
+  // Plan again with the image in place (the fixture planned before it existed; with variant
+  // reads that plan patched nothing).
+  BuildSrtPlan(fixture->program, true);
+  Check(TrackResources(fixture->program, true) == 0x44u,
+        "a loop-variant T# was not reported for dropping");
+}
+
+// Variant reads leave loop-invariant pointers alone: a phi that only carries its entry value is
+// still evaluated before the dispatch through a flat slot.
+void TestLoopInvariantReadsStayFlat() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *loop = fixture.AddBlock();
+  entry->AddBranch(loop);
+  loop->AddBranch(loop);
+  auto &low = loop->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  low.AddPhiOperand(entry, fixture.UserData(0));
+  low.AddPhiOperand(loop, Value(&low));
+  fixture.block = loop;
+  const auto table = fixture.Address(Value(&low), fixture.UserData(1), 4);
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarAddress;
+  const auto word = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {table, Value(0u), Value(0u), Value(true)},
+                                 fixture.AddMemory(scalar, 4));
+  const auto handle = fixture.Buffer({word, Value(0u), Value(64u), Value(0u)}, 8);
+  MemoryInfo buffer;
+  buffer.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(buffer, 8));
+  BuildSrtPlan(fixture.program, true);
+  TrackResources(fixture.program, true);
+  Check(fixture.program.srt_reads.size() == 1u && fixture.program.dynamic_reads.empty() &&
+            fixture.program.info.buffers.size() == 1u,
+        "a loop-invariant pointer read lost its flat slot with variant reads");
+}
+
 void TestInvariantLoopPhi() {
   Fixture fixture;
   auto *entry = fixture.block;
@@ -3048,6 +3221,9 @@ int main() {
     Run("guarded sampler phi", TestGuardedSamplerPhi);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
+    Run("loop-variant record reads", TestLoopVariantRecordReads);
+    Run("loop-variant image dropped", TestLoopVariantImageIsDropped);
+    Run("loop-invariant reads stay flat", TestLoopInvariantReadsStayFlat);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);

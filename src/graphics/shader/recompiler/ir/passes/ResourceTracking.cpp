@@ -82,7 +82,9 @@ uint32_t ByteExtent(const MemoryInfo& memory) {
 
 class Tracker {
 public:
-	explicit Tracker(Program& program): m_program(program), m_info(program.info) {
+	Tracker(Program& program, bool indirect_scalar_buffers)
+	    : m_program(program), m_info(program.info),
+	      m_indirect_scalar_buffers(indirect_scalar_buffers) {
 		m_info.buffers.clear();
 		m_info.images.clear();
 		m_info.samplers.clear();
@@ -1029,6 +1031,10 @@ private:
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
+			if (m_indirect_scalar_buffers) {
+				MarkUnresolved(pc);
+				return false;
+			}
 			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
 			                     ValueOpcodeName(expected), bad_dword));
 		}
@@ -1206,7 +1212,17 @@ private:
 		if (buffer != BufferAccess::None) {
 			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle,
 			               source)) {
-				if (memory.kind != ResourceKind::Buffer || !memory.SupportsIndirectBufferLoad(op)) {
+				// An S_BUFFER_LOAD through a V# the shader computed (KYTY_SRT_VARIANT_READS, e.g.
+				// a BVH instance's record) reads through BDA like the vector raw loads below.
+				const bool indirect_scalar = m_indirect_scalar_buffers &&
+				                             memory.kind == ResourceKind::ScalarBuffer &&
+				                             memory.SupportsIndirectBufferLoad(op);
+				if (!indirect_scalar &&
+				    (memory.kind != ResourceKind::Buffer || !memory.SupportsIndirectBufferLoad(op))) {
+					if (m_indirect_scalar_buffers) {
+						MarkUnresolved(flags.pc);
+						return;
+					}
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
 					     "requires a raw DWORD x2/x3/x4 load");
@@ -1254,8 +1270,9 @@ private:
 		const auto* indirect = handle != nullptr ? FindIndirectImage(*handle) : nullptr;
 		if (indirect != nullptr) {
 			source = indirect->source;
-		} else {
-			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle, source);
+		} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle,
+		                      source)) {
+			return; // unresolved (KYTY_SRT_VARIANT_READS): the shader is skipped
 		}
 		resource = AddImage(source, memory, op, flags.pc);
 		if (resource == UINT32_MAX) {
@@ -1271,8 +1288,10 @@ private:
 			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
-			GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc, sampler_handle,
-			          sampler_source, true, sample_adjust);
+			if (!GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
+			               sampler_handle, sampler_source, true, sample_adjust)) {
+				return; // unresolved (KYTY_SRT_VARIANT_READS): the shader is skipped
+			}
 			sampler = AddSampler(sampler_source, flags.pc);
 			if (sampler == UINT32_MAX) {
 				Fail(flags.pc, "sampler resource limit exceeded");
@@ -1320,12 +1339,24 @@ private:
 	std::vector<IndirectImagePlan>             m_indirect_images;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
+	bool                                       m_indirect_scalar_buffers = false;
+	uint32_t                                   m_unresolved_pc = UINT32_MAX;
+
+public:
+	// KYTY_SRT_VARIANT_READS: a descriptor the shader computes at runtime that has no BDA path
+	// (an image, a sampler, a single-dword vector load). Planning it at runtime removed the flat
+	// slot that would have failed to evaluate and dropped the dispatch, so the program is dropped
+	// here instead of failing: never worse than without the switch.
+	void MarkUnresolved(uint32_t pc) { m_unresolved_pc = std::min(m_unresolved_pc, pc); }
+	[[nodiscard]] uint32_t UnresolvedPc() const { return m_unresolved_pc; }
 };
 
 } // namespace
 
-void TrackResources(Program& program) {
-	Tracker(program).Run();
+uint32_t TrackResources(Program& program, bool indirect_scalar_buffers) {
+	Tracker tracker(program, indirect_scalar_buffers);
+	tracker.Run();
+	return tracker.UnresolvedPc();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

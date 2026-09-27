@@ -781,6 +781,9 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_BACKING_INPLACE=0")
 	add_test(NAME buffer_cache_eager_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --readback-eager-only)
+	# KYTY_SRT_VARIANT_READS: loop-variant scalar reads and runtime S_BUFFER_LOAD V#s through BDA.
+	add_test(NAME srt_variant_reads
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srt-variant-only)
 
 	if(WIN32)
 		# These tests still depend on the Windows multisample-depth path.

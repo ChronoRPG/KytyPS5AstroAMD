@@ -48,6 +48,14 @@ struct CodegenOptions {
 	// perspective (NoPerspective on all inputs when LINEAR_CENTER is enabled) instead of per input
 	// from the I/J pair its V_INTERP_P2 reads use (centroid, sample, linear).
 	bool interp_modes = true;
+	// KYTY_SRT_VARIANT_READS=1: a scalar read whose address is only known inside the shader (not a
+	// valid runtime value: e.g. a BVH traversal's loop-carried instance pointer, or data the GPU
+	// produces) is planned as a runtime read instead of a flat SRT slot. A flat slot is evaluated
+	// once before the dispatch, so such a slot always fails to evaluate and the whole dispatch is
+	// dropped. An S_BUFFER_LOAD through a V# read that way then reads through BDA, and a program with
+	// another such descriptor (no BDA path) is dropped, as before. Reads whose address can be
+	// evaluated before the dispatch keep their flat slots.
+	bool srt_variant_reads = false;
 };
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();

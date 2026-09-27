@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
@@ -25,7 +26,9 @@
 #include <chrono>
 #include <fmt/format.h>
 #include <map>
+#include <mutex>
 #include <span>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -484,6 +487,24 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 
 } // namespace
 
+// KYTY_SRT_VARIANT_READS: logs each program dropped because a descriptor it computes at runtime
+// has no BDA path (see TrackResources). Without the switch its flat SRT slots fail to evaluate and
+// its dispatches or draws are dropped just the same.
+static void NoteUnresolvedDescriptor(const CompileOptions& options, uint32_t pc) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> logged;
+	{
+		std::scoped_lock lock(mutex);
+		if (!logged.insert(options.shader_hash ^ static_cast<uint64_t>(options.stage)).second) {
+			return;
+		}
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "KYTY_SRT_VARIANT_READS: {} shader 0x{:016x} computes a descriptor at runtime (pc=0x{:08x}) "
+	    "that has no BDA path; its dispatches and draws are skipped.\n",
+	    StageName(options.stage), options.shader_hash, pc));
+}
+
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
@@ -615,9 +636,16 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::EliminateDeadCode(ir.blocks);
 	}
 	LowerTessellationMemory(ir, options);
-	IR::BuildSrtPlan(ir);
+	const bool variant_reads = GetCodegenOptions().srt_variant_reads;
+	IR::BuildSrtPlan(ir, variant_reads);
 	IR::EliminateDeadCode(ir.blocks);
-	IR::TrackResources(ir);
+	if (const auto unresolved_pc = IR::TrackResources(ir, variant_reads);
+	    unresolved_pc != UINT32_MAX) {
+		NoteUnresolvedDescriptor(options, unresolved_pc);
+		TranslateResult skipped;
+		skipped.skip_dispatch = true;
+		return skipped;
+	}
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
 	result.program = std::move(ir);

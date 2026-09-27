@@ -37604,6 +37604,7 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 }
 
 #include "ShaderCodegenTests.inc"
+#include "ShaderSrtVariantTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
@@ -38170,6 +38171,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--readlane-key-guard-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--srt-variant-only") == 0) {
+    VulkanHarness vulkan;
+    SrtVariantTests::RunAll(&vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--codegen-only") == 0) {

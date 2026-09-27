@@ -25,6 +25,7 @@ CodegenOptions FromEnvironment() {
 	options.lod_stats_gate = EnvFlag("KYTY_LOD_STATS_GATE", options.lod_stats_gate);
 	options.robust_buffer_loads = EnvFlag("KYTY_ROBUST_BUFFER_LOADS", options.robust_buffer_loads);
 	options.interp_modes = EnvFlag("KYTY_INTERP_MODES", options.interp_modes);
+	options.srt_variant_reads = EnvFlag("KYTY_SRT_VARIANT_READS", options.srt_variant_reads);
 	if (const auto* mode = std::getenv("KYTY_MAD_MODE"); mode != nullptr) {
 		if (std::strcmp(mode, "exact") == 0) {
 			options.mad_mode = MadMode::Exact;
