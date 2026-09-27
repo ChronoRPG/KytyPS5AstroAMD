@@ -9880,6 +9880,13 @@ public:
                   enabled ? "a fast-clear-eliminate draw left a reader without DCC metadata "
                             "with the contents from before the clear"
                           : "a dropped fast-clear-eliminate draw changed the target");
+          // Either way a bind of the target with its metadata shows the clear and consumes
+          // the key (materialized here, or already by the eliminate).
+          bind();
+          Require(name, "bind after fast clear eliminate",
+                  ReadCachedTexel(name, context, color.image_id) ==
+                      std::vector<u32>(fill_case.texel.begin(), fill_case.texel.end()),
+                  "binding the target after the eliminate lost or repeated the clear");
           RenderExecutorTestAccess::ResetBindings(executor);
         }
 
