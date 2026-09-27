@@ -603,6 +603,96 @@ uint32_t EmitUGreaterThan64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	return CompareOrdered64(state, arg0, arg1, spv::OpUGreaterThan, spv::OpUGreaterThan);
 }
 
+namespace {
+
+void CollectPositionSlice(EmitterState& state) {
+	state.position_slice_ready = true;
+	std::vector<const IR::Inst*> pending;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != IR::ValueOpcode::SetAttribute) {
+				continue;
+			}
+			const auto index = inst.Flags<IR::ExportFlags>().index;
+			if (index < state.program.export_info.size() &&
+			    state.program.export_info[index].kind == IR::ExportTargetKind::Position) {
+				pending.push_back(&inst);
+			}
+		}
+	}
+	while (!pending.empty()) {
+		const auto* inst = pending.back();
+		pending.pop_back();
+		for (size_t index = 0; index < inst->NumArgs(); index++) {
+			const auto* producer = inst->Arg(index).Resolve().TryInstruction();
+			if (producer != nullptr && state.position_slice.insert(producer).second) {
+				pending.push_back(producer);
+			}
+		}
+	}
+}
+
+uint32_t EmitFloatBinary(ValueEmitContext& ctx, const IR::Inst& inst, spv::Op opcode) {
+	auto&      state  = ctx.state;
+	const auto result = Binary(state, opcode, TypeF32(state), ctx.Def(inst.Arg(0)),
+	                           ctx.Def(inst.Arg(1)));
+	if (NoContraction(state, inst)) {
+		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	}
+	return result;
+}
+
+} // namespace
+
+// MadMode: guest float arithmetic is never contracted by the guest's hardware (it contracts only
+// where the program uses FMA/FMAC explicitly), so a host FMA contraction changes bits. Exact
+// forbids it everywhere; Position only where the value reaches a position export, so that two
+// shaders computing the same position (depth pre-pass and main pass) cannot be compiled to
+// different roundings.
+bool NoContraction(EmitterState& state, const IR::Inst& inst) {
+	switch (GetCodegenOptions().mad_mode) {
+		case MadMode::Exact: return true;
+		case MadMode::Fused: return false;
+		case MadMode::Position:
+			if (!state.position_slice_ready) {
+				CollectPositionSlice(state);
+			}
+			return state.position_slice.contains(&inst);
+	}
+	return false;
+}
+
+uint32_t EmitFPAdd32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitFloatBinary(ctx, inst, spv::OpFAdd);
+}
+
+uint32_t EmitFPSub32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitFloatBinary(ctx, inst, spv::OpFSub);
+}
+
+uint32_t EmitFPMul32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitFloatBinary(ctx, inst, spv::OpFMul);
+}
+
+// V_MAD_F32/V_MAC_F32/V_MADMK_F32/V_MADAK_F32. PS5 executes them unfused (as GCN/RDNA1 did): the
+// product is rounded to f32, then added, so v_mad_f32 equals v_mul_f32 + v_add_f32 bit for bit.
+// An FMul and an FAdd, both NoContraction, reproduce that exactly; MadMode::Fused (and
+// MadMode::Position off the position data flow) keep the cheaper fused FMA of the old code.
+uint32_t EmitFPMad32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state = ctx.state;
+	const auto a     = ctx.Def(inst.Arg(0));
+	const auto b     = ctx.Def(inst.Arg(1));
+	const auto c     = ctx.Def(inst.Arg(2));
+	if (!NoContraction(state, inst)) {
+		return EmitExt(state, TypeF32(state), GLSLstd450Fma, {a, b, c});
+	}
+	const auto product = Binary(state, spv::OpFMul, TypeF32(state), a, b);
+	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
+	const auto sum = Binary(state, spv::OpFAdd, TypeF32(state), product, c);
+	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
+	return sum;
+}
+
 uint32_t EmitFPIsNan32(EmitterState& state, uint32_t arg0) {
 	return EmitNative<spv::OpFUnordNotEqual, IR::Type::U1>(state, arg0, arg0);
 }

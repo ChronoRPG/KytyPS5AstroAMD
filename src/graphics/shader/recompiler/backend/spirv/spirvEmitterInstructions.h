@@ -117,11 +117,12 @@ EMIT_NATIVE(FPOrdGreaterThanEqual32, OpFOrdGreaterThanEqual, U1, uint32_t, uint3
 EMIT_NATIVE(FPUnordGreaterThanEqual32, OpFUnordGreaterThanEqual, U1, uint32_t, uint32_t)
 uint32_t              EmitFPIsNan32(EmitterState& state, uint32_t arg0);
 inline constexpr auto EmitFPCmpClass32 = EmitClassMaskF32;
-EMIT_NATIVE(FPAdd32, OpFAdd, F32, uint32_t, uint32_t)
-EMIT_NATIVE(FPSub32, OpFSub, F32, uint32_t, uint32_t)
-EMIT_NATIVE(FPMul32, OpFMul, F32, uint32_t, uint32_t)
+uint32_t              EmitFPAdd32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitFPSub32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitFPMul32(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitFPFma32 =
     EmitGlsl<GLSLstd450Fma, IR::Type::F32, uint32_t, uint32_t, uint32_t>;
+uint32_t              EmitFPMad32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t EmitFPMin32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1);
 uint32_t EmitFPMax32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1);
 uint32_t EmitFPMinTri32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1, IR::Value arg2);

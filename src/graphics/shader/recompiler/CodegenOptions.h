@@ -5,6 +5,20 @@
 
 namespace Libs::Graphics::ShaderRecompiler {
 
+// How V_MAD_F32/V_MAC_F32/V_MADMK_F32/V_MADAK_F32 (unfused on PS5: the product is rounded before
+// the add) are emitted, and which float arithmetic may not be contracted by the host compiler.
+enum class MadMode : uint8_t {
+	// Every MAD is an FMul plus an FAdd, and every guest FMul/FAdd/FSub is NoContraction: bit
+	// exact everywhere, at the cost of one extra instruction per MAD.
+	Exact,
+	// Exact on the data flow that feeds position exports (plus Invariant on the position built-in),
+	// fused FMA elsewhere: positions computed by different shaders (depth pre-pass and main pass)
+	// match bit for bit, while pixel-shader math keeps the cheaper FMA.
+	Position,
+	// Every MAD is a fused FMA and the host may contract freely (the behaviour before MadMode).
+	Fused,
+};
+
 // Switches for code-generation changes that must stay revertible at runtime. Every field is read
 // from its environment variable once (first use); tests may replace the whole set. Programs are
 // cached in memory only and the driver pipeline cache is keyed by the SPIR-V code, so changing a
@@ -28,6 +42,8 @@ struct CodegenOptions {
 	// KYTY_ROBUST_BUFFER_LOADS=0: bounds-check every plain dword storage-buffer load in the shader
 	// even when the device's robustBufferAccess2 already returns zero for out-of-range dwords.
 	bool robust_buffer_loads = true;
+	// KYTY_MAD_MODE=exact|position|fused, see MadMode.
+	MadMode mad_mode = MadMode::Position;
 };
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();

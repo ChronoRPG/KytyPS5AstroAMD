@@ -24,6 +24,15 @@ CodegenOptions FromEnvironment() {
 	    EnvFlag("KYTY_SINGLE_F2I_SATURATION", options.single_f2i_saturation);
 	options.lod_stats_gate = EnvFlag("KYTY_LOD_STATS_GATE", options.lod_stats_gate);
 	options.robust_buffer_loads = EnvFlag("KYTY_ROBUST_BUFFER_LOADS", options.robust_buffer_loads);
+	if (const auto* mode = std::getenv("KYTY_MAD_MODE"); mode != nullptr) {
+		if (std::strcmp(mode, "exact") == 0) {
+			options.mad_mode = MadMode::Exact;
+		} else if (std::strcmp(mode, "fused") == 0) {
+			options.mad_mode = MadMode::Fused;
+		} else if (std::strcmp(mode, "position") == 0) {
+			options.mad_mode = MadMode::Position;
+		}
+	}
 	return options;
 }
 

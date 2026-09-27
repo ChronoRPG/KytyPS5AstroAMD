@@ -835,7 +835,158 @@ void CheckRobustBufferLoads(VulkanHarness *vulkan) {
               CountSpirv(device_spirv, "OpBranchConditional"));
 }
 
+// Random finite f32 with a moderate exponent, so products and sums stay normal.
+u32 RandomModerateF32(uint64_t &state) {
+  const auto bits = NextRandom(state);
+  const auto exponent = 127u - 20u + (NextRandom(state) % 41u);
+  return (bits & 0x807fffffu) | (exponent << 23u);
+}
+
+float RoundedF32(float value) {
+  volatile float stored = value;
+  return stored;
+}
+
+// V_MAD/MAC/MADMK/MADAK (unfused on PS5) and V_FMA (fused) in a compute shader under every
+// MadMode: Exact must give round(round(a*b)+c), Fused and Position (compute has no position
+// export) the fused result.
+void CheckMadModes(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenMadModes";
+  using O = ShaderOpcode;
+  std::vector<std::vector<u32>> inputs(3);
+  uint64_t seed = 0x3141592653589793ull;
+  while (inputs[0].size() < 16384u) {
+    for (auto &input : inputs) {
+      input.push_back(RandomModerateF32(seed));
+    }
+  }
+  static constexpr u32 MadmkConstant = 0x3fa66666u; // 1.3f
+  const auto bulk = MakeBulkCase(
+      name, 3, 6, inputs,
+      [](std::vector<u32> *code) {
+        AppendVop3(code, 0x141, 10, Vgpr(2), Vgpr(3), Vgpr(4)); // v_mad_f32
+        code->push_back(EncodeVop1(0x01, 11, Vgpr(4)));         // v_mov_b32 v11, v4
+        code->push_back(EncodeVop2(0x1f, 11, Vgpr(2), 3));      // v_mac_f32 v11, v2, v3
+        code->push_back(EncodeVop2(0x20, 12, Vgpr(2), 4));      // v_madmk_f32 v12, v2, K, v4
+        code->push_back(MadmkConstant);
+        code->push_back(EncodeVop2(0x21, 13, Vgpr(2), 3));      // v_madak_f32 v13, v2, v3, K
+        code->push_back(MadmkConstant);
+        AppendVop3(code, 0x14b, 14, Vgpr(2), Vgpr(3), Vgpr(4)); // v_fma_f32
+        code->push_back(EncodeVop1(0x01, 15, Vgpr(4)));         // v_mov_b32 v15, v4
+        code->push_back(EncodeVop2(0x2b, 15, Vgpr(2), 3));      // v_fmac_f32 v15, v2, v3
+      },
+      {O::V_MAD_F32, O::V_MOV_B32, O::V_MAC_F32, O::V_MADMK_F32, O::V_MADAK_F32,
+       O::V_FMA_F32});
+  const auto k = std::bit_cast<float>(MadmkConstant);
+  const auto reference = [&](u32 output, u32 e, bool fused) -> u32 {
+    const auto a = std::bit_cast<float>(inputs[0][e]);
+    const auto b = std::bit_cast<float>(inputs[1][e]);
+    const auto c = std::bit_cast<float>(inputs[2][e]);
+    const auto mad = [&](float x, float y, float z) {
+      return fused ? std::fma(x, y, z) : RoundedF32(RoundedF32(x * y) + z);
+    };
+    switch (output) {
+    case 0:
+    case 1: return std::bit_cast<u32>(mad(a, b, c));
+    case 2: return std::bit_cast<u32>(mad(a, k, c));
+    case 3: return std::bit_cast<u32>(mad(a, b, k));
+    default: return std::bit_cast<u32>(std::fma(a, b, c));
+    }
+  };
+  static const char *const names[] = {"mad", "mac", "madmk", "madak", "fma", "fmac"};
+  size_t differing = 0;
+  for (const auto mode : {ShaderRecompiler::MadMode::Exact, ShaderRecompiler::MadMode::Fused,
+                          ShaderRecompiler::MadMode::Position}) {
+    CodegenOptions options = GetCodegenOptions();
+    options.mad_mode = mode;
+    const auto run = RunBulk(vulkan, bulk, options);
+    const bool fused = mode != ShaderRecompiler::MadMode::Exact;
+    for (u32 o = 0; o < bulk.outputs; o++) {
+      const auto out = BulkOutput(bulk, run.words, o);
+      for (u32 e = 0; e < bulk.count; e++) {
+        const auto expected = reference(o, e, fused);
+        if (out[e] != expected) {
+          Fail(name, names[o],
+               "mode " + std::to_string(static_cast<int>(mode)) + " element " +
+                   std::to_string(e) + ": got " + Hex(out[e]) + ", expected " +
+                   Hex(expected));
+        }
+        if (o == 0 && !fused && expected != reference(o, e, true)) {
+          differing++;
+        }
+      }
+    }
+  }
+  std::printf("[codegen] %-32s ok (%u elements, %zu where fused and unfused differ)\n", name,
+              bulk.count, differing);
+}
+
+// A vertex shader with one MAD feeding the position and one feeding a parameter: which of them
+// are fused, which carry NoContraction, and the Invariant position, per MadMode.
+void CheckMadPositionSlice() {
+  constexpr const char *name = "CodegenMadPositionSlice";
+  std::vector<u32> code;
+  AppendVop3(&code, 0x141, 4, Vgpr(0), Vgpr(1), Vgpr(2)); // v_mad_f32 v4 (position)
+  AppendVop3(&code, 0x141, 5, Vgpr(0), Vgpr(2), Vgpr(1)); // v_mad_f32 v5 (parameter)
+  AppendVMovLiteral(&code, 6, 0x3f800000u);
+  code.push_back(EncodeExp0(12, 0xf, true)); // exp pos0 v4, v4, v4, v6 done
+  code.push_back(EncodeExp1(4, 4, 4, 6));
+  code.push_back(EncodeExp0(32, 0xf, false)); // exp param0 v5, v5, v5, v6
+  code.push_back(EncodeExp1(5, 5, 5, 6));
+  AppendEnd(&code);
+  const auto compile = [&](ShaderRecompiler::MadMode mode) {
+    CodegenOptions options = GetCodegenOptions();
+    options.mad_mode = mode;
+    ScopedCodegenOptions scope(options);
+    std::array<u32, 16> user_data{};
+    ShaderVertexInputInfo vertex;
+    ShaderRecompiler::CompileOptions compile_options;
+    compile_options.stage = ShaderType::Vertex;
+    compile_options.user_data = user_data;
+    compile_options.input_info.vertex = &vertex;
+    auto translated = ShaderRecompiler::TranslateProgram(code, compile_options);
+    auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    const ShaderRecompiler::IR::SrtRuntime runtime{
+        .user_data = compile_options.user_data,
+        .shader_base = reinterpret_cast<uint64_t>(code.data()),
+    };
+    Require(name, "resource materialization",
+            ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources,
+                                                       specialization),
+            "vertex resources could not be materialized");
+    auto result = ShaderRecompiler::CompileProgram(std::move(translated), compile_options,
+                                                   specialization);
+    ValidateSpirv(name, result.spirv);
+    return result.spirv;
+  };
+  struct Expectation {
+    ShaderRecompiler::MadMode mode;
+    size_t fma;
+    size_t no_contraction;
+    size_t invariant;
+  };
+  for (const auto &expect : {Expectation{ShaderRecompiler::MadMode::Exact, 0, 4, 1},
+                             Expectation{ShaderRecompiler::MadMode::Position, 1, 2, 1},
+                             Expectation{ShaderRecompiler::MadMode::Fused, 2, 0, 0}}) {
+    const auto spirv = compile(expect.mode);
+    const auto fma = CountSpirv(spirv, "Fma ");
+    const auto no_contraction = CountSpirv(spirv, "NoContraction");
+    const auto invariant = CountSpirv(spirv, "Invariant");
+    Require(name, "decorations",
+            fma == expect.fma && no_contraction == expect.no_contraction &&
+                invariant == expect.invariant,
+            "mode " + std::to_string(static_cast<int>(expect.mode)) + ": Fma " +
+                std::to_string(fma) + ", NoContraction " + std::to_string(no_contraction) +
+                ", Invariant " + std::to_string(invariant));
+  }
+  std::printf("[codegen] %-32s ok\n", name);
+}
+
 void RunAll(VulkanHarness *vulkan) {
+  CheckMadPositionSlice();
+  CheckMadModes(vulkan);
   CheckLodStatsGate();
   CheckMoveRelValueSet(vulkan);
   CheckFloatMinMax(vulkan);

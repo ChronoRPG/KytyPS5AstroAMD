@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
@@ -152,6 +153,16 @@ uint32_t PushConstantBlockType(EmitterState& state) {
 }
 
 uint32_t PerVertexType(EmitterState& state) {
+	// MadMode::Exact/Position: the position is computed without contraction; Invariant also asks
+	// the host compiler to evaluate it identically in every shader that computes it the same way.
+	if (GetCodegenOptions().mad_mode != MadMode::Fused) {
+		return state.builder.DecoratedType(
+		    spv::OpTypeStruct,
+		    {{spv::OpMemberDecorate, {0, spv::DecorationBuiltIn, spv::BuiltInPosition}},
+		     {spv::OpMemberDecorate, {0, spv::DecorationInvariant}},
+		     {spv::OpDecorate, {spv::DecorationBlock}}},
+		    TypeF32Vector(state, 4));
+	}
 	return state.builder.DecoratedType(
 	    spv::OpTypeStruct,
 	    {{spv::OpMemberDecorate, {0, spv::DecorationBuiltIn, spv::BuiltInPosition}},
