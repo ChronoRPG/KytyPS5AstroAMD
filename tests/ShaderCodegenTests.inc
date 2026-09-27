@@ -723,6 +723,63 @@ void CheckLodStatsGate() {
               gated_spirv.size());
 }
 
+// KYTY_LOD_STATS_PLAIN_VARIANT: the plain variant of an instrumented pixel shader keeps the
+// mip_stats binding and every guest instruction but has no GET_LOD_STATS feedback: no LOD query,
+// subgroup reduction or atomic, so no memory side effect that would force late depth tests.
+void CheckLodStatsPlainVariant() {
+  constexpr const char *name = "CodegenLodStatsPlainVariant";
+  GraphicsCase test;
+  test.name = name;
+  AppendVMovLiteral(&test.fragment_code, 20, 0x3f000000u);
+  AppendVMovLiteral(&test.fragment_code, 21, 0x3f000000u);
+  test.fragment_code.push_back(EncodeMimg0(0x20, 0xf)); // image_sample v[0:3], v[20:21]
+  test.fragment_code.push_back(EncodeMimg1(0, 20));
+  test.fragment_code.push_back(EncodeExp0(0, 0xf, true, false, true));
+  test.fragment_code.push_back(EncodeExp1(0, 1, 2, 3));
+  AppendEnd(&test.fragment_code);
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+  test.has_user_data = true;
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE, ShaderOpcode::EXP,
+                  ShaderOpcode::S_ENDPGM};
+  const auto without = CompileFragmentCase(test);
+  const auto with = CompileFragmentCase(test, true);
+  Require(name, "only on request", without.spirv_plain.empty() && !with.spirv_plain.empty(),
+          "the plain variant was emitted without being requested, or not at all");
+  Require(name, "instrumented module unchanged", with.spirv == without.spirv,
+          "requesting the plain variant changed the instrumented module");
+  const auto &plain = with.spirv_plain;
+  const auto count = [](const std::vector<u32> &spirv, const char *op) {
+    return CountSpirv(spirv, op);
+  };
+  Require(name, "no feedback",
+          count(plain, "OpImageQueryLod") == 0u && count(plain, "OpAtomicUMin") == 0u &&
+              count(plain, "OpAtomicIAdd") == 0u && count(plain, "OpAtomicLoad") == 0u &&
+              count(plain, "OpGroupNonUniformUMin") == 0u &&
+              count(plain, "OpImageSampleImplicitLod") ==
+                  count(with.spirv, "OpImageSampleImplicitLod") &&
+              count(with.spirv, "OpAtomicUMin") == 1u,
+          "the plain variant still records GET_LOD_STATS feedback, or lost the guest sample");
+  // Same bindings: the mip_stats storage buffer stays declared, so both modules fit one layout.
+  const auto has_name = [](const std::vector<u32> &spirv, const char *wanted) {
+    for (size_t i = 5; i < spirv.size();) {
+      const u32 words = spirv[i] >> 16u;
+      if (words == 0u) {
+        break;
+      }
+      if ((spirv[i] & 0xffffu) == 5u /* OpName */ && words > 2u &&
+          std::strcmp(reinterpret_cast<const char *>(&spirv[i + 2]), wanted) == 0) {
+        return true;
+      }
+      i += words;
+    }
+    return false;
+  };
+  Require(name, "binding kept", has_name(plain, "mip_stats") && has_name(with.spirv, "mip_stats"),
+          "the plain variant dropped the mip_stats binding declaration");
+  std::printf("[codegen] %-32s ok (SPIR-V %zu -> %zu words)\n", name, with.spirv.size(),
+              plain.size());
+}
+
 // Buffer and scalar-buffer loads that straddle the end of a descriptor range whose size is not a
 // multiple of 4 bytes, with the shader's dword bounds check and with the device's
 // robustBufferAccess2 check. Out-of-range dwords (any byte past the range) must read 0.
@@ -1087,6 +1144,7 @@ void RunAll(VulkanHarness *vulkan) {
   CheckMadPositionSlice();
   CheckMadModes(vulkan);
   CheckLodStatsGate();
+  CheckLodStatsPlainVariant();
   CheckMoveRelValueSet(vulkan);
   CheckFloatMinMax(vulkan);
   CheckFloatClampConstants(vulkan);

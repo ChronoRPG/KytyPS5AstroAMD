@@ -699,6 +699,27 @@ enum class FrameEvent : uint32_t {
 	// KYTY_DRAW_PREP_LOCKFREE_HINT_VERIFY: worker hints checked against the locked tracker bits.
 	DrawPrepHintVerifyChecks,
 	DrawPrepHintVerifyMismatches,
+	// KYTY_DEPTH_LAYOUT_STABLE: draws whose unsampled depth target kept its current layout where
+	// the per-draw layout would have transitioned it (and ended the rendering instance).
+	DepthLayoutTransitionsAvoided,
+	// KYTY_LOD_STATS_PLAIN_VARIANT: draws of GET_LOD_STATS-instrumented pixel programs that used the
+	// plain (feedback-free) variant because no image had a counter, and those that needed the
+	// instrumented one; verify mode: canary checks at GET_LOD_STATS and counters found changed.
+	LodStatsPlainDraws,
+	LodStatsInstrumentedDraws,
+	LodStatsCanaryChecks,
+	LodStatsCanaryMismatches,
+	// KYTY_UPLOAD_DMA: buffer uploads whose host -> VRAM part went to the copy engine (count,
+	// bytes), those kept on the graphics queue because the ring was full, transfer-queue
+	// submissions, and guest submissions that had to wait for an unfinished transfer.
+	UploadDmaCopies,
+	UploadDmaBytes,
+	UploadDmaRingFull,
+	UploadDmaSubmits,
+	UploadDmaSubmitWaits,
+	// KYTY_UPLOAD_DMA_VERIFY=1: staged uploads compared, and those whose ring bytes differed.
+	UploadDmaVerifyChecks,
+	UploadDmaVerifyMismatches,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

@@ -60,6 +60,11 @@ bool DepthFeedbackKeepEnabled() {
 	return enabled;
 }
 
+bool DepthLayoutStableEnabled() {
+	static const bool enabled = EnvSwitch("KYTY_DEPTH_LAYOUT_STABLE", true);
+	return enabled;
+}
+
 bool PushConstantShadowEnabled() {
 	static const bool enabled = EnvSwitch("KYTY_PUSH_CONSTANT_SHADOW", true);
 	return enabled;

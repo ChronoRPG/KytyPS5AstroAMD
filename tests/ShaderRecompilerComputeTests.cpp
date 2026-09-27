@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
@@ -168,6 +169,8 @@ struct BufferCacheTestAccess {
   static StreamBuffer &DownloadBuffer(BufferCache &cache) {
     return cache.m_download_buffer;
   }
+
+  static UploadDma *Dma(BufferCache &cache) { return cache.m_upload_dma.get(); }
 
   static bool SynchronizeBufferFromImage(BufferCache &cache, Buffer &buffer,
                                          uint64_t address, uint64_t size) {
@@ -1374,6 +1377,8 @@ struct CompiledShader {
   ShaderRecompiler::IR::Program program;
   ShaderRecompiler::IR::ResourceSnapshot resources;
   std::vector<u32> packed_user_data;
+  // CompileOptions::plain_mip_stats_variant (KYTY_LOD_STATS_PLAIN_VARIANT).
+  std::vector<u32> spirv_plain;
 };
 
 std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
@@ -1795,7 +1800,7 @@ std::string StorageUint2DImageBindingName(bool atomic) {
   return "image_" + std::to_string(static_cast<uint32_t>(*binding));
 }
 
-CompiledShader CompileFragmentCase(const GraphicsCase &test) {
+CompiledShader CompileFragmentCase(const GraphicsCase &test, bool plain_variant = false) {
   const auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   ShaderPixelInputInfo pixel_info{};
@@ -1825,6 +1830,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
+  options.plain_mip_stats_variant = plain_variant;
 
   auto translated =
       ShaderRecompiler::TranslateProgram(test.fragment_code, options);
@@ -1853,8 +1859,11 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
         resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
+  if (!result.spirv_plain.empty()) {
+    ValidateSpirv(test.name, result.spirv_plain);
+  }
   return {std::move(result.spirv), std::move(result.program),
-          std::move(resources), std::move(packed_user_data)};
+          std::move(resources), std::move(packed_user_data), std::move(result.spirv_plain)};
 }
 
 std::array<u32, 64> MakeSampledTextureData(Prospero::BufferFormat format) {
@@ -12025,6 +12034,314 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // KYTY_DEPTH_LAYOUT_STABLE: draws that alternate depth writes on a depth target nothing
+  // samples keep one attachment layout and one rendering instance; sampling still takes a
+  // readable layout, and a write after it the writable one again.
+  void CheckDepthLayoutStable() {
+    constexpr const char *name = "DepthLayoutStable";
+    constexpr uintptr_t base = 0x0000000205c00000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    context.InitializeGpu(nullptr);
+    scheduler.Begin(registers, user_config, shaders);
+    auto &texture_cache = context.GetTextureCache();
+    auto &executor = context.GetRenderExecutor();
+    context.MapMemory(base, allocation_size);
+    std::vector<PipelineCache::Pipeline> descriptor_pipelines;
+
+    ShaderRecompiler::IR::Program sampled_program{};
+    sampled_program.stage = ShaderType::Pixel;
+    sampled_program.resource_tracking_complete = true;
+    ShaderRecompiler::IR::ImageResource sampled_resource{};
+    sampled_resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+    sampled_resource.numeric_class = Prospero::TextureNumericClass::Float;
+    sampled_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    sampled_resource.read = true;
+    sampled_program.info.images.push_back(sampled_resource);
+    sampled_program.shader_info_complete = true;
+    ShaderRecompiler::IR::AllocateBindings(sampled_program);
+    ShaderRecompiler::IR::ResourceSnapshot sampled_snapshot{};
+    ShaderRecompiler::IR::DescriptorValue sampled_descriptor{};
+    sampled_descriptor.dword_count = 8;
+    sampled_snapshot.images.push_back(sampled_descriptor);
+    ShaderRecompiler::IR::CompiledShaderInfo sampled_info{};
+    sampled_info.stage = sampled_program.stage;
+    sampled_info.info = std::move(sampled_program.info);
+    sampled_info.bindings = std::move(sampled_program.bindings);
+    ShaderStageRuntime sampled_runtime{&sampled_info, &sampled_snapshot};
+
+    ImageDesc depth_desc{};
+    depth_desc.type = BindingType::DepthTarget;
+    depth_desc.info.data = {base + 0x10000, 4 * 4 * sizeof(float)};
+    depth_desc.info.pixel_format = vk::Format::eD32Sfloat;
+    depth_desc.info.guest_format = Prospero::BufferFormat::k32Float;
+    depth_desc.info.type = Prospero::ImageType::kColor2D;
+    depth_desc.info.extent = {4, 4, 1};
+    depth_desc.info.resources = {1, 1};
+    depth_desc.info.pitch = 4;
+    depth_desc.info.bytes_per_block = 4;
+    depth_desc.info.samples = 1;
+    depth_desc.info.tile_mode = Prospero::TileMode::kLinear;
+    depth_desc.info.mip_layout[0] = {0, 64, 4, 4};
+    depth_desc.view_info.format = vk::Format::eD32Sfloat;
+    depth_desc.view_info.type = vk::ImageViewType::e2D;
+    depth_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+    depth_desc.view_info.level_count = 1;
+    depth_desc.view_info.layer_count = 1;
+    depth_desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    const auto depth_id = texture_cache.FindImage(depth_desc);
+    auto sampled_desc = depth_desc;
+    sampled_desc.type = BindingType::Texture;
+    sampled_desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+    const auto sampled_view = texture_cache.FindTexture(depth_id, sampled_desc);
+    Require(name, "sampled view", sampled_view != nullptr, "no sampled depth view");
+
+    const auto draw = [&](bool depth_write, bool sample) {
+      RenderDepthInfo depth{};
+      depth.desc = depth_desc;
+      depth.image_id = depth_id;
+      depth.depth_test_enable = true;
+      depth.depth_write_enable = depth_write;
+      depth.depth_compare_op = vk::CompareOp::eLessOrEqual;
+      PreparedBindings binding{};
+      binding.runtime = &sampled_runtime;
+      if (sample) {
+        binding.images.push_back({depth_id, sampled_view, sampled_desc});
+      }
+      RenderExecutorTestAccess::BindRenderTarget(executor, depth_id);
+      std::array<PreparedBindings *, 1> stages{&binding};
+      RenderColorInfo no_color{};
+      const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &no_color, 0, depth,
+          sample ? std::span<PreparedBindings *const>(stages)
+                 : std::span<PreparedBindings *const>{});
+      if (sample) {
+        descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+            executor, scheduler.Current(), binding));
+      }
+      scheduler.BeginRendering(rendering);
+      RenderExecutorTestAccess::NoteDepthFeedback(executor, scheduler.Current());
+      RenderExecutorTestAccess::ResetBindings(executor);
+      return std::pair{scheduler.Current().ActiveRenderingSerial(),
+                       rendering.depth_stencil_attachment.image_layout};
+    };
+
+    const auto writes = draw(true, false);
+    const auto tests_only = draw(false, false);
+    const auto writes_again = draw(true, false);
+    const auto tests_again = draw(false, false);
+    if (DepthLayoutStableEnabled()) {
+      Require(name, "unsampled draws keep one instance",
+              writes.first != 0 && tests_only.first == writes.first &&
+                  writes_again.first == writes.first && tests_again.first == writes.first &&
+                  tests_only.second == vk::ImageLayout::eDepthAttachmentOptimal &&
+                  tests_again.second == vk::ImageLayout::eDepthAttachmentOptimal &&
+                  scheduler.Current().PendingImageBarriers() == 0,
+              "draws alternating depth writes split the instance or changed the layout");
+    } else {
+      Require(name, "per-draw layouts (KYTY_DEPTH_LAYOUT_STABLE=0)",
+              tests_only.first != writes.first && writes_again.first != tests_only.first &&
+                  tests_only.second == vk::ImageLayout::eDepthReadOnlyOptimal,
+              "the reverted policy kept the writable layout for a draw without writes");
+    }
+
+    // Sampling needs a layout in which the sampled aspect is readable (with the stable layouts a
+    // new instance: the unsampled draws before it kept the writable layout).
+    const auto sampling = draw(false, true);
+    Require(name, "sampling takes a readable layout",
+            (!DepthLayoutStableEnabled() || sampling.first != tests_again.first) &&
+                (DepthReadableAspects(sampling.second) & vk::ImageAspectFlagBits::eDepth),
+            "a sampled depth attachment kept a layout that does not allow reading it");
+    // A draw that neither writes nor samples keeps the readable layout.
+    const auto after_sampling = draw(false, false);
+    Require(name, "an unsampled draw without writes keeps the readable layout",
+            !DepthLayoutStableEnabled() || after_sampling.second == sampling.second,
+            "an unsampled draw without writes transitioned away from the readable layout");
+    // A write needs a writable layout again, which later tests-only draws keep.
+    const auto writes_after = draw(true, false);
+    const auto tests_after = draw(false, false);
+    Require(name, "a write after sampling returns to the writable layout",
+            writes_after.first != sampling.first &&
+                writes_after.second == vk::ImageLayout::eDepthAttachmentOptimal &&
+                (!DepthLayoutStableEnabled() || (tests_after.first == writes_after.first &&
+                                                 tests_after.second == writes_after.second)),
+            "the write after sampling kept a read-only layout, or the next draw split again");
+
+    scheduler.Current().EndRendering();
+    scheduler.Current().FlushBarriers();
+    scheduler.Finish();
+    RenderExecutorTestAccess::DestroyDescriptorPipelines(executor, descriptor_pipelines);
+    std::printf("[gpu]     %-32s ok (%s)\n", name,
+                DepthLayoutStableEnabled() ? "stable" : "per-draw");
+  }
+
+  // KYTY_UPLOAD_DMA: CPU-dirty buffer uploads staged through the transfer queue reach the cache
+  // buffer intact (BufferCache path), the ring refuses space that the recording tick may still
+  // read and reuses it once that tick completed, and small uploads keep the direct copy.
+  void CheckUploadDma() {
+    constexpr const char *name = "UploadDma";
+    constexpr uintptr_t base = 0x0000000206800000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t upload_size = 0x200000;
+    EnsureRuntimeContext();
+    if (m_runtime_context.transfer_queue == nullptr) {
+      std::printf("[gpu]     %-32s skipped (no transfer queue or KYTY_UPLOAD_DMA=0)\n", name);
+      return;
+    }
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed mapping failed");
+    auto *memory = static_cast<uint32_t *>(mapped);
+    for (uint64_t i = 0; i < upload_size / sizeof(uint32_t); i++) {
+      memory[i] = static_cast<uint32_t>(i * 2654435761u + 0x9e37u);
+    }
+
+    // Reads `size` bytes of a native buffer through a host-visible copy.
+    const auto read_back = [&](vk::Buffer source, uint64_t offset, uint64_t size) {
+      Libs::Graphics::Buffer readback(m_runtime_context, scheduler, MemoryUsage::Download, 0,
+                                      vk::BufferUsageFlagBits::eTransferDst, size);
+      auto native = scheduler.Current().Handle();
+      vk::MemoryBarrier before{};
+      before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+      before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+      native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                             vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+                             nullptr);
+      const vk::BufferCopy copy{offset, 0, size};
+      native.copyBuffer(source, readback.Handle(), 1, &copy);
+      vk::MemoryBarrier after{};
+      after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                             vk::PipelineStageFlagBits::eHost, {}, 1, &after, 0, nullptr, 0,
+                             nullptr);
+      scheduler.Finish();
+      readback.Invalidate(0, size);
+      std::vector<uint32_t> words(size / sizeof(uint32_t));
+      std::memcpy(words.data(), readback.Mapped().data(), size);
+      return words;
+    };
+
+    auto &cache = context.GetBufferCache();
+    context.MapMemory(base, allocation_size);
+    auto *dma = BufferCacheTestAccess::Dma(cache);
+    Require(name, "enabled", dma != nullptr, "the buffer cache has no upload DMA");
+    const auto staged_before = dma->Staged();
+    const auto [buffer, buffer_offset] = cache.ObtainBuffer(base, upload_size, false, false);
+    Require(name, "allocation", buffer != nullptr, "buffer allocation failed");
+    Require(name, "staged through the copy engine", dma->Staged() > staged_before,
+            "a 2 MiB CPU-dirty upload did not use the transfer queue");
+    const auto words = read_back(buffer->Handle(), buffer_offset, upload_size);
+    for (uint64_t i = 0; i < words.size(); i++) {
+      if (words[i] != memory[i]) {
+        std::fprintf(stderr, "word %llu: 0x%08x, expected 0x%08x\n",
+                     static_cast<unsigned long long>(i), words[i], memory[i]);
+        Require(name, "contents", false, "the DMA-staged upload changed the buffer contents");
+      }
+    }
+
+    // A private ring of 1 MiB. The cache's dependency slot is borrowed and restored.
+    {
+      constexpr uint64_t Chunk = 512 * 1024;
+      UploadDma ring(m_runtime_context, scheduler, 2 * Chunk, 4096);
+      scheduler.SetSubmitDependency(&ring, 1);
+      Libs::Graphics::Buffer host(m_runtime_context, scheduler, MemoryUsage::Upload, 0,
+                                  vk::BufferUsageFlagBits::eTransferSrc, 3 * Chunk, true);
+      auto *host_words = reinterpret_cast<uint32_t *>(host.Mapped().data());
+      for (uint64_t i = 0; i < 3 * Chunk / sizeof(uint32_t); i++) {
+        host_words[i] = static_cast<uint32_t>(0xa5000000u + i);
+      }
+      host.Flush(0, 3 * Chunk);
+      Libs::Graphics::Buffer device(m_runtime_context, scheduler, MemoryUsage::DeviceLocal, 0,
+                                    vk::BufferUsageFlagBits::eTransferSrc |
+                                        vk::BufferUsageFlagBits::eTransferDst,
+                                    3 * Chunk);
+      const auto copy_from_ring = [&](uint64_t ring_offset, uint64_t device_offset) {
+        const vk::BufferCopy copy{ring_offset, device_offset, Chunk};
+        scheduler.Current().Handle().copyBuffer(ring.RingHandle(), device.Handle(), 1, &copy);
+      };
+      Require(name, "small uploads stay direct", !ring.Stage(host.Handle(), 0, 1024).has_value(),
+              "an upload below the minimum size was queued");
+      const auto first = ring.Stage(host.Handle(), 0, Chunk);
+      const auto second = ring.Stage(host.Handle(), Chunk, Chunk);
+      const auto third = ring.Stage(host.Handle(), 2 * Chunk, Chunk);
+      Require(name, "ring allocation",
+              first == uint64_t{0} && second == Chunk && !third.has_value(),
+              "the ring handed out space the recording tick still reads");
+      copy_from_ring(*first, 0);
+      copy_from_ring(*second, Chunk);
+      const auto both = read_back(device.Handle(), 0, 2 * Chunk);
+      // The previous tick completed (Finish): its ring space is free again.
+      const auto reused = ring.Stage(host.Handle(), 2 * Chunk, Chunk);
+      Require(name, "ring reuse", reused.has_value(),
+              "ring space of a completed tick was not reused");
+      copy_from_ring(*reused, 2 * Chunk);
+      const auto last = read_back(device.Handle(), 2 * Chunk, Chunk);
+      bool same = true;
+      for (uint64_t i = 0; i < both.size(); i++) {
+        same &= both[i] == host_words[i];
+      }
+      for (uint64_t i = 0; i < last.size(); i++) {
+        same &= last[i] == host_words[2 * Chunk / sizeof(uint32_t) + i];
+      }
+      Require(name, "ring contents", same, "bytes copied through the ring differ");
+      scheduler.SetSubmitDependency(dma, 1);
+    }
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
@@ -18379,6 +18696,10 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
+    if (m_transfer_queue != nullptr && UploadDmaRequested()) {
+      m_runtime_context.transfer_queue_family = m_transfer_family;
+      m_runtime_context.transfer_queue = m_transfer_queue;
+    }
     m_runtime_context.attachment_feedback_loop_enabled = true;
     m_runtime_context.provoking_vertex_last_enabled = true;
     m_runtime_context.storage_image_read_without_format_enabled =
@@ -18557,16 +18878,42 @@ private:
             "production rasterization features are not supported");
 
     float priority = 1.0f;
-    vk::DeviceQueueCreateInfo queue_info{};
+    std::array<vk::DeviceQueueCreateInfo, 2> queue_infos{};
+    auto &queue_info = queue_infos[0];
     queue_info.sType = vk::StructureType::eDeviceQueueCreateInfo;
     queue_info.queueFamilyIndex = m_queue_family;
     queue_info.queueCount = 1;
     queue_info.pQueuePriorities = &priority;
+    // Like the emulator's device (KYTY_UPLOAD_DMA): a queue of a transfer-only family, when the
+    // device has one, which the runtime context hands to UploadDma.
+    u32 queue_info_count = 1;
+    {
+      u32 family_count = 0;
+      m_physical_device.getQueueFamilyProperties(&family_count, nullptr);
+      std::vector<vk::QueueFamilyProperties> families(family_count);
+      m_physical_device.getQueueFamilyProperties(&family_count, families.data());
+      for (u32 family = 0; family < family_count; family++) {
+        const auto flags = families[family].queueFlags;
+        if (family != m_queue_family && families[family].queueCount != 0 &&
+            (flags & vk::QueueFlagBits::eTransfer) &&
+            !(flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute |
+                       vk::QueueFlagBits::eVideoDecodeKHR | vk::QueueFlagBits::eVideoEncodeKHR |
+                       vk::QueueFlagBits::eOpticalFlowNV))) {
+          m_transfer_family = family;
+          auto &transfer = queue_infos[queue_info_count++];
+          transfer.sType = vk::StructureType::eDeviceQueueCreateInfo;
+          transfer.queueFamilyIndex = family;
+          transfer.queueCount = 1;
+          transfer.pQueuePriorities = &priority;
+          break;
+        }
+      }
+    }
 
     vk::DeviceCreateInfo device_info{};
     device_info.sType = vk::StructureType::eDeviceCreateInfo;
-    device_info.queueCreateInfoCount = 1;
-    device_info.pQueueCreateInfos = &queue_info;
+    device_info.queueCreateInfoCount = queue_info_count;
+    device_info.pQueueCreateInfos = queue_infos.data();
     vk::PhysicalDeviceVulkan12Features device_features12{};
     device_features12.sType =
         vk::StructureType::ePhysicalDeviceVulkan12Features;
@@ -18668,6 +19015,9 @@ private:
               "vkCreateDevice");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
     m_device.getQueue(m_queue_family, 0, &m_queue);
+    if (m_transfer_family != UINT32_MAX) {
+      m_device.getQueue(m_transfer_family, 0, &m_transfer_queue);
+    }
     {
       vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties{};
       vk::PhysicalDeviceProperties2 properties{};
@@ -18995,6 +19345,8 @@ private:
   vk::Queue m_queue = nullptr;
   vk::CommandPool m_command_pool = nullptr;
   u32 m_queue_family = 0;
+  vk::Queue m_transfer_queue = nullptr;
+  u32 m_transfer_family = UINT32_MAX;
   vk::DeviceSize m_robust_storage_alignment = 0;
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
   Buffer m_bda_pagetable_buffer;
@@ -34683,6 +35035,76 @@ void CheckStorageTextureVolumeMipRegions() {
   std::printf("[host]    %-32s ok\n", "StorageTextureVolumeMipRegions");
 }
 
+// KYTY_DEPTH_LAYOUT_STABLE layout rules (depth_stable_attachment_layout): the current layout is
+// kept only when it is a standard attachment layout for the image's aspects that allows every
+// aspect the draw writes; otherwise the fully writable layout of those aspects.
+void CheckDepthStableLayoutRules() {
+  constexpr const char *name = "DepthStableLayoutRules";
+  using L = vk::ImageLayout;
+  const vk::ImageAspectFlags depth = vk::ImageAspectFlagBits::eDepth;
+  const vk::ImageAspectFlags stencil = vk::ImageAspectFlagBits::eStencil;
+  const vk::ImageAspectFlags both = depth | stencil;
+  const vk::ImageAspectFlags none{};
+  struct Case {
+    L current;
+    bool whole;
+    vk::ImageAspectFlags available;
+    vk::ImageAspectFlags writes;
+    L expected;
+  };
+  const Case cases[] = {
+      // The stencil-mark pattern: a depth-only write keeps DEPTH_STENCIL_ATTACHMENT.
+      {L::eDepthStencilAttachmentOptimal, true, both, depth, L::eDepthStencilAttachmentOptimal},
+      {L::eDepthStencilAttachmentOptimal, true, both, none, L::eDepthStencilAttachmentOptimal},
+      {L::eDepthStencilAttachmentOptimal, true, both, both, L::eDepthStencilAttachmentOptimal},
+      // A read-only aspect that the draw writes needs the writable layout.
+      {L::eDepthAttachmentStencilReadOnlyOptimal, true, both, depth,
+       L::eDepthAttachmentStencilReadOnlyOptimal},
+      {L::eDepthAttachmentStencilReadOnlyOptimal, true, both, both,
+       L::eDepthStencilAttachmentOptimal},
+      {L::eDepthReadOnlyStencilAttachmentOptimal, true, both, depth,
+       L::eDepthStencilAttachmentOptimal},
+      {L::eDepthStencilReadOnlyOptimal, true, both, none, L::eDepthStencilReadOnlyOptimal},
+      {L::eDepthStencilReadOnlyOptimal, true, both, stencil, L::eDepthStencilAttachmentOptimal},
+      // Layouts that are not standard attachment layouts for the aspects are left.
+      {L::eGeneral, true, both, none, L::eDepthStencilAttachmentOptimal},
+      {L::eShaderReadOnlyOptimal, true, both, none, L::eDepthStencilAttachmentOptimal},
+      {L::eTransferDstOptimal, true, depth, none, L::eDepthAttachmentOptimal},
+      {L::eUndefined, true, depth, depth, L::eDepthAttachmentOptimal},
+      {L::eDepthAttachmentOptimal, true, both, depth, L::eDepthStencilAttachmentOptimal},
+      {L::eDepthAttachmentStencilReadOnlyOptimal, true, depth, depth, L::eDepthAttachmentOptimal},
+      // Depth-only and stencil-only images.
+      {L::eDepthStencilAttachmentOptimal, true, depth, depth, L::eDepthStencilAttachmentOptimal},
+      {L::eDepthReadOnlyOptimal, true, depth, none, L::eDepthReadOnlyOptimal},
+      {L::eDepthReadOnlyOptimal, true, depth, depth, L::eDepthAttachmentOptimal},
+      {L::eDepthAttachmentOptimal, true, depth, none, L::eDepthAttachmentOptimal},
+      {L::eStencilReadOnlyOptimal, true, stencil, stencil, L::eStencilAttachmentOptimal},
+      {L::eStencilAttachmentOptimal, true, stencil, none, L::eStencilAttachmentOptimal},
+      {L::eDepthReadOnlyOptimal, true, stencil, none, L::eStencilAttachmentOptimal},
+      // Per-subresource states: no single current layout to keep.
+      {L::eDepthStencilAttachmentOptimal, false, both, none, L::eDepthStencilAttachmentOptimal},
+      {L::eDepthStencilReadOnlyOptimal, false, both, none, L::eDepthStencilAttachmentOptimal},
+      {L::eDepthReadOnlyOptimal, false, depth, none, L::eDepthAttachmentOptimal},
+  };
+  uint32_t index = 0;
+  for (const auto &test : cases) {
+    const auto layout =
+        depth_stable_attachment_layout(test.current, test.whole, test.available, test.writes);
+    if (layout != test.expected) {
+      std::fprintf(stderr, "case %u: current=%s whole=%d available=%u writes=%u -> %s, expected %s\n",
+                   index, vk::to_string(test.current).c_str(), test.whole ? 1 : 0,
+                   static_cast<uint32_t>(test.available), static_cast<uint32_t>(test.writes),
+                   vk::to_string(layout).c_str(), vk::to_string(test.expected).c_str());
+      Require(name, "rule", false, "unexpected stable depth attachment layout");
+    }
+    // Whatever is chosen allows the draw's writes.
+    Require(name, "writes allowed", !(test.writes & ~DepthWritableAspects(layout)),
+            "the chosen layout does not allow the draw's writes");
+    index++;
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 // GpuTilerCpuParity compares the GPU tiler shaders with TileGetBlockOffset at every in-block
 // position, so both share any error in the per-family bit equations. Check the equations
 // themselves: one block's elements must map onto distinct, element-aligned offsets that fill
@@ -37271,6 +37693,17 @@ int main(int argc, char **argv) {
     vulkan.CheckDepthFeedbackKeep();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--upload-dma-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckUploadDma();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-layout-stable-only") == 0) {
+    CheckDepthStableLayoutRules();
+    VulkanHarness vulkan;
+    vulkan.CheckDepthLayoutStable();
+    return 0;
+  }
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--tiler-image-bench") == 0) {
     VulkanHarness vulkan;
@@ -37530,6 +37963,7 @@ int main(int argc, char **argv) {
   // CPU only: compiles and validates the GET_LOD_STATS instrumentation.
   if (argc == 2 && std::strcmp(argv[1], "--lod-stats-codegen-only") == 0) {
     CodegenTests::CheckLodStatsGate();
+    CodegenTests::CheckLodStatsPlainVariant();
     return 0;
   }
   // Only the recompiler semantic cases (compute and graphics), without the host/runtime
@@ -37697,6 +38131,9 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
   vulkan.CheckDepthFeedbackKeep();
+  CheckDepthStableLayoutRules();
+  vulkan.CheckDepthLayoutStable();
+  vulkan.CheckUploadDma();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBgra16Readback();
   vulkan.CheckRasterization(false);

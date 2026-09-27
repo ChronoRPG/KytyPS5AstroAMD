@@ -692,7 +692,8 @@ void EmitGatedMipStatsRecord(EmitterState& state, uint32_t id, uint32_t lod) {
 }
 
 void EmitMipStatsRecord(EmitterState& state, uint32_t resource, uint32_t lod) {
-	if (state.mip_stats_variable == 0 || resource >= state.program.bindings.mip_stats_count) {
+	if (state.mip_stats_variable == 0 || !state.mip_stats_records ||
+	    resource >= state.program.bindings.mip_stats_count) {
 		return;
 	}
 	constexpr uint32_t Entries = MipStatsEntries;
@@ -933,7 +934,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				sample_operands.insert(sample_operands.end(), operands.begin(), operands.end());
 			}
 			state.builder.AddFunction(opcode, sample_operands);
-			if (state.mip_stats_variable != 0) {
+			if (state.mip_stats_variable != 0 && state.mip_stats_records) {
 				const auto sample_lod = [&](uint32_t sampled_image) {
 					uint32_t lod = ZeroF32(state);
 					if (HasFlag(mem, Decoder::ImageSampleFlagLevelZero)) {

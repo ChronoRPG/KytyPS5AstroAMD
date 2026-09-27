@@ -100,6 +100,9 @@ struct EmitterState {
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         mip_stats_variable           = 0;
+	// False for the plain variant of an instrumented pixel shader (KYTY_LOD_STATS_PLAIN_VARIANT):
+	// the mip_stats binding stays declared, but no sample records GET_LOD_STATS feedback.
+	bool                                             mip_stats_records            = true;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};

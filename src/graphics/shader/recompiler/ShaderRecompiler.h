@@ -22,6 +22,9 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// Also emit CompileResult::spirv_plain for a GET_LOD_STATS-instrumented pixel shader
+	// (KYTY_LOD_STATS_PLAIN_VARIANT).
+	bool                        plain_mip_stats_variant = false;
 };
 
 struct TranslateResult {
@@ -33,6 +36,10 @@ struct TranslateResult {
 
 struct CompileResult {
 	std::vector<uint32_t>  spirv;
+	// The same program without GET_LOD_STATS feedback (Spirv::EmitProgram mip_stats_records=false):
+	// its only difference is the absent per-sample recording. Empty unless requested and the
+	// program is instrumented.
+	std::vector<uint32_t>  spirv_plain;
 	std::string            decoded_dump;
 	std::string            ir_dump;
 	IR::Program            program;

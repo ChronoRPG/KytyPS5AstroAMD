@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <array>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -29,6 +30,10 @@ public:
 	// has finished on the host (its writes then precede vkQueueSubmit).
 	[[nodiscard]] virtual uint64_t      PendingValue()    = 0;
 	[[nodiscard]] virtual vk::Semaphore Semaphore() const = 0;
+	// Stages of the batch that wait for it.
+	[[nodiscard]] virtual vk::PipelineStageFlags WaitStages() const {
+		return vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer;
+	}
 	// Host-side wait, used when the batch has no free wait slot.
 	virtual void WaitHost(uint64_t value) = 0;
 };
@@ -105,9 +110,11 @@ public:
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
-	// Recording-thread only; the owner clears it before it is destroyed.
-	void SetSubmitDependency(SubmitDependency* dependency) noexcept {
-		m_submit_dependency = dependency;
+	// Recording-thread only; the owner clears it before it is destroyed. Slot 0: TextureCache
+	// staging copies; slot 1: BufferCache upload DMA.
+	static constexpr uint32_t SubmitDependencySlots = 2;
+	void SetSubmitDependency(SubmitDependency* dependency, uint32_t slot = 0) noexcept {
+		m_submit_dependencies[slot] = dependency;
 	}
 
 private:
@@ -171,7 +178,7 @@ private:
 	std::unique_ptr<GpuTimestampRing> m_gpu_timing;
 	// Guest scheduler with KYTY_GPU_OP_PROFILE / counters enabled (gpuOpProfiler.h).
 	bool m_gpu_ops = false;
-	SubmitDependency* m_submit_dependency = nullptr;
+	std::array<SubmitDependency*, SubmitDependencySlots> m_submit_dependencies {};
 	// Declared last: the runner starts in the constructor and uses the members above.
 	std::jthread m_priority_thread;
 };

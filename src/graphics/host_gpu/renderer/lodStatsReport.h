@@ -25,6 +25,9 @@ constexpr uint32_t Entries    = Counters + 1; // the shader's last entry absorbs
 constexpr uint32_t ReportSize = 64 + Counters * 8;
 constexpr uint64_t NoData     = 0x0F00000000000000ull;
 constexpr uint32_t Unsampled  = 0xffffffffu; // reset value of a finest-level word
+// ImageField bit set when the image's T# has no mip-statistics counter: the instrumented shader
+// records nothing for it.
+constexpr uint32_t NoCounterFlag = 0x8000u;
 
 // When a report becomes visible to the guest (KYTY_LOD_REPORT_PUBLISH).
 enum class Publish : uint8_t {

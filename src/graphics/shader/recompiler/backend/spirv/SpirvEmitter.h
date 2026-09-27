@@ -32,8 +32,11 @@ struct HostBufferRobustness {
 void                 SetHostBufferRobustness(const HostBufferRobustness& robustness);
 HostBufferRobustness GetHostBufferRobustness();
 
+// mip_stats_records=false emits the plain variant of a GET_LOD_STATS-instrumented pixel shader:
+// the same bindings and code, without the per-sample feedback (and so without its storage-buffer
+// atomics, which force depth/stencil tests after the shader for a shader that can discard).
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info);
+                                  ShaderStageInputInfo input_info, bool mip_stats_records = true);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

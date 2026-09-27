@@ -785,6 +785,18 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("depth attachment feedback loop is not supported by the host\n");
 		}
 		auto layout = depth_attachment_layout(depth);
+		if (!sampled_aspects && DepthLayoutStableEnabled()) {
+			// Nothing in this draw samples the image, so its attachment layout is not observable:
+			// keep the current one while it allows the draw's writes (no transition, no new
+			// rendering instance).
+			const auto stable = depth_stable_attachment_layout(
+			    image.backing.state.layout, image.backing.subresource_states.empty(),
+			    ImageViewOps::DepthAspectMask(depth.desc.view_info.format), draw_writes);
+			if (stable != layout && stable == image.backing.state.layout) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::DepthLayoutTransitionsAvoided);
+			}
+			layout = stable;
+		}
 		if (sampled_aspects & ~DepthReadableAspects(layout)) {
 			layout = m_context.GetGraphics().attachment_feedback_loop_enabled
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
@@ -1592,10 +1604,12 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 // and it samples none of them. Conservative: any shader write path (storage buffers/images,
 // atomics, address writes, GDS, fault/LOD counters), indirect arguments or a feedback loop makes
 // the draw unsafe for sinking a pending barrier past it.
+// plain_pixel: the pixel stage runs its feedback-free variant (KYTY_LOD_STATS_PLAIN_VARIANT), so
+// its mip-statistics binding is not written.
 static bool DrawIsBarrierSafe(std::span<PreparedBindings* const> stages,
                               const RenderColorInfo* colors, uint32_t color_count,
                               const RenderDepthInfo& depth, vk::ImageAspectFlags feedback_aspects,
-                              bool indirect) {
+                              bool indirect, bool plain_pixel) {
 	if (indirect || feedback_aspects || !BarrierSinkEnabled()) {
 		return false;
 	}
@@ -1620,7 +1634,8 @@ static bool DrawIsBarrierSafe(std::span<PreparedBindings* const> stages,
 		}
 		for (const auto& binding: program.bindings.descriptors) {
 			if (binding.kind == Kind::Gds || binding.kind == Kind::FaultBuffer ||
-			    binding.kind == Kind::MipStats) {
+			    (binding.kind == Kind::MipStats &&
+			     !(plain_pixel && program.stage == ShaderType::Pixel))) {
 				return false;
 			}
 		}
@@ -1833,10 +1848,37 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
+	// KYTY_LOD_STATS_PLAIN_VARIANT: without a mip-statistics counter on any image the pixel
+	// program's feedback records nothing; its feedback-free variant then gives the same results
+	// without forcing the depth/stencil tests after a shader that can discard.
+	const auto* programs    = &state.programs;
+	bool        plain_pixel = false;
+	PipelineCache::GraphicsPrograms plain_programs;
+	if (state.ps_active && bindings.pixel.has_value()) {
+		const auto plain_mode = LodStatsCounter::PlainVariant();
+		const auto plain      = plain_mode != LodStatsCounter::Plain::Off
+		                            ? PipelineCache::PlainPixelProgram(state.stage_preps.pixel)
+		                            : ShaderProgram {};
+		if (plain) {
+			if (bindings.pixel->mip_stats_active) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::LodStatsInstrumentedDraws);
+			} else if (plain_mode == LodStatsCounter::Plain::On) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::LodStatsPlainDraws);
+				plain_programs       = state.programs;
+				plain_programs.pixel = plain;
+				programs             = &plain_programs;
+				plain_pixel          = true;
+			} else if (m_context.GetLodStats().CanaryReady()) {
+				// Verify: the instrumented program records into the canary, which must stay reset.
+				Profiler::CountFrameEvent(Profiler::FrameEvent::LodStatsPlainDraws);
+				bindings.pixel->mip_stats_canary = true;
+			}
+		}
+	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	    *programs);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1849,7 +1891,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// (or, for a safe draw continuing the same rendering instance, may sink past the draw).
 	const CommandBuffer::DrawScope draw_scope(
 	    buffer, DrawIsBarrierSafe(stages, state.color_info, state.color_count, state.depth_info,
-	                              feedback_aspects, indirect != nullptr));
+	                              feedback_aspects, indirect != nullptr, plain_pixel));
 	auto vk_buffer = buffer.StateHandle();
 	SetDrawDebugPhase(buffer, submit_id, draw, emit, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
