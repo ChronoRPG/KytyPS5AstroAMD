@@ -1404,6 +1404,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 					     LibKernel::Memory::IsGpuCleanForRead(pairs.address, pairs.size))) {
 						packet_class = DrawPrep::PacketClass::WindowSafe;
 						Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepRegIndirectKept);
+						DrawPrep::GetTotals().register_indirect_kept.fetch_add(
+						    1, std::memory_order_relaxed);
 					}
 				}
 				engine->OnPacket(packet_class, fence_kind);

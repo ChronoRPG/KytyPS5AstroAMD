@@ -92,6 +92,17 @@ enum class Failure : uint8_t {
 	Mismatch,
 };
 
+// Process-wide totals of the engine's decisions, always counted (relaxed; written on the GPU
+// thread). The DrawPrep* frame events only count with a connected profiler; tests read these.
+struct Totals {
+	std::atomic<uint64_t> committed {0};              // Validate accepted a preparation
+	std::atomic<uint64_t> fallbacks {0};              // Validate rejected one (serial preparation)
+	std::atomic<uint64_t> drains {0};                 // Drain calls that found pending draws
+	std::atomic<uint64_t> register_indirect_kept {0}; // SET_*_REG_INDIRECT packets kept in a window
+	std::atomic<Failure>  last_failure {Failure::None};
+};
+[[nodiscard]] Totals& GetTotals();
+
 // One draw's speculative preparation and its certificate. Reused across draws (vectors keep
 // their capacity).
 struct PreparedDraw {
