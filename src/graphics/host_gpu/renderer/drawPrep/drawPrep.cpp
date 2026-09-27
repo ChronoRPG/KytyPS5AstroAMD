@@ -161,6 +161,17 @@ bool PacketHookEnabled() {
 	return enabled;
 }
 
+bool PacketHookActive() {
+	if (PacketHookEnabled()) {
+		return true;
+	}
+	static const bool passive = [] {
+		const auto* value = EnvValue("KYTY_DRAW_PREP_FENCE_HISTOGRAM");
+		return Profiler::AggregateEnabled() && (value == nullptr || std::strcmp(value, "0") != 0);
+	}();
+	return passive && tracy::ProfilerAvailable() && TracyIsConnected;
+}
+
 void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, bool eligible,
              bool exact, PreparedDraw& prepared) {
 	prepared.ok         = false;
@@ -641,7 +652,7 @@ void Engine::NoteFence() {
 	m_draws_since_fence = 0;
 }
 
-void Engine::OnPacket(PacketClass packet_class) {
+void Engine::OnPacket(PacketClass packet_class, FenceKind fence_kind) {
 	switch (packet_class) {
 		case PacketClass::WindowSafe: break;
 		case PacketClass::Draw:
@@ -651,10 +662,23 @@ void Engine::OnPacket(PacketClass packet_class) {
 				m_draws_since_fence++;
 			}
 			break;
-		case PacketClass::Fence:
+		case PacketClass::Fence: {
+			using E = Profiler::FrameEvent;
+			static constexpr std::array<E, static_cast<size_t>(FenceKind::Count)> events {
+			    E::DrawPrepFenceRegIndirect, E::DrawPrepFenceEventWrite,
+			    E::DrawPrepFenceEndOfPipe,   E::DrawPrepFenceAcquireMem,
+			    E::DrawPrepFenceWait,        E::DrawPrepFenceDataWrite,
+			    E::DrawPrepFenceConstantEngine, E::DrawPrepFenceMarker,
+			    E::DrawPrepFenceDispatch,    E::DrawPrepFenceIndirectDraw,
+			    E::DrawPrepFenceContextControl, E::DrawPrepFenceOther,
+			};
+			if (static_cast<size_t>(fence_kind) < events.size()) {
+				Profiler::CountFrameEvent(events[static_cast<size_t>(fence_kind)]);
+			}
 			NoteFence();
 			Drain();
 			break;
+		}
 	}
 }
 
