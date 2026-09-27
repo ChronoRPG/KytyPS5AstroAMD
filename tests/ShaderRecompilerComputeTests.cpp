@@ -2882,6 +2882,12 @@ public:
     drain_submissions();
     finish_gpu();
 
+    // INT_SEL=1 (kOnly) selects the interrupt; it does not gate DATA_SEL on RDNA, so the
+    // graphics queue writes the label as compute queues do (8235d858,
+    // KYTY_EOP_DROPPED_LABELS=count restores the old interrupt-only behavior).
+    const char *dropped_labels = std::getenv("KYTY_EOP_DROPPED_LABELS");
+    const bool kOnly_writes_label =
+        dropped_labels == nullptr || std::strcmp(dropped_labels, "count") != 0;
     interrupt_count = 0;
     const auto graphics_interrupt_wait =
         wait_for_interrupt(interrupt_event, interrupt_count);
@@ -2889,8 +2895,9 @@ public:
             graphics_interrupt_wait == 0 && interrupt_count == 1 &&
                 interrupt_event.ident == 0 && interrupt_event.data == 0 &&
                 interrupt_event.udata == &graphics_interrupt_udata &&
-                graphics_interrupt_label == 0xa5a5a5a5u,
-            "graphics kOnly interrupt was misrouted or wrote its label");
+                graphics_interrupt_label ==
+                    (kOnly_writes_label ? 0x11223344u : 0xa5a5a5a5u),
+            "graphics kOnly interrupt was misrouted or mishandled its label data");
 
     uint32_t compute_interrupt_label = 0x5a5a5a5au;
     auto compute_interrupt_commands = make_interrupt_packet(
