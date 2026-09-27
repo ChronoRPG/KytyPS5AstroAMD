@@ -16675,6 +16675,12 @@ public:
       auto tiled = CreateHostBuffer(name, tiled_size, AllFlags, tiled_words);
       Libs::Graphics::Image direct(m_runtime_context, scheduler, info);
       Libs::Graphics::Image buffered(m_runtime_context, scheduler, info);
+      if (info.IsBlock() &&
+          !(direct.backing.usage & vk::ImageUsageFlagBits::eStorage)) {
+        // No block-texel storage on this device: the buffer path is the only path.
+        DestroyBuffer(&tiled);
+        return;
+      }
       Require(name, (label + " eligible").c_str(),
               tile_manager.DetileToImage(direct, tiled.buffer, 0, tiled_size,
                                          linear_size, infos, regions),
@@ -16697,7 +16703,8 @@ public:
             << " of " << direct_texels.size();
         Fail(name, (label + " upload texels").c_str(), out.str());
       }
-      if (downloads) {
+      // Block-compressed images take the direct path for uploads only.
+      if (downloads && !info.IsBlock()) {
         std::vector<u32> prefill(tiled_words.size());
         fill(&prefill, 0x5a5a0000u + checked);
         auto direct_tiled = CreateHostBuffer(name, tiled_size, AllFlags, prefill);
@@ -16762,6 +16769,20 @@ public:
          false},
         {"depth-tiled r32f layers", Prospero::BufferFormat::k32Float,
          vk::Format::eR32Sfloat, Prospero::TileMode::kDepth, 129, 65, 1, 3, true},
+        // KYTY_TILER_IMAGE_DIRECT_BC: uncompressed block-texel views, one per (level, layer).
+        {"std64 bc7 mips", Prospero::BufferFormat::kBc7UNorm,
+         vk::Format::eBc7UnormBlock, Prospero::TileMode::kStandard64KB, 256, 256, 9, 1,
+         false},
+        {"std64 bc1 mips odd", Prospero::BufferFormat::kBc1UNorm,
+         vk::Format::eBc1RgbaUnormBlock, Prospero::TileMode::kStandard64KB, 268, 204, 9,
+         1, false},
+        {"std4 bc4 mips layers", Prospero::BufferFormat::kBc4UNorm,
+         vk::Format::eBc4UnormBlock, Prospero::TileMode::kStandard4KB, 132, 68, 4, 3,
+         false},
+        {"prt bc5 mips", Prospero::BufferFormat::kBc5UNorm, vk::Format::eBc5UnormBlock,
+         Prospero::TileMode::kPrt, 512, 256, 10, 1, false},
+        {"std256 bc3", Prospero::BufferFormat::kBc3UNorm, vk::Format::eBc3UnormBlock,
+         Prospero::TileMode::kStandard256B, 36, 20, 2, 1, false},
     };
     u32 salt = 1;
     for (const auto &c : cases) {
@@ -16801,7 +16822,8 @@ public:
       check(c.label, info, tiled, infos, regions, linear_size);
 
       // A partial band (TextureCache::TryPartialUpload): block rows [1, 3) of level 0,
-      // placed at a nonzero image row.
+      // placed at a nonzero image row (image rows are texel rows: 4 per BC block).
+      const u32 texel = info.IsBlock() ? 4u : 1u;
       TileBlockLayout block{};
       const auto &tile0 = infos.front();
       const bool bands = c.tile != Prospero::TileMode::kRenderTarget &&
@@ -16825,8 +16847,8 @@ public:
                            tile0.bytes_per_element;
         auto band_region = regions.front();
         band_region.bufferOffset = 0;
-        band_region.imageOffset.y = static_cast<int32_t>(block.block_height);
-        band_region.imageExtent.height = band.height;
+        band_region.imageOffset.y = static_cast<int32_t>(block.block_height * texel);
+        band_region.imageExtent.height = band.height * texel;
         std::vector<u32> band_tiled((total.size + 3u) / 4u);
         fill(&band_tiled, salt++);
         check(std::string(c.label) + " band", info, band_tiled,
@@ -16836,8 +16858,9 @@ public:
       }
     }
 
-    // Fallbacks: block-compressed images have no storage usage; a transfer whose element
-    // size differs from the texel size is declined.
+    // Fallbacks: KYTY_TILER_IMAGE_DIRECT_BC takes block-compressed uploads only where the device
+    // gave the image storage usage; a transfer whose element size differs from the texel (block)
+    // size is declined.
     {
       constexpr auto format = Prospero::BufferFormat::kBc1UNorm;
       TileSizeAlign total{};
@@ -16865,10 +16888,21 @@ public:
       Libs::Graphics::Image bc1(m_runtime_context, scheduler, info);
       auto tiled = CreateHostBuffer(name, (total.size + 3u) & ~uint64_t{3u}, AllFlags,
                                     std::vector<u32>((total.size + 3u) / 4u, 0));
-      Require(name, "bc1 fallback",
-              !tile_manager.DetileToImage(bc1, tiled.buffer, 0, total.size,
-                                          total.size, infos, regions),
-              "a block-compressed image took the direct path");
+      const bool bc_storage = static_cast<bool>(bc1.backing.usage &
+                                                vk::ImageUsageFlagBits::eStorage);
+      Require(name, "bc1 storage usage",
+              bc_storage == (m_runtime_context.supports_block_texel_view &&
+                             ImageOps::BlockStorageUploadsEnabled()) ||
+                  !bc_storage,
+              "a block-compressed image got storage usage without block-texel views");
+      Require(name, "bc1 direct only with storage usage",
+              tile_manager.DetileToImage(bc1, tiled.buffer, 0, total.size,
+                                         total.size, infos, regions) == bc_storage,
+              "the block-compressed direct upload disagrees with the image's usage");
+      Require(name, "bc1 downloads keep the buffer path",
+              !tile_manager.TileFromImage(bc1, regions, tiled.buffer, 0, total.size,
+                                          total.size, infos),
+              "a block-compressed download took the direct path");
 
       ImageInfo wide = info;
       wide.pixel_format = vk::Format::eR32G32B32A32Sfloat;
@@ -16882,8 +16916,9 @@ public:
       scheduler.Finish();
       DestroyBuffer(&tiled);
     }
-    std::printf("[gpu]     %-32s ok (%u parity checks, downloads %s)\n", name,
-                checked, downloads ? "checked" : "unsupported");
+    std::printf("[gpu]     %-32s ok (%u parity checks, downloads %s, block uploads %s)\n",
+                name, checked, downloads ? "checked" : "unsupported",
+                m_runtime_context.supports_block_texel_view ? "checked" : "unsupported");
   }
 
   // --tiler-image-bench: GPU time per 1920x1080 render-target upload and download, buffer path
@@ -16923,6 +16958,32 @@ public:
         {"rg8", Prospero::BufferFormat::k16UNorm, vk::Format::eR8G8Unorm},
     };
     constexpr u32 width = 1920, height = 1080, iterations = 16;
+    // Random contents (uniform data would let compressed memory paths flatter the timings).
+    const auto fill_random = [&](const Buffer &target, uint64_t size) {
+      std::vector<u32> words(static_cast<size_t>(size / 4u));
+      uint64_t state = 0x9e3779b97f4a7c15ull ^ size;
+      for (auto &word : words) {
+        state ^= state << 13u;
+        state ^= state >> 7u;
+        state ^= state << 17u;
+        word = static_cast<u32>(state >> 11u);
+      }
+      auto source = CreateHostBuffer(name, size, AllFlags, words);
+      auto command = scheduler.Current().Handle();
+      const vk::BufferCopy copy{0, 0, size};
+      command.copyBuffer(source.buffer, target.buffer, 1, &copy);
+      vk::MemoryBarrier2 after{};
+      after.srcStageMask = vk::PipelineStageFlagBits2::eCopy;
+      after.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+      after.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+      after.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+      vk::DependencyInfo dependency{};
+      dependency.memoryBarrierCount = 1;
+      dependency.pMemoryBarriers = &after;
+      command.pipelineBarrier2(dependency);
+      scheduler.Finish();
+      DestroyBuffer(&source);
+    };
     for (const auto &c : cases) {
       TileSizeAlign total{};
       TileGetTextureTotalSize(c.transfer, width, height, 1, 1,
@@ -16942,6 +17003,7 @@ public:
       }
       const uint64_t tiled_size = (total.size + 3u) & ~uint64_t{3u};
       auto tiled = CreateDeviceBuffer(name, tiled_size, AllFlags);
+      fill_random(tiled, tiled_size);
       ImageInfo info{};
       info.pixel_format = c.host;
       info.guest_format = c.transfer;
@@ -17042,6 +17104,7 @@ public:
       }
       const uint64_t tiled_size = (total.size + 3u) & ~uint64_t{3u};
       auto tiled = CreateDeviceBuffer(name, tiled_size, AllFlags);
+      fill_random(tiled, tiled_size);
       ImageInfo info{};
       info.pixel_format = c.host;
       info.guest_format = c.format;
@@ -17065,11 +17128,23 @@ public:
         }
         image.Upload(copies, linear.buffer, linear.offset, linear.size);
       };
+      const bool block_direct =
+          static_cast<bool>(image.backing.usage & vk::ImageUsageFlagBits::eStorage);
+      const auto direct_upload = [&] {
+        if (block_direct) {
+          Require(name, c.label,
+                  tile_manager.DetileToImage(image, tiled.buffer, 0, tiled_size,
+                                             linear_size, infos, regions),
+                  "direct block upload declined");
+        }
+      };
       detile_only();
       detile_upload();
+      direct_upload();
       scheduler.Finish();
-      const std::array<std::function<void()>, 2> runs{detile_only, detile_upload};
-      std::array<double, 2> us{};
+      const std::array<std::function<void()>, 3> runs{detile_only, detile_upload,
+                                                      direct_upload};
+      std::array<double, 3> us{};
       for (size_t run = 0; run < runs.size(); ++run) {
         auto command = scheduler.Current().Handle();
         command.resetQueryPool(pool, 0, 2);
@@ -17089,9 +17164,105 @@ public:
         us[run] = static_cast<double>(stamps[1] - stamps[0]) * period / 1000.0 /
                   iterations;
       }
-      std::printf("[gpu]     %-32s %-10s detile %8.1f us detile+copy %8.1f us (%.1f MB)\n",
-                  name, c.label, us[0], us[1], static_cast<double>(total.size) / 1e6);
+      std::printf("[gpu]     %-32s %-10s detile %8.1f us detile+copy %8.1f us direct %8.1f us "
+                  "(%.1f MB)\n",
+                  name, c.label, us[0], us[1], block_direct ? us[2] : -1.0,
+                  static_cast<double>(total.size) / 1e6);
       DestroyBuffer(&tiled);
+    }
+
+    // Texture streaming stages guest bytes in host memory (the 512 MiB upload ring without
+    // resizable BAR). Detiling straight from there reads host memory with scattered shader loads;
+    // a linear copy into device memory first moves the same bytes with one DMA-style copy.
+    const auto time_run = [&](const std::function<void()> &run) {
+      auto command = scheduler.Current().Handle();
+      command.resetQueryPool(pool, 0, 2);
+      command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, 0);
+      for (u32 i = 0; i < iterations; ++i) {
+        run();
+      }
+      scheduler.Current().Handle().writeTimestamp2(
+          vk::PipelineStageFlagBits2::eAllCommands, pool, 1);
+      scheduler.Finish();
+      std::array<uint64_t, 2> stamps{};
+      RequireVk(name, "timestamps",
+                m_device.getQueryPoolResults(
+                    pool, 0, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+                    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                "vkGetQueryPoolResults");
+      return static_cast<double>(stamps[1] - stamps[0]) * period / 1000.0 / iterations;
+    };
+    for (const auto &c : block_cases) {
+      constexpr u32 side = 2048;
+      constexpr auto tile = Prospero::TileMode::kStandard64KB;
+      TileSizeAlign total{};
+      TileGetTextureTotalSize(c.format, side, side, 1, 1, tile, false, total);
+      const auto layout = TextureCalcUploadLayout(c.format, side, side, 1, 1, tile,
+                                                  total.size, false, false, name);
+      const auto regions = TextureBuildImageCopies(layout);
+      std::vector<GpuTileInfo> infos;
+      Require(name, c.label,
+              TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos),
+              "no tile infos");
+      uint64_t linear_size = 0;
+      for (const auto &info : infos) {
+        linear_size = std::max(linear_size, info.linear_offset + info.linear_size);
+      }
+      const uint64_t tiled_size = (total.size + 3u) & ~uint64_t{3u};
+      auto host = CreateHostBuffer(name, tiled_size, AllFlags,
+                                   std::vector<u32>(tiled_size / 4u, 0x5a5a5a5au));
+      auto device = CreateDeviceBuffer(name, tiled_size, AllFlags);
+      const auto stage = [&] {
+        auto command = scheduler.Current().Handle();
+        vk::BufferMemoryBarrier2 before{};
+        before.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands |
+                              vk::PipelineStageFlagBits2::eHost;
+        before.srcAccessMask = vk::AccessFlagBits2::eMemoryRead |
+                               vk::AccessFlagBits2::eMemoryWrite |
+                               vk::AccessFlagBits2::eHostWrite;
+        before.dstStageMask = vk::PipelineStageFlagBits2::eCopy;
+        before.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+        before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        before.buffer = device.buffer;
+        before.offset = 0;
+        before.size = VK_WHOLE_SIZE;
+        vk::DependencyInfo dependency{};
+        dependency.bufferMemoryBarrierCount = 1;
+        dependency.pBufferMemoryBarriers = &before;
+        command.pipelineBarrier2(dependency);
+        const vk::BufferCopy copy{0, 0, tiled_size};
+        command.copyBuffer(host.buffer, device.buffer, 1, &copy);
+        auto after = before;
+        after.srcStageMask = vk::PipelineStageFlagBits2::eCopy;
+        after.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+        after.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+        after.dstAccessMask = vk::AccessFlagBits2::eMemoryRead;
+        vk::DependencyInfo after_dependency{};
+        after_dependency.bufferMemoryBarrierCount = 1;
+        after_dependency.pBufferMemoryBarriers = &after;
+        command.pipelineBarrier2(after_dependency);
+      };
+      const auto detile_from = [&](vk::Buffer source) {
+        (void)tile_manager.Detile(source, 0, tiled_size, linear_size, infos);
+      };
+      detile_from(host.buffer);
+      stage();
+      detile_from(device.buffer);
+      scheduler.Finish();
+      const double from_host = time_run([&] { detile_from(host.buffer); });
+      const double staged = time_run([&] {
+        stage();
+        detile_from(device.buffer);
+      });
+      const double copy_only = time_run(stage);
+      const double from_device = time_run([&] { detile_from(device.buffer); });
+      std::printf("[gpu]     %-32s %-10s host staging: detile from host %8.1f us | copy to "
+                  "device %8.1f us + detile %8.1f us = %8.1f us (%.1f MB)\n",
+                  name, c.label, from_host, copy_only, from_device, staged,
+                  static_cast<double>(total.size) / 1e6);
+      DestroyBuffer(&device);
+      DestroyBuffer(&host);
     }
     m_device.destroyQueryPool(pool, nullptr);
   }
