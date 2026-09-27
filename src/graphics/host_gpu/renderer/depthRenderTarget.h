@@ -70,6 +70,61 @@ inline vk::ImageAspectFlags DepthReadableAspects(vk::ImageLayout layout) {
 	}
 }
 
+// Aspects a draw may write through a depth/stencil attachment in `layout` (no attachment layout
+// restricts depth/stencil tests).
+inline vk::ImageAspectFlags DepthWritableAspects(vk::ImageLayout layout) {
+	switch (layout) {
+		case vk::ImageLayout::eDepthStencilAttachmentOptimal:
+			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+		case vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal:
+		case vk::ImageLayout::eDepthAttachmentOptimal: return vk::ImageAspectFlagBits::eDepth;
+		case vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal:
+		case vk::ImageLayout::eStencilAttachmentOptimal: return vk::ImageAspectFlagBits::eStencil;
+		default: return {};
+	}
+}
+
+// KYTY_DEPTH_LAYOUT_STABLE: the attachment layout of a depth target that the draw does not
+// sample. depth_attachment_layout() picks the narrowest layout for each draw's writes, so draws
+// that alternate stencil writes (a stencil mark followed by draws that only test it) toggled the
+// image between DEPTH_STENCIL_ATTACHMENT and DEPTH_ATTACHMENT_STENCIL_READ_ONLY: a layout
+// transition, and so a new rendering instance, before every such draw. The layout of an
+// attachment nothing samples is not observable by the draw: every standard depth/stencil
+// attachment layout allows the tests, and a writable one also the writes. So the image keeps its
+// current layout when that is a standard attachment layout for its aspects that allows this
+// draw's writes (`current_whole`: one tracked state covers the image), and otherwise takes the
+// fully writable layout, which every later draw can keep.
+inline vk::ImageLayout depth_stable_attachment_layout(vk::ImageLayout current, bool current_whole,
+                                                      vk::ImageAspectFlags available,
+                                                      vk::ImageAspectFlags writes) {
+	const bool has_depth   = static_cast<bool>(available & vk::ImageAspectFlagBits::eDepth);
+	const bool has_stencil = static_cast<bool>(available & vk::ImageAspectFlagBits::eStencil);
+	bool       standard    = false;
+	switch (current) {
+		case vk::ImageLayout::eDepthStencilAttachmentOptimal:
+		case vk::ImageLayout::eDepthStencilReadOnlyOptimal: standard = true; break;
+		case vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal:
+		case vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal:
+			standard = has_depth && has_stencil;
+			break;
+		case vk::ImageLayout::eDepthAttachmentOptimal:
+		case vk::ImageLayout::eDepthReadOnlyOptimal: standard = has_depth && !has_stencil; break;
+		case vk::ImageLayout::eStencilAttachmentOptimal:
+		case vk::ImageLayout::eStencilReadOnlyOptimal: standard = has_stencil && !has_depth; break;
+		default: break;
+	}
+	if (current_whole && standard && !(writes & ~DepthWritableAspects(current))) {
+		return current;
+	}
+	if (!has_stencil) {
+		return vk::ImageLayout::eDepthAttachmentOptimal;
+	}
+	if (!has_depth) {
+		return vk::ImageLayout::eStencilAttachmentOptimal;
+	}
+	return vk::ImageLayout::eDepthStencilAttachmentOptimal;
+}
+
 inline vk::ImageLayout depth_attachment_layout(const RenderDepthInfo& depth) {
 	const auto available     = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 	const auto writes        = depth.AttachmentWriteAspects();

@@ -655,6 +655,9 @@ enum class FrameEvent : uint32_t {
 	DrawIndirectFallbackQuadList,
 	DrawIndirectFallbackRestart,
 	DrawIndirectFallbackMesh,
+	// KYTY_DEPTH_LAYOUT_STABLE: draws whose unsampled depth target kept its current layout where
+	// the per-draw layout would have transitioned it (and ended the rendering instance).
+	DepthLayoutTransitionsAvoided,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

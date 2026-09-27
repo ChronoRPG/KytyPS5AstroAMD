@@ -148,6 +148,13 @@ struct DrawAutoArgs {
 // is not continued after all, BeginRendering() records the left-out barrier before the next
 // one (CommandBuffer::NoteFeedbackKeep). KYTY_DEPTH_FEEDBACK_KEEP=0 restores the toggles.
 [[nodiscard]] bool DepthFeedbackKeepEnabled();
+// KYTY_DEPTH_LAYOUT_STABLE (default on): a depth target the draw does not sample keeps its
+// current attachment layout while that layout allows the draw's writes, instead of taking the
+// narrowest layout for each draw's write aspects (depth_stable_attachment_layout in
+// depthRenderTarget.h). Draws alternating stencil writes no longer transition the image, and so no
+// longer end the rendering instance, between them. KYTY_DEPTH_LAYOUT_STABLE=0 restores the
+// per-draw layouts.
+[[nodiscard]] bool DepthLayoutStableEnabled();
 // Descriptor commit switches (default on; =0 restores the previous behaviour):
 // KYTY_PUSH_CONSTANT_SHADOW skips push-constant updates identical to the one in effect;
 // KYTY_DESCRIPTOR_SET_REUSE reuses descriptor sets (layouts beyond maxPushDescriptors) written

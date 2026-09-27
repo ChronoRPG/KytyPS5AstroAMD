@@ -785,6 +785,18 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("depth attachment feedback loop is not supported by the host\n");
 		}
 		auto layout = depth_attachment_layout(depth);
+		if (!sampled_aspects && DepthLayoutStableEnabled()) {
+			// Nothing in this draw samples the image, so its attachment layout is not observable:
+			// keep the current one while it allows the draw's writes (no transition, no new
+			// rendering instance).
+			const auto stable = depth_stable_attachment_layout(
+			    image.backing.state.layout, image.backing.subresource_states.empty(),
+			    ImageViewOps::DepthAspectMask(depth.desc.view_info.format), draw_writes);
+			if (stable != layout && stable == image.backing.state.layout) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::DepthLayoutTransitionsAvoided);
+			}
+			layout = stable;
+		}
 		if (sampled_aspects & ~DepthReadableAspects(layout)) {
 			layout = m_context.GetGraphics().attachment_feedback_loop_enabled
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT

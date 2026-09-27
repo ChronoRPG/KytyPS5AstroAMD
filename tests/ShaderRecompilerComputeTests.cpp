@@ -11645,6 +11645,170 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // KYTY_DEPTH_LAYOUT_STABLE: draws that alternate depth writes on a depth target nothing
+  // samples keep one attachment layout and one rendering instance; sampling still takes a
+  // readable layout, and a write after it the writable one again.
+  void CheckDepthLayoutStable() {
+    constexpr const char *name = "DepthLayoutStable";
+    constexpr uintptr_t base = 0x0000000205c00000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    context.InitializeGpu(nullptr);
+    scheduler.Begin(registers, user_config, shaders);
+    auto &texture_cache = context.GetTextureCache();
+    auto &executor = context.GetRenderExecutor();
+    context.MapMemory(base, allocation_size);
+    std::vector<PipelineCache::Pipeline> descriptor_pipelines;
+
+    ShaderRecompiler::IR::Program sampled_program{};
+    sampled_program.stage = ShaderType::Pixel;
+    sampled_program.resource_tracking_complete = true;
+    ShaderRecompiler::IR::ImageResource sampled_resource{};
+    sampled_resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+    sampled_resource.numeric_class = Prospero::TextureNumericClass::Float;
+    sampled_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    sampled_resource.read = true;
+    sampled_program.info.images.push_back(sampled_resource);
+    sampled_program.shader_info_complete = true;
+    ShaderRecompiler::IR::AllocateBindings(sampled_program);
+    ShaderRecompiler::IR::ResourceSnapshot sampled_snapshot{};
+    ShaderRecompiler::IR::DescriptorValue sampled_descriptor{};
+    sampled_descriptor.dword_count = 8;
+    sampled_snapshot.images.push_back(sampled_descriptor);
+    ShaderRecompiler::IR::CompiledShaderInfo sampled_info{};
+    sampled_info.stage = sampled_program.stage;
+    sampled_info.info = std::move(sampled_program.info);
+    sampled_info.bindings = std::move(sampled_program.bindings);
+    ShaderStageRuntime sampled_runtime{&sampled_info, &sampled_snapshot};
+
+    ImageDesc depth_desc{};
+    depth_desc.type = BindingType::DepthTarget;
+    depth_desc.info.data = {base + 0x10000, 4 * 4 * sizeof(float)};
+    depth_desc.info.pixel_format = vk::Format::eD32Sfloat;
+    depth_desc.info.guest_format = Prospero::BufferFormat::k32Float;
+    depth_desc.info.type = Prospero::ImageType::kColor2D;
+    depth_desc.info.extent = {4, 4, 1};
+    depth_desc.info.resources = {1, 1};
+    depth_desc.info.pitch = 4;
+    depth_desc.info.bytes_per_block = 4;
+    depth_desc.info.samples = 1;
+    depth_desc.info.tile_mode = Prospero::TileMode::kLinear;
+    depth_desc.info.mip_layout[0] = {0, 64, 4, 4};
+    depth_desc.view_info.format = vk::Format::eD32Sfloat;
+    depth_desc.view_info.type = vk::ImageViewType::e2D;
+    depth_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+    depth_desc.view_info.level_count = 1;
+    depth_desc.view_info.layer_count = 1;
+    depth_desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    const auto depth_id = texture_cache.FindImage(depth_desc);
+    auto sampled_desc = depth_desc;
+    sampled_desc.type = BindingType::Texture;
+    sampled_desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+    const auto sampled_view = texture_cache.FindTexture(depth_id, sampled_desc);
+    Require(name, "sampled view", sampled_view != nullptr, "no sampled depth view");
+
+    const auto draw = [&](bool depth_write, bool sample) {
+      RenderDepthInfo depth{};
+      depth.desc = depth_desc;
+      depth.image_id = depth_id;
+      depth.depth_test_enable = true;
+      depth.depth_write_enable = depth_write;
+      depth.depth_compare_op = vk::CompareOp::eLessOrEqual;
+      PreparedBindings binding{};
+      binding.runtime = &sampled_runtime;
+      if (sample) {
+        binding.images.push_back({depth_id, sampled_view, sampled_desc});
+      }
+      RenderExecutorTestAccess::BindRenderTarget(executor, depth_id);
+      std::array<PreparedBindings *, 1> stages{&binding};
+      RenderColorInfo no_color{};
+      const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &no_color, 0, depth,
+          sample ? std::span<PreparedBindings *const>(stages)
+                 : std::span<PreparedBindings *const>{});
+      if (sample) {
+        descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+            executor, scheduler.Current(), binding));
+      }
+      scheduler.BeginRendering(rendering);
+      RenderExecutorTestAccess::NoteDepthFeedback(executor, scheduler.Current());
+      RenderExecutorTestAccess::ResetBindings(executor);
+      return std::pair{scheduler.Current().ActiveRenderingSerial(),
+                       rendering.depth_stencil_attachment.image_layout};
+    };
+
+    const auto writes = draw(true, false);
+    const auto tests_only = draw(false, false);
+    const auto writes_again = draw(true, false);
+    const auto tests_again = draw(false, false);
+    if (DepthLayoutStableEnabled()) {
+      Require(name, "unsampled draws keep one instance",
+              writes.first != 0 && tests_only.first == writes.first &&
+                  writes_again.first == writes.first && tests_again.first == writes.first &&
+                  tests_only.second == vk::ImageLayout::eDepthAttachmentOptimal &&
+                  tests_again.second == vk::ImageLayout::eDepthAttachmentOptimal &&
+                  scheduler.Current().PendingImageBarriers() == 0,
+              "draws alternating depth writes split the instance or changed the layout");
+    } else {
+      Require(name, "per-draw layouts (KYTY_DEPTH_LAYOUT_STABLE=0)",
+              tests_only.first != writes.first && writes_again.first != tests_only.first &&
+                  tests_only.second == vk::ImageLayout::eDepthReadOnlyOptimal,
+              "the reverted policy kept the writable layout for a draw without writes");
+    }
+
+    // Sampling needs a layout in which the sampled aspect is readable (with the stable layouts a
+    // new instance: the unsampled draws before it kept the writable layout).
+    const auto sampling = draw(false, true);
+    Require(name, "sampling takes a readable layout",
+            (!DepthLayoutStableEnabled() || sampling.first != tests_again.first) &&
+                (DepthReadableAspects(sampling.second) & vk::ImageAspectFlagBits::eDepth),
+            "a sampled depth attachment kept a layout that does not allow reading it");
+    // A draw that neither writes nor samples keeps the readable layout.
+    const auto after_sampling = draw(false, false);
+    Require(name, "an unsampled draw without writes keeps the readable layout",
+            !DepthLayoutStableEnabled() || after_sampling.second == sampling.second,
+            "an unsampled draw without writes transitioned away from the readable layout");
+    // A write needs a writable layout again, which later tests-only draws keep.
+    const auto writes_after = draw(true, false);
+    const auto tests_after = draw(false, false);
+    Require(name, "a write after sampling returns to the writable layout",
+            writes_after.first != sampling.first &&
+                writes_after.second == vk::ImageLayout::eDepthAttachmentOptimal &&
+                (!DepthLayoutStableEnabled() || (tests_after.first == writes_after.first &&
+                                                 tests_after.second == writes_after.second)),
+            "the write after sampling kept a read-only layout, or the next draw split again");
+
+    scheduler.Current().EndRendering();
+    scheduler.Current().FlushBarriers();
+    scheduler.Finish();
+    RenderExecutorTestAccess::DestroyDescriptorPipelines(executor, descriptor_pipelines);
+    std::printf("[gpu]     %-32s ok (%s)\n", name,
+                DepthLayoutStableEnabled() ? "stable" : "per-draw");
+  }
+
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
@@ -34303,6 +34467,76 @@ void CheckStorageTextureVolumeMipRegions() {
   std::printf("[host]    %-32s ok\n", "StorageTextureVolumeMipRegions");
 }
 
+// KYTY_DEPTH_LAYOUT_STABLE layout rules (depth_stable_attachment_layout): the current layout is
+// kept only when it is a standard attachment layout for the image's aspects that allows every
+// aspect the draw writes; otherwise the fully writable layout of those aspects.
+void CheckDepthStableLayoutRules() {
+  constexpr const char *name = "DepthStableLayoutRules";
+  using L = vk::ImageLayout;
+  const vk::ImageAspectFlags depth = vk::ImageAspectFlagBits::eDepth;
+  const vk::ImageAspectFlags stencil = vk::ImageAspectFlagBits::eStencil;
+  const vk::ImageAspectFlags both = depth | stencil;
+  const vk::ImageAspectFlags none{};
+  struct Case {
+    L current;
+    bool whole;
+    vk::ImageAspectFlags available;
+    vk::ImageAspectFlags writes;
+    L expected;
+  };
+  const Case cases[] = {
+      // The stencil-mark pattern: a depth-only write keeps DEPTH_STENCIL_ATTACHMENT.
+      {L::eDepthStencilAttachmentOptimal, true, both, depth, L::eDepthStencilAttachmentOptimal},
+      {L::eDepthStencilAttachmentOptimal, true, both, none, L::eDepthStencilAttachmentOptimal},
+      {L::eDepthStencilAttachmentOptimal, true, both, both, L::eDepthStencilAttachmentOptimal},
+      // A read-only aspect that the draw writes needs the writable layout.
+      {L::eDepthAttachmentStencilReadOnlyOptimal, true, both, depth,
+       L::eDepthAttachmentStencilReadOnlyOptimal},
+      {L::eDepthAttachmentStencilReadOnlyOptimal, true, both, both,
+       L::eDepthStencilAttachmentOptimal},
+      {L::eDepthReadOnlyStencilAttachmentOptimal, true, both, depth,
+       L::eDepthStencilAttachmentOptimal},
+      {L::eDepthStencilReadOnlyOptimal, true, both, none, L::eDepthStencilReadOnlyOptimal},
+      {L::eDepthStencilReadOnlyOptimal, true, both, stencil, L::eDepthStencilAttachmentOptimal},
+      // Layouts that are not standard attachment layouts for the aspects are left.
+      {L::eGeneral, true, both, none, L::eDepthStencilAttachmentOptimal},
+      {L::eShaderReadOnlyOptimal, true, both, none, L::eDepthStencilAttachmentOptimal},
+      {L::eTransferDstOptimal, true, depth, none, L::eDepthAttachmentOptimal},
+      {L::eUndefined, true, depth, depth, L::eDepthAttachmentOptimal},
+      {L::eDepthAttachmentOptimal, true, both, depth, L::eDepthStencilAttachmentOptimal},
+      {L::eDepthAttachmentStencilReadOnlyOptimal, true, depth, depth, L::eDepthAttachmentOptimal},
+      // Depth-only and stencil-only images.
+      {L::eDepthStencilAttachmentOptimal, true, depth, depth, L::eDepthStencilAttachmentOptimal},
+      {L::eDepthReadOnlyOptimal, true, depth, none, L::eDepthReadOnlyOptimal},
+      {L::eDepthReadOnlyOptimal, true, depth, depth, L::eDepthAttachmentOptimal},
+      {L::eDepthAttachmentOptimal, true, depth, none, L::eDepthAttachmentOptimal},
+      {L::eStencilReadOnlyOptimal, true, stencil, stencil, L::eStencilAttachmentOptimal},
+      {L::eStencilAttachmentOptimal, true, stencil, none, L::eStencilAttachmentOptimal},
+      {L::eDepthReadOnlyOptimal, true, stencil, none, L::eStencilAttachmentOptimal},
+      // Per-subresource states: no single current layout to keep.
+      {L::eDepthStencilAttachmentOptimal, false, both, none, L::eDepthStencilAttachmentOptimal},
+      {L::eDepthStencilReadOnlyOptimal, false, both, none, L::eDepthStencilAttachmentOptimal},
+      {L::eDepthReadOnlyOptimal, false, depth, none, L::eDepthAttachmentOptimal},
+  };
+  uint32_t index = 0;
+  for (const auto &test : cases) {
+    const auto layout =
+        depth_stable_attachment_layout(test.current, test.whole, test.available, test.writes);
+    if (layout != test.expected) {
+      std::fprintf(stderr, "case %u: current=%s whole=%d available=%u writes=%u -> %s, expected %s\n",
+                   index, vk::to_string(test.current).c_str(), test.whole ? 1 : 0,
+                   static_cast<uint32_t>(test.available), static_cast<uint32_t>(test.writes),
+                   vk::to_string(layout).c_str(), vk::to_string(test.expected).c_str());
+      Require(name, "rule", false, "unexpected stable depth attachment layout");
+    }
+    // Whatever is chosen allows the draw's writes.
+    Require(name, "writes allowed", !(test.writes & ~DepthWritableAspects(layout)),
+            "the chosen layout does not allow the draw's writes");
+    index++;
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 // GpuTilerCpuParity compares the GPU tiler shaders with TileGetBlockOffset at every in-block
 // position, so both share any error in the per-family bit equations. Check the equations
 // themselves: one block's elements must map onto distinct, element-aligned offsets that fill
@@ -36891,6 +37125,12 @@ int main(int argc, char **argv) {
     vulkan.CheckDepthFeedbackKeep();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-layout-stable-only") == 0) {
+    CheckDepthStableLayoutRules();
+    VulkanHarness vulkan;
+    vulkan.CheckDepthLayoutStable();
+    return 0;
+  }
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--tiler-image-bench") == 0) {
     VulkanHarness vulkan;
@@ -37306,6 +37546,8 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
   vulkan.CheckDepthFeedbackKeep();
+  CheckDepthStableLayoutRules();
+  vulkan.CheckDepthLayoutStable();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBgra16Readback();
   vulkan.CheckRasterization(false);

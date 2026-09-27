@@ -409,6 +409,7 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.DrawIndirectFallbackQuadList.Cumulative",
     "FrameEvent.DrawIndirectFallbackRestart.Cumulative",
     "FrameEvent.DrawIndirectFallbackMesh.Cumulative",
+    "FrameEvent.DepthLayoutTransitionsAvoided.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
