@@ -504,6 +504,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
 #endif
+	if (PipelineDynamicRasterStateEnabled()) {
+		// Core Vulkan 1.3 (no feature bit). The key holds zeroes for these fields; the draw records
+		// the values from the same registers (SetGraphicsDynamicParams).
+		dynamic_states.push_back(vk::DynamicState::eCullMode);
+		dynamic_states.push_back(vk::DynamicState::eFrontFace);
+#if !defined(__APPLE__)
+		dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
+		dynamic_states.push_back(vk::DynamicState::eDepthBounds);
+#endif
+	}
 	if (graphics.attachment_feedback_loop_enabled) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
 	}

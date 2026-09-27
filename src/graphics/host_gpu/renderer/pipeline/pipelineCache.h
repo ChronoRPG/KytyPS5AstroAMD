@@ -252,6 +252,11 @@ private:
 	void     NotePipelineCreated(uint64_t create_ns);
 };
 
+// KYTY_PIPELINE_DYNAMIC_STATE (default on): cull mode, front face, the depth-bounds test enable and
+// the depth bounds are dynamic state of every renderer graphics pipeline, recorded per draw by
+// SetGraphicsDynamicParams, instead of pipeline-key fields (=0: baked into each pipeline).
+[[nodiscard]] bool PipelineDynamicRasterStateEnabled();
+
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,

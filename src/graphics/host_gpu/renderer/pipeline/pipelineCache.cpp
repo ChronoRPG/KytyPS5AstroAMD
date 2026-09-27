@@ -2104,7 +2104,68 @@ void PipelineCache::Save() {
 	m_driver_cache = nullptr;
 }
 
+bool PipelineDynamicRasterStateEnabled() {
+	static const bool enabled = EnvU64("KYTY_PIPELINE_DYNAMIC_STATE", 1) != 0;
+	return enabled;
+}
+
 namespace {
+
+bool PipelineKeyNormalizationEnabled() {
+	static const bool enabled = EnvU64("KYTY_PIPELINE_KEY_NORMALIZE", 1) != 0;
+	return enabled;
+}
+
+// Zeroes pipeline-key fields that cannot change the pipeline CreatePipelineInternal creates, so
+// draws that differ only in them share one pipeline instead of compiling identical copies.
+// KYTY_PIPELINE_KEY_NORMALIZE=0 keeps them. Each rule and why the field is unused:
+// - Blend factors and ops of an attachment with blending off: they only feed the blend equation
+//   of VkPipelineColorBlendAttachmentState, which Vulkan ignores when blendEnable is VK_FALSE.
+//   0 is BlendFactor::kZero / BlendOp::kAdd, which GetBlendFactor/GetBlendOp accept.
+// - Alpha factors and op with separate alpha blending off: CreatePipelineInternal then copies the
+//   color factors and op into the alpha ones and never reads these.
+// - The depth-bounds test without a depth/stencil attachment: CreatePipelineInternal passes no
+//   VkPipelineDepthStencilStateCreateInfo at all (pDepthStencilState is null).
+// - Depth-bounds min/max while the test is disabled: they are only inputs of that test.
+// Not normalized: the clip-space viewport transform in the vertex-program key
+// (BuildStageStaticKey). The emitter bakes scale, offset and half extent into the SPIR-V as
+// constants (ConvertPositionToClipSpace), so each value is a different shader; moving them to
+// push constants would also turn the power-of-two division into a runtime division, which is not
+// guaranteed to be bit-identical.
+// With KYTY_PIPELINE_DYNAMIC_STATE, cull mode, front face and the depth-bounds state are dynamic
+// (set per draw from the same registers) and leave the key entirely.
+void NormalizePipelineKey(PipelineStaticParameters& params, bool with_depth) {
+	if (PipelineKeyNormalizationEnabled()) {
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if (!params.blend_enable[slot]) {
+				params.color_srcblend[slot]       = 0;
+				params.color_comb_fcn[slot]       = 0;
+				params.color_destblend[slot]      = 0;
+				params.separate_alpha_blend[slot] = false;
+			}
+			if (!params.blend_enable[slot] || !params.separate_alpha_blend[slot]) {
+				params.alpha_srcblend[slot]  = 0;
+				params.alpha_comb_fcn[slot]  = 0;
+				params.alpha_destblend[slot] = 0;
+			}
+		}
+		if (!with_depth) {
+			params.depth_bounds_test_enable = false;
+		}
+		if (!params.depth_bounds_test_enable) {
+			params.depth_min_bounds = 0.0f;
+			params.depth_max_bounds = 0.0f;
+		}
+	}
+	if (PipelineDynamicRasterStateEnabled()) {
+		params.cull_front               = false;
+		params.cull_back                = false;
+		params.face                     = false;
+		params.depth_bounds_test_enable = false;
+		params.depth_min_bounds         = 0.0f;
+		params.depth_max_bounds         = 0.0f;
+	}
+}
 
 // KYTY_STAGE_PREP_VERIFY: 0 (default) off; 1 reruns the serial preparation after every parallel
 // one and logs and counts differences; "exit" also stops the emulator on the first difference.
@@ -2434,6 +2495,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
+	NormalizePipelineKey(static_params, with_depth);
 
 	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
 		EXIT_IF(vs_input_info.buffers_num < 0 ||
