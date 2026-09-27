@@ -782,6 +782,10 @@ enum class FrameEvent : uint32_t {
 	GuestProtectWatchedPages,
 	GuestProtectOverriddenPages,
 	GuestProtectRestrictsGpuMemory,
+	// KYTY_CLAMP_RANGE_MEMO: lookups the per-thread committed-run cache could not answer, and its
+	// verify mode's mismatches.
+	ClampRangeMemoMisses,
+	ClampRangeMemoVerifyMismatches,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

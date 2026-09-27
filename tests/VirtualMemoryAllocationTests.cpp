@@ -1623,6 +1623,78 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// KYTY_CLAMP_RANGE_MEMO: ClampRangeSize answers repeated lookups from the calling thread's cache
+// of committed runs, and every change of the ranges (unmap, map, protection) retires it: the
+// answers always equal the locked lookup's (verify mode counts no mismatch).
+void TestClampRangeMemoFollowsMappings() {
+	const char* test    = "ClampRangeMemoFollowsMappings";
+	const auto* setting = std::getenv("KYTY_CLAMP_RANGE_MEMO");
+	const bool  memo    = setting == nullptr || std::strcmp(setting, "0") != 0;
+	void*       reserve = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, SceKernelPageSize * 3, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base  = reinterpret_cast<uint64_t>(reserve);
+	void*      left  = reinterpret_cast<void*>(base);
+	void*      right = reinterpret_cast<void*>(base + SceKernelPageSize);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &left, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "clamp_left"),
+	        "KernelMapNamedFlexibleMemory(left)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &right, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "clamp_right"),
+	        "KernelMapNamedFlexibleMemory(right)");
+	using Libs::LibKernel::Memory::ClampRangeSize;
+	const auto totals = [] { return Libs::LibKernel::Memory::TestClampRangeMemoTotals(); };
+	const auto crossing = base + SceKernelPageSize - 0x100;
+
+	Check(test, ClampRangeSize(crossing, 0x200) == 0x200,
+	      "a range across two adjacent committed mappings was clamped");
+	const auto first = totals();
+	Check(test,
+	      ClampRangeSize(crossing, 0x200) == 0x200 && ClampRangeSize(base + 0x10, 0x20) == 0x20,
+	      "a repeated lookup changed its answer");
+	Check(test, !memo || totals().hits == first.hits + 2,
+	      "repeated lookups in an unchanged run were not answered from the cache");
+	// The third page is only reserved: the run ends at base + 2 pages.
+	Check(test, ClampRangeSize(base + SceKernelPageSize, SceKernelPageSize * 2) == SceKernelPageSize,
+	      "a range into a reserved page was not clamped at the committed run's end");
+
+	// Unmapping the right page ends the run there.
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(right)");
+	Check(test, ClampRangeSize(crossing, 0x200) == 0x100,
+	      "a lookup after an unmap used the run from before it");
+	// Mapping it again joins the run.
+	right = reinterpret_cast<void*>(base + SceKernelPageSize);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &right, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "clamp_right"),
+	        "KernelMapNamedFlexibleMemory(right again)");
+	Check(test, ClampRangeSize(crossing, 0x200) == 0x200,
+	      "a lookup after a map used the run from before it");
+	// A protection change keeps the pages committed.
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMprotect(reinterpret_cast<void*>(base), SceKernelPageSize,
+	                                                SceKernelProtCpuRead),
+	        "KernelMprotect(left)");
+	Check(test, ClampRangeSize(crossing, 0x200) == 0x200,
+	      "a protection change altered the committed run");
+	Check(test, totals().verify_mismatches == 0,
+	      "the verify mode found a cached answer that differs from the locked lookup");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 2),
+	        "KernelMunmap(both)");
+	Check(test, ClampRangeSize(crossing, 0x200) == 0,
+	      "a lookup after unmapping everything found a committed range");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize * 2, SceKernelPageSize),
+	        "KernelMunmap(reserved page)");
+	std::printf("[host]    %-48s ok (memo %s)\n", test, memo ? "on" : "off");
+}
+
 void TestNonzeroDirectOffsetAliasesSharedBacking() {
 	const char* test = "NonzeroDirectOffsetAliasesSharedBacking";
 
@@ -3320,6 +3392,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
+	RunTest(TestClampRangeMemoFollowsMappings);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 #if defined(__linux__)

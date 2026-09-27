@@ -480,6 +480,8 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.GuestProtectWatchedPages.Cumulative",
     "FrameEvent.GuestProtectOverriddenPages.Cumulative",
     "FrameEvent.GuestProtectRestrictsGpuMemory.Cumulative",
+    "FrameEvent.ClampRangeMemoMisses.Cumulative",
+    "FrameEvent.ClampRangeMemoVerifyMismatches.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
