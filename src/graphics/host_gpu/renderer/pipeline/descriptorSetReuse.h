@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -36,6 +37,19 @@ public:
 	            std::span<const vk::WriteDescriptorSet> writes, uint64_t hash,
 	            vk::DescriptorSet set);
 
+	// KYTY_DESCRIPTOR_SET_REUSE_AUDIT (a measurement): an XXH3 digest of everything Matches
+	// compares (layout; each write's binding, element, count and type; every buffer and image
+	// info), in which every input bit reaches every output bit, unlike Hash's final mixes.
+	[[nodiscard]] static uint64_t Digest(vk::DescriptorSetLayout                  layout,
+	                                     std::span<const vk::WriteDescriptorSet> writes);
+	struct AuditResult {
+		// An earlier commit of the same command buffer had this digest.
+		bool repeat = false;
+		// A cache like this one (Slots entries, direct-mapped) indexed by the digest still held it.
+		bool digest_slot_hit = false;
+	};
+	[[nodiscard]] AuditResult Audit(uint64_t tick, uint64_t digest);
+
 private:
 	struct Entry {
 		uint64_t                              tick   = 0;
@@ -54,6 +68,12 @@ private:
 	                                  uint64_t                                 hash);
 
 	std::array<Entry, Slots> m_entries {};
+
+	// Audit state of the command buffer (tick) being recorded.
+	uint64_t                     m_audit_tick = UINT64_MAX;
+	std::unordered_set<uint64_t> m_audit_seen;
+	std::array<uint64_t, Slots>  m_audit_slots {};
+	std::array<bool, Slots>      m_audit_slot_used {};
 };
 
 } // namespace Libs::Graphics

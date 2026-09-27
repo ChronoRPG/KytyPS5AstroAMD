@@ -289,6 +289,23 @@ public:
 		return true;
 	}
 
+	// The backing alias of [vaddr, vaddr + size) when one mapping holds the whole range, or
+	// nullptr. The alias view stays mapped and writable for the store's lifetime, so reading it
+	// never faults, whatever the guest view's protection; if the guest unmaps the range later, the
+	// alias keeps showing whatever that backing then holds.
+	const uint8_t* BackingAlias(uint64_t vaddr, uint64_t size) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return nullptr;
+		}
+		std::lock_guard lock(m_mutex);
+		MapEntry entry {};
+		if (!FindContainingUnlocked(vaddr, 1, &entry) || size > entry.size - (vaddr - entry.vaddr)) {
+			return nullptr;
+		}
+		const auto offset = entry.backing_offset + (vaddr - entry.vaddr);
+		return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
+	}
+
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -945,6 +962,10 @@ public:
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadSparseBacking(vaddr, data, size);
+	}
+
+	const uint8_t* BackingAlias(uint64_t vaddr, uint64_t size) {
+		return m_backing->BackingAlias(vaddr, size);
 	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }

@@ -1747,6 +1747,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		total_size += bytes;
 	};
+	// KYTY_UPLOAD_DMA_HOST_COPY (uploadDma.h): a read upload large enough for the copy engine
+	// leaves its guest bytes to the DMA worker. The pages are already clean and write-protected
+	// when upload() runs (ForEachUploadRange), as for the copy made here.
+	std::vector<UploadHostCopy> host_copies;
 	const auto upload = [&]() noexcept {
 		// A normal upload replaces whatever a hot page shadow described.
 		for (const auto& copy: copies) {
@@ -1766,9 +1770,13 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			}
 			if (!copies.empty()) source = m_staging_buffer.Handle();
 		} else {
-			reserved = nullptr;
-			source   = UploadCopies(buffer, copies, total_size, guest_copies,
-			                        m_hot_scratch.data(), host_base);
+			reserved             = nullptr;
+			const bool defer_host = !is_written && UploadBatchEnabled() && m_upload_dma != nullptr &&
+			                        UploadDmaHostCopyEnabled() && !UploadDmaVerify() &&
+			                        m_staging_buffer.IsCoherent() &&
+			                        total_size >= m_upload_dma->MinBytes();
+			source = UploadCopies(buffer, copies, total_size, guest_copies, m_hot_scratch.data(),
+			                      host_base, defer_host ? &host_copies : nullptr);
 		}
 	};
 	if (is_written && m_memory_tracker.GetFaultPolicy().copy_outside_lock) {
@@ -1847,7 +1855,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		if (UploadBatchEnabled() && !late_source) {
 			// One barrier pair per flush for all queued uploads instead of one per upload. Inside
 			// an UploadBatch scope the copy waits for the scope end (or an earlier flush point).
-			source = StageUploadDma(source, copies);
+			source = StageUploadDma(source, copies, &host_copies);
 			command.RequestUploadCopy(source, buffer.Handle(), copies);
 			buffer.MarkContentWritten();
 			if (m_upload_batch_depth == 0) {
@@ -1910,8 +1918,20 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
-vk::Buffer BufferCache::StageUploadDma(vk::Buffer source, std::span<vk::BufferCopy> copies) {
+vk::Buffer BufferCache::StageUploadDma(vk::Buffer source, std::span<vk::BufferCopy> copies,
+                                       std::vector<UploadHostCopy>* host_copies) {
+	// Staging bytes UploadCopies left to the DMA worker, written here when the copy is not
+	// staged after all (the graphics copies then read the staging ring directly).
+	const auto write_host_copies = [host_copies] {
+		if (host_copies != nullptr) {
+			for (const auto& copy: *host_copies) {
+				std::memcpy(copy.destination, copy.source, static_cast<size_t>(copy.size));
+			}
+			host_copies->clear();
+		}
+	};
 	if (m_upload_dma == nullptr || source != m_staging_buffer.Handle() || copies.empty()) {
+		write_host_copies();
 		return source;
 	}
 	// The staged bytes of one upload are one packed range of the ring (SynchronizeBuffer and
@@ -1923,8 +1943,9 @@ vk::Buffer BufferCache::StageUploadDma(vk::Buffer source, std::span<vk::BufferCo
 		end   = std::max(end, copy.srcOffset + copy.size);
 	}
 	const auto size        = end - begin;
-	const auto ring_offset = m_upload_dma->Stage(source, begin, size);
+	const auto ring_offset = m_upload_dma->Stage(source, begin, size, host_copies);
 	if (!ring_offset.has_value()) {
+		write_host_copies();
 		return source;
 	}
 	for (auto& copy: copies) {
@@ -1964,7 +1985,8 @@ vk::Buffer BufferCache::StageUploadDma(vk::Buffer source, std::span<vk::BufferCo
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size, size_t guest_copies,
-                                     const uint8_t* host_data, uint64_t host_base) {
+                                     const uint8_t* host_data, uint64_t host_base,
+                                     std::vector<UploadHostCopy>* deferred) {
 	if (copies.empty()) {
 		return nullptr;
 	}
@@ -1981,7 +2003,18 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (mapped != nullptr) {
 		for (size_t index = 0; index < copies.size(); index++) {
 			auto& copy = copies[index];
-			std::memcpy(mapped + copy.srcOffset, source_of(index, copy), copy.size);
+			const void* alias = nullptr;
+			if (deferred != nullptr && index < guest_copies) {
+				// KYTY_UPLOAD_DMA_HOST_COPY: the DMA worker copies from the backing alias.
+				alias = LibKernel::Memory::GuestBackingAlias(buffer.CpuAddress() + copy.dstOffset,
+				                                             copy.size);
+			}
+			if (alias != nullptr) {
+				deferred->push_back({mapped + copy.srcOffset, static_cast<const uint8_t*>(alias),
+				                     copy.size});
+			} else {
+				std::memcpy(mapped + copy.srcOffset, source_of(index, copy), copy.size);
+			}
 			copy.srcOffset += base_offset;
 		}
 		m_staging_buffer.Commit();

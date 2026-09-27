@@ -41,6 +41,9 @@ struct RenderDepthInfo {
 	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects() const;
 };
 
+// Every field compared one by one (floats by their bits, padding excluded).
+[[nodiscard]] bool SameRenderDepthInfo(const RenderDepthInfo& a, const RenderDepthInfo& b);
+
 inline vk::ImageAspectFlags DepthFeedbackAspects(vk::ImageAspectFlags draw_writes,
                                                  const ImageViewInfo& target,
                                                  const ImageViewInfo& sampled) {

@@ -109,6 +109,11 @@ void                   RegisterCallbacks(callback_func_t alloc_func, callback_fu
 void                   SetFlexibleMemorySize(uint64_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// The direct-memory backing alias of [vaddr, vaddr + size) when one mapping holds the whole range,
+// or nullptr (not direct memory, or spanning mappings). The alias stays mapped and writable for
+// the process lifetime: reading it never faults, whatever the guest view's protection, and after
+// the guest unmaps the range it shows whatever that backing then holds. Any thread.
+[[nodiscard]] const void* GuestBackingAlias(uint64_t vaddr, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 // TryReadGpuCleanBacking that also returns the XXH3-64 digest of the bytes read. Inside a
 // draw-prep preparation the read is certified by that digest instead of its bytes

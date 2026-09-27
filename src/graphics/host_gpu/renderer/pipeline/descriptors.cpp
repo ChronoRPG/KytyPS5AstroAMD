@@ -1824,6 +1824,17 @@ void RenderExecutor::CommitDescriptorSet(CommandBuffer& buffer, vk::PipelineBind
 		hash = DescriptorSetReuse::Hash(layout, m_descriptor_writes);
 		set  = m_descriptor_set_reuse.Find(tick, layout, m_descriptor_writes, hash);
 	}
+	if (DescriptorSetReuseAuditEnabled()) {
+		const auto audit = m_descriptor_set_reuse.Audit(
+		    tick, DescriptorSetReuse::Digest(layout, m_descriptor_writes));
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorSetAuditCommits);
+		if (audit.repeat) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorSetAuditRepeats);
+		}
+		if (audit.digest_slot_hit) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorSetAuditDigestSlotHits);
+		}
+	}
 	if (set != nullptr) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorSetsReused);
 	} else {

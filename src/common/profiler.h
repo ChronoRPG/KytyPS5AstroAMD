@@ -860,6 +860,26 @@ enum class FrameEvent : uint32_t {
 	EqueueCoalescedDataChanges,
 	// KYTY_DRAW_PREP_HOT: parked (cold) draw-prep workers woken because the unclaimed backlog grew.
 	DrawPrepColdWakes,
+	// KYTY_RENDER_STATE_FAST (colorRenderTarget.h): prepared vertex inputs copied as their used
+	// prefixes, or in full (a count out of range); draws whose target entries were not
+	// value-initialised first; stage preparations swapped member by member. VerifyChecks/Mismatches:
+	// KYTY_RENDER_STATE_VERIFY comparisons with the full copy, swap or resolution.
+	RenderStateVertexPartialCopies,
+	RenderStateVertexFullCopies,
+	RenderStateMinimalResets,
+	RenderStateMemberSwaps,
+	RenderStateVerifyChecks,
+	RenderStateVerifyMismatches,
+	// KYTY_DESCRIPTOR_SET_REUSE_AUDIT (render.h): descriptor-set commits, those whose exact
+	// contents an earlier commit of the same command buffer had, and those a 64-slot cache indexed
+	// by a full digest of the contents would have held (compare DescriptorSetsReused).
+	DescriptorSetAuditCommits,
+	DescriptorSetAuditRepeats,
+	DescriptorSetAuditDigestSlotHits,
+	// KYTY_UPLOAD_DMA_HOST_COPY (uploadDma.h): staged upload copies whose guest bytes the DMA
+	// worker copied into the staging ring instead of the command processor, and those bytes.
+	UploadDmaHostCopies,
+	UploadDmaHostCopyBytes,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

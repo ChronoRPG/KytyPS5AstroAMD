@@ -161,6 +161,11 @@ struct DrawAutoArgs {
 // earlier in the same command buffer with the same contents, and skips rebinding the bound set.
 [[nodiscard]] bool PushConstantShadowEnabled();
 [[nodiscard]] bool DescriptorSetReuseEnabled();
+// KYTY_DESCRIPTOR_SET_REUSE_AUDIT=1 (default off, a measurement): every descriptor-set commit also
+// counts whether an earlier commit of its command buffer had exactly its contents (the reuse an
+// unbounded cache would find) and whether a 64-slot cache indexed by a full digest of the contents
+// would still hold it (DescriptorSetAudit*; compare DescriptorSetsReused).
+[[nodiscard]] bool DescriptorSetReuseAuditEnabled();
 [[nodiscard]] bool UploadBatchEnabled();
 
 // Attribution of batched barrier requests (gpuOpProfiler site of the recorded batch).

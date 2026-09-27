@@ -40,6 +40,11 @@ bool UploadDmaVerify() {
 	return verify;
 }
 
+bool UploadDmaHostCopyEnabled() {
+	static const bool enabled = EnvU64("KYTY_UPLOAD_DMA_HOST_COPY", 1) != 0;
+	return enabled;
+}
+
 std::unique_ptr<UploadDma> UploadDma::Create(GraphicContext& graphics, CommandScheduler& scheduler) {
 	if (!UploadDmaRequested() || graphics.transfer_queue == nullptr) {
 		return nullptr;
@@ -162,7 +167,8 @@ std::optional<uint64_t> UploadDma::Allocate(uint64_t size) {
 	return offset;
 }
 
-std::optional<uint64_t> UploadDma::Stage(vk::Buffer source, uint64_t source_offset, uint64_t size) {
+std::optional<uint64_t> UploadDma::Stage(vk::Buffer source, uint64_t source_offset, uint64_t size,
+                                         std::vector<UploadHostCopy>* host_copies) {
 	if (source == nullptr || size < m_min_bytes) {
 		return std::nullopt;
 	}
@@ -173,10 +179,22 @@ std::optional<uint64_t> UploadDma::Stage(vk::Buffer source, uint64_t source_offs
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::UploadDmaCopies);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::UploadDmaBytes, size);
+	std::vector<UploadHostCopy> copies;
+	if (host_copies != nullptr && !host_copies->empty()) {
+		uint64_t bytes = 0;
+		for (const auto& copy: *host_copies) {
+			bytes += copy.size;
+		}
+		m_host_bytes_queued += bytes;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::UploadDmaHostCopies, host_copies->size());
+		Profiler::CountFrameEvent(Profiler::FrameEvent::UploadDmaHostCopyBytes, bytes);
+		copies.swap(*host_copies);
+	}
 	{
 		std::scoped_lock lock(m_mutex);
 		EXIT_IF(m_stopping);
-		m_jobs.push_back({source, source_offset, *offset, size, ++m_enqueued, m_reuse_tick});
+		m_jobs.push_back(
+		    {source, source_offset, *offset, size, ++m_enqueued, m_reuse_tick, std::move(copies)});
 	}
 	m_available.notify_one();
 	m_stage_tick  = m_scheduler.CurrentTick();
@@ -266,6 +284,14 @@ void UploadDma::SubmitBatch(std::vector<Job>& jobs) {
 	Profiler::CountFrameEvent(Profiler::FrameEvent::UploadDmaSubmits);
 }
 
+void UploadDma::HoldWorkerForTest(bool hold) {
+	{
+		std::scoped_lock lock(m_mutex);
+		m_hold = hold;
+	}
+	m_available.notify_all();
+}
+
 void UploadDma::Worker(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("Upload DMA");
 	(void)stop;
@@ -273,11 +299,24 @@ void UploadDma::Worker(std::stop_token stop) {
 	for (;;) {
 		{
 			std::unique_lock lock(m_mutex);
-			m_available.wait(lock, [this] { return m_stopping || !m_jobs.empty(); });
+			m_available.wait(lock,
+			                 [this] { return m_stopping || (!m_hold && !m_jobs.empty()); });
 			if (m_jobs.empty()) {
 				return; // stopping and drained
 			}
 			jobs.swap(m_jobs);
+		}
+		// KYTY_UPLOAD_DMA_HOST_COPY: the staged bytes the command processor left to this worker,
+		// written before the submission below makes them visible to the transfer.
+		uint64_t copied = 0;
+		for (const auto& job: jobs) {
+			for (const auto& copy: job.host_copies) {
+				std::memcpy(copy.destination, copy.source, static_cast<size_t>(copy.size));
+				copied += copy.size;
+			}
+		}
+		if (copied != 0) {
+			m_host_bytes_done.fetch_add(copied, std::memory_order_release);
 		}
 		SubmitBatch(jobs);
 		jobs.clear();

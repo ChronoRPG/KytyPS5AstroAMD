@@ -99,6 +99,48 @@ vk::DescriptorSet DescriptorSetReuse::Find(uint64_t tick, vk::DescriptorSetLayou
 	return Matches(entry, tick, layout, writes, hash) ? entry.set : vk::DescriptorSet {};
 }
 
+uint64_t DescriptorSetReuse::Digest(vk::DescriptorSetLayout                  layout,
+                                    std::span<const vk::WriteDescriptorSet> writes) {
+	thread_local std::vector<uint64_t> words;
+	words.clear();
+	words.push_back(HandleBits(layout));
+	for (const auto& write: writes) {
+		words.push_back((static_cast<uint64_t>(write.dstBinding) << 32u) | write.descriptorCount);
+		words.push_back((static_cast<uint64_t>(write.descriptorType) << 32u) |
+		                write.dstArrayElement);
+		for (uint32_t i = 0; i < write.descriptorCount; i++) {
+			if (IsBufferDescriptor(write.descriptorType) && write.pBufferInfo != nullptr) {
+				const auto& info = write.pBufferInfo[i];
+				words.push_back(HandleBits(info.buffer));
+				words.push_back(info.offset);
+				words.push_back(info.range);
+			} else if (IsImageDescriptor(write.descriptorType) && write.pImageInfo != nullptr) {
+				const auto& info = write.pImageInfo[i];
+				words.push_back(HandleBits(info.sampler));
+				words.push_back(HandleBits(info.imageView));
+				words.push_back(static_cast<uint64_t>(info.imageLayout));
+			}
+		}
+	}
+	return XXH3_64bits(words.data(), words.size() * sizeof(uint64_t));
+}
+
+DescriptorSetReuse::AuditResult DescriptorSetReuse::Audit(uint64_t tick, uint64_t digest) {
+	if (tick != m_audit_tick) {
+		m_audit_tick = tick;
+		m_audit_seen.clear();
+		m_audit_slot_used.fill(false);
+	}
+	AuditResult result;
+	result.repeat          = !m_audit_seen.insert(digest).second;
+	const auto slot        = digest % Slots;
+	result.digest_slot_hit = m_audit_slot_used[slot] && m_audit_slots[slot] == digest;
+	// As Insert does on a miss: the slot takes the newest set.
+	m_audit_slots[slot]     = digest;
+	m_audit_slot_used[slot] = true;
+	return result;
+}
+
 void DescriptorSetReuse::Insert(uint64_t tick, vk::DescriptorSetLayout layout,
                                 std::span<const vk::WriteDescriptorSet> writes, uint64_t hash,
                                 vk::DescriptorSet set) {
