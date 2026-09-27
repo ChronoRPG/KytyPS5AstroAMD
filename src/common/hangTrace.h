@@ -114,14 +114,18 @@ void RecordTexture(const uint32_t* fields);
 
 // GPU->CPU readbacks (BufferCache::ReadMemory), attributed to the path that requested them.
 // FaultReadSide / FaultReadDuplicate: a guest read fault served by a side copy (no drain of the
-// current recording), or by waiting on another thread's pending side copy.
+// current recording), or by waiting on another thread's pending side copy. FaultReadEager: a
+// guest read fault that waited for (or finished) a pending eager copy (KYTY_READBACK_EAGER).
+// EagerPublish: an eager copy published at completion; duration_us is issue to publication.
 enum class ReadbackKind : uint8_t {
 	Invalidate,
 	FaultRead,
 	FaultWrite,
 	GpuSync,
 	FaultReadSide,
-	FaultReadDuplicate
+	FaultReadDuplicate,
+	FaultReadEager,
+	EagerPublish
 };
 // Guest access fault context for readbacks on this thread (instruction address, guest thread).
 void SetFaultContext(uint64_t pc, std::string_view thread_name);

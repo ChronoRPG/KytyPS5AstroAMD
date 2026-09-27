@@ -621,6 +621,30 @@ enum class FrameEvent : uint32_t {
 	DepthFeedbackKeepMissInstance,
 	DepthFeedbackKeepMissSerial,
 	DepthFeedbackKeepMissState,
+	// Eager readback publication (BufferCache, KYTY_READBACK_EAGER): read-hot pages registered by
+	// a readback; copies recorded at a submission (and their dirty bytes); candidates kept for a
+	// later submission (writer in the current recording, pending readback or publication, no
+	// slot); readers that waited for or finished a pending eager copy; pages unprotected at
+	// completion or kept protected by a newer writer; early submissions after a recorded writer
+	// of a page the GPU thread reads back.
+	ReadbackEagerHotPages,
+	ReadbackEagerCopies,
+	ReadbackEagerCopyBytes,
+	ReadbackEagerRetries,
+	ReadbackEagerWaits,
+	ReadbackEagerPagesUnmarked,
+	ReadbackEagerPagesRetained,
+	ReadbackEagerFlushes,
+	// Why an indirect draw with GPU-owned arguments took the CPU-read path (the CPU read then
+	// synchronizes with the arguments' writer): host feature/alignment/mapping limits, no usable
+	// index buffer range, a target operation mode, legacy quads, a restart value only an index
+	// scan can decide, or a mesh (merged NGG) vertex stage.
+	DrawIndirectFallbackHost,
+	DrawIndirectFallbackIndexBuffer,
+	DrawIndirectFallbackTargetOp,
+	DrawIndirectFallbackQuadList,
+	DrawIndirectFallbackRestart,
+	DrawIndirectFallbackMesh,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

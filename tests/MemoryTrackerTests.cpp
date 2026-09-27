@@ -1,5 +1,6 @@
 #include "common/hostException.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/eagerReadbackPages.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/writeTickMap.h"
@@ -33,11 +34,13 @@
 
 namespace {
 
+using Libs::Graphics::EagerReadbackPages;
 using Libs::Graphics::GuestRange;
 using Libs::Graphics::MemoryTracker;
 using Libs::Graphics::PageManager;
 using Libs::Graphics::RangeSet;
 using Libs::Graphics::TRACKER_ADDRESS_SIZE;
+using Libs::Graphics::TRACKER_PAGE_SIZE;
 using Libs::Graphics::WriteTickMap;
 
 void Check(bool value, const char *text) {
@@ -440,6 +443,98 @@ void TestWriteTickMap() {
   ticks.Prune(4);
   Check(ticks.Size() == 1 && ticks.MaxTick(0x8000, 1) == 0 && ticks.MaxTick(0x1000, 1) == 9,
         "write-tick prune removed the wrong entries");
+}
+
+void TestEagerReadbackPages() {
+  using Result = EagerReadbackPages::IssueResult;
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  EagerReadbackPages::Limits limits;
+  limits.capacity = 3;
+  limits.idle_frames = 10;
+  limits.frame_budget = 2;
+  EagerReadbackPages pages(limits);
+
+  // Writes of pages no reader needed are ignored.
+  Check(!pages.NoteWrite(0x10000, page) && pages.Candidates() == 0,
+        "eager: a write of a cold page became a candidate");
+  pages.NoteRead(0x10000, 1, false);
+  pages.NoteRead(0x20000, 1, true);
+  Check(pages.Size() == 2 && pages.IsHot(0x10000) && pages.IsHot(0x20000),
+        "eager: readbacks did not make their pages hot");
+
+  // A write covering part of a hot page makes it a candidate; only GPU-thread-read pages ask
+  // for an early submission.
+  Check(!pages.NoteWrite(0x10000 + 0x800, 8) && pages.IsCandidate(0x10000) &&
+            !pages.IsCandidate(0x20000) && pages.Candidates() == 1,
+        "eager: a partial write did not mark exactly its hot page");
+  Check(pages.NoteWrite(0x1f000, 2 * page) && pages.IsCandidate(0x20000) &&
+            pages.Candidates() == 2,
+        "eager: a write of a GPU-thread-read page did not request an early submission");
+  // A second write of a candidate does not count twice.
+  (void)pages.NoteWrite(0x10000, page);
+  Check(pages.Candidates() == 2, "eager: a repeated write counted a candidate twice");
+
+  // Retry keeps a candidate, Drop and Issued clear it.
+  std::vector<uint64_t> offered;
+  pages.IssueCandidates(1, [&](uint64_t address) {
+    offered.push_back(address);
+    return address == 0x10000 ? Result::Retry : Result::Drop;
+  });
+  Check(offered.size() == 2 && pages.IsCandidate(0x10000) &&
+            !pages.IsCandidate(0x20000) && pages.Candidates() == 1,
+        "eager: issue results did not update the candidates");
+
+  // At most frame_budget copies per page and frame; a spent budget keeps the candidate for the
+  // next frame.
+  uint32_t issued = 0;
+  for (int round = 0; round < 3; round++) {
+    (void)pages.NoteWrite(0x10000, 4);
+    pages.IssueCandidates(2, [&](uint64_t) {
+      issued++;
+      return Result::Issued;
+    });
+  }
+  Check(issued == 2 && pages.IsCandidate(0x10000),
+        "eager: the per-frame copy budget was not applied");
+  pages.IssueCandidates(3, [&](uint64_t) {
+    issued++;
+    return Result::Issued;
+  });
+  Check(issued == 3 && !pages.IsCandidate(0x10000) && pages.Candidates() == 0,
+        "eager: a candidate held back by the budget was not issued next frame");
+
+  // Capacity: the least recently read page is evicted (with its candidate).
+  pages.NoteRead(0x30000, 4, false);
+  (void)pages.NoteWrite(0x20000, 4);
+  pages.NoteRead(0x10000, 5, false);
+  pages.NoteRead(0x40000, 5, false);
+  Check(pages.Size() == 3 && !pages.IsHot(0x20000) && pages.IsHot(0x10000) &&
+            pages.IsHot(0x30000) && pages.IsHot(0x40000) && pages.Candidates() == 0,
+        "eager: capacity eviction did not drop the least recently read page");
+
+  // Pages no reader needed for more than idle_frames expire (0x30000 was read in frame 4, the
+  // others in frame 5).
+  pages.Sweep(14);
+  Check(pages.Size() == 3, "eager: sweep expired pages read within idle_frames");
+  (void)pages.NoteWrite(0x30000, 4);
+  pages.Sweep(15);
+  Check(pages.Size() == 2 && !pages.IsHot(0x30000) && pages.IsHot(0x10000) &&
+            pages.IsHot(0x40000) && pages.Candidates() == 0,
+        "eager: sweep did not expire exactly the idle page and its candidate");
+
+  // Frame counters wrap.
+  EagerReadbackPages wrap(limits);
+  wrap.NoteRead(0x50000, UINT32_MAX - 2, false);
+  wrap.Sweep(3);
+  Check(wrap.IsHot(0x50000), "eager: sweep mishandled a wrapped frame counter");
+  wrap.Sweep(20);
+  Check(!wrap.IsHot(0x50000), "eager: a wrapped idle page did not expire");
+
+  // Capacity 0 disables hot pages.
+  EagerReadbackPages none(EagerReadbackPages::Limits{0, 10, 2});
+  none.NoteRead(0x10000, 1, true);
+  Check(none.Empty() && !none.NoteWrite(0x10000, 4),
+        "eager: capacity 0 kept a hot page");
 }
 
 void TestReadbackPendingUnmark() {
@@ -1691,6 +1786,7 @@ int main(int argc, char **argv) {
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
   TestWriteTickMap();
+  TestEagerReadbackPages();
   TestReadbackPendingUnmark();
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();

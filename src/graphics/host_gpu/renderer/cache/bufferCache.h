@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "graphics/host_gpu/eagerReadbackPages.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -77,8 +78,26 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	// Publishes (waiting if necessary) every pending side readback overlapping the range. Any
 	// thread; never waits for the current recording. Required before other ownership changes.
-	void CompleteSideReadbacks(uint64_t vaddr, uint64_t size);
-	void CompleteAllSideReadbacks();
+	// Returns how many of them were eager copies.
+	uint32_t CompleteSideReadbacks(uint64_t vaddr, uint64_t size);
+	void     CompleteAllSideReadbacks();
+	// Eager readback publication (KYTY_READBACK_EAGER, default on; needs side readbacks). A page
+	// whose GPU-written bytes a CPU reader needed read back becomes read-hot. When a submission
+	// finds a hot page's dirty bytes all written by earlier (already submitted) recordings, it
+	// appends a copy of them to its own command buffer and registers their publication; the
+	// completion runner publishes them and unprotects the page when that submission completes,
+	// unless a newer writer took the page meanwhile. A later read then finds the page clean
+	// instead of faulting; a read before completion waits for that copy as for a side readback.
+	// Values are unchanged: the bytes, their order against newer writers and the protection rules
+	// are those of a side readback of the same bytes, only issued before the read.
+	// The command processor calls this right before it submits the current recording, between
+	// packets (GPU thread); never from inside another cache operation.
+	void IssueEagerReadbacks();
+	// True once after a recorded writer of a page the GPU thread reads back, outside a rendering
+	// instance: the command processor then submits the recording right away, so the producer runs
+	// (and its eager copy can complete) before that read, instead of the read draining the GPU.
+	// Budgeted per frame (KYTY_READBACK_EAGER_FLUSHES, default 8; 0 disables).
+	[[nodiscard]] bool TakeEagerFlushRequest(bool in_rendering);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -262,10 +281,15 @@ private:
 	};
 	[[nodiscard]] SideIssueResult TryIssueSideReadback(uint64_t vaddr, uint64_t size,
 	                                                  std::shared_ptr<SideReadback>& issued);
-	void CompleteSideReadback(SideReadback& readback);
+	// Returns true when this call published the readback (false: it was already done).
+	bool CompleteSideReadback(SideReadback& readback);
 	[[nodiscard]] bool OverlapsPendingSideReadback(uint64_t begin, uint64_t end) const;
 	// Every GPU-side write of cached buffer contents for a guest range (GPU thread).
 	void NoteBufferContentWrite(uint64_t vaddr, uint64_t size);
+	// A reader needed a readback of [vaddr, vaddr + size): its pages become read-hot (GPU thread).
+	void NoteEagerRead(uint64_t vaddr, uint64_t size, bool gpu_thread_reader);
+	[[nodiscard]] EagerReadbackPages::IssueResult TryIssueEagerReadback(uint64_t page,
+	                                                                    uint64_t tick);
 
 	struct BackingPublication {
 		uint64_t                token;
@@ -346,6 +370,14 @@ private:
 	uint64_t     m_unbounded_write_tick  = 0;
 	uint64_t     m_unbounded_write_serial = 0;
 	std::unique_ptr<SideReadbackState> m_side;
+	// Eager readback publication (GPU thread): read-hot pages, and the early-submission request a
+	// recorded writer of a GPU-thread-read page makes (with its per-frame budget).
+	bool               m_eager_enabled       = false;
+	EagerReadbackPages m_eager;
+	bool               m_eager_flush         = false;
+	uint32_t           m_eager_flush_budget  = 0;
+	uint32_t           m_eager_flush_frame   = 0;
+	uint32_t           m_eager_flushes       = 0;
 };
 
 } // namespace Libs::Graphics

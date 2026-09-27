@@ -192,6 +192,19 @@ struct BufferCacheTestAccess {
   }
 };
 
+// Sets (or with nullptr removes) an environment switch read when a cache is constructed.
+void SetEnvironment(const char *name, const char *value) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  _putenv_s(name, value != nullptr ? value : "");
+#else
+  if (value != nullptr) {
+    setenv(name, value, 1);
+  } else {
+    unsetenv(name);
+  }
+#endif
+}
+
 struct StreamBufferTestAccess {
   static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t &size,
                                    uint64_t &alignment) {
@@ -4816,6 +4829,308 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "dirty-GC direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // KYTY_READBACK_EAGER (BufferCache::IssueEagerReadbacks): a page whose GPU-written bytes a
+  // reader needed read back is published when the submission after its writer completes, so a
+  // later read finds it clean; a reader during that copy waits for it; a newer writer keeps the
+  // page protected; a GPU-thread read makes a writer request an early submission; =0 disables.
+  void CheckEagerReadback() {
+    CheckEagerReadbackEnabled();
+    CheckEagerReadbackDisabled();
+  }
+
+  struct EagerReadbackFixture {
+    static constexpr uintptr_t base = 0x0000000200700000ull;
+    static constexpr uint64_t allocation_size = 0x400000;
+    static constexpr uint64_t allocation_alignment = 0x10000;
+  };
+
+  void CheckEagerReadbackEnabled() {
+    constexpr const char *name = "EagerReadback";
+    constexpr uintptr_t base = EagerReadbackFixture::base;
+    constexpr uint64_t allocation_size = EagerReadbackFixture::allocation_size;
+    // A value the guest polls (like 0x555f41dd0 in Astro Bot) and indirect arguments the CP
+    // reads (like 0x56ddaffa0), on different tracker pages of one buffer.
+    constexpr uint64_t guest_offset = 0x1dd0;
+    constexpr uint64_t cp_offset = 0x9fa0;
+    constexpr uint64_t guest_page = base + (guest_offset & ~uint64_t{0xfff});
+    constexpr uint64_t cp_page = base + (cp_offset & ~uint64_t{0xfff});
+
+    SetEnvironment("KYTY_READBACK_EAGER", "1");
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, EagerReadbackFixture::allocation_alignment, 0,
+                &direct_offset) == 0,
+            "eager-readback direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                EagerReadbackFixture::allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "eager-readback fixed direct-memory mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    {
+      auto &resources = context;
+      auto &cache = resources.GetBufferCache();
+      resources.MapMemory(base, allocation_size);
+      // A recorded GPU write of `value` (as a storage write or DMA fill would be).
+      const auto gpu_write = [&](uint64_t offset, uint32_t value) {
+        const auto allocation =
+            cache.ObtainBuffer(base + offset, sizeof(value), true, false);
+        Require(name, "gpu write", allocation.first != nullptr,
+                "eager-readback buffer allocation failed");
+        cache.FillBuffer(base + offset, sizeof(value), value, false);
+      };
+      const auto backing = [&](uint64_t offset) {
+        uint32_t value = 0;
+        Libs::LibKernel::Memory::TryReadBacking(base + offset, &value,
+                                                sizeof(value));
+        return value;
+      };
+      // A command-processor submission (CommandProcessor::BufferFlush): eager copies are issued
+      // on the GPU thread right before the recording is submitted.
+      const auto submit = [&] {
+        OnGpuThread(context, [&] {
+          cache.IssueEagerReadbacks();
+          scheduler.Flush();
+        });
+      };
+      // Everything submitted has completed and its completion callbacks ran.
+      const auto complete = [&] {
+        scheduler.Finish();
+        scheduler.DrainPriorityOperations();
+      };
+      const auto protected_page = [&](uint64_t page) {
+        return cache.IsRegionGpuModified(page, 0x1000);
+      };
+
+      // 1. A guest read of a GPU-written value makes its page read-hot (its writer is still
+      // being recorded, so this read drains as before).
+      gpu_write(guest_offset, 0x11111111u);
+      cache.ReadMemory(base + guest_offset, 1);
+      Require(name, "first read",
+              backing(guest_offset) == 0x11111111u &&
+                  !protected_page(guest_page),
+              "the first readback did not publish the value");
+
+      // 2. The next write of the page is copied by the submission after its writer, and
+      // published (page unprotected) when that submission completes.
+      gpu_write(guest_offset, 0x22222222u);
+      submit();
+      Require(name, "writer submission",
+              cache.HasGpuDirtyBytes(base + guest_offset, 4) &&
+                  !cache.HasPendingBackingPublication(base + guest_offset, 4),
+              "an eager copy was issued with its writer's own submission");
+      submit();
+      Require(name, "eager issue",
+              !cache.HasGpuDirtyBytes(base + guest_offset, 4) &&
+                  cache.HasPendingBackingPublication(base + guest_offset, 4) &&
+                  protected_page(guest_page),
+              "the submission after the writer did not issue an eager copy, "
+              "or unprotected the page before completion");
+      complete();
+      Require(name, "eager publication",
+              backing(guest_offset) == 0x22222222u &&
+                  !protected_page(guest_page) &&
+                  !cache.HasPendingBackingPublication(base + guest_offset, 4),
+              "the eager copy was not published at completion");
+
+      // 3. A writer recorded while the copy is in flight keeps the page protected; the eager
+      // copy still publishes its own (older) bytes, and the next read returns the newest.
+      cache.AdvanceFrame();
+      gpu_write(guest_offset, 0x33333333u);
+      submit();
+      submit();
+      Require(name, "second eager issue",
+              cache.HasPendingBackingPublication(base + guest_offset, 4),
+              "a later writer of a hot page was not copied eagerly");
+      gpu_write(guest_offset, 0x44444444u);
+      complete();
+      Require(name, "newer writer retained",
+              backing(guest_offset) == 0x33333333u &&
+                  protected_page(guest_page) &&
+                  cache.HasGpuDirtyBytes(base + guest_offset, 4),
+              "a newer writer's page was unprotected by an older eager copy");
+      cache.ReadMemory(base + guest_offset, 1);
+      Require(name, "read after retained",
+              backing(guest_offset) == 0x44444444u &&
+                  !protected_page(guest_page),
+              "the read after a retained page did not return the newest value");
+
+      // 4. A guest read while the eager copy is pending waits for that copy instead of
+      // issuing its own.
+      cache.AdvanceFrame();
+      gpu_write(guest_offset, 0x55555555u);
+      submit();
+      submit();
+      Require(name, "third eager issue",
+              cache.HasPendingBackingPublication(base + guest_offset, 4),
+              "the eager copy was not pending before the read");
+      cache.ReadMemory(base + guest_offset, 1);
+      Require(name, "read during copy",
+              backing(guest_offset) == 0x55555555u &&
+                  !protected_page(guest_page) &&
+                  !cache.HasPendingBackingPublication(base + guest_offset, 4),
+              "a read during the eager copy did not wait for it");
+      complete();
+      Require(name, "completion after reader",
+              backing(guest_offset) == 0x55555555u && !protected_page(guest_page),
+              "the completion runner republished a copy a reader finished");
+
+      // 5. A GPU-thread (command-processor) read makes the page read-hot for the CP: its next
+      // writer requests an early submission (outside a rendering instance only, once), and the
+      // CP read after the eager copy waits for that copy, not for the current recording.
+      gpu_write(cp_offset, 0x66666666u);
+      Require(name, "cp read",
+              OnGpuThread(context,
+                          [&] {
+                            return context.SynchronizeGpuBackingForRead(
+                                base + cp_offset, 4);
+                          }) &&
+                  backing(cp_offset) == 0x66666666u,
+              "the first CP read did not synchronize the value");
+      Require(name, "no request before a writer",
+              !cache.TakeEagerFlushRequest(false),
+              "an early submission was requested without a writer");
+      gpu_write(cp_offset, 0x77777777u);
+      Require(name, "early submission request",
+              !cache.TakeEagerFlushRequest(true) &&
+                  cache.TakeEagerFlushRequest(false) &&
+                  !cache.TakeEagerFlushRequest(false),
+              "a writer of a CP-read page did not request exactly one early "
+              "submission outside a rendering instance");
+      // A guest-read page's writer does not request one.
+      gpu_write(guest_offset, 0x88888888u);
+      Require(name, "no request for guest pages",
+              !cache.TakeEagerFlushRequest(false),
+              "a writer of a guest-read page requested an early submission");
+      submit();
+      submit();
+      Require(name, "cp eager issue",
+              cache.HasPendingBackingPublication(base + cp_offset, 4) &&
+                  cache.HasPendingBackingPublication(base + guest_offset, 4),
+              "eager copies of both pages were not issued");
+      // Recorded after the copies were issued; a CP read must not wait for it.
+      gpu_write(0x20000, 0x99999999u);
+      const auto cp_tick = scheduler.CurrentTick();
+      Require(name, "cp read after eager issue",
+              OnGpuThread(context,
+                          [&] {
+                            return context.SynchronizeGpuBackingForRead(
+                                base + cp_offset, 4);
+                          }) &&
+                  backing(cp_offset) == 0x77777777u &&
+                  !protected_page(cp_page) && scheduler.CurrentTick() == cp_tick,
+              "the CP read did not complete the eager copy without submitting "
+              "the current recording");
+      complete();
+      Require(name, "guest page after cp read",
+              backing(guest_offset) == 0x88888888u && !protected_page(guest_page),
+              "the guest page's eager copy was not published");
+      cache.ReadMemory(base + 0x20000, 1);
+
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "eager-readback direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "eager-readback direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckEagerReadbackDisabled() {
+    constexpr const char *name = "EagerReadbackDisabled";
+    constexpr uintptr_t base = EagerReadbackFixture::base;
+    constexpr uint64_t allocation_size = EagerReadbackFixture::allocation_size;
+    constexpr uint64_t offset = 0x1dd0;
+
+    SetEnvironment("KYTY_READBACK_EAGER", "0");
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, EagerReadbackFixture::allocation_alignment, 0,
+                &direct_offset) == 0,
+            "eager-disabled direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                EagerReadbackFixture::allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "eager-disabled fixed direct-memory mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto gpu_write = [&](uint32_t value) {
+        (void)cache.ObtainBuffer(base + offset, sizeof(value), true, false);
+        cache.FillBuffer(base + offset, sizeof(value), value, false);
+      };
+      gpu_write(0x12345678u);
+      cache.ReadMemory(base + offset, 1);
+      gpu_write(0x23456789u);
+      Require(name, "no early submission", !cache.TakeEagerFlushRequest(false),
+              "KYTY_READBACK_EAGER=0 requested an early submission");
+      for (int round = 0; round < 2; round++) {
+        OnGpuThread(context, [&] {
+          cache.IssueEagerReadbacks();
+          scheduler.Flush();
+        });
+      }
+      Require(name, "no eager copy",
+              cache.HasGpuDirtyBytes(base + offset, 4) &&
+                  !cache.HasPendingBackingPublication(base + offset, 4) &&
+                  cache.IsRegionGpuModified(base + offset, 4),
+              "KYTY_READBACK_EAGER=0 still issued an eager copy");
+      cache.ReadMemory(base + offset, 1);
+      uint32_t value = 0;
+      Libs::LibKernel::Memory::TryReadBacking(base + offset, &value, sizeof(value));
+      Require(name, "readback", value == 0x23456789u,
+              "the readback with eager copies disabled returned a stale value");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "eager-disabled direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "eager-disabled direct-memory allocation release failed");
+    SetEnvironment("KYTY_READBACK_EAGER", nullptr);
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -36225,6 +36540,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--readback-eager-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckEagerReadback();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
@@ -36418,6 +36738,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRasterization(false);
   vulkan.CheckRasterization(false, true);
   vulkan.CheckBufferCacheDirtyGarbageCollection();
+  vulkan.CheckEagerReadback();
 #endif
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckTexelSyncOverStaleGpuDirtyBytes();
