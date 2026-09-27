@@ -190,6 +190,10 @@ enum class FrameEvent : uint32_t {
 	DrawIndirectFallback,
 	// Later draws that inherited a native indirect draw's instance count and read it back.
 	DrawIndirectInstanceReads,
+	// Compute dispatches and draws that ran a program with IMAGE_BVH*_INTERSECT_RAY translated
+	// by KYTY_RT_STUB (every ray misses).
+	RtStubDispatches,
+	RtStubDraws,
 	// KYTY_GPU_TIMING: command buffers without a usable timestamp pair (ring full, results
 	// unavailable, ambiguous wrap, or pending samples over capacity). Busy/idle exclude them.
 	GpuTimingDropped,

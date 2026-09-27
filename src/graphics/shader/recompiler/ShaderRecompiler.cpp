@@ -483,8 +483,43 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 	return data;
 }
 
+// Marks every BVH instruction the decoder produced as unsupported when no BVH mode is on (fused
+// and front programs decode all instructions), and logs each BVH shader once.
+void NoteBvhInstructions(const CompileOptions& options, Decoder::Program& decoded,
+                         bool decode_bvh) {
+	uint32_t count    = 0;
+	uint32_t first_pc = UINT32_MAX;
+	for (auto& inst: decoded.instructions) {
+		if (!Decoder::IsBvhIntersect(inst)) {
+			continue;
+		}
+		decoded.has_bvh = true;
+		count++;
+		first_pc = std::min(first_pc, inst.pc);
+		if (!decode_bvh && inst.opcode != Decoder::Opcode::UNSUPPORTED) {
+			Decoder::SetUnsupported(inst, Decoder::Family::MIMG, inst.opcode_id,
+			                        "BVH ray intersection is disabled (KYTY_RT_STUB=1 enables it)");
+		}
+	}
+	if (count == 0 || !decode_bvh) {
+		return;
+	}
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> logged;
+	{
+		std::scoped_lock lock(mutex);
+		if (!logged.insert(options.shader_hash ^ static_cast<uint64_t>(options.stage)).second) {
+			return;
+		}
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "KYTY_RT_STUB: {} shader 0x{:016x} has {} BVH intersection instruction(s), first at "
+	    "pc=0x{:08x}; every ray misses.\n",
+	    StageName(options.stage), options.shader_hash, count, first_pc));
+}
+
 Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<const uint32_t> back,
-                                    std::vector<uint32_t>& joined_code) {
+                                    std::vector<uint32_t>& joined_code, bool decode_bvh) {
 	EXIT_IF(back.empty());
 	auto       result      = Decoder::DecodeFrontProgram(front);
 	const auto front_words = static_cast<uint32_t>(result.code.size());
@@ -496,7 +531,7 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	result.instructions.back()    = {};
 	Decoder::DecodeInstruction(joined_code, front_words - 1u, result.instructions.back());
 	Decoder::Program back_program;
-	Decoder::DecodeProgram(back, back_program);
+	Decoder::DecodeProgram(back, back_program, decode_bvh);
 	const auto back_pc = front_words * sizeof(uint32_t);
 	for (auto& inst: back_program.instructions) {
 		// A back-stage PC-relative data reference requires its guest code address.
@@ -552,10 +587,12 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(code.size()));
 
+	// IMAGE_BVH*_INTERSECT_RAY is translated only when a BVH mode is on (KYTY_RT_STUB).
+	const bool decode_bvh = GetCodegenOptions().rt_stub;
 	Decoder::Program decoded;
 	std::vector<uint32_t> joined_code;
 	if (!options.back_code.empty()) {
-		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
+		decoded = DecodeFusedProgram(code, options.back_code, joined_code, decode_bvh);
 	} else if (options.stage == ShaderType::Local) {
 		decoded = Decoder::DecodeFrontProgram(code);
 		// The separately compiled hull half runs in the next Vulkan stage.
@@ -563,25 +600,33 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		handoff.opcode    = Decoder::Opcode::S_ENDPGM;
 		handoff.src_count = 0;
 	} else {
-		Decoder::DecodeProgram(code, decoded);
+		Decoder::DecodeProgram(code, decoded, decode_bvh);
 	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
+	NoteBvhInstructions(options, decoded, decode_bvh);
 
-	// Temporary workaround for games that compile ray-tracing shaders before
-	// the player can select a mode without ray tracing.
-	if (options.stage == ShaderType::Compute && decoded.has_bvh) {
+	// Without a BVH mode, compute dispatches of ray-tracing shaders are skipped (games may compile
+	// them before the player can select a mode without ray tracing); other stages stop at the
+	// unsupported instruction when the CFG is built.
+	if (options.stage == ShaderType::Compute && decoded.has_bvh && !decode_bvh) {
 		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 		if (!warned.test_and_set(std::memory_order_relaxed)) {
 			const auto& bvh = decoded.instructions.back();
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "Warning: ray tracing is not implemented; skipping compute dispatches containing "
-			    "BVH intersection instructions (shader=0x{:016x}, pc=0x{:08x}, opcode=0x{:02x}).\n",
+			    "BVH intersection instructions (shader=0x{:016x}, pc=0x{:08x}, opcode=0x{:02x}). "
+			    "KYTY_RT_STUB=1 runs them with every ray missing.\n",
 			    options.shader_hash, bvh.pc, bvh.opcode_id));
 		}
-		return {.skip_dispatch = true};
+		TranslateResult skipped;
+		skipped.skip_dispatch = true;
+		if (options.dump_ir) {
+			skipped.decoded_dump = Decoder::ProgramToString(decoded);
+		}
+		return skipped;
 	}
 
 	std::string decoded_dump;

@@ -76,6 +76,7 @@ CodegenOptions FromEnvironment() {
 		    std::strcmp(mode, "1") == 0 || std::strcmp(mode, "on") == 0 ||
 		    std::strcmp(mode, "verify") == 0 || std::strcmp(mode, "exit") == 0;
 	}
+	options.rt_stub      = EnvFlag("KYTY_RT_STUB", options.rt_stub);
 	if (const auto* mode = std::getenv("KYTY_MAD_MODE"); mode != nullptr) {
 		if (std::strcmp(mode, "exact") == 0) {
 			options.mad_mode = MadMode::Exact;

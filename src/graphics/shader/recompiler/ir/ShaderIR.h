@@ -494,6 +494,8 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	// IMAGE_BVH*_INTERSECT_RAY translated (KYTY_RT_STUB); counts the program's draws/dispatches.
+	bool                             uses_bvh           = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

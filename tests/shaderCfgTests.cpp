@@ -14636,7 +14636,13 @@ int main(int argc, char **argv) {
     std::printf("shader_cfg --fold-lane-masks-only: ok\n");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--ray-tracing-only") == 0) {
+    TestRayTracingDispatchDetection();
+    TestRayTracingStub();
+    return 0;
+  }
   TestRayTracingDispatchDetection();
+  TestRayTracingStub();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

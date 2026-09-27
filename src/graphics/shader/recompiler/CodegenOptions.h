@@ -170,6 +170,12 @@ struct CodegenOptions {
 	// and shorter driver compiles; not in hull shaders, and in pixel shaders ANDed with the lane's
 	// own bit of a ballot of true (helper invocations may sit out of ballots).
 	bool fold_lane_masks = false;
+	// KYTY_RT_STUB=1: translate IMAGE_BVH_INTERSECT_RAY / IMAGE_BVH64_INTERSECT_RAY (MIMG
+	// 0xe6/0xe7) as "no intersection" for every lane instead of skipping compute dispatches that
+	// contain them (and failing other stages). A box node returns four invalid child pointers
+	// (0xffffffff); a triangle node returns t_num=+inf, t_denom=1.0 and zero in dwords 2-3 (a
+	// cleared hit_status in triangle return mode 0). Diagnostic only: it never reports a hit.
+	bool rt_stub = false;
 };
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.

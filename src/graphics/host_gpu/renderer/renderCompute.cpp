@@ -382,6 +382,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
+	if (program.info.uses_bvh) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::RtStubDispatches);
+	}
 	RebindImages(bindings);
 	RebindBuffers(bindings);
 
@@ -502,6 +505,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
+	}
+	if (program.info.uses_bvh) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::RtStubDispatches);
 	}
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.

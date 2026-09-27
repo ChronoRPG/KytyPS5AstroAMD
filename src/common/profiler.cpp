@@ -125,6 +125,8 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.DrawIndirectNative.Cumulative",
     "FrameEvent.DrawIndirectFallback.Cumulative",
     "FrameEvent.DrawIndirectInstanceReads.Cumulative",
+    "FrameEvent.RtStubDispatches.Cumulative",
+    "FrameEvent.RtStubDraws.Cumulative",
     "FrameEvent.GpuTimingDropped.Cumulative",
     "FrameEvent.CleanVerdictHits.Cumulative",
     "FrameEvent.CleanVerdictMisses.Cumulative",

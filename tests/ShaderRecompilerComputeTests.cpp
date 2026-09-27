@@ -49729,6 +49729,7 @@ void CheckCpSeqOps(RenderContext &renderer) {
 #include "ShaderGiProbeTests.inc"
 #include "ShaderSrtVariantTests.inc"
 #include "ShaderProgramCacheTests.inc"
+#include "ShaderBvhTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
@@ -50785,6 +50786,11 @@ int main(int argc, char **argv) {
     CodegenTests::RunAll(&vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-only") == 0) {
+    VulkanHarness vulkan;
+    BvhTests::RunAll(&vulkan);
+    return 0;
+  }
   // CPU only: compiles and validates the GET_LOD_STATS instrumentation.
   if (argc == 2 && std::strcmp(argv[1], "--lod-stats-codegen-only") == 0) {
     CodegenTests::CheckLodStatsGate();
@@ -51015,6 +51021,7 @@ int main(int argc, char **argv) {
     RunGraphicsCase(&vulkan, test);
   }
   vulkan.CheckCpSeqGuestGpu();
+  BvhTests::RunAll(&vulkan);
   vulkan.CheckGpuCommandLane();
   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
   return 0;

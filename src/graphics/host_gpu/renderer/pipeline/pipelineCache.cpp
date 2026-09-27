@@ -2533,6 +2533,9 @@ struct PipelineCache::ProgramCache {
 				translate_now();
 			}
 			if (translated.skip_dispatch) {
+				// Skipped ray-tracing shaders are never compiled; dump their guest code here.
+				DumpShaderOriginal(ProgramStageName(options.stage), options.shader_hash,
+				                   params.code, translated.decoded_dump);
 				if (disk_on) {
 					disk->AddSource(disk_key, true, {});
 				}
