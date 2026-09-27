@@ -1882,6 +1882,13 @@ public:
     EnsureRuntimeContext();
     return Renderer();
   }
+  // A private RenderContext for one check. It is several MiB (the RenderExecutor keeps its
+  // 4096-entry texture-description memo inline), so it must not live on the 1 MiB main-thread
+  // stack.
+  [[nodiscard]] std::unique_ptr<RenderContext> MakeRenderContext() {
+    EnsureRuntimeContext();
+    return std::make_unique<RenderContext>(m_runtime_context);
+  }
 
   void CheckHostImageAllocation() {
     constexpr const char *name = "HostImageAllocation";
@@ -1984,7 +1991,8 @@ public:
               "vkCreatePipelineLayout");
 
     {
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -2017,7 +2025,8 @@ public:
   void CheckGraphicsPushConstantBank() {
     constexpr const char *name = "GraphicsPushConstantStages";
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -2252,7 +2261,8 @@ public:
 
   void CheckGpuMappedRangeLifecycle() {
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -2305,7 +2315,8 @@ public:
 
   void CheckStreamBufferRing() {
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -3650,7 +3661,8 @@ public:
     constexpr uint32_t ring_fault_second_value = 0x4e5f6071u;
 
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -4584,7 +4596,8 @@ public:
     constexpr uint64_t read_write_meta = 0x0000000204202000ull;
     constexpr uint64_t write_only_meta = 0x0000000204202100ull;
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -4690,7 +4703,8 @@ public:
     constexpr uint64_t base = 0x0000000260000000ull;
     constexpr uint64_t page = 0x100000;
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &cache = context.GetTextureCache();
 
     // Ownership-only records exercise large guest ranges without requiring large
@@ -4788,7 +4802,8 @@ public:
   void CheckImagePressureRetirement() {
     constexpr const char *name = "ImagePressureRetirement";
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &cache = context.GetTextureCache();
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
@@ -4860,7 +4875,8 @@ public:
                 mapped == reinterpret_cast<void *>(base),
             "pressure test fixed mapping failed");
 
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &cache = context.GetTextureCache();
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
@@ -4945,7 +4961,8 @@ public:
     constexpr uint64_t allocation_size = 0x2800000;
     constexpr uint64_t allocation_alignment = 0x200000;
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -8489,7 +8506,8 @@ public:
                 mapped == reinterpret_cast<void *>(base),
             "BGRA16 fixed mapping failed");
 
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
@@ -8651,7 +8669,8 @@ public:
       const auto width = target.width;
       const auto height = target.height;
       const bool is_1d = target.dimension == 0;
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -8784,7 +8803,8 @@ public:
     constexpr uint64_t slice_size = 0x10000;
 
     {
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       context.InitializeGpu(nullptr);
       LibKernel::Memory::InstallGpuResources(&context);
       auto &scheduler = context.GetCommandScheduler();
@@ -9138,7 +9158,8 @@ public:
       std::memset(reinterpret_cast<void *>(argument_address(i)), 0, 12);
     }
 
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     context.InitializeGpu(nullptr);
     LibKernel::Memory::InstallGpuResources(&context);
     context.GetGpu().SendCommandSync([&] {
@@ -9320,7 +9341,8 @@ public:
     std::memset(mapped, 0, allocation_size);
 
     for (const auto &fill_case : cases) {
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       HW::Context registers{};
       HW::UserConfig user_config{};
       HW::Shader shaders{};
@@ -9562,7 +9584,8 @@ public:
     for (const auto initial_size : {metadata_size - 0x1000, metadata_size}) {
       std::memset(mapped, 0x5a, color_size);
       std::memset(reinterpret_cast<void *>(dcc_address), 0xff, metadata_size);
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       context.InitializeGpu(nullptr);
       LibKernel::Memory::InstallGpuResources(&context);
       auto &scheduler = context.GetCommandScheduler();
@@ -9697,7 +9720,8 @@ public:
     for (const auto &format : cases) {
       std::memset(mapped, 0, allocation_size);
       std::memcpy(mapped, format.words.data(), sizeof(format.words));
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -9813,7 +9837,8 @@ public:
         }
       }
 
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -9984,7 +10009,8 @@ public:
             "cube-face mapping failed");
     std::memset(mapped, 0, allocation_size);
     {
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -10126,7 +10152,8 @@ public:
 
       const auto target_address = base + tile_case.target_offset;
       const auto target_size = slice.size * 6ull;
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -10238,7 +10265,8 @@ public:
     std::memcpy(mapped, expected.data(), allocation_size);
 
     {
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -10351,7 +10379,8 @@ public:
                 0x10000 / 4, tail_backing_value);
 
     {
-      RenderContext context(m_runtime_context);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
       auto &scheduler = context.GetCommandScheduler();
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -13824,7 +13853,8 @@ public:
     constexpr uint64_t allocation_size = 0x40000;
     constexpr uint64_t rect_address = depth_address + 0x8000;
     EnsureRuntimeContext();
-    RenderContext context(m_runtime_context);
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
