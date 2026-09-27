@@ -304,6 +304,11 @@ enum class FrameEvent : uint32_t {
 	// New compute pipelines (graphics ones are GraphicsPipelinesCreated). Programs and pipelines
 	// are also recorded per compile in the hang trace (compiles.csv).
 	ComputePipelinesCreated,
+	// Program compiles run outside the exclusive programs lock: requests that waited for another
+	// thread's compile of the same source or permutation, and finished compiles dropped because an
+	// equal permutation had been published meanwhile.
+	ProgramCompileWaits,
+	ProgramCompileDuplicates,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

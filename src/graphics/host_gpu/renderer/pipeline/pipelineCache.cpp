@@ -862,10 +862,13 @@ struct PipelineCache::Permutation {
 
 // Program preparation is split into a shared lookup (FindSource), a pure per-draw
 // materialization into caller-owned StagePrep (MaterializeStage), a lock-free permutation
-// lookup (FindPermutation) and an exclusive compile path (CompileAndPublish). Get composes them
-// serially. Invariants:
+// lookup (FindPermutation) and a compile path (CompileAndPublish) that takes m_programs_mutex
+// exclusively only around its lookups, its in-flight registration and its publication, and
+// translates and compiles unlocked. Get composes them serially. Invariants:
 // - `programs` nodes are never erased or moved, so a SourceEntry* stays valid for the cache
 //   lifetime. Finds take m_programs_mutex shared; inserts take it exclusively.
+// - A source or permutation being compiled is listed in `in_flight`; other threads needing the
+//   same one wait for it (compile_done) instead of compiling a second copy.
 // - A SourceEntry's plan, key and dependency list are immutable once inserted.
 // - Permutations are append-only with stable addresses (PermutationList).
 // - Only the O15 reuse state (KYTY_RESOURCE_REUSE) mutates an entry after insertion; it is
@@ -1195,7 +1198,7 @@ struct PipelineCache::ProgramCache {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
-		const auto id = ++next_shader_id;
+		const auto id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
 		GpuOpProfiler::RegisterShader(id, stage_name, options.shader_hash);
 		return {
 		    .specialization = std::move(specialization),
@@ -1392,10 +1395,88 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
+	// A compile running outside m_programs_mutex. While `source` is null the thread is translating
+	// a source that is not in `programs` yet (covers every request with an equal key); once it is
+	// set and `specialization_known`, it covers only that permutation request, and before that
+	// every permutation of the source. Records live on the compiling thread's stack and are
+	// listed in `in_flight`, both guarded by m_programs_mutex.
+	struct InFlightCompile {
+		ProgramKey                                   key;
+		const SourceEntry*                           source               = nullptr;
+		bool                                         specialization_known = false;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		uint32_t                                     push_data_cursor = 0;
+
+		[[nodiscard]] bool CoversSource(const ProgramKey& other) const {
+			return source == nullptr && key == other;
+		}
+		[[nodiscard]] bool CoversPermutation(
+		    const SourceEntry* other, const ShaderRecompiler::IR::ResourceSpecialization& spec,
+		    uint32_t cursor) const {
+			return source == other &&
+			       (!specialization_known ||
+			        (push_data_cursor == cursor && specialization == spec));
+		}
+	};
+
+	// Requires m_programs_mutex exclusively (held by `lock`). Waits while `covered` holds for an
+	// in-flight compile and returns whether it waited (the caller then repeats its lookup).
+	template <typename Covered>
+	bool WaitForInFlight(std::unique_lock<std::shared_mutex>& lock, Covered&& covered) {
+		const auto busy = [&] {
+			return std::any_of(in_flight.begin(), in_flight.end(),
+			                   [&](const InFlightCompile* record) { return covered(*record); });
+		};
+		if (!busy()) {
+			return false;
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ProgramCompileWaits);
+		compile_done.wait(lock, [&] { return !busy(); });
+		return true;
+	}
+
+	// Requires m_programs_mutex exclusively. Idempotent.
+	void FinishInFlight(InFlightCompile& record) {
+		if (std::erase(in_flight, &record) != 0) {
+			compile_done.notify_all();
+		}
+	}
+
+	// Unregisters `record` on every exit from the unlocked compile (including unwinding), so a
+	// waiter can never observe a record whose owner is gone.
+	struct InFlightScope {
+		InFlightScope(ProgramCache& owner, InFlightCompile& compile,
+		              std::unique_lock<std::shared_mutex>& programs_lock)
+		    : cache(owner), record(compile), lock(programs_lock) {}
+		ProgramCache&                        cache;
+		InFlightCompile&                     record;
+		std::unique_lock<std::shared_mutex>& lock;
+		~InFlightScope() {
+			if (!lock.owns_lock()) {
+				lock.lock();
+			}
+			cache.FinishInFlight(record);
+		}
+		InFlightScope(const InFlightScope&)            = delete;
+		InFlightScope& operator=(const InFlightScope&) = delete;
+	};
+
 	// The compile path: translates, inserts a new source, materializes it into `prep` when
 	// `prep` was not prepared from an existing entry, compiles and publishes the permutation.
-	// Holds m_programs_mutex exclusively throughout, which serializes all compiles. Returns
-	// null for skip-dispatch shaders and for a failed materialization.
+	// Returns null for skip-dispatch shaders and for a failed materialization.
+	//
+	// Locking (draw-prep S2 noted that compiles held m_programs_mutex exclusively throughout,
+	// blocking every FindSource): the exclusive lock is now held only to look up, to register the
+	// compile in `in_flight`, and to insert the new source and publish the permutation.
+	// Translation, resource-plan extraction, materialization, SPIR-V emission, validation and
+	// module creation run unlocked, so FindSource on other threads (draw-prep workers) proceeds
+	// and independent compiles run in parallel. A second thread that needs the same source or
+	// permutation waits for the first (compile_done) instead of compiling it again. Publication
+	// re-checks FindPermutation, so permutations stay unique per (specialization, push start),
+	// which LookupMemo relies on. No mutex was added: the lock order stays m_reuse_mutex (reuse
+	// mode only, held by the caller for the whole Get) before m_programs_mutex; the wait releases
+	// m_programs_mutex. In reuse mode m_reuse_mutex serializes all preparation, so no other
+	// thread can own an in-flight record there and nothing ever waits.
 	template <typename InputInfo>
 	const Permutation* CompileAndPublish(const ShaderParams& params, InputInfo& input_info,
 	                                     uint32_t push_data_cursor, const ProgramKey& key,
@@ -1406,30 +1487,67 @@ struct PipelineCache::ProgramCache {
 		// Cache hits returned before this. This covers translation through native shader-module
 		// creation; readiness failures can retry, so count successful creations separately.
 		Profiler::ScopedFrameWait shader_miss(Profiler::FrameWait::ShaderProgramMiss);
-		// Everything from here on, lock waits included, is compile time of the waiting draw.
+		// Everything from here on, lock and in-flight waits included, is compile time of the
+		// waiting draw.
 		struct StallScope {
 			uint64_t begin = CompileClockNs();
 			~StallScope() { AddCompileStall(CompileClockNs() - begin); }
 		} stall;
-		std::unique_lock lock(m_programs_mutex);
 		const auto publish_index = [&](const SourceEntry& source, const Permutation& permutation) {
 			if (ResourceReuseEnabled()) source.reuse.current.permutation_index = permutation.index;
 			return &permutation;
 		};
-		// Another preparer may have inserted or compiled this source since the shared lookup.
-		auto entry = programs.find(key);
-		if (entry != programs.end()) {
-			if (entry->second.skip_dispatch.load(std::memory_order_relaxed)) return nullptr;
-			if (!prep_materialized &&
-			    !Materialize(entry->second, runtime, evaluation, scratch, prep, read_attempt)) {
-				return nullptr;
+		std::unique_lock lock(m_programs_mutex);
+		SourceEntry*     source = nullptr;
+		for (;;) {
+			// Another preparer may have inserted or compiled this source since the shared lookup.
+			const auto entry = programs.find(key);
+			if (entry == programs.end()) {
+				if (WaitForInFlight(lock, [&](const InFlightCompile& record) {
+					    return record.CoversSource(key);
+				    })) {
+					continue;
+				}
+				break;
 			}
-			prep_materialized = true;
-			if (const auto* published = FindPermutation(entry->second, prep.specialization,
-			                                            push_data_cursor, true)) {
-				return publish_index(entry->second, *published);
+			source = &entry->second;
+			if (source->skip_dispatch.load(std::memory_order_relaxed)) return nullptr;
+			if (!prep_materialized) {
+				// The plan is sealed and never mutated here (reuse-mode state is guarded by
+				// m_reuse_mutex, held by the caller), so this needs no programs lock.
+				lock.unlock();
+				const bool materialized =
+				    Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
+				lock.lock();
+				if (!materialized) return nullptr;
+				prep_materialized = true;
 			}
+			if (const auto* published =
+			        FindPermutation(*source, prep.specialization, push_data_cursor, true)) {
+				return publish_index(*source, *published);
+			}
+			if (WaitForInFlight(lock, [&](const InFlightCompile& record) {
+				    return record.CoversPermutation(source, prep.specialization, push_data_cursor);
+			    })) {
+				continue;
+			}
+			break;
 		}
+		InFlightCompile record;
+		record.key.stage           = key.stage;
+		record.key.hash            = key.hash;
+		record.key.user_data_count = key.user_data_count;
+		record.key.code_size       = key.code_size;
+		record.key.static_state    = key.static_state;
+		record.source              = source;
+		record.push_data_cursor    = push_data_cursor;
+		if (source != nullptr) {
+			record.specialization       = prep.specialization;
+			record.specialization_known = true;
+		}
+		in_flight.push_back(&record);
+		const InFlightScope in_flight_scope(*this, record, lock);
+		lock.unlock();
 
 		const auto stage = key.stage;
 		ShaderStageInputInfo stage_input {};
@@ -1480,25 +1598,55 @@ struct PipelineCache::ProgramCache {
 		}
 		times.translate_ns = CompileClockNs() - translate_begin;
 		if (translated.skip_dispatch) {
-			entry = programs.try_emplace(key, ShaderRecompiler::IR::ResourcePlan {}).first;
+			lock.lock();
+			// An existing source never reaches here: it would have skip_dispatch set already.
+			const auto entry = programs.try_emplace(key, ShaderRecompiler::IR::ResourcePlan {}).first;
 			entry->second.skip_dispatch.store(true, std::memory_order_relaxed);
+			FinishInFlight(record);
 			return nullptr;
 		}
-		if (entry == programs.end()) {
-			entry = programs.try_emplace(key,
-			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			if (!Materialize(entry->second, runtime, evaluation, scratch, prep, read_attempt)) {
+		if (source == nullptr) {
+			// Pure function of the translated program; no lock needed.
+			auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			lock.lock();
+			// Nobody else inserts this key while `record` covers it.
+			source        = &programs.try_emplace(key, std::move(plan)).first->second;
+			record.source = source; // Still covers every permutation of it.
+			lock.unlock();
+			const bool materialized =
+			    Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
+			lock.lock();
+			if (!materialized) {
+				FinishInFlight(record);
 				return nullptr;
 			}
+			// No other thread can have compiled a permutation of this source: they all waited on
+			// `record`, which covered the whole source until now.
+			record.specialization       = prep.specialization;
+			record.specialization_known = true;
+			compile_done.notify_all(); // Other permutations of the source may proceed.
+			lock.unlock();
 		}
-		const auto& permutation = entry->second.permutations.Append(CompilePermutation(
-		    params, options, std::move(translated), prep.specialization, push_data_cursor,
-		    entry->first.static_state, times));
+		auto compiled = CompilePermutation(params, options, std::move(translated),
+		                                   prep.specialization, push_data_cursor,
+		                                   key.static_state, times);
+		lock.lock();
+		if (const auto* published =
+		        FindPermutation(*source, prep.specialization, push_data_cursor, true)) {
+			// Only possible when another cursor mapped to the same push-data start (both
+			// NoStart): keep permutations unique and drop this equal copy.
+			device.destroyShaderModule(compiled.handle.module, nullptr);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ProgramCompileDuplicates);
+			FinishInFlight(record);
+			return publish_index(*source, *published);
+		}
+		const auto& permutation = source->permutations.Append(std::move(compiled));
+		FinishInFlight(record);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderProgramsCreated);
 		RecordProgramCompile(ProgramStageName(stage), params.hash, permutation.handle.id, times,
 		                     CompileClockNs() - stall.begin);
 		CountCompiledPermutation(stage);
-		return publish_index(entry->second, permutation);
+		return publish_index(*source, permutation);
 	}
 
 	// Per-stage totals of compiled permutations (equal to the sum of every source's
@@ -1701,7 +1849,11 @@ struct PipelineCache::ProgramCache {
 	std::mutex                                                  m_reuse_mutex;
 	size_t history_bytes = 0; // Guarded by m_reuse_mutex.
 	vk::Device                                                  device;
-	uint64_t next_shader_id = 0; // Guarded by the exclusive m_programs_mutex.
+	// Assigned by compiles running outside m_programs_mutex.
+	std::atomic<uint64_t> next_shader_id {0};
+	// Compiles in progress outside the lock and their completion signal (m_programs_mutex).
+	std::vector<InFlightCompile*> in_flight;
+	std::condition_variable_any   compile_done;
 };
 
 // Classifies each new graphics pipeline for stutter attribution: whether a pipeline already existed
