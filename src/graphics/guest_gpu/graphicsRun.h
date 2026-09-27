@@ -84,6 +84,7 @@ private:
 		bool                      command_complete  = false;
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
+		bool                      slice_progress    = false; // the last slice advanced
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  enqueue_ns        = 0;
 	};
@@ -106,6 +107,8 @@ private:
 	std::atomic_uint32_t                           m_pending_commands {0};
 	std::deque<DeferredLabel>                      m_deferred_labels; // m_queue_mutex
 	std::atomic_uint32_t                           m_deferred_label_count {0};
+	// Some queue front is marked blocked (set under m_queue_mutex; NotifyProgress fast path).
+	std::atomic_bool                               m_has_blocked {false};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;

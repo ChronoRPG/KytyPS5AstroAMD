@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -142,10 +143,43 @@ static bool GraphicsRunDebugDumpEnabled() {
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
 }
 
+// KYTY_CP_WAKEUPS=0 restores the old blocked-queue handling: sleep 100 us (about 1 ms with the
+// Windows condition variable) and retry every blocked queue only after that timeout or when a
+// queue completes. By default completed GPU work (every completion-runner operation), deferred
+// label writes and flip completions wake the scheduler and unblock its queues at once, and
+// before sleeping it spins for KYTY_CP_BLOCKED_SPIN_US (default 50) retrying blocked queues,
+// which catches guest CPU writes (not observable otherwise) that follow shortly.
+static bool CpWakeupsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CP_WAKEUPS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+static uint64_t CpBlockedSpinNs() {
+	static const uint64_t ns = [] {
+		const auto* value  = std::getenv("KYTY_CP_BLOCKED_SPIN_US");
+		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 50ul;
+		return static_cast<uint64_t>(std::min(parsed, 10000ul)) * 1000u;
+	}();
+	return ns;
+}
+
+static uint64_t CpNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
+	if (CpWakeupsEnabled()) {
+		m_renderer.GetCommandScheduler().SetProgressHook(
+		    [](void* context) { static_cast<GuestGpu*>(context)->NotifyProgress(); }, this);
+	}
 	m_thread = std::jthread(ThreadRun, this);
 }
 
@@ -167,6 +201,9 @@ void GuestGpu::Shutdown() {
 	if (m_thread.joinable()) {
 		m_thread.join();
 	}
+	// No completion-runner call may reach this object once it is destroyed.
+	m_renderer.GetCommandScheduler().SetProgressHook(nullptr, nullptr);
+	m_renderer.GetCommandScheduler().DrainPriorityOperations();
 	m_shutdown_complete = true;
 }
 
@@ -230,6 +267,11 @@ bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
 }
 
 void GuestGpu::NotifyProgress() {
+	// Cheap when nothing is blocked (called after every completion-runner operation).
+	if (!m_has_blocked.exchange(false, std::memory_order_acq_rel)) {
+		return;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::CpProgressWakeups);
 	Common::LockGuard lock(m_queue_mutex);
 	for (auto& queue: m_queues) {
 		if (!queue.empty()) {
@@ -632,6 +674,8 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
+	const bool wakeups       = CpWakeupsEnabled();
+	uint64_t   spin_deadline = 0; // 0: not spinning on blocked queues
 	for (;;) {
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
@@ -664,7 +708,26 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					if (!wakeups) {
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					} else {
+						const auto now = CpNowNs();
+						if (spin_deadline == 0) {
+							spin_deadline = now + CpBlockedSpinNs();
+						}
+						if (now < spin_deadline) {
+							// Every queue is suspended: retry shortly without sleeping.
+							Profiler::CountFrameEvent(Profiler::FrameEvent::CpBlockedSpins);
+							gpu->m_queue_mutex.Unlock();
+							std::this_thread::yield();
+							gpu->m_queue_mutex.Lock();
+						} else {
+							// Completions, deferred labels and flips signal this condition.
+							Profiler::CountFrameEvent(Profiler::FrameEvent::CpBlockedSleeps);
+							gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 1000);
+						}
+					}
+					gpu->m_has_blocked.store(false, std::memory_order_release);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -694,6 +757,7 @@ void GuestGpu::ThreadRun(void* data) {
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
 			command();
+			spin_deadline = 0;
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -717,9 +781,13 @@ void GuestGpu::ThreadRun(void* data) {
 			                           complete);
 		}
 
+		if (complete || submission.slice_progress) {
+			spin_deadline = 0;
+		}
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
 			submission.blocked = true;
+			gpu->m_has_blocked.store(true, std::memory_order_release);
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
@@ -779,6 +847,7 @@ bool GuestGpu::Process(Submission& submission) {
 					break;
 				}
 			}
+			submission.slice_progress = progressed;
 			if (progressed) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
@@ -805,6 +874,7 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
+			submission.slice_progress = submission.command_execution.MadeProgress();
 			if (submission.command_execution.MadeProgress()) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();

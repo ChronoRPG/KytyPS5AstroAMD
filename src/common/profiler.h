@@ -292,6 +292,11 @@ enum class FrameEvent : uint32_t {
 	// DrainPriorityOperations waiters (KYTY_PRIORITY_WAKE_BATCH: only at a tick boundary with waiters).
 	PriorityOperationsRun,
 	PriorityWaiterWakeups,
+	// CP scheduler with every queue suspended (KYTY_CP_WAKEUPS): short retry spins, timed sleeps,
+	// and completion/label/flip notifications that unblocked suspended queues.
+	CpBlockedSpins,
+	CpBlockedSleeps,
+	CpProgressWakeups,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
