@@ -27,6 +27,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
@@ -532,11 +533,34 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
-	vk::DeviceQueueCreateInfo queue_create_info {};
+	// Queue 0 carries every scheduler submission and presentation. A second queue of the same
+	// family (KYTY_SIDE_QUEUE, default on when the family has one) runs side-copy readbacks, so a
+	// copy waits only for its producer instead of for everything queued ahead of it on queue 0.
+	// Buffers stay EXCLUSIVE: ownership is per family, and both queues share it.
+	uint32_t family_queue_count = 0;
+	{
+		uint32_t count = 0;
+		physical_device.getQueueFamilyProperties(&count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(count);
+		physical_device.getQueueFamilyProperties(&count, families.data());
+		if (queue_family < count) {
+			family_queue_count = families[queue_family].queueCount;
+		}
+	}
+	const bool side_queue_requested = [] {
+		const auto* value = std::getenv("KYTY_SIDE_QUEUE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	graphics.side_queue_index = side_queue_requested && family_queue_count >= 2 ? 1u : 0u;
+	std::printf("Kyty side-copy queue: %s (family %u has %u queues, KYTY_SIDE_QUEUE)\n",
+	       graphics.side_queue_index != 0 ? "queue 1" : "shared with queue 0", queue_family,
+	       family_queue_count);
+
+	const std::array<float, 2> queue_priorities {1.0f, 1.0f};
+	vk::DeviceQueueCreateInfo  queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	queue_create_info.queueCount       = graphics.side_queue_index != 0 ? 2u : 1u;
+	queue_create_info.pQueuePriorities = queue_priorities.data();
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -1255,6 +1279,11 @@ void WindowContext::CreateVulkan() {
 	GpuOpProfiler::InstallHooks(graphic_ctx);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.side_queue_index != 0) {
+		graphic_ctx.device.getQueue(graphic_ctx.queue_family, graphic_ctx.side_queue_index,
+		                            &graphic_ctx.side_queue);
+		EXIT_IF(graphic_ctx.side_queue == nullptr);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

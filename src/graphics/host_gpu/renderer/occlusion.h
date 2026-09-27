@@ -26,10 +26,22 @@ public:
 	void Begin();                  // after beginning guest rendering
 	void End();                    // before ending guest rendering
 	void Accumulate();             // after ending rendering; flush only when pool is full
-	// Returns true when the caller must wait for this dump's publication before continuing
-	// (default on, KYTY_OCCLUSION_SYNC_PROXY=0 disables; this end dump closes a depth-only proxy scope).
+	// Visibility-proxy handling (an end dump closing a depth-only scope, whose result Astro Bot
+	// reads right after the next end-of-pipe label). KYTY_OCCLUSION_PROXY_MODE:
+	//   defer-label (default): the CP continues; its next label write is deferred until this
+	//                          dump's tick has completed and its result has been published.
+	//   sync:                  the CP waits for the publication (BufferWait), as before.
+	// KYTY_OCCLUSION_SYNC_PROXY=0 disables proxy handling (plain asynchronous publication).
+	enum class ProxyMode { Off, Sync, DeferLabel };
+	[[nodiscard]] static ProxyMode GetProxyMode();
+	// Returns true when this dump is a proxy end dump the caller must order (see ProxyMode).
 	[[nodiscard]] bool Dump(uint64_t address);
+	// Proxy detection enabled (any mode but Off).
 	[[nodiscard]] static bool SyncProxyDumps();
+	// Publications run on the completion (priority) runner instead of the GPU thread's pending
+	// operations: required whenever labels may be deferred, so a deferred label, registered later
+	// on the same FIFO runner, is written only after the result it announces.
+	[[nodiscard]] static bool PriorityPublication();
 	// True while a dump has been recorded but not yet published to guest memory.
 	[[nodiscard]] bool HasUnpublishedDumps() const noexcept {
 		return m_published.load(std::memory_order_acquire) != m_issued;

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/hangTrace.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/presentation/videoOut.h"
@@ -32,9 +33,22 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
 	m_gpu       = std::make_unique<GuestGpu>(*this);
+	std::unique_lock lock(m_gpu_notify_mutex);
+	m_gpu_notify = m_gpu.get();
+}
+
+void RenderContext::NotifyGpuProgress() {
+	std::shared_lock lock(m_gpu_notify_mutex);
+	if (m_gpu_notify != nullptr) {
+		m_gpu_notify->NotifyProgress();
+	}
 }
 
 void RenderContext::ShutdownGpu() {
+	{
+		std::unique_lock lock(m_gpu_notify_mutex);
+		m_gpu_notify = nullptr;
+	}
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
 		m_gpu.reset();
@@ -148,7 +162,8 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	}
 	const auto unmap = [this, vaddr, size] {
 		if (m_command_scheduler.Active()) {
-			const auto tick = m_command_scheduler.CurrentTick();
+			Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitUnmap);
+			const auto                    tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}

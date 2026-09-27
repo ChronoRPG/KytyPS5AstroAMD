@@ -1,7 +1,11 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "common/profiler.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+
+#include <optional>
 
 namespace Libs::Graphics {
 
@@ -39,6 +43,15 @@ void MasterSemaphore::Refresh() {
 }
 
 void MasterSemaphore::Wait(uint64_t tick) {
+	if (IsFree(tick)) {
+		return;
+	}
+	// Attribute CP-thread blocking to its caller (Profiler::ScopedGpuWaitReason). Other threads
+	// (the completion runner, guest threads) wait here by design and are not counted.
+	std::optional<Profiler::ScopedFrameWait> frame_wait;
+	if (GuestGpu::IsGpuThread() && Profiler::AggregateEnabled()) {
+		frame_wait.emplace(Profiler::CurrentGpuWaitReason());
+	}
 	if (m_submission_progress) {
 		auto submitted = m_submission_progress->dispatched_tick.load(std::memory_order_acquire);
 		while (submitted < tick) {
