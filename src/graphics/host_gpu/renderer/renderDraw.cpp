@@ -855,8 +855,73 @@ static bool IsMetadataColorMode(uint8_t mode) {
 	       mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
 }
 
-static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
-	return IsMetadataColorMode(buffer.GetRegisters().GetColorControl().mode);
+// KYTY_CB_METADATA_MATERIALIZE=1: a fast-clear-eliminate or DCC-decompress draw first resolves
+// each DCC render-target-tiled colour target it names (FindImage), which materializes a pending
+// uniform DCC fast clear into the image (TextureCache::MaterializeDccClear) and consumes the
+// clear key, exactly as a later attachment bind would. On hardware these draws exist to write the
+// cleared values into the surface memory for readers without DCC metadata (a T# without META,
+// buffer reads); dropping them left such readers with the surface's previous contents whenever
+// no draw bound the target in between. Off by default until a trace shows which targets the game
+// eliminates (cp.csv "cb-meta-op" rows, KYTY_HANG_TRACE_CP=1).
+static bool MetadataColorMaterializeEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CB_METADATA_MATERIALIZE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
+                                                   uint32_t      render_target_slice_offset) {
+	const auto& hw   = buffer.GetRegisters();
+	const auto  mode = hw.GetColorControl().mode;
+	if (!IsMetadataColorMode(mode)) {
+		return false;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::MetadataColorOps);
+	const bool materialize =
+	    MetadataColorMaterializeEnabled() &&
+	    (mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) ||
+	     mode == static_cast<uint8_t>(CbColorMode::DccDecompress));
+	const auto target_mask = hw.GetRenderTargetMask();
+	for (uint32_t slot = 0; slot < 8; slot++) {
+		const auto& rt = hw.GetRenderTarget(slot);
+		if (rt.base.addr == 0 || (slot != 0 && render_target_mask_slot(target_mask, slot) == 0)) {
+			continue;
+		}
+		const bool dcc = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
+		// Only the layouts ResolveRenderColorTarget supports with DCC: render-target tiled,
+		// single sample.
+		const bool eligible = materialize && dcc &&
+		                      rt.attrib3.tile_mode == Prospero::TileMode::kRenderTarget &&
+		                      rt.attrib.num_samples == 0 && rt.attrib.num_fragments == 0;
+		uint64_t image_size = 0;
+		if (eligible) {
+			RenderColorInfo target {};
+			ResolveRenderColorTarget(buffer, target, render_target_slice_offset, slot, true, false);
+			if (target.image_id) {
+				image_size = target.desc.info.data.size;
+				Profiler::CountFrameEvent(Profiler::FrameEvent::MetadataColorOpMaterializations);
+			}
+		}
+		if (HangTrace::CpTraceEnabled()) {
+			// cp.csv: address = colour base, value = CB_COLOR_CONTROL.MODE, ref = DCC base,
+			// mask = CMASK base, aux = slot | DCC enable << 8 | tile mode << 16 | resolved << 24,
+			// size = the resolved image's guest size (0 when not resolved).
+			HangTrace::CpEvent event;
+			event.event   = "cb-meta-op";
+			event.address = rt.base.addr;
+			event.value   = mode;
+			event.ref     = rt.dcc_addr.addr;
+			event.mask    = rt.cmask.addr;
+			event.aux     = static_cast<int64_t>(slot) | (static_cast<int64_t>(dcc ? 1 : 0) << 8) |
+			            (static_cast<int64_t>(rt.attrib3.tile_mode) << 16) |
+			            (static_cast<int64_t>(image_size != 0 ? 1 : 0) << 24);
+			event.size = image_size;
+			HangTrace::RecordCp(event);
+		}
+	}
+	return true;
 }
 
 struct DrawEmitInfo {
@@ -1813,7 +1878,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return;
@@ -1933,7 +1999,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return;

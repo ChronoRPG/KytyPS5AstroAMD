@@ -214,6 +214,8 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.TexelImageSyncDownloads.Cumulative",
     "FrameEvent.TexelImageSyncSkips.Cumulative",
     "FrameEvent.TexelImageSyncOverGpuDirty.Cumulative",
+    "FrameEvent.MetadataColorOps.Cumulative",
+    "FrameEvent.MetadataColorOpMaterializations.Cumulative",
     "FrameEvent.TextureResidentImages.Cumulative",
     "FrameEvent.TextureResidentLevelsSkipped.Cumulative",
     "FrameEvent.TextureResidentBytesSkipped.Cumulative",
