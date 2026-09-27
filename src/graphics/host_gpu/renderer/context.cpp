@@ -43,6 +43,11 @@ bool BarrierSinkEnabled() {
 	return enabled;
 }
 
+bool DrawWriteSinkEnabled() {
+	static const bool enabled = BarrierBatchEnabled() && EnvSwitch("KYTY_DRAW_WRITE_SINK", true);
+	return enabled;
+}
+
 namespace {
 
 using Stage2  = vk::PipelineStageFlagBits2;
@@ -256,14 +261,15 @@ void CommandBuffer::FlushBarriers() const {
 		return;
 	}
 	EXIT_IF(IsInvalid());
-	const GpuOpProfiler::ScopedSite site(BatchSite(m_pending.origins));
-	++m_internal_recording;
 	if (m_rendering) {
 		// Pipeline barriers cannot be recorded inside dynamic rendering. (A command recorded
 		// through Handle() mostly ends rendering anyway; only a draw that has to restart its own
-		// instance counts as a barrier split, in BeginRendering().)
+		// instance counts as a barrier split, in BeginRendering().) Ended before the batch site
+		// is entered, so the end is attributed to the site whose command needed the flush.
 		EndRendering();
 	}
+	const GpuOpProfiler::ScopedSite site(BatchSite(m_pending.origins));
+	++m_internal_recording;
 	if (m_pending.has_memory) {
 		// The requests were issued in some order with nothing recorded between them. Widening
 		// every buffer/image barrier by the global dependency reproduces the execution and
@@ -319,6 +325,17 @@ bool CommandBuffer::CanSinkPending() const {
 	return BarrierSinkEnabled() && m_draw_scope && m_draw_safe && m_rendering && m_epoch_clean &&
 	       m_epoch_instance != 0 && m_epoch_instance == m_rendering_serial &&
 	       m_pending.has_memory && m_pending.images.empty() && m_pending.buffers.empty();
+}
+
+bool CommandBuffer::CanSinkDrawWrites() const {
+	// A draw continuing its rendering instance may pass pending barriers that consist only of
+	// the post-draw shader-write requests of earlier draws. Every such request was made inside
+	// this instance: a new instance records the pending batch before it begins. Any other origin
+	// (guest synchronization, layout transitions, buffer barriers, indirect arguments, GDS)
+	// keeps the ordinary rules.
+	return DrawWriteSinkEnabled() && m_draw_scope && m_rendering && m_pending.has_memory &&
+	       m_pending.images.empty() && m_pending.buffers.empty() &&
+	       m_pending.origins == OriginBit(BarrierOrigin::ShaderWrite);
 }
 
 void CommandBuffer::NoteDrawRecorded() const {
@@ -447,8 +464,17 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {
 	const auto count_control = GetRegisters().GetDepthCountControl();
-	const bool same_instance =
-	    m_rendering && m_render_state == state && m_occlusion_control == count_control;
+	auto&      occlusion     = m_context.GetOcclusionCounter();
+	// A DB_COUNT_CONTROL change matters only when this instance or the next one is counted
+	// (KYTY_OCCLUSION_GATE, occlusion.h): with neither counted, no sample can reach a guest value.
+	const bool same_control =
+	    m_occlusion_control == count_control ||
+	    (OcclusionCounter::GateEnabled() && !occlusion.Active() && !occlusion.WouldCount(count_control));
+	const bool same_instance = m_rendering && m_render_state == state && same_control;
+	if (same_instance) {
+		m_occlusion_control = count_control;
+	}
+	bool barrier_split = false;
 	if (!BarrierBatchEnabled()) {
 		if (same_instance) {
 			return;
@@ -463,12 +489,31 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 			NoteDrawRecorded();
 			return;
 		}
+		if (CanSinkDrawWrites()) {
+			CountBatch(GpuOpProfiler::BarrierBatchEvent::DrawWriteSinks);
+			NoteDrawRecorded();
+			return;
+		}
 		// The pending barrier cannot move past this draw: end the instance to record it.
 		CountBatch(GpuOpProfiler::BarrierBatchEvent::RenderSplits);
+		barrier_split = true;
 	}
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
-	EndRendering();
+	if (m_rendering) {
+		// Attribution of the end (GpuOps.EndRendering.<site>): a pending barrier that could not
+		// be sunk, or different targets/state/occlusion control.
+		if (barrier_split) {
+			KYTY_GPU_OP_SITE("render.barrier_split");
+			EndRendering();
+		} else if (m_render_state == state) {
+			KYTY_GPU_OP_SITE("render.occlusion_control");
+			EndRendering();
+		} else {
+			KYTY_GPU_OP_SITE("render.state_change");
+			EndRendering();
+		}
+	}
 	if (BarrierBatchEnabled()) {
 		FlushBarriers();
 	}
@@ -544,6 +589,7 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
+	GpuOpProfiler::CountEndRendering();
 	// The occlusion counter may also record a query reduction here (Accumulate): foreign work.
 	++m_internal_recording;
 	m_context.GetOcclusionCounter().End();

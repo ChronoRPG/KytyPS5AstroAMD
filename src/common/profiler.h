@@ -246,6 +246,28 @@ enum class FrameEvent : uint32_t {
 	WriteRangeWhole,
 	WriteRangeBytesAvoided,
 	WriteRangeImagesSpared,
+	// Guest rendering instances ended (every cause; per-site Tracy plots
+	// GpuOps.EndRendering.<site>) and post-draw shader-write barriers kept pending across a draw
+	// continuing the same instance (KYTY_DRAW_WRITE_SINK).
+	GpuRenderingEnds,
+	GpuDrawWriteSinks,
+	// Rendering instances with ZPASS counting enabled that began while no occlusion dump pair was
+	// open, so no query was recorded (KYTY_OCCLUSION_GATE).
+	OcclusionScopesGated,
+	// DCC clear materialization of GPU-written metadata (TextureCache::MaterializeDccClear):
+	// native GPU inspections recorded (per metadata slice), retained inspections reused, and CPU
+	// readback fallbacks, each fallback also counted once under its first failing reason.
+	DccGpuRecords,
+	DccGpuReuses,
+	DccCpuFallbacks,
+	DccFallbackDisabled,       // KYTY_DCC_GPU is not 1, or the device lacks the helper features
+	DccFallbackBinding,        // video-out binding (its clear key is not consumed)
+	DccFallbackShape,          // volume, mip/aspect/view shape, or native extent mismatch
+	DccFallbackFormat,         // no UINT storage alias of the view format's texel size
+	DccFallbackImageState,     // image not registered/GPU-owned, CPU/buffer dirty, alias/depth
+	DccFallbackMetadataAliased, // an image owns (overlaps) the metadata, or metadata overlaps data
+	DccFallbackUnsupported,    // native image lacks storage/mutable usage, or size limits
+	DccFallbackAlignment,      // canonical metadata buffer offset is not 4-byte aligned
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

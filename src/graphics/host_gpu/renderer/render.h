@@ -116,8 +116,17 @@ struct DrawAutoArgs {
 // batch across a draw that continues the same rendering instance when the draw is proven
 // hazard-free with respect to everything since the last full barrier; see
 // CommandBuffer::CanSinkPending() for the exact conditions.
+// KYTY_DRAW_WRITE_SINK (default on, needs the batcher): the shader-write barrier a draw with guest
+// storage-buffer writes requests after itself no longer ends the rendering instance. It stays
+// pending while later draws continue the same instance and is recorded at the next flush point
+// (another instance, any Handle() command, End()). Guest-visible ordering between draws is what
+// the GPU provides: none for shader storage accesses unless the guest synchronizes (PS/VS/CS
+// partial flushes and cache actions become Guest requests, which are never sunk this way), so
+// draws of one instance may overlap as they do on the hardware. Every non-draw consumer is still
+// ordered after the writes. KYTY_DRAW_WRITE_SINK=0 ends the instance after such draws again.
 [[nodiscard]] bool BarrierBatchEnabled();
 [[nodiscard]] bool BarrierSinkEnabled();
+[[nodiscard]] bool DrawWriteSinkEnabled();
 
 // Attribution of batched barrier requests (gpuOpProfiler site of the recorded batch).
 enum class BarrierOrigin : uint32_t {
@@ -243,6 +252,7 @@ private:
 		m_epoch_clean          = false;
 	}
 	[[nodiscard]] bool CanSinkPending() const;
+	[[nodiscard]] bool CanSinkDrawWrites() const;
 	void               NoteDrawRecorded() const;
 	void               ResetBarrierState() const;
 

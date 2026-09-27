@@ -38,7 +38,10 @@
 // gpu_barriers_merged (joined an already pending batch), gpu_barriers_elided (covered by the
 // previous barrier with nothing recorded since), gpu_barriers_sunk (a pending batch kept across a
 // draw in the same rendering instance) and gpu_barrier_rp_splits (barrier flushes that ended an
-// active rendering instance). New columns are only ever appended.
+// active rendering instance). After the transfer columns: gpu_rendering_ends (guest rendering
+// instances ended, every cause; per-site Tracy plots GpuOps.EndRendering.<site>) and
+// gpu_draw_write_sinks (post-draw shader-write barriers kept pending across a draw continuing the
+// same instance, KYTY_DRAW_WRITE_SINK). New columns are only ever appended.
 
 #include <cstdint>
 #include <string>
@@ -231,6 +234,9 @@ struct GpuOpCounts {
 	uint64_t barriers_elided       = 0;
 	uint64_t barriers_sunk         = 0;
 	uint64_t barrier_render_splits = 0;
+	// Appended: rendering instances ended (all causes) and post-draw write barriers sunk.
+	uint64_t rendering_ends   = 0;
+	uint64_t draw_write_sinks = 0;
 };
 void RecordGpuOpCounts(const GpuOpCounts& counts);
 

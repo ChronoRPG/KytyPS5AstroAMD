@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace Libs::Graphics {
 class Buffer;
@@ -34,6 +35,15 @@ public:
 		return m_published.load(std::memory_order_acquire) != m_issued;
 	}
 	[[nodiscard]] bool Active() const noexcept { return m_active; }
+	// KYTY_OCCLUSION_GATE (default on, needs KYTY_GPU_OCCLUSION=1). The guest reads only
+	// end - begin differences of the cumulative counter, taken by interleaved dump pairs (begin at
+	// A, A % 16 == 0; end at A + 8). Samples of rendering instances begun while no pair is open
+	// cannot reach any such difference, so they are not counted. Every dump ends rendering, so
+	// an instance never straddles a pair boundary. Unexpected dump patterns disable the gate for
+	// the rest of the process (always-on counting, as without the gate).
+	[[nodiscard]] static bool GateEnabled();
+	// True when a rendering instance begun now with DB_COUNT_CONTROL `control` would be counted.
+	[[nodiscard]] bool WouldCount(uint32_t control) const noexcept;
 	// Hang-trace diagnostics: the depth target of the latest counted scope, reported with the
 	// next dump.
 	void NoteScope(uint64_t depth_address, uint32_t width, uint32_t height, uint32_t colors,
@@ -46,6 +56,17 @@ private:
 	void Initialize();
 	void FlushPending();
 	void Dispatch(uint32_t mode, vk::Buffer output, uint64_t offset, uint64_t range);
+	[[nodiscard]] static bool ControlCounts(uint32_t control) noexcept {
+		return (control & 1u) == 0 && (control & 0xf00u) != 0;
+	}
+	[[nodiscard]] bool GateOpen() const noexcept {
+		return !GateEnabled() || m_gate_broken || !m_open_pairs.empty();
+	}
+	void UpdateOpenPairs(uint64_t address);
+	void BreakGate(const char* reason, uint64_t address);
+	static constexpr size_t MaxOpenPairs = 64;
+	std::vector<uint64_t> m_open_pairs; // begin addresses of dump pairs awaiting their end
+	bool m_gate_broken = false;
 	static constexpr uint32_t QueryCapacity = 1024;
 	RenderContext& m_context;
 	vk::QueryPool m_pool;

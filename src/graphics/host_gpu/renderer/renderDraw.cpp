@@ -1596,7 +1596,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// begun right after the previous barrier needs no new one while it remains active.
 		const auto active = buffer.ActiveRenderingSerial();
 		if (active == 0 || active != m_indirect_barrier_rendering) {
-			m_context.GetCommandScheduler().EndRendering();
+			{
+				KYTY_GPU_OP_SITE("draw.indirect_args");
+				m_context.GetCommandScheduler().EndRendering();
+			}
 			IndirectArgumentsBarrier(buffer, vk_buffer);
 		}
 	}
@@ -1679,8 +1682,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
 	if (shader_write_stages) {
-		m_context.GetCommandScheduler().EndRendering();
-		ShaderWriteBarrier(buffer, shader_write_stages);
+		if (DrawWriteSinkEnabled()) {
+			// Queued without ending the instance (render.h, KYTY_DRAW_WRITE_SINK): a later draw of
+			// this instance may pass it, anything else records it first.
+			ShaderWriteBarrier(buffer, shader_write_stages);
+			// An indirect draw can no longer rely on "no buffer write since the argument barrier
+			// while this instance is active": it must end the instance and record a new one.
+			m_indirect_barrier_rendering = 0;
+		} else {
+			{
+				KYTY_GPU_OP_SITE("draw.write_barrier");
+				m_context.GetCommandScheduler().EndRendering();
+			}
+			ShaderWriteBarrier(buffer, shader_write_stages);
+		}
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
