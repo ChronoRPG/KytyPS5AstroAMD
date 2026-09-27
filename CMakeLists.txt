@@ -751,6 +751,15 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_fence PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_REG_INDIRECT_WINDOW=0")
+	# Value certificates (byte and digest comparisons), and the log-mode audit on top of them.
+	add_test(NAME draw_prep_engine_parallel_value
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_value PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_CERT=value")
+	add_test(NAME draw_prep_engine_parallel_value_audit
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_value_audit PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_CERT=value;KYTY_DRAW_PREP_LOG_AUDIT=1")
 	# KYTY_BACKING_INPLACE and KYTY_DRAW_PREP_LOCKFREE_HINT: verify modes, and both off.
 	add_test(NAME draw_prep_engine_parallel_inplace_verify
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)

@@ -30,7 +30,7 @@
 //
 // KYTY_DRAW_PREP_VERIFY=1|exit: after every committed preparation the serial preparation runs
 // on copies and the outputs are compared (logged and counted; "exit" stops on a difference).
-// KYTY_DRAW_PREP_CERT=value (default)|log: see Validate() in drawPrep.cpp.
+// KYTY_DRAW_PREP_CERT=log (default)|value: see Validate() in drawPrep.cpp.
 // KYTY_DRAW_PREP_WORKERS (default 6, 1..32), KYTY_DRAW_PREP_WINDOW (default 32 slots, rounded
 // up to a power of two), KYTY_DRAW_PREP_SPIN_US (default 200: how long an idle worker spins
 // before parking): parallel mode only.

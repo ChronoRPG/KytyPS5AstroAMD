@@ -168,8 +168,10 @@ int VerifyMode() {
 
 CertMode GetCertMode() {
 	static const CertMode mode = [] {
+		// Log by default (Run A audit, CP-ARCHITECTURE-20260927.md: DrawPrepLogMissed 0 in every
+		// scene); KYTY_DRAW_PREP_CERT=value restores the byte and digest comparisons.
 		const auto* value = EnvValue("KYTY_DRAW_PREP_CERT");
-		return value != nullptr && std::strcmp(value, "log") == 0 ? CertMode::Log : CertMode::Value;
+		return value != nullptr && std::strcmp(value, "value") == 0 ? CertMode::Value : CertMode::Log;
 	}();
 	return mode;
 }
@@ -336,13 +338,15 @@ static ValidateResult ValidateValues(const ReadSet& reads) {
 }
 
 // Certificate modes:
-// - value (default): every coalesced read range must be clean for a backing read now and hold
-//   the recorded bytes. Sound on its own (readSet.h); the coherence log is not consulted.
-// - log: the plan's cheaper check. No coherence transition logged since the preparation began
-//   may touch a read range, and every range must be clean now; bytes are not compared. It relies
-//   on the log being complete for emulator-side changes and treats unsynchronized guest CPU
-//   writes as races (they are: only a fence orders them against a draw). Validate it with
-//   KYTY_DRAW_PREP_VERIFY before trusting it.
+// - log (default): no coherence transition logged since the preparation began may touch a read
+//   or digest range, and every range must be clean now; bytes are neither compared nor re-hashed.
+//   It relies on the log being complete for emulator-side changes and treats unsynchronized guest
+//   CPU writes as races (they are: only a fence orders them against a draw, and a fence commits
+//   the window before its handler runs). Audited with KYTY_DRAW_PREP_CERT=value
+//   KYTY_DRAW_PREP_LOG_AUDIT=1 (DrawPrepLogMissed counts the draws log mode would have accepted
+//   with changed bytes: 0 in all five Run A scenes).
+// - value: every coalesced read range must be clean for a backing read now and hold the recorded
+//   bytes, and every digest range must hash to the recorded digest. Sound on its own (readSet.h).
 bool Validate(PreparedDraw& prepared, bool pixel_active,
               std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping) {
 	const auto fail = [&](Failure failure) {
