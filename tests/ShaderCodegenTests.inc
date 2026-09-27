@@ -662,7 +662,57 @@ void CheckFloatToIntSaturation(VulkanHarness *vulkan) {
               slow_run.spirv.size(), fast_run.spirv.size());
 }
 
+// GET_LOD_STATS instrumentation of a pixel-shader sample: compile-only (the graphics harness has
+// no mip-statistics buffer), SPIR-V validation and structure in both modes.
+void CheckLodStatsGate() {
+  constexpr const char *name = "CodegenLodStatsGate";
+  GraphicsCase test;
+  test.name = name;
+  AppendVMovLiteral(&test.fragment_code, 20, 0x3f000000u);
+  AppendVMovLiteral(&test.fragment_code, 21, 0x3f000000u);
+  test.fragment_code.push_back(EncodeMimg0(0x20, 0xf)); // image_sample v[0:3], v[20:21]
+  test.fragment_code.push_back(EncodeMimg1(0, 20));
+  test.fragment_code.push_back(EncodeExp0(0, 0xf, true, false, true));
+  test.fragment_code.push_back(EncodeExp1(0, 1, 2, 3));
+  AppendEnd(&test.fragment_code);
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+  test.has_user_data = true;
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE, ShaderOpcode::EXP,
+                  ShaderOpcode::S_ENDPGM};
+  CodegenOptions gated = GetCodegenOptions();
+  gated.lod_stats_gate = true;
+  CodegenOptions legacy = gated;
+  legacy.lod_stats_gate = false;
+  std::vector<u32> gated_spirv;
+  std::vector<u32> legacy_spirv;
+  {
+    ScopedCodegenOptions scope(gated);
+    gated_spirv = CompileFragmentCase(test).spirv;
+  }
+  {
+    ScopedCodegenOptions scope(legacy);
+    legacy_spirv = CompileFragmentCase(test).spirv;
+  }
+  const auto count = [](const std::vector<u32> &spirv, const char *op) {
+    return CountSpirv(spirv, op);
+  };
+  Require(name, "instrumentation",
+          count(legacy_spirv, "OpImageQueryLod") == 1u &&
+              count(legacy_spirv, "OpAtomicUMin") == 1u &&
+              count(legacy_spirv, "OpAtomicLoad") == 0u &&
+              count(gated_spirv, "OpImageQueryLod") == 1u &&
+              count(gated_spirv, "OpAtomicUMin") == 1u &&
+              count(gated_spirv, "OpAtomicIAdd") == 1u &&
+              count(gated_spirv, "OpAtomicLoad") == 1u &&
+              count(gated_spirv, "OpSelectionMerge") ==
+                  count(legacy_spirv, "OpSelectionMerge") + 2u,
+          "unexpected GET_LOD_STATS instrumentation structure");
+  std::printf("[codegen] %-32s ok (SPIR-V %zu -> %zu words)\n", name, legacy_spirv.size(),
+              gated_spirv.size());
+}
+
 void RunAll(VulkanHarness *vulkan) {
+  CheckLodStatsGate();
   CheckMoveRelValueSet(vulkan);
   CheckFloatMinMax(vulkan);
   CheckFloatClampConstants(vulkan);

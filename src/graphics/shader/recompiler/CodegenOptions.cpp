@@ -22,6 +22,7 @@ CodegenOptions FromEnvironment() {
 	options.fast_pkrtz         = EnvFlag("KYTY_FAST_PKRTZ", options.fast_pkrtz);
 	options.single_f2i_saturation =
 	    EnvFlag("KYTY_SINGLE_F2I_SATURATION", options.single_f2i_saturation);
+	options.lod_stats_gate = EnvFlag("KYTY_LOD_STATS_GATE", options.lod_stats_gate);
 	return options;
 }
 

@@ -22,6 +22,9 @@ struct CodegenOptions {
 	// KYTY_SINGLE_F2I_SATURATION=0: repeat the float-to-int NaN/range saturation in the emitter even
 	// though the translator's saturated conversion already guarantees an in-range operand.
 	bool single_f2i_saturation = true;
+	// KYTY_LOD_STATS_GATE=0: record GET_LOD_STATS feedback for every sample, including images whose
+	// T# has no mip-statistics counter, and issue the finest-level AtomicUMin unconditionally.
+	bool lod_stats_gate = true;
 };
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();
