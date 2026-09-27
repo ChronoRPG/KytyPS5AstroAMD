@@ -798,6 +798,10 @@ if(BUILD_TESTING)
 	# Tracker-gap detectors: the page states they classify host writes by.
 	add_test(NAME tracker_gap_detectors
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tracker-gap-detectors-only)
+	add_test(NAME tracker_gap_host_write_tracking_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tracker-gap-detectors-only)
+	set_tests_properties(tracker_gap_host_write_tracking_off PROPERTIES
+		ENVIRONMENT "KYTY_HOST_WRITE_TRACKING=0")
 	# KYTY_TEXTURE_MEMO_REVALIDATE: default, verify mode, off.
 	add_test(NAME texture_memo_revalidate
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)

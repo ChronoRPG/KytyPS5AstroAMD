@@ -77,6 +77,13 @@ public:
 	//    not the guest's).
 	enum class HostWriter : uint8_t { LodStats, Occlusion };
 	void NoteHostBackingWrite(uint64_t vaddr, uint64_t size, HostWriter writer) noexcept;
+	// Called right before an emulator write of guest backing bytes (LOD-statistics reports,
+	// occlusion results) on the GPU thread, a completion included. KYTY_HOST_WRITE_TRACKING
+	// (default on): when the range has clean tracked pages and no GPU-owned bytes, it gets the
+	// transition a guest write fault gives it (InvalidateMemory: CPU-dirty and writable, images
+	// invalidated), so the next GPU use uploads the new bytes; otherwise, and with =0, it is only
+	// reported (NoteHostBackingWrite). FrameEvent HostBackingWritesTracked.
+	void PrepareHostBackingWrite(uint64_t vaddr, uint64_t size, HostWriter writer) noexcept;
 	void NoteGuestProtection(uint64_t vaddr, uint64_t size, bool allows_read,
 	                         bool allows_write) noexcept;
 

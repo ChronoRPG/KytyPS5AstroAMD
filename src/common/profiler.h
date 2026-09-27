@@ -882,6 +882,9 @@ enum class FrameEvent : uint32_t {
 	BdaSyncLogOverflows,
 	BdaSyncLogVerifyChecks,
 	BdaSyncLogVerifyMismatches,
+	// KYTY_HOST_WRITE_TRACKING (RenderContext::PrepareHostBackingWrite): emulator writes of guest
+	// bytes that gave their clean tracked pages the transition of a guest write fault.
+	HostBackingWritesTracked,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

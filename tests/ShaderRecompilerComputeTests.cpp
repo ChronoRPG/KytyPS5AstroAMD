@@ -5970,6 +5970,33 @@ public:
       Require(name, "CPU-dirty page", dirty.clean == 0 && dirty.gpu_dirty == 0 &&
                                           dirty.untracked == 0,
               "a CPU-dirty page was reported clean, GPU-dirty or untracked");
+
+      // KYTY_HOST_WRITE_TRACKING: an emulator write on the GPU thread gives a clean tracked page
+      // the transition of a guest write (the next binding uploads it) and leaves a GPU-dirty
+      // page GPU-owned.
+      const char *tracking_setting = std::getenv("KYTY_HOST_WRITE_TRACKING");
+      const bool tracking = tracking_setting == nullptr || std::strcmp(tracking_setting, "0") != 0;
+      Libs::Graphics::BufferCache::PageStates reuploaded{}, host_written{}, host_gpu{}, next{};
+      OnGpuThread(context, [&] {
+        (void)cache.ObtainBuffer(base + clean_offset, 0x8000, false, false);
+        reuploaded = states(clean_offset);
+        const std::array<uint8_t, 248> bytes{0x11, 0x22, 0x33};
+        context.PrepareHostBackingWrite(base + clean_offset, bytes.size(),
+                                        Libs::Graphics::RenderContext::HostWriter::LodStats);
+        (void)Libs::LibKernel::Memory::TryWriteBacking(base + clean_offset, bytes.data(),
+                                                        bytes.size());
+        host_written = states(clean_offset);
+        context.PrepareHostBackingWrite(base + written_offset, 248,
+                                        Libs::Graphics::RenderContext::HostWriter::LodStats);
+        host_gpu = states(written_offset);
+        (void)cache.ObtainBuffer(base + clean_offset, 0x8000, false, false);
+        next = states(clean_offset);
+      });
+      Require(name, "host write tracked",
+              reuploaded.clean == 1 && host_written.clean == (tracking ? 0u : 1u) &&
+                  host_written.gpu_dirty == 0 && host_gpu.gpu_dirty == 1 && next.clean == 1,
+              tracking ? "an emulator write left its clean page clean, or touched a GPU-dirty one"
+                       : "KYTY_HOST_WRITE_TRACKING=0 changed a page's state");
       // Read back the GPU-written range so the context can be torn down.
       cache.ReadMemory(base + written_offset, 0x8000);
       scheduler.Finish();
