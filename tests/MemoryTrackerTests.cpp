@@ -1055,6 +1055,52 @@ void TestFaultMutationEpochWithHotPages() {
   Release(memory);
 }
 
+// KYTY_BDA_DIRTY_LOG (BufferCache::SynchronizeBdaBuffersNow): every transition FaultMutationEpoch()
+// covers also records the range it can make CPU-dirty, and a take returns the ranges with the
+// epoch they account for.
+void TestDirtiedLog() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 4;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  tracker.EnableDirtiedLog();
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 16);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  RangeSet ranges;
+  uint64_t epoch = 0;
+
+  // The region is created (entirely CPU-dirty) by the first upload.
+  UploadAll(tracker, address, page_size * 16);
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && epoch == tracker.FaultMutationEpoch() &&
+            ranges.Contains(address, page_size * 16),
+        "a new region was not logged with the epoch it produced");
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Empty() &&
+            epoch == tracker.FaultMutationEpoch(),
+        "a take without transitions returned ranges or another epoch");
+
+  // A write fault logs its fault-ahead window (pages 4-7 around page 5), nothing else.
+  const auto before = tracker.FaultMutationEpoch();
+  WriteFault(tracker, address + page_size * 5 + 8);
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && epoch != before &&
+            epoch == tracker.FaultMutationEpoch() &&
+            ranges.Contains(address + page_size * 4, page_size * 4) &&
+            !ranges.Intersects(address, page_size * 4) &&
+            !ranges.Intersects(address + page_size * 8, page_size * 8),
+        "a write fault did not log exactly its fault-ahead window");
+
+  // Explicit CPU-dirty marks log their range.
+  UploadAll(tracker, address, page_size * 16);
+  tracker.MarkRegionAsCpuModified(address + page_size * 12, page_size);
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && epoch == tracker.FaultMutationEpoch() &&
+            ranges.Contains(address + page_size * 12, page_size) &&
+            !ranges.Intersects(address, page_size * 12),
+        "an explicit CPU-dirty mark was not logged");
+
+  tracker.UntrackMemory(address, page_size * 16);
+  Release(memory);
+}
+
 void TestForeignWatcherFaultsDoNotPromote() {
   MemoryTracker::FaultPolicy policy;
   policy.hot_frames = 2;
@@ -2169,6 +2215,7 @@ int main(int argc, char **argv) {
   TestHotPagePromotionAndUpload();
   TestHotPageDemotionPaths();
   TestFaultMutationEpochWithHotPages();
+  TestDirtiedLog();
   TestForeignWatcherFaultsDoNotPromote();
   TestWrittenUploadCopiesOutsideLock();
   TestHotPageSettle();

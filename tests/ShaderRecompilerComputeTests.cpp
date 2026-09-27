@@ -222,6 +222,11 @@ struct BufferCacheTestAccess {
   // KYTY_BDA_SYNC_EPOCH.
   static bool BdaEpochSkip(const BufferCache &cache) { return cache.m_bda_epoch_skip; }
   static int BdaEpochVerify(const BufferCache &cache) { return cache.m_bda_epoch_verify; }
+  static bool BdaDirtyLog(const BufferCache &cache) { return cache.m_bda_dirty_log; }
+  static int BdaDirtyLogVerify(const BufferCache &cache) { return cache.m_bda_log_verify; }
+  static BufferCache::BdaLogTotals BdaLogTotals(const BufferCache &cache) {
+    return cache.m_bda_log_totals;
+  }
   static BufferCache::BdaEpochTotals BdaEpochTotals(const BufferCache &cache) {
     return cache.m_bda_epoch_totals;
   }
@@ -5615,25 +5620,51 @@ public:
       // Everything below runs in one GPU-thread command: every service command advances the
       // epoch when it ends, so separate commands would never share one.
       using Totals = decltype(BufferCacheTestAccess::BdaEpochTotals(cache));
-      Totals first{}, skipped{}, advanced{}, restructured{};
+      using LogTotals = decltype(BufferCacheTestAccess::BdaLogTotals(cache));
+      Totals first{}, skipped{}, advanced{}, second{}, restructured{};
+      LogTotals log_first{}, log_advanced{}, log_second{}, log_restructured{};
       OnGpuThread(context, [&] {
         context.PrepareBda();
         first = totals();
+        log_first = BufferCacheTestAccess::BdaLogTotals(cache);
         cpu_write(buffer_offset + 0x100, 0xabcdef01u);
         context.PrepareBda(); // the same epoch: skipped
         skipped = totals();
         SyncEpoch::Advance(); // a fence
         context.PrepareBda();
         advanced = totals();
+        log_advanced = BufferCacheTestAccess::BdaLogTotals(cache);
+        // KYTY_BDA_DIRTY_LOG: another write in another page, in a later epoch, with the buffers
+        // unchanged: a logged pass uploads it.
+        cpu_write(buffer_offset + 0x8100, 0x13572468u);
+        SyncEpoch::Advance();
+        context.PrepareBda();
+        second = totals();
+        log_second = BufferCacheTestAccess::BdaLogTotals(cache);
         (void)cache.ObtainBuffer(base + other_offset, buffer_size, false, false); // new buffer
         context.PrepareBda(); // the same epoch, but the structure moved
         restructured = totals();
+        log_restructured = BufferCacheTestAccess::BdaLogTotals(cache);
       });
+      if (BufferCacheTestAccess::BdaDirtyLog(cache)) {
+        // The first pass is a full scan; the writes before a pass with unchanged buffers are
+        // then synchronized from the log, and the pass after the new buffer is a full scan.
+        Require(name, "logged passes",
+                log_first.passes == 0 && log_advanced.passes >= 1 &&
+                    log_second.passes == log_advanced.passes + 1 &&
+                    log_restructured.passes == log_second.passes && log_second.ranges >= 2 &&
+                    log_restructured.verify_mismatch_pages == 0,
+                "the passes after CPU writes with unchanged buffers did not synchronize from the "
+                "dirtied-range log, or its verify mode found a missed page");
+        Require(name, "logged verify", BufferCacheTestAccess::BdaDirtyLogVerify(cache) == 0 ||
+                    log_restructured.verify_checks == log_restructured.passes,
+                "the dirtied-range log's verify mode did not check every logged pass");
+      }
       if (!(first.passes >= 1 &&
             (skip_on ? skipped.skips == first.skips + 1 && skipped.passes == first.passes
                      : skipped.passes == first.passes + 1) &&
-            advanced.passes == skipped.passes + 1 &&
-            restructured.passes == advanced.passes + 1)) {
+            advanced.passes == skipped.passes + 1 && second.passes == advanced.passes + 1 &&
+            restructured.passes == second.passes + 1)) {
         std::printf("BdaSyncEpoch: skip %d passes %llu/%llu/%llu/%llu skips %llu/%llu/%llu/%llu\n",
                     skip_on ? 1 : 0, static_cast<unsigned long long>(first.passes),
                     static_cast<unsigned long long>(skipped.passes),

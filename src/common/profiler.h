@@ -874,6 +874,14 @@ enum class FrameEvent : uint32_t {
 	// worker copied into the staging ring instead of the command processor, and those bytes.
 	UploadDmaHostCopies,
 	UploadDmaHostCopyBytes,
+	// KYTY_BDA_DIRTY_LOG (bufferCache.h): BDA passes that synchronized only the logged dirtied
+	// ranges (and the recorded hot runs), those ranges, logs that overflowed (a full scan
+	// followed); KYTY_BDA_DIRTY_LOG_VERIFY checks and the CPU-dirty pages a logged pass missed.
+	BdaSyncLogPasses,
+	BdaSyncLogRanges,
+	BdaSyncLogOverflows,
+	BdaSyncLogVerifyChecks,
+	BdaSyncLogVerifyMismatches,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

@@ -248,6 +248,14 @@ private:
 	// KYTY_BDA_HOT_SYNC_VERIFY: the full scan after a hot pass that relied on these epochs.
 	void VerifyBdaHotPass(const RangeSet& mapped_ranges, uint64_t fault_epoch,
 	                      uint64_t structure_epoch);
+	// The full scan a pass that relied on these epochs replaced (it uploads whatever it finds):
+	// the normal CPU-dirty pages it finds while both epochs still hold, which that pass missed.
+	[[nodiscard]] uint64_t VerifyBdaFullScan(const RangeSet& mapped_ranges, uint64_t fault_epoch,
+	                                         uint64_t structure_epoch);
+	// KYTY_BDA_DIRTY_LOG pass (SynchronizeBdaBuffersNow): synchronizes the ranges the tracker
+	// logged since the last pass (m_bda_dirtied) and the recorded hot runs, instead of every
+	// mapped buffer. False (nothing done) when a recorded hot run's buffer is gone.
+	[[nodiscard]] bool SynchronizeBdaDirtied(const RangeSet& mapped_ranges);
 	// The BDA synchronization pass itself (SynchronizeBdaBuffers decides whether it runs).
 	void SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges);
 	// KYTY_BDA_SYNC_EPOCH_VERIFY: the full scan a skipped pass replaced.
@@ -555,7 +563,29 @@ private:
 	// Hot page runs inside the buffers the last full BDA pass scanned (KYTY_BDA_HOT_SYNC; GPU
 	// thread). Valid while the epochs of that pass hold: a page can only become hot through a
 	// write fault, which changes the fault epoch, and buffers only change with the structure one.
+	// Dirty-log passes add the hot runs they find in the logged ranges.
 	std::vector<BdaHotRange>                          m_bda_hot_ranges;
+	// KYTY_BDA_DIRTY_LOG (default on with KYTY_BDA_HOT_SYNC; =0 off). A BDA pass whose structure
+	// epoch is unchanged but whose fault epoch moved synchronizes only the ranges the tracker
+	// logged since the last pass (MemoryTracker::TakeDirtiedRanges, taken with the epoch they
+	// account for) and the recorded hot runs, instead of every mapped buffer. After the last pass
+	// every page of a mapped buffer was clean or hot; one can only have turned CPU-dirty since
+	// through a transition that advanced the fault epoch, and each such transition logged its
+	// range before advancing it, under its region lock and before changing the page's bits. A
+	// full scan runs when the log overflowed, the buffers changed (structure epoch), or no full
+	// scan with the log has run yet (m_bda_log_baseline).
+	bool                                              m_bda_dirty_log    = false;
+	bool                                              m_bda_log_baseline = false;
+	int                                               m_bda_log_verify   = 0;
+	RangeSet                                          m_bda_dirtied;
+	struct BdaLogTotals {
+		uint64_t passes                = 0;
+		uint64_t ranges                = 0;
+		uint64_t overflows             = 0;
+		uint64_t verify_checks         = 0;
+		uint64_t verify_mismatch_pages = 0;
+	};
+	BdaLogTotals                                      m_bda_log_totals;
 	// KYTY_BDA_SYNC_EPOCH (SynchronizeBdaBuffers): the sync, BDA structure and fault epochs taken
 	// before the last completed pass (GPU thread; 0: none yet), and the outcomes (tests read them).
 	bool     m_bda_epoch_skip        = false;

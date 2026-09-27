@@ -92,6 +92,8 @@ public:
 	}
 
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
+	// The number of disjoint ranges.
+	[[nodiscard]] size_t Size() const { return m_ranges.size(); }
 
 private:
 	static uint64_t End(uint64_t address, uint64_t size) {
