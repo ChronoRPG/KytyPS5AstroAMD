@@ -315,6 +315,10 @@ enum class FrameEvent : uint32_t {
 	// with INT_SEL=1, and RELEASE_MEM with INT_SEL=4 and DATA_SEL 1/2/3.
 	EopLabelsIntSel1,
 	ReleaseMemLabelsIntSel4,
+	// CP WRITE_DATA packets recorded on the GPU timeline because their destination was owned by
+	// recorded GPU work (KYTY_WRITE_DATA_GPU), and those written by the CPU at parse time.
+	WriteDataGpu,
+	WriteDataCpu,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

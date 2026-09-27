@@ -1237,6 +1237,44 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	RecordKnownFill(vaddr, size, value);
 }
 
+bool BufferCache::TryWriteDataGpu(uint64_t vaddr, const uint32_t* data, uint64_t size) {
+	if (vaddr == 0 || data == nullptr || size == 0 || (vaddr & 3u) != 0 || (size & 3u) != 0 ||
+	    size > 65536 || !GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	// Only bytes owned by recorded GPU work need ordering on the GPU timeline; everything else
+	// keeps the CPU write (which faults into the usual invalidation when tracked).
+	if (!HasGpuDirtyBytes(vaddr, size) && !HasPendingBackingPublication(vaddr, size)) {
+		return false;
+	}
+	KYTY_GPU_OP_SITE("buffercache.write_data");
+	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	HangTrace::ScopedGpuWriteKind trace_kind(HangTrace::GpuWriteKind::Copy);
+	auto [buffer, offset] = ObtainBuffer(vaddr, size, true, true);
+	auto& command         = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = buffer->Handle();
+	before.offset              = offset;
+	before.size                = size;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+	                       nullptr);
+	native.updateBuffer(buffer->Handle(), offset, size, data);
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1, &after, 0,
+	                       nullptr);
+	return true;
+}
+
 void BufferCache::RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value) {
 	if (size == 0) {
 		return;

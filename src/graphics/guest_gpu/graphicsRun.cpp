@@ -657,6 +657,27 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
+	// KYTY_WRITE_DATA_GPU (default on): a destination owned by recorded-but-unexecuted GPU work is
+	// written on the GPU timeline, after that work, instead of by the CPU now (which drained the
+	// GPU through a fault, or was later overwritten by the GPU data's readback).
+	static const bool gpu_writes = [] {
+		const auto* value = std::getenv("KYTY_WRITE_DATA_GPU");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	if (gpu_writes) {
+		const auto address = reinterpret_cast<uint64_t>(dst);
+		auto&      cache   = m_renderer.GetBufferCache();
+		const bool written =
+		    write_one_address
+		        ? cache.TryWriteDataGpu(address, src + (dw_num - 1u), sizeof(uint32_t))
+		        : cache.TryWriteDataGpu(address, src, uint64_t {dw_num} * sizeof(uint32_t));
+		if (written) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::WriteDataGpu);
+			return;
+		}
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::WriteDataCpu);
+
 	if (write_one_address) {
 		for (uint32_t i = 0; i < dw_num; i++) {
 			dst[0] = src[i];
