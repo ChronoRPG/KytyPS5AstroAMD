@@ -53,6 +53,11 @@ struct GraphicContext {
 	QueueSubmissionBroker              submission_queue;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// Second queue of queue_family for side-copy readbacks (KYTY_SIDE_QUEUE); null when absent,
+	// then side copies share `queue`. Submissions to it hold side_queue_mutex, not queue_mutex.
+	uint32_t                           side_queue_index = 0;
+	vk::Queue                          side_queue       = nullptr;
+	Common::Mutex                      side_queue_mutex;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

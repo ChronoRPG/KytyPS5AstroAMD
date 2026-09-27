@@ -20,6 +20,7 @@ enum HostFloatControlBits : uint32_t {
 };
 
 std::atomic_uint32_t g_host_float_controls {0};
+std::atomic_bool     g_storage_dword_loads_return_zero {false};
 
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
@@ -347,6 +348,16 @@ HostFloatControls GetHostFloatControls() {
 	    .denorm_preserve_f16 = (bits & DenormPreserveF16) != 0u,
 	    .denorm_preserve_f64 = (bits & DenormPreserveF64) != 0u,
 	};
+}
+
+void SetHostBufferRobustness(const HostBufferRobustness& robustness) {
+	g_storage_dword_loads_return_zero.store(robustness.storage_dword_loads_return_zero,
+	                                        std::memory_order_relaxed);
+}
+
+HostBufferRobustness GetHostBufferRobustness() {
+	return {.storage_dword_loads_return_zero =
+	            g_storage_dword_loads_return_zero.load(std::memory_order_relaxed)};
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,

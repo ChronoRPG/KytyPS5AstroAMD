@@ -25,6 +25,9 @@ struct TextureBinding {
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+	// TextureBindingMemo entry (slot, unique tag) whose description `desc` equals; tag 0: none.
+	uint64_t                   memo_tag  = 0;
+	uint32_t                   memo_slot = 0;
 };
 
 struct PreparedBindings {

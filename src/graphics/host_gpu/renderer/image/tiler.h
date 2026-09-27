@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <mutex>
 #include <span>
 #include <vector>
 #include <vk_mem_alloc.h>
@@ -109,6 +110,8 @@ private:
 		vk::Buffer    buffer     = nullptr;
 		VmaAllocation allocation = nullptr;
 		uint64_t      size       = 0;
+		// Allocated capacity (a power-of-two size class when pooled, else size).
+		uint64_t      capacity   = 0;
 	};
 	struct StorageBinding {
 		vk::DescriptorBufferInfo info;
@@ -122,6 +125,7 @@ private:
 	                                             uint64_t alignment, uint64_t max_range,
 	                                             uint32_t max_groups) noexcept;
 	void                          DeferDestroy(Scratch scratch);
+	void                          ReleaseScratch(Scratch scratch);
 	void Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
 	             std::span<const GpuTileInfo> infos, uint64_t source_base, uint64_t target_base,
 	             std::vector<Dispatch>& dispatches);
@@ -142,6 +146,13 @@ private:
 	vk::Pipeline                            m_d24_to_d16  = nullptr;
 	vk::Pipeline                            m_d32_to_d16  = nullptr;
 	vk::Pipeline                            m_swap_bgra16 = nullptr;
+	// Completed scratch buffers kept for reuse (KYTY_TILER_SCRATCH_POOL). Returned by the
+	// deferred completion callback, so a pooled buffer is never in use by the GPU.
+	std::mutex                              m_scratch_mutex;
+	std::vector<Scratch>                    m_scratch_pool;
+	uint64_t                                m_scratch_pool_bytes = 0;
+	uint64_t                                m_scratch_pool_limit = 0;
+	bool                                    m_clear_detile_scratch = false;
 };
 
 } // namespace Libs::Graphics

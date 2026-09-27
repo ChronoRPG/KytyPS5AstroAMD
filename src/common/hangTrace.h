@@ -179,6 +179,7 @@ enum class ImageFreeReason : uint8_t {
 	Unmap,
 	GarbageCollect,
 	PressureCollect,
+	ResidentIdle,
 	Count
 };
 void SetImageFreeReason(ImageFreeReason reason);

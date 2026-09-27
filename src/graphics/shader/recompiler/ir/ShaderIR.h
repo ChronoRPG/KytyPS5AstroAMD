@@ -187,6 +187,23 @@ enum class StageInputKind {
 	LocalInvocationIndex,
 	GlobalInvocationId,
 	Parameter,
+	// Further SPI_PS_INPUT I/J pairs (components 0/1 are I/J).
+	BaryCoordSmoothSample,
+	BaryCoordNoPerspectiveCentroid,
+	BaryCoordNoPerspectiveSample,
+};
+
+// How a V_INTERP_P2 read is interpolated, from the I/J pair it uses (GetAttribute flags).
+// Unknown: the I/J operand is not one of the hardware-provided pairs (or the switch is off); the
+// input keeps the shader-wide interpolation.
+enum class InterpolationMode : uint32_t {
+	Unknown,
+	PerspectiveCenter,
+	PerspectiveCentroid,
+	PerspectiveSample,
+	LinearCenter,
+	LinearCentroid,
+	LinearSample,
 };
 
 enum class StageOutputKind {

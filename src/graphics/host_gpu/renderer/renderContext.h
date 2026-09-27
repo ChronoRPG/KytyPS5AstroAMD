@@ -39,6 +39,9 @@ public:
 	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
 	void                                    ShutdownGpu();
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
+	// Wakes guest queues suspended on external progress (e.g. a completed flip). Any thread;
+	// a no-op before InitializeGpu and after ShutdownGpu has begun.
+	void                                    NotifyGpuProgress();
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
 	Common::Mutex&      GetMutex() { return m_mutex; }
@@ -87,6 +90,9 @@ private:
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;
+	// Guards m_gpu_notify against GPU teardown (NotifyGpuProgress holds it shared).
+	std::shared_mutex         m_gpu_notify_mutex;
+	GuestGpu*                 m_gpu_notify = nullptr;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 
