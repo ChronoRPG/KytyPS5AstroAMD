@@ -6,8 +6,10 @@
 #include "common/common.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/queueSubmission.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorSetReuse.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/textureBindingMemo.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -127,6 +129,12 @@ struct DrawAutoArgs {
 [[nodiscard]] bool BarrierBatchEnabled();
 [[nodiscard]] bool BarrierSinkEnabled();
 [[nodiscard]] bool DrawWriteSinkEnabled();
+// Descriptor commit switches (default on; =0 restores the previous behaviour):
+// KYTY_PUSH_CONSTANT_SHADOW skips push-constant updates identical to the one in effect;
+// KYTY_DESCRIPTOR_SET_REUSE reuses descriptor sets (layouts beyond maxPushDescriptors) written
+// earlier in the same command buffer with the same contents, and skips rebinding the bound set.
+[[nodiscard]] bool PushConstantShadowEnabled();
+[[nodiscard]] bool DescriptorSetReuseEnabled();
 
 // Attribution of batched barrier requests (gpuOpProfiler site of the recorded batch).
 enum class BarrierOrigin : uint32_t {
@@ -201,9 +209,29 @@ public:
 	[[nodiscard]] vk::Pipeline BoundPipeline(vk::PipelineBindPoint point) const {
 		return m_bound_pipelines[point == vk::PipelineBindPoint::eCompute ? 1u : 0u];
 	}
-	void PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
-	                     uint32_t count, const vk::WriteDescriptorSet* writes);
+	// PushDescriptors result: the update was skipped (identical to the one still in effect), there
+	// was nothing comparable (no earlier push in this command buffer for the bind point, another
+	// layout, a bound set, or the dedup is off), or the binding list differs; otherwise the index
+	// of the first write whose descriptors differ.
+	static constexpr int32_t PushAvoided   = -1;
+	static constexpr int32_t PushMissState = -2;
+	static constexpr int32_t PushMissShape = -3;
+	int32_t PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
+	                        uint32_t count, const vk::WriteDescriptorSet* writes);
 	void InvalidateDescriptors(vk::PipelineBindPoint point);
+	// Binds `set` as set 0 unless it is still the set bound there with this layout
+	// (KYTY_DESCRIPTOR_SET_REUSE). Bound sets are disturbed only by another bind or a push
+	// descriptor update of set 0 at that bind point, both of which go through this class.
+	void BindDescriptorSet(vk::PipelineBindPoint point, vk::PipelineLayout layout,
+	                       vk::DescriptorSet set);
+	// Records vkCmdPushConstants(layout, stages, 0, size, data) unless the last update recorded
+	// in this command buffer was exactly this one and no other update can have been recorded
+	// since (KYTY_PUSH_CONSTANT_SHADOW). Other recorders reach the native handle only through
+	// Handle(), which forgets the shadow; InvalidatePushConstants() is for a caller that records
+	// push constants through StateHandle().
+	void PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t size,
+	                   const void* data);
+	void InvalidatePushConstants() const { m_push_constants.valid = false; }
 
 	// Native handle for recording any command. Records pending batched barriers first.
 	[[nodiscard]] vk::CommandBuffer Handle() const;
@@ -276,11 +304,21 @@ private:
 	std::array<vk::Pipeline, 2> m_bound_pipelines {};
 	struct DescriptorState {
 		vk::PipelineLayout layout = nullptr;
+		// Non-null: set 0 is this bound descriptor set (the push contents below are unused).
+		vk::DescriptorSet bound_set = nullptr;
 		std::vector<vk::WriteDescriptorSet> writes;
 		std::vector<vk::DescriptorBufferInfo> buffers;
 		std::vector<vk::DescriptorImageInfo> images;
 	};
 	std::array<DescriptorState, 2> m_descriptor_states;
+	struct PushConstantShadow {
+		bool                     valid  = false;
+		vk::PipelineLayout       layout = nullptr;
+		vk::ShaderStageFlags     stages;
+		uint32_t                 size = 0;
+		std::array<uint32_t, 64> dwords {};
+	};
+	mutable PushConstantShadow m_push_constants;
 
 	// Barrier batcher state (see BarrierBatchEnabled()). Owned by the recording producer.
 	mutable PendingBarriers m_pending;
@@ -401,7 +439,12 @@ private:
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
-	[[nodiscard]] vk::DescriptorBufferInfo UploadShaderData(std::span<const uint32_t> data);
+	// `site` names the caller's stage and table kind; it only selects the entry checked first.
+	[[nodiscard]] vk::DescriptorBufferInfo UploadShaderData(std::span<const uint32_t> data,
+	                                                        uint32_t                  site);
+	// Descriptor set for a layout beyond maxPushDescriptors: reused or written, then bound.
+	void CommitDescriptorSet(CommandBuffer& buffer, vk::PipelineBindPoint point,
+	                         const PipelineCache::Pipeline& pipeline);
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
@@ -428,6 +471,12 @@ private:
 		std::vector<uint32_t> words;
 	};
 	std::array<ShaderUploadEntry, 64> m_shader_uploads;
+	// KYTY_UPLOAD_DEDUP: same-tick content dedup of shader-data/flattened-SRT uploads, and the
+	// entry each upload site filled or matched last (checked before hashing).
+	std::array<ShaderUploadEntry, 256> m_upload_dedup;
+	std::array<uint32_t, 32>           m_upload_last_slot {};
+	// KYTY_DESCRIPTOR_SET_REUSE: sets written earlier in the current command buffer.
+	DescriptorSetReuse m_descriptor_set_reuse;
 	// Rendering instance begun right after the last indirect-argument barrier. Buffer writes
 	// are recorded outside rendering, or end it (shader-write barrier), so while this instance
 	// stays active the barrier still covers every argument write.
@@ -459,6 +508,8 @@ private:
 		TextureCache::ImageDesc desc;
 	};
 	std::array<TextureDescriptionEntry, 4096> m_texture_descriptions;
+	// KYTY_TEXTURE_BINDING_MEMO: (T# dwords, resource) -> resolved image, description and view.
+	TextureBindingMemo m_texture_memo;
 	// KYTY_SAMPLER_MEMO: final sampler dwords -> native sampler. The sampler cache never evicts,
 	// so a remembered handle stays the one GetSampler returns for those dwords.
 	struct SamplerMemoEntry {

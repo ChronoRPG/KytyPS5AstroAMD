@@ -369,6 +369,55 @@ enum class FrameEvent : uint32_t {
 	// AgcSuspendPoint calls in bounded mode (KYTY_AGC_DONE_MODE) that had to wait for the previous
 	// frame's submissions.
 	AgcDoneBoundedWaits,
+	// Texture binding identity memo (KYTY_TEXTURE_BINDING_MEMO, pipeline/textureBindingMemo.h).
+	// ResolveTexture answered from an entry (Hits), with no entry for the key (Misses), or with an
+	// entry that a texture-cache structure change or the image's live state ruled out (Stale: new
+	// page version, stencil association, pending rebind, residency extension needed, alias
+	// partner not owned). Full resolutions recorded (Fills) or not memoizable (Rejects:
+	// overlap/rebased answers, DCC, stencil redirect, non-first-page lookup). Sampled views
+	// answered from an entry (ViewHits) or by FindTexture after the entry could not be used
+	// (ViewMisses: first use, dirty/untracked/under-resident image). Hits whose binding already
+	// held the description (DescCopiesAvoided). StructureChanges: registrations,
+	// unregistrations and stencil associations (each bumps the versions of the pages it covers).
+	TextureBindingMemoHits,
+	TextureBindingMemoMisses,
+	TextureBindingMemoStale,
+	TextureBindingMemoFills,
+	TextureBindingMemoRejects,
+	TextureViewMemoHits,
+	TextureViewMemoMisses,
+	TextureBindingDescCopiesAvoided,
+	TextureCacheStructureChanges,
+	// Descriptor commit. Renderer pipeline layouts created, and pipelines that received an
+	// existing interned layout (KYTY_LAYOUT_INTERN, pipeline/pipelineLayoutCache.h).
+	PipelineLayoutsCreated,
+	PipelineLayoutsShared,
+	// vkCmdPushConstants recorded by descriptor commits, and identical updates skipped by the
+	// per-command-buffer shadow (KYTY_PUSH_CONSTANT_SHADOW).
+	PushConstantUpdates,
+	PushConstantUpdatesAvoided,
+	// Push-descriptor updates recorded (DescriptorPushesAvoided counts the skipped ones) and, for
+	// renderer commits, why an update was needed: no comparable earlier update in this command
+	// buffer for the bind point, or another layout (Layout); a different binding list (Shape); or
+	// the kind of the first descriptor that differs: image, sampler, guest storage buffer, per-draw
+	// upload (flattened SRT or shader data), other (GDS, BDA page table, fault buffer, mip stats).
+	DescriptorPushes,
+	DescriptorPushMissLayout,
+	DescriptorPushMissShape,
+	DescriptorPushMissImage,
+	DescriptorPushMissSampler,
+	DescriptorPushMissBuffer,
+	DescriptorPushMissUpload,
+	DescriptorPushMissOther,
+	// Layouts beyond maxPushDescriptors (KYTY_DESCRIPTOR_SET_REUSE): sets allocated and written,
+	// sets reused because this command buffer already wrote one with the same layout and
+	// contents, and binds skipped because that set was still bound.
+	DescriptorSetsWritten,
+	DescriptorSetsReused,
+	DescriptorSetBindsAvoided,
+	// Per-draw shader-data/flattened-SRT uploads answered by the previous upload of the same stage
+	// slot and kind before hashing (KYTY_UPLOAD_DEDUP); also counted in ShaderUploadReuseHits.
+	ShaderUploadLastHits,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

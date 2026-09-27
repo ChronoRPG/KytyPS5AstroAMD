@@ -35,6 +35,7 @@ class CommandScheduler;
 class DccClearHelper;
 class RenderExecutor;
 class StagingCopier;
+class TextureBindingMemo;
 struct TextureCacheTestAccess;
 
 class TextureCache {
@@ -327,10 +328,36 @@ private:
 	// KYTY_TEXEL_SYNC_SKIP=0 downloads image contents for every texel-buffer read.
 	bool                                     m_texel_sync_skip = true;
 	[[nodiscard]] StreamBuffer& StagingRing();
+	// Structural generations for TextureBindingMemo (pipeline/textureBindingMemo.h), one per
+	// ImagePageTable page: NoteStructureChange(image) bumps every page the image's registered
+	// range covers. Called by RegisterImage and UnregisterImage (every change of a page's owner
+	// list or of an image's registered flag, i.e. whenever FindImage's first-page lookup on that
+	// page may answer differently) and when a stencil association is attached. Changing a
+	// registered image's SameBacking fields (address, size, extent, resources, samples, block
+	// size, tile mode, format, type) in place must call it too. Caller holds m_lock.
+	std::unique_ptr<uint64_t[]> m_page_versions;
+	void NoteStructureChange(const Image& image) {
+		ImagePageTable::PageRange pages {};
+		if (!ImagePageTable::TryGetPageRange(image.live.address, image.live.size, pages)) {
+			return;
+		}
+		if (!m_page_versions) {
+			m_page_versions = std::make_unique<uint64_t[]>(
+			    size_t {1} << (ImagePageTable::kAddressSpaceBits - ImagePageTable::kPageBits));
+		}
+		for (auto page = pages.first; page < pages.last_exclusive; ++page) {
+			++m_page_versions[page];
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureCacheStructureChanges);
+	}
+	[[nodiscard]] uint64_t PageVersion(uint64_t page) const noexcept {
+		return m_page_versions ? m_page_versions[page] : 0;
+	}
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
+	friend class TextureBindingMemo;
 };
 
 } // namespace Libs::Graphics
