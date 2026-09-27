@@ -751,6 +751,21 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-epoch-only)
 	set_tests_properties(bda_sync_epoch_off PROPERTIES
 		ENVIRONMENT "KYTY_BDA_SYNC_EPOCH=0")
+	# KYTY_BINDING_EPOCH_MEMO: default, verify mode, off, and off through KYTY_SYNC_EPOCH=0.
+	add_test(NAME binding_epoch_memo
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-epoch-memo-only)
+	add_test(NAME binding_epoch_memo_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-epoch-memo-only)
+	set_tests_properties(binding_epoch_memo_verify PROPERTIES
+		ENVIRONMENT "KYTY_BINDING_EPOCH_MEMO_VERIFY=exit")
+	add_test(NAME binding_epoch_memo_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-epoch-memo-only)
+	set_tests_properties(binding_epoch_memo_off PROPERTIES
+		ENVIRONMENT "KYTY_BINDING_EPOCH_MEMO=0")
+	add_test(NAME binding_epoch_memo_no_sync_epoch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-epoch-memo-only)
+	set_tests_properties(binding_epoch_memo_no_sync_epoch PROPERTIES
+		ENVIRONMENT "KYTY_SYNC_EPOCH=0")
 	# KYTY_TEXTURE_MEMO_REVALIDATE: default, verify mode, off.
 	add_test(NAME texture_memo_revalidate
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)
@@ -790,7 +805,7 @@ if(BUILD_TESTING)
 	add_test(NAME draw_prep_engine_parallel_inplace_verify
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_inplace_verify PROPERTIES
-		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE_VERIFY=exit;KYTY_DRAW_PREP_LOCKFREE_HINT_VERIFY=exit;KYTY_TRACKER_RELAXED_VERIFY=exit")
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE_VERIFY=exit;KYTY_DRAW_PREP_LOCKFREE_HINT_VERIFY=exit;KYTY_TRACKER_RELAXED_VERIFY=exit;KYTY_BINDING_EPOCH_MEMO_VERIFY=exit")
 	add_test(NAME draw_prep_engine_parallel_copied
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_copied PROPERTIES

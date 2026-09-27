@@ -763,6 +763,14 @@ enum class FrameEvent : uint32_t {
 	BdaSyncEpochSkips,
 	BdaSyncEpochVerifyChecks,
 	BdaSyncEpochVerifyMismatches,
+	// KYTY_BINDING_EPOCH_MEMO: read bindings reused within a sync epoch (a stream copy or a cache
+	// buffer), results recorded, and the verify mode's checks, mismatches and races.
+	BindingEpochMemoStreamHits,
+	BindingEpochMemoCachedHits,
+	BindingEpochMemoRecords,
+	BindingEpochMemoVerifyChecks,
+	BindingEpochMemoVerifyMismatches,
+	BindingEpochMemoVerifyRaces,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

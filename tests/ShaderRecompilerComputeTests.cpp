@@ -223,6 +223,14 @@ struct BufferCacheTestAccess {
   static BufferCache::BdaEpochTotals BdaEpochTotals(const BufferCache &cache) {
     return cache.m_bda_epoch_totals;
   }
+  // KYTY_BINDING_EPOCH_MEMO.
+  static bool BindingMemoEnabled(const BufferCache &cache) {
+    return cache.m_binding_memo != nullptr;
+  }
+  static int BindingMemoVerify(const BufferCache &cache) { return cache.m_binding_memo_verify; }
+  static BufferCache::BindingMemoTotals BindingMemoTotals(const BufferCache &cache) {
+    return cache.m_binding_memo_totals;
+  }
 };
 
 // Sets (or with nullptr removes) an environment switch read when a cache is constructed.
@@ -5619,6 +5627,203 @@ public:
                 BufferCacheTestAccess::BdaEpochSkip(context.GetBufferCache()) ? "on" : "off",
                 BufferCacheTestAccess::BdaEpochVerify(context.GetBufferCache()) != 0 ? "on"
                                                                                        : "off");
+  }
+
+  // KYTY_BINDING_EPOCH_MEMO: a read binding's result (a stream copy or a cache buffer and offset)
+  // is reused within a sync epoch while the range's tracker state, the buffer structure and, for a
+  // stream copy, the stream tick hold. A guest write within the epoch races the draws: the reused
+  // copy keeps the bytes from before it (verify mode: the normal path's fresh copy, counted as a
+  // race); the next epoch copies them. A GPU write, a write fault, a buffer join or a new tick in
+  // between makes the next binding take the normal path.
+  void CheckBindingEpochMemo() {
+    constexpr const char *name = "BindingEpochMemo";
+    constexpr uintptr_t base = 0x0000000207400000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t small_offset = 0x10000; // stream copies, then GPU-written
+    constexpr uint64_t small_size = 0x100;
+    constexpr uint64_t large_offset = 0x40000; // a cache buffer (above CACHING_PAGESIZE)
+    constexpr uint64_t large_size = 0x8000;
+    constexpr uint64_t grow_offset = 0x3c000; // overlaps the large range: a join
+    constexpr uint64_t grow_size = 0x10000;
+    static_assert(small_size <= BufferCache::CACHING_PAGESIZE &&
+                  large_size > BufferCache::CACHING_PAGESIZE);
+
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "binding-memo direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "binding-memo fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    for (uint64_t index = 0; index < allocation_size; index++) {
+      memory[index] = static_cast<uint8_t>((index * 37 + index / 4096) & 0xffu);
+    }
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const bool memo_on = BufferCacheTestAccess::BindingMemoEnabled(cache);
+      const int verify = BufferCacheTestAccess::BindingMemoVerify(cache);
+      // Hits return the recorded result; in verify mode the normal path's.
+      const bool reuse = memo_on && verify == 0;
+      const auto totals = [&] { return BufferCacheTestAccess::BindingMemoTotals(cache); };
+      auto &stream = cache.GetUtilityBuffer(Libs::Graphics::MemoryUsage::Stream);
+      const auto read_native = [&](const Libs::Graphics::Buffer &buffer, uint64_t offset,
+                                   uint64_t bytes) {
+        auto readback = CreateHostBuffer(name, bytes, vk::BufferUsageFlagBits::eTransferDst, {0});
+        const vk::BufferCopy copy{offset, 0, bytes};
+        scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                                     vk::PipelineStageFlagBits::eHost, {}, 0,
+                                                     nullptr, 1, &barrier, 0, nullptr);
+        scheduler.Finish();
+        auto words = ReadBuffer(name, readback, static_cast<uint32_t>(bytes / 4));
+        DestroyBuffer(&readback);
+        return words;
+      };
+      const auto cpu_write = [&](uint64_t offset, uint32_t value) {
+        Require(name, "write fault",
+                context.HandleFault(PageFaultAccess::Write, base + offset),
+                "a CPU write to a tracked page did not fault through the tracker");
+        std::memcpy(memory + offset, &value, sizeof(value));
+      };
+      using Binding = std::pair<Libs::Graphics::Buffer *, uint64_t>;
+      const auto bind = [&](uint64_t offset, uint64_t size) {
+        return cache.ObtainBuffer(base + offset, size, false, false);
+      };
+      const auto copied = [&](const Binding &binding) {
+        return binding.first == &stream &&
+               std::memcmp(stream.Mapped().data() + binding.second, memory + small_offset,
+                           small_size) == 0;
+      };
+      using Totals = decltype(BufferCacheTestAccess::BindingMemoTotals(cache));
+      Binding joined{};
+      // Everything below runs in one GPU-thread command: every service command advances the
+      // epoch when it ends, so separate commands would never share one.
+      OnGpuThread(context, [&] {
+        // A stream copy: the first binding creates the tracker region (not recorded), the second
+        // is recorded, the third reuses it.
+        (void)bind(small_offset, small_size);
+        const auto first = bind(small_offset, small_size);
+        const Totals recorded = totals();
+        const auto again = bind(small_offset, small_size);
+        Require(name, "stream copy reuse",
+                copied(first) && copied(again) &&
+                    (!memo_on || totals().stream_hits == recorded.stream_hits + 1) &&
+                    (!reuse || again == first),
+                "a repeated stream-copy binding in one epoch was not reused, or lost its bytes");
+
+        // A guest write within the epoch (the page is CPU-dirty, so no fault) races the draws.
+        memory[small_offset + 5] ^= 0xffu;
+        const Totals before_race = totals();
+        const auto racing = bind(small_offset, small_size);
+        Require(name, "guest write within the epoch",
+                racing.first == &stream &&
+                    (reuse ? racing == first && !copied(racing) : copied(racing)) &&
+                    (verify == 0 || totals().verify_races == before_race.verify_races + 1),
+                "a binding after a racing guest write did not keep the epoch's copy (or, in "
+                "verify mode, copy the new bytes and count a race)");
+
+        // The next epoch copies the new bytes.
+        SyncEpoch::Advance();
+        const auto next_epoch = bind(small_offset, small_size);
+        Require(name, "next epoch copies", copied(next_epoch) && next_epoch != first,
+                "the first binding of the next epoch did not copy the current bytes");
+        (void)bind(small_offset, small_size);
+
+        // A new tick (the ring may reuse older allocations) copies again.
+        scheduler.Flush();
+        const Totals before_tick = totals();
+        const auto next_tick = bind(small_offset, small_size);
+        Require(name, "next tick copies",
+                copied(next_tick) && totals().stream_hits == before_tick.stream_hits,
+                "a stream copy of an earlier tick was reused");
+
+        // A GPU write in between (a writable binding of the range) makes the next read bind the
+        // written cache buffer instead of the stale copy.
+        (void)bind(small_offset, small_size);
+        const auto written = cache.ObtainBuffer(base + small_offset, small_size, true, false);
+        const auto after_write = bind(small_offset, small_size);
+        Require(name, "GPU write ends the copy",
+                written.first != &stream && after_write == written,
+                "a read binding after a GPU write did not bind the written buffer");
+
+        // A cache buffer: recorded after its upload, then reused.
+        const auto large = bind(large_offset, large_size);
+        const Totals large_recorded = totals();
+        const auto large_again = bind(large_offset, large_size);
+        Require(name, "cache buffer reuse",
+                large.first != &stream && large_again == large &&
+                    (!memo_on || totals().cached_hits == large_recorded.cached_hits + 1),
+                "a repeated cache-buffer binding in one epoch was not reused");
+
+        // A write fault moves the range's signature: the next binding uploads it.
+        cpu_write(large_offset + 0x100, 0x5a5aa5a5u);
+        const Totals before_fault = totals();
+        const auto after_fault = bind(large_offset, large_size);
+        Require(name, "write fault ends the reuse",
+                after_fault == large && totals().cached_hits == before_fault.cached_hits,
+                "a binding after a write fault was reused");
+
+        // A join replaces the buffer: the structure moved, so the next binding finds the new one.
+        const auto grow = bind(grow_offset, grow_size);
+        const Totals before_join = totals();
+        joined = bind(large_offset, large_size);
+        Require(name, "join ends the reuse",
+                joined.first == grow.first &&
+                    joined.second == grow.second + (large_offset - grow_offset) &&
+                    joined.first != large.first &&
+                    totals().cached_hits == before_join.cached_hits,
+                "a binding after its buffer was joined into another was reused");
+      });
+      const auto words = read_native(*joined.first, joined.second, large_size);
+      Require(name, "joined bytes",
+              std::memcmp(words.data(), memory + large_offset, large_size) == 0,
+              "the joined buffer lost the uploaded write");
+      Require(name, "verify agrees", totals().verify_mismatches == 0,
+              "the verify mode found a hit the normal path disagrees with");
+      Require(name, "memo state", memo_on == (totals().records != 0),
+              "the memo recorded nothing although enabled, or recorded while disabled");
+      scheduler.Finish();
+      context.UnmapMemory(base, allocation_size);
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "binding-memo direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "binding-memo direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok (memo %s, verify %s)\n", name,
+                BufferCacheTestAccess::BindingMemoEnabled(context.GetBufferCache()) ? "on" : "off",
+                BufferCacheTestAccess::BindingMemoVerify(context.GetBufferCache()) != 0 ? "on"
+                                                                                          : "off");
   }
 
   void CheckComputeMetaClearClassification() {
@@ -38390,6 +38595,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBdaSyncEpoch();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--binding-epoch-memo-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBindingEpochMemo();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--texture-memo-revalidate-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTextureMemoRevalidation();
@@ -38618,6 +38828,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBufferCacheDirtyGarbageCollection();
   vulkan.CheckBufferRangeMemo();
   vulkan.CheckBdaSyncEpoch();
+  vulkan.CheckBindingEpochMemo();
   vulkan.CheckEagerReadback();
 #endif
   vulkan.CheckUnifiedImageViewCache();

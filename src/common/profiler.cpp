@@ -467,6 +467,12 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.BdaSyncEpochSkips.Cumulative",
     "FrameEvent.BdaSyncEpochVerifyChecks.Cumulative",
     "FrameEvent.BdaSyncEpochVerifyMismatches.Cumulative",
+    "FrameEvent.BindingEpochMemoStreamHits.Cumulative",
+    "FrameEvent.BindingEpochMemoCachedHits.Cumulative",
+    "FrameEvent.BindingEpochMemoRecords.Cumulative",
+    "FrameEvent.BindingEpochMemoVerifyChecks.Cumulative",
+    "FrameEvent.BindingEpochMemoVerifyMismatches.Cumulative",
+    "FrameEvent.BindingEpochMemoVerifyRaces.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 

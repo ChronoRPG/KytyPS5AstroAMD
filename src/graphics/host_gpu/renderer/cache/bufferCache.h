@@ -296,6 +296,61 @@ private:
 	bool VerifyRelaxedSnapshot(uint64_t vaddr, uint64_t size,
 	                           const MemoryTracker::DirtyState& relaxed,
 	                           const MemoryTracker::DirtyState& locked, uint64_t signature);
+	// KYTY_BINDING_EPOCH_MEMO (default on; =0 off; off with KYTY_SYNC_EPOCH=0). The result of a read
+	// binding (ObtainBuffer: not written, not a texel read; GPU thread) of [vaddr, vaddr + size) is
+	// reused by later read bindings of exactly that range while
+	//  - the sync epoch is the one it was obtained in (syncEpoch.h): a guest CPU write since then
+	//    races the draws, which may read the bytes from before it or after it;
+	//  - the range's MemoryTracker::RangeSignature is unchanged: no tracker transition in the
+	//    range's regions (uploads, GPU-dirty marks, readbacks, hot-page changes, write faults), so
+	//    every tracker bit the binding's decision and synchronization read is the same;
+	//  - a cache-buffer result: the buffer structure is unchanged (m_bda_structure_epoch moves on
+	//    every Register/Unregister), so the range is in the same buffer at the same offset. It is
+	//    recorded with the signature taken after its synchronization, and for a small read only
+	//    when the tracker bits then do not make the next one a stream copy. Pages that
+	//    synchronization would upload now are hot pages written since, or pages a guest write
+	//    fault dirtied before the signature was taken: guest writes racing the draws;
+	//  - a stream copy: the signature is the one taken before the decision and after the copy, and
+	//    the stream buffer's tick is the one it was copied in (the ring never overwrites an
+	//    allocation during its tick). Bytes written since race the draws.
+	// A hit returns the same buffer and offset (touching a cache buffer's LRU entry): no dirty
+	// query, page-table lookup, synchronization or stream copy. Every ordered change within an
+	// epoch is a GPU-thread tracker transition or buffer registration; the emulator's own writes
+	// of guest bytes (labels, WRITE_DATA, DMA, LOD and occlusion results) happen in fence packets,
+	// which start a new epoch first, or complete asynchronously like GPU writes.
+	// KYTY_BINDING_EPOCH_MEMO_VERIFY=1|exit: every hit also runs the normal path and returns its
+	// result. A different decision (a stream copy against a cache buffer) or a different buffer or
+	// offset while no tracker transition raced the check is a mismatch (exit stops on the first);
+	// a stream copy whose bytes changed, or a cache-buffer range with CPU-dirty pages the normal
+	// path uploads, counts as a race (BindingEpochMemoVerifyRaces).
+	enum class BindingMemoKind : uint8_t { Empty, Stream, Cached };
+	struct BindingMemo {
+		uint64_t        vaddr     = 0;
+		uint64_t        size      = 0;
+		uint64_t        epoch     = 0;
+		uint64_t        signature = 0;
+		uint64_t        guard     = 0; // stream: tick; cached: buffer structure epoch
+		uint64_t        offset    = 0;
+		BufferId        id;
+		BindingMemoKind kind = BindingMemoKind::Empty;
+	};
+	static constexpr size_t BindingMemoSlots = 2048;
+	[[nodiscard]] BindingMemo& BindingMemoSlot(uint64_t vaddr, uint64_t size) noexcept {
+		const auto hash = (vaddr >> 4u) * 0x9e3779b97f4a7c15ull ^ size * 0xc2b2ae3d27d4eb4full;
+		return m_binding_memo[static_cast<size_t>(hash >> 53u) & (BindingMemoSlots - 1)];
+	}
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainReadBinding(uint64_t vaddr, uint64_t size,
+	                                                             BufferId id);
+	// The binding without the memo; *obtained receives the cache buffer's id (unchanged for a
+	// stream copy).
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferNow(uint64_t vaddr, uint64_t size,
+	                                                           bool is_written, bool is_texel_buffer,
+	                                                           BufferId id, BufferId* obtained);
+	void RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, uint64_t before,
+	                   const std::pair<Buffer*, uint64_t>& result, BufferId id);
+	[[nodiscard]] std::pair<Buffer*, uint64_t> VerifyBindingHit(const BindingMemo& memo,
+	                                                            std::pair<Buffer*, uint64_t> hit,
+	                                                            BufferId id);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size, size_t guest_copies = SIZE_MAX,
 	                                      const uint8_t* host_data = nullptr,
@@ -445,6 +500,18 @@ private:
 	};
 	RelaxedTotals                                     m_relaxed_totals;
 	bool                                              m_relaxed_queries = false;
+	// KYTY_BINDING_EPOCH_MEMO (nullptr when disabled; GPU thread) and its outcomes (tests read them).
+	std::unique_ptr<BindingMemo[]>                    m_binding_memo;
+	int                                               m_binding_memo_verify = 0;
+	struct BindingMemoTotals {
+		uint64_t stream_hits       = 0;
+		uint64_t cached_hits       = 0;
+		uint64_t records           = 0;
+		uint64_t verify_checks     = 0;
+		uint64_t verify_mismatches = 0;
+		uint64_t verify_races      = 0;
+	};
+	BindingMemoTotals                                 m_binding_memo_totals;
 	uint32_t                                          m_upload_batch_depth = 0;
 	uint32_t                                          m_hot_sweep_frame  = 0;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};
