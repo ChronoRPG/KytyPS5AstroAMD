@@ -6,8 +6,10 @@
 #include "common/common.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/queueSubmission.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorSetReuse.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/textureBindingMemo.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -37,6 +39,11 @@ struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
+
+namespace DrawPrep {
+struct PreparedDraw;
+class Engine;
+} // namespace DrawPrep
 
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
@@ -124,9 +131,21 @@ struct DrawAutoArgs {
 // partial flushes and cache actions become Guest requests, which are never sunk this way), so
 // draws of one instance may overlap as they do on the hardware. Every non-draw consumer is still
 // ordered after the writes. KYTY_DRAW_WRITE_SINK=0 ends the instance after such draws again.
+// KYTY_UPLOAD_BATCH (default on, needs the batcher): CPU-dirty buffer uploads are queued with
+// CommandBuffer::RequestUploadCopy and recorded at the next flush point as ONE barrier for all
+// destination buffers, the copies, and their post-copy barriers merged into the batch being
+// flushed (see CommandBuffer::RecordPendingUploads). KYTY_UPLOAD_BATCH=0 records each upload with
+// its own EndRendering and barrier pair.
 [[nodiscard]] bool BarrierBatchEnabled();
 [[nodiscard]] bool BarrierSinkEnabled();
 [[nodiscard]] bool DrawWriteSinkEnabled();
+// Descriptor commit switches (default on; =0 restores the previous behaviour):
+// KYTY_PUSH_CONSTANT_SHADOW skips push-constant updates identical to the one in effect;
+// KYTY_DESCRIPTOR_SET_REUSE reuses descriptor sets (layouts beyond maxPushDescriptors) written
+// earlier in the same command buffer with the same contents, and skips rebinding the bound set.
+[[nodiscard]] bool PushConstantShadowEnabled();
+[[nodiscard]] bool DescriptorSetReuseEnabled();
+[[nodiscard]] bool UploadBatchEnabled();
 
 // Attribution of batched barrier requests (gpuOpProfiler site of the recorded batch).
 enum class BarrierOrigin : uint32_t {
@@ -137,6 +156,7 @@ enum class BarrierOrigin : uint32_t {
 	IndirectArgs,      // shader/transfer writes -> indirect command fetch
 	Gds,               // GDS buffer -> shader stages
 	Image,             // Image::Transit layout/access transitions
+	Upload,            // after queued buffer uploads: copy writes -> everything later
 	Count,
 };
 
@@ -168,6 +188,15 @@ public:
 	// batch (with these barriers) is recorded immediately.
 	[[nodiscard]] bool BatchImageBarriers(std::span<const vk::ImageMemoryBarrier2> barriers,
 	                                      vk::CommandBuffer target, bool deferrable) const;
+	// Queues a copy of CPU-dirty guest data from a staging `source` into `destination`, recorded
+	// at the next flush point (Handle(), BeginRendering(), End(), FlushBarriers()) after one
+	// barrier ordering every earlier access of the destination buffers before the queued copies;
+	// the copies' writes are then ordered before everything later by buffer barriers merged into
+	// the batch flushed with them. A request whose regions overlap a queued copy into the same
+	// buffer records the queue first (copies in one batch are unordered). Requires
+	// UploadBatchEnabled(); the source must stay valid for this command buffer.
+	void RequestUploadCopy(vk::Buffer source, vk::Buffer destination,
+	                       std::span<const vk::BufferCopy> regions) const;
 	// Records the pending batch now (no-op when empty).
 	void FlushBarriers() const;
 
@@ -201,9 +230,29 @@ public:
 	[[nodiscard]] vk::Pipeline BoundPipeline(vk::PipelineBindPoint point) const {
 		return m_bound_pipelines[point == vk::PipelineBindPoint::eCompute ? 1u : 0u];
 	}
-	void PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
-	                     uint32_t count, const vk::WriteDescriptorSet* writes);
+	// PushDescriptors result: the update was skipped (identical to the one still in effect), there
+	// was nothing comparable (no earlier push in this command buffer for the bind point, another
+	// layout, a bound set, or the dedup is off), or the binding list differs; otherwise the index
+	// of the first write whose descriptors differ.
+	static constexpr int32_t PushAvoided   = -1;
+	static constexpr int32_t PushMissState = -2;
+	static constexpr int32_t PushMissShape = -3;
+	int32_t PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
+	                        uint32_t count, const vk::WriteDescriptorSet* writes);
 	void InvalidateDescriptors(vk::PipelineBindPoint point);
+	// Binds `set` as set 0 unless it is still the set bound there with this layout
+	// (KYTY_DESCRIPTOR_SET_REUSE). Bound sets are disturbed only by another bind or a push
+	// descriptor update of set 0 at that bind point, both of which go through this class.
+	void BindDescriptorSet(vk::PipelineBindPoint point, vk::PipelineLayout layout,
+	                       vk::DescriptorSet set);
+	// Records vkCmdPushConstants(layout, stages, 0, size, data) unless the last update recorded
+	// in this command buffer was exactly this one and no other update can have been recorded
+	// since (KYTY_PUSH_CONSTANT_SHADOW). Other recorders reach the native handle only through
+	// Handle(), which forgets the shadow; InvalidatePushConstants() is for a caller that records
+	// push constants through StateHandle().
+	void PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t size,
+	                   const void* data);
+	void InvalidatePushConstants() const { m_push_constants.valid = false; }
 
 	// Native handle for recording any command. Records pending batched barriers first.
 	[[nodiscard]] vk::CommandBuffer Handle() const;
@@ -213,9 +262,10 @@ public:
 	[[nodiscard]] vk::CommandBuffer StateHandle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
-	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
-	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
-	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
+	// Read-only: a committed draw-prep draw points these at its register snapshot.
+	[[nodiscard]] const HW::Context&    GetRegisters() const noexcept { return *m_registers; }
+	[[nodiscard]] const HW::UserConfig& GetUserConfig() const noexcept { return *m_user_config; }
+	[[nodiscard]] const HW::Shader&     GetShaders() const noexcept { return *m_shaders; }
 
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
@@ -228,24 +278,37 @@ private:
 	void Begin();
 	void End() const;
 
+	struct PendingUpload {
+		vk::Buffer source;
+		vk::Buffer destination;
+		uint32_t   first_region = 0;
+		uint32_t   region_count = 0;
+	};
 	struct PendingBarriers {
 		vk::MemoryBarrier2                    memory;
 		bool                                  has_memory = false;
 		std::vector<vk::ImageMemoryBarrier2>  images;
 		std::vector<vk::BufferMemoryBarrier2> buffers;
+		// Queued upload copies (RequestUploadCopy), recorded first when the batch is flushed.
+		std::vector<PendingUpload>  uploads;
+		std::vector<vk::BufferCopy> upload_regions;
 		uint32_t                              origins = 0; // bit per BarrierOrigin
 
 		[[nodiscard]] bool Empty() const {
-			return !has_memory && images.empty() && buffers.empty();
+			return !has_memory && images.empty() && buffers.empty() && uploads.empty();
 		}
 		void Clear() {
 			has_memory = false;
 			memory     = vk::MemoryBarrier2 {};
 			images.clear();
 			buffers.clear();
+			uploads.clear();
+			upload_regions.clear();
 			origins = 0;
 		}
 	};
+	// Records the queued upload copies behind one barrier and queues their post-copy barriers.
+	void RecordPendingUploads() const;
 	// Every native command other than the batch itself and the rendering bookkeeping below.
 	void NoteForeignCommand() const {
 		m_recorded_since_flush = true;
@@ -276,11 +339,21 @@ private:
 	std::array<vk::Pipeline, 2> m_bound_pipelines {};
 	struct DescriptorState {
 		vk::PipelineLayout layout = nullptr;
+		// Non-null: set 0 is this bound descriptor set (the push contents below are unused).
+		vk::DescriptorSet bound_set = nullptr;
 		std::vector<vk::WriteDescriptorSet> writes;
 		std::vector<vk::DescriptorBufferInfo> buffers;
 		std::vector<vk::DescriptorImageInfo> images;
 	};
 	std::array<DescriptorState, 2> m_descriptor_states;
+	struct PushConstantShadow {
+		bool                     valid  = false;
+		vk::PipelineLayout       layout = nullptr;
+		vk::ShaderStageFlags     stages;
+		uint32_t                 size = 0;
+		std::array<uint32_t, 64> dwords {};
+	};
+	mutable PushConstantShadow m_push_constants;
 
 	// Barrier batcher state (see BarrierBatchEnabled()). Owned by the recording producer.
 	mutable PendingBarriers m_pending;
@@ -361,6 +434,13 @@ public:
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
 
+	// Draw-prep: hands the committed draw's preparation to its program refresh (once).
+	[[nodiscard]] DrawPrep::PreparedDraw* TakePreparedDraw() noexcept {
+		auto* prepared  = m_prepared_draw;
+		m_prepared_draw = nullptr;
+		return prepared;
+	}
+
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
@@ -407,7 +487,12 @@ private:
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
-	[[nodiscard]] vk::DescriptorBufferInfo UploadShaderData(std::span<const uint32_t> data);
+	// `site` names the caller's stage and table kind; it only selects the entry checked first.
+	[[nodiscard]] vk::DescriptorBufferInfo UploadShaderData(std::span<const uint32_t> data,
+	                                                        uint32_t                  site);
+	// Descriptor set for a layout beyond maxPushDescriptors: reused or written, then bound.
+	void CommitDescriptorSet(CommandBuffer& buffer, vk::PipelineBindPoint point,
+	                         const PipelineCache::Pipeline& pipeline);
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
@@ -434,6 +519,12 @@ private:
 		std::vector<uint32_t> words;
 	};
 	std::array<ShaderUploadEntry, 64> m_shader_uploads;
+	// KYTY_UPLOAD_DEDUP: same-tick content dedup of shader-data/flattened-SRT uploads, and the
+	// entry each upload site filled or matched last (checked before hashing).
+	std::array<ShaderUploadEntry, 256> m_upload_dedup;
+	std::array<uint32_t, 32>           m_upload_last_slot {};
+	// KYTY_DESCRIPTOR_SET_REUSE: sets written earlier in the current command buffer.
+	DescriptorSetReuse m_descriptor_set_reuse;
 	// Rendering instance begun right after the last indirect-argument barrier. Buffer writes
 	// are recorded outside rendering, or end it (shader-write barrier), so while this instance
 	// stays active the barrier still covers every argument write.
@@ -465,6 +556,8 @@ private:
 		TextureCache::ImageDesc desc;
 	};
 	std::array<TextureDescriptionEntry, 4096> m_texture_descriptions;
+	// KYTY_TEXTURE_BINDING_MEMO: (T# dwords, resource) -> resolved image, description and view.
+	TextureBindingMemo m_texture_memo;
 	// KYTY_SAMPLER_MEMO: final sampler dwords -> native sampler. The sampler cache never evicts,
 	// so a remembered handle stays the one GetSampler returns for those dwords.
 	struct SamplerMemoEntry {
@@ -493,8 +586,12 @@ private:
 	};
 	DepthTargetDescMemo        m_depth_target_memo {};
 	GraphicsDynamicStateShadow m_dynamic_state {};
+	// Draw-prep (drawPrep.h): the preparation of the draw the engine is committing, taken by
+	// RefreshShaders in place of GetGraphicsPrograms when its certificate holds. Null otherwise.
+	DrawPrep::PreparedDraw* m_prepared_draw = nullptr;
 
 	friend class CommandProcessor;
+	friend class DrawPrep::Engine;
 	friend struct RenderExecutorTestAccess;
 };
 

@@ -7,6 +7,7 @@
 #include "common/lruCache.h"
 #include "common/profiler.h"
 #include "common/slotVector.h"
+#include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -35,6 +36,7 @@ class CommandScheduler;
 class DccClearHelper;
 class RenderExecutor;
 class StagingCopier;
+class TextureBindingMemo;
 struct TextureCacheTestAccess;
 
 class TextureCache {
@@ -145,7 +147,21 @@ private:
 		}
 	}
 
-	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
+	// resident_first > 0: register only the prefix holding levels [resident_first, levels)
+	// (resident_prefix bytes, computed when 0); stays fully resident when not applicable.
+	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info, uint32_t resident_first = 0,
+	                                      uint64_t resident_prefix = 0);
+	// Resident mip levels (Image::live, KYTY_TEXTURE_RESIDENT_MIPS). Caller holds m_lock.
+	// The finest level a view of `desc` can read, for an image with `levels` levels.
+	[[nodiscard]] uint32_t    RequestedFirstLevel(const ImageDesc& desc, uint32_t levels) const;
+	[[nodiscard]] uint64_t    ResidentPrefixSize(const ImageInfo& info, uint32_t first_level) const;
+	// Makes levels >= first_level resident (re-registration; the next refresh uploads them).
+	// `sampling`: requested by a sampled view (counted as an extension, else a fallback).
+	void                      EnsureResidency(ImageId id, uint32_t first_level, bool sampling);
+	// Whole chain resident and refreshed now, before a non-sampling use records anything.
+	void                      RequireFullResidency(ImageId id);
+	void                      PoisonNonResidentLevels(Image& image);
+	void                      RetireIdlePartialImages();
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
@@ -181,7 +197,9 @@ private:
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	// All callers hold m_lock; negative ownership proofs contain no guest values.
 	void                      MarkImageGpuModified(Image& image);
-	void                      InvalidateCleanImageProofs();
+	// Logs [address, address + size) to the coherence log (all memory by default).
+	void InvalidateCleanImageProofs(uint64_t address = 0, uint64_t size = UINT64_MAX,
+	                                Coherence::Source source = Coherence::Source::Universe);
 	void                      TrackImageDownload(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
@@ -209,6 +227,12 @@ private:
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
+	[[nodiscard]] static TextureTransfer BuildTextureTransfer(const ImageInfo& info,
+	                                                          uint32_t backing_samples,
+	                                                          BindingType binding,
+	                                                          TransferDirection direction);
+	// Drops the regions (and tiles) of non-resident levels and packs the detiled scratch.
+	void RestrictToResidentLevels(const Image& image, TextureTransfer& transfer) const;
 	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
@@ -297,13 +321,46 @@ private:
 	// (KYTY_TEXTURE_FAULT_FAST_PATH=0 always takes the lock).
 	std::unique_ptr<std::atomic<uint32_t>[]> m_image_page_counts;
 	bool                                     m_fault_fast_path = true;
+	enum class ResidencyMode : uint8_t { Off, On, Poison };
+	ResidencyMode                            m_residency            = ResidencyMode::On;
+	uint64_t                                 m_residency_violations = 0;
+	// Partially resident images (stale ids are dropped by the once-per-frame scan).
+	std::vector<ImageId>                     m_partial_images;
+	uint64_t                                 m_partial_scan_frame   = 0;
+	uint64_t                                 m_resident_idle_frames = 30;
 	// KYTY_TEXEL_SYNC_SKIP=0 downloads image contents for every texel-buffer read.
 	bool                                     m_texel_sync_skip = true;
 	[[nodiscard]] StreamBuffer& StagingRing();
+	// Structural generations for TextureBindingMemo (pipeline/textureBindingMemo.h), one per
+	// ImagePageTable page: NoteStructureChange(image) bumps every page the image's registered
+	// range covers. Called by RegisterImage and UnregisterImage (every change of a page's owner
+	// list or of an image's registered flag, i.e. whenever FindImage's first-page lookup on that
+	// page may answer differently) and when a stencil association is attached. Changing a
+	// registered image's SameBacking fields (address, size, extent, resources, samples, block
+	// size, tile mode, format, type) in place must call it too. Caller holds m_lock.
+	std::unique_ptr<uint64_t[]> m_page_versions;
+	void NoteStructureChange(const Image& image) {
+		ImagePageTable::PageRange pages {};
+		if (!ImagePageTable::TryGetPageRange(image.live.address, image.live.size, pages)) {
+			return;
+		}
+		if (!m_page_versions) {
+			m_page_versions = std::make_unique<uint64_t[]>(
+			    size_t {1} << (ImagePageTable::kAddressSpaceBits - ImagePageTable::kPageBits));
+		}
+		for (auto page = pages.first; page < pages.last_exclusive; ++page) {
+			++m_page_versions[page];
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureCacheStructureChanges);
+	}
+	[[nodiscard]] uint64_t PageVersion(uint64_t page) const noexcept {
+		return m_page_versions ? m_page_versions[page] : 0;
+	}
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
+	friend class TextureBindingMemo;
 };
 
 } // namespace Libs::Graphics

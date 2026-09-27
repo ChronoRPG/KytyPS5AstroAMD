@@ -21,6 +21,17 @@ struct HostFloatControls {
 void              SetHostFloatControls(const HostFloatControls& controls);
 HostFloatControls GetHostFloatControls();
 
+// Storage-buffer robustness the device guarantees. With robustBufferAccess2 enabled and
+// robustStorageBufferAccessSizeAlignment == 1, a 32-bit load from a storage-buffer descriptor
+// returns 0 exactly when some byte of it lies outside the descriptor range, which is the
+// shader's own "dword index < OpArrayLength" check. The device layer sets this once.
+struct HostBufferRobustness {
+	bool storage_dword_loads_return_zero = false;
+};
+
+void                 SetHostBufferRobustness(const HostBufferRobustness& robustness);
+HostBufferRobustness GetHostBufferRobustness();
+
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
                                   ShaderStageInputInfo input_info);
 

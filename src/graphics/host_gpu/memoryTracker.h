@@ -19,7 +19,10 @@ namespace Libs::Graphics {
 
 class MemoryTracker final {
 public:
-	explicit MemoryTracker(PageManager& page_manager, bool track_cpu_mutations = false);
+	using FaultPolicy = RegionManager::FaultPolicy;
+
+	explicit MemoryTracker(PageManager& page_manager, bool track_cpu_mutations = false,
+	                       FaultPolicy fault_policy = {});
 	~MemoryTracker();
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);
@@ -41,17 +44,39 @@ public:
 	void                               MarkReadbackPending(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] ReadbackUnmarkResult UnmarkReadbackPending(uint64_t vaddr, uint64_t size);
 	// A dirty-state mutation token, not a backing/GPU cleanliness proof. UINT64_MAX means
-	// saturated: callers must conservatively stop reusing any previously observed token.
+	// saturated: callers must conservatively stop reusing any previously observed token. While
+	// hot pages exist it is UINT64_MAX too: they are written without faults.
 	[[nodiscard]] uint64_t CpuMutationEpoch() const noexcept {
+		if (m_hot_count.load(std::memory_order_acquire) != 0) {
+			return UINT64_MAX;
+		}
 		return m_cpu_mutation_epoch.load(std::memory_order_acquire);
 	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
+		InvalidateRegion(vaddr, size, on_flush, false, [](uint64_t, uint64_t) noexcept {});
+	}
+	// As InvalidateRegion for a guest write fault: clean pages take the fault policy (fault-ahead
+	// window, hot-page detection, RegionManager::MarkWriteFault). on_ahead(address, bytes) sees
+	// every run of pages fault-ahead makes CPU-dirty, under the region lock, before they become
+	// writable: what the faulting range's caller does before a write can land applies to them.
+	template <typename Flush, typename AheadFunc>
+	void InvalidateRegionOnWriteFault(uint64_t vaddr, uint64_t size, Flush&& on_flush,
+	                                  AheadFunc&& on_ahead) noexcept {
+		InvalidateRegion(vaddr, size, on_flush, true, on_ahead);
+	}
+
+private:
+	template <typename Flush, typename AheadFunc>
+	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush& on_flush, bool write_fault,
+	                      AheadFunc&& on_ahead) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
+		static_assert(std::is_nothrow_invocable_v<AheadFunc&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
 
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			RegionManager::FaultResult fault;
 			const bool should_flush = [&] {
 				// Perform both the GPU modification check and CPU state change with the lock in
 				// case the GPU thread is racing to mark the page modified. If a flush is needed,
@@ -61,14 +86,44 @@ public:
 					return true;
 				}
 				NotifyCpuMutation();
-				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+				if (write_fault) {
+					fault = manager->MarkWriteFault(manager->GetCpuAddr() + offset, bytes,
+					                                m_fault_policy, Frame(), m_hot_count,
+					                                on_ahead);
+				} else {
+					manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
+					                                             bytes);
+				}
 				return false;
 			}();
 			if (should_flush) {
 				on_flush();
 			}
+			MemoryStats::Count(MemoryStats::Counter::FaultAheadPages, fault.ahead_pages);
+			MemoryStats::Count(MemoryStats::Counter::HotPromotions, fault.promoted);
 		});
 	}
+
+public:
+	// Fault policy knobs (constant after construction).
+	[[nodiscard]] const FaultPolicy& GetFaultPolicy() const noexcept { return m_fault_policy; }
+	// Guest frame counter for hot-page detection (any thread, once per completed guest flip).
+	void AdvanceFrame() noexcept { m_frame.fetch_add(1, std::memory_order_relaxed); }
+	[[nodiscard]] uint32_t Frame() const noexcept {
+		return m_frame.load(std::memory_order_relaxed);
+	}
+	[[nodiscard]] uint32_t HotPageCount() const noexcept {
+		return m_hot_count.load(std::memory_order_relaxed);
+	}
+	[[nodiscard]] bool IsRegionHot(uint64_t vaddr, uint64_t size);
+	// Returns hot pages of the range to normal tracking (they stay CPU-dirty until uploaded).
+	void DemoteHotPages(uint64_t vaddr, uint64_t size);
+	// Demotes hot pages no upload visited for more than idle_frames frames.
+	void SweepHotPages(uint32_t idle_frames);
+	// Returns the hot pages of [vaddr, vaddr + size) (every hot page when size is 0) to normal
+	// tracking as clean, write-protected pages (RegionManager::SettleHot) and lists them. The
+	// caller must mark each one whose contents changed since its last upload CPU-dirty again.
+	[[nodiscard]] std::vector<uint64_t> SettleHotPages(uint64_t vaddr, uint64_t size);
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                           const char* operation) const noexcept;
@@ -84,7 +139,7 @@ public:
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
 		if constexpr (clear) {
-			CleanVerdict::Invalidate();
+			CleanVerdict::Invalidate(vaddr, size, Coherence::Source::TrackerDownload);
 		}
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);
@@ -96,22 +151,42 @@ public:
 		});
 	}
 
+	// range_func(address, bytes) or range_func(address, bytes, hot). Only a caller taking the hot
+	// flag keeps hot pages CPU-dirty and writable on a read-only upload; it must then treat every
+	// hot range as possibly changed since its previous upload. Written uploads and callers
+	// without the flag return hot pages to normal tracking first.
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
 	                        UploadFunc&& upload_func) {
-		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
+		constexpr bool hot_aware = std::is_invocable_v<RangeFunc&, uint64_t, uint64_t, bool>;
+		if constexpr (hot_aware) {
+			static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t, bool>);
+		} else {
+			static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
+		}
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+		const bool  keep_hot              = hot_aware && !is_written;
+		const auto  frame                 = Frame();
+		uint32_t    demoted               = 0;
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
-			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
-			                                                      bytes, range_func);
+			demoted += manager->CollectUpload(
+			    manager->GetCpuAddr() + offset, bytes, keep_hot, frame, m_hot_count,
+			    [&](uint64_t address, uint64_t range_bytes, bool hot) noexcept {
+				    if constexpr (hot_aware) {
+					    range_func(address, range_bytes, hot);
+				    } else {
+					    range_func(address, range_bytes);
+				    }
+			    });
 			if (!is_written) {
 				manager->lock.unlock();
 			}
 		});
+		MemoryStats::Count(MemoryStats::Counter::HotDemotions, demoted);
 		upload_func();
 		// No clean-verdict bump: these GPU bits are not read by clean-read verdicts, and the
 		// only writer (BufferCache::ObtainBuffer) bumps when it adds the exact dirty range.
@@ -124,6 +199,62 @@ public:
 			               });
 		}
 		s_upload_owner = previous_upload_owner;
+	}
+
+	// A written upload (the range becomes GPU-owned) that copies its CPU-dirty pages WITHOUT the
+	// region locks held, for FaultPolicy::copy_outside_lock:
+	//  1. per region, under its lock: clear and write-protect the CPU-dirty pages, reporting them
+	//     to range_func, then release the lock;
+	//  2. upload_func() copies them with no tracker lock held. A guest write to one of them now
+	//     faults, and the fault marks it CPU-dirty again under the region lock;
+	//  3. all region locks are taken and held; pages that became CPU-dirty since step 1 are
+	//     cleared and write-protected again (only then can their contents no longer change) and
+	//     reported to late_range_func; late_upload_func() copies them under the locks;
+	//  4. the whole range becomes GPU-dirty and the locks are released.
+	// Pages not reported in step 3 stayed write-protected and clean from step 1 to step 4, so the
+	// step-2 copy is exact; step 3 and 4 are the single locked upload of ForEachUploadRange.
+	template <typename RangeFunc, typename UploadFunc, typename LateRangeFunc,
+	          typename LateUploadFunc>
+	void ForEachWrittenUploadRange(uint64_t vaddr, uint64_t size, RangeFunc&& range_func,
+	                               UploadFunc&& upload_func, LateRangeFunc&& late_range_func,
+	                               LateUploadFunc&& late_upload_func) {
+		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
+		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
+		static_assert(std::is_nothrow_invocable_v<LateRangeFunc&, uint64_t, uint64_t>);
+		static_assert(std::is_nothrow_invocable_v<LateUploadFunc&>);
+		CheckNotInUploadCallback();
+		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
+		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+		const auto  frame                 = Frame();
+		uint32_t    demoted               = 0;
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			demoted += manager->CollectUpload(
+			    manager->GetCpuAddr() + offset, bytes, false, frame, m_hot_count,
+			    [&](uint64_t address, uint64_t range_bytes, bool) noexcept {
+				    range_func(address, range_bytes);
+			    });
+		});
+		upload_func();
+		uint64_t late_pages = 0;
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			manager->lock.lock();
+			demoted += manager->CollectUpload(
+			    manager->GetCpuAddr() + offset, bytes, false, frame, m_hot_count,
+			    [&](uint64_t address, uint64_t range_bytes, bool) noexcept {
+				    late_pages += range_bytes / TRACKER_PAGE_SIZE;
+				    late_range_func(address, range_bytes);
+			    });
+		});
+		late_upload_func();
+		Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			manager->template ChangeState<DirtySource::Gpu, true>(manager->GetCpuAddr() + offset,
+			                                                      bytes);
+			manager->lock.unlock();
+		});
+		s_upload_owner = previous_upload_owner;
+		MemoryStats::Count(MemoryStats::Counter::HotDemotions, demoted);
+		MemoryStats::Count(MemoryStats::Counter::WrittenUploadLatePages, late_pages);
 	}
 
 private:
@@ -176,6 +307,9 @@ private:
 	PageManager&                                   m_page_manager;
 	const bool                                     m_track_cpu_mutations;
 	std::atomic_uint64_t                            m_cpu_mutation_epoch {1};
+	const FaultPolicy                              m_fault_policy;
+	std::atomic_uint32_t                           m_frame {1};
+	std::atomic_uint32_t                           m_hot_count {0};
 };
 
 } // namespace Libs::Graphics

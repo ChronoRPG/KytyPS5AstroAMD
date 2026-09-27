@@ -3,8 +3,10 @@
 #include "common/assert.h"
 #include "common/hangTrace.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
+#include "graphics/host_gpu/memoryStats.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -32,9 +34,22 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
 	m_video_out = video_out;
 	m_gpu       = std::make_unique<GuestGpu>(*this);
+	std::unique_lock lock(m_gpu_notify_mutex);
+	m_gpu_notify = m_gpu.get();
+}
+
+void RenderContext::NotifyGpuProgress() {
+	std::shared_lock lock(m_gpu_notify_mutex);
+	if (m_gpu_notify != nullptr) {
+		m_gpu_notify->NotifyProgress();
+	}
 }
 
 void RenderContext::ShutdownGpu() {
+	{
+		std::unique_lock lock(m_gpu_notify_mutex);
+		m_gpu_notify = nullptr;
+	}
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
 		m_gpu.reset();
@@ -65,8 +80,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	const MemoryStats::ScopedTimer fault_timer(MemoryStats::Counter::FaultNs);
+	MemoryStats::Count(access == PageFaultAccess::Write ? MemoryStats::Counter::WriteFaults
+	                                                    : MemoryStats::Counter::ReadFaults);
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size, true);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
@@ -126,7 +144,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	// GPU mapping changes retire clean-read verdicts (the backing translation has its own
 	// generation in the guest address space).
-	CleanVerdict::Invalidate();
+	CleanVerdict::Invalidate(vaddr, size, Coherence::Source::MapMemory);
 	m_mapped_ranges.Add(vaddr, size);
 	m_buffer_cache.InvalidateBdaSynchronization();
 }
@@ -148,14 +166,15 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	}
 	const auto unmap = [this, vaddr, size] {
 		if (m_command_scheduler.Active()) {
-			const auto tick = m_command_scheduler.CurrentTick();
+			Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitUnmap);
+			const auto                    tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
-		CleanVerdict::Invalidate();
+		CleanVerdict::Invalidate(vaddr, size, Coherence::Source::UnmapMemory);
 		m_mapped_ranges.Subtract(vaddr, size);
 		m_buffer_cache.InvalidateBdaSynchronization();
 	};

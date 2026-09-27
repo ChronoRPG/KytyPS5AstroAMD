@@ -28,9 +28,13 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
+#include <unordered_map>
+#include <mutex>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
@@ -530,11 +534,34 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
-	vk::DeviceQueueCreateInfo queue_create_info {};
+	// Queue 0 carries every scheduler submission and presentation. A second queue of the same
+	// family (KYTY_SIDE_QUEUE, default on when the family has one) runs side-copy readbacks, so a
+	// copy waits only for its producer instead of for everything queued ahead of it on queue 0.
+	// Buffers stay EXCLUSIVE: ownership is per family, and both queues share it.
+	uint32_t family_queue_count = 0;
+	{
+		uint32_t count = 0;
+		physical_device.getQueueFamilyProperties(&count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(count);
+		physical_device.getQueueFamilyProperties(&count, families.data());
+		if (queue_family < count) {
+			family_queue_count = families[queue_family].queueCount;
+		}
+	}
+	const bool side_queue_requested = [] {
+		const auto* value = std::getenv("KYTY_SIDE_QUEUE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	graphics.side_queue_index = side_queue_requested && family_queue_count >= 2 ? 1u : 0u;
+	std::printf("Kyty side-copy queue: %s (family %u has %u queues, KYTY_SIDE_QUEUE)\n",
+	       graphics.side_queue_index != 0 ? "queue 1" : "shared with queue 0", queue_family,
+	       family_queue_count);
+
+	const std::array<float, 2> queue_priorities {1.0f, 1.0f};
+	vk::DeviceQueueCreateInfo  queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	queue_create_info.queueCount       = graphics.side_queue_index != 0 ? 2u : 1u;
+	queue_create_info.pQueuePriorities = queue_priorities.data();
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -662,14 +689,36 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceVulkan12Properties properties12 {};
 	properties12.pNext = &properties11;
 
+	vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties {};
 	vk::PhysicalDeviceProperties2 properties2 {};
 	properties2.pNext = &properties12;
 
 	if (graphics.mesh_shader_enabled) {
 		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
 	}
+	if (robustness2_ext_enabled) {
+		robustness2_properties.pNext = properties2.pNext;
+		properties2.pNext            = &robustness2_properties;
+	}
 	physical_device.getProperties2(&properties2);
 	ConfigureShaderFloatControls(properties12);
+	// robustBufferAccess2 (enabled below whenever supported) makes a storage-buffer load return 0
+	// when any byte lies past the descriptor range rounded up to this alignment; at 1 byte that is
+	// exactly the shaders' own dword bounds check, which they can then leave to the device.
+	{
+		ShaderRecompiler::Spirv::HostBufferRobustness robustness {};
+		robustness.storage_dword_loads_return_zero =
+		    robustness2_ext_enabled && supported_robustness2.robustBufferAccess2 == VK_TRUE &&
+		    robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u;
+		ShaderRecompiler::Spirv::SetHostBufferRobustness(robustness);
+		LOGF("Vulkan robustness: robustBufferAccess2=%s storage alignment=%" PRIu64
+		     " shader dword bounds checks=%s\n",
+		     robustness2_ext_enabled && supported_robustness2.robustBufferAccess2 == VK_TRUE
+		         ? "true"
+		         : "false",
+		     static_cast<uint64_t>(robustness2_properties.robustStorageBufferAccessSizeAlignment),
+		     robustness.storage_dword_loads_return_zero ? "device" : "shader");
+	}
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
@@ -891,12 +940,85 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
 	}
 }
 
+// KYTY_VULKAN_VALIDATION_MODE=log: diagnostic runs record validation errors and warnings in a
+// file (KYTY_VULKAN_VALIDATION_LOG, default _kyty_vulkan_validation.log) and keep running,
+// instead of exiting on the first error. Each message id is written in full for its first five
+// occurrences, then as a count at every power of two.
+static bool VulkanValidationLogOnly() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VULKAN_VALIDATION_MODE");
+		return value != nullptr && std::strcmp(value, "log") == 0;
+	}();
+	return enabled;
+}
+
+static void RecordVulkanValidationMessage(const char*                                   severity,
+                                          const vk::DebugUtilsMessengerCallbackDataEXT* data) {
+	static std::mutex                                mutex;
+	static std::unordered_map<std::string, uint64_t> counts;
+	static std::FILE*                                file = [] {
+		const char* path = std::getenv("KYTY_VULKAN_VALIDATION_LOG");
+		return std::fopen(path != nullptr && path[0] != 0 ? path : "_kyty_vulkan_validation.log",
+		                  "a");
+	}();
+	// Key on the message id plus its first line with handles and numbers blanked, so the same id
+	// raised by different commands (e.g. two unrelated hazards) is reported separately.
+	std::string first_line(data->pMessage, std::strcspn(data->pMessage, "\r\n"));
+	std::string shape;
+	shape.reserve(first_line.size());
+	for (size_t i = 0; i < first_line.size(); i++) {
+		const char c = first_line[i];
+		if (c >= '0' && c <= '9') {
+			if (shape.empty() || shape.back() != '#') {
+				shape.push_back('#');
+			}
+			if (c == '0' && i + 1 < first_line.size() && (first_line[i + 1] == 'x')) {
+				i++;
+			}
+			while (i + 1 < first_line.size() &&
+			       std::isxdigit(static_cast<unsigned char>(first_line[i + 1])) != 0) {
+				i++;
+			}
+			continue;
+		}
+		shape.push_back(c);
+	}
+	const std::string id = std::string(severity) + " " +
+	                       (data->pMessageIdName != nullptr ? data->pMessageIdName : "?") + " | " +
+	                       shape.substr(0, 160);
+	std::scoped_lock lock(mutex);
+	if (counts.size() >= 4096 && counts.find(id) == counts.end()) {
+		return;
+	}
+	const auto count = ++counts[id];
+	if (file == nullptr) {
+		return;
+	}
+	if (count <= 5) {
+		std::fprintf(file, "[%s] occurrence %llu\n%s\n\n", id.c_str(),
+		             static_cast<unsigned long long>(count), data->pMessage);
+	} else if ((count & (count - 1)) == 0) {
+		std::fprintf(file, "[%s] repeated %llu times\n", id.c_str(),
+		             static_cast<unsigned long long>(count));
+	}
+	std::fflush(file);
+}
+
 static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
     vk::DebugUtilsMessageSeverityFlagBitsEXT      message_severity,
     vk::DebugUtilsMessageTypeFlagsEXT             message_types,
     const vk::DebugUtilsMessengerCallbackDataEXT* callback_data, void* /*user_data*/) {
 	EXIT_IF(callback_data == nullptr);
 	EXIT_IF(callback_data->pMessage == nullptr);
+
+	if (VulkanValidationLogOnly() &&
+	    (message_severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eError ||
+	     message_severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning)) {
+		RecordVulkanValidationMessage(
+		    message_severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eError ? "E" : "W",
+		    callback_data);
+		return VK_FALSE;
+	}
 
 	const char*     severity_str   = nullptr;
 	fmt::text_style severity_style = Log::Color::Default;
@@ -1017,8 +1139,13 @@ void WindowContext::CreateVulkan() {
 		EXIT("--spirv-debug-printf and --gpu-assisted-validation are mutually exclusive\n");
 	}
 
-	vk::ValidationFeatureEnableEXT enabled_features[3]    = {};
+	vk::ValidationFeatureEnableEXT enabled_features[4]    = {};
 	uint32_t                       enabled_features_count = 0;
+	// KYTY_VULKAN_SYNC_VALIDATION=1: synchronization validation (missing or wrong barriers).
+	if (const char* sync = std::getenv("KYTY_VULKAN_SYNC_VALIDATION"); sync != nullptr && sync[0] == '1') {
+		enabled_features[enabled_features_count++] =
+		    vk::ValidationFeatureEnableEXT::eSynchronizationValidation;
+	}
 #ifdef KYTY_ENABLE_BEST_PRACTICES
 	enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eBestPractices;
 #endif
@@ -1215,6 +1342,11 @@ void WindowContext::CreateVulkan() {
 	GpuOpProfiler::InstallHooks(graphic_ctx);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.side_queue_index != 0) {
+		graphic_ctx.device.getQueue(graphic_ctx.queue_family, graphic_ctx.side_queue_index,
+		                            &graphic_ctx.side_queue);
+		EXIT_IF(graphic_ctx.side_queue == nullptr);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

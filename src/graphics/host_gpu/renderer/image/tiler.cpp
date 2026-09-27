@@ -16,6 +16,7 @@
 #include "gpu_tiler_shaders/gpu_tiler_standard64_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_swap_bgra16_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -136,6 +137,10 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TilerScratchPoolMisses);
 	}
+	// Native scratch creations only (pool misses, or every use with the pool off).
+	MemoryStats::Count(MemoryStats::Counter::ScratchAllocs);
+	MemoryStats::Count(MemoryStats::Counter::ScratchAllocBytes, capacity);
+	const MemoryStats::ScopedTimer timer(MemoryStats::Counter::ScratchAllocNs);
 	vk::BufferCreateInfo create {};
 	create.size  = capacity;
 	create.usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |

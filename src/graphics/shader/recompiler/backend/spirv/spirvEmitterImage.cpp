@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
@@ -566,18 +567,103 @@ spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
 // id (16 bits, 0xffff when the T# has MipStatsCntEn clear). The mip_stats buffer holds 257
 // finest-mip words followed by 257 sample counts; entry 256 absorbs images without a counter.
 // The id is uniform per draw, so one atomic pair per subgroup records the subgroup minimum.
-void EmitMipStatsRecord(EmitterState& state, uint32_t resource, uint32_t lod) {
-	if (state.mip_stats_variable == 0 || resource >= state.program.bindings.mip_stats_count) {
-		return;
-	}
-	constexpr uint32_t Entries = 257;
-	state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
-	state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
+constexpr uint32_t MipStatsEntries = 257;
+
+// 16-bit field: counter id in bits 0..7, T# BASE_LEVEL in bits 8..11, bit 15 = no counter. The
+// upper half of the returned word may hold the neighbouring image's field.
+uint32_t LoadMipStatsId(EmitterState& state, uint32_t resource) {
 	auto id = EmitShaderDataDwordLoad(state,
 	                                  state.program.bindings.MipStatsOffsetDword() + resource / 2u);
 	if ((resource & 1u) != 0u) {
 		id = Binary(state, spv::OpShiftRightLogical, TypeU32(state), id, ConstantU32(state, 16));
 	}
+	return id;
+}
+
+// The finest mip a sample wanted, as an absolute level: floor of the unclamped LOD plus the view's
+// BASE_LEVEL, limited to 0..14, reduced to the subgroup minimum.
+uint32_t EmitMipStatsFinestLevel(EmitterState& state, uint32_t id, uint32_t lod) {
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
+	const auto base_level = Binary(
+	    state, spv::OpBitwiseAnd, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), id, ConstantU32(state, 8)),
+	    ConstantU32(state, 0xfu));
+	const auto base_f32 = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), base_f32, base_level);
+	const auto absolute = Binary(state, spv::OpFAdd, TypeF32(state), lod, base_f32);
+	const auto clamped  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
+	                          GLSLstd450FClamp, absolute, ConstantF32Value(state, 0.0f),
+	                          ConstantF32Value(state, 14.0f));
+	const auto floored = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floored, GlslStd450(state),
+	                          GLSLstd450Floor, clamped);
+	const auto level = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), level, floored);
+	const auto finest = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformUMin, TypeU32(state), finest,
+	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
+	                          level);
+	return finest;
+}
+
+uint32_t MipStatsElement(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.mip_stats_variable, ConstantU32(state, 0), index);
+	return pointer;
+}
+
+// KYTY_LOD_STATS_GATE (default): recording for an image whose T# has a counter (checked by the
+// caller, uniformly per draw). Per subgroup, one lane
+//  - issues the finest-level AtomicUMin only when a relaxed atomic load shows a larger value.
+//    The finest words only ever decrease between resets (UMin is the only writer; the resets
+//    are transfer fills ordered before and after every draw by pipeline barriers), so a value
+//    at or below `finest` stays at or below it and the skipped UMin would not change the word.
+//    A stale larger value just issues the UMin as before.
+//  - adds 1 to the sample count, unchanged (one per subgroup and sample instruction).
+// Images without a counter recorded into entry 256, which the host never reads; they now record
+// nothing.
+void EmitGatedMipStatsRecord(EmitterState& state, uint32_t id, uint32_t lod) {
+	const auto counter =
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 0xffu));
+	const auto finest  = EmitMipStatsFinestLevel(state, id, lod);
+	const auto elected = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformElect, TypeBool(state), elected,
+	                          ConstantU32(state, spv::ScopeSubgroup));
+	EmitIfCondition(state, elected, [&]() {
+		const auto finest_pointer = MipStatsElement(state, counter);
+		const auto current        = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), current, finest_pointer,
+		                          ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+		const auto lower = Binary(state, spv::OpULessThan, TypeBool(state), finest, current);
+		EmitIfCondition(state, lower, [&]() {
+			const auto min_result = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAtomicUMin, TypeU32(state), min_result, finest_pointer,
+			                          ConstantU32(state, spv::ScopeDevice),
+			                          ConstantU32(state, spv::MemorySemanticsMaskNone), finest);
+		});
+		const auto count_index =
+		    Binary(state, spv::OpIAdd, TypeU32(state), counter, ConstantU32(state, MipStatsEntries));
+		const auto add_result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), add_result,
+		                          MipStatsElement(state, count_index),
+		                          ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+		                          ConstantU32(state, 1));
+	});
+}
+
+void EmitMipStatsRecord(EmitterState& state, uint32_t resource, uint32_t lod) {
+	if (state.mip_stats_variable == 0 || resource >= state.program.bindings.mip_stats_count) {
+		return;
+	}
+	constexpr uint32_t Entries = MipStatsEntries;
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
+	const auto id = LoadMipStatsId(state, resource);
 	// 16-bit field: counter id in bits 0..7, T# BASE_LEVEL in bits 8..11, bit 15 = no counter.
 	const auto disabled = Binary(state, spv::OpBitwiseAnd, TypeU32(state), id,
 	                             ConstantU32(state, 0x8000u));
@@ -851,32 +937,52 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 			state.builder.AddFunction(opcode, sample_operands);
 			if (state.mip_stats_variable != 0) {
-				uint32_t lod = ZeroF32(state);
-				if (HasFlag(mem, Decoder::ImageSampleFlagLevelZero)) {
-					// Level 0 explicitly.
-				} else if (HasFlag(mem, Decoder::ImageSampleFlagLod) &&
-				           layout.lod != NoImageComponent) {
-					lod = AddressF32(ctx, mem, *address, layout.lod);
-				} else {
-					// Implicit or gradient sampling: the unclamped LOD (before MIN_LOD and the
-					// resident range), which is what the streamer needs to know.
-					state.builder.RequireCapability(spv::CapabilityImageQuery);
-					const auto query = state.builder.AllocateId();
-					state.builder.AddFunction(
-					    spv::OpImageQueryLod, TypeF32Vector(state, 2), query, sampled,
-					    CoordF32(ctx, mem, *address, layout.coord,
-					             ImageDimensionInfoFor(candidate.dimension).spatial_components,
-					             candidate.cube));
-					lod = state.builder.AllocateId();
-					state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), lod, query,
-					                          1u);
-					// IMAGE_SAMPLE_B*: the shader bias adds to the computed LOD.
-					if (!explicit_lod && layout.bias != NoImageComponent) {
-						lod = Binary(state, spv::OpFAdd, TypeF32(state), lod,
-						             AddressF32(ctx, mem, *address, layout.bias));
+				const auto sample_lod = [&](uint32_t sampled_image) {
+					uint32_t lod = ZeroF32(state);
+					if (HasFlag(mem, Decoder::ImageSampleFlagLevelZero)) {
+						// Level 0 explicitly.
+					} else if (HasFlag(mem, Decoder::ImageSampleFlagLod) &&
+					           layout.lod != NoImageComponent) {
+						lod = AddressF32(ctx, mem, *address, layout.lod);
+					} else {
+						// Implicit or gradient sampling: the unclamped LOD (before MIN_LOD and the
+						// resident range), which is what the streamer needs to know.
+						state.builder.RequireCapability(spv::CapabilityImageQuery);
+						const auto query = state.builder.AllocateId();
+						state.builder.AddFunction(
+						    spv::OpImageQueryLod, TypeF32Vector(state, 2), query, sampled_image,
+						    CoordF32(ctx, mem, *address, layout.coord,
+						             ImageDimensionInfoFor(candidate.dimension).spatial_components,
+						             candidate.cube));
+						lod = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), lod,
+						                          query, 1u);
+						// IMAGE_SAMPLE_B*: the shader bias adds to the computed LOD.
+						if (!explicit_lod && layout.bias != NoImageComponent) {
+							lod = Binary(state, spv::OpFAdd, TypeF32(state), lod,
+							             AddressF32(ctx, mem, *address, layout.bias));
+						}
 					}
+					return lod;
+				};
+				if (GetCodegenOptions().lod_stats_gate &&
+				    resource < state.program.bindings.mip_stats_count) {
+					// The counter id is uniform per draw: when the T# has no counter, skip the LOD
+					// query and the atomics entirely instead of recording into the unused slot.
+					const auto id          = LoadMipStatsId(state, resource);
+					const auto has_counter = Binary(
+					    state, spv::OpIEqual, TypeBool(state),
+					    Binary(state, spv::OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 0x8000u)),
+					    ConstantU32(state, 0));
+					// OpSampledImage must sit in the block of its consumer, so the query inside the
+					// branch combines the image and sampler again.
+					EmitIfCondition(state, has_counter, [&]() {
+						EmitGatedMipStatsRecord(
+						    state, id, sample_lod(MakeSampledImage(state, resource, mem.sampler)));
+					});
+				} else {
+					EmitMipStatsRecord(state, resource, sample_lod(sampled));
 				}
-				EmitMipStatsRecord(state, resource, lod);
 			}
 			return sample;
 		};

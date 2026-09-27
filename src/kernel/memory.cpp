@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/gpuReadDelegate.h"
+#include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -885,34 +886,89 @@ static bool IsGpuRangeCleanForBackingRead(uint64_t vaddr, uint64_t size) {
 	       !resources.GetTextureCache().IsRegionGpuModified(vaddr, size);
 }
 
-bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+// The clean verdict of a GPU address range (verdict cache when enabled). GPU thread or an
+// active GpuReadDelegate scope.
+static bool QueryGpuCleanVerdict(uint64_t vaddr, uint64_t size) {
+	namespace CleanVerdict = Graphics::CleanVerdict;
+	if (!CleanVerdict::Enabled()) {
+		return IsGpuRangeCleanForBackingRead(vaddr, size);
+	}
+	// Only the ownership verdict is cached; bytes are always read fresh by the callers.
+	static thread_local CleanVerdict::Table verdicts;
+	const auto result = CleanVerdict::Query(verdicts, vaddr, size, IsGpuRangeCleanForBackingRead);
+	Profiler::CountFrameEvent(result.hit ? Profiler::FrameEvent::CleanVerdictHits
+	                                     : Profiler::FrameEvent::CleanVerdictMisses);
+	if (result.stores != 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::CleanVerdictStores, result.stores);
+	}
+	return result.clean;
+}
+
+static bool TryReadGpuCleanBackingExact(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		// A draw-preparation helper may probe only inside a GPU-thread fork window
 		// (gpuReadDelegate.h), during which the GPU-thread-owned dirty state is stable.
 		if (!Graphics::GuestGpu::IsGpuThread() && !Graphics::GpuReadDelegate::Active()) {
 			return false;
 		}
-		namespace CleanVerdict = Graphics::CleanVerdict;
-		if (!CleanVerdict::Enabled()) {
-			if (!IsGpuRangeCleanForBackingRead(vaddr, size)) {
-				return false;
-			}
-		} else {
-			// Only the ownership verdict is cached; the bytes below are still read fresh.
-			static thread_local CleanVerdict::Table verdicts;
-			const auto result =
-			    CleanVerdict::Query(verdicts, vaddr, size, IsGpuRangeCleanForBackingRead);
-			Profiler::CountFrameEvent(result.hit ? Profiler::FrameEvent::CleanVerdictHits
-			                                     : Profiler::FrameEvent::CleanVerdictMisses);
-			if (result.stores != 0) {
-				Profiler::CountFrameEvent(Profiler::FrameEvent::CleanVerdictStores, result.stores);
-			}
-			if (!result.clean) {
-				return false;
-			}
+		if (!QueryGpuCleanVerdict(vaddr, size)) {
+			return false;
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
+}
+
+// Draw-prep (readSet.h): every read of a speculative draw preparation is recorded for its
+// certificate. The GPU thread applies the exact clean predicate. Other preparing threads cannot
+// read the GPU thread's unlocked dirty state; they gate reads with a conservative, thread-safe
+// hint (tracker GPU-dirty pages, which cover every buffer GPU-dirty byte, and pending backing
+// publications) so that they rarely compute on stale bytes, and the commit re-validates every
+// range with the exact predicate. The hint does not consult the texture cache: a range owned by
+// a GPU-modified image is caught at commit.
+static bool TryReadForDrawPrep(Graphics::DrawPrep::Recorder& recorder, uint64_t vaddr, void* data,
+                               uint64_t size) {
+	using Graphics::DrawPrep::ReadFailure;
+	auto& reads = *recorder.reads;
+	if (reads.Failed()) {
+		return false;
+	}
+	if (recorder.exact) {
+		if (!TryReadGpuCleanBackingExact(vaddr, data, size)) {
+			reads.Fail(ReadFailure::Unclean);
+			return false;
+		}
+	} else {
+		if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+			auto& buffers = GetGpuResources().GetBufferCache();
+			if (buffers.IsRegionGpuModified(vaddr, size) ||
+			    buffers.HasPendingBackingPublication(vaddr, size)) {
+				reads.Fail(ReadFailure::Unclean);
+				return false;
+			}
+		}
+		if (!TryReadBacking(vaddr, data, size)) {
+			reads.Fail(ReadFailure::Backing);
+			return false;
+		}
+	}
+	return reads.Record(vaddr, data, size);
+}
+
+bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (auto* recorder = Graphics::DrawPrep::ActiveRecorder(); recorder != nullptr) [[unlikely]] {
+		return TryReadForDrawPrep(*recorder, vaddr, data, size);
+	}
+	return TryReadGpuCleanBackingExact(vaddr, data, size);
+}
+
+bool IsGpuCleanForRead(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return true;
+	}
+	if (!Graphics::GuestGpu::IsGpuThread() && !Graphics::GpuReadDelegate::Active()) {
+		return false;
+	}
+	return QueryGpuCleanVerdict(vaddr, size);
 }
 
 bool SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {

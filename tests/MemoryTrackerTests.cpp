@@ -614,6 +614,357 @@ void TestGpuDownloadProtectionMirrors() {
   Release(memory);
 }
 
+struct PolicyHarness {
+  explicit PolicyHarness(MemoryTracker::FaultPolicy policy,
+                         bool track_cpu_mutations = false)
+      : tracker(page_manager, track_cpu_mutations, policy) {}
+
+  PageManager page_manager;
+  MemoryTracker tracker;
+};
+
+void UploadAll(MemoryTracker &tracker, uint64_t address, uint64_t size) {
+  tracker.ForEachUploadRange(
+      address, size, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+}
+
+// Write fault as RenderContext::HandleFault reports it (one byte).
+uint32_t WriteFault(MemoryTracker &tracker, uint64_t address,
+                    std::vector<std::pair<uint64_t, uint64_t>> *ahead = nullptr) {
+  uint32_t flushes = 0;
+  tracker.InvalidateRegionOnWriteFault(
+      address, 1, [&] { flushes++; },
+      [&](uint64_t run, uint64_t bytes) noexcept {
+        Check(!IsWritable(reinterpret_cast<const void *>(run)),
+              "fault-ahead run was reported after it became writable");
+        if (ahead != nullptr) {
+          ahead->push_back({run, bytes});
+        }
+      });
+  return flushes;
+}
+
+// Hot-aware read upload: returns {normal pages, hot pages} reported.
+std::pair<uint64_t, uint64_t> UploadHotAware(MemoryTracker &tracker,
+                                             uint64_t address, uint64_t size) {
+  uint64_t normal = 0;
+  uint64_t hot = 0;
+  tracker.ForEachUploadRange(
+      address, size, false,
+      [&](uint64_t, uint64_t bytes, bool is_hot) noexcept {
+        (is_hot ? hot : normal) += bytes / 4096;
+      },
+      []() noexcept {});
+  return {normal, hot};
+}
+
+void TestFaultAheadWindow() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 8;
+  PolicyHarness harness(policy);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 16);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  UploadAll(tracker, address, page_size * 16);
+  // Page 5 becomes GPU-owned: fault-ahead must leave it alone.
+  tracker.ForEachUploadRange(
+      address + page_size * 5, page_size, true,
+      [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  Check(!IsWritable(memory) && Protection(memory + page_size * 5) == PAGE_NOACCESS,
+        "fault-ahead setup did not protect the range");
+
+  ResetProtectionLog();
+  std::vector<std::pair<uint64_t, uint64_t>> ahead_runs;
+  Check(WriteFault(tracker, address + page_size * 2 + 16, &ahead_runs) == 0,
+        "clean fault-ahead write fault requested a GPU flush");
+  Check(ahead_runs.size() == 3 && ahead_runs[0].first == address &&
+            ahead_runs[0].second == page_size * 2 &&
+            ahead_runs[1].first == address + page_size * 3 &&
+            ahead_runs[1].second == page_size * 2 &&
+            ahead_runs[2].first == address + page_size * 6 &&
+            ahead_runs[2].second == page_size * 2,
+        "fault-ahead did not report exactly the runs it opened");
+  for (uint64_t page = 0; page < 16; page++) {
+    const bool in_window = page < 8 && page != 5;
+    Check(tracker.IsRegionCpuModified(address + page * page_size, page_size) ==
+                  in_window &&
+              IsWritable(memory + page * page_size) == in_window,
+          "fault-ahead window state is wrong");
+  }
+  Check(tracker.IsRegionGpuModified(address + page_size * 5, page_size) &&
+            Protection(memory + page_size * 5) == PAGE_NOACCESS &&
+            g_protection_calls <= 2,
+        "fault-ahead disturbed a GPU-owned page or used too many protection calls");
+
+  // A write fault on the GPU-owned page takes the flush path, without fault-ahead.
+  UploadAll(tracker, address, page_size * 16);
+  uint32_t flushes = 0;
+  tracker.InvalidateRegionOnWriteFault(
+      address + page_size * 5, 1,
+      [&] {
+        flushes++;
+        tracker.ForEachDownloadRange<true>(address + page_size * 5, page_size,
+                                           [](uint64_t, uint64_t) noexcept {});
+        tracker.MarkRegionAsCpuModified(address + page_size * 5, 1);
+      },
+      [](uint64_t, uint64_t) noexcept {
+        Check(false, "GPU-owned write fault reported fault-ahead pages");
+      });
+  Check(flushes == 1 && IsWritable(memory + page_size * 5) &&
+            !IsWritable(memory + page_size * 4) &&
+            !tracker.IsRegionCpuModified(address + page_size * 4, page_size),
+        "GPU-owned write fault used fault-ahead");
+
+  tracker.UntrackMemory(address, page_size * 16);
+  Release(memory);
+}
+
+void TestHotPagePromotionAndUpload() {
+  MemoryTracker::FaultPolicy policy;
+  policy.hot_frames = 2;
+  policy.hot_max = 8;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  UploadAll(tracker, address, page_size * 4);
+  // Frame 1: fault, upload. Two faults in one frame count once.
+  WriteFault(tracker, address + 8);
+  UploadAll(tracker, address, page_size * 4);
+  WriteFault(tracker, address + 8);
+  UploadAll(tracker, address, page_size * 4);
+  Check(tracker.HotPageCount() == 0, "one frame of faults promoted a page");
+  // Frame 3 (a skipped frame) restarts the streak.
+  tracker.AdvanceFrame();
+  tracker.AdvanceFrame();
+  WriteFault(tracker, address + 8);
+  UploadAll(tracker, address, page_size * 4);
+  Check(tracker.HotPageCount() == 0, "non-consecutive frames promoted a page");
+  tracker.AdvanceFrame();
+  const auto epoch_before = tracker.CpuMutationEpoch();
+  WriteFault(tracker, address + 8);
+  Check(tracker.HotPageCount() == 1 && tracker.IsRegionHot(address, page_size) &&
+            !tracker.IsRegionHot(address + page_size, page_size * 3) &&
+            epoch_before != UINT64_MAX && tracker.CpuMutationEpoch() == UINT64_MAX,
+        "consecutive faulting frames did not promote exactly the page");
+
+  // Hot-aware read uploads report the hot page and keep it dirty and writable.
+  const auto [normal, hot] = UploadHotAware(tracker, address, page_size * 4);
+  Check(normal == 0 && hot == 1 && tracker.IsRegionCpuModified(address, page_size) &&
+            IsWritable(memory),
+        "hot page did not stay CPU-dirty and writable across its upload");
+  memory[8] = 0x5a; // no fault: the page is writable
+  const auto [normal2, hot2] = UploadHotAware(tracker, address, page_size * 4);
+  Check(normal2 == 0 && hot2 == 1, "hot page was not reported on every upload");
+
+  // A caller that does not understand hot pages returns them to normal tracking.
+  UploadAll(tracker, address, page_size);
+  Check(tracker.HotPageCount() == 0 && !tracker.IsRegionCpuModified(address, page_size) &&
+            !IsWritable(memory) && tracker.CpuMutationEpoch() != UINT64_MAX,
+        "hot-unaware upload did not demote and protect the page");
+
+  // Promote again (two consecutive frames), then a GPU writer takes it.
+  tracker.AdvanceFrame();
+  WriteFault(tracker, address + 8);
+  UploadAll(tracker, address, page_size);
+  tracker.AdvanceFrame();
+  WriteFault(tracker, address + 8);
+  Check(tracker.HotPageCount() == 1, "page was not promoted again");
+  uint64_t written_ranges = 0;
+  tracker.ForEachUploadRange(
+      address, page_size, true,
+      [&](uint64_t, uint64_t, bool is_hot) noexcept {
+        Check(!is_hot, "written upload reported a hot range");
+        written_ranges++;
+      },
+      []() noexcept {});
+  Check(written_ranges == 1 && tracker.HotPageCount() == 0 &&
+            tracker.IsRegionGpuModified(address, page_size) &&
+            !tracker.IsRegionCpuModified(address, page_size) &&
+            Protection(memory) == PAGE_NOACCESS,
+        "GPU writer did not take a hot page back to GPU ownership");
+
+  tracker.UnmarkRegionAsGpuModified(address, page_size);
+  tracker.UntrackMemory(address, page_size * 4);
+  Release(memory);
+}
+
+void TestHotPageDemotionPaths() {
+  MemoryTracker::FaultPolicy policy;
+  policy.hot_frames = 1;
+  policy.hot_max = 1;
+  PolicyHarness harness(policy);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  UploadAll(tracker, address, page_size * 4);
+  WriteFault(tracker, address);
+  WriteFault(tracker, address + page_size);
+  Check(tracker.HotPageCount() == 1 && tracker.IsRegionHot(address, page_size) &&
+            !tracker.IsRegionHot(address + page_size, page_size) &&
+            tracker.IsRegionCpuModified(address + page_size, page_size),
+        "hot page budget was exceeded");
+
+  // Explicit demotion keeps the page dirty until its next upload protects it.
+  tracker.DemoteHotPages(address, page_size * 4);
+  Check(tracker.HotPageCount() == 0 && tracker.IsRegionCpuModified(address, page_size) &&
+            IsWritable(memory),
+        "demotion lost the CPU-dirty state");
+  const auto [normal, hot] = UploadHotAware(tracker, address, page_size * 4);
+  Check(hot == 0 && normal == 2 && !IsWritable(memory) && !IsWritable(memory + page_size),
+        "demoted page was not uploaded and protected normally");
+
+  // Idle sweep: a hot page no upload visits returns to normal tracking.
+  tracker.AdvanceFrame();
+  WriteFault(tracker, address);
+  Check(tracker.HotPageCount() == 1, "page was not promoted for the sweep");
+  tracker.SweepHotPages(3);
+  Check(tracker.HotPageCount() == 1, "sweep demoted a recently used hot page");
+  for (int frame = 0; frame < 5; frame++) {
+    tracker.AdvanceFrame();
+  }
+  tracker.SweepHotPages(3);
+  Check(tracker.HotPageCount() == 0 && tracker.IsRegionCpuModified(address, page_size),
+        "sweep did not demote an idle hot page");
+
+  // Untracking demotes as well.
+  UploadAll(tracker, address, page_size * 4);
+  tracker.AdvanceFrame();
+  WriteFault(tracker, address);
+  Check(tracker.HotPageCount() == 1, "page was not promoted for untracking");
+  tracker.UntrackMemory(address, page_size * 4);
+  Check(tracker.HotPageCount() == 0 && tracker.IsRegionCpuModified(address, page_size * 4),
+        "untracking kept a hot page");
+  Release(memory);
+}
+
+void TestForeignWatcherFaultsDoNotPromote() {
+  MemoryTracker::FaultPolicy policy;
+  policy.hot_frames = 2;
+  policy.hot_max = 8;
+  PolicyHarness harness(policy);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 1);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  // The page is never uploaded, so it stays CPU-dirty: faults there belong to other watchers.
+  Check(tracker.IsRegionCpuModified(address, page_size), "new page was not CPU-dirty");
+  for (int frame = 0; frame < 4; frame++) {
+    WriteFault(tracker, address);
+    tracker.AdvanceFrame();
+  }
+  Check(tracker.HotPageCount() == 0, "faults on a CPU-dirty page promoted it");
+  tracker.UntrackMemory(address, page_size);
+  Release(memory);
+}
+
+void TestWrittenUploadCopiesOutsideLock() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  Check(tracker.IsRegionCpuModified(address, page_size * 3),
+        "new pages were not CPU-dirty");
+
+  // A racing guest write fault during the unlocked copy re-dirties page 1; the late pass must
+  // protect it again before copying it, and the range still ends GPU-owned.
+  uint64_t main_pages = 0;
+  uint64_t late_pages = 0;
+  bool late_protected = false;
+  bool racer_done = false;
+  tracker.ForEachWrittenUploadRange(
+      address, page_size * 3,
+      [&](uint64_t, uint64_t bytes) noexcept { main_pages += bytes / page_size; },
+      [&]() noexcept {
+        Check(!IsWritable(memory + page_size),
+              "main copy ran on an unprotected page");
+        // Would deadlock if the region lock were held here.
+        std::jthread racer([&] {
+          tracker.InvalidateRegionOnWriteFault(address + page_size + 8, 1, [] {},
+                                               [](uint64_t, uint64_t) noexcept {});
+          memory[page_size + 8] = 0x77;
+          racer_done = true;
+        });
+        racer.join();
+      },
+      [&](uint64_t range_address, uint64_t bytes) noexcept {
+        late_pages += bytes / page_size;
+        late_protected = range_address == address + page_size &&
+                         !IsWritable(memory + page_size);
+      },
+      []() noexcept {});
+  Check(racer_done && main_pages == 3 && late_pages == 1 && late_protected &&
+            tracker.IsRegionGpuModified(address, page_size * 3) &&
+            !tracker.IsRegionCpuModified(address, page_size * 3) &&
+            Protection(memory + page_size) == PAGE_NOACCESS,
+        "unlocked written upload lost a racing write or GPU ownership");
+
+  // Without a racing write the late pass reports nothing.
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 3);
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  main_pages = 0;
+  late_pages = 0;
+  tracker.ForEachWrittenUploadRange(
+      address, page_size * 3,
+      [&](uint64_t, uint64_t bytes) noexcept { main_pages += bytes / page_size; },
+      []() noexcept {},
+      [&](uint64_t, uint64_t bytes) noexcept { late_pages += bytes / page_size; },
+      []() noexcept {});
+  Check(main_pages == 1 && late_pages == 0 &&
+            tracker.IsRegionGpuModified(address, page_size * 3),
+        "unlocked written upload copied clean pages or reported late pages");
+
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 3);
+  tracker.UntrackMemory(address, page_size * 3);
+  Release(memory);
+}
+
+void TestHotPageSettle() {
+  MemoryTracker::FaultPolicy policy;
+  policy.hot_frames = 1;
+  policy.hot_max = 8;
+  PolicyHarness harness(policy);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  UploadAll(tracker, address, page_size * 4);
+  WriteFault(tracker, address);
+  WriteFault(tracker, address + page_size * 2);
+  Check(tracker.HotPageCount() == 2, "pages were not promoted for settling");
+
+  // A ranged settle only touches its hot pages: they become clean and write-protected.
+  const auto settled = tracker.SettleHotPages(address, page_size * 2);
+  Check(settled.size() == 1 && settled[0] == address && tracker.HotPageCount() == 1 &&
+            !tracker.IsRegionCpuModified(address, page_size) && !IsWritable(memory) &&
+            tracker.IsRegionHot(address + page_size * 2, page_size) &&
+            IsWritable(memory + page_size * 2),
+        "ranged settle did not return exactly its hot page to clean tracking");
+  // The caller found the contents changed: dirty and writable again.
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
+        "settled page could not be re-dirtied");
+
+  // Settling everything (size 0) reaches every region.
+  const auto all = tracker.SettleHotPages(0, 0);
+  Check(all.size() == 1 && all[0] == address + page_size * 2 &&
+            tracker.HotPageCount() == 0 && !IsWritable(memory + page_size * 2),
+        "global settle missed a hot page");
+  Check(tracker.SettleHotPages(0, 0).empty(), "settle without hot pages reported pages");
+
+  tracker.UntrackMemory(address, page_size * 4);
+  Release(memory);
+}
+
 void TestCrossRegionUpload() {
   constexpr uintptr_t base = 0x0000000200010000ull;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
@@ -995,6 +1346,127 @@ void TestCleanVerdictCrossThreadInvalidation() {
         "a published dirtying transition was hidden by a cached verdict");
 }
 
+// Draw-prep S4 audit of the tracker (fault-ahead, hot pages, unlocked written uploads): every
+// transition of the tracker's GPU ownership logs its exact range and source to the coherence log
+// (whose generation is the clean-verdict one), and the CPU-side policies move no GPU ownership at
+// all: they log nothing and leave the GPU state as it was. The written upload's GPU bits are, as
+// for ForEachUploadRange, not read by clean verdicts; its clean-verdict transition is the buffer
+// cache's dirty-range Add, which logs the range itself. main() enables a log reader
+// (KYTY_DRAW_PREP_LOG_AUDIT) so that entries are recorded.
+std::vector<std::pair<Libs::Graphics::Coherence::Range, Libs::Graphics::Coherence::Source>>
+LoggedSince(uint64_t generation) {
+  namespace Coherence = Libs::Graphics::Coherence;
+  std::vector<std::pair<Coherence::Range, Coherence::Source>> entries;
+  const auto newest = Coherence::Generation();
+  for (auto g = generation + 1; g <= newest; g++) {
+    Coherence::Range range;
+    Coherence::Source source{};
+    Check(Coherence::g_log.Read(g, range, source),
+          "a logged coherence transition is unreadable");
+    entries.push_back({range, source});
+  }
+  return entries;
+}
+
+bool LoggedExactly(uint64_t generation, uint64_t address, uint64_t size,
+                   Libs::Graphics::Coherence::Source source) {
+  const auto entries = LoggedSince(generation);
+  return entries.size() == 1 &&
+         entries[0].first ==
+             Libs::Graphics::Coherence::MakeRange(address, size) &&
+         entries[0].second == source;
+}
+
+void TestCoherenceLogTrackerTransitions() {
+  namespace Coherence = Libs::Graphics::Coherence;
+  using Coherence::Source;
+  Check(Coherence::LogReadersEnabled(), "coherence log entries are not recorded");
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 8;
+  policy.hot_frames = 1;
+  policy.hot_max = 8;
+  PolicyHarness harness(policy);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 16);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto page = [&](uint64_t index) { return address + index * page_size; };
+
+  auto generation = Coherence::Generation();
+  UploadAll(tracker, address, page_size * 16);
+  Check(LoggedSince(generation).empty(), "a read upload logged a coherence transition");
+
+  // Hooked GPU-ownership transitions: exact range and source.
+  generation = Coherence::Generation();
+  tracker.MarkRegionAsGpuModified(page(12), page_size);
+  Check(LoggedExactly(generation, page(12), page_size, Source::TrackerGpuMark),
+        "GPU marking did not log its exact range");
+
+  // Fault-ahead and hot promotion (one faulting frame suffices here): CPU state only.
+  generation = Coherence::Generation();
+  std::vector<std::pair<uint64_t, uint64_t>> ahead;
+  Check(WriteFault(tracker, page(2) + 16, &ahead) == 0 && !ahead.empty() &&
+            tracker.HotPageCount() == 1,
+        "audit setup: the write fault did not open a window and promote its page");
+  Check(LoggedSince(generation).empty() &&
+            tracker.IsRegionGpuModified(page(12), page_size) &&
+            !tracker.IsRegionGpuModified(address, page_size * 12) &&
+            !tracker.IsRegionGpuModified(page(13), page_size * 3),
+        "fault-ahead or hot promotion changed GPU ownership or logged a transition");
+  // Hot-aware uploads, demotion, sweep and settle: CPU state only as well.
+  generation = Coherence::Generation();
+  (void)UploadHotAware(tracker, address, page_size * 8);
+  tracker.DemoteHotPages(address, page_size * 16);
+  UploadAll(tracker, address, page_size * 12);
+  tracker.AdvanceFrame();
+  (void)WriteFault(tracker, page(3));
+  Check(tracker.HotPageCount() == 1, "audit setup: the page was not promoted again");
+  (void)tracker.SettleHotPages(0, 0);
+  tracker.AdvanceFrame();
+  (void)WriteFault(tracker, page(3));
+  for (int frame = 0; frame < 4; frame++) {
+    tracker.AdvanceFrame();
+  }
+  tracker.SweepHotPages(1);
+  Check(LoggedSince(generation).empty() &&
+            tracker.IsRegionGpuModified(page(12), page_size) &&
+            !tracker.IsRegionGpuModified(address, page_size * 12),
+        "hot-page maintenance changed GPU ownership or logged a transition");
+
+  // The unlocked written upload makes its range GPU-owned in the tracker at its end, without a
+  // log entry: the buffer cache's dirty-range Add that follows it is the logged transition.
+  generation = Coherence::Generation();
+  tracker.ForEachWrittenUploadRange(
+      page(8), page_size * 2, [](uint64_t, uint64_t) noexcept {}, []() noexcept {},
+      [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  Check(LoggedSince(generation).empty() &&
+            tracker.IsRegionGpuModified(page(8), page_size * 2),
+        "the written upload logged a transition or did not take GPU ownership");
+
+  // The remaining hooked transitions.
+  generation = Coherence::Generation();
+  tracker.UnmarkRegionAsGpuModified(page(8), page_size * 2);
+  Check(LoggedExactly(generation, page(8), page_size * 2, Source::TrackerGpuUnmark),
+        "GPU unmarking did not log its exact range");
+  generation = Coherence::Generation();
+  tracker.ForEachDownloadRange<true>(page(12), page_size,
+                                     [](uint64_t, uint64_t) noexcept {});
+  Check(LoggedExactly(generation, page(12), page_size, Source::TrackerDownload) &&
+            !tracker.IsRegionGpuModified(page(12), page_size),
+        "a clearing download did not log its exact range");
+  tracker.MarkRegionAsGpuModified(page(12), page_size);
+  generation = Coherence::Generation();
+  tracker.MarkReadbackPending(page(12), page_size);
+  Check(LoggedSince(generation).empty(), "marking a readback pending logged a transition");
+  (void)tracker.UnmarkReadbackPending(page(12), page_size);
+  Check(LoggedExactly(generation, page(12), page_size, Source::TrackerReadbackUnmark) &&
+            !tracker.IsRegionGpuModified(page(12), page_size),
+        "a readback unmark did not log its exact range");
+
+  tracker.UntrackMemory(address, page_size * 16);
+  Release(memory);
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1136,6 +1608,13 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
+  // Record coherence-log entries (read by TestCoherenceLogTrackerTransitions). Set before the
+  // first transition: the choice is made once per process.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  _putenv_s("KYTY_DRAW_PREP_LOG_AUDIT", "1");
+#else
+  setenv("KYTY_DRAW_PREP_LOG_AUDIT", "1", 1);
+#endif
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
@@ -1159,6 +1638,13 @@ int main(int argc, char **argv) {
   TestCleanVerdictQuery();
   TestCleanVerdictTrackerTransitionsBump();
   TestCleanVerdictCrossThreadInvalidation();
+  TestFaultAheadWindow();
+  TestHotPagePromotionAndUpload();
+  TestHotPageDemotionPaths();
+  TestForeignWatcherFaultsDoNotPromote();
+  TestWrittenUploadCopiesOutsideLock();
+  TestHotPageSettle();
+  TestCoherenceLogTrackerTransitions();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();

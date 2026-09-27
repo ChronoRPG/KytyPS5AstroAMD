@@ -177,6 +177,10 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 
 	vk::PipelineRenderingCreateInfo rendering {};
 	rendering.depthAttachmentFormat = key.format;
+	if (color32 && key.format == vk::Format::eD32SfloatS8Uint) {
+		// CopyColor32ToDepth binds the combined view as the stencil attachment too.
+		rendering.stencilAttachmentFormat = key.format;
+	}
 
 	vk::GraphicsPipelineCreateInfo create {};
 	create.pNext               = &rendering;
@@ -310,9 +314,11 @@ bool BlitHelper::SupportsDepthToColor32(const Image& source, const Image& destin
 }
 
 bool BlitHelper::SupportsColor32ToDepth(const Image& source, const Image& destination) const {
-	// Depth-only destination: a depth/stencil attachment view must cover both aspects.
+	// D32_SFLOAT, or D32_SFLOAT_S8_UINT through one view of both aspects bound as the depth and
+	// the stencil attachment, whose stencil is loaded and stored unchanged (no stencil test).
 	return m_reinterpret_supported && SingleSample2D(destination) &&
-	       destination.backing.format == vk::Format::eD32Sfloat &&
+	       (destination.backing.format == vk::Format::eD32Sfloat ||
+	        destination.backing.format == vk::Format::eD32SfloatS8Uint) &&
 	       static_cast<bool>(destination.backing.usage &
 	                         vk::ImageUsageFlagBits::eDepthStencilAttachment) &&
 	       SupportsColor32Side(source) && SameBaseExtent2D(source, destination);
@@ -383,11 +389,18 @@ void BlitHelper::CopyColor32ToDepth(Image& source, Image& destination) {
 	destination.NoteContentWrite();
 	m_scheduler.EndRendering();
 
-	auto& command_buffer = m_scheduler.Current();
-	auto  command        = command_buffer.Handle();
+	// A combined format keeps its stencil: the same view is the stencil attachment, loaded and
+	// stored unchanged (stencil test off), so the attachment is also read.
+	const bool with_stencil = destination.backing.format == vk::Format::eD32SfloatS8Uint;
+	auto&      command_buffer = m_scheduler.Current();
+	auto       command        = command_buffer.Handle();
 	source.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead, {}, command);
-	destination.Transit(ColorToMsDepthLayout, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {},
-	                    command);
+	destination.Transit(ColorToMsDepthLayout,
+	                    with_stencil ? vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+	                                       vk::AccessFlagBits2::eDepthStencilAttachmentWrite
+	                                 : vk::AccessFlags2 {
+	                                       vk::AccessFlagBits2::eDepthStencilAttachmentWrite},
+	                    {}, command);
 	const auto pipeline =
 	    GetPipeline({1, destination.backing.format, PipelineKind::Color32ToDepth});
 	for (uint32_t level = 0; level < levels; level++) {
@@ -411,6 +424,9 @@ void BlitHelper::CopyColor32ToDepth(Image& source, Image& destination) {
 			destination_view_info.format      = destination.backing.format;
 			destination_view_info.type        = vk::ImageViewType::e2D;
 			destination_view_info.aspect      = vk::ImageAspectFlagBits::eDepth;
+			if (with_stencil) {
+				destination_view_info.aspect |= vk::ImageAspectFlagBits::eStencil;
+			}
 			destination_view_info.base_level  = level;
 			destination_view_info.level_count = 1;
 			destination_view_info.base_layer  = layer;
@@ -424,11 +440,17 @@ void BlitHelper::CopyColor32ToDepth(Image& source, Image& destination) {
 			// The fullscreen triangle writes every texel of the render area.
 			depth_attachment.loadOp  = vk::AttachmentLoadOp::eDontCare;
 			depth_attachment.storeOp = vk::AttachmentStoreOp::eStore;
+			vk::RenderingAttachmentInfo stencil_attachment {};
+			stencil_attachment.imageView   = destination_view;
+			stencil_attachment.imageLayout = ColorToMsDepthLayout;
+			stencil_attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+			stencil_attachment.storeOp     = vk::AttachmentStoreOp::eStore;
 
 			vk::RenderingInfo rendering {};
-			rendering.renderArea.extent = vk::Extent2D {width, height};
-			rendering.layerCount        = 1;
-			rendering.pDepthAttachment  = &depth_attachment;
+			rendering.renderArea.extent  = vk::Extent2D {width, height};
+			rendering.layerCount         = 1;
+			rendering.pDepthAttachment   = &depth_attachment;
+			rendering.pStencilAttachment = with_stencil ? &stencil_attachment : nullptr;
 			command.beginRendering(&rendering);
 
 			vk::WriteDescriptorSet write {};

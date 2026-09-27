@@ -36,6 +36,7 @@
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
@@ -1249,6 +1250,8 @@ struct TestCase {
   u32 image_descriptor_swizzle = DstSel(4, 5, 6, 7);
   bool compile_only = false;
   size_t storage_buffer_range_dwords = 0;
+  // Descriptor range in bytes for every storage buffer (overrides the dword range when set).
+  size_t storage_buffer_range_bytes = 0;
   std::vector<u32> storage_buffer_offsets;
   std::vector<BdaMapping> bda_mappings;
   bool expand_shader_data_storage = false;
@@ -1900,6 +1903,10 @@ public:
   };
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
+  // robustStorageBufferAccessSizeAlignment, or 0 without robustBufferAccess2.
+  [[nodiscard]] vk::DeviceSize RobustStorageAlignment() const {
+    return m_robust_storage_alignment;
+  }
   [[nodiscard]] u32 SubgroupSize() const {
     vk::PhysicalDeviceSubgroupProperties subgroup{};
     vk::PhysicalDeviceProperties2 properties{};
@@ -13591,6 +13598,11 @@ public:
           Require(test.name, "dispatch", info.range <= buffer.size,
                   "storage buffer descriptor range exceeds backing buffer");
         }
+        if (test.storage_buffer_range_bytes != 0) {
+          info.range = static_cast<vk::DeviceSize>(test.storage_buffer_range_bytes);
+          Require(test.name, "dispatch", info.range <= buffer.size,
+                  "storage buffer descriptor range exceeds backing buffer");
+        }
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -16115,6 +16127,9 @@ private:
     available_provoking_vertex.pNext = &available_feedback_dynamic;
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT available_min_lod{};
     available_min_lod.pNext = &available_provoking_vertex;
+    vk::PhysicalDeviceRobustness2FeaturesEXT available_robustness2{};
+    available_robustness2.pNext = available_min_lod.pNext;
+    available_min_lod.pNext = &available_robustness2;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_min_lod;
@@ -16208,7 +16223,18 @@ private:
     min_lod.pNext = &provoking_vertex;
     min_lod.minLod = true;
     device_info.pNext = &min_lod;
+    // Like the emulator's device: robustBufferAccess2 when available, so shaders may leave plain
+    // dword storage-buffer bounds checks to the device (see HostBufferRobustness).
+    vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
+    const bool robustness2_supported =
+        available_robustness2.robustBufferAccess2 == VK_TRUE;
+    if (robustness2_supported) {
+      robustness2.robustBufferAccess2 = VK_TRUE;
+      robustness2.pNext = const_cast<void *>(device_info.pNext);
+      device_info.pNext = &robustness2;
+    }
     vk::PhysicalDeviceFeatures device_features{};
+    device_features.robustBufferAccess = robustness2_supported;
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
     device_features.sampleRateShading = true;
@@ -16227,6 +16253,9 @@ private:
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
         VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+    if (robustness2_supported) {
+      device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    }
     // KYTY_PIPELINE_LIBRARY=1 runs the renderer's pipeline creation through graphics pipeline
     // libraries (pipelineLibrary.h), as on a production device that supports them. Checks that
     // compare pipeline handles need KYTY_PIPELINE_LIBRARY_OPTIMIZE=0 (a background build replaces
@@ -16234,7 +16263,7 @@ private:
     // the driver's cache already holds.
     vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT pipeline_library{};
     if (PipelineLibraryRequested()) {
-      pipeline_library.pNext = &min_lod;
+      pipeline_library.pNext = const_cast<void *>(device_info.pNext);
       pipeline_library.graphicsPipelineLibrary = true;
       device_info.pNext = &pipeline_library;
       device_features13.pipelineCreationCacheControl = true;
@@ -16242,13 +16271,25 @@ private:
       device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
       m_pipeline_library = true;
     }
-    device_info.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
+    device_info.enabledExtensionCount = static_cast<u32>(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
     m_device.getQueue(m_queue_family, 0, &m_queue);
+    {
+      vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties{};
+      vk::PhysicalDeviceProperties2 properties{};
+      properties.pNext = &robustness2_properties;
+      m_physical_device.getProperties2(&properties);
+      m_robust_storage_alignment =
+          robustness2_supported
+              ? robustness2_properties.robustStorageBufferAccessSizeAlignment
+              : 0u;
+      ShaderRecompiler::Spirv::SetHostBufferRobustness(
+          {.storage_dword_loads_return_zero = m_robust_storage_alignment == 1u});
+    }
 
     vk::CommandPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eCommandPoolCreateInfo;
@@ -16564,6 +16605,7 @@ private:
   vk::Queue m_queue = nullptr;
   vk::CommandPool m_command_pool = nullptr;
   u32 m_queue_family = 0;
+  vk::DeviceSize m_robust_storage_alignment = 0;
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
@@ -34295,6 +34337,8 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
 }
 
+#include "ShaderCodegenTests.inc"
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -34791,6 +34835,24 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--readlane-key-guard-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--codegen-only") == 0) {
+    VulkanHarness vulkan;
+    CodegenTests::RunAll(&vulkan);
+    return 0;
+  }
+  // Only the recompiler semantic cases (compute and graphics), without the host/runtime
+  // checks that precede them in the default run.
+  if (argc == 2 && std::strcmp(argv[1], "--cases-only") == 0) {
+    VulkanHarness vulkan;
+    for (const auto &test : MakeCases()) {
+      RunCase(&vulkan, test);
+    }
+    for (const auto &test : MakeGraphicsCases()) {
+      RunGraphicsCase(&vulkan, test);
+    }
+    std::printf("ShaderRecompilerComputeTests: all cases passed\n");
     return 0;
   }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

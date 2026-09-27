@@ -41,11 +41,35 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		return EmitAddU32(state, local,
 		                  EmitBinaryU32(state, spv::OpIMul, group, ConstantU32(state, size)));
 	}
-	const bool centroid = kind == IR::StageInputKind::BaryCoordSmoothCentroid;
+	const bool centroid = kind == IR::StageInputKind::BaryCoordSmoothCentroid ||
+	                      kind == IR::StageInputKind::BaryCoordNoPerspectiveCentroid;
+	const bool sample   = kind == IR::StageInputKind::BaryCoordSmoothSample ||
+	                    kind == IR::StageInputKind::BaryCoordNoPerspectiveSample;
+	const bool linear   = kind == IR::StageInputKind::BaryCoordNoPerspectiveCentroid ||
+	                    kind == IR::StageInputKind::BaryCoordNoPerspectiveSample;
 	const auto variable = InputVariableForKind(
-	    state, centroid ? IR::StageInputKind::BaryCoordSmooth : kind);
+	    state, centroid || sample ? (linear ? IR::StageInputKind::BaryCoordNoPerspective
+	                                        : IR::StageInputKind::BaryCoordSmooth)
+	                              : kind);
 	if (variable == 0) {
 		return ConstantU32(state, 0);
+	}
+	if (sample) {
+		// The sample I/J pair: the barycentrics at the current sample's position.
+		const auto sample_id_variable = InputVariableForKind(state, IR::StageInputKind::SampleId);
+		const auto sample_id          = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeI32(state), sample_id, sample_id_variable);
+		const auto coordinates = state.builder.AllocateId();
+		state.builder.RequireCapability(spv::CapabilityInterpolationFunction);
+		state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 3), coordinates,
+		                          GlslStd450(state), GLSLstd450InterpolateAtSample, variable,
+		                          sample_id);
+		const auto value = state.builder.AllocateId();
+		const auto bits  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, coordinates,
+		                          component + 1u);
+		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+		return bits;
 	}
 	if (kind == IR::StageInputKind::FrontFacing) {
 		const auto value = state.builder.AllocateId();
@@ -149,7 +173,8 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 	return result;
 }
 
-uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
+uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan,
+                       IR::InterpolationMode mode = IR::InterpolationMode::Unknown) {
 	const auto* input = InputBindingForParameter(state, attr);
 	if (input == nullptr || input->variable_id == 0) {
 		return ConstantU32(state, 0);
@@ -197,7 +222,21 @@ uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
 	const auto vector    = state.builder.AllocateId();
 	const auto component = state.builder.AllocateId();
 	const auto bits      = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeF32Vector(state, 4), vector, input->variable_id);
+	const auto decided   = state.input_interpolation.find(input->variable_id);
+	if (decided != state.input_interpolation.end() &&
+	    (decided->second == IR::InterpolationMode::PerspectiveCenter ||
+	     decided->second == IR::InterpolationMode::LinearCenter) &&
+	    (mode == IR::InterpolationMode::PerspectiveCentroid ||
+	     mode == IR::InterpolationMode::LinearCentroid)) {
+		// A centroid read of an input that other reads use at the pixel center.
+		state.builder.RequireCapability(spv::CapabilityInterpolationFunction);
+		state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 4), vector,
+		                          GlslStd450(state), GLSLstd450InterpolateAtCentroid,
+		                          input->variable_id);
+	} else {
+		state.builder.AddFunction(spv::OpLoad, TypeF32Vector(state, 4), vector,
+		                          input->variable_id);
+	}
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), component, vector,
 	                          chan & 3u);
 	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, component);
@@ -735,7 +774,12 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return EmitAttribute(ctx.state, inst.Arg(0).U32(), inst.Arg(1).U32());
+	return EmitAttribute(ctx.state, inst.Arg(0).U32(), inst.Arg(1).U32(),
+	                     static_cast<IR::InterpolationMode>(inst.Flags<uint32_t>()));
+}
+
+uint32_t EmitGetAttributeWithBary(ValueEmitContext& ctx, const IR::Inst& inst) {
+	ctx.Fail(inst, "was not resolved to GetAttribute by constant propagation");
 }
 
 uint32_t EmitGetInterpolationParameter(ValueEmitContext& ctx, const IR::Inst& inst) {

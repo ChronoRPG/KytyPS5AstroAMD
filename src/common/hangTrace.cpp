@@ -150,7 +150,7 @@ constexpr const char* kReadbackKindNames[] = {"invalidate", "fault-read", "fault
 constexpr const char* kImageFreeReasonNames[] = {
     "other",           "depth-association", "depth-recreate", "overlap-layout",
     "overlap-mip-merge", "overlap-stale",   "expand",         "smaller-resources",
-    "unmap",           "gc",                "pressure-gc"};
+    "unmap",           "gc",                "pressure-gc",    "resident-idle"};
 static_assert(std::size(kImageFreeReasonNames) == static_cast<size_t>(ImageFreeReason::Count));
 
 struct NativeImageKey {
@@ -274,6 +274,7 @@ struct Totals {
 	std::atomic<uint64_t> gpu_barrier_rp_splits {0};
 	std::atomic<uint64_t> gpu_rendering_ends {0};
 	std::atomic<uint64_t> gpu_draw_write_sinks {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(MemoryCounter::Count)> memory {};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(TransferKind::Count)> transfer_count {};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(TransferKind::Count)> transfer_bytes {};
 	std::atomic<uint64_t> compile_programs {0};
@@ -314,6 +315,49 @@ constexpr const char*    kPipelineOriginNames[] = {"", "new", "permutation", "va
 std::mutex               g_compile_mutex;
 std::vector<std::string> g_pending_compile_rows;
 uint64_t                 g_compile_rows_total = 0;
+
+struct MemoryCounterColumn {
+	const char* name;
+	uint64_t    divisor;
+};
+// summary.csv names of HangTrace::MemoryCounter, in enum order.
+constexpr std::array<MemoryCounterColumn, static_cast<size_t>(MemoryCounter::Count)>
+    kMemoryCounterColumns {{
+        {"mem_write_faults", 1},
+        {"mem_read_faults", 1},
+        {"mem_fault_us", 1000},
+        {"mem_protect_calls", 1},
+        {"mem_protect_pages", 1},
+        {"mem_unprotect_calls", 1},
+        {"mem_unprotect_pages", 1},
+        {"mem_protect_us", 1000},
+        {"mem_tracker_lock_contended", 1},
+        {"mem_scratch_allocs", 1},
+        {"mem_scratch_bytes", 1},
+        {"mem_scratch_us", 1000},
+        {"mem_buffer_from_image", 1},
+        {"mem_upload_copies", 1},
+        {"mem_upload_barriers", 1},
+        {"mem_upload_render_splits", 1},
+        {"mem_image_writebacks", 1},
+        {"mem_image_writeback_bytes", 1},
+        {"mem_image_writeback_partial", 1},
+        {"mem_image_writeback_skips", 1},
+        {"mem_fault_ahead_pages", 1},
+        {"mem_hot_promotions", 1},
+        {"mem_hot_demotions", 1},
+        {"mem_hot_upload_pages", 1},
+        {"mem_hot_upload_skipped", 1},
+        {"mem_written_upload_late_pages", 1},
+    }};
+static_assert(kMemoryCounterColumns.back().name != nullptr,
+              "memory counter columns must match HangTrace::MemoryCounter");
+// summary.csv emits the memory counters that existed when the compile columns were appended
+// after them in that position; any later MemoryCounter goes to the end of the row, so every
+// existing column keeps its index.
+constexpr size_t kMemoryColumnsBeforeCompile =
+    static_cast<size_t>(MemoryCounter::WrittenUploadLatePages) + 1;
+static_assert(kMemoryColumnsBeforeCompile <= kMemoryCounterColumns.size());
 
 std::mutex                  g_publish_mutex;
 std::condition_variable_any g_publish_condition;
@@ -720,6 +764,14 @@ void Publish() {
 		}
 		line += fmt::format(",{},{}", take(g_totals.gpu_rendering_ends),
 		                    take(g_totals.gpu_draw_write_sinks));
+		const auto memory_columns = [&](size_t begin, size_t end) {
+			for (size_t counter = begin; counter < end; counter++) {
+				line += fmt::format(",{}", take(g_totals.memory[counter]) /
+				                               kMemoryCounterColumns[counter].divisor);
+			}
+		};
+		memory_columns(0, kMemoryColumnsBeforeCompile);
+		// Compile columns (appended after the memory columns).
 		line += fmt::format(",{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
 		                    take(g_totals.compile_programs),
 		                    take(g_totals.compile_translate_ns) / 1000u,
@@ -754,6 +806,8 @@ void Publish() {
 		gpl(PipelineLibraryEvent::Linked, true);
 		gpl(PipelineLibraryEvent::Library, true);
 		gpl(PipelineLibraryEvent::Optimized, true);
+		// Memory counters added after the compile columns (none yet).
+		memory_columns(kMemoryColumnsBeforeCompile, kMemoryCounterColumns.size());
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
@@ -831,6 +885,13 @@ void Initialize() {
 	                  "xfer_buffer_upload_bytes,xfer_image_copies,xfer_image_copy_bytes,"
 	                  "xfer_alias_syncs,xfer_alias_sync_bytes";
 	summary_header += ",gpu_rendering_ends,gpu_draw_write_sinks";
+	const auto memory_header = [&](size_t begin, size_t end) {
+		for (size_t counter = begin; counter < end; counter++) {
+			summary_header += ',';
+			summary_header += kMemoryCounterColumns[counter].name;
+		}
+	};
+	memory_header(0, kMemoryColumnsBeforeCompile);
 	summary_header += ",compile_programs,compile_translate_us,compile_emit_us,compile_validate_us,"
 	                  "compile_module_us,compile_gfx_pipelines,compile_gfx_pipeline_us,"
 	                  "compile_cs_pipelines,compile_cs_pipeline_us,compile_stall_us,"
@@ -841,6 +902,7 @@ void Initialize() {
 	summary_header += ",validate_async_count,validate_async_us";
 	summary_header += ",gpl_cache_hits,gpl_links,gpl_link_us,gpl_libraries,gpl_library_us,"
 	                  "gpl_optimized,gpl_optimize_us";
+	memory_header(kMemoryColumnsBeforeCompile, kMemoryCounterColumns.size());
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.compiles = OpenFile("compiles.csv",
 	                            "t_ms,kind,stage,guest_hash,id,id2,origin,translate_us,emit_us,"
@@ -1466,6 +1528,13 @@ void RecordGpuFrame(const GpuFrame& frame) {
 	g_totals.gpu_dispatch_latency_ns.fetch_add(frame.dispatch_latency_ns,
 	                                           std::memory_order_relaxed);
 	g_totals.gpu_dropped.fetch_add(frame.dropped, std::memory_order_relaxed);
+}
+
+void CountMemory(MemoryCounter counter, uint64_t amount) {
+	if (!Enabled() || counter >= MemoryCounter::Count) {
+		return;
+	}
+	g_totals.memory[static_cast<size_t>(counter)].fetch_add(amount, std::memory_order_relaxed);
 }
 
 void RecordGpuOpCounts(const GpuOpCounts& counts) {

@@ -58,6 +58,7 @@ namespace {
 void Check(bool value, const char *text) {
   if (!value) {
     std::fprintf(stderr, "ShaderCfgTests: failed: %s\n", text);
+    if (std::getenv("KYTY_CFG_TESTS_CONTINUE") != nullptr) return;
     std::abort();
   }
 }
@@ -13511,9 +13512,10 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeExp1(0, 0, 0, 0), // POS0.x
       EncodeSopp(0x01),
   };
+  // +4 words / +1 instruction: the Invariant decoration on the position (MadMode::Position).
   const auto wqm_result = compile("wqm", wqm,
-                                  {.words = 407,
-                                   .instructions = 99,
+                                  {.words = 411,
+                                   .instructions = 100,
                                    .variables = 4,
                                    .loads = 3,
                                    .stores = 2,

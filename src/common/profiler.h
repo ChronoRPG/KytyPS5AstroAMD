@@ -301,6 +301,226 @@ enum class FrameEvent : uint32_t {
 	// changed since the previous one (KYTY_TEXEL_SYNC_SKIP).
 	TexelImageSyncDownloads,
 	TexelImageSyncSkips,
+	// Resident mip levels (KYTY_TEXTURE_RESIDENT_MIPS): images created holding only the levels
+	// their views can sample and the levels left out, guest bytes their refreshes did not
+	// upload, residency extensions (a finer MIN_LOD, or any non-sampling use), extensions to
+	// the whole chain for non-sampling uses, partially resident images retired by an unmap of
+	// their non-resident bytes, and GPU writes that reached a partially resident image (0).
+	TextureResidentImages,
+	TextureResidentLevelsSkipped,
+	TextureResidentBytesSkipped,
+	TextureResidencyExtensions,
+	TextureResidencyFullFallbacks,
+	TextureResidencyUnmapFrees,
+	TextureResidencyViolations,
+	// Partially resident images retired after KYTY_TEXTURE_RESIDENT_IDLE_FRAMES unused frames.
+	TextureResidentIdleFrees,
+	// Headerless shader code hashed from a clean-backing copy (no fault possible) or in place
+	// through the guest mapping (KYTY_SHADER_HASH_BACKING).
+	ShaderCodeHashBacking,
+	ShaderCodeHashDirect,
+	// GPU-thread reads of GPU-owned bytes (KYTY_READBACK_SIDE_GPU_THREAD): served by a side copy
+	// the GPU thread waited for, or by the drain path (fallback reason also counted above).
+	ReadbackGpuThreadSideCopies,
+	ReadbackGpuThreadDrains,
+	// Side copies submitted to the second queue of the family (KYTY_SIDE_QUEUE).
+	ReadbackSideQueueCopies,
+	// Visibility-proxy end dumps (KYTY_OCCLUSION_PROXY_MODE); end-of-pipe labels deferred to their
+	// tick's completion (all, armed by a proxy dump, kept behind an older deferred label to the
+	// same address); WAIT_REG_MEM suspensions on a pending deferred label, and those that first
+	// flushed the recording holding it.
+	OcclusionProxyDumps,
+	LabelWritesDeferred,
+	LabelWritesDeferredProxy,
+	LabelWritesDeferredOrdered,
+	WaitRegMemDeferredLabel,
+	WaitRegMemDeferredLabelFlushes,
+	// Completion-runner (priority) operations run, and broadcasts to WaitPriorityOperations /
+	// DrainPriorityOperations waiters (KYTY_PRIORITY_WAKE_BATCH: only at a tick boundary with waiters).
+	PriorityOperationsRun,
+	PriorityWaiterWakeups,
+	// CP scheduler with every queue suspended (KYTY_CP_WAKEUPS): short retry spins, timed sleeps,
+	// and completion/label/flip notifications that unblocked suspended queues.
+	CpBlockedSpins,
+	CpBlockedSleeps,
+	CpProgressWakeups,
+	// WAIT_FLIP_DONE packets that suspended their queue (KYTY_FLIP_WAIT_MODE=suspend) or blocked
+	// the GPU thread (=block).
+	FlipWaitSuspends,
+	FlipWaitBlocking,
+	// GDS end-of-pipe reads (RELEASE_MEM data_sel=5 / event source 1), and those snapshotted and
+	// written at completion instead of draining the GPU (KYTY_GDS_EOP_MODE=defer).
+	GdsEopReads,
+	GdsEopReadsDeferred,
+	// Early submits because the GPU had finished all submitted work (KYTY_IDLE_FLUSH_DRAWS), outside
+	// and inside an active rendering instance.
+	IdleFlushes,
+	IdleFlushesInPass,
+	// Graphics slices ended early so runnable async compute queues could run (KYTY_GFX_SLICE_DRAWS).
+	GfxSliceYields,
+	// End-of-pipe data writes Kyty used to drop (KYTY_EOP_DROPPED_LABELS): graphics-queue events
+	// with INT_SEL=1, and RELEASE_MEM with INT_SEL=4 and DATA_SEL 1/2/3.
+	EopLabelsIntSel1,
+	ReleaseMemLabelsIntSel4,
+	// CP WRITE_DATA packets recorded on the GPU timeline because their destination was owned by
+	// recorded GPU work (KYTY_WRITE_DATA_GPU), and those written by the CPU at parse time.
+	WriteDataGpu,
+	WriteDataCpu,
+	// AgcSuspendPoint calls in bounded mode (KYTY_AGC_DONE_MODE) that had to wait for the previous
+	// frame's submissions.
+	AgcDoneBoundedWaits,
+	// Texture binding identity memo (KYTY_TEXTURE_BINDING_MEMO, pipeline/textureBindingMemo.h).
+	// ResolveTexture answered from an entry (Hits), with no entry for the key (Misses), or with an
+	// entry that a texture-cache structure change or the image's live state ruled out (Stale: new
+	// page version, stencil association, pending rebind, residency extension needed, alias
+	// partner not owned). Full resolutions recorded (Fills) or not memoizable (Rejects:
+	// overlap/rebased answers, DCC, stencil redirect, non-first-page lookup). Sampled views
+	// answered from an entry (ViewHits) or by FindTexture after the entry could not be used
+	// (ViewMisses: first use, dirty/untracked/under-resident image). Hits whose binding already
+	// held the description (DescCopiesAvoided). StructureChanges: registrations,
+	// unregistrations and stencil associations (each bumps the versions of the pages it covers).
+	TextureBindingMemoHits,
+	TextureBindingMemoMisses,
+	TextureBindingMemoStale,
+	TextureBindingMemoFills,
+	TextureBindingMemoRejects,
+	TextureViewMemoHits,
+	TextureViewMemoMisses,
+	TextureBindingDescCopiesAvoided,
+	TextureCacheStructureChanges,
+	// Descriptor commit. Renderer pipeline layouts created, and pipelines that received an
+	// existing interned layout (KYTY_LAYOUT_INTERN, pipeline/pipelineLayoutCache.h).
+	PipelineLayoutsCreated,
+	PipelineLayoutsShared,
+	// vkCmdPushConstants recorded by descriptor commits, and identical updates skipped by the
+	// per-command-buffer shadow (KYTY_PUSH_CONSTANT_SHADOW).
+	PushConstantUpdates,
+	PushConstantUpdatesAvoided,
+	// Push-descriptor updates recorded (DescriptorPushesAvoided counts the skipped ones) and, for
+	// renderer commits, why an update was needed: no comparable earlier update in this command
+	// buffer for the bind point, or another layout (Layout); a different binding list (Shape); or
+	// the kind of the first descriptor that differs: image, sampler, guest storage buffer, per-draw
+	// upload (flattened SRT or shader data), other (GDS, BDA page table, fault buffer, mip stats).
+	DescriptorPushes,
+	DescriptorPushMissLayout,
+	DescriptorPushMissShape,
+	DescriptorPushMissImage,
+	DescriptorPushMissSampler,
+	DescriptorPushMissBuffer,
+	DescriptorPushMissUpload,
+	DescriptorPushMissOther,
+	// Layouts beyond maxPushDescriptors (KYTY_DESCRIPTOR_SET_REUSE): sets allocated and written,
+	// sets reused because this command buffer already wrote one with the same layout and
+	// contents, and binds skipped because that set was still bound.
+	DescriptorSetsWritten,
+	DescriptorSetsReused,
+	DescriptorSetBindsAvoided,
+	// Per-draw shader-data/flattened-SRT uploads answered by the previous upload of the same stage
+	// slot and kind before hashing (KYTY_UPLOAD_DEDUP); also counted in ShaderUploadReuseHits.
+	ShaderUploadLastHits,
+	// Guest memory tracking and buffer uploads (graphics/host_gpu/memoryStats.h, mirrored in the
+	// hang-trace mem_* columns): guest write/read faults handled by RenderContext and the time
+	// spent handling them (nanoseconds), host protection calls/pages removing write access and
+	// restoring read-write access and their time, contended region tracking lock acquisitions,
+	// tiler scratch buffer allocations (count, bytes, nanoseconds), SynchronizeBufferFromImage
+	// downloads, and the copy commands, pipeline barriers and rendering-instance ends recorded by
+	// CPU-dirty buffer uploads (BufferCache::SynchronizeBuffer).
+	GuestWriteFaults,
+	GuestReadFaults,
+	GuestFaultNanoseconds,
+	PageProtectCalls,
+	PageProtectPages,
+	PageUnprotectCalls,
+	PageUnprotectPages,
+	PageProtectNanoseconds,
+	TrackerLockContended,
+	TilerScratchAllocs,
+	TilerScratchBytes,
+	TilerScratchNanoseconds,
+	BufferFromImageSyncs,
+	BufferUploadCopies,
+	BufferUploadBarriers,
+	BufferUploadRenderSplits,
+	// GPU-modified images moved into a buffer before a GPU write took their ownership
+	// (BufferCache::PreserveImagesForGpuWrite): downloads, bytes, downloads covering only leading
+	// mips, and overlapping images that could not be moved (their contents are lost as before).
+	ImageWritebacks,
+	ImageWritebackBytes,
+	ImageWritebackPartial,
+	ImageWritebackSkips,
+	// Write-fault policy (KYTY_FAULT_AHEAD_KB, KYTY_HOT_PAGES, MemoryTracker): pages made CPU-dirty
+	// ahead of use by a write fault, pages entering and leaving hot (sticky-dirty, unprotected)
+	// tracking, hot pages visited by buffer uploads, and those skipped as unchanged.
+	FaultAheadPages,
+	HotPagePromotions,
+	HotPageDemotions,
+	HotPageUploads,
+	HotPageUploadsSkipped,
+	// Written-upload pages a racing guest write re-dirtied while they were copied outside the
+	// tracker locks (KYTY_UPLOAD_COPY_OUTSIDE_LOCK), copied again under the locks.
+	WrittenUploadLatePages,
+	// Image::CopyImageWithBuffer rounds (barrier, image->buffer copy of all packed regions,
+	// barrier, buffer->image copy); ImageCopyViaBuffer counts the copies themselves.
+	ImageCopyViaBufferRounds,
+	// Draw-prep S5/S6 (KYTY_DRAW_PREP=inline|parallel). Submitted: direct draws handed to the
+	// engine. Published: entered the preparation window (parallel). Ready: prepared by a worker
+	// before the command processor needed it. SelfPrepared: prepared on the command processor
+	// (inline mode, or the head slot was still unclaimed). Committed: the prepared programs were
+	// used after a valid certificate. Unused: the draw returned before its programs were needed.
+	DrawPrepSubmitted,
+	DrawPrepPublished,
+	DrawPrepReady,
+	DrawPrepSelfPrepared,
+	DrawPrepCommitted,
+	DrawPrepUnused,
+	// Serial fallbacks per reason. Ineligible: tessellation, O15 reuse or a draw the engine does
+	// not take. Unclean/Backing/Overflow/Inconsistent/Uncertified: preparation reads (readSet.h).
+	// NotPublished: a source or permutation was missing. ShaderMap: the shader map changed before
+	// commit. CertUnclean/CertChanged: a read range was not clean, or held other bytes, at commit.
+	// CoherenceLog: the log check failed (KYTY_DRAW_PREP_CERT=log). Mismatch: the commit's own
+	// pixel-activity or export-mapping decision differed from the snapshot's.
+	DrawPrepFallbackIneligible,
+	DrawPrepFallbackUnclean,
+	DrawPrepFallbackBacking,
+	DrawPrepFallbackOverflow,
+	DrawPrepFallbackInconsistent,
+	DrawPrepFallbackUncertified,
+	DrawPrepFallbackNotPublished,
+	DrawPrepFallbackShaderMap,
+	DrawPrepFallbackCertUnclean,
+	DrawPrepFallbackCertChanged,
+	DrawPrepFallbackCoherenceLog,
+	DrawPrepFallbackMismatch,
+	// Certificate sizes (coalesced ranges and bytes of committed certificates).
+	DrawPrepCertRanges,
+	DrawPrepCertBytes,
+	// KYTY_DRAW_PREP_VERIFY: prepared draws re-prepared serially, and differences.
+	DrawPrepVerifyChecks,
+	DrawPrepVerifyMismatches,
+	// S0 window measurement: fences (packets that end a preparation window) and the number of
+	// direct draws parsed since the previous fence, bucketed. Also counted with
+	// KYTY_DRAW_PREP_HISTOGRAM=1 in off mode.
+	DrawPrepFences,
+	DrawPrepFenceDraws0,
+	DrawPrepFenceDraws1,
+	DrawPrepFenceDraws2To3,
+	DrawPrepFenceDraws4To7,
+	DrawPrepFenceDraws8To15,
+	DrawPrepFenceDraws16To31,
+	DrawPrepFenceDraws32To63,
+	DrawPrepFenceDraws64Plus,
+	// Parallel mode: drains (window committed because of a fence or a full window), the summed
+	// window occupancy observed at each publish (mean = sum / Published), and head slots the
+	// command processor had to wait for while a worker was preparing them.
+	DrawPrepDrains,
+	DrawPrepWindowOccupancy,
+	DrawPrepCommitWaits,
+	// KYTY_DRAW_PREP_LOG_AUDIT=1 with value certificates: commits the log check would have
+	// refused although the bytes were unchanged (LogWouldReject), and certificates whose ranges
+	// were clean with no intersecting log entry but whose bytes had changed (LogMissed: the
+	// log-mode certificate would have accepted stale bytes).
+	DrawPrepLogWouldReject,
+	DrawPrepLogMissed,
 	// New compute pipelines (graphics ones are GraphicsPipelinesCreated). Programs and pipelines
 	// are also recorded per compile in the hang trace (compiles.csv).
 	ComputePipelinesCreated,
@@ -360,6 +580,29 @@ enum class FrameWait : uint32_t {
 	TextureUpload,
 	// StagingCopier worker time copying guest texture bytes into staging (not the GPU thread).
 	TextureStagingCopy,
+	// GPU (CP) thread blocked in MasterSemaphore::Wait (submission dispatch plus timeline wait;
+	// waits that find the tick already complete are not counted), attributed to the caller that
+	// set a ScopedGpuWaitReason: ReadMemory drains, occlusion publication waits (sync proxy,
+	// predication on unpublished dumps, publish-slot reuse), stream-buffer wraps, LOD-stats slot
+	// reuse, unmaps, predication/boolean waits, GDS end-of-pipe reads, side-copy waits of GPU
+	// thread reads, and everything untagged (GpuWaitOther).
+	GpuWaitDrain,
+	GpuWaitOcclusion,
+	GpuWaitStreamWrap,
+	GpuWaitLodStats,
+	GpuWaitUnmap,
+	GpuWaitPredication,
+	GpuWaitGds,
+	GpuWaitSideCopy,
+	GpuWaitOther,
+	// Guest thread time in AgcSuspendPoint (GuestGpu::Done): the idle wait, or the bounded wait
+	// for the previous frame's submissions (KYTY_AGC_DONE_MODE).
+	AgcDoneWait,
+	// Draw-prep: command-processor time waiting for a worker's head slot (CommitWaitNs),
+	// preparation time on any thread, and certificate validation time at commit.
+	DrawPrepCommitWait,
+	DrawPrepPrepare,
+	DrawPrepValidate,
 	// Phases of a new program permutation, nested in ShaderProgramMiss: TranslateProgram,
 	// CompileProgram (specialization + SPIR-V emission), spirv-val and vkCreateShaderModule.
 	ShaderTranslate,
@@ -402,6 +645,21 @@ private:
 // Adds externally measured totals (the GPU timeline entries above) with the same gating as
 // ScopedFrameWait: aggregate diagnostics enabled and a connected profiler.
 void AddFrameWait(FrameWait kind, uint64_t calls, uint64_t nanoseconds);
+
+// Per-thread attribution of GPU waits (the GpuWait* categories): the innermost scope wins.
+class ScopedGpuWaitReason {
+public:
+	explicit ScopedGpuWaitReason(FrameWait reason);
+	ScopedGpuWaitReason(const ScopedGpuWaitReason&)            = delete;
+	ScopedGpuWaitReason& operator=(const ScopedGpuWaitReason&) = delete;
+	ScopedGpuWaitReason(ScopedGpuWaitReason&&)                 = delete;
+	ScopedGpuWaitReason& operator=(ScopedGpuWaitReason&&)      = delete;
+	~ScopedGpuWaitReason();
+
+private:
+	FrameWait m_previous;
+};
+[[nodiscard]] FrameWait CurrentGpuWaitReason() noexcept;
 
 // Call immediately after the existing completed guest-flip marker. Snapshots
 // include workload and wait totals, and are cumulative so an on-demand connection

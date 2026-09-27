@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
@@ -1201,6 +1202,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			barycentric_pair(ps->ps_perspective_center_vgpr, IR::StageInputKind::BaryCoordSmooth);
 			barycentric_pair(ps->ps_perspective_centroid_vgpr,
 			                 IR::StageInputKind::BaryCoordSmoothCentroid);
+			if (GetCodegenOptions().interp_modes) {
+				barycentric_pair(ps->ps_perspective_sample_vgpr,
+				                 IR::StageInputKind::BaryCoordSmoothSample);
+				barycentric_pair(ps->ps_linear_sample_vgpr,
+				                 IR::StageInputKind::BaryCoordNoPerspectiveSample);
+				barycentric_pair(ps->ps_linear_center_vgpr, IR::StageInputKind::BaryCoordNoPerspective);
+				barycentric_pair(ps->ps_linear_centroid_vgpr,
+				                 IR::StageInputKind::BaryCoordNoPerspectiveCentroid);
+			}
 			uint32_t reg = ps->ps_system_input_base;
 			if (ps->ps_pos_x) {
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(reg++),

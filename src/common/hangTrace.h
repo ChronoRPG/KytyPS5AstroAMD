@@ -41,7 +41,8 @@
 // active rendering instance). After the transfer columns: gpu_rendering_ends (guest rendering
 // instances ended, every cause; per-site Tracy plots GpuOps.EndRendering.<site>) and
 // gpu_draw_write_sinks (post-draw shader-write barriers kept pending across a draw continuing the
-// same instance, KYTY_DRAW_WRITE_SINK). Then shader/pipeline compilation (see RecordCompile):
+// same instance, KYTY_DRAW_WRITE_SINK). Then the guest memory tracking / upload counters
+// (MemoryCounter below, mem_* columns). Then shader/pipeline compilation (see RecordCompile):
 // compile_programs, compile_translate_us, compile_emit_us, compile_validate_us, compile_module_us,
 // compile_gfx_pipelines, compile_gfx_pipeline_us, compile_cs_pipelines, compile_cs_pipeline_us,
 // compile_stall_us, compile_stall_max_us, compile_gfx_new, compile_gfx_perm, compile_gfx_variant.
@@ -53,7 +54,8 @@
 // (KYTY_SHADER_VALIDATION_ASYNC), off the compiling thread (RecordShaderValidation).
 // Then graphics pipeline libraries (KYTY_PIPELINE_LIBRARY, RecordPipelineLibraryEvent):
 // gpl_cache_hits, gpl_links, gpl_link_us, gpl_libraries, gpl_library_us, gpl_optimized,
-// gpl_optimize_us.
+// gpl_optimize_us. Memory counters added to MemoryCounter after mem_written_upload_late_pages
+// follow at the end of the row (kMemoryColumnsBeforeCompile in hangTrace.cpp).
 // New columns are only ever appended.
 //
 //   compiles.csv       one row per new shader program permutation or pipeline: phase times, the
@@ -195,6 +197,7 @@ enum class ImageFreeReason : uint8_t {
 	Unmap,
 	GarbageCollect,
 	PressureCollect,
+	ResidentIdle,
 	Count
 };
 void SetImageFreeReason(ImageFreeReason reason);
@@ -303,6 +306,64 @@ void RecordShaderValidation(uint64_t validate_ns);
 // background optimized compile (Optimized, on a worker thread).
 enum class PipelineLibraryEvent : uint8_t { CacheHit, Linked, Library, Optimized, Count };
 void RecordPipelineLibraryEvent(PipelineLibraryEvent event, uint64_t ns, uint64_t count = 1);
+
+// Guest memory tracking and buffer upload counters (graphics/host_gpu/memoryStats.h), summed per
+// second into summary.csv columns appended after gpu_draw_write_sinks, in enum order (column
+// names in hangTrace.cpp; *_us columns are nanosecond counters divided by 1000). Append only;
+// counters added after WrittenUploadLatePages are emitted at the end of the row, after the
+// compile columns, so that no existing column index moves.
+//   mem_write_faults / mem_read_faults   guest write/read faults handled by RenderContext
+//   mem_fault_us                         time inside RenderContext::HandleFault (both kinds)
+//   mem_protect_calls / _pages           host protection calls that remove write access
+//   mem_unprotect_calls / _pages         host protection calls that restore read-write access
+//   mem_protect_us                       time inside those protection calls (both directions)
+//   mem_tracker_lock_contended           region tracking spinlock acquisitions that had to spin
+//   mem_scratch_allocs / _bytes / _us    tiler scratch buffers (vmaCreateBuffer) and their cost
+//   mem_buffer_from_image                SynchronizeBufferFromImage downloads recorded
+//   mem_upload_copies                    vkCmdCopyBuffer calls recording CPU-dirty uploads
+//   mem_upload_barriers                  pipeline barriers recorded around those uploads
+//   mem_upload_render_splits             uploads that had to end an active rendering instance
+//   mem_image_writebacks / _bytes        GPU-modified images moved into a buffer before a GPU
+//                                        write took their ownership (PreserveImagesForGpuWrite)
+//   mem_image_writeback_partial          of those, downloads that covered only leading mips
+//   mem_image_writeback_skips            overlapping GPU-modified images that could not be moved
+//                                        (unsupported/unsafe/outside the buffer): contents lost
+//   mem_fault_ahead_pages                pages a write fault made CPU-dirty ahead of use
+//   mem_hot_promotions / _demotions      pages entering / leaving hot (sticky-dirty) tracking
+//   mem_hot_upload_pages                 hot pages visited by uploads (compared with a shadow)
+//   mem_hot_upload_skipped               of those, unchanged pages whose copy was skipped
+//   mem_written_upload_late_pages        written-upload pages a racing guest write re-dirtied
+//                                        while copied outside the tracker lock (copied again)
+enum class MemoryCounter : uint8_t {
+	WriteFaults,
+	ReadFaults,
+	FaultNs,
+	ProtectCalls,
+	ProtectPages,
+	UnprotectCalls,
+	UnprotectPages,
+	ProtectNs,
+	TrackerLockContended,
+	ScratchAllocs,
+	ScratchAllocBytes,
+	ScratchAllocNs,
+	BufferFromImageSyncs,
+	UploadCopies,
+	UploadBarriers,
+	UploadRenderSplits,
+	ImageWritebacks,
+	ImageWritebackBytes,
+	ImageWritebackPartial,
+	ImageWritebackSkips,
+	FaultAheadPages,
+	HotPromotions,
+	HotDemotions,
+	HotUploadPages,
+	HotUploadSkipped,
+	WrittenUploadLatePages,
+	Count
+};
+void CountMemory(MemoryCounter counter, uint64_t amount = 1);
 
 } // namespace HangTrace
 

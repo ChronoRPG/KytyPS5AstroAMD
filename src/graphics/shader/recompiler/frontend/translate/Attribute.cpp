@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <algorithm>
@@ -76,6 +77,17 @@ void Translator::TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32
 void Translator::V_INTERP_P1_F32() {}
 
 void Translator::V_INTERP_P2_F32(const Decoder::Instruction& inst) {
+	// The host interpolates the input; the J operand (VGPR) tells which hardware I/J pair the guest
+	// used, so the input can get the matching centroid/sample/linear interpolation
+	// (KYTY_INTERP_MODES). Constant propagation resolves it once the operand is an SSA value.
+	if (GetCodegenOptions().interp_modes && program.stage == ShaderType::Pixel &&
+	    inst.src0.kind == Decoder::OperandKind::Vgpr) {
+		const auto value = ir.Emit(IR::ValueOpcode::GetAttributeWithBary,
+		                           {IR::Value(inst.src1.value), IR::Value(inst.src2.value),
+		                            ir.GetVectorReg(static_cast<IR::VectorReg>(inst.src0.reg))});
+		WriteOperand(inst.dst, value);
+		return;
+	}
 	const auto value = ir.Emit(IR::ValueOpcode::GetAttribute,
 	                           {IR::Value(inst.src1.value), IR::Value(inst.src2.value)});
 	WriteOperand(inst.dst, value);

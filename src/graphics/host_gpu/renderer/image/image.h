@@ -89,17 +89,32 @@ public:
 	void AdoptContentSerial(uint64_t serial) noexcept { m_content_serial = serial; }
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
-		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
+		if (ImageRangeOverlaps(live.address, live.size, vaddr, size)) {
 			m_cpu_dirty        = true;
 			m_maybe_cpu_dirty  = false;
 			m_maybe_hash_valid = false;
 			// Whole-image invalidation carries no chunk information.
 			m_partial_valid = false;
 			NoteDirtySpan(vaddr, size);
-		} else if (ImagePageRangesOverlap(info.data.address, info.data.size, vaddr, size)) {
+		} else if (ImagePageRangesOverlap(live.address, live.size, vaddr, size)) {
 			m_maybe_cpu_dirty = true;
 			NoteDirtySpan(vaddr, size);
 		}
+	}
+
+	// Resident mip levels (TextureCache, KYTY_TEXTURE_RESIDENT_MIPS). PS5 mip chains are stored
+	// smallest level first, so levels [resident_first, levels) occupy the prefix `live` of the
+	// guest range. The cache registers, watches, overlap-tests and uploads only `live`; levels
+	// below resident_first hold undefined native contents that no view can sample (every
+	// sampled view clamps its minimum LOD at or above resident_first, see TextureCache::
+	// RequestedFirstLevel). Any other use makes the image fully resident first.
+	[[nodiscard]] bool FullyResident() const noexcept { return resident_first == 0; }
+	// Every resident level must be refreshed from guest memory (newly resident levels).
+	void MarkResidencyDirty() noexcept {
+		m_cpu_dirty        = true;
+		m_maybe_cpu_dirty  = false;
+		m_maybe_hash_valid = false;
+		m_partial_valid    = false;
 	}
 
 	// Chunk-granular CPU write tracking (TextureCache, KYTY_TEXTURE_PARTIAL_UPLOAD). Only for
@@ -128,14 +143,18 @@ public:
 	[[nodiscard]] bool ChunkTracked() const noexcept { return chunks.count != 0; }
 	void               EnableChunkTracking(uint32_t shift) {
 		chunks.shift = shift;
-		chunks.base  = info.data.address & ~((uint64_t {1} << shift) - 1);
-		const auto end   = info.data.End();
+		chunks.base  = live.address & ~((uint64_t {1} << shift) - 1);
+		const auto end   = live.End();
 		const auto count = ((end - chunks.base) + (uint64_t {1} << shift) - 1) >> shift;
 		chunks.count     = static_cast<uint32_t>(count);
 		chunks.dirty.assign((count + 63) / 64, 0);
 		chunks.untracked.assign((count + 63) / 64, 0);
 		chunks.dirty_count     = 0;
 		chunks.untracked_count = 0;
+		chunks.full_streak     = 0;
+		chunks.whole_cycles    = 0;
+		chunks.whole_released  = false;
+		chunks.hashes.clear();
 	}
 	[[nodiscard]] static bool ChunkBit(const std::vector<uint64_t>& bits, uint32_t index) noexcept {
 		return (bits[index >> 6] >> (index & 63u)) & 1u;
@@ -194,8 +213,8 @@ public:
 	// Transfer attribution (diagnostics only): union of the guest ranges that dirtied this image
 	// since its last refresh, clipped to the image, and why it was last refreshed.
 	void NoteDirtySpan(uint64_t vaddr, uint64_t size) noexcept {
-		const auto begin = std::max(vaddr, info.data.address);
-		const auto end   = std::min(vaddr + size, info.data.End());
+		const auto begin = std::max(vaddr, live.address);
+		const auto end   = std::min(vaddr + size, live.End());
 		if (begin >= end) {
 			return;
 		}
@@ -277,10 +296,11 @@ public:
 	}
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
+	// Against the registered (resident) guest range; see `live`.
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
-		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
-		             : ImageRangeOverlaps(info.data.address, info.data.size, address, size);
+		return pages ? ImagePageRangesOverlap(live.address, live.size, address, size)
+		             : ImageRangeOverlaps(live.address, live.size, address, size);
 	}
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
@@ -292,6 +312,14 @@ public:
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 
 	ImageInfo        info;
+	// The guest bytes of the resident levels: info.data, or its prefix when resident_first > 0.
+	// Changed only while the image is unregistered.
+	GuestRange       live;
+	uint32_t         resident_first = 0;
+	// KYTY_TEXTURE_RESIDENT_MIPS=poison: non-resident levels were filled with a marker.
+	bool             residency_poisoned = false;
+	// The next refresh uploads levels made resident by a residency change (attribution only).
+	bool             residency_refresh = false;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
 	ImageUsage       usage;

@@ -50,9 +50,28 @@ public:
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
-	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-	// Guest read faults outside the GPU thread use a side copy when every dirty byte they need
-	// was written by an already submitted recording (KYTY_READBACK_SIDE_COPY=0 disables it).
+	// write_fault: a guest write fault on the range (fault-ahead / hot-page policy applies).
+	void                   InvalidateMemory(uint64_t vaddr, uint64_t size, bool write_fault = false);
+	// Once per completed guest flip (any thread): the frame clock of hot-page detection.
+	void                   AdvanceFrame() noexcept;
+	// While one is alive (GPU thread), CPU-dirty uploads are only queued on the current command
+	// buffer (KYTY_UPLOAD_BATCH, CommandBuffer::RequestUploadCopy); the outermost scope's end
+	// records them all behind one barrier. Every command recorded meanwhile through
+	// CommandBuffer::Handle() records the queue first, so only commands recorded through a handle
+	// obtained BEFORE the scope began must not follow uploads made in it.
+	class UploadBatch {
+	public:
+		explicit UploadBatch(BufferCache& cache);
+		~UploadBatch();
+		UploadBatch(const UploadBatch&)            = delete;
+		UploadBatch& operator=(const UploadBatch&) = delete;
+
+	private:
+		BufferCache& m_cache;
+	};
+	// Reads use a side copy when every dirty byte they need was written by an already submitted
+	// recording (KYTY_READBACK_SIDE_COPY=0 disables it). GPU-thread reads wait for their copy in
+	// place (KYTY_READBACK_SIDE_GPU_THREAD=0 makes them drain instead).
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	// Publishes (waiting if necessary) every pending side readback overlapping the range. Any
 	// thread; never waits for the current recording. Required before other ownership changes.
@@ -84,6 +103,9 @@ public:
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// CP WRITE_DATA to bytes owned by recorded GPU work: records the write (vkCmdUpdateBuffer)
+	// at its position in the GPU timeline and returns true; false leaves it to the CPU write.
+	[[nodiscard]] bool TryWriteDataGpu(uint64_t vaddr, const uint32_t* data, uint64_t size);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 
@@ -159,8 +181,39 @@ private:
 	                                     BdaSyncStats* stats = nullptr,
 	                                     const char* upload_reason = nullptr);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-	                                      uint64_t total_size);
+	                                      uint64_t total_size, size_t guest_copies = SIZE_MAX,
+	                                      const uint8_t* host_data = nullptr,
+	                                      uint64_t       host_base = 0);
+	// Hot pages (GPU thread). Snapshots each hot page of hot_ranges, appends a copy (reading
+	// m_hot_scratch from the first appended srcOffset on) for those that differ from their
+	// shadow, and lists pages to return to normal tracking.
+	void CollectHotPages(Buffer& buffer, std::span<const GuestRange> hot_ranges,
+	                     std::vector<vk::BufferCopy>& copies, uint64_t& total_size,
+	                     std::vector<uint64_t>& demote);
+	void EraseHotShadows(uint64_t vaddr, uint64_t size);
+	// Before (or right after recording) a GPU-side write of the range that tracked GPU ownership
+	// does not cover (image downloads into the buffer, unbounded address writers; size 0 = all):
+	// returns its hot pages to normal tracking, clean unless their contents changed since their
+	// last upload. From then on the ordinary fault tracking decides their next upload.
+	void SettleHotPages(uint64_t vaddr, uint64_t size);
+	void MaintainHotPages();
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// Records a download of a GPU-modified image into `buffer` at the image's own guest address
+	// (every mip level that fits). Caller holds the texture-cache lock and has checked that the
+	// image may be downloaded. Returns the bytes covered from the image start, 0 when nothing
+	// was recorded. skip_unchanged (texel reads, KYTY_TEXEL_SYNC_SKIP): record nothing when
+	// neither the image nor the buffer changed since the last download (sets *skipped).
+	[[nodiscard]] uint64_t RecordImageDownload(Buffer& buffer, Common::SlotId image_id,
+	                                           bool skip_unchanged = false,
+	                                           bool* skipped       = nullptr);
+	// A GPU write about to own [vaddr, vaddr + size) of buffer `id` takes GPU ownership away from
+	// every overlapping GPU-modified image (TextureCache::InvalidateMemoryFromGPU), after which
+	// the image is rebuilt from the buffer. Moves each such image's contents into the buffer
+	// first and makes those bytes GPU-owned, so neither the rebuild nor a CPU readback sees the
+	// stale guest bytes (KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE=0 disables). GPU thread, before the
+	// writer is recorded and before InvalidateMemoryFromGPU.
+	void PreserveImagesForGpuWrite(BufferId id, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] static bool ImageWritebackOnGpuWriteEnabled();
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	struct ReadMemoryTrace {
@@ -217,8 +270,25 @@ private:
 	void                                              ForgetKnownFillsLocked(uint64_t vaddr, uint64_t size);
 	mutable std::mutex                                m_known_fill_mutex;
 	std::vector<KnownFillRange>                       m_known_fills;
+	// m_known_fills is nonempty; written under m_known_fill_mutex, read without it.
+	std::atomic<bool>                                 m_has_known_fills {false};
 	const bool                                        m_bda_incremental_sync;
 	MemoryTracker                                     m_memory_tracker;
+	// Hot pages: exact copy of the last contents uploaded for each hot page (GPU thread only).
+	// While a page is hot its buffer bytes equal this copy: every other write of them either
+	// returns the page to normal tracking first (written uploads, SettleHotPages for image
+	// downloads and address writers, untracking) or keeps the bytes (joins copy them). A normal
+	// upload of the page erases the copy.
+	struct HotShadow {
+		std::unique_ptr<uint8_t[]> data;
+		uint32_t                   last_change = 0;
+		uint32_t                   last_use    = 0;
+	};
+	std::map<uint64_t, HotShadow>                     m_hot_shadows;
+	std::vector<uint8_t>                              m_hot_scratch;
+	uint32_t                                          m_hot_quiet_frames = 8;
+	uint32_t                                          m_upload_batch_depth = 0;
+	uint32_t                                          m_hot_sweep_frame  = 0;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};
 	// GPU-thread-only snapshots taken BEFORE the last full scan, never after it.
 	uint64_t                                          m_bda_scanned_cpu_epoch = 0;

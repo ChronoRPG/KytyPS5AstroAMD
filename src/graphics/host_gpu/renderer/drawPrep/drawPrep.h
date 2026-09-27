@@ -1,0 +1,191 @@
+#ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_DRAWPREP_H_
+#define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_DRAWPREP_H_
+
+#include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
+#include "graphics/host_gpu/renderer/drawPrep/readSet.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/render.h"
+
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <span>
+#include <vector>
+
+// Draw-prep S5/S6: prepare-then-commit for direct draws.
+//
+// KYTY_DRAW_PREP=off (default): nothing here runs; the command processor executes draws exactly
+// as before.
+// KYTY_DRAW_PREP=inline (S5): each direct draw snapshots the registers, is prepared on the
+// command processor (GPU) thread from that snapshot with every guest read recorded, and is then
+// committed: the command buffer reads the snapshot, the certificate is checked where the serial
+// path would call GetGraphicsPrograms, and the prepared programs are used when it holds (the
+// serial preparation runs otherwise). This is the whole protocol without threads.
+// KYTY_DRAW_PREP=parallel (S6): the command processor keeps parsing while DrawPrep workers
+// prepare the published draws of a window; packets that could change what a later draw reads
+// (fences) first commit the whole window in guest order.
+//
+// KYTY_DRAW_PREP_VERIFY=1|exit: after every committed preparation the serial preparation runs
+// on copies and the outputs are compared (logged and counted; "exit" stops on a difference).
+// KYTY_DRAW_PREP_CERT=value (default)|log: see Validate() in drawPrep.cpp.
+// KYTY_DRAW_PREP_WORKERS (default 6, 1..32), KYTY_DRAW_PREP_WINDOW (default 32 slots, rounded
+// up to a power of two), KYTY_DRAW_PREP_SPIN_US (default 200: how long an idle worker spins
+// before parking): parallel mode only.
+// KYTY_DRAW_PREP_HISTOGRAM=1: the S0 draws-per-fence histogram also in off mode (the packet
+// classification runs, nothing else changes).
+namespace Libs::Graphics {
+
+class RenderContext;
+struct ShaderVertexInputInfo;
+struct ShaderPixelInputInfo;
+
+namespace DrawPrep {
+
+enum class Mode : uint8_t { Off, Inline, Parallel };
+enum class CertMode : uint8_t { Value, Log };
+
+[[nodiscard]] Mode     GetMode();
+[[nodiscard]] int      VerifyMode(); // 0 off, 1 count/log, 2 exit on difference
+[[nodiscard]] CertMode GetCertMode();
+// The command processor's per-packet hook (window fences and the S0 histogram) is needed.
+[[nodiscard]] bool PacketHookEnabled();
+
+// The register state a draw reads, copied when the draw packet is parsed.
+struct RegisterSnapshot {
+	HW::Context    context;
+	HW::UserConfig user_config;
+	HW::Shader     shaders;
+};
+
+enum class Failure : uint8_t {
+	None,
+	Ineligible,
+	Unclean,
+	Backing,
+	Overflow,
+	Inconsistent,
+	Uncertified,
+	NotPublished,
+	ShaderMap,
+	CertUnclean,
+	CertChanged,
+	CoherenceLog,
+	Mismatch,
+};
+
+// One draw's speculative preparation and its certificate. Reused across draws (vectors keep
+// their capacity).
+struct PreparedDraw {
+	bool                                                ok      = false;
+	Failure                                             failure = Failure::None;
+	bool                                                pixel_active = false;
+	std::array<Prospero::ColorComponentMapping, 8>      target_export_mapping {};
+	PipelineCache::GraphicsPrograms                     programs;
+	ShaderVertexInputInfo                               vertex_info;
+	ShaderPixelInputInfo                                pixel_info;
+	PipelineCache::StagePrep                            vertex_prep;
+	PipelineCache::StagePrep                            pixel_prep;
+	ReadSet                                             reads;
+	uint64_t                                            coherence_generation  = 0;
+	uint64_t                                            shader_map_generation = 0;
+};
+
+// Whether the draw path would reach its program preparation for a draw with these registers and
+// counts (renderDraw.cpp: the early returns before PrepareDrawRenderState, with target operations
+// as a superset). Only such draws are prepared, so a preparation never evaluates registers the
+// serial path would not have evaluated for that draw.
+[[nodiscard]] bool DrawReachesPrograms(const HW::Context& context, const HW::UserConfig& user_config,
+                                       const HW::Shader& shaders, uint32_t count,
+                                       uint32_t instance_count);
+
+// The pure preparation of one draw from a register snapshot. `exact`: the caller is the GPU
+// thread (exact clean predicate for reads); otherwise a DrawPrep worker. Never touches the
+// texture/buffer caches, the scheduler or Vulkan, and never dereferences guest memory (every
+// read goes through the recorder). `eligible`: DrawReachesPrograms for the draw; otherwise the
+// preparation is skipped (Ineligible).
+void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, bool eligible,
+             bool exact, PreparedDraw& prepared);
+
+// GPU thread, at the point where the serial path would prepare the programs: whether the
+// prepared outputs equal what the serial preparation would produce now. Counts the committed
+// draw or the fallback reason.
+[[nodiscard]] bool Validate(PreparedDraw& prepared, bool pixel_active,
+                            std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping);
+
+// KYTY_DRAW_PREP_VERIFY: compares committed outputs with a serial preparation's (the pixel stage
+// only when it is active). Returns true when equal; otherwise counts, logs and (exit mode) stops.
+bool VerifyCommitted(bool pixel_active, const PipelineCache::GraphicsPrograms& programs,
+                     const ShaderVertexInputInfo& vertex_info, const ShaderPixelInputInfo& pixel_info,
+                     const PipelineCache::GraphicsStagePreps& preps,
+                     const PipelineCache::GraphicsPrograms& serial_programs,
+                     const ShaderVertexInputInfo&            serial_vertex_info,
+                     const ShaderPixelInputInfo&             serial_pixel_info,
+                     const PipelineCache::GraphicsStagePreps& serial_preps);
+
+enum class DrawKind : uint8_t { Index, Auto };
+
+// Owned by the graphics command processor; its methods run only on the GPU thread.
+//
+// Parallel mode (S6): Submit publishes the draw (register snapshot + resolved arguments) into
+// the window, where KYTY_DRAW_PREP_WORKERS DrawPrep#k threads claim and prepare it. The command
+// processor keeps parsing. Drain commits every pending draw in guest order; the command processor
+// drains before every fence packet, before servicing commands from other threads, when a
+// draw's instance count may be GPU data, and at the end of every command-stream slice. A head
+// slot no worker has claimed yet is prepared by the command processor itself; a claimed one is
+// waited for (spinning; only after 2 ms, as a deadlock guard, does the wait service commands from
+// other threads). Workers never touch the caches, the scheduler or Vulkan, and never dereference
+// guest memory; a failed preparation or certificate runs the serial preparation at commit.
+class Engine {
+public:
+	// service_commands runs the GPU thread's pending cross-thread commands (used while waiting).
+	// after_commit runs after every committed draw has been recorded, with the command buffer
+	// bound to the live registers again (the command processor's per-draw hooks, e.g. the
+	// idle-GPU early submit). Commits happen at packet boundaries (before a fence packet or a
+	// service command, at the end of a slice) or at the start of a draw packet, before the
+	// packet records anything, so a flush there splits no packet.
+	Engine(RenderContext& renderer, std::function<void()> service_commands,
+	       std::function<void()> after_commit);
+	~Engine();
+	Engine(const Engine&)            = delete;
+	Engine& operator=(const Engine&) = delete;
+
+	// Takes a direct draw whose arguments the command processor has fully resolved. Returns
+	// false when the caller must execute the draw serially now (off mode).
+	[[nodiscard]] bool Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
+	                          const DrawAutoArgs* auto_args, const HW::Context& context,
+	                          const HW::UserConfig& user_config, const HW::Shader& shaders);
+	// Commits every pending draw in submission order.
+	void Drain();
+	[[nodiscard]] bool Pending() const noexcept;
+
+	// Per-packet hook of the command processor (before the packet's handler runs).
+	void OnPacket(PacketClass packet_class);
+
+	struct Slot;
+
+private:
+	struct Workers;
+
+	void Commit(Slot& slot);
+	void CommitHead();
+	void NoteFence();
+	void FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index_args,
+	              const DrawAutoArgs* auto_args, const HW::Context& context,
+	              const HW::UserConfig& user_config, const HW::Shader& shaders);
+
+	RenderContext&           m_renderer;
+	Mode                     m_mode;
+	std::function<void()>    m_service_commands;
+	std::function<void()>    m_after_commit;
+	std::unique_ptr<Slot>    m_inline_slot;
+	std::unique_ptr<Workers> m_workers; // parallel mode: the window and its threads
+	uint64_t                 m_draws_since_fence = 0;
+};
+
+} // namespace DrawPrep
+} // namespace Libs::Graphics
+
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_DRAWPREP_H_

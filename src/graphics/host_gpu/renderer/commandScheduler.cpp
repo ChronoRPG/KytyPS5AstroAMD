@@ -5,11 +5,14 @@
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -150,6 +153,11 @@ void CommandScheduler::Shutdown() {
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
 	m_operation_available.notify_all();
+	{
+		// The runner re-checks its stop token only under the lock it sleeps with.
+		std::lock_guard lock(m_operation_mutex);
+	}
+	m_priority_available.notify_all();
 	if (m_priority_thread.joinable()) {
 		m_priority_thread.join();
 	}
@@ -299,9 +307,16 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 				m_diagnostic_generic_completion = true;
 			}
 		}
+		const bool was_empty = m_priority_operations.empty();
 		m_priority_operations.push({std::move(operation), CurrentTick()});
 		lock.unlock();
-		m_operation_available.notify_one();
+		if (!PriorityWakeupsBatched()) {
+			m_operation_available.notify_one();
+			m_priority_available.notify_one();
+		} else if (was_empty) {
+			// The runner sleeps only on an empty queue; otherwise it pops this one by itself.
+			m_priority_available.notify_one();
+		}
 		return;
 	}
 	if (g_deferred_callback_scheduler == this) {
@@ -315,12 +330,46 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 	operation();
 }
 
+bool CommandScheduler::PriorityWakeupsBatched() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PRIORITY_WAKE_BATCH");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+void CommandScheduler::SetProgressHook(ProgressHook hook, void* context) {
+	std::lock_guard lock(m_operation_mutex);
+	m_progress_hook         = hook;
+	m_progress_hook_context = context;
+}
+
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	const bool batched       = PriorityWakeupsBatched();
+	bool       has_previous  = false;
+	uint64_t   previous_tick = 0;
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
+		ProgressHook     hook         = nullptr;
+		void*            hook_context = nullptr;
 		{
 			std::unique_lock lock(m_operation_mutex);
-			m_operation_available.wait(lock, [this, &stop] {
+			if (has_previous) {
+				has_previous           = false;
+				m_priority_active      = false;
+				m_priority_active_tick = 0;
+				// Waiters need every operation of their tick done. Wake them when the next queued
+				// operation belongs to a later tick or the queue is empty, and only if any wait.
+				const bool tick_done = m_priority_operations.empty() ||
+				                       m_priority_operations.front().tick != previous_tick;
+				if (!batched || (m_priority_waiters != 0 && tick_done)) {
+					m_operation_available.notify_all();
+					if (batched) {
+						Profiler::CountFrameEvent(Profiler::FrameEvent::PriorityWaiterWakeups);
+					}
+				}
+			}
+			m_priority_available.wait(lock, [this, &stop] {
 				return stop.stop_requested() || !m_priority_operations.empty();
 			});
 			if (stop.stop_requested()) {
@@ -330,11 +379,23 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_operations.pop();
 			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
+			hook                   = m_progress_hook;
+			hook_context           = m_progress_hook_context;
 		}
 		m_master.Wait(operation.tick);
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
+			Profiler::CountFrameEvent(Profiler::FrameEvent::PriorityOperationsRun);
+			// Still marked active: an owner clearing the hook and then draining this runner
+			// never races with this call.
+			if (hook != nullptr) {
+				hook(hook_context);
+			}
 		}
+		has_previous  = true;
+		previous_tick = operation.tick;
+	}
+	if (has_previous) {
 		{
 			std::lock_guard lock(m_operation_mutex);
 			m_priority_active      = false;
@@ -347,19 +408,23 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 void CommandScheduler::DrainPriorityOperations() {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
+	++m_priority_waiters;
 	m_operation_available.wait(
 	    lock, [this] { return m_priority_operations.empty() && !m_priority_active; });
+	--m_priority_waiters;
 }
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
+	++m_priority_waiters;
 	m_operation_available.wait(lock, [this, tick] {
 		const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
 		const bool queued_before_or_at =
 		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
 		return !active_before_or_at && !queued_before_or_at;
 	});
+	--m_priority_waiters;
 }
 
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
@@ -379,6 +444,8 @@ bool CommandScheduler::IsFree(uint64_t tick) {
 
 void CommandScheduler::CheckActive() const {
 	EXIT_IF(!Active());
+	// Draw-prep workers only prepare; recording belongs to the GPU thread.
+	EXIT_IF(DrawPrep::IsWorkerThread());
 }
 
 CommandBuffer& CommandScheduler::Current() {

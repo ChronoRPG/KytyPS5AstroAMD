@@ -162,6 +162,11 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       custom_interpolation_mask    = 0;
 	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;
 	uint32_t                                       ps_perspective_centroid_vgpr = UINT32_MAX;
+	// First VGPR of the other SPI_PS_INPUT I/J pairs, UINT32_MAX when not enabled.
+	uint32_t                                       ps_perspective_sample_vgpr   = UINT32_MAX;
+	uint32_t                                       ps_linear_sample_vgpr        = UINT32_MAX;
+	uint32_t                                       ps_linear_center_vgpr        = UINT32_MAX;
+	uint32_t                                       ps_linear_centroid_vgpr      = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       scratch_size_dwords          = 0;
@@ -301,6 +306,8 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// Changes after every shader map update (draw-prep certificates compare it).
+[[nodiscard]] uint64_t ShaderMapGeneration();
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

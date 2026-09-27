@@ -38,6 +38,12 @@ struct ExceptionInfo {
 using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
+// Windows: additionally registers `handler` at the FRONT of the vectored exception handler list
+// for access violations only. It must return false (never terminate) for faults it does not
+// resolve: those continue to any other vectored handler and then to InstallHandler's, which
+// stays registered last. Returns false (nothing installed) on other platforms, where the
+// single signal handler already runs first.
+bool InstallFirstAccessHandler(Handler handler);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();
