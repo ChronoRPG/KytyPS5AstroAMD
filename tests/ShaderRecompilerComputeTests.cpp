@@ -7958,12 +7958,18 @@ public:
               "failed to create the overlapping dirty Buffer owner");
       exact_buffer.first->Fill(exact_buffer.second, sizeof(uint32_t),
                                dirty_sibling_value);
+      // As every product GPU buffer writer does (storage bindings, fills, copies,
+      // GPU-timeline WRITE_DATA): the write retires the GPU ownership of the images
+      // it overlaps. TextureCache::SupersedesGpuDirtyBytes relies on this.
+      texture_cache.InvalidateMemoryFromGPU(base + exact_image_offset,
+                                            sizeof(uint32_t));
       Libs::Graphics::Buffer exact_download(
           m_runtime_context, scheduler, MemoryUsage::DeviceLocal,
           base + exact_image_offset, AllFlags, sizeof(uint32_t));
       Require(name, "overlapping buffer ownership rejection",
-              !texture_cache.FindImageFromRange(base + exact_image_offset,
-                                                sizeof(uint32_t)) &&
+              !texture_cache.GetImage(exact_image).IsGpuModified() &&
+                  !texture_cache.FindImageFromRange(base + exact_image_offset,
+                                                    sizeof(uint32_t)) &&
                   !BufferCacheTestAccess::SynchronizeBufferFromImage(
                       resources.GetBufferCache(), exact_download,
                       base + exact_image_offset, sizeof(uint32_t)),
