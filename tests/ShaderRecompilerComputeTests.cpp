@@ -180,6 +180,16 @@ struct BufferCacheTestAccess {
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
+
+  // GPU-dirty bytes without their writer (e.g. left by an earlier image writeback).
+  static void AddGpuDirty(BufferCache &cache, uint64_t address, uint64_t size) {
+    cache.m_gpu_modified_ranges.Add(address, size);
+  }
+
+  static void SubtractGpuDirty(BufferCache &cache, uint64_t address,
+                               uint64_t size) {
+    cache.m_gpu_modified_ranges.Subtract(address, size);
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -375,6 +385,29 @@ struct TextureCacheTestAccess {
   static void DeleteImage(TextureCache &cache, ImageId id) {
     std::lock_guard lock(cache.m_lock);
     cache.DeleteImage(id);
+  }
+
+  // A GPU write binding of an ownership-only image (render target, storage image), as
+  // TextureCache::CommitGpuWrite records it without a native backing: the write supersedes
+  // pending refreshes and gives the contents a new serial.
+  static void MarkGpuModified(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    auto &image = cache.m_slot_images[id];
+    image.ClearBufferModified();
+    if (image.IsCpuDirty()) {
+      image.RefreshComplete();
+    }
+    cache.MarkImageGpuModified(image);
+  }
+
+  static bool SafeToDownload(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    return cache.SafeToDownload(cache.m_slot_images[id]);
+  }
+
+  static bool SafeToSyncIntoBuffer(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    return cache.SafeToSyncIntoBuffer(cache.m_slot_images[id]);
   }
 
   static const Image *Owner(const TextureCache &cache, ImageId id) {
@@ -4984,6 +5017,87 @@ public:
     Require(name, "final owner removal",
             !TextureCacheTestAccess::FindSameBacking(cache, info),
             "the exact lookup retained a removed image");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Texel-read syncs (SynchronizeBufferFromImage) over GPU-dirty buffer bytes that a
+  // GPU-modified image supersedes (KYTY_IMAGE_SUPERSEDES_GPU_DIRTY). Astro Bot's Sky Garden
+  // water copies its scene colour target with a compute memcpy that reads the target's memory
+  // as a texel buffer; an earlier image writeback had left that range GPU-dirty, so U40..U43
+  // never synced the target and the memcpy copied stale bytes (white water).
+  void CheckTexelSyncOverStaleGpuDirtyBytes() {
+    constexpr const char *name = "TexelSyncOverStaleGpuDirty";
+    constexpr uint64_t base = 0x0000000262000000ull;
+    constexpr uint64_t size = 0x10000;
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    auto &textures = context.GetTextureCache();
+    auto &buffers = context.GetBufferCache();
+
+    // Ownership-only record of a render target; its range holds GPU-dirty buffer bytes from an
+    // earlier writer, and the target was written after it.
+    ImageInfo info{};
+    info.data = {base, size};
+    BufferCacheTestAccess::AddGpuDirty(buffers, base, size);
+    const auto id = TextureCacheTestAccess::InsertImage(textures, info);
+    TextureCacheTestAccess::MarkGpuModified(textures, id);
+    Require(name, "guest downloads keep the veto",
+            buffers.HasGpuDirtyBytes(base, size) &&
+                TextureCacheTestAccess::Owner(textures, id)->SafeToDownload() &&
+                !TextureCacheTestAccess::SafeToDownload(textures, id) &&
+                !textures.FindImageFromRange(base, size),
+            "a guest-memory download accepted an image over GPU-dirty bytes");
+    Require(name, "texel-read sync over superseded bytes",
+            TextureCacheTestAccess::SafeToSyncIntoBuffer(textures, id) &&
+                textures.FindImageFromRange(base, size, true, true) == id,
+            "a GPU-modified image written after every GPU-dirty byte of its range was not "
+            "selected for the texel-read sync (the memcpy reads stale bytes)");
+
+    // An unbounded (address) writer bound after the image write may have written its bytes
+    // without taking the image's GPU ownership: the veto applies again.
+    gpu.SendCommandSync([&] { buffers.InvalidateContentRevisions(); });
+    Require(name, "unbounded writer after the image write",
+            !TextureCacheTestAccess::SafeToSyncIntoBuffer(textures, id) &&
+                !textures.FindImageFromRange(base, size, true, true),
+            "the image superseded bytes an unbounded writer bound after it may have written");
+
+    // A content mark restored after the unbounded writer (a depth binding that did not write)
+    // must not make the image look newer than that writer.
+    const auto mark = textures.MarkContent(id);
+    gpu.SendCommandSync([&] { buffers.InvalidateContentRevisions(); });
+    TextureCacheTestAccess::MarkGpuModified(textures, id);
+    Require(name, "rewritten after the unbounded writer",
+            TextureCacheTestAccess::SafeToSyncIntoBuffer(textures, id),
+            "a GPU write after the unbounded writer did not supersede the stale bytes");
+    textures.RestoreContentIfUnwritten(id, mark);
+    // (KYTY_ALIAS_SYNC_SKIP=0 disables restoring; the image then keeps its newer serial.)
+    const bool restored = textures.MarkContent(id).serial == mark.serial;
+    Require(name, "restored mark stays conservative",
+            restored ? !TextureCacheTestAccess::SafeToSyncIntoBuffer(textures, id)
+                     : TextureCacheTestAccess::SafeToSyncIntoBuffer(textures, id),
+            "a restored content serial ordered the image after a later unbounded writer");
+    TextureCacheTestAccess::MarkGpuModified(textures, id);
+
+    // A bounded GPU buffer write over part of the image takes its GPU ownership
+    // (InvalidateMemoryFromGPU): its bytes are the newer ones.
+    textures.InvalidateMemoryFromGPU(base + 0x100, sizeof(uint32_t));
+    Require(name, "bounded writer after the image write",
+            !TextureCacheTestAccess::SafeToSyncIntoBuffer(textures, id) &&
+                !textures.FindImageFromRange(base, size, true, true),
+            "the image superseded a bounded GPU write made after it");
+
+    TextureCacheTestAccess::DeleteImage(textures, id);
+    BufferCacheTestAccess::SubtractGpuDirty(buffers, base, size);
+    scheduler.Finish();
+    context.ShutdownGpu();
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -35267,6 +35381,11 @@ int main(int argc, char **argv) {
     vulkan.CheckImageExactBackingLookup();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--texel-sync-gpu-dirty-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTexelSyncOverStaleGpuDirtyBytes();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-pressure-retirement-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckImagePressureRetirement();
@@ -35533,6 +35652,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBufferCacheDirtyGarbageCollection();
 #endif
   vulkan.CheckUnifiedImageViewCache();
+  vulkan.CheckTexelSyncOverStaleGpuDirtyBytes();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();
   const auto tests = MakeCases();
