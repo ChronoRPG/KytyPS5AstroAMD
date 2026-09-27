@@ -3543,7 +3543,10 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 			return;
 		}
 	}
-	std::scoped_lock lock {m_lock};
+	// Images that stop watching these pages release them when the scope ends, after m_lock is
+	// released (KYTY_DEFER_UNPROTECT). Constructed before the lock guard, destroyed after it.
+	const PageManager::DeferUnprotectScope defer_unprotect;
+	std::scoped_lock                       lock {m_lock};
 	InvalidateCpuAliases(address, size);
 }
 

@@ -121,6 +121,10 @@ private:
 		static_assert(std::is_invocable_v<Flush&>);
 		static_assert(std::is_nothrow_invocable_v<AheadFunc&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
+		// The pages this makes CPU-dirty become writable when the scope ends, after every region
+		// lock below is released (KYTY_DEFER_UNPROTECT): their bits, serials and mirrors change
+		// under the lock as before, only the host call leaves it.
+		const PageManager::DeferUnprotectScope defer_unprotect;
 
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			RegionManager::FaultResult fault;

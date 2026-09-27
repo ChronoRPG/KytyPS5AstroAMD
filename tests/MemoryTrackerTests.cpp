@@ -5,12 +5,14 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/writeTickMap.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <semaphore>
 #include <string>
 #include <thread>
@@ -24,6 +26,7 @@
 #include <windows.h>
 #undef min
 #undef max
+#include <immintrin.h>
 #else
 #include <csignal>
 #include <map>
@@ -1086,6 +1089,305 @@ void TestWrittenUploadCopiesOutsideLock() {
   Release(memory);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Deferred write-unprotect (KYTY_DEFER_UNPROTECT) through the tracker
+
+void TestDeferredFaultUnprotect() {
+  PageManager::SetDeferModeForTests(PageManager::DeferMode::On);
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  UploadAll(tracker, address, page_size * 2);
+  Check(!IsWritable(memory) && !IsWritable(memory + page_size),
+        "deferred fault setup did not protect");
+
+  // Inside an enclosing scope (an emulator write between that scope's releases) the fault's
+  // release waits for the scope; reconciling the faulting page makes it writable at once.
+  {
+    const PageManager::DeferUnprotectScope outer;
+    WriteFault(tracker, address + 8);
+    Check(tracker.IsRegionCpuModified(address, page_size),
+          "fault did not make its page CPU-dirty");
+    Check(!IsWritable(memory), "fault inside an enclosing scope unprotected before it ended");
+    page_manager.Reconcile(address, 1, true);
+    Check(IsWritable(memory), "reconciling the faulting page left it protected");
+    memory[8] = 1;
+  }
+  // Alone, a fault returns with its page writable.
+  WriteFault(tracker, address + page_size + 8);
+  Check(IsWritable(memory + page_size), "fault returned with its page protected");
+  memory[page_size + 8] = 2;
+
+  // An upload takes the page back while a fault's release is still pending: the late update
+  // leaves it protected, and the retried write faults again and is tracked.
+  UploadAll(tracker, address, page_size * 2);
+  std::binary_semaphore faulted{0};
+  std::binary_semaphore uploaded{0};
+  bool stale_unprotect = false;
+  std::thread writer([&] {
+    {
+      const PageManager::DeferUnprotectScope scope;
+      WriteFault(tracker, address + 16);
+      faulted.release();
+      uploaded.acquire();
+    }
+    stale_unprotect = IsWritable(memory);
+    WriteFault(tracker, address + 16);
+    memory[16] = 3;
+  });
+  faulted.acquire();
+  uint64_t copied_pages = 0;
+  tracker.ForEachUploadRange(
+      address, page_size, false,
+      [&](uint64_t, uint64_t bytes) noexcept { copied_pages += bytes / page_size; },
+      []() noexcept {});
+  Check(copied_pages == 1 && !tracker.IsRegionCpuModified(address, page_size) &&
+            !IsWritable(memory),
+        "upload during a pending release did not take the page back");
+  uploaded.release();
+  writer.join();
+  Check(!stale_unprotect, "a stale release unprotected an uploaded page");
+  Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory) &&
+            memory[16] == 3,
+        "the retried write after a pending release was not tracked");
+
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+struct FaultStressState {
+  PageManager *page_manager = nullptr;
+  MemoryTracker *tracker = nullptr;
+  uint64_t begin = 0;
+  uint64_t end = 0;
+  std::atomic<uint64_t> faults{0};
+};
+FaultStressState g_fault_stress;
+
+// RenderContext::HandleFault's write path, on the stress test's memory.
+bool FaultStressHandler(const Common::HostException::ExceptionInfo &info) {
+  using namespace Common::HostException;
+  const auto address = info.access_violation_vaddr;
+  auto *tracker = g_fault_stress.tracker;
+  if (info.type != ExceptionType::AccessViolation ||
+      info.access_violation_type != AccessViolationType::Write || tracker == nullptr ||
+      address < g_fault_stress.begin || address >= g_fault_stress.end) {
+    return false;
+  }
+  g_fault_stress.faults.fetch_add(1, std::memory_order_relaxed);
+  const bool nested = PageManager::InDeferUnprotectScope();
+  {
+    const PageManager::DeferUnprotectScope scope;
+    tracker->InvalidateRegionOnWriteFault(address, 1, [] {},
+                                          [](uint64_t, uint64_t) noexcept {});
+    g_fault_stress.page_manager->Reconcile(address & ~(TRACKER_PAGE_SIZE - 1),
+                                           TRACKER_PAGE_SIZE, nested);
+  }
+  return true;
+}
+
+// Writer threads store to tracked pages (real faults, resolved as HandleFault does) while an
+// uploader keeps taking the pages back. After the last upload the uploaded copy must equal memory:
+// a write that landed on a page the tracker considered clean would be missing from it.
+void TestFaultStressNoLostWrites(PageManager::DeferMode mode) {
+  PageManager::SetDeferModeForTests(mode);
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 4;
+  PolicyHarness harness(policy);
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  constexpr uint64_t pages = 32;
+  auto *memory = Allocate(page_manager, pages);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto size = page_size * pages;
+  std::vector<uint8_t> shadow(size);
+  uint64_t uploads = 0;
+  const auto upload = [&] {
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    tracker.ForEachUploadRange(
+        address, size, false,
+        [&](uint64_t range, uint64_t bytes) noexcept { ranges.push_back({range, bytes}); },
+        [&]() noexcept {
+          for (const auto &[range, bytes] : ranges) {
+            std::memcpy(shadow.data() + (range - address),
+                        reinterpret_cast<const void *>(range), bytes);
+          }
+        });
+    uploads++;
+  };
+  upload();
+  Check(std::memcmp(shadow.data(), memory, size) == 0 && !IsWritable(memory),
+        "fault stress setup did not upload and protect");
+
+  g_fault_stress.page_manager = &page_manager;
+  g_fault_stress.begin = address;
+  g_fault_stress.end = address + size;
+  g_fault_stress.tracker = &tracker;
+  const auto faults_before = g_fault_stress.faults.load();
+  const auto stats_before = PageManager::GetDeferStats();
+  std::atomic<bool> writing{true};
+  std::vector<std::thread> writers;
+  std::atomic<uint64_t> writer_cpu_100ns{0};
+  const auto start = std::chrono::steady_clock::now();
+  for (uint32_t t = 0; t < 4; t++) {
+    writers.emplace_back([&, t] {
+      std::mt19937_64 rng(77 + t);
+      for (uint32_t i = 1; i <= 20000; i++) {
+        const auto offset = (rng() % (size / 8)) * 8;
+        *reinterpret_cast<volatile uint64_t *>(memory + offset) = (uint64_t{t + 1} << 56) | i;
+      }
+      FILETIME creation{};
+      FILETIME exit{};
+      FILETIME kernel{};
+      FILETIME user{};
+      if (GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user) != 0) {
+        const auto ticks = [](FILETIME time) {
+          return (uint64_t{time.dwHighDateTime} << 32u) | time.dwLowDateTime;
+        };
+        writer_cpu_100ns.fetch_add(ticks(kernel) + ticks(user));
+      }
+    });
+  }
+  std::thread uploader([&] {
+    while (writing.load(std::memory_order_acquire)) {
+      upload();
+    }
+  });
+  for (auto &writer : writers) {
+    writer.join();
+  }
+  const auto wall_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  writing.store(false, std::memory_order_release);
+  uploader.join();
+  upload();
+  g_fault_stress.tracker = nullptr;
+  const auto faults = g_fault_stress.faults.load() - faults_before;
+  const auto stats = PageManager::GetDeferStats();
+  Check(faults != 0, "fault stress took no faults");
+  Check(std::memcmp(shadow.data(), memory, size) == 0,
+        "a write was not uploaded: it landed on a page the tracker considered clean");
+  Check(stats.verify_mismatches == stats_before.verify_mismatches,
+        "verify mode found protection mismatches under the fault stress");
+  std::printf("  fault stress (%s): %llu faults in %.0f ms (writers %.0f ms CPU, %.1f us CPU "
+              "per fault), %llu uploads, %llu deferred spans, %llu settled, %llu verify checks\n",
+              mode == PageManager::DeferMode::Off   ? "deferral off"
+              : mode == PageManager::DeferMode::On ? "deferred"
+                                                   : "verify",
+              static_cast<unsigned long long>(faults), wall_ms,
+              static_cast<double>(writer_cpu_100ns.load()) / 1e4,
+              faults != 0 ? static_cast<double>(writer_cpu_100ns.load()) / 10.0 /
+                                static_cast<double>(faults)
+                          : 0.0,
+              static_cast<unsigned long long>(uploads),
+              static_cast<unsigned long long>(stats.spans - stats_before.spans),
+              static_cast<unsigned long long>(stats.settled - stats_before.settled),
+              static_cast<unsigned long long>(stats.verify_checks - stats_before.verify_checks));
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
+// --fault-bench: round-based contention on one tracking region. Each round the range is uploaded
+// (clean and write-protected); then 8 writers each write once to each of their own pages, so
+// every write takes exactly one fault, while a querier thread (standing in for the CP) keeps
+// asking the tracker about the range. Reports the fault phase's wall time and the querier's
+// latency. Run it with KYTY_TRACKER_LOCK_PARK=0 and =1.
+void FaultBench() {
+  for (const auto mode : {PageManager::DeferMode::Off, PageManager::DeferMode::On}) {
+    PageManager::SetDeferModeForTests(mode);
+    TrackerHarness harness;
+    auto &tracker = harness.tracker;
+    auto &page_manager = harness.page_manager;
+    const auto page_size = page_manager.GetPageSize();
+    constexpr uint32_t writers = 8;
+    constexpr uint64_t pages = 256;
+    constexpr uint32_t rounds = 200;
+    auto *memory = Allocate(page_manager, pages);
+    const auto address = reinterpret_cast<uint64_t>(memory);
+    const auto size = page_size * pages;
+    UploadAll(tracker, address, size);
+    g_fault_stress.page_manager = &page_manager;
+    g_fault_stress.begin = address;
+    g_fault_stress.end = address + size;
+    g_fault_stress.tracker = &tracker;
+    const auto faults_before = g_fault_stress.faults.load();
+
+    std::atomic<uint32_t> phase{0}; // round * 2 + 1 while writing
+    std::atomic<uint32_t> done{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> threads;
+    for (uint32_t w = 0; w < writers; w++) {
+      threads.emplace_back([&, w] {
+        for (uint32_t round = 0; round < rounds; round++) {
+          while (phase.load(std::memory_order_acquire) != round * 2 + 1) {
+            _mm_pause();
+          }
+          for (uint64_t page = w; page < pages; page += writers) {
+            *reinterpret_cast<volatile uint64_t *>(memory + page * page_size + 64) = round;
+          }
+          done.fetch_add(1, std::memory_order_acq_rel);
+        }
+      });
+    }
+    std::vector<uint32_t> query_ns;
+    query_ns.reserve(1 << 20);
+    std::thread querier([&] {
+      while (!stop.load(std::memory_order_acquire)) {
+        const auto start = std::chrono::steady_clock::now();
+        (void)tracker.QueryDirty(address, size);
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+        if (query_ns.size() < query_ns.capacity()) {
+          query_ns.push_back(static_cast<uint32_t>(std::min<int64_t>(ns, UINT32_MAX)));
+        }
+      }
+    });
+    double fault_ms = 0;
+    for (uint32_t round = 0; round < rounds; round++) {
+      UploadAll(tracker, address, size);
+      const auto start = std::chrono::steady_clock::now();
+      phase.store(round * 2 + 1, std::memory_order_release);
+      while (done.load(std::memory_order_acquire) != writers * (round + 1)) {
+        _mm_pause();
+      }
+      fault_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                            start)
+                      .count();
+      phase.store(round * 2 + 2, std::memory_order_release);
+    }
+    for (auto &thread : threads) {
+      thread.join();
+    }
+    stop.store(true, std::memory_order_release);
+    querier.join();
+    g_fault_stress.tracker = nullptr;
+    const auto faults = g_fault_stress.faults.load() - faults_before;
+    std::sort(query_ns.begin(), query_ns.end());
+    const auto percentile = [&](double p) {
+      return query_ns.empty()
+                 ? 0.0
+                 : query_ns[static_cast<size_t>(p * static_cast<double>(query_ns.size() - 1))] /
+                       1000.0;
+    };
+    std::printf("  fault bench (%s, lock park %s): %llu faults, %.1f us wall per fault; "
+                "tracker query p50 %.1f us, p99 %.1f us, p99.9 %.1f us, max %.1f us\n",
+                mode == PageManager::DeferMode::Off ? "deferral off" : "deferred",
+                Libs::Graphics::TrackerLockParkEnabled() ? "on" : "off",
+                static_cast<unsigned long long>(faults),
+                faults != 0 ? fault_ms * 1000.0 / static_cast<double>(faults) : 0.0,
+                percentile(0.5), percentile(0.99), percentile(0.999), percentile(1.0));
+    tracker.UntrackMemory(address, size);
+    Release(memory);
+  }
+}
+#endif
+
 void TestHotPageSettle() {
   MemoryTracker::FaultPolicy policy;
   policy.hot_frames = 1;
@@ -2092,6 +2394,14 @@ int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--fault-bench") == 0) {
+    Check(Common::HostException::InstallFirstAccessHandler(FaultStressHandler),
+          "install fault bench handler failed");
+    FaultBench();
+    return 0;
+  }
+#endif
   TestGuestRange();
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();
@@ -2129,6 +2439,30 @@ int main(int argc, char **argv) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();
 #endif
+
+  // Everything above ran with deferred write-unprotect (the default). The fault and upload cases
+  // again with it off (the previous synchronous releases) and in verify mode.
+  TestDeferredFaultUnprotect();
+  for (const auto mode : {PageManager::DeferMode::Off, PageManager::DeferMode::Verify}) {
+    PageManager::SetDeferModeForTests(mode);
+    TestRangeInvalidation();
+    TestGpuReacquisitionAfterInvalidation();
+    TestFaultAheadWindow();
+    TestHotPagePromotionAndUpload();
+    TestForeignWatcherFaultsDoNotPromote();
+    TestWrittenUploadCopiesOutsideLock();
+    TestHotPageSettle();
+  }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  Check(Common::HostException::InstallFirstAccessHandler(FaultStressHandler),
+        "install fault stress handler failed");
+  for (const auto mode : {PageManager::DeferMode::Off, PageManager::DeferMode::On,
+                          PageManager::DeferMode::Verify}) {
+    TestFaultStressNoLostWrites(mode);
+  }
+#endif
+  Check(PageManager::GetDeferStats().verify_mismatches == 0,
+        "verify mode found protection mismatches");
   std::puts("MemoryTrackerTests: all cases passed");
   return 0;
 }

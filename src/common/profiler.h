@@ -777,6 +777,21 @@ enum class FrameEvent : uint32_t {
 	EqueueCoalescedDataChanges,
 	// KYTY_DRAW_PREP_HOT: parked (cold) draw-prep workers woken because the unclaimed backlog grew.
 	DrawPrepColdWakes,
+	// KYTY_DEFER_UNPROTECT: write-watcher releases whose host unprotect waited for the end of the
+	// thread's scope (spans), the host calls those updates made, the spans that needed none
+	// (another thread had applied them), spans applied at once because the thread's batch was full,
+	// and write faults taken inside a scope that applied their page at once.
+	DeferredUnprotectSpans,
+	DeferredUnprotectCalls,
+	DeferredUnprotectSettled,
+	DeferredUnprotectOverflows,
+	DeferredUnprotectNestedFaults,
+	// KYTY_TRACKER_LOCK_PARK: tracking-lock waiters that parked after spinning their budget.
+	TrackerLockParks,
+	// KYTY_DEFER_UNPROTECT=verify: protection checks, and pages found looser than their watchers
+	// ask or different from what was just set.
+	ProtectVerifyChecks,
+	ProtectVerifyMismatches,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

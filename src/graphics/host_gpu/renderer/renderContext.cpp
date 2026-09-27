@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/hangTrace.h"
 #include "common/logging/log.h"
@@ -85,8 +86,23 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	MemoryStats::Count(access == PageFaultAccess::Write ? MemoryStats::Counter::WriteFaults
 	                                                    : MemoryStats::Counter::ReadFaults);
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size, true);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		// Both caches' releases of the page reach the host once, when the scope ends and no
+		// tracking lock is held (KYTY_DEFER_UNPROTECT).
+		const bool nested = PageManager::InDeferUnprotectScope();
+		{
+			const PageManager::DeferUnprotectScope defer_unprotect;
+			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size, true);
+			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+			// The faulting page gets the protection its watchers ask even when neither cache
+			// released anything here: another thread may have released it without having applied
+			// the release yet. A fault inside an enclosing scope (an emulator write between that
+			// scope's releases) applies at once: the enclosing scope ends only after the retry.
+			m_page_manager.Reconcile(Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE),
+			                         TRACKER_PAGE_SIZE, nested);
+		}
+		if (nested) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DeferredUnprotectNestedFaults);
+		}
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
@@ -97,6 +113,8 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
+	// One host update per page for both caches, after their locks (KYTY_DEFER_UNPROTECT).
+	const PageManager::DeferUnprotectScope defer_unprotect;
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
