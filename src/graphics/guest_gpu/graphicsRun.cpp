@@ -281,6 +281,16 @@ void GuestGpu::NotifyProgress() {
 	m_work_available.Signal();
 }
 
+bool GuestGpu::HasRunnableComputeWork() {
+	Common::LockGuard lock(m_queue_mutex);
+	for (uint32_t id = 1; id < QueueCount; id++) {
+		if (!m_queues[id].empty() && !m_queues[id].front().blocked) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void GuestGpu::AddDeferredLabel(uint64_t address, uint32_t size, uint64_t tick) {
 	Common::LockGuard lock(m_queue_mutex);
 	m_deferred_labels.push_back({address, size, tick});
@@ -498,6 +508,36 @@ void CommandProcessor::MaybeFlushIdleGpu() {
 	Profiler::CountFrameEvent(in_pass ? Profiler::FrameEvent::IdleFlushesInPass
 	                                  : Profiler::FrameEvent::IdleFlushes);
 	BufferFlush();
+}
+
+// KYTY_GFX_SLICE_DRAWS (default 128, 0 disables): one GPU thread runs the graphics queue and all
+// async compute queues round-robin, and a graphics slice used to run until it completed or
+// blocked (up to ~100 ms of CP time per frame), so compute submissions waited that long. Every
+// that many draws the graphics CP checks whether another queue has runnable (not suspended)
+// work and, only then, ends its slice after the current packet (a slice end flushes).
+static uint32_t GfxSliceDraws() {
+	static const uint32_t draws = [] {
+		const char* value  = std::getenv("KYTY_GFX_SLICE_DRAWS");
+		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 128ul;
+		return static_cast<uint32_t>(std::min(parsed, 1000000ul));
+	}();
+	return draws;
+}
+
+void CommandProcessor::MaybeYieldSlice() {
+	const auto limit = GfxSliceDraws();
+	if (limit == 0 || IsAsyncComputeQueue() || g_current_execution == nullptr ||
+	    g_gpu_state == nullptr || g_current_processor != this) {
+		return;
+	}
+	if (++m_slice_draws < limit || (m_slice_draws % limit) != 0) {
+		return;
+	}
+	if (!g_gpu_state->HasRunnableComputeWork()) {
+		return;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GfxSliceYields);
+	g_current_execution->m_yield = true;
 }
 
 void CommandProcessor::BufferFlushAndWait() {
@@ -834,7 +874,11 @@ void GuestGpu::ThreadRun(void* data) {
 			spin_deadline = 0;
 		}
 		Common::LockGuard lock(gpu->m_queue_mutex);
-		if (!complete) {
+		if (!complete && submission.command_execution.Yielded()) {
+			// Yielded to other queues: runnable again in round-robin order.
+			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
+			gpu->m_submission_count++;
+		} else if (!complete) {
 			submission.blocked = true;
 			gpu->m_has_blocked.store(true, std::memory_order_release);
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
@@ -892,7 +936,7 @@ bool GuestGpu::Process(Submission& submission) {
 				}
 				progressed |= round_progress;
 				complete = submission.command_complete && submission.constant_complete;
-				if (complete || !round_progress) {
+				if (complete || !round_progress || submission.command_execution.Yielded()) {
 					break;
 				}
 			}
@@ -953,6 +997,9 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	}
 	execution.m_suspended     = false;
 	execution.m_made_progress = false;
+	execution.m_yield         = false;
+	execution.m_yielded       = false;
+	m_slice_draws             = 0;
 
 	struct ExecutionScope {
 		ExecutionScope(CommandProcessor& processor, Pm4Execution& execution)
@@ -1085,6 +1132,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			}
 			execution.m_next_buffer = {};
 		}
+		if (execution.m_yield) {
+			execution.m_yield   = false;
+			execution.m_yielded = true;
+			return;
+		}
 	}
 }
 
@@ -1213,6 +1265,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	}
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 	MaybeFlushIdleGpu();
+	MaybeYieldSlice();
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
@@ -1357,6 +1410,7 @@ bool CommandProcessor::TryDrawIndirectNative(DrawIndirectSource source) {
 	}
 	m_pending_num_instances.push_back(pending);
 	MaybeFlushIdleGpu();
+	MaybeYieldSlice();
 	return true;
 }
 
@@ -1581,6 +1635,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 	MaybeFlushIdleGpu();
+	MaybeYieldSlice();
 }
 
 // KYTY_FLIP_WAIT_MODE=block restores the blocking WAIT_FLIP_DONE, which stalled every guest

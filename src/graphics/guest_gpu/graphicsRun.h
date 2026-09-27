@@ -47,6 +47,8 @@ public:
 	// Something a suspended (blocked) queue may wait for has changed: clear the blocked marks so
 	// the scheduler retries them now, and wake it. Any thread.
 	void NotifyProgress();
+	// Some async compute queue has a submission that is not suspended. GPU thread.
+	[[nodiscard]] bool HasRunnableComputeWork();
 
 	// End-of-pipe labels whose guest write is deferred to their tick's completion (see
 	// CommandProcessor::TryDeferLabel). Registration and completion run on the GPU thread.

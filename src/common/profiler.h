@@ -309,6 +309,8 @@ enum class FrameEvent : uint32_t {
 	// and inside an active rendering instance.
 	IdleFlushes,
 	IdleFlushesInPass,
+	// Graphics slices ended early so runnable async compute queues could run (KYTY_GFX_SLICE_DRAWS).
+	GfxSliceYields,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

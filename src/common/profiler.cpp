@@ -218,6 +218,7 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.GdsEopReadsDeferred.Cumulative",
     "FrameEvent.IdleFlushes.Cumulative",
     "FrameEvent.IdleFlushesInPass.Cumulative",
+    "FrameEvent.GfxSliceYields.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
