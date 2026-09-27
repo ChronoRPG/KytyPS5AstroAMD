@@ -342,12 +342,19 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	} else {
 		LOGF("Image cache policy: submission age (Approach A)\n");
 	}
-	// Texture streaming. KYTY_TEXTURE_PARTIAL_UPLOAD=0 restores whole-image CPU write tracking
-	// and whole-image refreshes. KYTY_TEXTURE_DIRTY_CHUNK_KB (power of two, 4..4096, default 64)
+	// Texture streaming. KYTY_TEXTURE_PARTIAL_UPLOAD=1 enables chunk-granular CPU write tracking
+	// and partial refreshes; the default is whole-image tracking and refreshes. The partial path
+	// left stale coarse mips in reused streaming slots (Astro Bot, U44: distant Sky Garden trees
+	// washed out or missing leaves, correct up close), so it is off until that is fixed.
+	// KYTY_TEXTURE_DIRTY_CHUNK_KB (power of two, 4..4096, default 64)
 	// is the write-tracking granularity. KYTY_TEXTURE_PARTIAL_BANDS=0 refreshes whole mip
 	// levels instead of rows of tile blocks. KYTY_TEXTURE_PARTIAL_VERIFY=1 hashes every clean
 	// chunk before a partial refresh and falls back to a full one on a mismatch (diagnostic).
-	m_partial_upload = EnvNotZero("KYTY_TEXTURE_PARTIAL_UPLOAD");
+	if (const auto* partial = std::getenv("KYTY_TEXTURE_PARTIAL_UPLOAD"); partial != nullptr) {
+		m_partial_upload = std::strcmp(partial, "0") != 0;
+	} else {
+		m_partial_upload = false;
+	}
 	m_partial_bands  = EnvNotZero("KYTY_TEXTURE_PARTIAL_BANDS");
 	if (const auto* verify = std::getenv("KYTY_TEXTURE_PARTIAL_VERIFY");
 	    verify != nullptr && std::strcmp(verify, "1") == 0) {
@@ -374,11 +381,15 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	// By default a sampled texture holds only the levels its views can sample (finer than the
 	// T# MIN_LOD / BASE_LEVEL clamp is never read); =poison also fills the other levels with a
 	// visible marker to check that claim on screen.
+	// Default off: a partially resident image left mip 0 of the Sky Garden water's normal map
+	// undefined (zero) although the water samples it (U44). =1 enables, =poison enables and marks
+	// non-resident levels.
+	m_residency = ResidencyMode::Off;
 	if (const auto* residency = std::getenv("KYTY_TEXTURE_RESIDENT_MIPS"); residency != nullptr) {
-		if (std::strcmp(residency, "0") == 0) {
-			m_residency = ResidencyMode::Off;
-		} else if (std::strcmp(residency, "poison") == 0) {
+		if (std::strcmp(residency, "poison") == 0) {
 			m_residency = ResidencyMode::Poison;
+		} else if (std::strcmp(residency, "0") != 0) {
+			m_residency = ResidencyMode::On;
 		}
 	}
 	if (const auto* idle = std::getenv("KYTY_TEXTURE_RESIDENT_IDLE_FRAMES"); idle != nullptr) {
@@ -3555,12 +3566,15 @@ uint64_t BufferCache::RecordImageDownload(Buffer& buffer, ImageId id, bool skip_
 	return copy_size;
 }
 
-// KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE=0 restores the previous behaviour: a GPU write binding over a
-// GPU-modified image drops the image's contents (see PreserveImagesForGpuWrite).
+// KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE=1 enables writebacks: a GPU write binding over a GPU-modified
+// image first moves the image's contents into the buffer (see PreserveImagesForGpuWrite). Default
+// off, the previous behaviour (the contents are dropped): each writeback leaves the whole moved
+// range GPU-dirty until a readback, and images created there later start from those bytes; the
+// Sky Garden water sampled such stale data (a never-written quarter-res input) and rendered white.
 bool BufferCache::ImageWritebackOnGpuWriteEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE");
-		return value == nullptr || std::strcmp(value, "0") != 0;
+		return value != nullptr && std::strcmp(value, "0") != 0;
 	}();
 	return enabled;
 }
