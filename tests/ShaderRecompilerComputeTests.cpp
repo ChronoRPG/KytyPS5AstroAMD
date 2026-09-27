@@ -32290,6 +32290,206 @@ void CheckStorageTextureVolumeMipRegions() {
           "Vulkan Z coordinates");
   std::printf("[host]    %-32s ok\n", "StorageTextureVolumeMipRegions");
 }
+
+// TileManager::Detile does not clear its linear scratch (KYTY_TILER_CLEAR_SCRATCH), and
+// TileManager::TileImage never cleared the scratch it downloads the image into. Both rely on
+// one contract: the buffer<->image copies of a tiled transfer touch exactly the linear bytes
+// its tile dispatches touch. An upload copy reading a byte no dispatch writes would sample
+// stale scratch; a tile dispatch reading a byte no download copy writes would store it into
+// guest memory. Check the contract on the layouts TextureCache::BuildTextureTransfer builds,
+// for every tiled format/mode and for mip chains, mip tails, arrays, volumes and the
+// resident-level subsets that RestrictToResidentLevels uploads.
+void CheckDetileCopyCoverage() {
+  constexpr const char *name = "DetileCopyCoverage";
+  struct Span {
+    uint64_t begin = 0;
+    uint64_t end = 0;
+  };
+  const auto normalize = [](std::vector<Span> spans) {
+    std::sort(spans.begin(), spans.end(),
+              [](const Span &a, const Span &b) { return a.begin < b.begin; });
+    std::vector<Span> merged;
+    for (const auto &span : spans) {
+      if (span.begin == span.end) {
+        continue;
+      }
+      if (!merged.empty() && span.begin <= merged.back().end) {
+        merged.back().end = std::max(merged.back().end, span.end);
+      } else {
+        merged.push_back(span);
+      }
+    }
+    return merged;
+  };
+  const auto first_difference = [](const std::vector<Span> &a,
+                                   const std::vector<Span> &b) {
+    for (size_t i = 0; i < std::max(a.size(), b.size()); ++i) {
+      if (i >= a.size()) {
+        return b[i].begin;
+      }
+      if (i >= b.size()) {
+        return a[i].begin;
+      }
+      if (a[i].begin != b[i].begin) {
+        return std::min(a[i].begin, b[i].begin);
+      }
+      if (a[i].end != b[i].end) {
+        return std::min(a[i].end, b[i].end);
+      }
+    }
+    return UINT64_MAX;
+  };
+  // Bytes of the linear buffer each side touches: tile dispatches by element rows, copies by
+  // the Vulkan buffer addressing rules (texel blocks for block-compressed formats).
+  const auto check = [&](const char *stage, const std::string &label,
+                         const TextureUploadLayout &layout,
+                         std::span<const vk::BufferImageCopy> regions,
+                         std::span<const GpuTileInfo> tiles) {
+    std::vector<Span> dispatched;
+    for (const auto &tile : tiles) {
+      const uint64_t row =
+          static_cast<uint64_t>(tile.pitch) * tile.bytes_per_element;
+      const uint64_t slice = tile.linear_slice_stride != 0
+                                 ? tile.linear_slice_stride
+                                 : row * tile.height;
+      for (uint32_t z = 0; z < tile.depth; ++z) {
+        for (uint32_t y = 0; y < tile.height; ++y) {
+          const uint64_t begin = tile.linear_offset + z * slice + y * row;
+          dispatched.push_back(
+              {begin, begin + static_cast<uint64_t>(tile.width) *
+                                  tile.bytes_per_element});
+        }
+      }
+    }
+    const auto &texture = layout.surface.texture;
+    const uint32_t texel_width = texture.texel_width;
+    const uint32_t texel_height = texture.texel_height;
+    const uint32_t element = texture.block.bytes_per_element;
+    std::vector<Span> copied;
+    for (const auto &region : regions) {
+      const uint32_t row_length = region.bufferRowLength != 0
+                                      ? region.bufferRowLength
+                                      : region.imageExtent.width;
+      const uint32_t image_height = region.bufferImageHeight != 0
+                                        ? region.bufferImageHeight
+                                        : region.imageExtent.height;
+      const uint64_t row =
+          static_cast<uint64_t>((row_length + texel_width - 1u) / texel_width) *
+          element;
+      const uint64_t slice =
+          static_cast<uint64_t>((image_height + texel_height - 1u) /
+                                texel_height) *
+          row;
+      const uint32_t blocks_x =
+          (region.imageExtent.width + texel_width - 1u) / texel_width;
+      const uint32_t blocks_y =
+          (region.imageExtent.height + texel_height - 1u) / texel_height;
+      for (uint32_t z = 0; z < region.imageExtent.depth; ++z) {
+        for (uint32_t y = 0; y < blocks_y; ++y) {
+          const uint64_t begin = region.bufferOffset + z * slice + y * row;
+          copied.push_back(
+              {begin, begin + static_cast<uint64_t>(blocks_x) * element});
+        }
+      }
+    }
+    const auto dispatched_bytes = normalize(std::move(dispatched));
+    const auto copied_bytes = normalize(std::move(copied));
+    if (dispatched_bytes.empty() || copied_bytes.size() != dispatched_bytes.size() ||
+        first_difference(dispatched_bytes, copied_bytes) != UINT64_MAX) {
+      std::ostringstream out;
+      out << label << ": copies and tile dispatches cover different linear bytes, "
+          << "first difference at byte "
+          << first_difference(dispatched_bytes, copied_bytes);
+      Fail(name, stage, out.str());
+    }
+  };
+
+  struct Shape {
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth; // array layers, or volume depth
+    uint32_t levels;
+    bool volume;
+  };
+  constexpr Shape shapes[] = {
+      {67, 51, 1, 1, false},   {67, 51, 1, 7, false},  {1, 1, 1, 1, false},
+      {256, 256, 1, 9, false}, {129, 65, 3, 8, false}, {5, 300, 2, 9, false},
+      {65, 33, 37, 6, true},   {16, 8, 17, 5, true},
+  };
+  constexpr Prospero::TileMode modes[] = {
+      Prospero::TileMode::kStandard256B, Prospero::TileMode::kStandard4KB,
+      Prospero::TileMode::kStandard64KB, Prospero::TileMode::kPrt,
+      Prospero::TileMode::kRenderTarget, Prospero::TileMode::kDepth,
+  };
+  uint32_t transfers = 0;
+  uint32_t subsets = 0;
+  for (u32 raw_format = 1;
+       raw_format <= static_cast<uint32_t>(Prospero::BufferFormat::kBc7Srgb);
+       ++raw_format) {
+    const auto format = static_cast<Prospero::BufferFormat>(raw_format);
+    if (Prospero::IsFmaskTextureFormat(format)) {
+      continue;
+    }
+    for (const auto mode : modes) {
+      for (const auto &shape : shapes) {
+        TileTextureBlockLayout texture{};
+        if (!TileGetTextureBlockLayout(format, mode, shape.volume, texture)) {
+          continue;
+        }
+        TileSizeAlign total{};
+        TileGetTextureTotalSize(format, shape.width, shape.height, shape.depth,
+                                shape.levels, mode, shape.volume, total);
+        const auto layout = TextureCalcUploadLayout(
+            format, shape.width, shape.height, shape.levels, shape.depth, mode,
+            total.size, true, shape.volume, name);
+        const auto regions = TextureBuildImageCopies(layout);
+        std::vector<GpuTileInfo> tiles;
+        std::ostringstream label;
+        label << "format=" << raw_format << " tile=" << static_cast<u32>(mode)
+              << " extent=" << shape.width << "x" << shape.height << "x"
+              << shape.depth << " levels=" << shape.levels
+              << (shape.volume ? " volume" : "");
+        if (!TextureBuildGpuTileInfos(total.size, regions, layout, shape.levels,
+                                      tiles)) {
+          Fail(name, "tile infos", label.str());
+        }
+        check("full chain", label.str(), layout, regions, tiles);
+        ++transfers;
+
+        // RestrictToResidentLevels: 2D, single-layer chains upload a resident suffix of
+        // their levels, re-based to the start of the scratch.
+        if (shape.volume || shape.depth != 1 || tiles.size() != regions.size()) {
+          continue;
+        }
+        for (uint32_t first = 1; first < shape.levels; ++first) {
+          std::vector<vk::BufferImageCopy> kept_regions;
+          std::vector<GpuTileInfo> kept_tiles;
+          for (size_t index = 0; index < regions.size(); ++index) {
+            if (regions[index].imageSubresource.mipLevel >= first) {
+              kept_regions.push_back(regions[index]);
+              kept_tiles.push_back(tiles[index]);
+            }
+          }
+          uint64_t base = UINT64_MAX;
+          for (const auto &tile : kept_tiles) {
+            base = std::min(base, tile.linear_offset);
+          }
+          for (size_t index = 0; index < kept_tiles.size(); ++index) {
+            kept_tiles[index].linear_offset -= base;
+            kept_regions[index].bufferOffset -= base;
+          }
+          check("resident levels", label.str() + " first=" + std::to_string(first),
+                layout, kept_regions, kept_tiles);
+          ++subsets;
+        }
+      }
+    }
+  }
+  Require(name, "coverage", transfers != 0 && subsets != 0,
+          "no tiled transfer layouts were checked");
+  std::printf("[host]    %-32s ok (%u transfers, %u resident subsets)\n", name,
+              transfers, subsets);
+}
 void CheckStandard64RenderTargetTileRoundTrip() {
   constexpr auto format = Prospero::BufferFormat::k32Float;
   constexpr auto tile = Prospero::TileMode::kStandard64KB;
@@ -34617,6 +34817,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
+    CheckDetileCopyCoverage();
     VulkanHarness vulkan;
     vulkan.CheckGpuTilerCpuParity();
     return 0;
@@ -34989,6 +35190,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGraphicsPushConstantBank();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
+  CheckDetileCopyCoverage();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
