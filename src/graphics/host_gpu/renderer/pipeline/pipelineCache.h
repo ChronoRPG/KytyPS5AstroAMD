@@ -171,6 +171,7 @@ public:
 
 private:
 	struct ProgramCache;
+	struct PipelineDiagnostics;
 
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;
@@ -234,6 +235,8 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// Why new graphics pipelines were needed (compiles.csv, compile totals); guarded by m_mutex.
+	std::unique_ptr<PipelineDiagnostics> m_diagnostics;
 	// Guards the pipeline maps and the driver cache. ProgramCache has its own locks.
 	Common::Mutex m_mutex;
 

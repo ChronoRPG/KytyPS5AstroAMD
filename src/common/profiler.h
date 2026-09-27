@@ -301,6 +301,9 @@ enum class FrameEvent : uint32_t {
 	// changed since the previous one (KYTY_TEXEL_SYNC_SKIP).
 	TexelImageSyncDownloads,
 	TexelImageSyncSkips,
+	// New compute pipelines (graphics ones are GraphicsPipelinesCreated). Programs and pipelines
+	// are also recorded per compile in the hang trace (compiles.csv).
+	ComputePipelinesCreated,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
@@ -342,6 +345,16 @@ enum class FrameWait : uint32_t {
 	TextureUpload,
 	// StagingCopier worker time copying guest texture bytes into staging (not the GPU thread).
 	TextureStagingCopy,
+	// Phases of a new program permutation, nested in ShaderProgramMiss: TranslateProgram,
+	// CompileProgram (specialization + SPIR-V emission), spirv-val and vkCreateShaderModule.
+	ShaderTranslate,
+	ShaderEmit,
+	ShaderValidate,
+	ShaderModuleCreate,
+	// vkCreateGraphicsPipelines alone (nested in GraphicsPipelineCreate), and a whole new compute
+	// pipeline (layouts and vkCreateComputePipelines).
+	GraphicsPipelineDriver,
+	ComputePipelineCreate,
 	Count,
 };
 

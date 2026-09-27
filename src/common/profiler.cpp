@@ -213,6 +213,7 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.TextureInvalidateSkips.Cumulative",
     "FrameEvent.TexelImageSyncDownloads.Cumulative",
     "FrameEvent.TexelImageSyncSkips.Cumulative",
+    "FrameEvent.ComputePipelinesCreated.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
@@ -244,6 +245,12 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.StagePrepHelper.Calls.Cumulative",
     "FrameWait.TextureUpload.Calls.Cumulative",
     "FrameWait.TextureStagingCopy.Calls.Cumulative",
+    "FrameWait.ShaderTranslate.Calls.Cumulative",
+    "FrameWait.ShaderEmit.Calls.Cumulative",
+    "FrameWait.ShaderValidate.Calls.Cumulative",
+    "FrameWait.ShaderModuleCreate.Calls.Cumulative",
+    "FrameWait.GraphicsPipelineDriver.Calls.Cumulative",
+    "FrameWait.ComputePipelineCreate.Calls.Cumulative",
 };
 static_assert(kFrameWaitCallNames.back() != nullptr, "FrameWait names must match the enum");
 constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
@@ -268,6 +275,12 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.StagePrepHelper.Nanoseconds.Cumulative",
     "FrameWait.TextureUpload.Nanoseconds.Cumulative",
     "FrameWait.TextureStagingCopy.Nanoseconds.Cumulative",
+    "FrameWait.ShaderTranslate.Nanoseconds.Cumulative",
+    "FrameWait.ShaderEmit.Nanoseconds.Cumulative",
+    "FrameWait.ShaderValidate.Nanoseconds.Cumulative",
+    "FrameWait.ShaderModuleCreate.Nanoseconds.Cumulative",
+    "FrameWait.GraphicsPipelineDriver.Nanoseconds.Cumulative",
+    "FrameWait.ComputePipelineCreate.Nanoseconds.Cumulative",
 };
 static_assert(kFrameWaitTimeNames.back() != nullptr, "FrameWait names must match the enum");
 

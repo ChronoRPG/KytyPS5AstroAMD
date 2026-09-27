@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
@@ -24,7 +25,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -105,6 +108,125 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
 	message += '\n';
 	Log::WriteToConsoleAndLog(message);
+}
+
+// Compile-time accounting (stutter attribution). Every new program permutation and pipeline is
+// timed per phase and reported three ways: per compile in the hang trace (compiles.csv, and
+// per-second summary.csv columns), as Tracy aggregate FrameWaits, and as process totals printed
+// once when the cache is destroyed. Only compile (miss) paths read the clock.
+uint64_t CompileClockNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+struct CompileTotals {
+	std::atomic<uint64_t> programs {0};
+	std::atomic<uint64_t> translate_ns {0};
+	std::atomic<uint64_t> emit_ns {0};
+	std::atomic<uint64_t> validate_ns {0};
+	std::atomic<uint64_t> module_ns {0};
+	std::atomic<uint64_t> gfx_pipelines {0};
+	std::atomic<uint64_t> gfx_pipeline_ns {0};
+	std::atomic<uint64_t> gfx_new {0};
+	std::atomic<uint64_t> gfx_permutation {0};
+	std::atomic<uint64_t> gfx_variant {0};
+	std::atomic<uint64_t> cs_pipelines {0};
+	std::atomic<uint64_t> cs_pipeline_ns {0};
+	std::atomic<uint64_t> stalls {0};
+	std::atomic<uint64_t> stall_ns {0};
+	std::atomic<uint64_t> stall_max_ns {0};
+};
+CompileTotals g_compile_totals;
+
+void AtomicMax(std::atomic<uint64_t>& target, uint64_t value) {
+	auto current = target.load(std::memory_order_relaxed);
+	while (value > current &&
+	       !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+	}
+}
+
+// Compile time this thread spent for the draw or dispatch it is preparing. Program compiles add
+// to it; the pipeline lookup that completes the draw adds its own compile and reports the sum as
+// one stall, so compile_stall_max_us is the worst per-draw hitch rather than per compile.
+thread_local uint64_t t_pending_compile_stall_ns = 0;
+
+void AddCompileStall(uint64_t ns) {
+	t_pending_compile_stall_ns += ns;
+}
+
+void FlushCompileStall() {
+	const auto ns = t_pending_compile_stall_ns;
+	if (ns == 0) {
+		return;
+	}
+	t_pending_compile_stall_ns = 0;
+	g_compile_totals.stalls.fetch_add(1, std::memory_order_relaxed);
+	g_compile_totals.stall_ns.fetch_add(ns, std::memory_order_relaxed);
+	AtomicMax(g_compile_totals.stall_max_ns, ns);
+	HangTrace::RecordCompileStall(ns);
+}
+
+// Phase times of one new program permutation.
+struct ProgramCompileTimes {
+	uint64_t translate_ns = 0;
+	uint64_t emit_ns      = 0;
+	uint64_t validate_ns  = 0;
+	uint64_t module_ns    = 0;
+	uint64_t spirv_words  = 0;
+};
+
+void RecordProgramCompile(const char* stage_name, uint64_t guest_hash, uint64_t id,
+                          const ProgramCompileTimes& times, uint64_t total_ns) {
+	auto& totals = g_compile_totals;
+	totals.programs.fetch_add(1, std::memory_order_relaxed);
+	totals.translate_ns.fetch_add(times.translate_ns, std::memory_order_relaxed);
+	totals.emit_ns.fetch_add(times.emit_ns, std::memory_order_relaxed);
+	totals.validate_ns.fetch_add(times.validate_ns, std::memory_order_relaxed);
+	totals.module_ns.fetch_add(times.module_ns, std::memory_order_relaxed);
+	Profiler::AddFrameWait(Profiler::FrameWait::ShaderTranslate, 1, times.translate_ns);
+	Profiler::AddFrameWait(Profiler::FrameWait::ShaderEmit, 1, times.emit_ns);
+	if (times.validate_ns != 0) {
+		Profiler::AddFrameWait(Profiler::FrameWait::ShaderValidate, 1, times.validate_ns);
+	}
+	Profiler::AddFrameWait(Profiler::FrameWait::ShaderModuleCreate, 1, times.module_ns);
+	if (HangTrace::Enabled()) {
+		HangTrace::RecordCompile({.kind         = HangTrace::CompileKind::Program,
+		                          .stage        = stage_name,
+		                          .guest_hash   = guest_hash,
+		                          .id           = id,
+		                          .translate_ns = times.translate_ns,
+		                          .emit_ns      = times.emit_ns,
+		                          .validate_ns  = times.validate_ns,
+		                          .module_ns    = times.module_ns,
+		                          .total_ns     = total_ns,
+		                          .spirv_words  = times.spirv_words});
+	}
+}
+
+double LoadMs(const std::atomic<uint64_t>& ns) {
+	return static_cast<double>(ns.load(std::memory_order_relaxed)) / 1.0e6;
+}
+
+void LogCompileTotals() {
+	const auto& t        = g_compile_totals;
+	const auto  ms       = LoadMs;
+	const auto programs  = t.programs.load(std::memory_order_relaxed);
+	const auto pipelines = t.gfx_pipelines.load(std::memory_order_relaxed);
+	const auto compute   = t.cs_pipelines.load(std::memory_order_relaxed);
+	if (programs == 0 && pipelines == 0 && compute == 0) {
+		return;
+	}
+	PipelineCacheLog("Compile totals: {} programs (translate {:.1f} ms, emit {:.1f} ms, validate "
+	                 "{:.1f} ms, module {:.1f} ms); {} graphics pipelines in {:.1f} ms (new {}, "
+	                 "permutation {}, variant {}); {} compute pipelines in {:.1f} ms; {} stalls "
+	                 "totalling {:.1f} ms, worst {:.1f} ms",
+	                 programs, ms(t.translate_ns), ms(t.emit_ns), ms(t.validate_ns),
+	                 ms(t.module_ns), pipelines, ms(t.gfx_pipeline_ns),
+	                 t.gfx_new.load(std::memory_order_relaxed),
+	                 t.gfx_permutation.load(std::memory_order_relaxed),
+	                 t.gfx_variant.load(std::memory_order_relaxed), compute, ms(t.cs_pipeline_ns),
+	                 t.stalls.load(std::memory_order_relaxed), ms(t.stall_ns), ms(t.stall_max_ns));
 }
 
 struct ShaderReadAttempt {
@@ -929,36 +1051,63 @@ struct PipelineCache::ProgramCache {
 
 	static constexpr std::size_t MaxStaticKeyWords = 13 + ShaderVertexInputInfo::RES_MAX * 13;
 
+	static const char* ProgramStageName(ShaderType stage) {
+		switch (stage) {
+			case ShaderType::Vertex: return "vs";
+			case ShaderType::Mesh: return "ms";
+			case ShaderType::Local: return "ls";
+			case ShaderType::TessellationControl: return "hs";
+			case ShaderType::TessellationEvaluation: return "ds";
+			case ShaderType::Pixel: return "ps";
+			case ShaderType::Compute: return "cs";
+			default: EXIT("invalid pipeline shader stage\n");
+		}
+		return "";
+	}
+
 	Permutation CompilePermutation(const ShaderParams&                          params,
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword,
-	                               std::span<const uint32_t> static_state) {
-		const char* stage_name = nullptr;
-		switch (options.stage) {
-			case ShaderType::Vertex: stage_name = "vs"; break;
-			case ShaderType::Mesh: stage_name = "ms"; break;
-			case ShaderType::Local: stage_name = "ls"; break;
-			case ShaderType::TessellationControl: stage_name = "hs"; break;
-			case ShaderType::TessellationEvaluation: stage_name = "ds"; break;
-			case ShaderType::Pixel: stage_name = "ps"; break;
-			case ShaderType::Compute: stage_name = "cs"; break;
-			default: EXIT("invalid pipeline shader stage\n");
+	                               std::span<const uint32_t> static_state,
+	                               ProgramCompileTimes&      times) {
+		const char* stage_name = ProgramStageName(options.stage);
+		const auto  emit_begin = CompileClockNs();
+		ShaderRecompiler::CompileResult result;
+		{
+			KYTY_PROFILER_BLOCK("Shader::Emit");
+			result = ShaderRecompiler::CompileProgram(std::move(translated), options,
+			                                          specialization, push_data_start_dword);
 		}
-		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-		                                               specialization, push_data_start_dword);
+		times.emit_ns     = CompileClockNs() - emit_begin;
+		times.spirv_words = result.spirv.size();
 		DumpMatchedShaderInputs(params, options, stage_name, static_state,
 		                        push_data_start_dword, result.spirv, result.ir_dump);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
+		const auto validate_begin = CompileClockNs();
+		bool       valid          = false;
+		{
+			KYTY_PROFILER_BLOCK("Shader::Validate");
+			valid = ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv);
+		}
+		if (Config::ShaderValidationEnabled()) {
+			times.validate_ns = CompileClockNs() - validate_begin;
+		}
+		if (!valid) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
-		const auto module = CompileSPV(result.spirv, device);
+		const auto       module_begin = CompileClockNs();
+		vk::ShaderModule module       = nullptr;
+		{
+			KYTY_PROFILER_BLOCK("Shader::CreateModule");
+			module = CompileSPV(result.spirv, device);
+		}
+		times.module_ns = CompileClockNs() - module_begin;
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
@@ -1175,6 +1324,11 @@ struct PipelineCache::ProgramCache {
 		// Cache hits returned before this. This covers translation through native shader-module
 		// creation; readiness failures can retry, so count successful creations separately.
 		Profiler::ScopedFrameWait shader_miss(Profiler::FrameWait::ShaderProgramMiss);
+		// Everything from here on, lock waits included, is compile time of the waiting draw.
+		struct StallScope {
+			uint64_t begin = CompileClockNs();
+			~StallScope() { AddCompileStall(CompileClockNs() - begin); }
+		} stall;
 		std::unique_lock lock(m_programs_mutex);
 		const auto publish_index = [&](const SourceEntry& source, const Permutation& permutation) {
 			if (ResourceReuseEnabled()) source.reuse.current.permutation_index = permutation.index;
@@ -1235,7 +1389,14 @@ struct PipelineCache::ProgramCache {
 		} else {
 			options.wave_size = input_info.wave_size;
 		}
-		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		ProgramCompileTimes               times;
+		const auto                        translate_begin = CompileClockNs();
+		ShaderRecompiler::TranslateResult translated;
+		{
+			KYTY_PROFILER_BLOCK("Shader::Translate");
+			translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		}
+		times.translate_ns = CompileClockNs() - translate_begin;
 		if (translated.skip_dispatch) {
 			entry = programs.try_emplace(key, ShaderRecompiler::IR::ResourcePlan {}).first;
 			entry->second.skip_dispatch.store(true, std::memory_order_relaxed);
@@ -1250,8 +1411,10 @@ struct PipelineCache::ProgramCache {
 		}
 		const auto& permutation = entry->second.permutations.Append(CompilePermutation(
 		    params, options, std::move(translated), prep.specialization, push_data_cursor,
-		    entry->first.static_state));
+		    entry->first.static_state, times));
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderProgramsCreated);
+		RecordProgramCompile(ProgramStageName(stage), params.hash, permutation.handle.id, times,
+		                     CompileClockNs() - stall.begin);
 
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
 		for (const auto& [program_key, source]: programs) {
@@ -1431,13 +1594,125 @@ struct PipelineCache::ProgramCache {
 	uint64_t next_shader_id = 0; // Guarded by the exclusive m_programs_mutex.
 };
 
+// Classifies each new graphics pipeline for stutter attribution: whether a pipeline already existed
+// for the same program ids (and which key groups differ from the closest one), only for the same
+// guest shaders compiled as other program permutations, or for neither. Guarded by m_mutex.
+struct PipelineCache::PipelineDiagnostics {
+	using Ids = std::array<uint64_t, 4>; // vertex program ids (or guest hashes), pixel last
+	struct IdsHash {
+		std::size_t operator()(const Ids& ids) const {
+			std::size_t hash = 0;
+			for (const auto id: ids) {
+				PipelineKeyHash::Mix(hash, static_cast<std::size_t>(id));
+			}
+			return hash;
+		}
+	};
+
+	enum Group : uint32_t {
+		Rendering   = 1u << 0u,
+		VertexInput = 1u << 1u,
+		Topology    = 1u << 2u,
+		Raster      = 1u << 3u,
+		Cull        = 1u << 4u,
+		DepthBounds = 1u << 5u,
+		ColorMask   = 1u << 6u,
+		Blend       = 1u << 7u,
+		Multisample = 1u << 8u,
+	};
+
+	static uint32_t Difference(const GraphicsPipelineKey& a, const GraphicsPipelineKey& b) {
+		const auto& x    = a.static_params;
+		const auto& y    = b.static_params;
+		uint32_t    mask = 0;
+		const auto  differ = [](const auto& left, const auto& right) {
+			return std::memcmp(&left, &right, sizeof(left)) != 0;
+		};
+		if (!(a.rendering == b.rendering)) mask |= Rendering;
+		if (!(a.vertex_input == b.vertex_input)) mask |= VertexInput;
+		if (x.topology != y.topology || x.primitive_restart_enable != y.primitive_restart_enable) {
+			mask |= Topology;
+		}
+		if (x.negative_one_to_one != y.negative_one_to_one ||
+		    x.depth_clip_enable != y.depth_clip_enable || x.polygon_mode != y.polygon_mode ||
+		    x.provoking_vtx_last != y.provoking_vtx_last) {
+			mask |= Raster;
+		}
+		if (x.cull_front != y.cull_front || x.cull_back != y.cull_back || x.face != y.face) {
+			mask |= Cull;
+		}
+		const float x_bounds[] {x.depth_min_bounds, x.depth_max_bounds};
+		const float y_bounds[] {y.depth_min_bounds, y.depth_max_bounds};
+		if (x.depth_bounds_test_enable != y.depth_bounds_test_enable ||
+		    differ(x_bounds, y_bounds)) {
+			mask |= DepthBounds;
+		}
+		if (differ(x.color_mask, y.color_mask)) mask |= ColorMask;
+		if (differ(x.color_srcblend, y.color_srcblend) ||
+		    differ(x.color_comb_fcn, y.color_comb_fcn) ||
+		    differ(x.color_destblend, y.color_destblend) ||
+		    differ(x.alpha_srcblend, y.alpha_srcblend) ||
+		    differ(x.alpha_comb_fcn, y.alpha_comb_fcn) ||
+		    differ(x.alpha_destblend, y.alpha_destblend) ||
+		    differ(x.separate_alpha_blend, y.separate_alpha_blend) ||
+		    differ(x.blend_enable, y.blend_enable)) {
+			mask |= Blend;
+		}
+		if (x.samples != y.samples || x.sample_shading_enable != y.sample_shading_enable) {
+			mask |= Multisample;
+		}
+		return mask;
+	}
+
+	static std::string Describe(uint32_t mask) {
+		static constexpr std::array<const char*, 9> names {
+		    "rt", "vi", "topo", "raster", "cull", "dbounds", "mask", "blend", "ms"};
+		std::string text;
+		for (uint32_t bit = 0; bit < names.size(); ++bit) {
+			if ((mask & (1u << bit)) != 0) {
+				if (!text.empty()) text += '+';
+				text += names[bit];
+			}
+		}
+		return text.empty() ? std::string("same") : text;
+	}
+
+	// Classifies `key` (not yet inserted) and records it; `key` must be the map's stored copy.
+	HangTrace::PipelineOrigin Classify(const GraphicsPipelineKey& key, const Ids& guest,
+	                                   std::string& detail) {
+		const Ids programs {key.vertex_shader_ids[0], key.vertex_shader_ids[1],
+		                    key.vertex_shader_ids[2], key.ps_shader_id};
+		auto&     siblings = by_programs[programs];
+		auto      origin   = HangTrace::PipelineOrigin::New;
+		if (!siblings.empty()) {
+			uint32_t best = UINT32_MAX;
+			for (const auto* sibling: siblings) {
+				const auto mask = Difference(*sibling, key);
+				if (std::popcount(mask) < std::popcount(best)) best = mask;
+			}
+			origin = HangTrace::PipelineOrigin::Variant;
+			detail = Describe(best);
+		} else if (by_guest[guest] != 0) {
+			origin = HangTrace::PipelineOrigin::Permutation;
+		}
+		siblings.push_back(&key);
+		by_guest[guest]++;
+		return origin;
+	}
+
+	std::unordered_map<Ids, std::vector<const GraphicsPipelineKey*>, IdsHash> by_programs;
+	std::unordered_map<Ids, uint32_t, IdsHash>                                  by_guest;
+};
+
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)),
+      m_diagnostics(std::make_unique<PipelineDiagnostics>()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }
 
 PipelineCache::~PipelineCache() {
+	LogCompileTotals();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -1962,6 +2237,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	if (memo_enabled) {
 		if (last.cache == this && last.pipeline != nullptr && last.key == key) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineMemoHits);
+			FlushCompileStall();
 			return *last.pipeline;
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineMemoMisses);
@@ -1972,6 +2248,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			last.pipeline = &pipeline;
 			last.key      = key;
 		}
+		FlushCompileStall();
 		return pipeline;
 	};
 
@@ -1979,6 +2256,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		return remember(*iter->second);
 	}
+	const auto create_begin = CompileClockNs();
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(vs_input_info);
@@ -2009,6 +2287,33 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	auto [iter, inserted] = m_graphics_pipelines.emplace(key, std::move(cached));
 	EXIT_IF(!inserted);
 
+	const auto create_ns = CompileClockNs() - create_begin;
+	PipelineDiagnostics::Ids guest {};
+	for (size_t i = 0; i < vertex_info.size() && i < 3; ++i) {
+		guest[i] = vertex_info[i].stage.program->shader_hash;
+	}
+	guest[3] = ps_active ? ps_input_info->stage.program->shader_hash : 0;
+	std::string detail;
+	const auto  origin = m_diagnostics->Classify(iter->first, guest, detail);
+	auto&       totals = g_compile_totals;
+	totals.gfx_pipelines.fetch_add(1, std::memory_order_relaxed);
+	totals.gfx_pipeline_ns.fetch_add(create_ns, std::memory_order_relaxed);
+	auto* origin_total = origin == HangTrace::PipelineOrigin::New           ? &totals.gfx_new
+	                     : origin == HangTrace::PipelineOrigin::Permutation ? &totals.gfx_permutation
+	                                                                         : &totals.gfx_variant;
+	origin_total->fetch_add(1, std::memory_order_relaxed);
+	if (HangTrace::Enabled()) {
+		HangTrace::RecordCompile({.kind        = HangTrace::CompileKind::GraphicsPipeline,
+		                          .origin      = origin,
+		                          .stage       = "gfx",
+		                          .guest_hash  = guest[0],
+		                          .id          = vs_id,
+		                          .id2         = ps_id,
+		                          .pipeline_ns = create_ns,
+		                          .total_ns    = create_ns,
+		                          .detail      = detail});
+	}
+	AddCompileStall(create_ns);
 	return remember(*iter->second);
 }
 
@@ -2023,8 +2328,10 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
+		FlushCompileStall();
 		return *iter->second;
 	}
+	const auto create_begin = CompileClockNs();
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(input_info);
@@ -2040,6 +2347,21 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
 
+	const auto create_ns = CompileClockNs() - create_begin;
+	g_compile_totals.cs_pipelines.fetch_add(1, std::memory_order_relaxed);
+	g_compile_totals.cs_pipeline_ns.fetch_add(create_ns, std::memory_order_relaxed);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::ComputePipelinesCreated);
+	Profiler::AddFrameWait(Profiler::FrameWait::ComputePipelineCreate, 1, create_ns);
+	if (HangTrace::Enabled()) {
+		HangTrace::RecordCompile({.kind        = HangTrace::CompileKind::ComputePipeline,
+		                          .stage       = "cs",
+		                          .guest_hash  = input_info.stage.program->shader_hash,
+		                          .id          = compute_program.id,
+		                          .pipeline_ns = create_ns,
+		                          .total_ns    = create_ns});
+	}
+	AddCompileStall(create_ns);
+	FlushCompileStall();
 	return *iter->second;
 }
 } // namespace Libs::Graphics

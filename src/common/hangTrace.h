@@ -41,7 +41,15 @@
 // active rendering instance). After the transfer columns: gpu_rendering_ends (guest rendering
 // instances ended, every cause; per-site Tracy plots GpuOps.EndRendering.<site>) and
 // gpu_draw_write_sinks (post-draw shader-write barriers kept pending across a draw continuing the
-// same instance, KYTY_DRAW_WRITE_SINK). New columns are only ever appended.
+// same instance, KYTY_DRAW_WRITE_SINK). Then shader/pipeline compilation (see RecordCompile):
+// compile_programs, compile_translate_us, compile_emit_us, compile_validate_us, compile_module_us,
+// compile_gfx_pipelines, compile_gfx_pipeline_us, compile_cs_pipelines, compile_cs_pipeline_us,
+// compile_stall_us, compile_stall_max_us, compile_gfx_new, compile_gfx_perm, compile_gfx_variant.
+// New columns are only ever appended.
+//
+//   compiles.csv       one row per new shader program permutation or pipeline: phase times, the
+//                      requesting thread, and for graphics pipelines which key fields differ from
+//                      the closest existing pipeline of the same programs (RecordCompile)
 
 #include <cstdint>
 #include <string>
@@ -239,6 +247,38 @@ struct GpuOpCounts {
 	uint64_t draw_write_sinks = 0;
 };
 void RecordGpuOpCounts(const GpuOpCounts& counts);
+
+// Shader and pipeline compilation (graphics/host_gpu/renderer/pipeline/pipelineCache.cpp). One
+// event per new program permutation (translate = ShaderRecompiler::TranslateProgram, emit =
+// CompileProgram: specialization and SPIR-V emission, validate = spirv-val, module =
+// vkCreateShaderModule) or new pipeline (pipeline = pipeline and layout creation, including
+// vkCreateGraphicsPipelines/vkCreateComputePipelines). total_ns is the wall time of the whole
+// compile on the thread that needed it. summary.csv adds each column per second.
+enum class CompileKind : uint8_t { Program, GraphicsPipeline, ComputePipeline, Count };
+// Graphics pipelines only: whether another pipeline already existed for the same program ids
+// (Variant, detail names the differing key fields), only for the same guest shaders with other
+// program permutations (Permutation), or for neither (New).
+enum class PipelineOrigin : uint8_t { None, New, Permutation, Variant };
+struct CompileEvent {
+	CompileKind      kind         = CompileKind::Program;
+	PipelineOrigin   origin       = PipelineOrigin::None;
+	const char*      stage        = "";
+	uint64_t         guest_hash   = 0;
+	uint64_t         id           = 0; // program id (for pipelines: the first vertex program)
+	uint64_t         id2          = 0; // pipelines: pixel program id
+	uint64_t         translate_ns = 0;
+	uint64_t         emit_ns      = 0;
+	uint64_t         validate_ns  = 0;
+	uint64_t         module_ns    = 0;
+	uint64_t         pipeline_ns  = 0;
+	uint64_t         total_ns     = 0;
+	uint64_t         spirv_words  = 0;
+	std::string_view detail;
+};
+void RecordCompile(const CompileEvent& event);
+// A draw or dispatch spent stall_ns in the compile paths (new programs and pipelines, including
+// lock waits). compile_stall_max_us is the longest single stall of the second.
+void RecordCompileStall(uint64_t stall_ns);
 
 } // namespace HangTrace
 
