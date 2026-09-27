@@ -2659,6 +2659,26 @@ bool BufferCache::IsRegionGpuModifiedRelaxed(uint64_t vaddr, uint64_t size) cons
 	return m_memory_tracker.IsRegionGpuModifiedRelaxed(vaddr, size);
 }
 
+BufferCache::PageStates BufferCache::CountPageStates(uint64_t vaddr, uint64_t size) const {
+	PageStates states;
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return states;
+	}
+	const auto end = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	for (auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE); page < end;
+	     page += TRACKER_PAGE_SIZE) {
+		MemoryTracker::DirtyState state;
+		if (!m_memory_tracker.QueryDirtyRelaxed(page, TRACKER_PAGE_SIZE, state)) {
+			states.untracked++;
+		} else if (state.gpu) {
+			states.gpu_dirty++;
+		} else if (!state.cpu) {
+			states.clean++;
+		}
+	}
+	return states;
+}
+
 bool BufferCache::GpuDirtyMirrorMatches(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.GpuMirrorMatches(vaddr, size);
 }

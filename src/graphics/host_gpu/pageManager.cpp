@@ -325,6 +325,31 @@ void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& ma
 	m_impl->UpdateRegionWatchers<track, is_read, true>(*region, base_addr, first, last, &mask);
 }
 
+PageManager::WatchedPages PageManager::CountWatchedPages(uint64_t vaddr, uint64_t size) {
+	WatchedPages result;
+	if (!GuestRange {vaddr, size}.Valid() || vaddr >= ADDRESS_SIZE) {
+		return result;
+	}
+	const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
+	const auto end   = std::min(Common::AlignUp(vaddr + size, PAGE_SIZE), ADDRESS_SIZE);
+	for (auto chunk_begin = begin; chunk_begin < end;) {
+		const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+		const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+		if (auto* region = m_impl->FindRegion(chunk_begin); region != nullptr) {
+			SpinGuard  lock(region->lock);
+			const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+			const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+			for (auto index = first; index < last; index++) {
+				const auto& page = region->pages[index];
+				result.access += page.access_watchers != 0 ? 1u : 0u;
+				result.write += page.access_watchers == 0 && page.write_watchers != 0 ? 1u : 0u;
+			}
+		}
+		chunk_begin = chunk_end;
+	}
+	return result;
+}
+
 template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&);

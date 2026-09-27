@@ -771,6 +771,17 @@ enum class FrameEvent : uint32_t {
 	BindingEpochMemoVerifyChecks,
 	BindingEpochMemoVerifyMismatches,
 	BindingEpochMemoVerifyRaces,
+	// Tracker-gap detectors (RenderContext::NoteHostBackingWrite, NoteGuestProtection): emulator
+	// writes of guest bytes outside publications and the GPU-dirty and clean tracked pages they
+	// land on; guest protection changes, the watched pages of GPU memory they cover and those
+	// whose tracking protection they replace, and those that restrict access to GPU memory.
+	HostBackingWrites,
+	HostBackingWriteGpuDirtyPages,
+	HostBackingWriteCleanPages,
+	GuestProtectCalls,
+	GuestProtectWatchedPages,
+	GuestProtectOverriddenPages,
+	GuestProtectRestrictsGpuMemory,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

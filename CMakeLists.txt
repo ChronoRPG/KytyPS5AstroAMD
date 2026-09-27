@@ -766,6 +766,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-epoch-memo-only)
 	set_tests_properties(binding_epoch_memo_no_sync_epoch PROPERTIES
 		ENVIRONMENT "KYTY_SYNC_EPOCH=0")
+	# Tracker-gap detectors: the page states they classify host writes by.
+	add_test(NAME tracker_gap_detectors
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tracker-gap-detectors-only)
 	# KYTY_TEXTURE_MEMO_REVALIDATE: default, verify mode, off.
 	add_test(NAME texture_memo_revalidate
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)

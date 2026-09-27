@@ -161,6 +161,15 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Lock-free hint (MemoryTracker::IsRegionGpuModifiedRelaxed), any thread; and its verify check.
 	[[nodiscard]] bool IsRegionGpuModifiedRelaxed(uint64_t vaddr, uint64_t size) const;
+	// Tracker pages of [vaddr, vaddr + size) by state, from the lock-free mirrors (any thread; a
+	// snapshot): GPU-dirty, clean (tracked, neither CPU- nor GPU-dirty: a GPU copy is current)
+	// and untracked (no tracker region yet). The rest are CPU-dirty.
+	struct PageStates {
+		uint64_t gpu_dirty = 0;
+		uint64_t clean     = 0;
+		uint64_t untracked = 0;
+	};
+	[[nodiscard]] PageStates CountPageStates(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool GpuDirtyMirrorMatches(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	// Caller holds the mapped-range lock. Cache/tracker iteration remains on the GPU thread.

@@ -87,6 +87,16 @@ static bool IsGpuAddressRange(uint64_t vaddr, uint64_t size) {
 	return vaddr != 0 && size != 0 && vaddr < GPU_ADDRESS_LIMIT && size < GPU_ADDRESS_LIMIT - vaddr;
 }
 
+// Tracker-gap detector (RenderContext::NoteGuestProtection): the host protection `mode` is about
+// to be applied to [vaddr, vaddr + size) directly, not through resource tracking's PageManager.
+static void NoteGuestProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return;
+	}
+	const auto bits = static_cast<uint32_t>(mode);
+	GetGpuResources().NoteGuestProtection(vaddr, size, (bits & 1u) != 0, (bits & 2u) != 0);
+}
+
 static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
@@ -3900,6 +3910,7 @@ void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mo
 
 	const auto host_mode = VirtualMemory::IsExecute(mode) ? VirtualMemory::Mode::ExecuteReadWrite
 	                                                      : VirtualMemory::Mode::ReadWrite;
+	NoteGuestProtection(vaddr, size, host_mode);
 	EXIT_IF(!g_guest_address_space->Protect(vaddr, size, host_mode));
 	g_virtual_ranges->Protect(vaddr, size, ProgramProtection(mode));
 }
@@ -3935,6 +3946,7 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 		*old_mode = static_cast<VirtualMemory::Mode>(
 		    ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
 	}
+	NoteGuestProtection(aligned_addr, aligned_size, mode);
 	if (!g_guest_address_space->Protect(aligned_addr, aligned_size, mode)) {
 		return false;
 	}
@@ -4000,6 +4012,7 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	}
 	const auto old_mode = static_cast<VirtualMemory::Mode>(
 	    old_ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
+	NoteGuestProtection(aligned_addr, aligned_len, mode);
 	bool ok = g_guest_address_space->Protect(aligned_addr, aligned_len, mode);
 
 	if (!ok) {

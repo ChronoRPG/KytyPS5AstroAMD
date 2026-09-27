@@ -5826,6 +5826,92 @@ public:
                                                                                           : "off");
   }
 
+  // Tracker-gap detectors (RenderContext::NoteHostBackingWrite, NoteGuestProtection): the page
+  // states they classify a host write by (BufferCache::CountPageStates): GPU-dirty after a GPU
+  // write, clean after an upload, neither after a CPU write, untracked before any tracking.
+  void CheckTrackerGapDetectors() {
+    constexpr const char *name = "TrackerGapDetectors";
+    constexpr uintptr_t base = 0x0000000207800000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t clean_offset = 0x10000;   // uploaded by a read binding
+    constexpr uint64_t written_offset = 0x20000; // a writable binding
+    constexpr uint64_t page = 0x1000;
+
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "detector direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "detector fixed direct-memory mapping failed");
+    std::memset(mapped, 0x5a, allocation_size);
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto states = [&](uint64_t offset) {
+        return cache.CountPageStates(base + offset, page);
+      };
+      const auto before = states(clean_offset);
+      Require(name, "before tracking", before.clean == 0 && before.gpu_dirty == 0,
+              "a page no binding has uploaded or written was reported clean or GPU-dirty");
+      OnGpuThread(context, [&] {
+        (void)cache.ObtainBuffer(base + clean_offset, 0x8000, false, false);
+        (void)cache.ObtainBuffer(base + written_offset, 0x8000, true, false);
+      });
+      const auto clean = states(clean_offset);
+      const auto written = states(written_offset);
+      Require(name, "clean and GPU-dirty pages",
+              clean.clean == 1 && clean.gpu_dirty == 0 && written.gpu_dirty == 1 &&
+                  written.clean == 0,
+              "an uploaded page was not clean, or a GPU-written page not GPU-dirty");
+      // A host write the detector reports (it only counts and logs).
+      context.NoteHostBackingWrite(base + clean_offset, 248,
+                                   Libs::Graphics::RenderContext::HostWriter::Occlusion);
+      context.NoteHostBackingWrite(base + written_offset, 248,
+                                   Libs::Graphics::RenderContext::HostWriter::LodStats);
+      context.NoteGuestProtection(base + clean_offset, page, true, true);
+      // A CPU write makes the clean page CPU-dirty: neither state then.
+      Require(name, "write fault",
+              context.HandleFault(PageFaultAccess::Write, base + clean_offset),
+              "a CPU write to an uploaded page did not fault through the tracker");
+      const auto dirty = states(clean_offset);
+      Require(name, "CPU-dirty page", dirty.clean == 0 && dirty.gpu_dirty == 0 &&
+                                          dirty.untracked == 0,
+              "a CPU-dirty page was reported clean, GPU-dirty or untracked");
+      // Read back the GPU-written range so the context can be torn down.
+      cache.ReadMemory(base + written_offset, 0x8000);
+      scheduler.Finish();
+      context.UnmapMemory(base, allocation_size);
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "detector direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "detector direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckComputeMetaClearClassification() {
     constexpr const char *name = "ComputeMetaClearClassification";
     constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
@@ -38600,6 +38686,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBindingEpochMemo();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--tracker-gap-detectors-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTrackerGapDetectors();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--texture-memo-revalidate-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTextureMemoRevalidation();
@@ -38829,6 +38920,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBufferRangeMemo();
   vulkan.CheckBdaSyncEpoch();
   vulkan.CheckBindingEpochMemo();
+  vulkan.CheckTrackerGapDetectors();
   vulkan.CheckEagerReadback();
 #endif
   vulkan.CheckUnifiedImageViewCache();
