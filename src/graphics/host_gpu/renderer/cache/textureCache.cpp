@@ -3598,7 +3598,7 @@ void BufferCache::PreserveImagesForGpuWrite(BufferId id, uint64_t vaddr, uint64_
 		// The tracker pages are GPU-owned now, so their bytes must be too (downloaded or not).
 		buffer.MarkContentWritten();
 		if (!m_gpu_modified_ranges.Contains(range.address, range.size)) {
-			CleanVerdict::Invalidate();
+			CleanVerdict::Invalidate(range.address, range.size, Coherence::Source::BufferDirtyAdd);
 		}
 		m_gpu_modified_ranges.Add(range.address, range.size);
 		NoteBufferContentWrite(range.address, range.size);

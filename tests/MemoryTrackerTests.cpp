@@ -1346,6 +1346,127 @@ void TestCleanVerdictCrossThreadInvalidation() {
         "a published dirtying transition was hidden by a cached verdict");
 }
 
+// Draw-prep S4 audit of the tracker (fault-ahead, hot pages, unlocked written uploads): every
+// transition of the tracker's GPU ownership logs its exact range and source to the coherence log
+// (whose generation is the clean-verdict one), and the CPU-side policies move no GPU ownership at
+// all: they log nothing and leave the GPU state as it was. The written upload's GPU bits are, as
+// for ForEachUploadRange, not read by clean verdicts; its clean-verdict transition is the buffer
+// cache's dirty-range Add, which logs the range itself. main() enables a log reader
+// (KYTY_DRAW_PREP_LOG_AUDIT) so that entries are recorded.
+std::vector<std::pair<Libs::Graphics::Coherence::Range, Libs::Graphics::Coherence::Source>>
+LoggedSince(uint64_t generation) {
+  namespace Coherence = Libs::Graphics::Coherence;
+  std::vector<std::pair<Coherence::Range, Coherence::Source>> entries;
+  const auto newest = Coherence::Generation();
+  for (auto g = generation + 1; g <= newest; g++) {
+    Coherence::Range range;
+    Coherence::Source source{};
+    Check(Coherence::g_log.Read(g, range, source),
+          "a logged coherence transition is unreadable");
+    entries.push_back({range, source});
+  }
+  return entries;
+}
+
+bool LoggedExactly(uint64_t generation, uint64_t address, uint64_t size,
+                   Libs::Graphics::Coherence::Source source) {
+  const auto entries = LoggedSince(generation);
+  return entries.size() == 1 &&
+         entries[0].first ==
+             Libs::Graphics::Coherence::MakeRange(address, size) &&
+         entries[0].second == source;
+}
+
+void TestCoherenceLogTrackerTransitions() {
+  namespace Coherence = Libs::Graphics::Coherence;
+  using Coherence::Source;
+  Check(Coherence::LogReadersEnabled(), "coherence log entries are not recorded");
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 8;
+  policy.hot_frames = 1;
+  policy.hot_max = 8;
+  PolicyHarness harness(policy);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 16);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto page = [&](uint64_t index) { return address + index * page_size; };
+
+  auto generation = Coherence::Generation();
+  UploadAll(tracker, address, page_size * 16);
+  Check(LoggedSince(generation).empty(), "a read upload logged a coherence transition");
+
+  // Hooked GPU-ownership transitions: exact range and source.
+  generation = Coherence::Generation();
+  tracker.MarkRegionAsGpuModified(page(12), page_size);
+  Check(LoggedExactly(generation, page(12), page_size, Source::TrackerGpuMark),
+        "GPU marking did not log its exact range");
+
+  // Fault-ahead and hot promotion (one faulting frame suffices here): CPU state only.
+  generation = Coherence::Generation();
+  std::vector<std::pair<uint64_t, uint64_t>> ahead;
+  Check(WriteFault(tracker, page(2) + 16, &ahead) == 0 && !ahead.empty() &&
+            tracker.HotPageCount() == 1,
+        "audit setup: the write fault did not open a window and promote its page");
+  Check(LoggedSince(generation).empty() &&
+            tracker.IsRegionGpuModified(page(12), page_size) &&
+            !tracker.IsRegionGpuModified(address, page_size * 12) &&
+            !tracker.IsRegionGpuModified(page(13), page_size * 3),
+        "fault-ahead or hot promotion changed GPU ownership or logged a transition");
+  // Hot-aware uploads, demotion, sweep and settle: CPU state only as well.
+  generation = Coherence::Generation();
+  (void)UploadHotAware(tracker, address, page_size * 8);
+  tracker.DemoteHotPages(address, page_size * 16);
+  UploadAll(tracker, address, page_size * 12);
+  tracker.AdvanceFrame();
+  (void)WriteFault(tracker, page(3));
+  Check(tracker.HotPageCount() == 1, "audit setup: the page was not promoted again");
+  (void)tracker.SettleHotPages(0, 0);
+  tracker.AdvanceFrame();
+  (void)WriteFault(tracker, page(3));
+  for (int frame = 0; frame < 4; frame++) {
+    tracker.AdvanceFrame();
+  }
+  tracker.SweepHotPages(1);
+  Check(LoggedSince(generation).empty() &&
+            tracker.IsRegionGpuModified(page(12), page_size) &&
+            !tracker.IsRegionGpuModified(address, page_size * 12),
+        "hot-page maintenance changed GPU ownership or logged a transition");
+
+  // The unlocked written upload makes its range GPU-owned in the tracker at its end, without a
+  // log entry: the buffer cache's dirty-range Add that follows it is the logged transition.
+  generation = Coherence::Generation();
+  tracker.ForEachWrittenUploadRange(
+      page(8), page_size * 2, [](uint64_t, uint64_t) noexcept {}, []() noexcept {},
+      [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  Check(LoggedSince(generation).empty() &&
+            tracker.IsRegionGpuModified(page(8), page_size * 2),
+        "the written upload logged a transition or did not take GPU ownership");
+
+  // The remaining hooked transitions.
+  generation = Coherence::Generation();
+  tracker.UnmarkRegionAsGpuModified(page(8), page_size * 2);
+  Check(LoggedExactly(generation, page(8), page_size * 2, Source::TrackerGpuUnmark),
+        "GPU unmarking did not log its exact range");
+  generation = Coherence::Generation();
+  tracker.ForEachDownloadRange<true>(page(12), page_size,
+                                     [](uint64_t, uint64_t) noexcept {});
+  Check(LoggedExactly(generation, page(12), page_size, Source::TrackerDownload) &&
+            !tracker.IsRegionGpuModified(page(12), page_size),
+        "a clearing download did not log its exact range");
+  tracker.MarkRegionAsGpuModified(page(12), page_size);
+  generation = Coherence::Generation();
+  tracker.MarkReadbackPending(page(12), page_size);
+  Check(LoggedSince(generation).empty(), "marking a readback pending logged a transition");
+  (void)tracker.UnmarkReadbackPending(page(12), page_size);
+  Check(LoggedExactly(generation, page(12), page_size, Source::TrackerReadbackUnmark) &&
+            !tracker.IsRegionGpuModified(page(12), page_size),
+        "a readback unmark did not log its exact range");
+
+  tracker.UntrackMemory(address, page_size * 16);
+  Release(memory);
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1487,6 +1608,13 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
+  // Record coherence-log entries (read by TestCoherenceLogTrackerTransitions). Set before the
+  // first transition: the choice is made once per process.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  _putenv_s("KYTY_DRAW_PREP_LOG_AUDIT", "1");
+#else
+  setenv("KYTY_DRAW_PREP_LOG_AUDIT", "1", 1);
+#endif
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
@@ -1516,6 +1644,7 @@ int main(int argc, char **argv) {
   TestForeignWatcherFaultsDoNotPromote();
   TestWrittenUploadCopiesOutsideLock();
   TestHotPageSettle();
+  TestCoherenceLogTrackerTransitions();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();
