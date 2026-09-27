@@ -19,6 +19,9 @@ struct CodegenOptions {
 	// KYTY_FAST_PKRTZ=0: convert V_CVT_PKRTZ_F16_F32 halves with the original select chain instead
 	// of the shorter integer formulation.
 	bool fast_pkrtz = true;
+	// KYTY_SINGLE_F2I_SATURATION=0: repeat the float-to-int NaN/range saturation in the emitter even
+	// though the translator's saturated conversion already guarantees an in-range operand.
+	bool single_f2i_saturation = true;
 };
 
 [[nodiscard]] const CodegenOptions& GetCodegenOptions();

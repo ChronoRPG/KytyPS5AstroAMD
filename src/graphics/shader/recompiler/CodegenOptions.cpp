@@ -20,6 +20,8 @@ CodegenOptions FromEnvironment() {
 	options.movrel_range = EnvFlag("KYTY_MOVREL_RANGE", options.movrel_range);
 	options.fast_float_min_max = EnvFlag("KYTY_FAST_FMINMAX", options.fast_float_min_max);
 	options.fast_pkrtz         = EnvFlag("KYTY_FAST_PKRTZ", options.fast_pkrtz);
+	options.single_f2i_saturation =
+	    EnvFlag("KYTY_SINGLE_F2I_SATURATION", options.single_f2i_saturation);
 	return options;
 }
 

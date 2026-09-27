@@ -390,11 +390,24 @@ uint32_t EmitConvertF16F32(EmitterState& state, uint32_t arg0) {
 	return EmitPackHalf2x16(state, pair);
 }
 
+// ConvertS32F32/ConvertU32F32 are only produced by Translator::ConvertF32ToI32Saturated and
+// ConvertF32ToU32Saturated, which already replace NaN, truncate, and clamp the operand to an
+// integral value inside the destination range (at most 2147483520 / 4294967040, at least
+// -2^31 / 0), and select the saturated result themselves. For such operands a bare conversion is
+// exact and EmitF32ToU32's second trunc/NaN/range layer never changes the value.
+// KYTY_SINGLE_F2I_SATURATION=0 keeps that second layer.
 uint32_t EmitConvertS32F32(EmitterState& state, uint32_t arg0) {
+	if (GetCodegenOptions().single_f2i_saturation) {
+		const auto converted = Unary(state, spv::OpConvertFToS, TypeI32(state), arg0);
+		return Unary(state, spv::OpBitcast, TypeU32(state), converted);
+	}
 	return EmitF32ToU32(state, arg0, true);
 }
 
 uint32_t EmitConvertU32F32(EmitterState& state, uint32_t arg0) {
+	if (GetCodegenOptions().single_f2i_saturation) {
+		return Unary(state, spv::OpConvertFToU, TypeU32(state), arg0);
+	}
 	return EmitF32ToU32(state, arg0, false);
 }
 

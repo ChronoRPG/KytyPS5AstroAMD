@@ -613,12 +613,62 @@ void CheckPackRtz(VulkanHarness *vulkan) {
               slow_run.spirv.size(), fast_run.spirv.size());
 }
 
+// Float-to-int conversions with the emitter's second saturation layer on and off.
+void CheckFloatToIntSaturation(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenFloatToIntSaturation";
+  using O = ShaderOpcode;
+  std::vector<std::vector<u32>> inputs(1);
+  inputs[0] = SpecialF32();
+  // Around the integer range limits and the rounding points.
+  const float edges[] = {2147483520.0f, 2147483648.0f, 4294967040.0f, 4294967296.0f,
+                         -2147483648.0f, -2147483904.0f, 65535.0f,    65536.0f,
+                         32767.0f,       32768.0f,       -32768.0f,   -32769.0f,
+                         255.0f,         255.5f,         256.0f,      0.5f,
+                         -0.5f,          1.5f,           -1.5f,       2.5f};
+  for (const auto edge : edges) {
+    const auto bits = std::bit_cast<u32>(edge);
+    for (int delta = -2; delta <= 2; delta++) {
+      inputs[0].push_back(bits + static_cast<u32>(delta));
+    }
+  }
+  uint64_t seed = 0x5eed5eed5eed5eedull;
+  while (inputs[0].size() < 65536u) {
+    // Random magnitudes spread over the whole exponent range.
+    inputs[0].push_back(RandomF32(seed));
+  }
+  const auto bulk = MakeBulkCase(
+      name, 1, 7, inputs,
+      [](std::vector<u32> *code) {
+        code->push_back(EncodeVop1(0x07, 10, Vgpr(2))); // v_cvt_u32_f32
+        code->push_back(EncodeVop1(0x08, 11, Vgpr(2))); // v_cvt_i32_f32
+        code->push_back(EncodeVop1(0x0c, 12, Vgpr(2))); // v_cvt_rpi_i32_f32
+        code->push_back(EncodeVop1(0x0d, 13, Vgpr(2))); // v_cvt_flr_i32_f32
+        code->push_back(EncodeVop1(0x52, 14, Vgpr(2))); // v_cvt_u16_f16 (low half as f16)
+        code->push_back(EncodeVop1(0x53, 15, Vgpr(2))); // v_cvt_i16_f16
+        AppendVop3(code, 0x15e, 16, Vgpr(2), InlineU32(1), InlineU32(0)); // v_cvt_pk_u8_f32
+      },
+      {O::V_CVT_U32_F32, O::V_CVT_I32_F32, O::V_CVT_RPI_I32_F32, O::V_CVT_FLR_I32_F32,
+       O::V_CVT_U16_F16, O::V_CVT_I16_F16, O::V_CVT_PK_U8_F32});
+  CodegenOptions fast = GetCodegenOptions();
+  fast.single_f2i_saturation = true;
+  CodegenOptions slow = fast;
+  slow.single_f2i_saturation = false;
+  const auto fast_run = RunBulk(vulkan, bulk, fast);
+  const auto slow_run = RunBulk(vulkan, bulk, slow);
+  static const char *const names[] = {"cvt_u32", "cvt_i32", "cvt_rpi", "cvt_flr",
+                                      "cvt_u16_f16", "cvt_i16_f16", "cvt_pk_u8"};
+  CompareBulk(name, bulk, fast_run, slow_run, {}, names);
+  std::printf("[codegen] %-32s ok (%u values, SPIR-V %zu -> %zu words)\n", name, bulk.count,
+              slow_run.spirv.size(), fast_run.spirv.size());
+}
+
 void RunAll(VulkanHarness *vulkan) {
   CheckMoveRelValueSet(vulkan);
   CheckFloatMinMax(vulkan);
   CheckFloatClampConstants(vulkan);
   CheckPackRtzExhaustive();
   CheckPackRtz(vulkan);
+  CheckFloatToIntSaturation(vulkan);
 }
 
 } // namespace CodegenTests
