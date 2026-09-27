@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/queueSubmission.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/textureBindingMemo.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -459,6 +460,8 @@ private:
 		TextureCache::ImageDesc desc;
 	};
 	std::array<TextureDescriptionEntry, 4096> m_texture_descriptions;
+	// KYTY_TEXTURE_BINDING_MEMO: (T# dwords, resource) -> resolved image, description and view.
+	TextureBindingMemo m_texture_memo;
 	// KYTY_SAMPLER_MEMO: final sampler dwords -> native sampler. The sampler cache never evicts,
 	// so a remembered handle stays the one GetSampler returns for those dwords.
 	struct SamplerMemoEntry {

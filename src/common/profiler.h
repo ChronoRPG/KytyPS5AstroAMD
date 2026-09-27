@@ -268,6 +268,24 @@ enum class FrameEvent : uint32_t {
 	DccFallbackMetadataAliased, // an image owns (overlaps) the metadata, or metadata overlaps data
 	DccFallbackUnsupported,    // native image lacks storage/mutable usage, or size limits
 	DccFallbackAlignment,      // canonical metadata buffer offset is not 4-byte aligned
+	// Texture binding identity memo (KYTY_TEXTURE_BINDING_MEMO, pipeline/textureBindingMemo.h).
+	// ResolveTexture answered from an entry (Hits), with no entry for the key (Misses), or with an
+	// entry that a texture-cache structure change or the image's live state ruled out (Stale: new
+	// generation, stencil association, pending rebind, alias partner not owned). Full resolutions
+	// recorded (Fills) or not memoizable (Rejects: overlap/rebased answers, DCC, stencil redirect,
+	// non-first-page lookup). Sampled views answered from an entry (ViewHits) or by FindTexture
+	// after the entry could not be used (ViewMisses: first use, dirty/untracked image). Hits whose
+	// binding already held the description (DescCopiesAvoided). StructureChanges: registrations,
+	// unregistrations and stencil associations (each bumps the memo generation).
+	TextureBindingMemoHits,
+	TextureBindingMemoMisses,
+	TextureBindingMemoStale,
+	TextureBindingMemoFills,
+	TextureBindingMemoRejects,
+	TextureViewMemoHits,
+	TextureViewMemoMisses,
+	TextureBindingDescCopiesAvoided,
+	TextureCacheStructureChanges,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

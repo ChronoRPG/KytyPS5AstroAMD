@@ -725,21 +725,44 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
                                     TextureBinding&                              binding) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage = resource.written;
-	if (storage) {
-		ValidateStorageImageResource(resource);
-	}
 	// The same state a freshly returned binding had: no view yet, no mip views (their capacity
 	// is kept), undefined layout.
 	binding.image_view = nullptr;
 	binding.layout     = vk::ImageLayout::eUndefined;
 	binding.mip_views.clear();
+
+	auto&      texture_cache     = m_context.GetTextureCache();
+	const bool memo              = TextureBindingMemo::Enabled();
+	const bool description_cache =
+	    Common::RendererBatchEnabled() && resource.indirect_resources.size() <= 256u;
+	TextureBindingMemo::Key memo_key;
+	uint64_t                hash = 0;
+	if (memo || description_cache) {
+		memo_key = TextureBindingMemo::MakeKey(resource, descriptor.fields);
+		hash     = TextureBindingMemo::Hash(memo_key);
+	}
+	// Exactly the answer of the full resolution below (see textureBindingMemo.h), including the
+	// FindImage access bookkeeping; validation of the key's resource already passed.
+	if (memo && m_texture_memo.TryResolve(texture_cache, memo_key, hash, binding)) {
+		if (!descriptor.IsNull() && HangTrace::Enabled()) {
+			HangTrace::RecordTexture(descriptor.fields);
+		}
+		return;
+	}
+	if (storage) {
+		ValidateStorageImageResource(resource);
+	}
+	TextureBindingMemo::Forget(binding);
 	auto& desc = binding.desc;
 
-	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
 		desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 		                                         : TextureCache::BindingType::Texture);
 		binding.image_id = texture_cache.FindImage(desc);
+		if (memo) {
+			m_texture_memo.Record(texture_cache, memo_key, hash, binding, binding.image_id, false,
+			                      false);
+		}
 		return;
 	}
 
@@ -747,7 +770,7 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 		HangTrace::RecordTexture(descriptor.fields);
 	}
 
-	if (Common::RendererBatchEnabled() && resource.indirect_resources.size() <= 256u) {
+	if (description_cache) {
 		const TextureDescriptionKey key {resource.resource_class, resource.numeric_class,
 		                                 resource.dimension,      resource.mip_mode,
 		                                 resource.mip_count,      resource.conversion_format,
@@ -755,12 +778,7 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 		                                 resource.written,        resource.atomic,
 		                                 resource.depth_compare,  resource.cube,
 		                                 resource.r128};
-		const auto hash =
-		    XXH3_64bits_withSeed(descriptor.fields, sizeof(descriptor.fields),
-		                         (static_cast<uint64_t>(key.dimension) << 32u) ^
-		                             (static_cast<uint64_t>(key.numeric_class) << 16u) ^
-		                             (key.written ? 1u : 0u) ^ (key.depth_compare ? 2u : 0u) ^
-		                             (static_cast<uint64_t>(key.mip_mode) << 8u));
+		// TextureBindingMemo::Hash is this cache's hash of the dwords and key.
 		auto& entry = m_texture_descriptions[hash % m_texture_descriptions.size()];
 		if (entry.valid && entry.key == key &&
 		    std::ranges::equal(entry.words, descriptor.fields)) {
@@ -782,9 +800,12 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 	const auto pixel_format = desc.info.pixel_format;
 	const auto view_format = desc.view_info.format;
 	const auto byte_size = desc.info.data.size;
+	const auto base_level = desc.view_info.base_level;
+	const auto base_layer = desc.view_info.base_layer;
 	const bool shader_conversion = TextureGetSurfaceFormatInfo(descriptor.Format()).conversion_format !=
 	                               Prospero::BufferFormat::kInvalid;
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	const auto found               = id;
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -802,6 +823,12 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 		                             descriptor.DstSelXYZW());
 	}
 	binding.image_id = id;
+	if (memo) {
+		const bool view_rebased =
+		    desc.view_info.base_level != base_level || desc.view_info.base_layer != base_layer;
+		m_texture_memo.Record(texture_cache, memo_key, hash, binding, found, shader_conversion,
+		                      view_rebased);
+	}
 }
 
 static bool SamplerMemoEnabled() {
@@ -1177,8 +1204,9 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
 			}
 			binding.image_view = binding.mip_views.front();
-		} else {
+		} else if (!m_texture_memo.TryAcquireView(texture_cache, binding)) {
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
+			m_texture_memo.RecordView(binding, binding.image_view);
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;

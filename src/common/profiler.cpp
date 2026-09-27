@@ -196,6 +196,15 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.DccFallbackMetadataAliased.Cumulative",
     "FrameEvent.DccFallbackUnsupported.Cumulative",
     "FrameEvent.DccFallbackAlignment.Cumulative",
+    "FrameEvent.TextureBindingMemoHits.Cumulative",
+    "FrameEvent.TextureBindingMemoMisses.Cumulative",
+    "FrameEvent.TextureBindingMemoStale.Cumulative",
+    "FrameEvent.TextureBindingMemoFills.Cumulative",
+    "FrameEvent.TextureBindingMemoRejects.Cumulative",
+    "FrameEvent.TextureViewMemoHits.Cumulative",
+    "FrameEvent.TextureViewMemoMisses.Cumulative",
+    "FrameEvent.TextureBindingDescCopiesAvoided.Cumulative",
+    "FrameEvent.TextureCacheStructureChanges.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 

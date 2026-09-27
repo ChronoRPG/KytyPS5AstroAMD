@@ -34,6 +34,7 @@ class CommandBuffer;
 class CommandScheduler;
 class DccClearHelper;
 class RenderExecutor;
+class TextureBindingMemo;
 struct TextureCacheTestAccess;
 
 class TextureCache {
@@ -259,10 +260,21 @@ private:
 	uint64_t         m_image_lookup_checks = 0;
 	uint64_t         m_image_lookup_mismatches = 0;
 	bool             m_readback_linear_images = false;
+	// Structural generation for TextureBindingMemo (pipeline/textureBindingMemo.h): bumped by
+	// every change of the page-owner index or of an image's registered flag, i.e. whenever the
+	// first-page lookup of FindImage may answer differently. Changing a registered image's
+	// SameBacking fields (address, size, extent, resources, samples, block size, tile mode,
+	// format, type) in place must bump it too.
+	std::atomic<uint64_t> m_binding_generation {1};
+	void NoteStructureChange() noexcept {
+		m_binding_generation.fetch_add(1, std::memory_order_relaxed);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureCacheStructureChanges);
+	}
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
+	friend class TextureBindingMemo;
 };
 
 } // namespace Libs::Graphics
