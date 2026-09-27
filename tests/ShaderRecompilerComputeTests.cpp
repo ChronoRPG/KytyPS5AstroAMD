@@ -11862,6 +11862,85 @@ public:
     std::printf("[gpu]     %-32s ok\n", "StreamedHeadMinLodResidency");
   }
 
+  // S# FILTER_MODE (bits 29..30): 0 blends the bilinear footprint, 1 and 2 return its minimum
+  // and maximum texel (RDNA2 ISA 8.2.7). A 4x4 linear R32F texture holds 1 + x + 4y; its center
+  // lies between texels 6, 7, 10 and 11.
+  void CheckSamplerFilterMode(const char *name, uintptr_t base, RenderContext &context,
+                              TextureCache &texture_cache, RenderExecutor &executor) {
+    if (!m_sampler_filter_minmax) {
+      std::printf("[gpu]     %-32s skipped (no samplerFilterMinmax)\n", "SamplerFilterMode");
+      return;
+    }
+    auto &scheduler = context.GetCommandScheduler();
+    const uint64_t address = base + 0x2f0000;
+    constexpr uint32_t pitch = 64; // 256-byte linear rows
+    for (uint32_t y = 0; y < 4; ++y) {
+      for (uint32_t x = 0; x < 4; ++x) {
+        reinterpret_cast<float *>(address)[y * pitch + x] = static_cast<float>(1 + x + 4 * y);
+      }
+    }
+    ShaderRecompiler::IR::DescriptorValue descriptor{};
+    descriptor.dword_count = 8;
+    descriptor.dwords = {
+        static_cast<uint32_t>(address >> 8u),
+        static_cast<uint32_t>(address >> 40u) |
+            (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) | (3u << 30u),
+        3u << 14u,
+        DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(Prospero::TileMode::kLinear) << 20u) |
+            (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+        0,
+        0x00700000u,
+        0,
+        0};
+    const auto make_sampler = [](uint32_t filter_mode) {
+      // Clamp to edge, bilinear, no mip filter.
+      return ShaderSamplerResource{
+          {2u | (2u << 3u) | (2u << 6u) | (filter_mode << 29u), 0, (1u << 20u) | (1u << 22u),
+           0}};
+    };
+    TestCase test;
+    test.name = "SamplerFilterMode";
+    test.has_user_data = true;
+    std::copy_n(descriptor.dwords.begin(), 8, test.user_data.begin());
+    const auto blend_sampler = make_sampler(0);
+    std::copy_n(blend_sampler.fields, 4, test.user_data.begin() + 8);
+    test.user_data[50] = sizeof(uint32_t);
+    test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                    ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+    AppendVMovLiteral(&test.code, 20, std::bit_cast<uint32_t>(0.5f));
+    AppendVMovLiteral(&test.code, 21, std::bit_cast<uint32_t>(0.5f));
+    test.code.push_back(EncodeMimg0(0x27, 1)); // IMAGE_SAMPLE_LZ
+    test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+    AppendStoreVgpr(&test.code, 0, 0);
+    AppendEnd(&test.code);
+    const auto program = CompileCase(test, SubgroupSize());
+    const auto binding = RenderExecutorTestAccess::ResolveTexture(
+        executor, program.program.info.images[0], descriptor);
+    const auto view = texture_cache.FindTexture(binding.image_id, binding.desc);
+    auto &image = texture_cache.GetImage(binding.image_id);
+    image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
+                  scheduler.Current().Handle());
+    Image sampled;
+    sampled.view = view;
+    sampled.layout = image.backing.state.layout;
+    scheduler.Finish();
+    std::array<float, 3> results{};
+    for (uint32_t mode = 0; mode < 3; ++mode) {
+      const auto sampler = context.GetSamplerCache().GetSampler(make_sampler(mode));
+      auto output = CreateStorageBuffer(test.name, {}, 1);
+      Dispatch(test, program, output, nullptr, &sampled, nullptr, nullptr, sampler);
+      results[mode] = std::bit_cast<float>(ReadBuffer(test.name, output, 1)[0]);
+      DestroyBuffer(&output);
+    }
+    Require(name, "sampler filter mode",
+            results[0] == 8.5f && results[1] == 6.0f && results[2] == 11.0f,
+            "blend/min/max samples returned " + std::to_string(results[0]) + "/" +
+                std::to_string(results[1]) + "/" + std::to_string(results[2]) +
+                " instead of 8.5/6/11");
+    RenderExecutorTestAccess::ResetBindings(executor);
+    std::printf("[gpu]     %-32s ok\n", "SamplerFilterMode");
+  }
+
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
@@ -12447,6 +12526,7 @@ public:
         RenderExecutorTestAccess::ResetBindings(executor);
       }
       CheckStreamedHeadMinLod(name, base, context, texture_cache, executor);
+      CheckSamplerFilterMode(name, base, context, texture_cache, executor);
 
       auto srgb_storage = storage;
       constexpr auto srgb_format =
@@ -18221,6 +18301,7 @@ private:
     m_runtime_context.provoking_vertex_last_enabled = true;
     m_runtime_context.storage_image_read_without_format_enabled =
         m_storage_image_read_without_format;
+    m_runtime_context.sampler_filter_minmax_enabled = m_sampler_filter_minmax;
     m_runtime_context.pipeline_library_enabled = m_pipeline_library;
     m_runtime_context.pipeline_creation_cache_control_enabled = m_pipeline_library;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
@@ -18411,6 +18492,9 @@ private:
     device_features12.timelineSemaphore = true;
     device_features12.bufferDeviceAddress = true;
     device_features12.shaderOutputLayer = true;
+    // Optional, as in the emulator: S# FILTER_MODE min/max reduction.
+    device_features12.samplerFilterMinmax = available_features12.samplerFilterMinmax;
+    m_sampler_filter_minmax = available_features12.samplerFilterMinmax == VK_TRUE;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
@@ -18840,6 +18924,7 @@ private:
   GraphicContext m_runtime_context{};
   bool m_pipeline_library = false;
   bool m_storage_image_read_without_format = false;
+  bool m_sampler_filter_minmax = false;
   std::unique_ptr<RenderContext> m_renderer;
 };
 

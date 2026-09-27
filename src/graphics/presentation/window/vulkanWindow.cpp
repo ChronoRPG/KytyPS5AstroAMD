@@ -673,6 +673,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.multi_draw_indirect_enabled =
 	    supported_features2.features.multiDrawIndirect == VK_TRUE;
 	graphics.draw_indirect_count_enabled = supported_features12.drawIndirectCount == VK_TRUE;
+	graphics.sampler_filter_minmax_enabled = supported_features12.samplerFilterMinmax == VK_TRUE;
+	LOGF("Vulkan sampler min/max reduction: %s\n",
+	     graphics.sampler_filter_minmax_enabled ? "true" : "false");
 	graphics.index_type_uint8_enabled =
 	    index_type_uint8_extension && supported_index_type_uint8.indexTypeUint8 == VK_TRUE;
 	LOGF("Vulkan indirect draws: firstInstance=%s multiDraw=%s count=%s indexUint8=%s\n",
@@ -835,6 +838,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		create_info.pNext = &provoking_vertex;
 	}
 	features12.drawIndirectCount = graphics.draw_indirect_count_enabled ? VK_TRUE : VK_FALSE;
+	features12.samplerFilterMinmax = graphics.sampler_filter_minmax_enabled ? VK_TRUE : VK_FALSE;
 	vk::PhysicalDeviceIndexTypeUint8FeaturesKHR index_type_uint8 {};
 	if (graphics.index_type_uint8_enabled) {
 		index_type_uint8.indexTypeUint8 = VK_TRUE;
