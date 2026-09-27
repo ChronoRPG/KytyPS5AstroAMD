@@ -168,6 +168,12 @@ bool RangeMemoEnabled() {
 	return ParseEnvU64("KYTY_BUFFER_RANGE_MEMO", 1) != 0;
 }
 
+// The small-read stream decision of ObtainBuffer from one MemoryTracker::QueryDirty.
+bool DirtyQueryCombinedEnabled() {
+	static const bool enabled = ParseEnvU64("KYTY_BUFFER_DIRTY_QUERY_COMBINED", 1) != 0;
+	return enabled;
+}
+
 int RangeMemoVerifyMode() {
 	static const int mode = [] {
 		const auto* value = std::getenv("KYTY_BUFFER_RANGE_MEMO_VERIFY");
@@ -1888,7 +1894,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		// KYTY_BUFFER_RANGE_MEMO: the decision depends only on the range's tracker bits, so a
 		// Stream or Clean fact recorded under the current signature decides it without the two
 		// locked queries (the bytes are copied again every time).
+		// KYTY_BUFFER_DIRTY_QUERY_COMBINED (default on): both tracker queries with each region
+		// lock taken once (MemoryTracker::QueryDirty), the same decision.
 		const auto decide = [&] {
+			if (DirtyQueryCombinedEnabled()) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::BufferDirtyQueriesCombined);
+				const auto state = m_memory_tracker.QueryDirty(vaddr, size);
+				return !state.gpu && state.cpu;
+			}
 			return !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 			       m_memory_tracker.IsRegionCpuModified(vaddr, size);
 		};
@@ -2235,6 +2248,14 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+}
+
+bool BufferCache::IsRegionGpuModifiedRelaxed(uint64_t vaddr, uint64_t size) const {
+	return m_memory_tracker.IsRegionGpuModifiedRelaxed(vaddr, size);
+}
+
+bool BufferCache::GpuDirtyMirrorMatches(uint64_t vaddr, uint64_t size) {
+	return m_memory_tracker.GpuMirrorMatches(vaddr, size);
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {

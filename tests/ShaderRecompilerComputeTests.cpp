@@ -10387,9 +10387,28 @@ public:
               "no certified range covers every code byte, or the code was certified the wrong "
               "way (bytes recorded with digests on, or no digest)");
       std::vector<uint8_t> scratch;
+      // KYTY_BACKING_INPLACE: the in-place validation decides as the copying one.
+      const auto in_place = [](const DrawPrep::ReadSet &set) {
+        return set.ValidateInPlace(
+            [](uint64_t address, const uint8_t *expected, uint64_t size) {
+              switch (LibKernel::Memory::CompareGpuCleanBacking(address, expected, size)) {
+              case LibKernel::Memory::BackingCompare::Equal:
+                return DrawPrep::ValidateResult::Ok;
+              case LibKernel::Memory::BackingCompare::Different:
+                return DrawPrep::ValidateResult::Changed;
+              case LibKernel::Memory::BackingCompare::Unavailable:
+                break;
+              }
+              return DrawPrep::ValidateResult::Unclean;
+            },
+            [](uint64_t address, uint64_t size, uint64_t &digest) {
+              return LibKernel::Memory::HashGpuCleanBacking(address, size, digest);
+            });
+      };
       Require(name, "unchanged certificate",
               reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
-                  DrawPrep::ValidateResult::Ok,
+                      DrawPrep::ValidateResult::Ok &&
+                  in_place(reads) == DrawPrep::ValidateResult::Ok,
               "the certificate rejected unchanged code");
 
       // One changed code byte, in the second page of the code.
@@ -10397,12 +10416,14 @@ public:
       changed ^= 0x40u;
       Require(name, "changed certificate",
               reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
-                  DrawPrep::ValidateResult::Changed,
+                      DrawPrep::ValidateResult::Changed &&
+                  in_place(reads) == DrawPrep::ValidateResult::Changed,
               "the certificate accepted changed code");
       changed ^= 0x40u;
       Require(name, "restored certificate",
               reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
-                  DrawPrep::ValidateResult::Ok,
+                      DrawPrep::ValidateResult::Ok &&
+                  in_place(reads) == DrawPrep::ValidateResult::Ok,
               "the certificate rejected code restored to the recorded bytes");
 
       // GPU-owned code bytes are not clean for a backing read: the preparation fails (the
@@ -10416,7 +10437,8 @@ public:
       Require(name, "unclean code",
               unclean.Failure() == DrawPrep::ReadFailure::Unclean &&
                   reads.Validate(LibKernel::Memory::TryReadGpuCleanBacking, scratch) ==
-                      DrawPrep::ValidateResult::Unclean,
+                      DrawPrep::ValidateResult::Unclean &&
+                  in_place(reads) == DrawPrep::ValidateResult::Unclean,
               "GPU-owned code bytes were certified");
       BufferCacheTestAccess::SubtractGpuDirty(cache, code_address + 0x40, 4);
       CleanVerdict::Invalidate(code_address + 0x40, 4, Coherence::Source::Test);

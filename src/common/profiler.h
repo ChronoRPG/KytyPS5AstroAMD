@@ -683,6 +683,22 @@ enum class FrameEvent : uint32_t {
 	// disagreements with the full resolution.
 	TextureBindingMemoRevalidated,
 	TextureBindingMemoRevalidateMismatches,
+	// KYTY_BUFFER_DIRTY_QUERY_COMBINED: small-read stream decisions from one locked query.
+	BufferDirtyQueriesCombined,
+	// KYTY_BACKING_INPLACE: shader-code hashes taken on the backing bytes in place (and of those,
+	// under the mapping lock); DrawPrep::Validate ranges compared or hashed in place (and locked).
+	BackingInPlaceHashes,
+	BackingInPlaceHashesLocked,
+	DrawPrepValidateInPlaceRanges,
+	DrawPrepValidateInPlaceLocked,
+	// KYTY_BACKING_INPLACE_VERIFY: in-place vs copied validations; Races = differed once, then
+	// agreed on a second run (a guest write between them).
+	DrawPrepValidateVerifyChecks,
+	DrawPrepValidateVerifyMismatches,
+	DrawPrepValidateVerifyRaces,
+	// KYTY_DRAW_PREP_LOCKFREE_HINT_VERIFY: worker hints checked against the locked tracker bits.
+	DrawPrepHintVerifyChecks,
+	DrawPrepHintVerifyMismatches,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

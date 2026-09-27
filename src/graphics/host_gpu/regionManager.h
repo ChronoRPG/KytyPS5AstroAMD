@@ -122,20 +122,40 @@ public:
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
-		const auto& bits        = GetBits<source>();
-		return RegionBits(bits, start, end).Any();
+		return GetBits<source>().AnyInRange(start, end);
+	}
+
+	// IsModified<Gpu> without `lock`, on the lock-free mirror of the GPU-dirty bits (any thread).
+	// Every change of those bits republishes the mirror under `lock` (PublishGpuMirror), so a
+	// thread holding `lock` sees the mirror equal to the bits; without it, each 64-page word is
+	// read atomically as it was at some moment, which makes this a hint (DrawPrep worker reads).
+	[[nodiscard]] bool IsGpuModifiedRelaxed(uint64_t offset, uint64_t size) const noexcept {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		return RegionBits::AnyInRange(start, end, [this](size_t word) {
+			return m_gpu_mirror[word].load(std::memory_order_relaxed);
+		});
+	}
+	// Verify mode, caller holds `lock`: the mirror words of the range equal the GPU-dirty bits.
+	[[nodiscard]] bool GpuMirrorMatches(uint64_t offset, uint64_t size) const noexcept {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		for (auto word = start / 64u; word <= (end - 1) / 64u; word++) {
+			if (m_gpu_mirror[word].load(std::memory_order_relaxed) != m_gpu_dirty.Word(word)) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
-			if (RegionBits(m_gpu_dirty, start, end).Any()) {
+			if (m_gpu_dirty.AnyInRange(start, end)) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
-			if (RegionBits(m_cpu_dirty, start, end).Any()) {
+			if (m_cpu_dirty.AnyInRange(start, end)) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
@@ -157,6 +177,7 @@ public:
 			// Any GPU ownership transition supersedes an outstanding side readback: a newer
 			// writer (enable) or an explicit download/unmark (disable) now owns these pages.
 			m_readback_pending.UnsetRange(start, end);
+			PublishGpuMirror();
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>();
@@ -180,6 +201,7 @@ public:
 				UpdateProtection<true, false>();
 			} else {
 				m_readback_pending.UnsetRange(start, end);
+				PublishGpuMirror();
 				UpdateProtection<false, true>();
 			}
 		}
@@ -215,7 +237,7 @@ public:
 	                           uint32_t frame, std::atomic_uint32_t& hot_count,
 	                           AheadFunc&& on_ahead) {
 		const auto [start, end] = GetPageRange(vaddr, size);
-		if (RegionBits(m_gpu_dirty, start, end).Any()) {
+		if (m_gpu_dirty.AnyInRange(start, end)) {
 			EXIT("CPU dirty state conflicts with GPU dirty state\n");
 		}
 		FaultResult result;
@@ -385,7 +407,7 @@ public:
 
 	[[nodiscard]] bool IsHot(uint64_t vaddr, uint64_t size) const {
 		const auto [start, end] = GetPageRange(vaddr, size);
-		return RegionBits(m_hot, start, end).Any();
+		return m_hot.AnyInRange(start, end);
 	}
 
 	// Side readbacks (BufferCache::ReadMemory). Pending marks the GPU-dirty pages of a range whose
@@ -415,6 +437,9 @@ public:
 			m_readback_pending.UnsetRange(first, last);
 			cleared += last - first;
 		}
+		if (cleared != 0) {
+			PublishGpuMirror();
+		}
 		uint64_t         retained = 0;
 		const RegionBits dirty(m_gpu_dirty, start, end);
 		for (const auto [first, last]: dirty) {
@@ -431,6 +456,13 @@ public:
 private:
 	// Callers hold `lock`: the serial advances before the bits it describes change.
 	void Bump() noexcept { m_serial.fetch_add(1, std::memory_order_release); }
+
+	// Callers hold `lock`, after changing m_gpu_dirty (IsGpuModifiedRelaxed).
+	void PublishGpuMirror() noexcept {
+		for (size_t word = 0; word < RegionBits::Words; word++) {
+			m_gpu_mirror[word].store(m_gpu_dirty.Word(word), std::memory_order_relaxed);
+		}
+	}
 
 	template <bool track, bool is_read>
 	void UpdateProtection() {
@@ -490,6 +522,8 @@ private:
 	RegionBits                    m_hot;
 	std::unique_ptr<FaultHistory> m_history;
 	std::atomic<uint64_t>         m_serial {1};
+	// Lock-free copy of m_gpu_dirty (PublishGpuMirror), on its own cache lines.
+	alignas(64) std::array<std::atomic<uint64_t>, RegionBits::Words> m_gpu_mirror {};
 };
 
 } // namespace Libs::Graphics

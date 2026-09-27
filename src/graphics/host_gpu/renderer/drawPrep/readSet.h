@@ -207,6 +207,36 @@ public:
 		return ValidateResult::Ok;
 	}
 
+	// Validate without copying the bytes out (KYTY_BACKING_INPLACE): compare(address, expected,
+	// size) -> ValidateResult for one byte range (Ok: clean and equal to `expected`; Unclean: not
+	// clean for a backing read, or no backing; Changed: clean but different), and hash(address,
+	// size, digest) -> bool (false: Unclean) for a digest range. Same checks in the same order as
+	// Validate, so the same result for the same guest bytes.
+	template <typename Compare, typename Hash>
+	[[nodiscard]] ValidateResult ValidateInPlace(Compare&& compare, Hash&& hash) const {
+		static_assert(std::is_invocable_r_v<ValidateResult, Compare&, uint64_t, const uint8_t*,
+		                                    uint64_t>);
+		static_assert(std::is_invocable_r_v<bool, Hash&, uint64_t, uint64_t, uint64_t&>);
+		for (size_t index = 0; index < m_ranges.size(); index++) {
+			const auto bytes  = RangeBytes(index);
+			const auto result = compare(m_ranges[index].begin, bytes.data(),
+			                            static_cast<uint64_t>(bytes.size()));
+			if (result != ValidateResult::Ok) {
+				return result;
+			}
+		}
+		for (const auto& digest: m_digests) {
+			uint64_t value = 0;
+			if (!hash(digest.address, digest.size, value)) {
+				return ValidateResult::Unclean;
+			}
+			if (value != digest.digest) {
+				return ValidateResult::Changed;
+			}
+		}
+		return ValidateResult::Ok;
+	}
+
 	// is_clean(address, size) -> bool: the clean verdict alone (no bytes compared).
 	template <typename IsClean>
 	[[nodiscard]] bool AllClean(IsClean&& is_clean) const {

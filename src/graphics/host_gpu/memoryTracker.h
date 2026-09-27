@@ -29,6 +29,21 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// IsRegionCpuModified and IsRegionGpuModified of one range with each region lock taken once.
+	// cpu is what IsRegionCpuModified would return (it creates missing regions, which start CPU
+	// dirty) unless gpu is set: then missing regions are left alone and cpu is not meaningful,
+	// exactly as `!IsRegionGpuModified(...) && IsRegionCpuModified(...)` never asks.
+	struct DirtyState {
+		bool cpu = false;
+		bool gpu = false;
+	};
+	[[nodiscard]] DirtyState QueryDirty(uint64_t vaddr, uint64_t size);
+	// IsRegionGpuModified without the region locks, on the regions' lock-free mirrors of their
+	// GPU-dirty bits (RegionManager::IsGpuModifiedRelaxed). Any thread. A hint: a transition racing
+	// it may or may not be seen, as with a locked query made a moment earlier or later.
+	[[nodiscard]] bool IsRegionGpuModifiedRelaxed(uint64_t vaddr, uint64_t size) const;
+	// Verify mode: under each region lock, whether the mirror equals the GPU-dirty bits.
+	[[nodiscard]] bool GpuMirrorMatches(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);

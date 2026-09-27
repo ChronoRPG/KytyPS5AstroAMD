@@ -219,6 +219,76 @@ public:
 		    cache_mappings);
 	}
 
+	// In-place inspection (KYTY_BACKING_INPLACE): inspect(bytes) gets a pointer to the `size`
+	// backing bytes of [vaddr, vaddr + size) and only reads them (a compare, a hash). When a
+	// per-thread mapping record covers the range the bytes are read where they are, without
+	// m_mutex, and the map generation is checked afterwards exactly as TryReadCachedMapping does;
+	// if a map mutation raced the inspection it is redone under m_mutex, so inspect may run twice
+	// and only its last run counts. A range spanning mappings is gathered into a copy under
+	// m_mutex. *locked tells whether m_mutex was taken.
+	template <typename Inspect>
+	bool TryInspectBacking(uint64_t vaddr, uint64_t size, Inspect& inspect, bool* locked) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		const auto generation = s_map_generation.load(std::memory_order_acquire);
+		for (const auto& entry: t_backing_mapping_cache.entries) {
+			if (entry.owner != this || entry.generation != generation || vaddr < entry.vaddr ||
+			    vaddr - entry.vaddr >= entry.size || size > entry.size - (vaddr - entry.vaddr)) {
+				continue;
+			}
+			// RangeOk held for the whole record when it was cached under m_mutex, and the backing
+			// view stays mapped for the store's lifetime.
+			inspect(static_cast<const uint8_t*>(m_backing_base + entry.backing_offset +
+			                                    (vaddr - entry.vaddr)));
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (s_map_generation.load(std::memory_order_relaxed) == generation) {
+				*locked = false;
+				return true;
+			}
+			break;
+		}
+		*locked = true;
+		std::lock_guard lock(m_mutex);
+		MapEntry entry {};
+		if (!FindContainingUnlocked(vaddr, 1, &entry)) {
+			return false;
+		}
+		if (size <= entry.size - (vaddr - entry.vaddr)) {
+			const auto offset = entry.backing_offset + vaddr - entry.vaddr;
+			if (!RangeOk(offset, size)) {
+				return false;
+			}
+			RememberMappingUnlocked(entry.vaddr, entry.size, entry.backing_offset);
+			inspect(static_cast<const uint8_t*>(m_backing_base + offset));
+			return true;
+		}
+		const auto end     = vaddr + size;
+		auto       current = vaddr;
+		while (current < end) {
+			if (!FindContainingUnlocked(current, 1, &entry)) {
+				return false;
+			}
+			const auto bytes = std::min(end, entry.vaddr + entry.size) - current;
+			if (!RangeOk(entry.backing_offset + current - entry.vaddr, bytes)) {
+				return false;
+			}
+			current += bytes;
+		}
+		static thread_local std::vector<uint8_t> gathered;
+		gathered.resize(size);
+		current = vaddr;
+		while (current < end) {
+			EXIT_IF(!FindContainingUnlocked(current, 1, &entry));
+			const auto bytes = std::min(end, entry.vaddr + entry.size) - current;
+			std::memcpy(gathered.data() + (current - vaddr),
+			            m_backing_base + entry.backing_offset + current - entry.vaddr, bytes);
+			current += bytes;
+		}
+		inspect(static_cast<const uint8_t*>(gathered.data()));
+		return true;
+	}
+
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -866,6 +936,11 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	template <typename Inspect>
+	bool TryInspectBacking(uint64_t vaddr, uint64_t size, Inspect& inspect, bool* locked) {
+		return m_backing->TryInspectBacking(vaddr, size, inspect, locked);
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {

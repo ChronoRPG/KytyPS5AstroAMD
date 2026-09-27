@@ -1265,6 +1265,91 @@ void TestRangeSignatureAcrossRegions() {
   Release(memory);
 }
 
+// MemoryTracker::QueryDirty decides as `!IsRegionGpuModified && IsRegionCpuModified` does (it
+// creates missing regions exactly when that expression would), and the lock-free GPU-dirty mirror
+// (IsRegionGpuModifiedRelaxed) follows every GPU-bit transition, across regions and bit words.
+void TestDirtyQueryAndGpuMirror() {
+  constexpr uintptr_t base = 0x0000000204800000ull;
+  constexpr uint64_t region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = static_cast<uint8_t *>(
+      VirtualAlloc(reinterpret_cast<void *>(base), region_size * 2,
+                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
+  const auto boundary = base + region_size;
+  const auto second_exists = [&] { return tracker.RangeSignature(boundary, page_size) != 0; };
+
+  // First region only, with a GPU-dirty page right below the boundary.
+  UploadAll(tracker, boundary - page_size * 80, page_size * 80);
+  tracker.ForEachUploadRange(
+      boundary - page_size, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  Check(!second_exists(), "the second region exists too early");
+  const auto across = tracker.QueryDirty(boundary - page_size, page_size * 2);
+  Check(across.gpu && !second_exists() &&
+            tracker.IsRegionGpuModifiedRelaxed(boundary - page_size, page_size * 2),
+        "a GPU-dirty query created the missing region or missed the GPU-dirty page");
+  tracker.UnmarkRegionAsGpuModified(boundary - page_size, page_size);
+  const auto created = tracker.QueryDirty(boundary - page_size, page_size * 2);
+  Check(!created.gpu && created.cpu && second_exists(),
+        "a clean query did not create the missing region CPU-dirty");
+  UploadAll(tracker, boundary, page_size * 80);
+
+  // Every query agrees with the locked ones after each GPU-bit transition.
+  const std::array<std::pair<uint64_t, uint64_t>, 8> queries = {{
+      {boundary - page_size * 70, page_size},
+      {boundary - page_size * 70, page_size * 8},
+      {boundary - page_size * 66, page_size * 3},
+      {boundary - page_size * 65, page_size * 66},
+      {boundary - page_size, page_size * 2},
+      {boundary - 16, 32},
+      {boundary + page_size * 63, page_size * 2},
+      {boundary + page_size * 5, 64},
+  }};
+  const auto check_queries = [&](const char *what) {
+    for (const auto &[address, size] : queries) {
+      const bool gpu = tracker.IsRegionGpuModified(address, size);
+      Check(tracker.IsRegionGpuModifiedRelaxed(address, size) == gpu &&
+                tracker.GpuMirrorMatches(address, size),
+            what);
+      const auto state = tracker.QueryDirty(address, size);
+      Check(state.gpu == gpu && (gpu || state.cpu == tracker.IsRegionCpuModified(address, size)),
+            what);
+    }
+  };
+  check_queries("queries diverged on a clean range");
+  // A GPU-dirty run crossing a 64-page bit word (pages 958..962 of the first region).
+  tracker.MarkRegionAsGpuModified(boundary - page_size * 66, page_size * 5);
+  check_queries("queries diverged after a GPU-dirty mark across a bit word");
+  tracker.ForEachDownloadRange<false>(boundary - page_size * 66, page_size * 5,
+                                      [](uint64_t, uint64_t) noexcept {});
+  check_queries("queries diverged after a non-clearing download");
+  tracker.ForEachDownloadRange<true>(boundary - page_size * 66, page_size * 2,
+                                     [](uint64_t, uint64_t) noexcept {});
+  check_queries("queries diverged after a clearing download");
+  tracker.MarkReadbackPending(boundary - page_size * 64, page_size * 3);
+  check_queries("queries diverged after a readback mark");
+  (void)tracker.UnmarkReadbackPending(boundary - page_size * 64, page_size * 3);
+  check_queries("queries diverged after a completed readback");
+  tracker.ForEachWrittenUploadRange(
+      boundary + page_size * 62, page_size * 4, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {}, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  check_queries("queries diverged after a written upload in the second region");
+  WriteFault(tracker, boundary - page_size * 70 + 8);
+  check_queries("queries diverged after a write fault");
+  tracker.MarkRegionAsCpuModified(boundary + page_size * 5, 64);
+  check_queries("queries diverged after a CPU-dirty mark");
+
+  tracker.ForEachDownloadRange<true>(base, region_size * 2, [](uint64_t, uint64_t) noexcept {});
+  check_queries("queries diverged after clearing every GPU-dirty page");
+  Check(!tracker.IsRegionGpuModifiedRelaxed(base, region_size * 2),
+        "the mirror kept a cleared GPU-dirty page");
+  tracker.UntrackMemory(base, region_size * 2);
+  Release(memory);
+}
+
 void TestCrossRegionUpload() {
   constexpr uintptr_t base = 0x0000000200010000ull;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
@@ -1948,6 +2033,7 @@ int main(int argc, char **argv) {
   TestHotPageSettle();
   TestRangeSignature();
   TestRangeSignatureAcrossRegions();
+  TestDirtyQueryAndGpuMirror();
   TestCoherenceLogTrackerTransitions();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX

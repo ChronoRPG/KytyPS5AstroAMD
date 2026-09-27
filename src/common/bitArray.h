@@ -155,6 +155,41 @@ public:
 
 	[[nodiscard]] constexpr bool Any() const { return !None(); }
 
+	static constexpr size_t Words = WORD_COUNT;
+	[[nodiscard]] constexpr uint64_t Word(size_t index) const { return m_data[index]; }
+
+	// Whether any bit of [start, end) is set in the words word_at(i) returns: the value of
+	// BitArray(bits, start, end).Any() without building the masked copy. False for an empty or
+	// out-of-range [start, end), as that copy would be empty.
+	template <typename WordAt>
+	[[nodiscard]] static constexpr bool AnyInRange(size_t start, size_t end, WordAt&& word_at) {
+		if (start >= end || end > N) {
+			return false;
+		}
+		const auto first_word = start / BITS_PER_WORD;
+		const auto last_word  = (end - 1) / BITS_PER_WORD;
+		const auto end_bit    = (end - 1) % BITS_PER_WORD;
+		const auto start_mask = ~uint64_t {0} << (start % BITS_PER_WORD);
+		const auto end_mask =
+		    end_bit == BITS_PER_WORD - 1 ? ~uint64_t {0} : (uint64_t {1} << (end_bit + 1)) - 1;
+		if (first_word == last_word) {
+			return (word_at(first_word) & start_mask & end_mask) != 0;
+		}
+		if ((word_at(first_word) & start_mask) != 0) {
+			return true;
+		}
+		for (auto word = first_word + 1; word < last_word; word++) {
+			if (word_at(word) != 0) {
+				return true;
+			}
+		}
+		return (word_at(last_word) & end_mask) != 0;
+	}
+
+	[[nodiscard]] constexpr bool AnyInRange(size_t start, size_t end) const {
+		return AnyInRange(start, end, [this](size_t word) { return m_data[word]; });
+	}
+
 	[[nodiscard]] constexpr Range FirstRangeFrom(size_t start) const {
 		if (start >= N) {
 			return {N, N};

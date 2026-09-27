@@ -330,14 +330,36 @@ static bool DrawPrepCodeDigestEnabled() {
 // value the preparation derives from those bytes and the key the serial path would look the
 // program up by. The commit re-reads the code (same clean read) and re-hashes it instead of
 // comparing it with a recorded copy, and the recorder keeps no copy of it.
+// KYTY_BACKING_INPLACE: the code is hashed where it is in the backing (same gate, same bytes), not
+// copied out first.
+static uint64_t HashCleanBackingInPlace(uint64_t address, uint64_t size, bool& ok) {
+	uint64_t                        digest = 0;
+	LibKernel::Memory::InPlaceStats stats;
+	ok = LibKernel::Memory::HashGpuCleanBacking(address, size, digest, &stats);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BackingInPlaceHashes, stats.inspected);
+	if (stats.locked != 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BackingInPlaceHashesLocked, stats.locked);
+	}
+	return digest;
+}
+
 static uint64_t HashShaderCodeCertified(std::span<const uint32_t> code) {
 	if (!DrawPrepCodeCertEnabled()) {
 		DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
 		return 0;
 	}
+	const auto address = reinterpret_cast<uint64_t>(code.data());
+	if (DrawPrepCodeDigestEnabled() && LibKernel::Memory::BackingInPlaceEnabled()) {
+		bool       ok     = false;
+		const auto digest = HashCleanBackingInPlace(address, code.size_bytes(), ok);
+		if (!ok) {
+			return 0; // the recorder has failed the preparation
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderCodeHashCertified);
+		return digest;
+	}
 	static thread_local std::vector<uint32_t> scratch;
 	scratch.resize(code.size());
-	const auto address = reinterpret_cast<uint64_t>(code.data());
 	if (DrawPrepCodeDigestEnabled()) {
 		uint64_t digest = 0;
 		if (!LibKernel::Memory::TryReadGpuCleanBackingDigest(address, scratch.data(),
@@ -361,12 +383,22 @@ static uint64_t HashShaderCode(std::span<const uint32_t> code) {
 		return HashShaderCodeCertified(code);
 	}
 	if (ShaderHashBackingEnabled()) {
-		static thread_local std::vector<uint32_t> scratch;
-		scratch.resize(code.size());
-		if (LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(code.data()),
-		                                              scratch.data(), code.size_bytes())) {
-			Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderCodeHashBacking);
-			return XXH3_64bits(scratch.data(), code.size_bytes());
+		if (LibKernel::Memory::BackingInPlaceEnabled()) {
+			bool       ok = false;
+			const auto digest =
+			    HashCleanBackingInPlace(reinterpret_cast<uint64_t>(code.data()), code.size_bytes(), ok);
+			if (ok) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderCodeHashBacking);
+				return digest;
+			}
+		} else {
+			static thread_local std::vector<uint32_t> scratch;
+			scratch.resize(code.size());
+			if (LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(code.data()),
+			                                              scratch.data(), code.size_bytes())) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderCodeHashBacking);
+				return XXH3_64bits(scratch.data(), code.size_bytes());
+			}
 		}
 	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderCodeHashDirect);

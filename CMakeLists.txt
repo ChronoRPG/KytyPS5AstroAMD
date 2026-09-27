@@ -718,6 +718,11 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
 	set_tests_properties(buffer_range_memo_off PROPERTIES
 		ENVIRONMENT "KYTY_BUFFER_RANGE_MEMO=0;KYTY_HOT_PAGE_CHECK_LIMIT=0")
+	# KYTY_BUFFER_DIRTY_QUERY_COMBINED=0: the small-read decision from the two separate queries.
+	add_test(NAME buffer_range_memo_separate_queries
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
+	set_tests_properties(buffer_range_memo_separate_queries PROPERTIES
+		ENVIRONMENT "KYTY_BUFFER_RANGE_MEMO=0;KYTY_BUFFER_DIRTY_QUERY_COMBINED=0")
 	# KYTY_TEXTURE_MEMO_REVALIDATE: default, verify mode, off.
 	add_test(NAME texture_memo_revalidate
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)
@@ -744,6 +749,19 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_fence PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_REG_INDIRECT_WINDOW=0")
+	# KYTY_BACKING_INPLACE and KYTY_DRAW_PREP_LOCKFREE_HINT: verify modes, and both off.
+	add_test(NAME draw_prep_engine_parallel_inplace_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_inplace_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE_VERIFY=exit;KYTY_DRAW_PREP_LOCKFREE_HINT_VERIFY=exit")
+	add_test(NAME draw_prep_engine_parallel_copied
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_copied PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE=0;KYTY_DRAW_PREP_LOCKFREE_HINT=0")
+	add_test(NAME draw_prep_code_cert_copied
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-code-cert-only)
+	set_tests_properties(draw_prep_code_cert_copied PROPERTIES
+		ENVIRONMENT "KYTY_BACKING_INPLACE=0")
 	add_test(NAME buffer_cache_eager_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --readback-eager-only)
 

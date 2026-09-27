@@ -451,6 +451,78 @@ void TestReadSetDigests() {
 	      "one digest over the limit is refused");
 }
 
+// ReadSet::ValidateInPlace (KYTY_BACKING_INPLACE) returns what Validate returns for the same
+// memory: the byte ranges first, then the digests, the first failing range deciding.
+void TestReadSetValidateInPlace() {
+	FakeMemory memory;
+	for (size_t i = 0; i < memory.bytes.size(); i++) {
+		memory.bytes[i] = static_cast<uint8_t>(i * 7u + 3u);
+	}
+	DrawPrep::ReadSet set;
+	RecordFrom(set, memory, 0x10000, 64);
+	RecordFrom(set, memory, 0x10200, 16);
+	RecordFrom(set, memory, 0x107f8, 16);
+	Check(set.RecordDigest(0x10a00, 0x400, XXH3_64bits(memory.bytes.data() + 0xa00, 0x400)),
+	      "record a digest");
+	Check(set.Finish() && set.Ranges().size() == 3, "reads finish as three ranges");
+
+	std::vector<uint8_t> scratch;
+	const auto read = [&](uint64_t address, void* data, uint64_t size) {
+		return memory.Read(address, data, size);
+	};
+	uint32_t compares = 0;
+	uint32_t hashes   = 0;
+	const auto compare = [&](uint64_t address, const uint8_t* expected, uint64_t size) {
+		compares++;
+		std::vector<uint8_t> bytes(size);
+		if (!memory.Read(address, bytes.data(), size)) {
+			return DrawPrep::ValidateResult::Unclean;
+		}
+		return std::memcmp(bytes.data(), expected, size) == 0 ? DrawPrep::ValidateResult::Ok
+		                                                     : DrawPrep::ValidateResult::Changed;
+	};
+	const auto hash = [&](uint64_t address, uint64_t size, uint64_t& digest) {
+		hashes++;
+		std::vector<uint8_t> bytes(size);
+		if (!memory.Read(address, bytes.data(), size)) {
+			return false;
+		}
+		digest = XXH3_64bits(bytes.data(), size);
+		return true;
+	};
+	const auto same = [&](const char* message) {
+		const auto copied = set.Validate(read, scratch);
+		Check(set.ValidateInPlace(compare, hash) == copied, message);
+		return copied;
+	};
+	Check(same("unchanged memory") == DrawPrep::ValidateResult::Ok && compares == 3 && hashes == 1,
+	      "unchanged memory validates in place, every range once");
+	for (const size_t offset: {size_t {0x10}, size_t {0x205}, size_t {0x7ff}, size_t {0x800},
+	                           size_t {0xc00}}) {
+		memory.bytes[offset] ^= 0x10u;
+		Check(same("a changed byte") == DrawPrep::ValidateResult::Changed,
+		      "a changed byte fails validation in place");
+		memory.bytes[offset] ^= 0x10u;
+	}
+	memory.bytes[0x900] ^= 0x10u; // in no certified range
+	Check(same("an uncertified byte") == DrawPrep::ValidateResult::Ok,
+	      "a change outside the certificate failed validation in place");
+	memory.bytes[0x900] ^= 0x10u;
+	// Unclean first: the byte ranges are checked before the (changed) digest.
+	memory.bytes[0xc00] ^= 0x10u;
+	memory.dirty_begin = 0x10204;
+	memory.dirty_end   = 0x10205;
+	Check(same("unclean before changed") == DrawPrep::ValidateResult::Unclean,
+	      "an unclean byte range decides before a changed digest in place");
+	memory.dirty_begin = 0x10b00;
+	memory.dirty_end   = 0x10b01;
+	Check(same("unclean digest") == DrawPrep::ValidateResult::Unclean,
+	      "an unclean digest range fails validation in place");
+	memory.dirty_begin = memory.dirty_end = 0;
+	memory.bytes[0xc00] ^= 0x10u;
+	Check(same("restored memory") == DrawPrep::ValidateResult::Ok, "restored memory validates");
+}
+
 void TestRecordScopeNests() {
 	DrawPrep::ReadSet  outer_set;
 	DrawPrep::ReadSet  inner_set;
@@ -772,6 +844,7 @@ int main() {
 	TestReadSetInconsistent();
 	TestReadSetLimits();
 	TestReadSetDigests();
+	TestReadSetValidateInPlace();
 	TestRecordScopeNests();
 	TestPacketClassification();
 	TestFenceKinds();

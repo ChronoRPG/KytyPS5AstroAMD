@@ -158,6 +158,9 @@ public:
 	                                                                  uint64_t size) const;
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Lock-free hint (MemoryTracker::IsRegionGpuModifiedRelaxed), any thread; and its verify check.
+	[[nodiscard]] bool IsRegionGpuModifiedRelaxed(uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] bool GpuDirtyMirrorMatches(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	// Caller holds the mapped-range lock. Cache/tracker iteration remains on the GPU thread.
 	void               SynchronizeBdaBuffers(const RangeSet& mapped_ranges);
