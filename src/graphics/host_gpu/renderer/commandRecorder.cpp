@@ -608,9 +608,18 @@ void CommandRecorder::Submit(const CommandStream::SubmitPacket& submit) {
 
 void CommandRecorder::Drain(const void* site_key, bool is_site) {
 	const auto start = NowNs();
-	const auto end   = m_encoder.DrainMarker(++m_drain_serial);
-	if (m_mode == Mode::Thread) {
-		m_ring.WaitConsumed(end, m_drain_policy, m_drain_stats);
+	// Idle: the recorder released everything encoded (published or not), so it executed every
+	// packet and records nothing until the next one. The window opens without a marker and
+	// without waking a parked recorder (the consumer's seq_cst release of the position orders its
+	// native calls before ours). Inline mode is always idle here.
+	const bool idle = m_ring.Consumed() == m_ring.WritePosition();
+	if (idle) {
+		m_idle_drains++;
+	} else {
+		const auto end = m_encoder.DrainMarker(++m_drain_serial);
+		if (m_mode == Mode::Thread) {
+			m_ring.WaitConsumed(end, m_drain_policy, m_drain_stats);
+		}
 	}
 	const auto now = NowNs();
 	m_drains++;
@@ -619,6 +628,11 @@ void CommandRecorder::Drain(const void* site_key, bool is_site) {
 		auto& entry = m_drain_log[DrainKey {site_key, is_site}];
 		entry.count++;
 		entry.ns += now - start;
+		if (idle) {
+			entry.idle++;
+		} else {
+			entry.waited_ns += now - start;
+		}
 		// Also every 10 s: a game session usually ends without a clean shutdown.
 		if (now - m_drain_log_printed_ns >= 10'000'000'000ull) {
 			m_drain_log_printed_ns = now;
@@ -675,10 +689,10 @@ void CommandRecorder::Stop() {
 	PublishCounters();
 	if (m_encoder.Packets() != 0) {
 		std::printf("Kyty CP recorder: %" PRIu64 " packets, %" PRIu64 " MiB, %" PRIu64
-		            " drains (%.3f ms), ring-full waits %" PRIu64 ", recorder parks %" PRIu64
-		            ", verify checks %" PRIu64 ", mismatches %" PRIu64 ", ownership faults %" PRIu64
-		            "\n",
-		            m_encoder.Packets(), m_encoder.Bytes() >> 20u, m_drains,
+		            " drains (%" PRIu64 " idle, %.3f ms), ring-full waits %" PRIu64
+		            ", recorder parks %" PRIu64 ", verify checks %" PRIu64 ", mismatches %" PRIu64
+		            ", ownership faults %" PRIu64 "\n",
+		            m_encoder.Packets(), m_encoder.Bytes() >> 20u, m_drains, m_idle_drains,
 		            static_cast<double>(m_drain_ns) / 1e6, m_encoder.Stats().spins,
 		            m_consumer_stats.blocks, m_replay.checks, m_replay.mismatches,
 		            g_ownership_faults.load(std::memory_order_relaxed));
@@ -795,6 +809,11 @@ void CommandRecorder::PublishCounters() {
 	if (m_drains != m_drains_published) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::CpRecorderDrains,
 		                          m_drains - m_drains_published);
+		if (m_idle_drains != m_idle_drains_published) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::CpRecorderIdleDrains,
+			                          m_idle_drains - m_idle_drains_published);
+			m_idle_drains_published = m_idle_drains;
+		}
 		Profiler::AddFrameWait(Profiler::FrameWait::CpRecorderDrain, m_drains - m_drains_published,
 		                       m_drain_ns - m_drain_ns_published);
 		m_drains_published   = m_drains;
@@ -843,27 +862,35 @@ void CommandRecorder::PrintDrainLog() {
 #if defined(_WIN32)
 	base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
 #endif
-	std::printf("Kyty CP recorder drains by site (%" PRIu64 " total, %.3f ms; count, us each):\n",
-	            m_drains, static_cast<double>(m_drain_ns) / 1e6);
-	LOGF("Kyty CP recorder drains by site (%" PRIu64 " total, %.3f ms; count, us each):\n",
-	     m_drains, static_cast<double>(m_drain_ns) / 1e6);
+	char line[256];
+	const auto emit = [&] {
+		std::printf("%s", line);
+		LOGF("%s", line);
+	};
+	std::snprintf(line, sizeof(line),
+	              "Kyty CP recorder drains by site (%" PRIu64 " total, %" PRIu64
+	              " idle, %.3f ms; count, idle, us each, us per waited drain):\n",
+	              m_drains, m_idle_drains, static_cast<double>(m_drain_ns) / 1e6);
+	emit();
+	const auto per = [](uint64_t ns, uint64_t count) {
+		return count != 0 ? static_cast<double>(ns) / 1e3 / static_cast<double>(count) : 0.0;
+	};
 	for (const auto& [key, stats]: sorted) {
-		const double each_us = stats.count != 0 ? static_cast<double>(stats.ns) / 1e3 /
-		                                              static_cast<double>(stats.count)
-		                                        : 0.0;
+		const double each_us   = per(stats.ns, stats.count);
+		const double waited_us = per(stats.waited_ns, stats.count - stats.idle);
 		if (key.is_site) {
 			const auto* site = static_cast<const GpuOpProfiler::Site*>(key.key);
-			std::printf("  %10" PRIu64 " %8.2f  site %s\n", stats.count, each_us,
-			            site != nullptr ? site->name : "?");
-			LOGF("  %10" PRIu64 " %8.2f  site %s\n", stats.count, each_us,
-			     site != nullptr ? site->name : "?");
+			std::snprintf(line, sizeof(line), "  %10" PRIu64 " %10" PRIu64 " %8.2f %8.2f  site %s\n",
+			              stats.count, stats.idle, each_us, waited_us,
+			              site != nullptr ? site->name : "?");
 		} else {
 			const auto address = reinterpret_cast<uintptr_t>(key.key);
-			std::printf("  %10" PRIu64 " %8.2f  caller exe+0x%" PRIxPTR "\n", stats.count, each_us,
-			            address >= base ? address - base : address);
-			LOGF("  %10" PRIu64 " %8.2f  caller exe+0x%" PRIxPTR "\n", stats.count, each_us,
-			     address >= base ? address - base : address);
+			std::snprintf(line, sizeof(line),
+			              "  %10" PRIu64 " %10" PRIu64 " %8.2f %8.2f  caller exe+0x%" PRIxPTR "\n",
+			              stats.count, stats.idle, each_us, waited_us,
+			              address >= base ? address - base : address);
 		}
+		emit();
 	}
 	std::fflush(stdout);
 }

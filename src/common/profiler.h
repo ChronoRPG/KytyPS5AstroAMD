@@ -942,6 +942,8 @@ enum class FrameEvent : uint32_t {
 	CpRecorderVerifyMismatches,
 	CpRecorderPlacementSamples,
 	CpRecorderSameCoreSamples,
+	// Drains that found the recorder idle (everything executed): no marker, no wake.
+	CpRecorderIdleDrains,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

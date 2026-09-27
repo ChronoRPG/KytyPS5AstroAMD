@@ -87,6 +87,7 @@
 #include <filesystem>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -1213,6 +1214,110 @@ void Require(const char *shader_name, const char *stage, bool value,
     Fail(shader_name, stage, message);
   }
 }
+
+// KYTY_TEST_VULKAN_VALIDATION=1 | sync | full: the harness instance runs under
+// VK_LAYER_KHRONOS_validation. `1`: core and thread-safety checks (the thread-safety checks see
+// command-pool, descriptor-pool, command-buffer and queue use from two threads at once), without
+// SPIR-V validation of the recompiler's modules; `sync` adds synchronization validation; `full`
+// keeps shader validation too. Every validation error is counted and printed in full for its
+// first three occurrences per message id. The harness fails at teardown when an error was
+// reported whose id KYTY_TEST_VULKAN_VALIDATION_IGNORE (comma-separated message-id names) does
+// not list.
+namespace TestValidation {
+
+enum class Mode { Off, Core, Sync, Full };
+
+Mode Requested() {
+  static const Mode mode = [] {
+    const char *value = std::getenv("KYTY_TEST_VULKAN_VALIDATION");
+    if (value == nullptr || value[0] == 0 || std::strcmp(value, "0") == 0) {
+      return Mode::Off;
+    }
+    if (std::strcmp(value, "sync") == 0) {
+      return Mode::Sync;
+    }
+    return std::strcmp(value, "full") == 0 ? Mode::Full : Mode::Core;
+  }();
+  return mode;
+}
+
+struct State {
+  std::mutex mutex;
+  std::map<std::string, uint64_t> errors;
+  uint64_t warnings = 0;
+  uint64_t ignored = 0;
+};
+
+State &GetState() {
+  static State state;
+  return state;
+}
+
+bool Ignored(std::string_view id) {
+  const char *list = std::getenv("KYTY_TEST_VULKAN_VALIDATION_IGNORE");
+  if (list == nullptr) {
+    return false;
+  }
+  std::string_view rest(list);
+  while (!rest.empty()) {
+    const auto comma = rest.find(',');
+    if (rest.substr(0, comma) == id) {
+      return true;
+    }
+    if (comma == std::string_view::npos) {
+      break;
+    }
+    rest.remove_prefix(comma + 1);
+  }
+  return false;
+}
+
+VKAPI_ATTR vk::Bool32 VKAPI_CALL
+Callback(vk::DebugUtilsMessageSeverityFlagBitsEXT severity, vk::DebugUtilsMessageTypeFlagsEXT types,
+         const vk::DebugUtilsMessengerCallbackDataEXT *data, void * /*user_data*/) {
+  if (data == nullptr || data->pMessage == nullptr) {
+    return VK_FALSE;
+  }
+  const std::string id = data->pMessageIdName != nullptr ? data->pMessageIdName : "?";
+  auto &state = GetState();
+  std::scoped_lock lock(state.mutex);
+  // Only validation errors count (GENERAL errors can come from unrelated loader or layer issues,
+  // as in the emulator's callback).
+  if (severity != vk::DebugUtilsMessageSeverityFlagBitsEXT::eError ||
+      !(types & vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation)) {
+    if (++state.warnings <= 10) {
+      std::printf("[validation] warning %s: %s\n", id.c_str(), data->pMessage);
+    }
+    return VK_FALSE;
+  }
+  if (Ignored(id)) {
+    state.ignored++;
+    return VK_FALSE;
+  }
+  const auto count = ++state.errors[id];
+  if (count <= 3) {
+    std::printf("[validation] ERROR %s (occurrence %" PRIu64 "): %s\n", id.c_str(), count,
+                data->pMessage);
+  }
+  return VK_FALSE;
+}
+
+// Prints the summary; returns the number of counted errors.
+uint64_t Summarize() {
+  auto &state = GetState();
+  std::scoped_lock lock(state.mutex);
+  uint64_t total = 0;
+  for (const auto &[id, count] : state.errors) {
+    std::printf("[validation]   %8" PRIu64 "  %s\n", count, id.c_str());
+    total += count;
+  }
+  std::printf("[validation] %" PRIu64 " errors in %zu ids, %" PRIu64 " warnings, %" PRIu64
+              " ignored\n",
+              total, state.errors.size(), state.warnings, state.ignored);
+  return total;
+}
+
+} // namespace TestValidation
 
 void CheckErrorDialogLifecycle() {
   namespace ErrorDialog = Libs::Dialog::ErrorDialog;
@@ -2554,7 +2659,7 @@ public:
 
   // KYTY_CP_RECORDER (commandRecorder.h, CP-RECORDER-P2.md):
   //  1. encoded commands and commands recorded natively in a direct window (after a drain) reach
-  //     the GPU in program order;
+  //     the GPU in program order; a drain with nothing encoded since the last one is idle;
   //  2. the CP waiting on a tick that is still only in the recorder's ring (the recorder held) is
   //     released once the recorder hands it to the queue (MasterSemaphore::Wait, WaitRecorded);
   //  3. a drain wakes a parked recorder that holds packets published without a wake;
@@ -2627,6 +2732,21 @@ public:
       }
       Require(name, "program order", ok,
               "encoded and direct-window commands did not execute in program order");
+    }
+
+    // 1b. A drain with nothing encoded since the previous one finds the recorder idle: no marker
+    //     and no wait (the previous drain waited for everything, its own marker included).
+    {
+      auto &command = scheduler.Current();
+      { (void)command.Handle(); }
+      command.BeginEmission();
+      const auto idle = recorder->IdleDrains();
+      const auto packets = recorder->Encoder().Packets();
+      { (void)command.Handle(); }
+      Require(name, "idle drain",
+              recorder->IdleDrains() == idle + 1 && recorder->Encoder().Packets() == packets,
+              "a drain with nothing encoded since the previous one encoded a marker");
+      command.BeginEmission();
     }
 
     // 2. Waiting on a tick that is still only in the ring.
@@ -2715,8 +2835,8 @@ public:
             "the recorder reported verify mismatches");
     scheduler.Finish();
     DestroyBuffer(&buffer);
-    std::printf("[host]    %-32s ok (%s, %" PRIu64 " drains)\n", name,
-                threaded ? "thread" : "inline", recorder->Drains());
+    std::printf("[host]    %-32s ok (%s, %" PRIu64 " drains, %" PRIu64 " idle)\n", name,
+                threaded ? "thread" : "inline", recorder->Drains(), recorder->IdleDrains());
   }
 
   // CP time of a draw-heavy command stream through the command processor (PM4 -> draw prep ->
@@ -2890,9 +3010,11 @@ public:
                          : recorder->GetMode() == CommandRecorder::Mode::Thread ? "thread"
                                                                                   : "inline";
       std::printf("[bench]   %-32s mode %-6s %u draws: CP %.0f ns/draw, recorder thread %.0f ns/draw, "
-                  "drains %" PRIu64 "\n",
+                  "drains %" PRIu64 " (%" PRIu64 " idle, %.3f ms in all)\n",
                   name, mode, draws, best_cp / draws, best_busy / draws,
-                  recorder != nullptr ? recorder->Drains() : 0);
+                  recorder != nullptr ? recorder->Drains() : 0,
+                  recorder != nullptr ? recorder->IdleDrains() : 0,
+                  recorder != nullptr ? static_cast<double>(recorder->DrainNs()) / 1e6 : 0.0);
       RenderExecutorTestAccess::ResetBindings(context.GetRenderExecutor());
       context.UnmapMemory(base, allocation_size);
     });
@@ -22902,10 +23024,65 @@ private:
     vk::InstanceCreateInfo instance_info{};
     instance_info.sType = vk::StructureType::eInstanceCreateInfo;
     instance_info.pApplicationInfo = &app;
+    // KYTY_TEST_VULKAN_VALIDATION (TestValidation): the layer, a messenger chained into instance
+    // creation and a messenger for the instance's lifetime.
+    const auto validation = TestValidation::Requested();
+    const std::array<const char *, 1> validation_layers{"VK_LAYER_KHRONOS_validation"};
+    const std::array<const char *, 2> validation_extensions{
+        VK_EXT_DEBUG_UTILS_EXTENSION_NAME, VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME};
+    const std::array<vk::ValidationFeatureEnableEXT, 1> validation_enables{
+        vk::ValidationFeatureEnableEXT::eSynchronizationValidation};
+    const std::array<vk::ValidationFeatureDisableEXT, 1> validation_disables{
+        vk::ValidationFeatureDisableEXT::eShaders};
+    vk::ValidationFeaturesEXT validation_features{};
+    vk::DebugUtilsMessengerCreateInfoEXT messenger_info{};
+    if (validation != TestValidation::Mode::Off) {
+      u32 layer_count = 0;
+      (void)vk::enumerateInstanceLayerProperties(&layer_count, nullptr);
+      std::vector<vk::LayerProperties> layers(layer_count);
+      (void)vk::enumerateInstanceLayerProperties(&layer_count, layers.data());
+      Require("VulkanHarness", "validation",
+              std::any_of(layers.begin(), layers.end(),
+                          [](const vk::LayerProperties &layer) {
+                            return std::strcmp(layer.layerName.data(),
+                                               "VK_LAYER_KHRONOS_validation") == 0;
+                          }),
+              "KYTY_TEST_VULKAN_VALIDATION: VK_LAYER_KHRONOS_validation is not installed");
+      if (validation == TestValidation::Mode::Sync) {
+        validation_features.enabledValidationFeatureCount =
+            static_cast<u32>(validation_enables.size());
+        validation_features.pEnabledValidationFeatures = validation_enables.data();
+      }
+      if (validation != TestValidation::Mode::Full) {
+        validation_features.disabledValidationFeatureCount =
+            static_cast<u32>(validation_disables.size());
+        validation_features.pDisabledValidationFeatures = validation_disables.data();
+      }
+      messenger_info.pNext = &validation_features;
+      messenger_info.messageSeverity = vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
+                                       vk::DebugUtilsMessageSeverityFlagBitsEXT::eError;
+      messenger_info.messageType = vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral |
+                                   vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation;
+      messenger_info.pfnUserCallback = &TestValidation::Callback;
+      instance_info.pNext = &messenger_info;
+      instance_info.enabledLayerCount = static_cast<u32>(validation_layers.size());
+      instance_info.ppEnabledLayerNames = validation_layers.data();
+      instance_info.enabledExtensionCount = static_cast<u32>(validation_extensions.size());
+      instance_info.ppEnabledExtensionNames = validation_extensions.data();
+      std::printf("[validation] VK_LAYER_KHRONOS_validation: core, thread safety%s%s\n",
+                  validation == TestValidation::Mode::Sync ? ", synchronization" : "",
+                  validation == TestValidation::Mode::Full ? ", shaders" : "");
+    }
     RequireVk("VulkanHarness", "dispatch",
               vk::createInstance(&instance_info, nullptr, &m_instance),
               "vkCreateInstance");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_instance);
+    if (validation != TestValidation::Mode::Off) {
+      messenger_info.pNext = nullptr;
+      RequireVk("VulkanHarness", "validation",
+                m_instance.createDebugUtilsMessengerEXT(&messenger_info, nullptr, &m_messenger),
+                "vkCreateDebugUtilsMessengerEXT");
+    }
 
     u32 physical_count = 0;
     RequireVk("VulkanHarness", "dispatch",
@@ -23133,6 +23310,9 @@ private:
       device_info.pNext = &robustness2;
     }
     vk::PhysicalDeviceFeatures device_features{};
+    // As on the emulator's device (vulkanWindow.cpp): the renderer's rasterization state always
+    // enables depth clamping, like the DB.
+    device_features.depthClamp = available_features.depthClamp;
     device_features.robustBufferAccess = robustness2_supported;
     device_features.shaderStorageImageWriteWithoutFormat = true;
     // Optional, as in the emulator: TileManager::TileFromImage reads through format-less views.
@@ -23181,6 +23361,23 @@ private:
       vk::PhysicalDeviceProperties2 properties{};
       properties.pNext = &m_mesh_properties;
       m_physical_device.getProperties2(&properties);
+    }
+    // As on the emulator's device, when available: viewports in GL clip space have
+    // minDepth = zoffset - zscale (renderDraw.cpp), which leaves [0, 1].
+    {
+      u32 extension_count = 0;
+      (void)m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                                 nullptr);
+      std::vector<vk::ExtensionProperties> extensions(extension_count);
+      (void)m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                                 extensions.data());
+      if (std::any_of(extensions.begin(), extensions.end(),
+                      [](const vk::ExtensionProperties &extension) {
+                        return std::strcmp(extension.extensionName.data(),
+                                           VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME) == 0;
+                      })) {
+        device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
+      }
     }
     // KYTY_PIPELINE_LIBRARY=1 runs the renderer's pipeline creation through graphics pipeline
     // libraries (pipelineLibrary.h), as on a production device that supports them. Checks that
@@ -23242,8 +23439,9 @@ private:
         m_renderer.reset();
         // Every scheduler has stopped: submit what the broker still holds, join its worker.
         m_runtime_context.submission_queue.Shutdown();
-        vmaDestroyAllocator(m_runtime_context.allocator);
-        m_runtime_context.allocator = nullptr;
+        // As the emulator's teardown: the native image pool's retired images first (a bare
+        // vmaDestroyAllocator left them alive; the validation layer reported them as leaked).
+        m_runtime_context.DestroyAllocator();
       }
       if (m_command_pool != nullptr) {
         m_device.destroyCommandPool(m_command_pool, nullptr);
@@ -23251,7 +23449,15 @@ private:
       m_device.destroy(nullptr);
     }
     if (m_instance != nullptr) {
+      if (m_messenger != nullptr) {
+        m_instance.destroyDebugUtilsMessengerEXT(m_messenger, nullptr);
+        m_messenger = nullptr;
+      }
       m_instance.destroy(nullptr);
+    }
+    if (TestValidation::Requested() != TestValidation::Mode::Off) {
+      Require("VulkanHarness", "validation", TestValidation::Summarize() == 0,
+              "the validation layer reported errors (listed above)");
     }
   }
 
@@ -23535,6 +23741,7 @@ private:
   }
 
   vk::Instance m_instance = nullptr;
+  vk::DebugUtilsMessengerEXT m_messenger = nullptr; // KYTY_TEST_VULKAN_VALIDATION
   vk::PhysicalDevice m_physical_device = nullptr;
   vk::Device m_device = nullptr;
   vk::Queue m_queue = nullptr;
