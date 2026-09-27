@@ -256,6 +256,10 @@ void CheckPixelWqmLiveExec(VulkanHarness *vulkan) {
 // DS_CONSUME, =all in every pixel shader.
 void CheckPixelLiveExecCodegen() {
   constexpr const char *name = "PixelLiveExecCodegen";
+  const ShaderRecompiler::CodegenOptions defaults;
+  Require(name, "defaults",
+          defaults.ps_live_exec == PsLiveExec::AppendConsume && defaults.ps_append_live_election,
+          "KYTY_PS_LIVE_EXEC=1 and KYTY_PS_APPEND_LIVE_ELECTION=1 are not the defaults");
   for (const auto mode : {PsLiveExec::Off, PsLiveExec::AppendConsume, PsLiveExec::All}) {
     auto options = GetCodegenOptions();
     options.ps_append_live_election = false;
@@ -286,6 +290,7 @@ void CheckPixelAppendElectionCodegen() {
   for (const bool live_election : {false, true}) {
     auto options = GetCodegenOptions();
     options.ps_append_live_election = live_election;
+    options.ps_live_exec = PsLiveExec::Off;
     ScopedCodegenOptions scoped(options);
     GraphicsCase test;
     test.name = name;

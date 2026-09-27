@@ -74,23 +74,25 @@ struct CodegenOptions {
 	// KYTY_EXEC_SELECTS=0: keep every EXEC-masked VGPR merge Select(exec, new, old) instead of
 	// replacing the ones whose old value no lane can observe (IR::EliminateExecSelects).
 	bool exec_selects = true;
-	// KYTY_PS_APPEND_LIVE_ELECTION=1: in a pixel shader, DS_APPEND/DS_CONSUME elect the lane that
-	// performs the counter atomic among the non-helper invocations only. A pixel shader's EXEC
-	// includes the helper invocations of partially covered quads, and Vulkan discards a helper
-	// invocation's atomic and leaves its result undefined, so electing a helper broadcast an
-	// undefined base to the whole subgroup (duplicate append indices; Astro Bot's GI ray-bundle
-	// linked lists then form cycles). The added count stays popcount(EXEC), so the per-lane
-	// indices a shader derives with V_MBCNT stay unique.
-	bool ps_append_live_election = false;
-	// KYTY_PS_LIVE_EXEC=1|all: pixel shaders that contain DS_APPEND/DS_CONSUME (1) or all pixel
-	// shaders (all) start with EXEC holding only the non-helper invocations. On the PS5 the
-	// initial EXEC is the pixel valid mask and S_WQM_B64 adds the helper lanes of partially
-	// covered quads; with this off EXEC starts full, so the exact-mode EXEC a shader restores
-	// before its stores and atomics still holds the helpers. A DS_APPEND then also counts and
-	// indexes the helper lanes: no duplicates with KYTY_PS_APPEND_LIVE_ELECTION, but slots that
-	// nothing writes (Astro Bot's mesh-particle emitter 0x4dd1f85484fc31f2 leaves unwritten
-	// particle slots, its GI ray-bundle shaders unlinked list nodes).
-	PsLiveExec ps_live_exec = PsLiveExec::Off;
+	// KYTY_PS_APPEND_LIVE_ELECTION=0: in a pixel shader, let DS_APPEND/DS_CONSUME elect the first
+	// EXEC lane for the counter atomic even when it is a helper invocation. By default the lane is
+	// elected among the non-helper invocations: a pixel shader's EXEC can include the helper
+	// invocations of partially covered quads (always without KYTY_PS_LIVE_EXEC, and in whole quad
+	// mode with it), and Vulkan discards a helper invocation's atomic and leaves its result
+	// undefined, so electing a helper broadcast an undefined base to the whole subgroup
+	// (duplicate append indices; Astro Bot's GI ray-bundle linked lists then form cycles and
+	// hang the GPU). The added count stays popcount(EXEC), so the per-lane indices a shader
+	// derives with V_MBCNT stay unique.
+	bool ps_append_live_election = true;
+	// KYTY_PS_LIVE_EXEC=0|1|all (default 1): pixel shaders that contain DS_APPEND/DS_CONSUME (1)
+	// or all pixel shaders (all) start with EXEC holding only the non-helper invocations; 0 starts
+	// every pixel shader with a full EXEC. On the PS5 the initial EXEC is the pixel valid mask and
+	// S_WQM_B64 adds the helper lanes of partially covered quads; with a full EXEC the exact-mode
+	// EXEC a shader restores before its stores and atomics still holds the helpers, so a
+	// DS_APPEND also counts and indexes the helper lanes and leaves slots that nothing writes
+	// (unwritten particle slots in Astro Bot's mesh-particle emitter 0x4dd1f85484fc31f2, unlinked
+	// nodes in its GI ray-bundle linked lists).
+	PsLiveExec ps_live_exec = PsLiveExec::AppendConsume;
 	// KYTY_LOOP_GUARD=<n> with KYTY_LOOP_GUARD_SHADERS=<hash>[,<hash>...] (hexadecimal guest shader
 	// hashes): a diagnostic for a GPU hang suspected in a shader loop. Every structured loop of a
 	// listed shader counts iterations against one per-invocation budget; an invocation that has
