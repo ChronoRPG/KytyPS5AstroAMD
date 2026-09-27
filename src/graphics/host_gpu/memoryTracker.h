@@ -83,19 +83,12 @@ public:
 	// serial before it changes a bit, so a signature read now describes the bits as they are now
 	// (a transition still waiting for the lock has not happened yet). Any thread.
 	[[nodiscard]] uint64_t RangeSignature(uint64_t vaddr, uint64_t size) const noexcept {
-		if (size == 0 || vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
-			return 0;
-		}
-		uint64_t   signature = 0;
-		const auto last      = (vaddr + size - 1) / TRACKER_REGION_SIZE;
-		for (auto index = vaddr / TRACKER_REGION_SIZE; index <= last; index++) {
-			const auto* manager = m_regions[index].load(std::memory_order_acquire);
-			if (manager == nullptr) {
-				return 0;
-			}
-			signature += manager->Serial();
-		}
-		return signature;
+		return SumRegions(vaddr, size, [](const RegionManager& manager) { return manager.Serial(); });
+	}
+	// The same over the regions' dirtying serials (RegionManager::Dirtied): unchanged means no page
+	// of the range's regions turned CPU-dirty in between (verify modes). 0 as above.
+	[[nodiscard]] uint64_t RangeDirtiedSignature(uint64_t vaddr, uint64_t size) const noexcept {
+		return SumRegions(vaddr, size, [](const RegionManager& manager) { return manager.Dirtied(); });
 	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
@@ -304,6 +297,25 @@ public:
 
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+
+	// The sum of value(region) over the regions [vaddr, vaddr + size) spans; 0 when one of them
+	// does not exist yet or the range is invalid. Lock-free.
+	template <typename Value>
+	[[nodiscard]] uint64_t SumRegions(uint64_t vaddr, uint64_t size, Value&& value) const noexcept {
+		if (size == 0 || vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
+			return 0;
+		}
+		uint64_t   sum  = 0;
+		const auto last = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+		for (auto index = vaddr / TRACKER_REGION_SIZE; index <= last; index++) {
+			const auto* manager = m_regions[index].load(std::memory_order_acquire);
+			if (manager == nullptr) {
+				return 0;
+			}
+			sum += value(*manager);
+		}
+		return sum;
+	}
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
 
 	void CheckNotInUploadCallback() const noexcept {

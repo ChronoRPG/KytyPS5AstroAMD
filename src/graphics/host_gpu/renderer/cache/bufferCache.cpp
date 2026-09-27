@@ -540,6 +540,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	m_range_memo_verify = m_range_memo != nullptr ? RangeMemoVerifyMode() : 0;
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	if (m_upload_dma != nullptr) {
@@ -1603,20 +1604,25 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	// nothing (bufferCache.h). Texel reads also download GPU-written images (not tracker state);
 	// the BDA hot-pass verification scans in full.
 	uint64_t memo_signature = 0;
+	uint64_t memo_dirtied   = 0; // verify mode: dirtying serials before the lookup
 	bool     memo_verify    = false;
 	const bool memo_applies = !is_written && !is_texel_buffer && m_range_memo != nullptr &&
 	                          (stats == nullptr || stats->verify_fault_epoch == 0);
 	if (memo_applies) {
+		if (m_range_memo_verify != 0) {
+			memo_dirtied = m_memory_tracker.RangeDirtiedSignature(vaddr, size);
+		}
 		memo_signature = m_memory_tracker.RangeSignature(vaddr, size);
 		const auto& memo = RangeMemoSlot(vaddr, size);
 		if (memo_signature != 0 && memo.signature == memo_signature && memo.vaddr == vaddr &&
 		    memo.size == size && memo.fact == RangeFact::Clean) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::BufferRangeMemoCleanHits);
 			m_range_memo_totals.clean_hits++;
-			if (RangeMemoVerifyMode() == 0) {
+			if (m_range_memo_verify == 0) {
 				return false;
 			}
 			memo_verify = true;
+			RunRangeMemoVerifyHook(vaddr, size);
 		}
 	}
 	std::vector<vk::BufferCopy> copies;
@@ -1718,9 +1724,10 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		const bool collected = !copies.empty() || !hot_ranges.empty();
 		if (memo_verify) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::BufferRangeMemoVerifyChecks);
+			m_range_memo_totals.verify_checks++;
 			if (collected) {
-				ReportRangeMemoMismatch("a skipped synchronization found pages to upload", vaddr,
-				                        size);
+				ClassifyRangeMemoDifference("a skipped synchronization found pages to upload",
+				                            vaddr, size, memo_dirtied);
 			}
 		} else if (!collected && memo_signature != 0 &&
 		           m_memory_tracker.RangeSignature(vaddr, size) == memo_signature) {
@@ -1930,8 +1937,23 @@ void BufferCache::RecordRangeFact(uint64_t vaddr, uint64_t size, uint64_t signat
 	m_range_memo_totals.records++;
 }
 
+void BufferCache::ClassifyRangeMemoDifference(const char* what, uint64_t vaddr, uint64_t size,
+                                              uint64_t dirtied_before) {
+	// Every transition that turns a page CPU-dirty advances its region's dirtying serial under the
+	// region lock before the bit changes, and the hit's signature was read after `dirtied_before`.
+	// Unchanged serials therefore mean the page was already dirty when the hit took place.
+	if (dirtied_before == 0 ||
+	    m_memory_tracker.RangeDirtiedSignature(vaddr, size) != dirtied_before) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BufferRangeMemoVerifyRaces);
+		m_range_memo_totals.verify_races++;
+		return;
+	}
+	ReportRangeMemoMismatch(what, vaddr, size);
+}
+
 void BufferCache::ReportRangeMemoMismatch(const char* what, uint64_t vaddr, uint64_t size) {
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BufferRangeMemoVerifyMismatches);
+	m_range_memo_totals.verify_mismatches++;
 	static std::atomic<uint32_t> logged {0};
 	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
 		std::fprintf(stderr,
@@ -1970,6 +1992,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		};
 		bool stream = false;
 		if (m_range_memo != nullptr) {
+			// Verify mode: dirtying serials before the lookup (ClassifyRangeMemoDifference).
+			const auto  dirtied = m_range_memo_verify != 0
+			                          ? m_memory_tracker.RangeDirtiedSignature(vaddr, size)
+			                          : uint64_t {0};
 			const auto  signature = m_memory_tracker.RangeSignature(vaddr, size);
 			const auto& memo      = RangeMemoSlot(vaddr, size);
 			if (signature != 0 && memo.signature == signature && memo.vaddr == vaddr &&
@@ -1980,12 +2006,23 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 					Profiler::CountFrameEvent(Profiler::FrameEvent::BufferRangeMemoStreamHits);
 					m_range_memo_totals.stream_hits++;
 				}
-				if (RangeMemoVerifyMode() != 0) {
+				if (m_range_memo_verify != 0) {
 					Profiler::CountFrameEvent(Profiler::FrameEvent::BufferRangeMemoVerifyChecks);
-					if (decide() != stream) {
-						ReportRangeMemoMismatch("a small read binding changed its stream decision",
-						                        vaddr, size);
-						stream = !stream;
+					m_range_memo_totals.verify_checks++;
+					RunRangeMemoVerifyHook(vaddr, size);
+					const bool decided = decide();
+					if (decided != stream) {
+						if (!stream) {
+							// Clean, CPU-dirty now: a page may have turned dirty since the lookup.
+							ClassifyRangeMemoDifference(
+							    "a small read binding changed its stream decision", vaddr, size,
+							    dirtied);
+						} else {
+							// Only this thread clears CPU-dirty pages and sets GPU-dirty ones.
+							ReportRangeMemoMismatch(
+							    "a small read binding changed its stream decision", vaddr, size);
+						}
+						stream = decided;
 					}
 				}
 			} else {

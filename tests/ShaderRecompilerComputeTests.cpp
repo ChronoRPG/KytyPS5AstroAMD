@@ -205,6 +205,11 @@ struct BufferCacheTestAccess {
   static BufferCache::RangeMemoTotals RangeMemoTotals(const BufferCache &cache) {
     return cache.m_range_memo_totals;
   }
+  static int RangeMemoVerify(const BufferCache &cache) { return cache.m_range_memo_verify; }
+  static void SetRangeMemoVerifyHook(BufferCache::RangeMemoVerifyHook hook, void *context) {
+    BufferCache::s_range_memo_verify_hook = hook;
+    BufferCache::s_range_memo_verify_context = context;
+  }
   static MemoryTracker &Tracker(BufferCache &cache) { return cache.m_memory_tracker; }
 };
 
@@ -5292,6 +5297,71 @@ public:
       (void)cache.ObtainBuffer(base + large_offset, large_size, false, false);
       Require(name, "clean again", !memo_on || totals().clean_hits == hits1 + 1,
               "the range was not skipped again once clean");
+
+      // A write from another host thread (guest threads and the command processor's label
+      // writes both land through the guest mapping, fault through the tracker first, then write)
+      // moves the signature before the next binding looks the fact up.
+      {
+        std::thread writer([&] { cpu_write(large_offset + 0x200, 0x0badf00du); });
+        writer.join();
+        const auto hits2 = totals().clean_hits;
+        (void)large_matches("write from another thread after a skipped synchronization");
+        Require(name, "cross-thread write invalidates the fact", totals().clean_hits == hits2,
+                "a synchronization after another thread's write was skipped");
+        (void)cache.ObtainBuffer(base + large_offset, large_size, false, false);
+      }
+
+      // KYTY_BUFFER_RANGE_MEMO_VERIFY re-evaluates a hit after it took place. A write fault that
+      // lands in between (in the product: a guest thread faulting while the re-evaluation waits
+      // for that region's lock; U50 check run, ~1 per 30 s at the Sky Garden start) dirties a
+      // page the hit legitimately did not see: a race, never a mismatch. The hook lands one in
+      // exactly that window, for a skipped synchronization and for a small read's decision.
+      if (memo_on && BufferCacheTestAccess::RangeMemoVerify(cache) != 0) {
+        struct Race {
+          std::function<void()> write;
+          bool fired = false;
+        } race;
+        const auto fire = +[](void *context, uint64_t, uint64_t) {
+          auto &state = *static_cast<Race *>(context);
+          if (!state.fired) {
+            state.fired = true;
+            state.write();
+          }
+        };
+        const auto races0 = totals().verify_races;
+        const auto mismatches0 = totals().verify_mismatches;
+        race.write = [&] { cpu_write(large_offset + 0x300, 0x12345678u); };
+        BufferCacheTestAccess::SetRangeMemoVerifyHook(fire, &race);
+        (void)large_matches("write racing a verified skipped synchronization");
+        BufferCacheTestAccess::SetRangeMemoVerifyHook(nullptr, nullptr);
+        Require(name, "racing write is a race (synchronization)",
+                race.fired && totals().verify_races == races0 + 1 &&
+                    totals().verify_mismatches == mismatches0,
+                "a write racing a verified hit was not counted as a race");
+
+        // A small clean range inside the (now uploaded) large one: its binding records Clean,
+        // the next one hits, and a write racing that hit's re-evaluation makes it a stream copy.
+        (void)large_matches("upload before the small clean range");
+        constexpr uint64_t clean_small_offset = large_offset + 0x400;
+        const auto bind_small = [&] {
+          return cache.ObtainBuffer(base + clean_small_offset, 0x40, false, false);
+        };
+        (void)bind_small();
+        (void)bind_small();
+        race.fired = false;
+        race.write = [&] { cpu_write(clean_small_offset + 0x10, 0x87654321u); };
+        BufferCacheTestAccess::SetRangeMemoVerifyHook(fire, &race);
+        const auto [racing_buffer, racing_offset] = bind_small();
+        BufferCacheTestAccess::SetRangeMemoVerifyHook(nullptr, nullptr);
+        Require(name, "racing write is a race (stream decision)",
+                race.fired && totals().verify_races == races0 + 2 &&
+                    totals().verify_mismatches == mismatches0 &&
+                    racing_buffer == &cache.GetUtilityBuffer(Libs::Graphics::MemoryUsage::Stream) &&
+                    std::memcmp(racing_buffer->Mapped().data() + racing_offset,
+                                memory + clean_small_offset, 0x40) == 0,
+                "a write racing a verified decision was not a race, or its bytes were not copied");
+        (void)large_matches("upload after the racing writes");
+      }
 
       // A small CPU-dirty range is a stream copy every time; the decision is reused, the bytes
       // are not.

@@ -244,6 +244,12 @@ private:
 	// equally miss. Direct-mapped, GPU thread only.
 	// KYTY_BUFFER_RANGE_MEMO_VERIFY=1|exit re-evaluates every hit the normal way (uploading whatever
 	// it finds) and counts disagreements (BufferRangeMemoVerifyMismatches; exit stops on the first).
+	// The hit acted at its lock-free signature read, the re-evaluation happens later under the
+	// region locks: a guest write fault in between (the re-evaluation often waits for the region
+	// lock that very fault holds) dirties a page the hit legitimately did not see. Such a
+	// difference counts as a race (BufferRangeMemoVerifyRaces), told apart by the range's
+	// dirtying serials (MemoryTracker::RangeDirtiedSignature) read before the lookup; only a
+	// difference no dirtying after that moment explains is a mismatch.
 	enum class RangeFact : uint8_t { Clean, Stream };
 	struct RangeMemo {
 		uint64_t  vaddr     = 0;
@@ -262,6 +268,21 @@ private:
 	// ring to the copy engine (UploadDma) and returns the source the graphics copies then read
 	// (the DMA ring, with the copies' source offsets rebased); otherwise `source` unchanged.
 	[[nodiscard]] vk::Buffer StageUploadDma(vk::Buffer source, std::span<vk::BufferCopy> copies);
+	// A verify-mode difference that only pages turned CPU-dirty since the lookup can cause: a race
+	// when the range's dirtying serials moved since `dirtied_before` (0: unknown, a race), a
+	// mismatch otherwise.
+	void ClassifyRangeMemoDifference(const char* what, uint64_t vaddr, uint64_t size,
+	                                 uint64_t dirtied_before);
+	// Tests only: runs right after a range-memo hit in verify mode, before its re-evaluation, so a
+	// test can land a transition exactly in that window.
+	using RangeMemoVerifyHook = void (*)(void* context, uint64_t vaddr, uint64_t size);
+	static inline RangeMemoVerifyHook s_range_memo_verify_hook    = nullptr;
+	static inline void*               s_range_memo_verify_context = nullptr;
+	static void RunRangeMemoVerifyHook(uint64_t vaddr, uint64_t size) {
+		if (s_range_memo_verify_hook != nullptr) {
+			s_range_memo_verify_hook(s_range_memo_verify_context, vaddr, size);
+		}
+	}
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size, size_t guest_copies = SIZE_MAX,
 	                                      const uint8_t* host_data = nullptr,
@@ -393,12 +414,16 @@ private:
 	std::unique_ptr<RangeMemo[]>                      m_range_memo;
 	// Always counted (GPU thread; the BufferRangeMemo* frame events need a connected profiler).
 	struct RangeMemoTotals {
-		uint64_t clean_hits  = 0;
-		uint64_t stream_hits = 0;
-		uint64_t records     = 0;
-		uint64_t settles     = 0;
+		uint64_t clean_hits        = 0;
+		uint64_t stream_hits       = 0;
+		uint64_t records           = 0;
+		uint64_t settles           = 0;
+		uint64_t verify_checks     = 0;
+		uint64_t verify_mismatches = 0;
+		uint64_t verify_races      = 0;
 	};
 	RangeMemoTotals                                   m_range_memo_totals;
+	int                                               m_range_memo_verify = 0; // RangeMemoVerifyMode
 	uint32_t                                          m_upload_batch_depth = 0;
 	uint32_t                                          m_hot_sweep_frame  = 0;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};

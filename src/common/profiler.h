@@ -746,6 +746,9 @@ enum class FrameEvent : uint32_t {
 	DrawPrepLogUnknown,
 	DrawPrepLogOverflows,
 	DrawPrepLogValueRescues,
+	// KYTY_BUFFER_RANGE_MEMO_VERIFY: differences explained by a page turned CPU-dirty after the
+	// memo hit (a guest write fault racing the re-evaluation), not counted as mismatches.
+	BufferRangeMemoVerifyRaces,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

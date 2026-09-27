@@ -1236,6 +1236,66 @@ void TestRangeSignature() {
   Release(memory);
 }
 
+// The dirtying signature (MemoryTracker::RangeDirtiedSignature) moves exactly when a page can turn
+// CPU-dirty: write faults (with hot promotion and fault-ahead) and CPU-dirty marks that change
+// something. Uploads, hot-page settles and demotions, GPU transitions and no-op marks leave it.
+void TestRangeDirtiedSignature() {
+  MemoryTracker::FaultPolicy policy;
+  policy.hot_frames = 1;
+  policy.hot_max = 8;
+  policy.ahead_pages = 2;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto dirtied = [&] { return tracker.RangeDirtiedSignature(address, page_size * 4); };
+
+  Check(dirtied() == 0, "a range without a region has a dirtying signature");
+  UploadAll(tracker, address, page_size * 4);
+  const auto created = dirtied();
+  Check(created != 0, "an existing region has no dirtying signature");
+  UploadAll(tracker, address, page_size * 4);
+  Check(dirtied() == created, "an upload moved the dirtying signature");
+
+  WriteFault(tracker, address + page_size * 2); // with fault-ahead of its pair
+  const auto faulted = dirtied();
+  Check(faulted > created, "a write fault kept the dirtying signature");
+  tracker.MarkRegionAsCpuModified(address + page_size * 2, 8);
+  Check(dirtied() == faulted, "a no-op CPU-dirty mark moved the dirtying signature");
+  UploadAll(tracker, address, page_size * 4);
+  Check(dirtied() == faulted, "clearing the fault's pages moved the dirtying signature");
+  tracker.MarkRegionAsCpuModified(address, 8);
+  const auto marked = dirtied();
+  Check(marked > faulted, "a CPU-dirty mark kept the dirtying signature");
+  UploadAll(tracker, address, page_size * 4);
+
+  // GPU ownership and its readback do not dirty the CPU side.
+  tracker.ForEachUploadRange(
+      address + page_size * 3, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  tracker.MarkReadbackPending(address + page_size * 3, page_size);
+  (void)tracker.UnmarkReadbackPending(address + page_size * 3, page_size);
+  Check(dirtied() == marked, "GPU transitions moved the dirtying signature");
+
+  // Hot pages: promotion is a fault (moves it); settling and demotion do not.
+  tracker.AdvanceFrame();
+  WriteFault(tracker, address);
+  const auto promoted = dirtied();
+  Check(tracker.HotPageCount() == 1 && promoted > marked, "hot promotion kept the signature");
+  Check(tracker.SettleHotPages(address, page_size).size() == 1 && dirtied() == promoted,
+        "settling a hot page moved the dirtying signature");
+  tracker.AdvanceFrame();
+  WriteFault(tracker, address);
+  const auto repromoted = dirtied();
+  tracker.DemoteHotPages(address, page_size * 4);
+  Check(tracker.HotPageCount() == 0 && dirtied() == repromoted,
+        "demoting a hot page moved the dirtying signature");
+
+  tracker.UntrackMemory(address, page_size * 4);
+  Release(memory);
+}
+
 // A signature over two regions moves when either region changes.
 void TestRangeSignatureAcrossRegions() {
   constexpr uintptr_t base = 0x0000000204000000ull;
@@ -2032,6 +2092,7 @@ int main(int argc, char **argv) {
   TestWrittenUploadCopiesOutsideLock();
   TestHotPageSettle();
   TestRangeSignature();
+  TestRangeDirtiedSignature();
   TestRangeSignatureAcrossRegions();
   TestDirtyQueryAndGpuMirror();
   TestCoherenceLogTrackerTransitions();

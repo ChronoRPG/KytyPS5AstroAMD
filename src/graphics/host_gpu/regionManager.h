@@ -118,6 +118,14 @@ public:
 	[[nodiscard]] uint64_t Serial() const noexcept {
 		return m_serial.load(std::memory_order_acquire);
 	}
+	// Dirtying serial (MemoryTracker::RangeDirtiedSignature): advanced, under `lock` and before the
+	// bits change, by every transition that can turn a page of this region CPU-dirty (write
+	// faults, including hot promotion and fault-ahead, and explicit CPU-dirty marks). Uploads and
+	// other clears never advance it, so a verify mode can tell a page dirtied after a moment from
+	// one that was already dirty then.
+	[[nodiscard]] uint64_t Dirtied() const noexcept {
+		return m_dirtied.load(std::memory_order_acquire);
+	}
 
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
@@ -166,6 +174,9 @@ public:
 			if (changes || (source == DirtySource::Gpu &&
 			                RegionBits(m_readback_pending, start, end).Any())) {
 				Bump();
+			}
+			if (source == DirtySource::Cpu && enable && changes) {
+				BumpDirtied();
 			}
 		}
 		if constexpr (enable) {
@@ -243,6 +254,7 @@ public:
 		FaultResult result;
 		// Dirty bits (and possibly the hot set) change below.
 		Bump();
+		BumpDirtied();
 		// Only pages this tracker protected fault through it; already CPU-dirty pages fault for
 		// another watcher (an image) and are not part of a fault/reprotect cycle.
 		const RegionBits already_dirty(m_cpu_dirty, start, end);
@@ -456,6 +468,8 @@ public:
 private:
 	// Callers hold `lock`: the serial advances before the bits it describes change.
 	void Bump() noexcept { m_serial.fetch_add(1, std::memory_order_release); }
+	// Callers hold `lock`, before pages become CPU-dirty (Dirtied).
+	void BumpDirtied() noexcept { m_dirtied.fetch_add(1, std::memory_order_release); }
 
 	// Callers hold `lock`, after changing m_gpu_dirty (IsGpuModifiedRelaxed).
 	void PublishGpuMirror() noexcept {
@@ -522,6 +536,7 @@ private:
 	RegionBits                    m_hot;
 	std::unique_ptr<FaultHistory> m_history;
 	std::atomic<uint64_t>         m_serial {1};
+	std::atomic<uint64_t>         m_dirtied {1};
 	// Lock-free copy of m_gpu_dirty (PublishGpuMirror), on its own cache lines.
 	alignas(64) std::array<std::atomic<uint64_t>, RegionBits::Words> m_gpu_mirror {};
 };
