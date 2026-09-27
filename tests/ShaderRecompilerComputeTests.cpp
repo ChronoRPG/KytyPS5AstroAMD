@@ -37,6 +37,7 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
@@ -216,6 +217,12 @@ struct BufferCacheTestAccess {
     return cache.m_relaxed_totals;
   }
   static MemoryTracker &Tracker(BufferCache &cache) { return cache.m_memory_tracker; }
+  // KYTY_BDA_SYNC_EPOCH.
+  static bool BdaEpochSkip(const BufferCache &cache) { return cache.m_bda_epoch_skip; }
+  static int BdaEpochVerify(const BufferCache &cache) { return cache.m_bda_epoch_verify; }
+  static BufferCache::BdaEpochTotals BdaEpochTotals(const BufferCache &cache) {
+    return cache.m_bda_epoch_totals;
+  }
 };
 
 // Sets (or with nullptr removes) an environment switch read when a cache is constructed.
@@ -5473,6 +5480,145 @@ public:
                 BufferCacheTestAccess::RelaxedQueriesEnabled(context.GetBufferCache()) ? "on"
                                                                                        : "off",
                 BufferCacheTestAccess::HotCheckLimit(context.GetBufferCache()));
+  }
+
+  // KYTY_BDA_SYNC_EPOCH: the BDA synchronization runs once per sync epoch. Within an epoch a CPU
+  // write races the draws and waits for the next epoch's pass; an epoch advance (a fence, a
+  // submission, a service command) or a new registered buffer runs the pass again, which uploads
+  // it. In verify mode the skipped pass scans anyway and counts the write as a race (its fault
+  // moved the fault epoch), never as a mismatch.
+  void CheckBdaSyncEpoch() {
+    constexpr const char *name = "BdaSyncEpoch";
+    constexpr uintptr_t base = 0x0000000206C00000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t buffer_offset = 0x20000;
+    constexpr uint64_t buffer_size = 0x10000;
+    constexpr uint64_t other_offset = 0x80000;
+
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "BDA-epoch direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "BDA-epoch fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    for (uint64_t index = 0; index < allocation_size; index++) {
+      memory[index] = static_cast<uint8_t>((index * 29 + index / 4096) & 0xffu);
+    }
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const bool skip_on = BufferCacheTestAccess::BdaEpochSkip(cache);
+      const bool verify_on = BufferCacheTestAccess::BdaEpochVerify(cache) != 0;
+      const auto totals = [&] { return BufferCacheTestAccess::BdaEpochTotals(cache); };
+      const auto read_native = [&](const Libs::Graphics::Buffer &buffer, uint64_t offset,
+                                   uint64_t bytes) {
+        auto readback = CreateHostBuffer(name, bytes, vk::BufferUsageFlagBits::eTransferDst, {0});
+        const vk::BufferCopy copy{offset, 0, bytes};
+        scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                                     vk::PipelineStageFlagBits::eHost, {}, 0,
+                                                     nullptr, 1, &barrier, 0, nullptr);
+        scheduler.Finish();
+        auto words = ReadBuffer(name, readback, static_cast<uint32_t>(bytes / 4));
+        DestroyBuffer(&readback);
+        return words;
+      };
+      const auto cpu_write = [&](uint64_t offset, uint32_t value) {
+        Require(name, "write fault",
+                context.HandleFault(PageFaultAccess::Write, base + offset),
+                "a CPU write to a tracked page did not fault through the tracker");
+        std::memcpy(memory + offset, &value, sizeof(value));
+      };
+      // A registered buffer the BDA passes scan.
+      const auto [buffer, offset] = OnGpuThread(context, [&] {
+        return cache.ObtainBuffer(base + buffer_offset, buffer_size, false, false);
+      });
+
+      // Everything below runs in one GPU-thread command: every service command advances the
+      // epoch when it ends, so separate commands would never share one.
+      using Totals = decltype(BufferCacheTestAccess::BdaEpochTotals(cache));
+      Totals first{}, skipped{}, advanced{}, restructured{};
+      OnGpuThread(context, [&] {
+        context.PrepareBda();
+        first = totals();
+        cpu_write(buffer_offset + 0x100, 0xabcdef01u);
+        context.PrepareBda(); // the same epoch: skipped
+        skipped = totals();
+        SyncEpoch::Advance(); // a fence
+        context.PrepareBda();
+        advanced = totals();
+        (void)cache.ObtainBuffer(base + other_offset, buffer_size, false, false); // new buffer
+        context.PrepareBda(); // the same epoch, but the structure moved
+        restructured = totals();
+      });
+      if (!(first.passes >= 1 &&
+            (skip_on ? skipped.skips == first.skips + 1 && skipped.passes == first.passes
+                     : skipped.passes == first.passes + 1) &&
+            advanced.passes == skipped.passes + 1 &&
+            restructured.passes == advanced.passes + 1)) {
+        std::printf("BdaSyncEpoch: skip %d passes %llu/%llu/%llu/%llu skips %llu/%llu/%llu/%llu\n",
+                    skip_on ? 1 : 0, static_cast<unsigned long long>(first.passes),
+                    static_cast<unsigned long long>(skipped.passes),
+                    static_cast<unsigned long long>(advanced.passes),
+                    static_cast<unsigned long long>(restructured.passes),
+                    static_cast<unsigned long long>(first.skips),
+                    static_cast<unsigned long long>(skipped.skips),
+                    static_cast<unsigned long long>(advanced.skips),
+                    static_cast<unsigned long long>(restructured.skips));
+        Require(name, "pass per epoch", false,
+                "the BDA pass did not run exactly once per epoch and structure");
+      }
+      Require(name, "verify counts a race",
+              !verify_on || (skipped.verify_checks == first.verify_checks + 1 &&
+                             restructured.verify_mismatch_pages == 0),
+              "the verify mode did not check a skipped pass, or took a guest write for a "
+              "missed page");
+      const auto words = read_native(*buffer, offset, buffer_size);
+      Require(name, "write uploaded after the epoch",
+              std::memcmp(words.data(), memory + buffer_offset, buffer_size) == 0,
+              "the pass after the epoch advanced did not upload the CPU write");
+      scheduler.Finish();
+      context.UnmapMemory(base, allocation_size);
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "BDA-epoch direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "BDA-epoch direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok (skip %s, verify %s)\n", name,
+                BufferCacheTestAccess::BdaEpochSkip(context.GetBufferCache()) ? "on" : "off",
+                BufferCacheTestAccess::BdaEpochVerify(context.GetBufferCache()) != 0 ? "on"
+                                                                                       : "off");
   }
 
   void CheckComputeMetaClearClassification() {
@@ -38239,6 +38385,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferRangeMemo();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-sync-epoch-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBdaSyncEpoch();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--texture-memo-revalidate-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTextureMemoRevalidation();
@@ -38466,6 +38617,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRasterization(false, true);
   vulkan.CheckBufferCacheDirtyGarbageCollection();
   vulkan.CheckBufferRangeMemo();
+  vulkan.CheckBdaSyncEpoch();
   vulkan.CheckEagerReadback();
 #endif
   vulkan.CheckUnifiedImageViewCache();

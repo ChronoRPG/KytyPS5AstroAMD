@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
@@ -192,6 +193,19 @@ int RangeMemoVerifyMode() {
 bool RelaxedQueriesEnabled() {
 	static const bool enabled = ParseEnvU64("KYTY_TRACKER_RELAXED_QUERIES", 1) != 0;
 	return enabled;
+}
+
+// KYTY_BDA_SYNC_EPOCH_VERIFY=1|exit: every skipped BDA pass runs anyway and counts the pages the
+// skip would have missed that no guest write explains (BufferCache::VerifyBdaEpochSkip).
+int BdaEpochVerifyMode() {
+	static const int mode = [] {
+		const auto* value = std::getenv("KYTY_BDA_SYNC_EPOCH_VERIFY");
+		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
+			return 0;
+		}
+		return std::strcmp(value, "exit") == 0 ? 2 : 1;
+	}();
+	return mode;
 }
 
 // KYTY_TRACKER_RELAXED_VERIFY=1|exit: every relaxed answer is followed by the locked query. Only
@@ -564,6 +578,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_texture_cache(texture_cache) {
 	m_range_memo_verify = m_range_memo != nullptr ? RangeMemoVerifyMode() : 0;
 	m_relaxed_queries = RelaxedQueriesEnabled();
+	m_bda_epoch_skip  = SyncEpoch::Enabled() && ParseEnvU64("KYTY_BDA_SYNC_EPOCH", 1) != 0;
+	// The verify mode tells guest writes from missed pages by the fault epoch, which the tracker
+	// keeps only with incremental BDA synchronization.
+	m_bda_epoch_verify = m_bda_epoch_skip && m_bda_incremental_sync ? BdaEpochVerifyMode() : 0;
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	if (m_upload_dma != nullptr) {
@@ -2627,9 +2645,8 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::InvalidateBdaSynchronization() noexcept {
-	if (!m_bda_incremental_sync) {
-		return;
-	}
+	// Also without incremental synchronization: KYTY_BDA_SYNC_EPOCH skips a pass only while the
+	// registered buffers and GPU mappings are the ones its last pass scanned.
 	auto epoch = m_bda_structure_epoch.load(std::memory_order_relaxed);
 	while (epoch != UINT64_MAX &&
 	       !m_bda_structure_epoch.compare_exchange_weak(epoch, epoch + 1,
@@ -2638,6 +2655,67 @@ void BufferCache::InvalidateBdaSynchronization() noexcept {
 }
 
 void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
+	// KYTY_BDA_SYNC_EPOCH (syncEpoch.h): once per synchronization epoch. After a completed pass,
+	// memory the pass left clean can only need an upload again within the same epoch through a
+	// guest CPU write, which races the draws that follow (the first pass of the next epoch uploads
+	// it), or a change of the registered buffers or GPU mappings, which moves the BDA structure
+	// epoch. Everything the command processor orders before later draws (packets writing memory,
+	// waits, cache invalidations, service commands) advances the epoch first.
+	const auto sync_epoch = SyncEpoch::Current();
+	const auto structure  = m_bda_structure_epoch.load(std::memory_order_acquire);
+	if (m_bda_epoch_skip && sync_epoch == m_bda_synced_epoch &&
+	    structure == m_bda_synced_structure) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncEpochSkips);
+		m_bda_epoch_totals.skips++;
+		if (m_bda_epoch_verify != 0) {
+			VerifyBdaEpochSkip(mapped_ranges);
+		}
+		return;
+	}
+	const auto fault_epoch = m_memory_tracker.FaultMutationEpoch();
+	SynchronizeBdaBuffersNow(mapped_ranges);
+	m_bda_epoch_totals.passes++;
+	m_bda_synced_epoch     = sync_epoch;
+	m_bda_synced_structure = structure;
+	m_bda_synced_fault     = fault_epoch;
+}
+
+void BufferCache::VerifyBdaEpochSkip(const RangeSet& mapped_ranges) {
+	// The full scan the skip replaced. It uploads whatever it finds, so this mode stays correct.
+	// A normal page it finds CPU-dirty while the fault epoch is still the one taken before the
+	// last pass is a page that pass should have uploaded (no page turned CPU-dirty since): a
+	// mismatch. Hot pages, written without faults, are compared with their shadows and uploaded
+	// when changed: guest writes racing the draws, as the skip assumes.
+	BdaSyncStats verify;
+	verify.verify_fault_epoch     = m_bda_synced_fault;
+	verify.verify_structure_epoch = m_bda_synced_structure;
+	{
+		const UploadBatch upload_batch(*this);
+		mapped_ranges.ForEach([this, &verify](uint64_t start, uint64_t end) {
+			SynchronizeBuffersInRange(start, end - start, &verify);
+		});
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncEpochVerifyChecks);
+	m_bda_epoch_totals.verify_checks++;
+	if (verify.verify_mismatch_pages == 0) {
+		return;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncEpochVerifyMismatches,
+	                          verify.verify_mismatch_pages);
+	m_bda_epoch_totals.verify_mismatch_pages += verify.verify_mismatch_pages;
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::fprintf(stderr,
+		             "BdaSyncEpochVerify: a skipped pass would have missed %" PRIu64
+		             " CPU-dirty page(s) that turned dirty before the last pass\n",
+		             verify.verify_mismatch_pages);
+	}
+	if (m_bda_epoch_verify == 2) {
+		EXIT("BdaSyncEpochVerify: a skipped BDA pass missed CPU-dirty pages\n");
+	}
+}
+
+void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	const bool collect = Profiler::AggregateEnabled();
 	// Read these before scanning: a fault to an already scanned page must force the NEXT
 	// pass, even if its dirty transition completed before this pass finished uploading.

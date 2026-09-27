@@ -757,6 +757,12 @@ enum class FrameEvent : uint32_t {
 	TrackerRelaxedVerifyChecks,
 	TrackerRelaxedVerifyMismatches,
 	TrackerRelaxedVerifyRaces,
+	// KYTY_SYNC_EPOCH: epoch advances; KYTY_BDA_SYNC_EPOCH: BDA passes skipped within an epoch and
+	// their verify mode (Mismatches: pages a skip missed that no guest write explains).
+	SyncEpochAdvances,
+	BdaSyncEpochSkips,
+	BdaSyncEpochVerifyChecks,
+	BdaSyncEpochVerifyMismatches,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

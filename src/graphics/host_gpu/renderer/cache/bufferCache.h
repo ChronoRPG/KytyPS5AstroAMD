@@ -225,6 +225,10 @@ private:
 	// KYTY_BDA_HOT_SYNC_VERIFY: the full scan after a hot pass that relied on these epochs.
 	void VerifyBdaHotPass(const RangeSet& mapped_ranges, uint64_t fault_epoch,
 	                      uint64_t structure_epoch);
+	// The BDA synchronization pass itself (SynchronizeBdaBuffers decides whether it runs).
+	void SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges);
+	// KYTY_BDA_SYNC_EPOCH_VERIFY: the full scan a skipped pass replaced.
+	void VerifyBdaEpochSkip(const RangeSet& mapped_ranges);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer,
 	                                     BdaSyncStats* stats = nullptr,
@@ -451,6 +455,20 @@ private:
 	// thread). Valid while the epochs of that pass hold: a page can only become hot through a
 	// write fault, which changes the fault epoch, and buffers only change with the structure one.
 	std::vector<BdaHotRange>                          m_bda_hot_ranges;
+	// KYTY_BDA_SYNC_EPOCH (SynchronizeBdaBuffers): the sync, BDA structure and fault epochs taken
+	// before the last completed pass (GPU thread; 0: none yet), and the outcomes (tests read them).
+	bool     m_bda_epoch_skip        = false;
+	int      m_bda_epoch_verify      = 0;
+	uint64_t m_bda_synced_epoch      = 0;
+	uint64_t m_bda_synced_structure  = 0;
+	uint64_t m_bda_synced_fault      = 0;
+	struct BdaEpochTotals {
+		uint64_t passes                = 0;
+		uint64_t skips                 = 0;
+		uint64_t verify_checks         = 0;
+		uint64_t verify_mismatch_pages = 0;
+	};
+	BdaEpochTotals m_bda_epoch_totals;
 	StreamBuffer                                      m_staging_buffer;
 	// After the staging ring: destroyed first, waiting for its copies that read the ring.
 	std::unique_ptr<UploadDma>                        m_upload_dma;

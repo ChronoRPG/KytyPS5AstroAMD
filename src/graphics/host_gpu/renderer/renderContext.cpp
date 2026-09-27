@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/memoryStats.h"
+#include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -147,6 +148,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	CleanVerdict::Invalidate(vaddr, size, Coherence::Source::MapMemory);
 	m_mapped_ranges.Add(vaddr, size);
 	m_buffer_cache.InvalidateBdaSynchronization();
+	SyncEpoch::Advance();
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -177,6 +179,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		CleanVerdict::Invalidate(vaddr, size, Coherence::Source::UnmapMemory);
 		m_mapped_ranges.Subtract(vaddr, size);
 		m_buffer_cache.InvalidateBdaSynchronization();
+		SyncEpoch::Advance();
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.

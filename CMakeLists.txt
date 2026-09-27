@@ -735,6 +735,22 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-range-memo-only)
 	set_tests_properties(buffer_range_memo_locked_queries PROPERTIES
 		ENVIRONMENT "KYTY_TRACKER_RELAXED_QUERIES=0")
+	# KYTY_BDA_SYNC_EPOCH: default, with incremental synchronization (as the product runs), verify
+	# mode (it needs the fault epoch of incremental synchronization), off.
+	add_test(NAME bda_sync_epoch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-epoch-only)
+	add_test(NAME bda_sync_epoch_incremental
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-epoch-only)
+	set_tests_properties(bda_sync_epoch_incremental PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1")
+	add_test(NAME bda_sync_epoch_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-epoch-only)
+	set_tests_properties(bda_sync_epoch_verify PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_SYNC_EPOCH_VERIFY=exit")
+	add_test(NAME bda_sync_epoch_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-epoch-only)
+	set_tests_properties(bda_sync_epoch_off PROPERTIES
+		ENVIRONMENT "KYTY_BDA_SYNC_EPOCH=0")
 	# KYTY_TEXTURE_MEMO_REVALIDATE: default, verify mode, off.
 	add_test(NAME texture_memo_revalidate
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)
