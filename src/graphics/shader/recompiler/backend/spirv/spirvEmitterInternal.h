@@ -20,6 +20,7 @@
 #include <spirv/unified1/GLSL.std.450.h>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -128,6 +129,12 @@ struct EmitterState {
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
 	std::unordered_map<const IR::Block*, uint32_t> labels;
+	// Instructions whose values reach a position export (MadMode::Position), built on first use.
+	bool                                  position_slice_ready = false;
+	std::unordered_set<const IR::Inst*>   position_slice;
+	// Pixel inputs whose V_INTERP_P2 reads were all resolved to hardware I/J pairs of one
+	// perspective mode (KYTY_INTERP_MODES): variable -> sampling location its decoration selects.
+	std::unordered_map<uint32_t, IR::InterpolationMode> input_interpolation;
 };
 
 uint32_t TypeVoid(EmitterState& state);
@@ -452,6 +459,9 @@ inline constexpr auto EmitLogicalOrBool =
     EmitNative<spv::OpLogicalOr, IR::Type::U1, uint32_t, uint32_t>;
 
 inline constexpr auto EmitLogicalNotBool = EmitNative<spv::OpLogicalNot, IR::Type::U1, uint32_t>;
+
+// Whether float arithmetic computing this instruction must not be contracted (MadMode).
+bool NoContraction(EmitterState& state, const IR::Inst& inst);
 
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits);
 

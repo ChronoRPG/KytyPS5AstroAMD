@@ -145,6 +145,9 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 						case StageInputKind::BaryCoordSmooth:
 						case StageInputKind::BaryCoordSmoothCentroid:
 						case StageInputKind::BaryCoordNoPerspective:
+						case StageInputKind::BaryCoordSmoothSample:
+						case StageInputKind::BaryCoordNoPerspectiveCentroid:
+						case StageInputKind::BaryCoordNoPerspectiveSample:
 							if (component >= 2u) {
 								return Fail("typed barycentric component is out of range");
 							}
@@ -304,7 +307,18 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 					AddInput(info, StageInputKind::BaryCoordSmooth, 0, 3, "gl_BaryCoordKHR");
 					break;
 				case StageInputKind::BaryCoordNoPerspective:
-					AddInput(info, kind, 0, 3, "gl_BaryCoordNoPerspKHR");
+				case StageInputKind::BaryCoordNoPerspectiveCentroid:
+					AddInput(info, StageInputKind::BaryCoordNoPerspective, 0, 3,
+					         "gl_BaryCoordNoPerspKHR");
+					break;
+				case StageInputKind::BaryCoordSmoothSample:
+					AddInput(info, StageInputKind::BaryCoordSmooth, 0, 3, "gl_BaryCoordKHR");
+					AddInput(info, StageInputKind::SampleId, 0, 1, "gl_SampleID");
+					break;
+				case StageInputKind::BaryCoordNoPerspectiveSample:
+					AddInput(info, StageInputKind::BaryCoordNoPerspective, 0, 3,
+					         "gl_BaryCoordNoPerspKHR");
+					AddInput(info, StageInputKind::SampleId, 0, 1, "gl_SampleID");
 					break;
 				case StageInputKind::WorkgroupId:
 					AddInput(info, kind, 0, 3, "gl_WorkGroupID");

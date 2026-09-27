@@ -1,6 +1,17 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
+namespace {
+
+bool FusedMacEncoding(const Decoder::Instruction& inst) {
+	const auto id = inst.opcode_id;
+	if (inst.family == Decoder::Family::VOP2) {
+		return id >= 0x2bu && id <= 0x2du;
+	}
+	return inst.family == Decoder::Family::VOP3 && id >= 0x12bu && id <= 0x12du;
+}
+
+} // namespace
 
 bool Translator::EmitVector(const Decoder::Instruction& inst) {
 	using O = Decoder::Opcode;
@@ -412,10 +423,20 @@ bool Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_MIN_F32: return FloatBinary(inst, IR::ValueOpcode::FPMin32, false);
 		case O::V_MAX_F32: return FloatBinary(inst, IR::ValueOpcode::FPMax32, false);
 		case O::V_LDEXP_F32: return FloatBinary(inst, IR::ValueOpcode::FPLdexp, false);
-		case O::V_MAC_F32: return FloatTernary(inst, IR::ValueOpcode::FPFma32, true, true);
+		// PS5 keeps the legacy unfused MAD/MAC (VOP2 0x1f-0x21, VOP3 0x11f and 0x141; removed from the
+		// RDNA2 ISA document): the product is rounded before the add. The decoder maps the fused
+		// RDNA2 V_FMAC/V_FMAMK/V_FMAAK_F32 (VOP2 0x2b-0x2d, VOP3 0x12b) to the same opcodes, so the
+		// encoding decides.
+		case O::V_MAC_F32:
+			return FloatTernary(inst, FusedMacEncoding(inst) ? IR::ValueOpcode::FPFma32
+			                                                 : IR::ValueOpcode::FPMad32,
+			                    true, true);
 		case O::V_MADMK_F32:
 		case O::V_MADAK_F32:
-		case O::V_MAD_F32:
+			return FloatTernary(inst, FusedMacEncoding(inst) ? IR::ValueOpcode::FPFma32
+			                                                 : IR::ValueOpcode::FPMad32,
+			                    false, true);
+		case O::V_MAD_F32: return FloatTernary(inst, IR::ValueOpcode::FPMad32, false, true);
 		case O::V_FMA_F32: return FloatTernary(inst, IR::ValueOpcode::FPFma32, false, true);
 		case O::V_MIN3_F32: return FloatTernary(inst, IR::ValueOpcode::FPMinTri32, false, false);
 		case O::V_MAX3_F32: return FloatTernary(inst, IR::ValueOpcode::FPMaxTri32, false, false);
