@@ -152,6 +152,7 @@ private:
 	std::vector<Scratch>                    m_scratch_pool;
 	uint64_t                                m_scratch_pool_bytes = 0;
 	uint64_t                                m_scratch_pool_limit = 0;
+	bool                                    m_clear_detile_scratch = false;
 };
 
 } // namespace Libs::Graphics

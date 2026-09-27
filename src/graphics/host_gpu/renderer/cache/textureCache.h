@@ -33,6 +33,7 @@ class CommandBuffer;
 class CommandScheduler;
 class DccClearHelper;
 class RenderExecutor;
+class StagingCopier;
 struct TextureCacheTestAccess;
 
 class TextureCache {
@@ -159,6 +160,9 @@ private:
 		uint64_t dirty_bytes = 0; // dirty chunk bytes that caused the refresh
 	};
 	[[nodiscard]] PartialUploadResult TryPartialUpload(Image& image);
+	// Whole-image refresh of a tiled sampled texture whose guest bytes are copied to staging
+	// by m_staging_copier. False when the ordinary refresh path must be used.
+	[[nodiscard]] bool        TryAsyncFullUpload(Image& image);
 	void                      RecordChunkHashes(Image& image);
 	[[nodiscard]] bool        VerifyCleanChunks(Image& image);
 	[[nodiscard]] bool        KeepOverlappedImage(const Image& cached, uint64_t current_frame) const;
@@ -275,6 +279,18 @@ private:
 	// images already share the requested range, so overlapped images are not kept.
 	bool             m_overlap_crowded     = false;
 	uint64_t         m_partial_verify_mismatches = 0;
+	// KYTY_TEXTURE_ASYNC_STAGING=0: null, staging copies stay on the GPU thread.
+	std::unique_ptr<StagingCopier> m_staging_copier;
+	// Device-local host-visible (resizable BAR) staging ring for StagingCopier jobs, so detile
+	// reads VRAM instead of system memory over PCIe (KYTY_TEXTURE_STAGING_REBAR=0: none).
+	std::unique_ptr<StreamBuffer>  m_texture_staging;
+	// Registered images per ImagePageTable page, readable without m_lock
+	// (KYTY_TEXTURE_FAULT_FAST_PATH=0 always takes the lock).
+	std::unique_ptr<std::atomic<uint32_t>[]> m_image_page_counts;
+	bool                                     m_fault_fast_path = true;
+	// KYTY_TEXEL_SYNC_SKIP=0 downloads image contents for every texel-buffer read.
+	bool                                     m_texel_sync_skip = true;
+	[[nodiscard]] StreamBuffer& StagingRing();
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

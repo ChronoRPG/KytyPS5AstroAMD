@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -14,6 +15,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/dccClear.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/stagingCopier.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -241,6 +243,10 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
+	m_image_page_counts = std::make_unique<std::atomic<uint32_t>[]>(
+	    size_t {1} << (ImagePageTable::kAddressSpaceBits - ImagePageTable::kPageBits));
+	m_fault_fast_path = EnvNotZero("KYTY_TEXTURE_FAULT_FAST_PATH");
+	m_texel_sync_skip = EnvNotZero("KYTY_TEXEL_SYNC_SKIP");
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -314,9 +320,51 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	     " frames\n",
 	     m_partial_upload ? 1u : 0u, (1u << m_chunk_shift) >> 10u, m_partial_bands ? 1u : 0u,
 	     m_partial_verify ? 1u : 0u, m_overlap_keep_frames);
+	// KYTY_TEXTURE_ASYNC_STAGING=0 keeps texture refresh staging copies on the GPU thread.
+	if (EnvNotZero("KYTY_TEXTURE_ASYNC_STAGING")) {
+		m_staging_copier = std::make_unique<StagingCopier>(graphics);
+		m_scheduler.SetSubmitDependency(m_staging_copier.get());
+		// With resizable BAR the worker writes straight into VRAM. Only when a device-local
+		// host-visible heap is large, so the ring cannot starve other users of a 256 MiB BAR.
+		const auto& memory = graphics.GetPhysicalDeviceMemoryProperties();
+		uint64_t    bar_heap = 0;
+		for (uint32_t index = 0; index < memory.memoryTypeCount; index++) {
+			const auto flags = memory.memoryTypes[index].propertyFlags;
+			if ((flags & vk::MemoryPropertyFlagBits::eDeviceLocal) &&
+			    (flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+				bar_heap = std::max<uint64_t>(bar_heap,
+				                              memory.memoryHeaps[memory.memoryTypes[index].heapIndex].size);
+			}
+		}
+		uint64_t ring_mib = 256;
+		if (const auto* size = std::getenv("KYTY_TEXTURE_STAGING_MB"); size != nullptr) {
+			ring_mib = std::strtoull(size, nullptr, 10);
+		}
+		constexpr uint64_t MiB = 1024ull * 1024;
+		if (EnvNotZero("KYTY_TEXTURE_STAGING_REBAR") && ring_mib != 0 &&
+		    bar_heap >= 2048 * MiB && ring_mib * MiB <= bar_heap / 8) {
+			m_texture_staging = std::make_unique<StreamBuffer>(graphics, scheduler, MemoryUsage::Stream,
+			                                                   ring_mib * MiB);
+		}
+		LOGF("Texture streaming: async staging copies on, staging ring %s (%" PRIu64
+		     " MiB, largest device-local host-visible heap %" PRIu64 " MiB)\n",
+		     m_texture_staging ? "device-local" : "shared upload ring",
+		     m_texture_staging ? ring_mib : 0, bar_heap / MiB);
+	} else {
+		LOGF("Texture streaming: async staging copies off\n");
+	}
+}
+
+StreamBuffer& TextureCache::StagingRing() {
+	return m_texture_staging ? *m_texture_staging
+	                         : m_buffer_cache.GetUtilityBuffer(MemoryUsage::Upload);
 }
 
 TextureCache::~TextureCache() {
+	if (m_staging_copier) {
+		// The scheduler has drained by now; no later submission may wait on the copier.
+		m_scheduler.SetSubmitDependency(nullptr);
+	}
 	if (m_image_lookup_mode == ImageLookupMode::Verify) {
 		LOGF("Image lookup verification final: checks=%" PRIu64 " mismatches=%" PRIu64 "\n",
 		     m_image_lookup_checks, m_image_lookup_mismatches);
@@ -407,6 +455,8 @@ void TextureCache::RegisterImage(ImageId id) {
 	InvalidateCleanImageProofs();
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
+		// Before the image can watch pages (TrackImage follows registration).
+		m_image_page_counts[page].fetch_add(1);
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
@@ -446,6 +496,8 @@ void TextureCache::UnregisterImage(ImageId id) {
 		if (owners == nullptr || !owners->Erase(id)) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
+		// After UntrackImage above: the image no longer watches these pages.
+		m_image_page_counts[page].fetch_sub(1);
 	});
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
@@ -1574,7 +1626,13 @@ void TextureCache::InitializeImage(ImageId id) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::TexturePartialFallbacks);
 			}
 		}
-		if (!partial.done) {
+		if (!partial.done && !TryAsyncFullUpload(image)) {
+			const bool cached_source =
+			    m_buffer_cache.IsRegionRegistered(image.info.data.address, image.info.data.size) ||
+			    m_buffer_cache.IsRegionGpuModified(image.info.data.address, image.info.data.size);
+			Profiler::CountFrameEvent(cached_source ? Profiler::FrameEvent::TextureUploadBytesBuffer
+			                                        : Profiler::FrameEvent::TextureUploadBytesStaging,
+			                          image.info.data.size);
 			const auto [source, source_offset] =
 			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 			if (source == nullptr) {
@@ -1758,6 +1816,7 @@ TextureCache::PartialUploadResult TextureCache::TryPartialUpload(Image& image) {
 		tiled_buffer   = source->Handle();
 		tiled_offset   = source_offset;
 		tiled_capacity = info.data.size;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureUploadBytesBuffer, tiled_bytes);
 	} else {
 		struct SourceRange {
 			uint64_t offset;
@@ -1779,20 +1838,34 @@ TextureCache::PartialUploadResult TextureCache::TryPartialUpload(Image& image) {
 			tile.tiled_offset = packed_total;
 			packed_total += tile.tiled_size;
 		}
-		auto& staging         = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Upload);
+		auto& staging = m_staging_copier ? StagingRing()
+		                                 : m_buffer_cache.GetUtilityBuffer(MemoryUsage::Upload);
 		auto [mapped, offset] = staging.Map(packed_total, 256);
 		if (mapped == nullptr) {
 			return result;
 		}
-		for (const auto& range: ranges) {
-			if (!LibKernel::Memory::TryReadBacking(base + range.offset, mapped + range.packed,
-			                                       range.size) &&
-			    !LibKernel::Memory::TryReadPrtBacking(base + range.offset, mapped + range.packed,
-			                                          range.size)) {
-				EXIT("TextureCache: failed to read mapped guest image backing\n");
+		Profiler::CountFrameEvent(m_staging_copier ? Profiler::FrameEvent::TextureUploadBytesAsync
+		                                           : Profiler::FrameEvent::TextureUploadBytesStaging,
+		                          packed_total);
+		if (m_staging_copier) {
+			std::vector<StagingCopier::Range> copies;
+			copies.reserve(ranges.size());
+			for (const auto& range: ranges) {
+				copies.push_back({base + range.offset, mapped + range.packed, range.size});
 			}
+			staging.Commit();
+			m_staging_copier->Enqueue(std::move(copies), &staging, offset, packed_total);
+		} else {
+			for (const auto& range: ranges) {
+				if (!LibKernel::Memory::TryReadBacking(base + range.offset, mapped + range.packed,
+				                                       range.size) &&
+				    !LibKernel::Memory::TryReadPrtBacking(base + range.offset,
+				                                          mapped + range.packed, range.size)) {
+					EXIT("TextureCache: failed to read mapped guest image backing\n");
+				}
+			}
+			staging.Commit();
 		}
-		staging.Commit();
 		tiled_buffer   = staging.Handle();
 		tiled_offset   = offset;
 		tiled_capacity = packed_total;
@@ -1806,6 +1879,43 @@ TextureCache::PartialUploadResult TextureCache::TryPartialUpload(Image& image) {
 	result.bytes       = tiled_bytes;
 	result.dirty_bytes = static_cast<uint64_t>(chunks.dirty_count) << chunks.shift;
 	return result;
+}
+
+bool TextureCache::TryAsyncFullUpload(Image& image) {
+	const auto& info = image.info;
+	if (!m_staging_copier || image.depth_id || image.IsBufferModified() || info.samples != 1 ||
+	    image.backing.samples != 1 || !info.IsTiled() || info.IsDepth() ||
+	    info.metadata.compression != VideoOutCompression::Uncompressed ||
+	    UploadBinding(image) != BindingType::Texture) {
+		return false;
+	}
+	// Same source choice as ObtainBufferForImage: cache buffers and GPU-written bytes stay on
+	// their synchronous paths; only plain guest memory is copied by the worker.
+	const auto base = info.data.address;
+	if (m_buffer_cache.IsRegionRegistered(base, info.data.size) ||
+	    m_buffer_cache.IsRegionGpuModified(base, info.data.size)) {
+		return false;
+	}
+	auto transfer = BuildTextureTransfer(image, BindingType::Texture, TransferDirection::Upload);
+	if (!transfer.valid || transfer.swap_bgra16 || transfer.tiles.empty()) {
+		return false;
+	}
+	auto& staging         = StagingRing();
+	auto [mapped, offset] = staging.Map(info.data.size, 256);
+	if (mapped == nullptr) {
+		return false;
+	}
+	staging.Commit();
+	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureUploadBytesAsync, info.data.size);
+	m_staging_copier->Enqueue({{base, mapped, info.data.size}}, &staging, offset, info.data.size);
+	// The detile barrier includes host writes; the submission waits for the copy on the GPU.
+	const auto linear = m_tiler.Detile(staging.Handle(), offset, info.data.size,
+	                                   transfer.LinearSize(), transfer.tiles);
+	for (auto& region: transfer.regions) {
+		region.bufferOffset += linear.offset;
+	}
+	image.Upload(transfer.regions, linear.buffer, linear.offset, linear.size);
+	return true;
 }
 
 void TextureCache::RecordChunkHashes(Image& image) {
@@ -2679,6 +2789,20 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
+	if (m_fault_fast_path) {
+		// Guest write faults on pages only buffers watch must not wait for the texture-cache
+		// lock, which the GPU thread holds across refreshes. An image watches a page only while
+		// registered on its 1 MiB page (counted before tracking starts, and after it ends).
+		ImagePageTable::PageRange pages {};
+		bool                      covered = !ImagePageTable::TryGetPageRange(address, size, pages);
+		for (auto page = pages.first; !covered && page < pages.last_exclusive; ++page) {
+			covered = m_image_page_counts[page].load() != 0;
+		}
+		if (!covered) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureInvalidateSkips);
+			return;
+		}
+	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
 }
@@ -2813,6 +2937,23 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	if (copy_size == 0) {
 		return false;
 	}
+	// The buffer already holds this image's bytes when neither changed since the last download:
+	// the image's content serial is unchanged and the buffer's write revision (which every GPU
+	// or CPU-upload write to it advances, and which CPU-dirty pages invalidate) is the one that
+	// download produced.
+	const bool track_texel_sync = m_texture_cache.m_texel_sync_skip && GuestGpu::IsGpuThread();
+	if (track_texel_sync && image.texel_sync.valid && image.ContentSerial() != 0 &&
+	    image.texel_sync.serial == image.ContentSerial() && image.texel_sync.size == copy_size) {
+		const auto revision = GetContentRevision(image.info.data.address, copy_size);
+		if (revision && revision->id == image.texel_sync.buffer &&
+		    revision->write_revision == image.texel_sync.revision &&
+		    revision->global_epoch == image.texel_sync.epoch &&
+		    &m_slot_buffers[revision->id] == &buffer) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TexelImageSyncSkips);
+			return true;
+		}
+	}
+	image.texel_sync.valid = false;
 	auto transfer = m_texture_cache.BuildDownload(image);
 	if (!transfer.valid) {
 		return false;
@@ -2839,6 +2980,14 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, std::move(transfer));
 	buffer.MarkContentWritten();
 	NoteBufferContentWrite(image.info.data.address, copy_size);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::TexelImageSyncDownloads);
+	if (track_texel_sync) {
+		if (const auto revision = GetContentRevision(image.info.data.address, copy_size);
+		    revision && &m_slot_buffers[revision->id] == &buffer) {
+			image.texel_sync = {revision->id, revision->write_revision, revision->global_epoch,
+			                    image.ContentSerial(), copy_size, true};
+		}
+	}
 	return true;
 }
 

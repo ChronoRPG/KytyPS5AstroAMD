@@ -305,6 +305,17 @@ public:
 	// Last GPU writer among overlapping aliases; cleared when another alias takes the bytes.
 	bool             alias_owner         = false;
 	ChunkState       chunks;
+	// Last download into a cache buffer for texel-buffer reads (SynchronizeBufferFromImage):
+	// the buffer revision it produced and this image's content serial at the time.
+	struct TexelSyncMark {
+		Common::SlotId buffer {};
+		uint64_t       revision = 0;
+		uint64_t       epoch    = 0;
+		uint64_t       serial   = 0;
+		uint64_t       size     = 0;
+		bool           valid    = false;
+	};
+	TexelSyncMark    texel_sync;
 
 private:
 	friend struct ImageTestAccess;

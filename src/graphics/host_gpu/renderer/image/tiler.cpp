@@ -70,6 +70,13 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 			m_scratch_pool_limit = std::strtoull(limit, nullptr, 10) * 1024ull * 1024ull;
 		}
 	}
+	// Detile output is consumed only by buffer->image copies (and element-wise conversions)
+	// that read exactly the width x height elements of each tile at its pitch, all of which the
+	// dispatches write; only row/level padding was cleared. KYTY_TILER_CLEAR_SCRATCH=1 clears.
+	if (const auto* clear = std::getenv("KYTY_TILER_CLEAR_SCRATCH");
+	    clear != nullptr && std::strcmp(clear, "1") == 0) {
+		m_clear_detile_scratch = true;
+	}
 }
 
 TileManager::~TileManager() {
@@ -439,7 +446,7 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	auto scratch = AllocateScratch(Common::AlignUp(linear_capacity, 4));
 	DeferDestroy(scratch);
 	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches,
-	       true);
+	       m_clear_detile_scratch);
 	return {scratch.buffer, 0, linear_capacity};
 }
 

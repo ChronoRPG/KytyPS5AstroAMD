@@ -254,6 +254,23 @@ enum class FrameEvent : uint32_t {
 	// TileManager scratch buffers reused from its pool or newly allocated (KYTY_TILER_SCRATCH_POOL).
 	TilerScratchPoolHits,
 	TilerScratchPoolMisses,
+	// Texture refresh staging copies handed to the StagingCopier worker, and their bytes
+	// (KYTY_TEXTURE_ASYNC_STAGING).
+	TextureAsyncCopies,
+	TextureAsyncCopyBytes,
+	// Image refresh bytes by source route: an existing cache buffer or GPU-written bytes
+	// (BufferCache), a synchronous staging copy on the GPU thread, or the StagingCopier worker.
+	TextureUploadBytesBuffer,
+	TextureUploadBytesStaging,
+	TextureUploadBytesAsync,
+	// Guest write-fault invalidations answered without the texture-cache lock because no
+	// registered image covers the faulting 1 MiB page (KYTY_TEXTURE_FAULT_FAST_PATH).
+	TextureInvalidateSkips,
+	// Texel-buffer reads of image-backed memory (BufferCache::SynchronizeBufferFromImage):
+	// image downloads recorded, and downloads skipped because neither the image nor the buffer
+	// changed since the previous one (KYTY_TEXEL_SYNC_SKIP).
+	TexelImageSyncDownloads,
+	TexelImageSyncSkips,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
@@ -293,6 +310,8 @@ enum class FrameWait : uint32_t {
 	// GPU-thread CPU time of TextureCache guest-memory -> image refreshes (staging copies,
 	// detile and copy recording), full or partial.
 	TextureUpload,
+	// StagingCopier worker time copying guest texture bytes into staging (not the GPU thread).
+	TextureStagingCopy,
 	Count,
 };
 
