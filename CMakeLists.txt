@@ -473,6 +473,11 @@ add_executable(lod_stats_report_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(lod_stats_report_tests PRIVATE ${inc_headers})
 
+add_executable(game_patch_filter_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GamePatchFilterTests.cpp"
+)
+target_include_directories(game_patch_filter_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -655,6 +660,7 @@ if(BUILD_TESTING)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lod_stats_report COMMAND $<TARGET_FILE:lod_stats_report_tests>)
+	add_test(NAME game_patch_filter COMMAND $<TARGET_FILE:game_patch_filter_tests>)
 	add_test(NAME lod_stats_codegen
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --lod-stats-codegen-only)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
@@ -795,6 +801,7 @@ if(BUILD_TESTING)
 		page_manager_tests
 		bit_array_tests
 		lod_stats_report_tests
+		game_patch_filter_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
