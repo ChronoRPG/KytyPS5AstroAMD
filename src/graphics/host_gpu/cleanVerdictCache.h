@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_CLEANVERDICTCACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_CLEANVERDICTCACHE_H_
 
+#include "graphics/host_gpu/coherenceLog.h"
+
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -37,17 +39,22 @@ constexpr uint64_t PAGE_SIZE = uint64_t {1} << PAGE_BITS;
 // Reads spanning more pages keep the exact range queries instead of probing every page.
 constexpr uint64_t MAX_CACHED_PAGES = 4;
 
-// Starts at 1: zero-initialized table entries never match.
-inline std::atomic<uint64_t> g_generation {1};
-
+// The verdict generation is the coherence log's generation (coherenceLog.h). It starts at 1:
+// zero-initialized table entries never match.
 [[nodiscard]] inline uint64_t Generation() noexcept {
-	return g_generation.load(std::memory_order_acquire);
+	return Coherence::Generation();
 }
 
 // The RMW is sequenced before the caller's state change, so any thread that later observes
 // that change (through the lock or atomic that publishes it) also observes the new generation.
+// Without a range the transition is logged as touching all memory.
 inline void Invalidate() noexcept {
-	g_generation.fetch_add(1, std::memory_order_seq_cst);
+	Coherence::Append(Coherence::Universe, Coherence::Source::Universe);
+}
+
+// The same, logging the guest range [address, address + size) the transition affects.
+inline void Invalidate(uint64_t address, uint64_t size, Coherence::Source source) noexcept {
+	Coherence::Append(address, size, source);
 }
 
 class Table {

@@ -211,6 +211,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/drawPrep/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/drawPrep/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/*.cpp"
@@ -526,6 +528,14 @@ add_executable(image_cache_gc_policy_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(image_cache_gc_policy_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+add_executable(draw_prep_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DrawPrepTests.cpp"
+)
+target_include_directories(draw_prep_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(LINUX)
+	target_link_libraries(draw_prep_tests Threads::Threads)
+endif()
+
 add_executable(ampr_counter_bank_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AmprCounterBankTests.cpp"
 )
@@ -583,6 +593,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME image_cache_gc_policy COMMAND $<TARGET_FILE:image_cache_gc_policy_tests>)
 	add_test(NAME ampr_counter_bank COMMAND $<TARGET_FILE:ampr_counter_bank_tests>)
+	add_test(NAME draw_prep COMMAND $<TARGET_FILE:draw_prep_tests>)
 	add_test(NAME image_exact_lookup
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-exact-lookup-only)
 	add_test(NAME image_pressure_retirement

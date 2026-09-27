@@ -262,7 +262,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
 		    // Ownership moves to the backing publication registered below (which bumps again).
-		    CleanVerdict::Invalidate();
+		    CleanVerdict::Invalidate(address, bytes, Coherence::Source::BufferDirtySubtract);
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
 	if (copies.empty()) {
@@ -624,7 +624,9 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 
 	// Ownership of the exact dirty bytes moves to the publication registered below, exactly as
 	// in DownloadBufferMemory. The tracker pages stay GPU-owned (protected) until completion.
-	CleanVerdict::Invalidate();
+	for (const auto& range: dirty) {
+		CleanVerdict::Invalidate(range.address, range.size, Coherence::Source::BufferDirtySubtract);
+	}
 	for (const auto& range: dirty) {
 		m_gpu_modified_ranges.Subtract(range.address, range.size);
 	}
@@ -1062,7 +1064,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		// dirty bytes are never cached clean. The tracker GPU bits that SynchronizeBuffer just
 		// set are only ever set together with this Add; clean-read verdicts never read them.
 		if (!m_gpu_modified_ranges.Contains(vaddr, size)) {
-			CleanVerdict::Invalidate();
+			CleanVerdict::Invalidate(vaddr, size, Coherence::Source::BufferDirtyAdd);
 		}
 		m_gpu_modified_ranges.Add(vaddr, size);
 		NoteBufferContentWrite(vaddr, size);
@@ -1264,7 +1266,7 @@ std::optional<BufferContentRevision> BufferCache::GetContentRevision(uint64_t va
 void BufferCache::InvalidateContentRevisions() {
 	EXIT_IF(!GuestGpu::IsGpuThread() || m_content_revision_epoch == UINT64_MAX);
 	// Unbounded GPU writes follow; retire clean-read verdicts along with the revisions.
-	CleanVerdict::Invalidate();
+	CleanVerdict::Invalidate(0, UINT64_MAX, Coherence::Source::ContentRevisions);
 	++m_content_revision_epoch;
 	// Their bytes carry no writer tick, so no readback may skip this recording.
 	m_unbounded_write_tick = m_scheduler.CurrentTick();
@@ -1279,7 +1281,9 @@ uint64_t BufferCache::BeginBackingPublication(std::span<const GuestRange> ranges
 	const auto token = ++m_next_backing_publication_token;
 	EXIT_IF(token == 0);
 	// Pending ranges are not clean for backing reads; retire verdicts before publishing them.
-	CleanVerdict::Invalidate();
+	for (const auto& range: ranges) {
+		CleanVerdict::Invalidate(range.address, range.size, Coherence::Source::PublicationBegin);
+	}
 	m_backing_publications.push_back({token, tick, {ranges.begin(), ranges.end()}});
 	m_backing_publication_count.store(m_backing_publications.size(), std::memory_order_release);
 	return token;
@@ -1292,7 +1296,9 @@ void BufferCache::EndBackingPublication(uint64_t token) {
 	EXIT_IF(found == m_backing_publications.end());
 	// Backing authority changes here (runs on the priority worker). Bump before the entry is
 	// erased so a verdict evaluated after the erase is tagged with the new generation.
-	CleanVerdict::Invalidate();
+	for (const auto& range: found->ranges) {
+		CleanVerdict::Invalidate(range.address, range.size, Coherence::Source::PublicationEnd);
+	}
 	m_backing_publications.erase(found);
 	// Publish completion only after the callback has written every registered backing range.
 	m_backing_publication_count.store(m_backing_publications.size(), std::memory_order_release);

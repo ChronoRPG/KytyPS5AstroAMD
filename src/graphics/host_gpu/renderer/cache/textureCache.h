@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -155,7 +156,9 @@ private:
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	// All callers hold m_lock; negative ownership proofs contain no guest values.
 	void                      MarkImageGpuModified(Image& image);
-	void                      InvalidateCleanImageProofs();
+	// Logs [address, address + size) to the coherence log (all memory by default).
+	void InvalidateCleanImageProofs(uint64_t address = 0, uint64_t size = UINT64_MAX,
+	                                Coherence::Source source = Coherence::Source::Universe);
 	void                      TrackImageDownload(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
