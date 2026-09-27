@@ -558,7 +558,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		} else {
 			layout_signature.push_back(0u);
 			layout_signature.push_back(pipeline.uses_push_descriptors ? 1u : 0u);
-			layout_signature.push_back(static_cast<vk::ShaderStageFlags::MaskType>(graphics_stages));
+			layout_signature.push_back(
+			    static_cast<vk::ShaderStageFlags::MaskType>(graphics_stages));
 			layout_signature.push_back(ShaderRecompiler::IR::NativePushConstantSize);
 			for (const auto& binding: descriptor_bindings) {
 				layout_signature.push_back(binding.binding);

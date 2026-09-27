@@ -35,14 +35,20 @@ struct GraphicContext;
 //
 // Libraries are shared only between pipelines whose layouts are identically defined, and a
 // layout holds the bindings of every stage: a vertex shader paired with fragment shaders of
-// different bindings gets one pre-rasterization library per layout.
+// different bindings gets one pre-rasterization library per layout. The layout identity is the
+// interned layout signature (pipelineLayoutCache.h, KYTY_LAYOUT_INTERN) or, without interning,
+// the ordered binding list (pipeline/shaders.cpp).
 //
 // Off by default. A fast-linked pipeline is compiled without whole-pipeline optimization and is
-// later replaced by the optimized build; the recompiler does not declare the position output
-// Invariant, so the two (and other pipelines sharing the vertex shader) are not guaranteed to
-// produce bit-identical positions. A multi-pass effect that depth-tests EQUAL against an earlier
-// pass could then lose fragments while a linked pipeline is in use. Enabling the extension also
-// makes some drivers (NVIDIA) compile shader modules at creation.
+// later replaced by the optimized build. Positions stay bit-identical between the two only
+// because the recompiler decorates the position Invariant and computes it without contraction
+// (KYTY_MAD_MODE exact or position, the default; not with =fused): otherwise a multi-pass effect
+// that depth-tests EQUAL against an earlier pass could lose fragments while a linked pipeline is
+// in use. Other outputs (pixel-shader math keeps FMA contraction) may still differ in the last
+// bits for the frames a linked pipeline renders, and which frames those are depends on
+// background compile timing, so runs are not pixel-reproducible with libraries on. Enabling the
+// extension also makes some drivers (NVIDIA) compile shader modules at creation, moving compile
+// time from pipeline creation to program compiles.
 //
 // Switches: KYTY_PIPELINE_LIBRARY=1 enables it (the device extensions are enabled only then);
 // KYTY_PIPELINE_LIBRARY_OPTIMIZE=0 keeps the fast-linked pipelines instead of replacing them;

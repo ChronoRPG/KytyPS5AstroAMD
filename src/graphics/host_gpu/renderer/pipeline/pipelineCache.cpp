@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/pipeline/stagePrepWorker.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -2502,6 +2503,12 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		m_library = std::make_unique<LibraryState>(*this);
 		PipelineCacheLog("Graphics pipeline libraries: enabled (fast link, {})",
 		                 m_library->optimize ? "optimized in background" : "linked pipelines kept");
+		if (ShaderRecompiler::GetCodegenOptions().mad_mode == ShaderRecompiler::MadMode::Fused) {
+			// See pipelineLibrary.h: identical positions rely on the Invariant position.
+			PipelineCacheLog("Graphics pipeline libraries: KYTY_MAD_MODE=fused drops the Invariant "
+			                 "position; a linked pipeline and its optimized build may rasterize "
+			                 "different depths");
+		}
 	} else if (PipelineLibraryRequested()) {
 		PipelineCacheLog("Graphics pipeline libraries: requested but not supported by the device");
 	}
