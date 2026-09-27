@@ -74,6 +74,75 @@ enum class PacketClass : uint8_t {
 	return PacketClass::Fence;
 }
 
+// What a fence packet is (FrameEvent DrawPrepFence<kind>): which packets end the preparation
+// windows in practice, to plan which of them a window could keep open.
+enum class FenceKind : uint8_t {
+	RegIndirect,    // SET_SH/CONTEXT/UCONFIG_REG_INDIRECT: registers loaded from guest memory
+	EventWrite,     // EVENT_WRITE, EVENT_WRITE_EOS (flushes, occlusion dumps, ...)
+	EndOfPipe,      // EVENT_WRITE_EOP, RELEASE_MEM and its custom NOP form
+	AcquireMem,     // ACQUIRE_MEM, SURFACE_SYNC and the custom NOP form
+	Wait,           // WAIT_REG_MEM(_64), MEM_SEMAPHORE, COND_EXEC, SET_PREDICATION, CE/DE waits, flip waits
+	DataWrite,      // WRITE_DATA, COPY_DATA, DMA_DATA, CP_DMA and the custom NOP forms
+	ConstantEngine, // WRITE_CONST_RAM, DUMP_CONST_RAM, CE/DE counter increments, INDIRECT_BUFFER_CNST
+	Marker,         // other NOPs: markers other than 0/4/0xd, flips, remaining custom codes
+	Dispatch,       // DISPATCH_DIRECT/INDIRECT and the custom dispatch reset
+	IndirectDraw,   // indirect draws and DISPATCH_DRAW
+	ContextControl, // CONTEXT_CONTROL
+	Other,          // everything else (conditional INDIRECT_BUFFER, GET_LOD_STATS, REWIND, ...)
+	Count,
+};
+
+[[nodiscard]] inline FenceKind ClassifyFence(uint32_t header) {
+	const auto opcode = (header >> 8u) & 0xffu;
+	switch (opcode) {
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT: return FenceKind::RegIndirect;
+		case Pm4::IT_EVENT_WRITE:
+		case Pm4::IT_EVENT_WRITE_EOS: return FenceKind::EventWrite;
+		case Pm4::IT_EVENT_WRITE_EOP:
+		case Pm4::IT_RELEASE_MEM: return FenceKind::EndOfPipe;
+		case Pm4::IT_ACQUIRE_MEM:
+		case Pm4::IT_SURFACE_SYNC: return FenceKind::AcquireMem;
+		case Pm4::IT_WAIT_REG_MEM:
+		case Pm4::IT_WAIT_REG_MEM_64:
+		case Pm4::IT_MEM_SEMAPHORE:
+		case Pm4::IT_COND_EXEC:
+		case Pm4::IT_SET_PREDICATION:
+		case Pm4::IT_WAIT_ON_CE_COUNTER:
+		case Pm4::IT_WAIT_ON_DE_COUNTER_DIFF: return FenceKind::Wait;
+		case Pm4::IT_WRITE_DATA:
+		case Pm4::IT_COPY_DATA:
+		case Pm4::IT_DMA_DATA:
+		case Pm4::IT_CP_DMA: return FenceKind::DataWrite;
+		case Pm4::IT_WRITE_CONST_RAM:
+		case Pm4::IT_DUMP_CONST_RAM:
+		case Pm4::IT_INCREMENT_CE_COUNTER:
+		case Pm4::IT_INCREMENT_DE_COUNTER:
+		case Pm4::IT_INDIRECT_BUFFER_CNST: return FenceKind::ConstantEngine;
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT: return FenceKind::Dispatch;
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		case Pm4::IT_DISPATCH_DRAW: return FenceKind::IndirectDraw;
+		case Pm4::IT_CONTEXT_CONTROL: return FenceKind::ContextControl;
+		case Pm4::IT_NOP:
+			switch (KYTY_PM4_R(header)) {
+				case Pm4::R_RELEASE_MEM: return FenceKind::EndOfPipe;
+				case Pm4::R_ACQUIRE_MEM: return FenceKind::AcquireMem;
+				case Pm4::R_WRITE_DATA:
+				case Pm4::R_DMA_DATA: return FenceKind::DataWrite;
+				case Pm4::R_WAIT_FLIP_DONE: return FenceKind::Wait;
+				case Pm4::R_DISPATCH_RESET: return FenceKind::Dispatch;
+				default: return FenceKind::Marker;
+			}
+		default: break;
+	}
+	return FenceKind::Other;
+}
+
 } // namespace Libs::Graphics::DrawPrep
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_PACKETCLASS_H_

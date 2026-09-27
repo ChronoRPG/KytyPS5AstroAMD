@@ -508,7 +508,7 @@ void CommandProcessor::DrawPrepDeleter::operator()(DrawPrep::Engine* engine) con
 
 DrawPrep::Engine* CommandProcessor::DrawPrepEngine() {
 	// Only the graphics processor draws; compute queues would only dilute the S0 histogram.
-	if (!DrawPrep::PacketHookEnabled() || IsAsyncComputeQueue()) {
+	if (!DrawPrep::PacketHookActive() || IsAsyncComputeQueue()) {
 		return nullptr;
 	}
 	if (m_draw_prep == nullptr) {
@@ -1387,11 +1387,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
-		if (DrawPrep::PacketHookEnabled()) [[unlikely]] {
+		if (DrawPrep::PacketHookActive()) [[unlikely]] {
 			// Window fences commit every pending draw before their handler runs.
 			if (auto* engine = DrawPrepEngine(); engine != nullptr) {
-				engine->OnPacket(
-				    DrawPrep::ClassifyPacket(packet_header & ~1u, packet + 1, remaining_dw));
+				const auto header       = packet_header & ~1u;
+				const auto packet_class = DrawPrep::ClassifyPacket(header, packet + 1, remaining_dw);
+				engine->OnPacket(packet_class, packet_class == DrawPrep::PacketClass::Fence
+				                                   ? DrawPrep::ClassifyFence(header)
+				                                   : DrawPrep::FenceKind::Other);
 			}
 		}
 		const auto packet_dw =

@@ -557,6 +557,21 @@ enum class FrameEvent : uint32_t {
 	// that scan found while the hot pass's epochs still held (pages the hot pass missed; 0).
 	BdaSyncHotVerifyChecks,
 	BdaSyncHotVerifyMismatches,
+	// Draw-prep window fences by packet kind (DrawPrep::FenceKind, packetClass.h), counted with the
+	// S0 histogram above; also passively in off mode while aggregates are collected
+	// (KYTY_DRAW_PREP_FENCE_HISTOGRAM=0 disables that).
+	DrawPrepFenceRegIndirect,
+	DrawPrepFenceEventWrite,
+	DrawPrepFenceEndOfPipe,
+	DrawPrepFenceAcquireMem,
+	DrawPrepFenceWait,
+	DrawPrepFenceDataWrite,
+	DrawPrepFenceConstantEngine,
+	DrawPrepFenceMarker,
+	DrawPrepFenceDispatch,
+	DrawPrepFenceIndirectDraw,
+	DrawPrepFenceContextControl,
+	DrawPrepFenceOther,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

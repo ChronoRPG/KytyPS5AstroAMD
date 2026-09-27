@@ -636,6 +636,44 @@ void TestPacketClassification() {
 	}
 }
 
+void TestFenceKinds() {
+	using DrawPrep::ClassifyFence;
+	using DrawPrep::FenceKind;
+	namespace Pm4 = Libs::Graphics::Pm4;
+	const auto kind = [](uint32_t op, uint32_t r = 0) { return ClassifyFence(KYTY_PM4(5, op, r)); };
+	Check(kind(Pm4::IT_SET_SH_REG_INDIRECT) == FenceKind::RegIndirect &&
+	          kind(Pm4::IT_SET_CONTEXT_REG_INDIRECT) == FenceKind::RegIndirect &&
+	          kind(Pm4::IT_SET_UCONFIG_REG_INDIRECT) == FenceKind::RegIndirect,
+	      "register-indirect fences");
+	Check(kind(Pm4::IT_EVENT_WRITE) == FenceKind::EventWrite &&
+	          kind(Pm4::IT_EVENT_WRITE_EOS) == FenceKind::EventWrite &&
+	          kind(Pm4::IT_EVENT_WRITE_EOP) == FenceKind::EndOfPipe &&
+	          kind(Pm4::IT_RELEASE_MEM) == FenceKind::EndOfPipe &&
+	          kind(Pm4::IT_NOP, Pm4::R_RELEASE_MEM) == FenceKind::EndOfPipe,
+	      "event and end-of-pipe fences");
+	Check(kind(Pm4::IT_ACQUIRE_MEM) == FenceKind::AcquireMem &&
+	          kind(Pm4::IT_NOP, Pm4::R_ACQUIRE_MEM) == FenceKind::AcquireMem &&
+	          kind(Pm4::IT_WAIT_REG_MEM) == FenceKind::Wait &&
+	          kind(Pm4::IT_COND_EXEC) == FenceKind::Wait &&
+	          kind(Pm4::IT_NOP, Pm4::R_WAIT_FLIP_DONE) == FenceKind::Wait,
+	      "acquire and wait fences");
+	Check(kind(Pm4::IT_WRITE_DATA) == FenceKind::DataWrite &&
+	          kind(Pm4::IT_DMA_DATA) == FenceKind::DataWrite &&
+	          kind(Pm4::IT_NOP, Pm4::R_WRITE_DATA) == FenceKind::DataWrite &&
+	          kind(Pm4::IT_WRITE_CONST_RAM) == FenceKind::ConstantEngine &&
+	          kind(Pm4::IT_INCREMENT_DE_COUNTER) == FenceKind::ConstantEngine,
+	      "data-write and constant-engine fences");
+	Check(kind(Pm4::IT_DISPATCH_DIRECT) == FenceKind::Dispatch &&
+	          kind(Pm4::IT_NOP, Pm4::R_DISPATCH_RESET) == FenceKind::Dispatch &&
+	          kind(Pm4::IT_DRAW_INDEX_INDIRECT) == FenceKind::IndirectDraw &&
+	          kind(Pm4::IT_CONTEXT_CONTROL) == FenceKind::ContextControl &&
+	          kind(Pm4::IT_NOP, Pm4::R_FLIP) == FenceKind::Marker &&
+	          kind(Pm4::IT_NOP, Pm4::R_ZERO) == FenceKind::Marker &&
+	          kind(Pm4::IT_GET_LOD_STATS) == FenceKind::Other &&
+	          kind(Pm4::IT_REWIND) == FenceKind::Other,
+	      "dispatch, indirect-draw, context-control, marker and other fences");
+}
+
 } // namespace
 
 int main() {
@@ -653,6 +691,7 @@ int main() {
 	TestReadSetLimits();
 	TestRecordScopeNests();
 	TestPacketClassification();
+	TestFenceKinds();
 	TestWindowSingleThread();
 	TestWindowConcurrent(4, 8, 200000);  // tiny window: constant wrap-around and races
 	TestWindowConcurrent(32, 6, 200000); // the default shape

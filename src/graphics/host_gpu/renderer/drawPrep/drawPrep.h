@@ -52,6 +52,10 @@ enum class CertMode : uint8_t { Value, Log };
 [[nodiscard]] CertMode GetCertMode();
 // The command processor's per-packet hook (window fences and the S0 histogram) is needed.
 [[nodiscard]] bool PacketHookEnabled();
+// PacketHookEnabled(), or the passive S0/fence-kind histogram: aggregate diagnostics with a
+// connected profiler (KYTY_DRAW_PREP_FENCE_HISTOGRAM=0 disables the passive part). The hook
+// changes nothing in off mode; it only classifies packets and counts.
+[[nodiscard]] bool PacketHookActive();
 
 // The register state a draw reads, copied when the draw packet is parsed.
 struct RegisterSnapshot {
@@ -161,8 +165,9 @@ public:
 	void Drain();
 	[[nodiscard]] bool Pending() const noexcept;
 
-	// Per-packet hook of the command processor (before the packet's handler runs).
-	void OnPacket(PacketClass packet_class);
+	// Per-packet hook of the command processor (before the packet's handler runs). fence_kind
+	// only matters for a fence (counted as FrameEvent DrawPrepFence<kind>).
+	void OnPacket(PacketClass packet_class, FenceKind fence_kind = FenceKind::Other);
 
 	struct Slot;
 
