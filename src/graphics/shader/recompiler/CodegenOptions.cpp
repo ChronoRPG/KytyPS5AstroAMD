@@ -56,6 +56,7 @@ CodegenOptions FromEnvironment() {
 			text.remove_prefix(comma + 1);
 		}
 	}
+	options.srt_variant_reads = EnvFlag("KYTY_SRT_VARIANT_READS", options.srt_variant_reads);
 	if (const auto* mode = std::getenv("KYTY_MAD_MODE"); mode != nullptr) {
 		if (std::strcmp(mode, "exact") == 0) {
 			options.mad_mode = MadMode::Exact;

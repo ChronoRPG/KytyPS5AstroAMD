@@ -99,6 +99,14 @@ struct CodegenOptions {
 	// guarded shaders' results when it fires. Off unless both variables are set.
 	uint32_t              loop_guard_budget = 0;
 	std::vector<uint64_t> loop_guard_shaders;
+	// KYTY_SRT_VARIANT_READS=1: a scalar read whose address is only known inside the shader (not a
+	// valid runtime value: e.g. a BVH traversal's loop-carried instance pointer, or data the GPU
+	// produces) is planned as a runtime read instead of a flat SRT slot. A flat slot is evaluated
+	// once before the dispatch, so such a slot always fails to evaluate and the whole dispatch is
+	// dropped. An S_BUFFER_LOAD through a V# read that way then reads through BDA, and a program with
+	// another such descriptor (no BDA path) is dropped, as before. Reads whose address can be
+	// evaluated before the dispatch keep their flat slots.
+	bool srt_variant_reads = false;
 };
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.
