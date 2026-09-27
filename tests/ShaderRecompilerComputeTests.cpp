@@ -19472,6 +19472,22 @@ public:
          false},
         {"depth-tiled r32f layers", Prospero::BufferFormat::k32Float,
          vk::Format::eR32Sfloat, Prospero::TileMode::kDepth, 129, 65, 1, 3, true},
+        // 2-byte depth tiling (R16 colour views of D16 memory, 256x128-element blocks) at the
+        // half-resolution depth sizes Astro Bot's water pass rebuilds from buffer bytes (U52 hang
+        // trace, 2026-09-27: 960x540 at 1080p, 1216x684 at 1368p, 1664x936 and 1920x1080), none a
+        // multiple of the block width; plus a layered and a 1-byte case.
+        {"depth-tiled r16 1216x684", Prospero::BufferFormat::k16UNorm,
+         vk::Format::eR16Unorm, Prospero::TileMode::kDepth, 1216, 684, 1, 1, true},
+        {"depth-tiled r16 960x540", Prospero::BufferFormat::k16UNorm,
+         vk::Format::eR16Unorm, Prospero::TileMode::kDepth, 960, 540, 1, 1, true},
+        {"depth-tiled r16 1664x936", Prospero::BufferFormat::k16UNorm,
+         vk::Format::eR16Unorm, Prospero::TileMode::kDepth, 1664, 936, 1, 1, true},
+        {"depth-tiled r16 1920x1080", Prospero::BufferFormat::k16UNorm,
+         vk::Format::eR16Unorm, Prospero::TileMode::kDepth, 1920, 1080, 1, 1, true},
+        {"depth-tiled r16 layers", Prospero::BufferFormat::k16UNorm,
+         vk::Format::eR16Unorm, Prospero::TileMode::kDepth, 129, 65, 1, 3, true},
+        {"depth-tiled r8 layers", Prospero::BufferFormat::k8UNorm, vk::Format::eR8Unorm,
+         Prospero::TileMode::kDepth, 130, 70, 1, 2, true},
         // KYTY_TILER_IMAGE_DIRECT_BC: uncompressed block-texel views, one per (level, layer).
         {"std64 bc7 mips", Prospero::BufferFormat::kBc7UNorm,
          vk::Format::eBc7UnormBlock, Prospero::TileMode::kStandard64KB, 256, 256, 9, 1,
@@ -19487,6 +19503,107 @@ public:
         {"std256 bc3", Prospero::BufferFormat::kBc3UNorm, vk::Format::eBc3UnormBlock,
          Prospero::TileMode::kStandard256B, 36, 20, 2, 1, false},
     };
+
+    // Linear bytes the buffer tiler (Detile) leaves for `infos`. Only each tile's width x height
+    // elements are defined; padding keeps whatever the pooled scratch held.
+    const auto detile_host = [&](const std::vector<u32> &tiled_words,
+                                 std::span<const GpuTileInfo> infos,
+                                 uint64_t linear_size) {
+      const uint64_t tiled_size = tiled_words.size() * sizeof(u32);
+      auto tiled = CreateHostBuffer(name, tiled_size, AllFlags, tiled_words);
+      const uint64_t words = (linear_size + 3u) / 4u;
+      auto output = CreateHostBuffer(
+          name, words * sizeof(u32), AllFlags,
+          std::vector<u32>(static_cast<size_t>(words), 0xabababab));
+      const auto linear =
+          tile_manager.Detile(tiled.buffer, 0, tiled_size, linear_size, infos);
+      const vk::BufferCopy copy{linear.offset, 0, words * sizeof(u32)};
+      scheduler.Current().Handle().copyBuffer(linear.buffer, output.buffer, 1, &copy);
+      host_barrier(output.buffer);
+      scheduler.Finish();
+      auto result = ReadBuffer(name, output, static_cast<size_t>(words));
+      DestroyBuffer(&output);
+      DestroyBuffer(&tiled);
+      return result;
+    };
+    // A depth-tiled surface reaches an image by two routes in TextureCache::UploadImage. The
+    // depth image (D16/D32) takes the depth path: BuildDepthTiles, one Depth64KB tile per layer at
+    // the depth pitch and plane size, then Image::Upload (its colour aliases then copy from it,
+    // maintenance8). A colour view of the same memory (e.g. the R16 alias of the half-resolution
+    // depth, rebuilt directly at the 1368p layouts) takes the colour path: TextureCalcUploadLayout
+    // with allow_depth_tile, TextureBuildGpuTileInfos and DetileToImage. `check` compares that
+    // colour path's direct and buffer variants; this compares its texels with the depth path's.
+    u32 route_checks = 0;
+    const auto check_depth_route = [&](const Case &c, uint64_t tiled_total,
+                                       const std::vector<u32> &tiled_words,
+                                       std::span<const GpuTileInfo> colour_infos,
+                                       std::span<const vk::BufferImageCopy> colour_regions,
+                                       uint64_t colour_linear_size) {
+      const std::string label = std::string(c.label) + " depth route";
+      const u32 bpe = colour_infos.front().bytes_per_element;
+      TileBlockLayout block{};
+      Require(name, (label + " block").c_str(),
+              TileGetBlockLayout(TileBlockFamily::Depth64KB, bpe, block),
+              "no Depth64KB block for this element size");
+      const u32 pitch = TileGetDepthPitch(c.width, bpe);
+      const uint64_t padded_height =
+          (static_cast<uint64_t>(c.height) + block.block_height - 1u) / block.block_height *
+          block.block_height;
+      const uint64_t plane = static_cast<uint64_t>(pitch) * padded_height * bpe;
+      Require(name, (label + " plane size").c_str(),
+              pitch == colour_infos.front().pitch && plane * c.layers == tiled_total,
+              "the depth path's pitch or plane size differs from the colour texture layout");
+      std::vector<GpuTileInfo> depth_infos;
+      for (u32 layer = 0; layer < c.layers; ++layer) {
+        GpuTileInfo tile{};
+        tile.family = TileBlockFamily::Depth64KB;
+        tile.bytes_per_element = bpe;
+        tile.linear_offset = plane * layer;
+        tile.linear_size = plane;
+        tile.tiled_offset = plane * layer;
+        tile.tiled_size = plane;
+        tile.width = c.width;
+        tile.height = c.height;
+        tile.depth = 1;
+        tile.pitch = pitch;
+        tile.surface_z = layer;
+        depth_infos.push_back(tile);
+      }
+      const auto depth_words = detile_host(tiled_words, depth_infos, plane * c.layers);
+      const auto colour_words =
+          detile_host(tiled_words, colour_infos, colour_linear_size);
+      const auto *depth_bytes = reinterpret_cast<const uint8_t *>(depth_words.data());
+      const auto *colour_bytes = reinterpret_cast<const uint8_t *>(colour_words.data());
+      uint64_t mismatches = 0;
+      std::ostringstream first;
+      for (u32 layer = 0; layer < c.layers; ++layer) {
+        const auto &region = colour_regions[layer];
+        const uint64_t row_texels =
+            region.bufferRowLength != 0 ? region.bufferRowLength : region.imageExtent.width;
+        for (u32 y = 0; y < c.height; ++y) {
+          for (u32 x = 0; x < c.width; ++x) {
+            const uint64_t depth_offset =
+                plane * layer + (static_cast<uint64_t>(y) * pitch + x) * bpe;
+            const uint64_t colour_offset =
+                region.bufferOffset + (static_cast<uint64_t>(y) * row_texels + x) * bpe;
+            if (std::memcmp(depth_bytes + depth_offset, colour_bytes + colour_offset, bpe) !=
+                0) {
+              if (mismatches++ == 0) {
+                first << "first differing texel (" << x << ", " << y << ", layer " << layer
+                      << ")";
+              }
+            }
+          }
+        }
+      }
+      if (mismatches != 0) {
+        first << ", " << mismatches << " of " << uint64_t{c.width} * c.height * c.layers
+              << " texels differ";
+        Fail(name, label.c_str(), first.str());
+      }
+      ++route_checks;
+    };
+
     u32 salt = 1;
     for (const auto &c : cases) {
       if (!TextureUploadLayoutSupported(c.guest, c.width, c.height, c.levels,
@@ -19523,6 +19640,9 @@ public:
       std::vector<u32> tiled((total.size + 3u) / 4u);
       fill(&tiled, salt++);
       check(c.label, info, tiled, infos, regions, linear_size);
+      if (c.tile == Prospero::TileMode::kDepth && c.levels == 1) {
+        check_depth_route(c, total.size, tiled, infos, regions, linear_size);
+      }
 
       // A partial band (TextureCache::TryPartialUpload): block rows [1, 3) of level 0,
       // placed at a nonzero image row (image rows are texel rows: 4 per BC block).
@@ -19619,8 +19739,9 @@ public:
       scheduler.Finish();
       DestroyBuffer(&tiled);
     }
-    std::printf("[gpu]     %-32s ok (%u parity checks, downloads %s, block uploads %s)\n",
-                name, checked, downloads ? "checked" : "unsupported",
+    std::printf("[gpu]     %-32s ok (%u parity checks, %u depth-route checks, downloads %s, "
+                "block uploads %s)\n",
+                name, checked, route_checks, downloads ? "checked" : "unsupported",
                 m_runtime_context.supports_block_texel_view ? "checked" : "unsupported");
   }
 
