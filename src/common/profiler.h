@@ -238,6 +238,14 @@ enum class FrameEvent : uint32_t {
 	// Shader map lookups answered by the per-thread memo (KYTY_SHADER_MAP_MEMO).
 	ShaderMapMemoHits,
 	ShaderMapMemoMisses,
+	// Precise write ranges (KYTY_PRECISE_WRITE_RANGES, WriteRangeAnalysis.h): writable storage
+	// bindings whose GPU-written range a shader proof narrowed below the binding, writable bindings
+	// kept whole (unprovable store, or the switch is off), binding bytes not marked GPU-written,
+	// and images overlapping a narrowed binding left valid because no written range overlaps them.
+	WriteRangeNarrowed,
+	WriteRangeWhole,
+	WriteRangeBytesAvoided,
+	WriteRangeImagesSpared,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

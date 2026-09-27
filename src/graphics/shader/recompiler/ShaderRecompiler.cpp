@@ -17,6 +17,7 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
+#include "graphics/shader/recompiler/ir/passes/WriteRangeAnalysis.h"
 
 #include <algorithm>
 #include <array>
@@ -639,6 +640,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	IR::CollectShaderInfo(ir, options.input_info);
 	IR::AllocateBindings(ir, push_data_start_dword);
+	IR::AnalyzeBufferWriteRanges(ir, options.input_info);
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);

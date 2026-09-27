@@ -64,6 +64,12 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// A writable binding whose shader can only write `written` (sub-ranges of [vaddr, vaddr +
+	// size), e.g. from a write-range proof): the whole range is synchronized as for any binding,
+	// but only `written` becomes GPU-owned (dirty, protected, write-ticked).
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainWrittenBuffer(uint64_t vaddr, uint64_t size,
+	                                                               std::span<const GuestRange> written,
+	                                                               BufferId id = {});
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;

@@ -78,6 +78,10 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// Diagnostics only (changes nothing): images that InvalidateMemoryFromGPU(address, size) would
+	// invalidate but that no range in `written` overlaps.
+	[[nodiscard]] uint32_t CountImagesOutsideGpuWrite(uint64_t address, uint64_t size,
+	                                                  std::span<const GuestRange> written);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);

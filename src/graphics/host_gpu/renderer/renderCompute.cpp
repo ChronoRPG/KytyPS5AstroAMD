@@ -372,6 +372,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
+	// The native dispatch size bounds workgroup ids for write-range proofs.
+	bindings.dispatch_groups     = {thread_group_x, thread_group_y, thread_group_z};
+	bindings.has_dispatch_groups = true;
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
@@ -486,6 +489,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
+	// GPU-produced dispatch arguments: workgroup ids stay unbounded for write-range proofs.
+	bindings.has_dispatch_groups = false;
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {

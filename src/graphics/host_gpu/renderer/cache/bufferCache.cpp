@@ -1072,6 +1072,45 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
+std::pair<Buffer*, uint64_t> BufferCache::ObtainWrittenBuffer(uint64_t vaddr, uint64_t size,
+                                                              std::span<const GuestRange> written,
+                                                              BufferId                    id) {
+	auto& command = m_scheduler.Current();
+	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: buffer request requires a recording command buffer\n");
+	}
+	for (const auto& range: written) {
+		if (!range.Valid() || range.address < vaddr || range.End() > vaddr + size) {
+			EXIT("BufferCache: written range 0x%016" PRIx64 "+0x%" PRIx64
+			     " is outside its binding 0x%016" PRIx64 "+0x%" PRIx64 "\n",
+			     range.address, range.size, vaddr, size);
+		}
+	}
+	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		id = FindBuffer(vaddr, size);
+	}
+	auto& buffer = m_slot_buffers[id];
+	TouchBuffer(buffer);
+	// Bytes the shader cannot write only need the upload a read binding gets. Each written range
+	// then uploads anything dirtied meanwhile and becomes GPU-owned under the same tracker locks,
+	// exactly as a whole writable binding does.
+	(void)SynchronizeBuffer(buffer, vaddr, size, false, false, nullptr, "written-binding");
+	// Writable descriptors reserve a new version before recording their shader commands.
+	buffer.MarkContentWritten();
+	for (const auto& range: written) {
+		(void)SynchronizeBuffer(buffer, range.address, range.size, true, false, nullptr,
+		                        "written-binding");
+		if (!m_gpu_modified_ranges.Contains(range.address, range.size)) {
+			CleanVerdict::Invalidate();
+		}
+		m_gpu_modified_ranges.Add(range.address, range.size);
+		NoteBufferContentWrite(range.address, range.size);
+		ForgetKnownFills(range.address, range.size);
+		HangTrace::NoteGpuWrite(range.address, range.size);
+	}
+	return {&buffer, buffer.Offset(vaddr)};
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
