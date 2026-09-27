@@ -309,6 +309,11 @@ enum class FrameEvent : uint32_t {
 	// equal permutation had been published meanwhile.
 	ProgramCompileWaits,
 	ProgramCompileDuplicates,
+	// Program permutations specialized from a source's kept translation instead of translating
+	// the guest code again (KYTY_TRANSLATION_CACHE), and reused translations that
+	// KYTY_TRANSLATION_CACHE_VERIFY found different from a fresh one.
+	TranslationReuses,
+	TranslationVerifyMismatches,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

@@ -15,6 +15,10 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 class Block;
 class Inst;
+struct Program;
+
+// ir/ProgramClone.cpp: deep copy of a translated program (copies every private member).
+[[nodiscard]] bool CloneProgram(const Program& source, Program& target);
 
 class Value {
 public:
@@ -158,6 +162,9 @@ public:
 	}
 
 private:
+	// Copies every member below; update it (and its layout check) when adding one.
+	friend bool CloneProgram(const Program& source, Program& target);
+
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();

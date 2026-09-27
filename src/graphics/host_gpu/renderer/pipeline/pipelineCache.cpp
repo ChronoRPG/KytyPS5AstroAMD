@@ -35,6 +35,7 @@
 #include <filesystem>
 #include <fmt/format.h>
 #include <limits>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
@@ -205,6 +206,8 @@ uint64_t CompileClockNs() {
 struct CompileTotals {
 	std::atomic<uint64_t> programs {0};
 	std::atomic<uint64_t> translate_ns {0};
+	std::atomic<uint64_t> clone_ns {0};
+	std::atomic<uint64_t> translation_reuses {0};
 	std::atomic<uint64_t> emit_ns {0};
 	std::atomic<uint64_t> validate_ns {0};
 	std::atomic<uint64_t> module_ns {0};
@@ -249,20 +252,26 @@ void FlushCompileStall() {
 	HangTrace::RecordCompileStall(ns);
 }
 
-// Phase times of one new program permutation.
+// Phase times of one new program permutation. clone_ns is the copy of a kept translation (reused)
+// or the copy kept after translating (item 5, KYTY_TRANSLATION_CACHE).
 struct ProgramCompileTimes {
 	uint64_t translate_ns = 0;
+	uint64_t clone_ns     = 0;
 	uint64_t emit_ns      = 0;
 	uint64_t validate_ns  = 0;
 	uint64_t module_ns    = 0;
 	uint64_t spirv_words  = 0;
+	bool     reused       = false;
 };
 
 void RecordProgramCompile(const char* stage_name, uint64_t guest_hash, uint64_t id,
-                          const ProgramCompileTimes& times, uint64_t total_ns) {
+                          const ProgramCompileTimes& times, uint64_t total_ns,
+                          std::string_view detail) {
 	auto& totals = g_compile_totals;
 	totals.programs.fetch_add(1, std::memory_order_relaxed);
 	totals.translate_ns.fetch_add(times.translate_ns, std::memory_order_relaxed);
+	totals.clone_ns.fetch_add(times.clone_ns, std::memory_order_relaxed);
+	if (times.reused) totals.translation_reuses.fetch_add(1, std::memory_order_relaxed);
 	totals.emit_ns.fetch_add(times.emit_ns, std::memory_order_relaxed);
 	totals.validate_ns.fetch_add(times.validate_ns, std::memory_order_relaxed);
 	totals.module_ns.fetch_add(times.module_ns, std::memory_order_relaxed);
@@ -282,7 +291,10 @@ void RecordProgramCompile(const char* stage_name, uint64_t guest_hash, uint64_t 
 		                          .validate_ns  = times.validate_ns,
 		                          .module_ns    = times.module_ns,
 		                          .total_ns     = total_ns,
-		                          .spirv_words  = times.spirv_words});
+		                          .spirv_words  = times.spirv_words,
+		                          .detail       = detail,
+		                          .clone_ns     = times.clone_ns,
+		                          .reused       = times.reused});
 	}
 }
 
@@ -299,12 +311,14 @@ void LogCompileTotals() {
 	if (programs == 0 && pipelines == 0 && compute == 0) {
 		return;
 	}
-	PipelineCacheLog("Compile totals: {} programs (translate {:.1f} ms, emit {:.1f} ms, validate "
-	                 "{:.1f} ms, module {:.1f} ms); {} graphics pipelines in {:.1f} ms (new {}, "
-	                 "permutation {}, variant {}); {} compute pipelines in {:.1f} ms; {} stalls "
-	                 "totalling {:.1f} ms, worst {:.1f} ms",
-	                 programs, ms(t.translate_ns), ms(t.emit_ns), ms(t.validate_ns),
-	                 ms(t.module_ns), pipelines, ms(t.gfx_pipeline_ns),
+	PipelineCacheLog("Compile totals: {} programs (translate {:.1f} ms, {} reused translations, "
+	                 "copies {:.1f} ms, emit {:.1f} ms, validate {:.1f} ms, module {:.1f} ms); {} "
+	                 "graphics pipelines in {:.1f} ms (new {}, permutation {}, variant {}); {} "
+	                 "compute pipelines in {:.1f} ms; {} stalls totalling {:.1f} ms, worst {:.1f} ms",
+	                 programs, ms(t.translate_ns),
+	                 t.translation_reuses.load(std::memory_order_relaxed), ms(t.clone_ns),
+	                 ms(t.emit_ns), ms(t.validate_ns), ms(t.module_ns), pipelines,
+	                 ms(t.gfx_pipeline_ns),
 	                 t.gfx_new.load(std::memory_order_relaxed),
 	                 t.gfx_permutation.load(std::memory_order_relaxed),
 	                 t.gfx_variant.load(std::memory_order_relaxed), compute, ms(t.cs_pipeline_ns),
@@ -961,6 +975,72 @@ struct PipelineCache::ProgramCache {
 		size_t                       next_victim = 0;
 	};
 
+	// Translation reuse (KYTY_TRANSLATION_CACHE, default on). TranslateProgram is a function of
+	// the guest code and the ProgramKey fields (the static key covers every input-info field it
+	// reads, which is also what makes reusing a source's permutations across draws exact), so a
+	// source's first translation, kept unmodified, can stand in for translating it again: each
+	// further permutation specializes a deep copy (IR::CloneProgram) instead of re-running decode,
+	// CFG structurization, IR translation and the IR passes. Kept translations are bounded by
+	// KYTY_TRANSLATION_CACHE_MB (default 256) of estimated IR, least recently used evicted first.
+	struct KeptTranslation {
+		ShaderRecompiler::TranslateResult translated;
+		size_t                            bytes = 0;
+	};
+
+	static bool TranslationCacheEnabled() {
+		static const bool enabled = EnvU64("KYTY_TRANSLATION_CACHE", 1) != 0;
+		return enabled;
+	}
+
+	// KYTY_TRANSLATION_CACHE_VERIFY: unset/0 off; 1 compiles every reused permutation also from a
+	// fresh translation and compares SPIR-V and shader metadata, using the fresh one and dropping
+	// the source's kept translation on a difference; "exit" stops the emulator on the first.
+	static int TranslationVerifyMode() {
+		static const int mode = [] {
+			const auto* value = std::getenv("KYTY_TRANSLATION_CACHE_VERIFY");
+			if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) return 0;
+			return std::strcmp(value, "exit") == 0 ? 2 : 1;
+		}();
+		return mode;
+	}
+
+	static size_t TranslationCacheBudget() {
+		static const size_t bytes = EnvU64("KYTY_TRANSLATION_CACHE_MB", 256) * 1024u * 1024u;
+		return bytes;
+	}
+
+	// Deep copy of a translation; false when the program cannot be copied (see CloneProgram).
+	static bool CopyTranslation(const ShaderRecompiler::TranslateResult& from,
+	                            ShaderRecompiler::TranslateResult&       to) {
+		if (!ShaderRecompiler::IR::CloneProgram(from.program, to.program)) return false;
+		to.decoded_dump  = from.decoded_dump;
+		to.cfg_dump      = from.cfg_dump;
+		to.skip_dispatch = from.skip_dispatch;
+		return true;
+	}
+
+	// Approximate heap footprint of a kept translation, for the budget.
+	static size_t EstimateTranslationBytes(const ShaderRecompiler::TranslateResult& translated) {
+		using namespace ShaderRecompiler::IR;
+		const auto& program = translated.program;
+		const auto  inst_bytes = [](const Inst& inst) {
+			return sizeof(Inst) + 2 * sizeof(void*) + inst.NumArgs() * sizeof(Value) +
+			       inst.UseCount() * sizeof(Use) + inst.NumPhiBlocks() * sizeof(Block*);
+		};
+		size_t bytes = sizeof(KeptTranslation) + translated.decoded_dump.size() +
+		               translated.cfg_dump.size();
+		for (const auto& block: program.block_storage) {
+			bytes += sizeof(Block);
+			for (const auto& inst: *block) bytes += inst_bytes(inst);
+		}
+		for (const auto& inst: program.value_storage) bytes += inst_bytes(inst);
+		bytes += program.descriptor_sources.size() * sizeof(DescriptorSource) +
+		         program.block_info.size() * sizeof(BlockInfo) +
+		         program.memory_info.size() * sizeof(MemoryInfo) +
+		         program.evaluation_recipes.size() * sizeof(ResourcePlan::EvaluationRecipe);
+		return bytes;
+	}
+
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
 		    : resource_plan(std::move(plan)) {
@@ -999,6 +1079,12 @@ struct PipelineCache::ProgramCache {
 		std::atomic<bool>                  skip_dispatch {false};
 		// Mutated in place by reuse-mode refreshes; only touched under m_reuse_mutex.
 		mutable ReuseState                 reuse;
+		// The source's unmodified translation for further permutations (KYTY_TRANSLATION_CACHE),
+		// and its place in kept_lru. Guarded by m_programs_mutex; readers copy the pointer.
+		std::shared_ptr<const KeptTranslation> kept_translation;
+		std::list<SourceEntry*>::iterator      kept_position;
+		// Set when a reused translation failed verification: always translate this source.
+		bool                                   kept_disabled = false;
 	};
 
 	// The last source found per stage by this thread and the permutation it last matched.
@@ -1435,6 +1521,74 @@ struct PipelineCache::ProgramCache {
 		return true;
 	}
 
+	// Requires m_programs_mutex exclusively. Keeps `kept` for `source` (unless it already has one
+	// or verification disabled it) and evicts least recently used translations over the budget.
+	void KeepTranslation(SourceEntry& source, std::shared_ptr<const KeptTranslation> kept) {
+		if (kept == nullptr || source.kept_translation != nullptr || source.kept_disabled) return;
+		kept_bytes += kept->bytes;
+		source.kept_translation = std::move(kept);
+		source.kept_position    = kept_lru.insert(kept_lru.end(), &source);
+		while (kept_bytes > TranslationCacheBudget() && !kept_lru.empty()) {
+			ForgetTranslation(*kept_lru.front());
+		}
+	}
+
+	// Requires m_programs_mutex exclusively. Threads already copying it keep their reference.
+	void ForgetTranslation(SourceEntry& source) {
+		if (source.kept_translation == nullptr) return;
+		kept_bytes -= source.kept_translation->bytes;
+		source.kept_translation.reset();
+		kept_lru.erase(source.kept_position);
+	}
+
+	// Requires m_programs_mutex exclusively.
+	void TouchTranslation(SourceEntry& source) {
+		kept_lru.splice(kept_lru.end(), kept_lru, source.kept_position);
+	}
+
+	// KYTY_TRANSLATION_CACHE_VERIFY: compiles the permutation from a copy of `kept` and from a
+	// fresh translation and compares the outputs that reach the GPU and the renderer.
+	bool VerifyKeptTranslation(const ShaderParams& params,
+	                           const ShaderRecompiler::CompileOptions& options,
+	                           const KeptTranslation& kept,
+	                           const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                           uint32_t push_data_cursor) {
+		ShaderRecompiler::TranslateResult copy;
+		if (!CopyTranslation(kept.translated, copy)) return false;
+		auto reused = ShaderRecompiler::CompileProgram(std::move(copy), options, specialization,
+		                                               push_data_cursor);
+		auto fresh_translation = ShaderRecompiler::TranslateProgram(params.code, options);
+		auto fresh = ShaderRecompiler::CompileProgram(std::move(fresh_translation), options,
+		                                              specialization, push_data_cursor);
+		const auto a    = std::move(reused.program).TakeCompiledInfo();
+		const auto b    = std::move(fresh.program).TakeCompiledInfo();
+		const bool same = reused.spirv == fresh.spirv && a.stage == b.stage &&
+		                  a.shader_hash == b.shader_hash && a.wave_size == b.wave_size &&
+		                  a.user_data_base == b.user_data_base &&
+		                  a.user_data_count == b.user_data_count &&
+		                  a.scratch_dwords == b.scratch_dwords &&
+		                  a.param_export_mask == b.param_export_mask &&
+		                  a.has_address_writes == b.has_address_writes && a.info == b.info &&
+		                  a.bindings == b.bindings && a.write_ranges == b.write_ranges;
+		if (same) {
+			return true;
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TranslationVerifyMismatches);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+			PipelineCacheLog("Translation cache: reused translation of {} 0x{:016x} differs from a "
+			                 "fresh one (SPIR-V {} vs {} words); using the fresh translation",
+			                 ProgramStageName(options.stage), options.shader_hash,
+			                 reused.spirv.size(), fresh.spirv.size());
+		}
+		if (TranslationVerifyMode() == 2) {
+			EXIT("Translation cache: reused translation differs from a fresh one (0x%016" PRIx64
+			     ")\n",
+			     options.shader_hash);
+		}
+		return false;
+	}
+
 	// Requires m_programs_mutex exclusively. Idempotent.
 	void FinishInFlight(InFlightCompile& record) {
 		if (std::erase(in_flight, &record) != 0) {
@@ -1590,13 +1744,52 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		ProgramCompileTimes               times;
-		const auto                        translate_begin = CompileClockNs();
 		ShaderRecompiler::TranslateResult translated;
-		{
-			KYTY_PROFILER_BLOCK("Shader::Translate");
-			translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		// An existing source's kept translation replaces translating the guest code again.
+		std::shared_ptr<const KeptTranslation> kept;
+		if (source != nullptr && TranslationCacheEnabled()) {
+			lock.lock();
+			kept = source->kept_translation;
+			if (kept != nullptr) TouchTranslation(*source);
+			lock.unlock();
 		}
-		times.translate_ns = CompileClockNs() - translate_begin;
+		if (kept != nullptr) {
+			const auto clone_begin = CompileClockNs();
+			{
+				KYTY_PROFILER_BLOCK("Shader::CopyTranslation");
+				times.reused = CopyTranslation(kept->translated, translated);
+			}
+			if (times.reused && TranslationVerifyMode() != 0 &&
+			    !VerifyKeptTranslation(params, options, *kept, prep.specialization,
+			                           push_data_cursor)) {
+				times.reused = false;
+				lock.lock();
+				ForgetTranslation(*source);
+				source->kept_disabled = true;
+				lock.unlock();
+			}
+			times.clone_ns = CompileClockNs() - clone_begin;
+		}
+		std::shared_ptr<KeptTranslation> keep;
+		if (!times.reused) {
+			const auto translate_begin = CompileClockNs();
+			{
+				KYTY_PROFILER_BLOCK("Shader::Translate");
+				translated = ShaderRecompiler::TranslateProgram(params.code, options);
+			}
+			times.translate_ns = CompileClockNs() - translate_begin;
+			// Keep an unmodified copy for this source's later permutations, taken before
+			// anything below (plan extraction, specialization) reads or changes the program.
+			if (TranslationCacheEnabled() && kept == nullptr && !translated.skip_dispatch) {
+				const auto copy_begin = CompileClockNs();
+				auto       copy       = std::make_shared<KeptTranslation>();
+				if (CopyTranslation(translated, copy->translated)) {
+					copy->bytes = EstimateTranslationBytes(copy->translated);
+					keep        = std::move(copy);
+				}
+				times.clone_ns = CompileClockNs() - copy_begin;
+			}
+		}
 		if (translated.skip_dispatch) {
 			lock.lock();
 			// An existing source never reaches here: it would have skip_dispatch set already.
@@ -1612,6 +1805,7 @@ struct PipelineCache::ProgramCache {
 			// Nobody else inserts this key while `record` covers it.
 			source        = &programs.try_emplace(key, std::move(plan)).first->second;
 			record.source = source; // Still covers every permutation of it.
+			KeepTranslation(*source, std::move(keep));
 			lock.unlock();
 			const bool materialized =
 			    Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
@@ -1631,6 +1825,7 @@ struct PipelineCache::ProgramCache {
 		                                   prep.specialization, push_data_cursor,
 		                                   key.static_state, times);
 		lock.lock();
+		KeepTranslation(*source, std::move(keep)); // An existing source that had none kept.
 		if (const auto* published =
 		        FindPermutation(*source, prep.specialization, push_data_cursor, true)) {
 			// Only possible when another cursor mapped to the same push-data start (both
@@ -1640,11 +1835,24 @@ struct PipelineCache::ProgramCache {
 			FinishInFlight(record);
 			return publish_index(*source, *published);
 		}
+		// Why this permutation was needed (compiles.csv): the source's first, only another
+		// push-data start of an existing specialization, or a new specialization.
+		bool same_specialization = false;
+		source->permutations.ForEach([&](const Permutation& existing) {
+			same_specialization |= existing.specialization == prep.specialization;
+		});
+		const char* reason = source->permutations.Size() == 0 ? "first"
+		                     : same_specialization            ? "push"
+		                                                      : "spec";
 		const auto& permutation = source->permutations.Append(std::move(compiled));
 		FinishInFlight(record);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderProgramsCreated);
+		if (times.reused) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TranslationReuses);
+		}
+		const auto detail = fmt::format("{}{}", reason, times.reused ? "+reused" : "");
 		RecordProgramCompile(ProgramStageName(stage), params.hash, permutation.handle.id, times,
-		                     CompileClockNs() - stall.begin);
+		                     CompileClockNs() - stall.begin, detail);
 		CountCompiledPermutation(stage);
 		return publish_index(*source, permutation);
 	}
@@ -1854,6 +2062,9 @@ struct PipelineCache::ProgramCache {
 	// Compiles in progress outside the lock and their completion signal (m_programs_mutex).
 	std::vector<InFlightCompile*> in_flight;
 	std::condition_variable_any   compile_done;
+	// Kept translations, least recently used first, and their estimated bytes (m_programs_mutex).
+	std::list<SourceEntry*> kept_lru;
+	size_t                  kept_bytes = 0;
 };
 
 // Classifies each new graphics pipeline for stutter attribution: whether a pipeline already existed

@@ -47,6 +47,8 @@
 // compile_stall_us, compile_stall_max_us, compile_gfx_new, compile_gfx_perm, compile_gfx_variant.
 // Then driver pipeline cache saves (RecordPipelineCacheSave): pcache_saves, pcache_save_kb,
 // pcache_save_serialize_us, pcache_save_write_us, pcache_save_overlaps, pcache_save_overlap_us.
+// Then compile_translation_reuses (programs specialized from a kept translation instead of
+// translating again) and compile_clone_us (copying translations, RecordCompile clone_ns).
 // New columns are only ever appended.
 //
 //   compiles.csv       one row per new shader program permutation or pipeline: phase times, the
@@ -276,6 +278,9 @@ struct CompileEvent {
 	uint64_t         total_ns     = 0;
 	uint64_t         spirv_words  = 0;
 	std::string_view detail;
+	// Programs: copy of a kept translation (reused, translate_ns 0) or of a new one being kept.
+	uint64_t         clone_ns = 0;
+	bool             reused   = false;
 };
 void RecordCompile(const CompileEvent& event);
 // A draw or dispatch spent stall_ns in the compile paths (new programs and pipelines, including

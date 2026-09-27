@@ -1504,6 +1504,41 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
+// Pipeline-cache translation reuse (KYTY_TRANSLATION_CACHE): specializing a deep
+// copy of a translation (IR::CloneProgram), taken before anything reads the
+// program, must emit exactly the SPIR-V and metadata of the translation itself.
+class TranslationCopyCheck {
+public:
+  explicit TranslationCopyCheck(
+      const ShaderRecompiler::TranslateResult &translated) {
+    m_cloned = ShaderRecompiler::IR::CloneProgram(translated.program,
+                                                  m_copy.program);
+    m_copy.decoded_dump = translated.decoded_dump;
+    m_copy.cfg_dump = translated.cfg_dump;
+  }
+
+  void Verify(const char *name, const ShaderRecompiler::CompileOptions &options,
+              const ShaderRecompiler::IR::ResourceSpecialization &specialization,
+              const ShaderRecompiler::CompileResult &original) {
+    Require(name, "translation copy", m_cloned,
+            "CloneProgram refused the translation");
+    auto copy = ShaderRecompiler::CompileProgram(std::move(m_copy), options,
+                                                 specialization);
+    Require(name, "translation copy", copy.spirv == original.spirv,
+            "SPIR-V of the copied translation differs");
+    Require(name, "translation copy",
+            copy.program.info == original.program.info &&
+                copy.program.bindings == original.program.bindings &&
+                copy.program.write_ranges == original.program.write_ranges &&
+                copy.program.scratch_dwords == original.program.scratch_dwords,
+            "shader metadata of the copied translation differs");
+  }
+
+private:
+  ShaderRecompiler::TranslateResult m_copy;
+  bool m_cloned = false;
+};
+
 CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
@@ -1534,6 +1569,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
 
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
+  TranslationCopyCheck copy_check(translated);
   auto resource_plan =
       ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -1550,6 +1586,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
           "translated resources could not be materialized");
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
+  copy_check.Verify(test.name, options, specialization, result);
   for (const auto &[text, expected] : test.decoded_counts) {
     const auto actual = CountText(result.decoded_dump, text);
     Require(test.name, "decoded RDNA2", actual == expected,
@@ -1703,6 +1740,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
 
   auto translated =
       ShaderRecompiler::TranslateProgram(test.fragment_code, options);
+  TranslationCopyCheck copy_check(translated);
   auto resource_plan =
       ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -1717,6 +1755,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
           "translated resources could not be materialized");
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
+  copy_check.Verify(test.name, options, specialization, result);
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
@@ -2073,7 +2112,8 @@ public:
 
   void CheckSchedulerTimeline() {
     EnsureRuntimeContext();
-    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    CommandScheduler scheduler(Renderer(), m_runtime_context,
+                               CommandScheduler::Role::Guest);
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
@@ -2203,7 +2243,8 @@ public:
         "completed command buffers were not reused after timeline progress");
     scheduler.Shutdown();
 
-    CommandScheduler draining(Renderer(), m_runtime_context);
+    CommandScheduler draining(Renderer(), m_runtime_context,
+                              CommandScheduler::Role::Guest);
     HW::Context drain_registers{};
     HW::UserConfig drain_user_config{};
     HW::Shader drain_shaders{};
@@ -3397,7 +3438,8 @@ public:
   void CheckUnifiedImageViewCache() {
     EnsureRuntimeContext();
     constexpr const char *name = "UnifiedImageViewCache";
-    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    CommandScheduler scheduler(Renderer(), m_runtime_context,
+                               CommandScheduler::Role::Guest);
 
     ImageInfo color_info{};
     color_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
@@ -14818,7 +14860,8 @@ public:
     constexpr const char *name = "GpuTilerCpuParity";
     EnsureRuntimeContext();
 
-    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    CommandScheduler scheduler(Renderer(), m_runtime_context,
+                               CommandScheduler::Role::Guest);
     HW::Context registers{};
     HW::UserConfig user_config{};
     HW::Shader shaders{};
@@ -30378,7 +30421,8 @@ void CheckRenderTargetFormatContract() {
              std::strcmp(kind, "volume-slice-range") == 0) {
     VulkanHarness vulkan;
     auto &graphics = vulkan.RuntimeContext();
-    CommandScheduler scheduler(vulkan.RuntimeRenderer(), graphics);
+    CommandScheduler scheduler(vulkan.RuntimeRenderer(), graphics,
+                               CommandScheduler::Role::Guest);
     ImageInfo volume_info{};
     volume_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
     volume_info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
@@ -30716,7 +30760,7 @@ void CheckSampledDepthResource() {
 void CheckImageTransitionState(RenderContext &renderer) {
   constexpr const char *name = "ImageTransitionState";
   auto &context = renderer.GetGraphics();
-  CommandScheduler scheduler(renderer, context);
+  CommandScheduler scheduler(renderer, context, CommandScheduler::Role::Guest);
   const auto MakeInfo = [](vk::Format format, uint32_t levels,
                            uint32_t layers) {
     ImageInfo info{};
