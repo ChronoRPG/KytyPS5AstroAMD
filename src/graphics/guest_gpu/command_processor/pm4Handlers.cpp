@@ -1050,6 +1050,18 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 			cs_regs.require_forward_progress =
 			    ((value >> Pm4::COMPUTE_PGM_RSRC1_FWD_PROGRESS_SHIFT) &
 			     Pm4::COMPUTE_PGM_RSRC1_FWD_PROGRESS_MASK) != 0u;
+			// Compute shaders are recompiled with the graphics float state (FLOAT_MODE 0xC0: f32
+			// denormals flushed, DX10_CLAMP, IEEE off). Report the first kernels that ask for
+			// something else (RDNA2 ISA 6.4); this state is not modelled.
+			if (cs_regs.float_mode != 0xc0u || !cs_regs.dx10_clamp || cs_regs.ieee_mode) {
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 8u) {
+					LOGF("Compute: COMPUTE_PGM_RSRC1 float_mode=0x%02x dx10_clamp=%u ieee=%u is not "
+					     "modelled (shader at 0x%016" PRIx64 ")\n",
+					     cs_regs.float_mode, cs_regs.dx10_clamp ? 1u : 0u,
+					     cs_regs.ieee_mode ? 1u : 0u, cs_regs.data_addr);
+				}
+			}
 			break;
 		case Pm4::COMPUTE_PGM_RSRC2:
 			cs_regs.scratch_en     = ((value >> Pm4::COMPUTE_PGM_RSRC2_SCRATCH_EN_SHIFT) &
