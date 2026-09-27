@@ -70,13 +70,29 @@
 //                      requesting thread, and for graphics pipelines which key fields differ from
 //                      the closest existing pipeline of the same programs (RecordCompile)
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <string_view>
 
 namespace HangTrace {
 
-[[nodiscard]] bool Enabled();
+namespace Detail {
+// KYTY_HANG_TRACE, read on first use by any thread: -1 until then, else 0 or 1 (constant-
+// initialized, so correct before this module's dynamic initialization).
+extern std::atomic<int8_t> g_enabled;
+[[nodiscard]] bool ReadEnabled() noexcept;
+// The KYTY_HANG_TRACE_CP_WATCH window: set once by Initialize when the CP trace is on (before
+// renderer threads start), empty otherwise.
+extern uint64_t g_cp_watch_begin;
+extern uint64_t g_cp_watch_end;
+} // namespace Detail
+
+// Inlined: checked on hot renderer paths.
+[[nodiscard]] inline bool Enabled() {
+	const auto value = Detail::g_enabled.load(std::memory_order_relaxed);
+	return value >= 0 ? value != 0 : Detail::ReadEnabled();
+}
 [[nodiscard]] bool ImportsEnabled();
 
 void Initialize();
@@ -197,7 +213,12 @@ void RecordLodReport(const LodReportEvent& event);
 // sequence it is processing (SetCpContext); events without an explicit queue carry that context.
 [[nodiscard]] bool CpTraceEnabled();
 void               SetCpContext(uint32_t queue, uint64_t sequence);
-[[nodiscard]] bool CpWatch(uint64_t address, uint64_t size);
+// Whether [address, address + size) overlaps the CP watch window (never without the CP trace:
+// the window is only set with it). Inlined: checked on every texture-cache image use.
+[[nodiscard]] inline bool CpWatch(uint64_t address, uint64_t size) {
+	return Detail::g_cp_watch_end > Detail::g_cp_watch_begin && address < Detail::g_cp_watch_end &&
+	       Detail::g_cp_watch_begin < address + size;
+}
 struct CpEvent {
 	const char* event   = "";
 	uint64_t    address = 0;

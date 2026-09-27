@@ -468,6 +468,16 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+# Per-thread profiler counters (common/profiler.h); also prints a timing of the counting paths.
+add_executable(profiler_counter_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ProfilerCounterTests.cpp"
+)
+target_link_libraries(profiler_counter_tests common)
+target_include_directories(profiler_counter_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(profiler_counter_tests Threads::Threads)
+endif()
+
 add_executable(lod_stats_report_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LodStatsReportTests.cpp"
 )
@@ -654,6 +664,7 @@ if(BUILD_TESTING)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME profiler_counters COMMAND $<TARGET_FILE:profiler_counter_tests>)
 	add_test(NAME lod_stats_report COMMAND $<TARGET_FILE:lod_stats_report_tests>)
 	add_test(NAME lod_stats_codegen
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --lod-stats-codegen-only)

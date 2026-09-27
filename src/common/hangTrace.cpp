@@ -34,6 +34,13 @@
 #endif
 
 namespace HangTrace {
+
+namespace Detail {
+std::atomic<int8_t> g_enabled {-1};
+uint64_t            g_cp_watch_begin = 0;
+uint64_t            g_cp_watch_end   = 0;
+} // namespace Detail
+
 namespace {
 
 constexpr uint32_t kMaxQueues   = 64;
@@ -408,8 +415,8 @@ std::vector<std::string> g_pending_cp_rows;
 uint64_t                 g_cp_rows_total = 0;
 thread_local uint32_t    g_cp_queue      = UINT32_MAX;
 thread_local uint64_t    g_cp_sequence   = 0;
-uint64_t                 g_cp_watch_begin = 0;
-uint64_t                 g_cp_watch_end   = 0;
+using Detail::g_cp_watch_begin;
+using Detail::g_cp_watch_end;
 
 constexpr uint64_t       kOcclusionRowLimit = 2'000'000;
 std::mutex               g_occlusion_mutex;
@@ -867,8 +874,9 @@ void Publish() {
 
 } // namespace
 
-bool Enabled() {
-	static const bool enabled = EnvFlag("KYTY_HANG_TRACE", false);
+bool Detail::ReadEnabled() noexcept {
+	const bool enabled = EnvFlag("KYTY_HANG_TRACE", false);
+	g_enabled.store(enabled ? 1 : 0, std::memory_order_relaxed);
 	return enabled;
 }
 
@@ -885,11 +893,6 @@ bool CpTraceEnabled() {
 void SetCpContext(uint32_t queue, uint64_t sequence) {
 	g_cp_queue    = queue;
 	g_cp_sequence = sequence;
-}
-
-bool CpWatch(uint64_t address, uint64_t size) {
-	return CpTraceEnabled() && g_cp_watch_end > g_cp_watch_begin && address < g_cp_watch_end &&
-	       g_cp_watch_begin < address + size;
 }
 
 void RecordCp(const CpEvent& event) {
