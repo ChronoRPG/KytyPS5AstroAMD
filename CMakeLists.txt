@@ -862,6 +862,19 @@ if(BUILD_TESTING)
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 	endif()
 
+	# A failed check fails its test from its message too, not only from the exit status (which
+	# a harness can lose, or a process exit can overtake when the check runs on another thread).
+	# The failure formats of the test programs: "<Suite>: failed: ...", "<Suite>: <case> failed
+	# ...", "FAILED: ...", "... test failed: ..." and "SaveDataMemoryTests:<line>: ...".
+	# failure_message_fails_test checks the expression itself: a program that prints a failure
+	# and exits with status 0 must fail (inverted by WILL_FAIL).
+	add_test(NAME failure_message_fails_test
+		COMMAND ${CMAKE_COMMAND} -E echo "SelfTests: failed: a check failed, the process exited 0")
+	set_tests_properties(failure_message_fails_test PROPERTIES WILL_FAIL TRUE)
+	get_property(kyty_test_names DIRECTORY PROPERTY TESTS)
+	set_tests_properties(${kyty_test_names} PROPERTIES FAIL_REGULAR_EXPRESSION
+		"Tests: failed: ;Tests: [^\n]* failed at ;Tests: [^\n]* failed: ;FAILED: ;test failed: ;SaveDataMemoryTests:[0-9]+: ")
+
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
 		shader_cfg_tests

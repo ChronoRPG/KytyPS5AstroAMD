@@ -77,6 +77,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1110,8 +1111,13 @@ std::string Hex(u32 value) {
 
 [[noreturn]] void Fail(const char *shader_name, const char *stage,
                        const std::string &message) {
+  std::fflush(stdout);
   std::fprintf(stderr, "ShaderRecompilerComputeTests: %s failed at %s: %s\n",
                shader_name, stage, message.c_str());
+  std::fflush(stderr);
+  // The default SIGABRT action, whatever a loaded library installed: abort() must end the
+  // process with a failure status (ctest also matches the message, FAIL_REGULAR_EXPRESSION).
+  std::signal(SIGABRT, SIG_DFL);
   std::abort();
 }
 
@@ -4994,6 +5000,24 @@ public:
       const auto protected_page = [&](uint64_t page) {
         return cache.IsRegionGpuModified(page, 0x1000);
       };
+      // The completion runner publishes an eager copy as soon as its submission completes, which
+      // can be before a check that the copy is still pending. hold_runner() queues a priority
+      // operation that blocks the runner until release_runner(): priority operations run in the
+      // order they were queued, so the publications of copies issued afterwards wait behind it.
+      std::atomic<bool> runner_released{true};
+      const auto hold_runner = [&] {
+        runner_released.store(false, std::memory_order_release);
+        OnGpuThread(context, [&] {
+          scheduler.DeferPriorityOperation([&runner_released] {
+            while (!runner_released.load(std::memory_order_acquire)) {
+              std::this_thread::yield();
+            }
+          });
+        });
+      };
+      const auto release_runner = [&] {
+        runner_released.store(true, std::memory_order_release);
+      };
 
       // 1. A guest read of a GPU-written value makes its page read-hot (its writer is still
       // being recorded, so this read drains as before).
@@ -5012,11 +5036,13 @@ public:
               cache.HasGpuDirtyBytes(base + guest_offset, 4) &&
                   !cache.HasPendingBackingPublication(base + guest_offset, 4),
               "an eager copy was issued with its writer's own submission");
+      hold_runner();
       submit();
-      Require(name, "eager issue",
-              !cache.HasGpuDirtyBytes(base + guest_offset, 4) &&
-                  cache.HasPendingBackingPublication(base + guest_offset, 4) &&
-                  protected_page(guest_page),
+      const bool issued = !cache.HasGpuDirtyBytes(base + guest_offset, 4) &&
+                          cache.HasPendingBackingPublication(base + guest_offset, 4) &&
+                          protected_page(guest_page);
+      release_runner();
+      Require(name, "eager issue", issued,
               "the submission after the writer did not issue an eager copy, "
               "or unprotected the page before completion");
       complete();
@@ -5031,9 +5057,11 @@ public:
       cache.AdvanceFrame();
       gpu_write(guest_offset, 0x33333333u);
       submit();
+      hold_runner();
       submit();
-      Require(name, "second eager issue",
-              cache.HasPendingBackingPublication(base + guest_offset, 4),
+      const bool second_pending = cache.HasPendingBackingPublication(base + guest_offset, 4);
+      release_runner();
+      Require(name, "second eager issue", second_pending,
               "a later writer of a hot page was not copied eagerly");
       gpu_write(guest_offset, 0x44444444u);
       complete();
@@ -5053,9 +5081,11 @@ public:
       cache.AdvanceFrame();
       gpu_write(guest_offset, 0x55555555u);
       submit();
+      hold_runner();
       submit();
-      Require(name, "third eager issue",
-              cache.HasPendingBackingPublication(base + guest_offset, 4),
+      const bool third_pending = cache.HasPendingBackingPublication(base + guest_offset, 4);
+      release_runner();
+      Require(name, "third eager issue", third_pending,
               "the eager copy was not pending before the read");
       cache.ReadMemory(base + guest_offset, 1);
       Require(name, "read during copy",
@@ -5095,22 +5125,12 @@ public:
       Require(name, "no request for guest pages",
               !cache.TakeEagerFlushRequest(false),
               "a writer of a guest-read page requested an early submission");
-      // The completion runner publishes an eager copy as soon as its submission completes, which
-      // can be before the check below. Hold it meanwhile: priority operations run in the order
-      // they were queued, so one queued now runs before the copies' publications.
-      std::atomic<bool> runner_released{false};
-      OnGpuThread(context, [&] {
-        scheduler.DeferPriorityOperation([&runner_released] {
-          while (!runner_released.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-          }
-        });
-      });
+      hold_runner();
       submit();
       submit();
       const bool both_pending = cache.HasPendingBackingPublication(base + cp_offset, 4) &&
                                 cache.HasPendingBackingPublication(base + guest_offset, 4);
-      runner_released.store(true, std::memory_order_release);
+      release_runner();
       Require(name, "cp eager issue", both_pending,
               "eager copies of both pages were not issued");
       // Recorded after the copies were issued; a CP read must not wait for it.
