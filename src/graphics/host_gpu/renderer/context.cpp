@@ -5,6 +5,7 @@
 #include "common/rendererBatch.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/memoryStats.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -40,6 +41,11 @@ bool BarrierBatchEnabled() {
 
 bool BarrierSinkEnabled() {
 	static const bool enabled = BarrierBatchEnabled() && EnvSwitch("KYTY_BARRIER_SINK", true);
+	return enabled;
+}
+
+bool UploadBatchEnabled() {
+	static const bool enabled = BarrierBatchEnabled() && EnvSwitch("KYTY_UPLOAD_BATCH", true);
 	return enabled;
 }
 
@@ -115,7 +121,8 @@ constinit GpuOpProfiler::Site g_batch_sites[static_cast<size_t>(BarrierOrigin::C
     GpuOpProfiler::Site {"batch.guest_global"},  GpuOpProfiler::Site {"batch.shader_access"},
     GpuOpProfiler::Site {"batch.shader_write"},  GpuOpProfiler::Site {"batch.shader_hazard"},
     GpuOpProfiler::Site {"batch.indirect_args"}, GpuOpProfiler::Site {"batch.gds"},
-    GpuOpProfiler::Site {"batch.image"},         GpuOpProfiler::Site {"batch.mixed"},
+    GpuOpProfiler::Site {"batch.image"},         GpuOpProfiler::Site {"batch.upload"},
+    GpuOpProfiler::Site {"batch.mixed"},
 };
 
 GpuOpProfiler::Site& BatchSite(uint32_t origins) {
@@ -256,17 +263,115 @@ bool CommandBuffer::BatchImageBarriers(std::span<const vk::ImageMemoryBarrier2> 
 	return true;
 }
 
+void CommandBuffer::RequestUploadCopy(vk::Buffer source, vk::Buffer destination,
+                                      std::span<const vk::BufferCopy> regions) const {
+	EXIT_IF(IsInvalid() || !UploadBatchEnabled() || source == nullptr || destination == nullptr);
+	if (regions.empty()) {
+		return;
+	}
+	// Copies recorded together are not ordered against each other: a rewrite of a queued
+	// destination range (a page re-dirtied between two uploads) goes into the next batch.
+	const bool overlaps = std::ranges::any_of(m_pending.uploads, [&](const PendingUpload& queued) {
+		if (queued.destination != destination) {
+			return false;
+		}
+		for (uint32_t index = 0; index < queued.region_count; index++) {
+			const auto& old = m_pending.upload_regions[queued.first_region + index];
+			for (const auto& region: regions) {
+				if (region.dstOffset < old.dstOffset + old.size &&
+				    old.dstOffset < region.dstOffset + region.size) {
+					return true;
+				}
+			}
+		}
+		return false;
+	});
+	if (overlaps) {
+		FlushBarriers();
+	}
+	CountBatch(GpuOpProfiler::BarrierBatchEvent::Requests);
+	if (!m_pending.Empty()) {
+		CountBatch(GpuOpProfiler::BarrierBatchEvent::Merged);
+	}
+	m_pending.uploads.push_back({source, destination,
+	                             static_cast<uint32_t>(m_pending.upload_regions.size()),
+	                             static_cast<uint32_t>(regions.size())});
+	m_pending.upload_regions.insert(m_pending.upload_regions.end(), regions.begin(),
+	                                regions.end());
+	m_pending.origins |= OriginBit(BarrierOrigin::Upload);
+}
+
+void CommandBuffer::RecordPendingUploads() const {
+	const GpuOpProfiler::ScopedSite site(
+	    g_batch_sites[static_cast<size_t>(BarrierOrigin::Upload)]);
+	std::vector<vk::BufferMemoryBarrier2> destinations;
+	for (const auto& upload: m_pending.uploads) {
+		if (std::ranges::any_of(destinations, [&upload](const auto& barrier) {
+			    return barrier.buffer == upload.destination;
+		    })) {
+			continue;
+		}
+		vk::BufferMemoryBarrier2 barrier {};
+		// Every earlier access of the destination (including an earlier upload copy) before
+		// the copies' writes, as SynchronizeBuffer's own pre-copy barrier.
+		barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+		barrier.srcAccessMask       = vk::AccessFlagBits2::eMemoryRead |
+		                        vk::AccessFlagBits2::eMemoryWrite |
+		                        vk::AccessFlagBits2::eTransferRead |
+		                        vk::AccessFlagBits2::eTransferWrite;
+		barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer              = upload.destination;
+		barrier.offset              = 0;
+		barrier.size                = VK_WHOLE_SIZE;
+		destinations.push_back(barrier);
+	}
+	++m_internal_recording;
+	vk::DependencyInfo dependency {};
+	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
+	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(destinations.size());
+	dependency.pBufferMemoryBarriers    = destinations.data();
+	m_buffer.pipelineBarrier2(dependency);
+	for (const auto& upload: m_pending.uploads) {
+		m_buffer.copyBuffer(upload.source, upload.destination, upload.region_count,
+		                    m_pending.upload_regions.data() + upload.first_region);
+	}
+	--m_internal_recording;
+	MemoryStats::Count(MemoryStats::Counter::UploadCopies, m_pending.uploads.size());
+	MemoryStats::Count(MemoryStats::Counter::UploadBarriers, 2);
+	// The copies' writes before every later access. These join the batch recorded right after
+	// the copies: its other barriers ordered earlier commands against later ones, which the
+	// copies (writing only their destinations, reading host-written staging data) do not need.
+	for (auto& barrier: destinations) {
+		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+		m_pending.buffers.push_back(barrier);
+	}
+	m_pending.uploads.clear();
+	m_pending.upload_regions.clear();
+}
+
 void CommandBuffer::FlushBarriers() const {
 	if (m_pending.Empty()) {
 		return;
 	}
 	EXIT_IF(IsInvalid());
+	if (m_rendering && !m_pending.uploads.empty()) {
+		MemoryStats::Count(MemoryStats::Counter::UploadRenderSplits);
+	}
 	if (m_rendering) {
 		// Pipeline barriers cannot be recorded inside dynamic rendering. (A command recorded
 		// through Handle() mostly ends rendering anyway; only a draw that has to restart its own
 		// instance counts as a barrier split, in BeginRendering().) Ended before the batch site
 		// is entered, so the end is attributed to the site whose command needed the flush.
 		EndRendering();
+	}
+	if (!m_pending.uploads.empty()) {
+		RecordPendingUploads();
 	}
 	const GpuOpProfiler::ScopedSite site(BatchSite(m_pending.origins));
 	++m_internal_recording;
@@ -324,7 +429,8 @@ bool CommandBuffer::CanSinkPending() const {
 	//  - the batch has no buffer/image barriers: layout transitions must precede D2.
 	return BarrierSinkEnabled() && m_draw_scope && m_draw_safe && m_rendering && m_epoch_clean &&
 	       m_epoch_instance != 0 && m_epoch_instance == m_rendering_serial &&
-	       m_pending.has_memory && m_pending.images.empty() && m_pending.buffers.empty();
+	       m_pending.has_memory && m_pending.images.empty() && m_pending.buffers.empty() &&
+	       m_pending.uploads.empty();
 }
 
 bool CommandBuffer::CanSinkDrawWrites() const {
@@ -334,7 +440,7 @@ bool CommandBuffer::CanSinkDrawWrites() const {
 	// (guest synchronization, layout transitions, buffer barriers, indirect arguments, GDS)
 	// keeps the ordinary rules.
 	return DrawWriteSinkEnabled() && m_draw_scope && m_rendering && m_pending.has_memory &&
-	       m_pending.images.empty() && m_pending.buffers.empty() &&
+	       m_pending.images.empty() && m_pending.buffers.empty() && m_pending.uploads.empty() &&
 	       m_pending.origins == OriginBit(BarrierOrigin::ShaderWrite);
 }
 

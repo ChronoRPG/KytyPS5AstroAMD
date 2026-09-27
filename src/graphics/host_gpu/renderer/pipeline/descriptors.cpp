@@ -1107,6 +1107,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	};
 	auto& write_scratch = ThreadWriteRangeScratch();
 	bool  write_ranges_evaluated = false;
+	// All bindings' uploads share one barrier pair (KYTY_UPLOAD_BATCH).
+	const BufferCache::UploadBatch upload_batch(m_context.GetBufferCache());
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		uint32_t   buffer_offset = 0;
 		const auto* written      = ResolveWrittenRanges(m_context, *prepared.runtime, prepared, i,
@@ -1217,6 +1219,8 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
+	// The uploads of every stage share one barrier pair (KYTY_UPLOAD_BATCH).
+	const BufferCache::UploadBatch upload_batch(m_context.GetBufferCache());
 	for (auto* stage: stages) {
 		RebindBuffers(*stage);
 	}

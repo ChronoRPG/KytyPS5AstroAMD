@@ -464,6 +464,19 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool write_fau
 	    vaddr, size, [this, vaddr, size] { ReadMemory(vaddr, size, true); }, write_fault);
 }
 
+BufferCache::UploadBatch::UploadBatch(BufferCache& cache): m_cache(cache) {
+	m_cache.m_upload_batch_depth++;
+}
+
+BufferCache::UploadBatch::~UploadBatch() {
+	if (--m_cache.m_upload_batch_depth == 0) {
+		auto& command = m_cache.m_scheduler.Current();
+		if (!command.IsInvalid()) {
+			command.FlushBarriers();
+		}
+	}
+}
+
 void BufferCache::AdvanceFrame() noexcept {
 	m_memory_tracker.AdvanceFrame();
 }
@@ -1182,6 +1195,19 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			                          0, static_cast<uint32_t>(copies.size()), 0, total_size, size);
 		}
 		auto& command = m_scheduler.Current();
+		if (UploadBatchEnabled() && !late_source) {
+			// One barrier pair per flush for all queued uploads instead of one per upload. Inside
+			// an UploadBatch scope the copy waits for the scope end (or an earlier flush point).
+			command.RequestUploadCopy(source, buffer.Handle(), copies);
+			buffer.MarkContentWritten();
+			if (m_upload_batch_depth == 0) {
+				command.FlushBarriers();
+			}
+			if (is_texel_buffer && !is_written) {
+				return SynchronizeBufferFromImage(buffer, vaddr, size);
+			}
+			return false;
+		}
 		if (command.ActiveRenderingSerial() != 0) {
 			MemoryStats::Count(MemoryStats::Counter::UploadRenderSplits);
 		}

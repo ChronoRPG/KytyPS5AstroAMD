@@ -124,9 +124,15 @@ struct DrawAutoArgs {
 // partial flushes and cache actions become Guest requests, which are never sunk this way), so
 // draws of one instance may overlap as they do on the hardware. Every non-draw consumer is still
 // ordered after the writes. KYTY_DRAW_WRITE_SINK=0 ends the instance after such draws again.
+// KYTY_UPLOAD_BATCH (default on, needs the batcher): CPU-dirty buffer uploads are queued with
+// CommandBuffer::RequestUploadCopy and recorded at the next flush point as ONE barrier for all
+// destination buffers, the copies, and their post-copy barriers merged into the batch being
+// flushed (see CommandBuffer::RecordPendingUploads). KYTY_UPLOAD_BATCH=0 records each upload with
+// its own EndRendering and barrier pair.
 [[nodiscard]] bool BarrierBatchEnabled();
 [[nodiscard]] bool BarrierSinkEnabled();
 [[nodiscard]] bool DrawWriteSinkEnabled();
+[[nodiscard]] bool UploadBatchEnabled();
 
 // Attribution of batched barrier requests (gpuOpProfiler site of the recorded batch).
 enum class BarrierOrigin : uint32_t {
@@ -137,6 +143,7 @@ enum class BarrierOrigin : uint32_t {
 	IndirectArgs,      // shader/transfer writes -> indirect command fetch
 	Gds,               // GDS buffer -> shader stages
 	Image,             // Image::Transit layout/access transitions
+	Upload,            // after queued buffer uploads: copy writes -> everything later
 	Count,
 };
 
@@ -168,6 +175,15 @@ public:
 	// batch (with these barriers) is recorded immediately.
 	[[nodiscard]] bool BatchImageBarriers(std::span<const vk::ImageMemoryBarrier2> barriers,
 	                                      vk::CommandBuffer target, bool deferrable) const;
+	// Queues a copy of CPU-dirty guest data from a staging `source` into `destination`, recorded
+	// at the next flush point (Handle(), BeginRendering(), End(), FlushBarriers()) after one
+	// barrier ordering every earlier access of the destination buffers before the queued copies;
+	// the copies' writes are then ordered before everything later by buffer barriers merged into
+	// the batch flushed with them. A request whose regions overlap a queued copy into the same
+	// buffer records the queue first (copies in one batch are unordered). Requires
+	// UploadBatchEnabled(); the source must stay valid for this command buffer.
+	void RequestUploadCopy(vk::Buffer source, vk::Buffer destination,
+	                       std::span<const vk::BufferCopy> regions) const;
 	// Records the pending batch now (no-op when empty).
 	void FlushBarriers() const;
 
@@ -228,24 +244,37 @@ private:
 	void Begin();
 	void End() const;
 
+	struct PendingUpload {
+		vk::Buffer source;
+		vk::Buffer destination;
+		uint32_t   first_region = 0;
+		uint32_t   region_count = 0;
+	};
 	struct PendingBarriers {
 		vk::MemoryBarrier2                    memory;
 		bool                                  has_memory = false;
 		std::vector<vk::ImageMemoryBarrier2>  images;
 		std::vector<vk::BufferMemoryBarrier2> buffers;
+		// Queued upload copies (RequestUploadCopy), recorded first when the batch is flushed.
+		std::vector<PendingUpload>  uploads;
+		std::vector<vk::BufferCopy> upload_regions;
 		uint32_t                              origins = 0; // bit per BarrierOrigin
 
 		[[nodiscard]] bool Empty() const {
-			return !has_memory && images.empty() && buffers.empty();
+			return !has_memory && images.empty() && buffers.empty() && uploads.empty();
 		}
 		void Clear() {
 			has_memory = false;
 			memory     = vk::MemoryBarrier2 {};
 			images.clear();
 			buffers.clear();
+			uploads.clear();
+			upload_regions.clear();
 			origins = 0;
 		}
 	};
+	// Records the queued upload copies behind one barrier and queues their post-copy barriers.
+	void RecordPendingUploads() const;
 	// Every native command other than the batch itself and the rendering bookkeeping below.
 	void NoteForeignCommand() const {
 		m_recorded_since_flush = true;

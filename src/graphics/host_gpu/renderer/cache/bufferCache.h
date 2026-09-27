@@ -54,6 +54,21 @@ public:
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size, bool write_fault = false);
 	// Once per completed guest flip (any thread): the frame clock of hot-page detection.
 	void                   AdvanceFrame() noexcept;
+	// While one is alive (GPU thread), CPU-dirty uploads are only queued on the current command
+	// buffer (KYTY_UPLOAD_BATCH, CommandBuffer::RequestUploadCopy); the outermost scope's end
+	// records them all behind one barrier. Every command recorded meanwhile through
+	// CommandBuffer::Handle() records the queue first, so only commands recorded through a handle
+	// obtained BEFORE the scope began must not follow uploads made in it.
+	class UploadBatch {
+	public:
+		explicit UploadBatch(BufferCache& cache);
+		~UploadBatch();
+		UploadBatch(const UploadBatch&)            = delete;
+		UploadBatch& operator=(const UploadBatch&) = delete;
+
+	private:
+		BufferCache& m_cache;
+	};
 	// Guest read faults outside the GPU thread use a side copy when every dirty byte they need
 	// was written by an already submitted recording (KYTY_READBACK_SIDE_COPY=0 disables it).
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
@@ -258,6 +273,7 @@ private:
 	std::map<uint64_t, HotShadow>                     m_hot_shadows;
 	std::vector<uint8_t>                              m_hot_scratch;
 	uint32_t                                          m_hot_quiet_frames = 8;
+	uint32_t                                          m_upload_batch_depth = 0;
 	uint32_t                                          m_hot_sweep_frame  = 0;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};
 	// GPU-thread-only snapshots taken BEFORE the last full scan, never after it.
