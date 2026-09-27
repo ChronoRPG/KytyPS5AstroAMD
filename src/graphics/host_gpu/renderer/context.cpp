@@ -54,6 +54,12 @@ bool DrawWriteSinkEnabled() {
 	return enabled;
 }
 
+bool DepthFeedbackKeepEnabled() {
+	static const bool enabled =
+	    BarrierBatchEnabled() && EnvSwitch("KYTY_DEPTH_FEEDBACK_KEEP", true);
+	return enabled;
+}
+
 bool PushConstantShadowEnabled() {
 	static const bool enabled = EnvSwitch("KYTY_PUSH_CONSTANT_SHADOW", true);
 	return enabled;
@@ -182,6 +188,12 @@ void CommandBuffer::ResetBarrierState() const {
 	m_epoch_clean          = false;
 	m_epoch_instance       = 0;
 	m_internal_recording   = 0;
+	m_feedback_keep.reset();
+}
+
+void CommandBuffer::NoteFeedbackKeep(const vk::ImageMemoryBarrier2& ordering) const {
+	EXIT_IF(!BarrierBatchEnabled() || !m_rendering);
+	m_feedback_keep = ordering;
 }
 
 void CommandBuffer::RequestMemoryBarrier(vk::PipelineStageFlags2 src_stages,
@@ -697,17 +709,21 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 			return;
 		}
 	} else if (same_instance) {
+		// The instance continues: a depth access kept by this draw needs no barrier.
 		if (m_pending.Empty()) {
+			m_feedback_keep.reset();
 			NoteDrawRecorded();
 			return;
 		}
 		if (CanSinkPending()) {
 			CountBatch(GpuOpProfiler::BarrierBatchEvent::Sunk);
+			m_feedback_keep.reset();
 			NoteDrawRecorded();
 			return;
 		}
 		if (CanSinkDrawWrites()) {
 			CountBatch(GpuOpProfiler::BarrierBatchEvent::DrawWriteSinks);
+			m_feedback_keep.reset();
 			NoteDrawRecorded();
 			return;
 		}
@@ -730,6 +746,13 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 			KYTY_GPU_OP_SITE("render.state_change");
 			EndRendering();
 		}
+	}
+	if (m_feedback_keep) {
+		// Unreachable (NoteFeedbackKeep needs an active instance, and ending it queues this
+		// barrier); kept so a new instance can never begin without the left-out ordering.
+		m_pending.images.push_back(*m_feedback_keep);
+		m_pending.origins |= OriginBit(BarrierOrigin::Image);
+		m_feedback_keep.reset();
 	}
 	if (BarrierBatchEnabled()) {
 		FlushBarriers();
@@ -817,6 +840,18 @@ void CommandBuffer::EndRendering() const {
 	--m_internal_recording;
 	if (BarrierBatchEnabled()) {
 		NoteForeignCommand();
+	}
+	if (m_feedback_keep) {
+		// The instance a kept depth access relied on ended before the draw that kept it: order its
+		// attachment store and reads before whatever follows (KYTY_DEPTH_FEEDBACK_KEEP). A barrier
+		// of this image already pending was built from the kept state and orders the same.
+		const auto image = m_feedback_keep->image;
+		if (std::ranges::none_of(m_pending.images,
+		                         [image](const auto& pending) { return pending.image == image; })) {
+			m_pending.images.push_back(*m_feedback_keep);
+			m_pending.origins |= OriginBit(BarrierOrigin::Image);
+		}
+		m_feedback_keep.reset();
 	}
 }
 

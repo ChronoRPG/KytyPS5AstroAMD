@@ -701,7 +701,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
                                                  std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
-	feedback_aspects = {};
+	feedback_aspects       = {};
+	m_depth_feedback.valid = false;
 	auto&       cache = m_context.GetTextureCache();
 	RenderState state {};
 	state.width                 = std::numeric_limits<uint32_t>::max();
@@ -790,11 +791,52 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			             : vk::ImageLayout::eGeneral;
 		}
 		// The attachment store writes even when guest depth/stencil tests do not.
-		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+		auto        access = vk::AccessFlags2 {vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+		                                vk::AccessFlagBits2::eDepthStencilAttachmentWrite};
+		const auto& view   = depth.desc.view_info;
+		// KYTY_DEPTH_FEEDBACK_KEEP: inside the active rendering instance, with no attachment
+		// write (draw writes, load clears) since it began - the content serial recorded then is
+		// unchanged and this draw writes nothing - every access to the image in the instance is a
+		// read (depth/stencil tests, sampling). Reads need no ordering among themselves, so the
+		// attachment <-> attachment+shader-read toggles of sampling draws, a barrier and a new
+		// instance per draw, are left out: the image keeps the union of both scopes.
+		const auto sampled = vk::AccessFlags2 {access | vk::AccessFlagBits2::eShaderRead};
+		const bool whole   = view.base_level == 0 && view.base_layer == 0 &&
+		                   view.level_count == image.info.resources.levels &&
+		                   view.layer_count == image.info.resources.layers;
+		const auto& tracked = image.backing.state;
+		if (DepthFeedbackKeepEnabled() && !draw_writes && whole &&
+		    image.backing.subresource_states.empty() && image.feedback_instance != 0 &&
+		    image.feedback_instance == buffer.ActiveRenderingSerial() &&
+		    image.feedback_serial == image.ContentSerial() && tracked.layout == layout &&
+		    (tracked.access_mask == access || tracked.access_mask == sampled)) {
+			// Without the keep: a barrier back to the attachment scope when the previous draw
+			// sampled, and one to the sampled scope when this draw samples.
+			const uint64_t avoided = (tracked.access_mask == sampled ? 1u : 0u) +
+			                         (sampled_aspects ? 1u : 0u);
+			if (avoided != 0) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::DepthFeedbackBarriersAvoided,
+				                          avoided);
+			}
+			vk::ImageMemoryBarrier2 ordering {};
+			ordering.srcStageMask        = tracked.pl_stage;
+			ordering.srcAccessMask       = sampled;
+			ordering.dstStageMask        = tracked.pl_stage;
+			ordering.dstAccessMask       = sampled;
+			ordering.oldLayout           = layout;
+			ordering.newLayout           = layout;
+			ordering.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			ordering.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			ordering.image               = image.backing.image;
+			ordering.subresourceRange    = {ImageViewOps::DepthAspectMask(image.backing.format), 0,
+			                                VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+			buffer.NoteFeedbackKeep(ordering);
+			image.AdoptState(tracked.pl_stage, sampled, layout);
+			access = sampled;
+		}
+		m_depth_feedback = {depth.image_id, static_cast<bool>(draw_writes), true};
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access = access;
-		const auto& view                = depth.desc.view_info;
 		image.Transit(layout, access,
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
@@ -825,6 +867,30 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	        state.width == std::numeric_limits<uint32_t>::max() ||
 	        state.height == std::numeric_limits<uint32_t>::max());
 	return state;
+}
+
+void RenderExecutor::NoteDepthFeedback(const CommandBuffer& buffer) {
+	m_depth_feedback.valid = false;
+	auto* image = m_context.GetTextureCache().m_slot_images.try_get(m_depth_feedback.id);
+	if (image == nullptr) {
+		return;
+	}
+	const auto instance      = buffer.ActiveRenderingSerial();
+	const bool first_draw    = image->feedback_attached != instance;
+	image->feedback_attached = instance;
+	if (m_depth_feedback.writes || instance == 0) {
+		// This draw writes the attachment (or clears it on load): the instance is not read-only.
+		image->feedback_instance = 0;
+		image->feedback_serial   = 0;
+		return;
+	}
+	if (first_draw) {
+		// The first draw of this instance attaching the image, and it writes nothing: later draws
+		// of the instance compare the content serial against this one. An instance whose earlier
+		// draw wrote the image keeps feedback_instance 0 until it ends.
+		image->feedback_instance = instance;
+		image->feedback_serial   = image->ContentSerial();
+	}
 }
 
 static bool DrawHasActivePixelShader(const CommandBuffer& buffer) {
@@ -1687,6 +1753,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
+	if (m_depth_feedback.valid) {
+		NoteDepthFeedback(buffer);
+	}
 	if (indirect != nullptr) {
 		// A state change above only switched instances; no buffer write came in between.
 		m_indirect_barrier_rendering = buffer.ActiveRenderingSerial();

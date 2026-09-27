@@ -555,6 +555,9 @@ enum class FrameEvent : uint32_t {
 	// whose bytes differed.
 	TilerImageVerifyChecks,
 	TilerImageVerifyMismatches,
+	// KYTY_DEPTH_FEEDBACK_KEEP: attachment <-> attachment+shader-read barriers of a sampled,
+	// unwritten depth attachment left out inside one rendering instance.
+	DepthFeedbackBarriersAvoided,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);

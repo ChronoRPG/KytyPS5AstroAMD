@@ -139,6 +139,15 @@ struct DrawAutoArgs {
 [[nodiscard]] bool BarrierBatchEnabled();
 [[nodiscard]] bool BarrierSinkEnabled();
 [[nodiscard]] bool DrawWriteSinkEnabled();
+// KYTY_DEPTH_FEEDBACK_KEEP (default on, needs the batcher): a depth attachment that draws of the
+// current rendering instance also sample keeps one tracked access (attachment + shader read)
+// instead of toggling between the two with a barrier per draw, which ended the instance before
+// every such draw. Taken only with an exact proof that no attachment write happened since the
+// instance began (content serial of RenderExecutor::AcquireRenderTargets, no load clear, no
+// depth/stencil write in any of its draws): reads after reads need no ordering. If the instance
+// is not continued after all, BeginRendering() records the left-out barrier before the next
+// one (CommandBuffer::NoteFeedbackKeep). KYTY_DEPTH_FEEDBACK_KEEP=0 restores the toggles.
+[[nodiscard]] bool DepthFeedbackKeepEnabled();
 // Descriptor commit switches (default on; =0 restores the previous behaviour):
 // KYTY_PUSH_CONSTANT_SHADOW skips push-constant updates identical to the one in effect;
 // KYTY_DESCRIPTOR_SET_REUSE reuses descriptor sets (layouts beyond maxPushDescriptors) written
@@ -199,6 +208,12 @@ public:
 	                       std::span<const vk::BufferCopy> regions) const;
 	// Records the pending batch now (no-op when empty).
 	void FlushBarriers() const;
+	// KYTY_DEPTH_FEEDBACK_KEEP: the draw being recorded left out an access-only barrier of its
+	// depth attachment that no access inside the active rendering instance needs. Unless the
+	// next BeginRendering() continues that instance, it queues `ordering` with the batch it
+	// records before the new instance (the ended instance's attachment store and reads must
+	// precede the new instance's accesses).
+	void NoteFeedbackKeep(const vk::ImageMemoryBarrier2& ordering) const;
 
 	// Brackets the draw recording path from the state commands through the draw itself. The
 	// draw must be recorded right after BeginRendering(). safe: the draw writes only its own
@@ -225,6 +240,8 @@ public:
 	[[nodiscard]] uint64_t ActiveRenderingSerial() const {
 		return m_rendering ? m_rendering_serial : 0;
 	}
+	// Image barriers queued for the next flush point (inspection).
+	[[nodiscard]] size_t PendingImageBarriers() const { return m_pending.images.size(); }
 	void BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline);
 	// The pipeline last bound through BindPipeline since Begin (null after Begin).
 	[[nodiscard]] vk::Pipeline BoundPipeline(vk::PipelineBindPoint point) const {
@@ -371,6 +388,8 @@ private:
 	mutable uint32_t m_internal_recording = 0;
 	mutable bool     m_draw_scope         = false;
 	mutable bool     m_draw_safe          = false;
+	// NoteFeedbackKeep() since the last BeginRendering() (at most one depth attachment per draw).
+	mutable std::optional<vk::ImageMemoryBarrier2> m_feedback_keep;
 
 	friend class CommandScheduler;
 };
@@ -529,6 +548,16 @@ private:
 	// are recorded outside rendering, or end it (shader-write barrier), so while this instance
 	// stays active the barrier still covers every argument write.
 	uint64_t m_indirect_barrier_rendering = 0;
+	// KYTY_DEPTH_FEEDBACK_KEEP: the depth attachment of the draw being recorded and whether the
+	// draw writes it, applied to Image::feedback_instance/_serial once BeginRendering() has
+	// chosen the draw's rendering instance (NoteDepthFeedback).
+	struct DepthFeedbackNote {
+		ImageId id {};
+		bool    writes = false;
+		bool    valid  = false;
+	};
+	DepthFeedbackNote m_depth_feedback;
+	void              NoteDepthFeedback(const CommandBuffer& buffer);
 	// The ImageResource fields BuildTextureDescription reads. The shader-specific identity
 	// (source slot, first use pc, indirect-image tables) is excluded, so one texture bound from
 	// different shaders shares an entry.

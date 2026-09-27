@@ -643,6 +643,14 @@ struct RenderExecutorTestAccess {
     executor.ResetBindings();
   }
 
+  // What ExecutePreparedDraw does right after BeginRendering (KYTY_DEPTH_FEEDBACK_KEEP).
+  static void NoteDepthFeedback(RenderExecutor &executor,
+                                const CommandBuffer &buffer) {
+    if (executor.m_depth_feedback.valid) {
+      executor.NoteDepthFeedback(buffer);
+    }
+  }
+
   static bool BoundImagesInOrder(const RenderExecutor &executor, ImageId first,
                                  ImageId second) {
     return executor.m_bound_images.size() == 2 &&
@@ -10697,6 +10705,177 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "depth-tiled color allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // KYTY_DEPTH_FEEDBACK_KEEP: draws of one rendering instance that sample their read-only depth
+  // attachment continue the instance (no access toggle barrier); a depth write, a load clear or
+  // the end of the instance restores the ordering.
+  void CheckDepthFeedbackKeep() {
+    constexpr const char *name = "DepthFeedbackKeep";
+    constexpr uintptr_t base = 0x0000000205800000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+    Require(name, "switch", DepthFeedbackKeepEnabled(),
+            "KYTY_DEPTH_FEEDBACK_KEEP is disabled in the test environment");
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    context.InitializeGpu(nullptr);
+    scheduler.Begin(registers, user_config, shaders);
+    auto &texture_cache = context.GetTextureCache();
+    auto &executor = context.GetRenderExecutor();
+    context.MapMemory(base, allocation_size);
+    std::vector<PipelineCache::Pipeline> descriptor_pipelines;
+
+    ShaderRecompiler::IR::Program sampled_program{};
+    sampled_program.stage = ShaderType::Pixel;
+    sampled_program.resource_tracking_complete = true;
+    ShaderRecompiler::IR::ImageResource sampled_resource{};
+    sampled_resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+    sampled_resource.numeric_class = Prospero::TextureNumericClass::Float;
+    sampled_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    sampled_resource.read = true;
+    sampled_program.info.images.push_back(sampled_resource);
+    sampled_program.shader_info_complete = true;
+    ShaderRecompiler::IR::AllocateBindings(sampled_program);
+    ShaderRecompiler::IR::ResourceSnapshot sampled_snapshot{};
+    ShaderRecompiler::IR::DescriptorValue sampled_descriptor{};
+    sampled_descriptor.dword_count = 8;
+    sampled_snapshot.images.push_back(sampled_descriptor);
+    ShaderRecompiler::IR::CompiledShaderInfo sampled_info{};
+    sampled_info.stage = sampled_program.stage;
+    sampled_info.info = std::move(sampled_program.info);
+    sampled_info.bindings = std::move(sampled_program.bindings);
+    ShaderStageRuntime sampled_runtime{&sampled_info, &sampled_snapshot};
+
+    ImageDesc depth_desc{};
+    depth_desc.type = BindingType::DepthTarget;
+    depth_desc.info.data = {base + 0x10000, 4 * 4 * sizeof(float)};
+    depth_desc.info.pixel_format = vk::Format::eD32Sfloat;
+    depth_desc.info.guest_format = Prospero::BufferFormat::k32Float;
+    depth_desc.info.type = Prospero::ImageType::kColor2D;
+    depth_desc.info.extent = {4, 4, 1};
+    depth_desc.info.resources = {1, 1};
+    depth_desc.info.pitch = 4;
+    depth_desc.info.bytes_per_block = 4;
+    depth_desc.info.samples = 1;
+    depth_desc.info.tile_mode = Prospero::TileMode::kLinear;
+    depth_desc.info.mip_layout[0] = {0, 64, 4, 4};
+    depth_desc.view_info.format = vk::Format::eD32Sfloat;
+    depth_desc.view_info.type = vk::ImageViewType::e2D;
+    depth_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+    depth_desc.view_info.level_count = 1;
+    depth_desc.view_info.layer_count = 1;
+    depth_desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    const auto depth_id = texture_cache.FindImage(depth_desc);
+    auto sampled_desc = depth_desc;
+    sampled_desc.type = BindingType::Texture;
+    sampled_desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+    const auto sampled_view = texture_cache.FindTexture(depth_id, sampled_desc);
+    Require(name, "sampled view", sampled_view != nullptr, "no sampled depth view");
+
+    // One draw: attach the depth target (writes or not), sample it, begin its instance.
+    const auto draw = [&](bool depth_write, bool sample) {
+      RenderDepthInfo depth{};
+      depth.desc = depth_desc;
+      depth.image_id = depth_id;
+      depth.depth_test_enable = true;
+      depth.depth_write_enable = depth_write;
+      depth.depth_compare_op = vk::CompareOp::eLessOrEqual;
+      PreparedBindings binding{};
+      binding.runtime = &sampled_runtime;
+      if (sample) {
+        binding.images.push_back({depth_id, sampled_view, sampled_desc});
+      }
+      RenderExecutorTestAccess::BindRenderTarget(executor, depth_id);
+      std::array<PreparedBindings *, 1> stages{&binding};
+      RenderColorInfo no_color{};
+      const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &no_color, 0, depth,
+          sample ? std::span<PreparedBindings *const>(stages)
+                 : std::span<PreparedBindings *const>{});
+      if (sample) {
+        descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+            executor, scheduler.Current(), binding));
+      }
+      scheduler.BeginRendering(rendering);
+      RenderExecutorTestAccess::NoteDepthFeedback(executor, scheduler.Current());
+      RenderExecutorTestAccess::ResetBindings(executor);
+      return scheduler.Current().ActiveRenderingSerial();
+    };
+    const auto &image = texture_cache.GetImage(depth_id);
+    const auto sampled_access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                                vk::AccessFlagBits2::eShaderRead;
+
+    const auto first = draw(false, true);
+    const auto second = draw(false, true);
+    const auto third = draw(false, false);
+    const auto fourth = draw(false, true);
+    Require(name, "read-only sampling continues the instance",
+            first != 0 && second == first && third == first && fourth == first &&
+                image.backing.state.access_mask == sampled_access &&
+                scheduler.Current().PendingImageBarriers() == 0,
+            "sampling draws of an unwritten depth attachment split the instance");
+
+    const auto writing = draw(true, false);
+    const auto after_write = draw(false, true);
+    const auto after_write_again = draw(false, true);
+    Require(name, "a depth write orders later sampling",
+            writing != first && after_write != writing &&
+                after_write_again == after_write,
+            "sampling after a depth write shared the writing instance, or read-only "
+            "sampling after it split again");
+
+    // The keep is taken inside the active instance; ending that instance before the next one
+    // begins must queue the left-out ordering for the image.
+    {
+      RenderDepthInfo depth{};
+      depth.desc = depth_desc;
+      depth.image_id = depth_id;
+      depth.depth_test_enable = true;
+      depth.depth_compare_op = vk::CompareOp::eLessOrEqual;
+      PreparedBindings binding{};
+      binding.runtime = &sampled_runtime;
+      binding.images.push_back({depth_id, sampled_view, sampled_desc});
+      RenderExecutorTestAccess::BindRenderTarget(executor, depth_id);
+      std::array<PreparedBindings *, 1> stages{&binding};
+      RenderColorInfo no_color{};
+      (void)RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &no_color, 0, depth, stages);
+      descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+          executor, scheduler.Current(), binding));
+      const size_t pending_before = scheduler.Current().PendingImageBarriers();
+      scheduler.Current().EndRendering();
+      Require(name, "ended instance queues the ordering",
+              pending_before == 0 && scheduler.Current().PendingImageBarriers() == 1,
+              "ending the instance after a kept depth access queued no barrier");
+      scheduler.Current().FlushBarriers();
+      RenderExecutorTestAccess::ResetBindings(executor);
+    }
+    scheduler.Finish();
+    RenderExecutorTestAccess::DestroyDescriptorPipelines(executor, descriptor_pipelines);
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -35687,6 +35866,13 @@ int main(int argc, char **argv) {
     vulkan.CheckTilerImageDirect();
     return 0;
   }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-keep-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDepthFeedbackKeep();
+    return 0;
+  }
+#endif
   if (argc == 2 && std::strcmp(argv[1], "--tiler-image-bench") == 0) {
     VulkanHarness vulkan;
     vulkan.BenchTilerImageDirect();
@@ -36078,6 +36264,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
+  vulkan.CheckDepthFeedbackKeep();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckBgra16Readback();
   vulkan.CheckRasterization(false);
