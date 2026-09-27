@@ -1208,6 +1208,10 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	submit.signalSemaphoreCount = 1;
 	submit.pSignalSemaphores    = &side.semaphore;
 	vk::Result submit_result;
+	// KYTY_CP_RECORDER: older ticks may still be in the recorder's ring. Hand them to the queue or
+	// the broker first (without queue_mutex, which the recorder may need): the producer before a
+	// side-queue wait on it, every older tick before a copy on the shared queue.
+	m_scheduler.WaitRecorded(side_queue ? producer : current - 1);
 	if (side_queue) {
 		// Every tick older than the current recording was handed to queue 0 or to the submission
 		// broker. Drain the broker only if the producer has not reached the driver yet, so this

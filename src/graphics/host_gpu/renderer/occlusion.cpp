@@ -147,13 +147,13 @@ void OcclusionCounter::Prepare(uint32_t control) {
 		return;
 	}
 	Initialize();
-	m_context.GetCommandScheduler().Current().Handle().resetQueryPool(m_pool, m_pending, 1);
+	m_context.GetCommandScheduler().Current().Sink().resetQueryPool(m_pool, m_pending, 1);
 	m_prepared = true;
 }
 
 void OcclusionCounter::Begin() {
 	if (!m_prepared) return;
-	m_context.GetCommandScheduler().Current().Handle().beginQuery(m_pool, m_pending, vk::QueryControlFlagBits::ePrecise);
+	m_context.GetCommandScheduler().Current().Sink().beginQuery(m_pool, m_pending, vk::QueryControlFlagBits::ePrecise);
 	m_active = true;
 	m_prepared = false;
 	++m_scopes_since_dump;
@@ -162,7 +162,7 @@ void OcclusionCounter::Begin() {
 
 void OcclusionCounter::End() {
 	if (!m_active) return;
-	m_context.GetCommandScheduler().Current().Handle().endQuery(m_pool, m_pending);
+	m_context.GetCommandScheduler().Current().Sink().endQuery(m_pool, m_pending);
 	m_active = false;
 	++m_pending;
 }

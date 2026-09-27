@@ -15,7 +15,10 @@ struct GraphicContext;
 
 class MasterSemaphore {
 public:
-	explicit MasterSemaphore(GraphicContext& graphics);
+	// track_dispatch: host submissions of this timeline happen on another thread than the one
+	// allocating its ticks even without the submission broker (the CP recorder, commandRecorder.h);
+	// a tick then counts as known complete only after its vkQueueSubmit returned.
+	explicit MasterSemaphore(GraphicContext& graphics, bool track_dispatch = false);
 	~MasterSemaphore();
 	KYTY_CLASS_NO_COPY(MasterSemaphore);
 

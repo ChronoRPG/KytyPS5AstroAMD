@@ -81,8 +81,9 @@ public:
 	// False when the queue family has no timestamp support; every call is then a no-op.
 	[[nodiscard]] bool Valid() const noexcept { return m_pool != nullptr; }
 
-	// Directly after vkBeginCommandBuffer, outside any rendering scope.
-	void BeginCommand(vk::CommandBuffer buffer);
+	// Directly after vkBeginCommandBuffer, outside any rendering scope. record_ns: when the
+	// producer started recording this buffer (0: now; the CP recorder passes the CP's time).
+	void BeginCommand(vk::CommandBuffer buffer, uint64_t record_ns = 0);
 	// After the final EndRendering and before vkEndCommandBuffer.
 	void EndCommand(vk::CommandBuffer buffer);
 	// Once the submitted tick is allocated; submit_ns is the Submit call time. Returns the

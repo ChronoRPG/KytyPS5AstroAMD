@@ -1745,6 +1745,11 @@ void LeaveSite(Site* previous, bool scope_owner) noexcept {
 	}
 }
 
+void CurrentSites(const void** site, const void** scope) noexcept {
+	*site  = t_site;
+	*scope = t_scope;
+}
+
 void CountBarrierBatch(BarrierBatchEvent event, uint64_t amount) noexcept {
 	const auto index = static_cast<size_t>(event);
 	if (index < g_counters.batch.size() && amount != 0) {

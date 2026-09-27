@@ -641,6 +641,18 @@ add_executable(binding_path_tests EXCLUDE_FROM_ALL
 target_link_libraries(binding_path_tests common fmt::fmt xxhash Vulkan::Headers)
 target_include_directories(binding_path_tests PRIVATE ${inc_headers})
 
+# CP recorder command stream (renderer/commandStream.h): ring, encoder, replay and verify mode,
+# without a Vulkan device (KYTY_CP_RECORDER).
+add_executable(cp_recorder_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CpRecorderTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandStream.cpp"
+)
+target_link_libraries(cp_recorder_tests common fmt::fmt Vulkan::Headers)
+target_include_directories(cp_recorder_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(cp_recorder_tests Threads::Threads)
+endif()
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -697,6 +709,7 @@ if(BUILD_TESTING)
 	add_test(NAME draw_prep COMMAND $<TARGET_FILE:draw_prep_tests>)
 	add_test(NAME repeat_trace COMMAND $<TARGET_FILE:repeat_trace_tests>)
 	add_test(NAME binding_path COMMAND $<TARGET_FILE:binding_path_tests>)
+	add_test(NAME cp_recorder COMMAND $<TARGET_FILE:cp_recorder_tests>)
 	add_test(NAME image_exact_lookup
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-exact-lookup-only)
 	add_test(NAME image_pressure_retirement
@@ -970,6 +983,60 @@ if(BUILD_TESTING)
 	add_test(NAME srt_variant_reads
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srt-variant-only)
 
+	# KYTY_CP_RECORDER (renderer/commandRecorder.h): the recorder's own GPU checks (recorder
+	# thread, 1 MiB ring, verify log mode), and the renderer and compute suites with the recorder
+	# thread or the inline replay under verify=exit (per-packet argument hashes, command-buffer
+	# digests, ownership hooks), with synchronous submission (the tests' default) and through
+	# the submission broker (KYTY_SUBMISSION_MODE=queued, as the game runs).
+	set(cp_recorder_env KYTY_CP_RECORDER=1 KYTY_CP_RECORDER_VERIFY=exit)
+	set(cp_recorder_inline_env KYTY_CP_RECORDER=inline KYTY_CP_RECORDER_VERIFY=exit)
+	add_test(NAME cp_recorder_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cp-recorder-only)
+	add_test(NAME cp_recorder_gpu_queued
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cp-recorder-only)
+	set_tests_properties(cp_recorder_gpu_queued PROPERTIES
+		ENVIRONMENT "KYTY_SUBMISSION_MODE=queued")
+	add_test(NAME cp_recorder_gpu_inline
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cp-recorder-only)
+	set_tests_properties(cp_recorder_gpu_inline PROPERTIES
+		ENVIRONMENT "KYTY_CP_RECORDER=inline")
+	add_test(NAME shader_recompiler_compute_cp_recorder
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(shader_recompiler_compute_cp_recorder PROPERTIES
+		ENVIRONMENT "${cp_recorder_env}")
+	add_test(NAME shader_recompiler_compute_cp_recorder_queued
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(shader_recompiler_compute_cp_recorder_queued PROPERTIES
+		ENVIRONMENT "${cp_recorder_env};KYTY_SUBMISSION_MODE=queued")
+	add_test(NAME shader_recompiler_compute_cp_recorder_inline
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(shader_recompiler_compute_cp_recorder_inline PROPERTIES
+		ENVIRONMENT "${cp_recorder_inline_env}")
+	# Thread (queued submission) and inline variants of a focused mode; extra arguments are extra
+	# environment entries.
+	function(add_cp_recorder_variants test_name mode_arg)
+		set(thread_env KYTY_CP_RECORDER=1 KYTY_CP_RECORDER_VERIFY=exit KYTY_SUBMISSION_MODE=queued
+			${ARGN})
+		set(inline_env KYTY_CP_RECORDER=inline KYTY_CP_RECORDER_VERIFY=exit ${ARGN})
+		add_test(NAME ${test_name}_cp_recorder
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> ${mode_arg})
+		set_tests_properties(${test_name}_cp_recorder PROPERTIES ENVIRONMENT "${thread_env}")
+		add_test(NAME ${test_name}_cp_recorder_inline
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> ${mode_arg})
+		set_tests_properties(${test_name}_cp_recorder_inline PROPERTIES ENVIRONMENT "${inline_env}")
+	endfunction()
+	add_cp_recorder_variants(draw_prep_engine --draw-prep-engine-only
+		KYTY_DRAW_PREP=parallel KYTY_DRAW_PREP_VERIFY=exit)
+	add_cp_recorder_variants(graphics_pipeline_rasterization --polygon-mode-only)
+	add_cp_recorder_variants(command_scheduler_timeline --scheduler-only)
+	add_cp_recorder_variants(gpu_command_lane --gpu-command-lane-only)
+	add_cp_recorder_variants(pm4_context_state --context-state-only)
+	add_cp_recorder_variants(stream_buffer_ring --stream-buffer-only)
+	add_cp_recorder_variants(texture_cache_layered_image --layered-image-only)
+	add_cp_recorder_variants(compute_meta_clear_classification --compute-meta-clear-only)
+	add_cp_recorder_variants(buffer_cache_dirty_gc --buffer-cache-gc-only)
+	add_cp_recorder_variants(buffer_cache_eager_readback --readback-eager-only)
+
 	if(WIN32)
 		# These tests still depend on the Windows multisample-depth path.
 		add_test(NAME texture_cache_image_overlap
@@ -978,6 +1045,9 @@ if(BUILD_TESTING)
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
 		add_test(NAME buffer_cache_ranges
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
+		add_cp_recorder_variants(texture_cache_image_overlap --image-overlap-only)
+		add_cp_recorder_variants(texture_cache_htile_clear --htile-clear-only)
+		add_cp_recorder_variants(buffer_cache_ranges --buffer-cache-range-only)
 	endif()
 
 	# A failed check fails its test from its message too, not only from the exit status (which
@@ -1007,6 +1077,7 @@ if(BUILD_TESTING)
 		resource_materialization_tests
 		resource_tracking_tests
 		binding_path_tests
+		cp_recorder_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests

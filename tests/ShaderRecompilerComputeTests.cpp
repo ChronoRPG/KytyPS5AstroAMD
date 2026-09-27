@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
@@ -2549,6 +2550,352 @@ public:
     RenderExecutorTestAccess::DestroyDescriptorPipelines(
         context.GetRenderExecutor(), std::span {&pipeline, 1u});
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // KYTY_CP_RECORDER (commandRecorder.h, CP-RECORDER-P2.md):
+  //  1. encoded commands and commands recorded natively in a direct window (after a drain) reach
+  //     the GPU in program order;
+  //  2. the CP waiting on a tick that is still only in the recorder's ring (the recorder held) is
+  //     released once the recorder hands it to the queue (MasterSemaphore::Wait, WaitRecorded);
+  //  3. a drain wakes a parked recorder that holds packets published without a wake;
+  //  4. a full ring blocks the CP until the recorder frees space, and nothing is lost;
+  //  5. verify mode: native recording through a handle kept past an emission safe point is
+  //     reported as an ownership fault.
+  void CheckCpRecorder() {
+    constexpr const char *name = "CpRecorder";
+    EnsureRuntimeContext();
+    CommandScheduler scheduler(Renderer(), m_runtime_context, CommandScheduler::Role::Guest);
+    auto *recorder = scheduler.Recorder();
+    Require(name, "recorder", recorder != nullptr,
+            "KYTY_CP_RECORDER did not give the guest scheduler a recorder");
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    const bool threaded = recorder->GetMode() == CommandRecorder::Mode::Thread;
+
+    constexpr u32 dwords = 64;
+    auto buffer = CreateHostBuffer(
+        name, dwords * sizeof(u32),
+        vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc,
+        std::vector<u32>(dwords, 0));
+    const auto barrier = [](const CommandSink &sink, vk::AccessFlags dst_access,
+                            vk::PipelineStageFlags dst_stage) {
+      vk::MemoryBarrier memory{};
+      memory.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      memory.dstAccessMask = dst_access;
+      sink.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, dst_stage, {}, 1, &memory, 0,
+                           nullptr, 0, nullptr);
+    };
+    const auto expect_all = [&](const char *stage, u32 value) {
+      const auto values = ReadBuffer(name, buffer, dwords);
+      bool ok = true;
+      for (const auto v : values) {
+        ok &= v == value;
+      }
+      Require(name, stage, ok, "the buffer does not hold " + Hex(value) + " everywhere");
+    };
+
+    // 1. Program order across a direct window.
+    {
+      auto &command = scheduler.Current();
+      command.Sink().fillBuffer(buffer.buffer, 0, dwords * sizeof(u32), 0x11111111u);
+      barrier(command.Sink(), vk::AccessFlagBits::eTransferWrite,
+              vk::PipelineStageFlagBits::eTransfer);
+      const auto drains = recorder->Drains();
+      {
+        const auto native = command.Handle();
+        native.fillBuffer(buffer.buffer, 0, 16, 0x22222222u);
+        vk::MemoryBarrier memory{};
+        memory.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        memory.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+        native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                               vk::PipelineStageFlagBits::eTransfer, {}, 1, &memory, 0, nullptr,
+                               0, nullptr);
+      }
+      Require(name, "drain", recorder->Drains() == drains + 1,
+              "Handle() did not drain the recorder before the direct window");
+      command.BeginEmission();
+      command.Sink().fillBuffer(buffer.buffer, 8, 16, 0x33333333u);
+      barrier(command.Sink(), vk::AccessFlagBits::eHostRead, vk::PipelineStageFlagBits::eHost);
+      scheduler.FlushAndWait();
+      const auto values = ReadBuffer(name, buffer, dwords);
+      bool ok = true;
+      for (u32 i = 0; i < dwords; i++) {
+        const u32 want = i < 2 ? 0x22222222u : i < 6 ? 0x33333333u : 0x11111111u;
+        ok &= values[i] == want;
+      }
+      Require(name, "program order", ok,
+              "encoded and direct-window commands did not execute in program order");
+    }
+
+    // 2. Waiting on a tick that is still only in the ring.
+    if (threaded) {
+      auto &command = scheduler.Current();
+      recorder->SetTestStall(true);
+      command.Sink().fillBuffer(buffer.buffer, 0, dwords * sizeof(u32), 0x44444444u);
+      barrier(command.Sink(), vk::AccessFlagBits::eHostRead, vk::PipelineStageFlagBits::eHost);
+      const auto tick = scheduler.Submit({}, true);
+      Require(name, "tick in the ring",
+              recorder->RecordedTick() < tick && !scheduler.IsFree(tick),
+              "the held recorder already handed the tick over");
+      std::atomic<bool> released{false};
+      std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        released = true;
+        recorder->SetTestStall(false);
+      });
+      std::thread other_thread_wait([&] { scheduler.WaitRecorded(tick, false); });
+      scheduler.GetMasterSemaphore().Wait(tick);
+      other_thread_wait.join();
+      releaser.join();
+      Require(name, "wait on a ringed tick",
+              released.load() && recorder->RecordedTick() >= tick && scheduler.IsFree(tick),
+              "the wait returned before the recorder submitted the tick");
+      expect_all("ringed tick contents", 0x44444444u);
+      scheduler.Begin(registers, user_config, shaders);
+    }
+
+    // 3. A drain wakes a parked recorder holding packets published without a wake.
+    if (threaded) {
+      auto &command = scheduler.Current();
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      command.Sink().fillBuffer(buffer.buffer, 0, dwords * sizeof(u32), 0x55555555u);
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      const auto start = std::chrono::steady_clock::now();
+      { (void)command.Handle(); }
+      const auto elapsed = std::chrono::steady_clock::now() - start;
+      Require(name, "drain of a parked recorder",
+              elapsed < std::chrono::seconds(2),
+              "the drain did not wake the parked recorder");
+      command.BeginEmission();
+      barrier(command.Sink(), vk::AccessFlagBits::eHostRead, vk::PipelineStageFlagBits::eHost);
+      scheduler.FlushAndWait();
+      expect_all("parked recorder contents", 0x55555555u);
+    }
+
+    // 4. A full ring (KYTY_CP_RECORDER_RING_MB=1 in this mode) blocks the CP, loses nothing.
+    if (threaded) {
+      auto &command = scheduler.Current();
+      const auto waits = recorder->ProducerStats().spins;
+      recorder->SetTestStall(true);
+      std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        recorder->SetTestStall(false);
+      });
+      // Equal values: fills of one range without barriers between them are unordered.
+      constexpr u32 fills = 60000;
+      for (u32 i = 0; i < fills; i++) {
+        command.Sink().fillBuffer(buffer.buffer, (i % dwords) * sizeof(u32), sizeof(u32),
+                                  0x66666666u);
+      }
+      releaser.join();
+      barrier(command.Sink(), vk::AccessFlagBits::eHostRead, vk::PipelineStageFlagBits::eHost);
+      scheduler.FlushAndWait();
+      Require(name, "ring full",
+              recorder->ProducerStats().spins > waits,
+              "60000 packets into a held 1 MiB ring never waited for space");
+      expect_all("ring-full contents", 0x66666666u);
+    }
+
+    // 5. Verify: a handle kept past a safe point is an ownership fault.
+    if (CommandRecorder::VerifyEnabled() && !CommandRecorder::VerifyExits()) {
+      auto &command = scheduler.Current();
+      const auto faults = CommandRecorder::OwnershipFaults();
+      const auto native = command.Handle();
+      command.BeginEmission();
+      // The recorder is idle (nothing encoded since the drain), so this is harmless here.
+      native.fillBuffer(buffer.buffer, 0, sizeof(u32), 0x77777777u);
+      Require(name, "ownership fault", CommandRecorder::OwnershipFaults() == faults + 1,
+              "native recording after the window closed was not reported");
+      scheduler.FlushAndWait();
+    }
+
+    Require(name, "verify", recorder->VerifyMismatches() == 0,
+            "the recorder reported verify mismatches");
+    scheduler.Finish();
+    DestroyBuffer(&buffer);
+    std::printf("[host]    %-32s ok (%s, %" PRIu64 " drains)\n", name,
+                threaded ? "thread" : "inline", recorder->Drains());
+  }
+
+  // CP time of a draw-heavy command stream through the command processor (PM4 -> draw prep ->
+  // RenderExecutor -> emission), for KYTY_CP_RECORDER=0 / inline / 1 A/B runs. Each draw
+  // switches the pixel shader (a pipeline bind per draw). Prints CP ns per draw (the thread
+  // running CommandProcessor::Process) and, with the recorder thread, its own busy ns per draw.
+  void RunCpRecorderBench() {
+    constexpr const char *name = "CpRecorderBench";
+    constexpr uintptr_t base = 0x0000000206600000ull;
+    constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t vertex_offset = 0x1000;
+    constexpr std::array<uint64_t, 2> pixel_offsets{0x2000, 0x3000};
+    constexpr uint64_t user_data_offset = 0x4000;
+    constexpr std::array<uint64_t, 2> pairs_offsets{0x5000, 0x5100};
+    constexpr uint64_t target_offset = 0x20000;
+    constexpr uint32_t extent = 32;
+    const auto *draws_env = std::getenv("KYTY_CP_RECORDER_BENCH_DRAWS");
+    const uint32_t draws = draws_env != nullptr ? static_cast<uint32_t>(std::strtoul(draws_env, nullptr, 10)) : 20000u;
+
+    std::vector<u32> vertex_code;
+    AppendVMovLiteral(&vertex_code, 1, 0xbf800000u);
+    AppendVMovLiteral(&vertex_code, 2, 0x40400000u);
+    vertex_code.push_back(EncodeVopc(0xc2, InlineU32(1), 5));
+    vertex_code.push_back(EncodeVop2(0x01, 3, Vgpr(1), 2));
+    vertex_code.push_back(EncodeVopc(0xc2, InlineU32(2), 5));
+    vertex_code.push_back(EncodeVop2(0x01, 4, Vgpr(1), 2));
+    AppendVMovU32(&vertex_code, 0, 0);
+    AppendVMovLiteral(&vertex_code, 6, 0x3f800000u);
+    vertex_code.push_back(EncodeExp0(0x0c, 0xf));
+    vertex_code.push_back(EncodeExp1(3, 4, 0, 6));
+    for (u32 parameter = 0; parameter < 8; parameter++) {
+      vertex_code.push_back(EncodeExp0(0x20 + parameter, 0xf));
+      vertex_code.push_back(EncodeExp1(0, 0, 0, 0));
+    }
+    AppendEnd(&vertex_code);
+    std::array<std::vector<u32>, 2> pixel_codes;
+    for (size_t i = 0; i < pixel_codes.size(); i++) {
+      for (u32 component = 0; component < 4; component++) {
+        AppendVMovU32(&pixel_codes[i], component, i == 0 ? 0x3c000000u : 0x3c800000u);
+      }
+      pixel_codes[i].push_back(EncodeExp0(0x00, 0xf));
+      pixel_codes[i].push_back(EncodeExp1(0, 1, 2, 3));
+      AppendEnd(&pixel_codes[i]);
+    }
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "bench allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "bench mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    std::memset(memory, 0, allocation_size);
+    const auto vertex_address = base + vertex_offset;
+    const std::array<uint64_t, 2> pixel_addresses{base + pixel_offsets[0],
+                                                  base + pixel_offsets[1]};
+    auto *user_data = reinterpret_cast<ShaderUserData *>(memory + user_data_offset);
+    std::memcpy(memory + vertex_offset, vertex_code.data(), vertex_code.size() * sizeof(u32));
+    ShaderMapUserData(vertex_address,
+                      {.type = Prospero::ShaderBinaryType::kGs,
+                       .user_data = user_data,
+                       .code_size_bytes = static_cast<uint32_t>(vertex_code.size() * sizeof(u32))});
+    std::array<std::array<u32, 5>, 2> load_pixel_shader{};
+    for (size_t i = 0; i < pixel_codes.size(); i++) {
+      std::memcpy(memory + pixel_offsets[i], pixel_codes[i].data(),
+                  pixel_codes[i].size() * sizeof(u32));
+      ShaderMapUserData(pixel_addresses[i],
+                        {.type = Prospero::ShaderBinaryType::kPs,
+                         .user_data = user_data,
+                         .code_size_bytes =
+                             static_cast<uint32_t>(pixel_codes[i].size() * sizeof(u32))});
+      const std::array<u32, 4> pairs{
+          Pm4::SPI_SHADER_PGM_LO_PS, static_cast<u32>(pixel_addresses[i] >> 8u),
+          Pm4::SPI_SHADER_PGM_HI_PS, static_cast<u32>(pixel_addresses[i] >> 40u)};
+      std::memcpy(memory + pairs_offsets[i], pairs.data(), sizeof(pairs));
+      const auto pairs_address = base + pairs_offsets[i];
+      load_pixel_shader[i] = {KYTY_PM4(5, Pm4::IT_SET_SH_REG_INDIRECT, Pm4::R_ZERO),
+                              static_cast<u32>(pairs_address),
+                              static_cast<u32>(pairs_address >> 32u), 0x80000000u,
+                              static_cast<u32>(pairs.size() / 2u)};
+    }
+    const std::array<u32, 3> draw{0xc0012d00u, 3u, 0x2u};
+
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      GraphicsInitJmpTables();
+      CommandProcessor processor(context, 0);
+      processor.Reset();
+      processor.BufferInit();
+      context.MapMemory(base, allocation_size);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &registers = processor.GetCtx();
+      auto &shaders = processor.GetShCtx();
+      registers.SetViewportTransformControl(0x300);
+      registers.SetViewportScaleOffset(0, extent / 2, extent / 2, extent / 2, extent / 2, 1, 0);
+      registers.SetViewportZMax(0, 1);
+      registers.SetScreenScissor(0, 0, extent, extent);
+      registers.SetWindowScissor(0, 0, extent, extent, false);
+      registers.SetGenericScissor(0, 0, extent, extent, false);
+      registers.SetViewportScissor(0, 0, 0, extent, extent, false);
+      registers.SetRenderTargetMask(0xf);
+      registers.SetShaderMask(0xf);
+      registers.SetPsInControl(0x8000);
+      registers.SetColorBase(0, {.addr = base + target_offset});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32_32_32_32,
+                                 .channel_type = Prospero::ChannelType::kFloat,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = extent - 1, .width = extent - 1});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+      registers.SetTargetOutputMode(0, 4);
+      auto blend = registers.GetBlendControl(0);
+      blend.enable = true;
+      blend.color_srcblend = blend.color_destblend = blend.alpha_srcblend =
+          blend.alpha_destblend = static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+      registers.SetBlendControl(0, blend);
+      auto target_info = registers.GetRenderTarget(0).info;
+      target_info.blend_bypass = false;
+      registers.SetColorInfo(0, target_info);
+      processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      shaders.SetEsShaderBase(vertex_address);
+      shaders.SetPsShaderBase(pixel_addresses[0]);
+
+      std::vector<u32> stream;
+      stream.reserve(size_t{draws} * 8u);
+      for (uint32_t i = 0; i < draws; i++) {
+        const auto &load = load_pixel_shader[i & 1u];
+        stream.insert(stream.end(), load.begin(), load.end());
+        stream.insert(stream.end(), draw.begin(), draw.end());
+      }
+      // Warm-up: programs, pipelines and the target exist before the timed rounds.
+      {
+        Pm4Execution execution;
+        std::vector<u32> warm(stream.begin(), stream.begin() + 16 * 8);
+        Require(name, "warm-up", processor.Process(execution, warm) == Pm4ProcessResult::Complete,
+                "the warm-up stream did not complete");
+        scheduler.Finish();
+      }
+      auto *recorder = scheduler.Recorder();
+      double best_cp = 1e30;
+      double best_busy = 0;
+      for (int round = 0; round < 5; round++) {
+        const auto busy_before = recorder != nullptr ? recorder->BusyNs() : 0;
+        const auto start = std::chrono::steady_clock::now();
+        Pm4Execution execution;
+        Require(name, "stream", processor.Process(execution, stream) == Pm4ProcessResult::Complete,
+                "the bench stream did not complete");
+        processor.BufferFlush();
+        const auto cp_ns =
+            std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start)
+                .count();
+        scheduler.Finish();
+        const auto busy = recorder != nullptr ? static_cast<double>(recorder->BusyNs() - busy_before) : 0.0;
+        if (cp_ns < best_cp) {
+          best_cp = cp_ns;
+          best_busy = busy;
+        }
+      }
+      const char *mode = recorder == nullptr ? "off"
+                         : recorder->GetMode() == CommandRecorder::Mode::Thread ? "thread"
+                                                                                  : "inline";
+      std::printf("[bench]   %-32s mode %-6s %u draws: CP %.0f ns/draw, recorder thread %.0f ns/draw, "
+                  "drains %" PRIu64 "\n",
+                  name, mode, draws, best_cp / draws, best_busy / draws,
+                  recorder != nullptr ? recorder->Drains() : 0);
+      RenderExecutorTestAccess::ResetBindings(context.GetRenderExecutor());
+      context.UnmapMemory(base, allocation_size);
+    });
   }
 
   void CheckSchedulerTimeline() {
@@ -22492,6 +22839,9 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
+    // KYTY_SUBMISSION_MODE=queued starts the submission broker as the emulator's window does;
+    // unset, submissions stay synchronous (the default for these tests).
+    m_runtime_context.submission_queue.Initialize(m_runtime_context);
     if (m_transfer_queue != nullptr && UploadDmaRequested()) {
       m_runtime_context.transfer_queue_family = m_transfer_family;
       m_runtime_context.transfer_queue = m_transfer_queue;
@@ -22853,6 +23203,8 @@ private:
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
+    // KYTY_CP_RECORDER_VERIFY: ownership hooks, as the emulator installs them after its device.
+    CommandRecorder::InstallVerifyHooks();
     m_device.getQueue(m_queue_family, 0, &m_queue);
     if (m_transfer_family != UINT32_MAX) {
       m_device.getQueue(m_transfer_family, 0, &m_transfer_queue);
@@ -22888,6 +23240,8 @@ private:
       DestroyBuffer(&m_bda_pagetable_buffer);
       if (m_runtime_context.allocator != nullptr) {
         m_renderer.reset();
+        // Every scheduler has stopped: submit what the broker still holds, join its worker.
+        m_runtime_context.submission_queue.Shutdown();
         vmaDestroyAllocator(m_runtime_context.allocator);
         m_runtime_context.allocator = nullptr;
       }
@@ -41552,6 +41906,28 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cp-recorder-only") == 0) {
+    // The recorder thread with a 1 MiB ring (ring-full check) and verify in log mode (the
+    // ownership-fault check), unless the environment chose otherwise.
+    if (std::getenv("KYTY_CP_RECORDER") == nullptr) {
+      SetEnvironment("KYTY_CP_RECORDER", "1");
+    }
+    if (std::getenv("KYTY_CP_RECORDER_VERIFY") == nullptr) {
+      SetEnvironment("KYTY_CP_RECORDER_VERIFY", "1");
+    }
+    if (std::getenv("KYTY_CP_RECORDER_RING_MB") == nullptr) {
+      SetEnvironment("KYTY_CP_RECORDER_RING_MB", "1");
+    }
+    VulkanHarness vulkan;
+    vulkan.CheckCpRecorder();
+    vulkan.CheckSchedulerTimeline();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cp-recorder-bench") == 0) {
+    VulkanHarness vulkan;
+    vulkan.RunCpRecorderBench();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--host-image-allocation-only") == 0) {
