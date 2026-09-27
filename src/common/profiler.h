@@ -303,6 +303,10 @@ enum class FrameEvent : uint32_t {
 	TexelImageSyncSkips,
 	// Texel-read syncs of an image over stale GPU-dirty buffer bytes (KYTY_IMAGE_SUPERSEDES_GPU_DIRTY).
 	TexelImageSyncOverGpuDirty,
+	// Colour metadata draws (fast clear eliminate, FMASK/DCC decompress) consumed without drawing,
+	// and targets of them resolved to materialize a DCC clear (KYTY_CB_METADATA_MATERIALIZE).
+	MetadataColorOps,
+	MetadataColorOpMaterializations,
 	// Resident mip levels (KYTY_TEXTURE_RESIDENT_MIPS): images created holding only the levels
 	// their views can sample and the levels left out, guest bytes their refreshes did not
 	// upload, residency extensions (a finer MIN_LOD, or any non-sampling use), extensions to
@@ -315,6 +319,11 @@ enum class FrameEvent : uint32_t {
 	TextureResidencyFullFallbacks,
 	TextureResidencyUnmapFrees,
 	TextureResidencyViolations,
+	// Residency extensions whose newly registered bytes another registered image already covers,
+	// and those where that image is GPU-modified (the extended image's refresh then reads guest
+	// memory the other image's native contents supersede; expected 0).
+	TextureResidencyExtensionOverlaps,
+	TextureResidencyExtensionGpuOverlaps,
 	// Partially resident images retired after KYTY_TEXTURE_RESIDENT_IDLE_FRAMES unused frames.
 	TextureResidentIdleFrees,
 	// Headerless shader code hashed from a clean-backing copy (no fault possible) or in place

@@ -9855,6 +9855,47 @@ public:
                     std::vector<u32>(fill_case.texel.begin(), fill_case.texel.end()),
                 "completing the metadata overwrite did not restore its clear");
 
+        // A fast clear the target is not bound after, then a fast-clear-eliminate draw, then a
+        // read through a description without DCC metadata (a T# without META): the eliminate
+        // makes the clear visible (KYTY_CB_METADATA_MATERIALIZE=1); dropped, the reader keeps
+        // the previous contents.
+        if (!fill_case.reuse_unorm) {
+          paint();
+          RenderExecutorTestAccess::ResetBindings(executor);
+          fill_metadata(metadata_words);
+          auto color_control = registers.GetColorControl();
+          color_control.mode = 2; // CB_ELIMINATE_FAST_CLEAR
+          registers.SetColorControl(color_control);
+          RenderExecutorTestAccess::DrawAuto(
+              executor, scheduler.Current(),
+              {.vertex_count = 3, .instance_count = 1});
+          registers.SetColorControl({});
+          auto sampled = color.desc;
+          sampled.type = BindingType::Texture;
+          sampled.info.metadata = {};
+          sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+          const auto sampled_id = texture_cache.FindImage(sampled);
+          const char *materialize = std::getenv("KYTY_CB_METADATA_MATERIALIZE");
+          const bool enabled = materialize != nullptr && std::strcmp(materialize, "1") == 0;
+          const auto expected =
+              enabled ? std::vector<u32>(fill_case.texel.begin(), fill_case.texel.end())
+                      : painted;
+          Require(name, "fast clear eliminate",
+                  sampled_id == color.image_id &&
+                      ReadCachedTexel(name, context, sampled_id) == expected,
+                  enabled ? "a fast-clear-eliminate draw left a reader without DCC metadata "
+                            "with the contents from before the clear"
+                          : "a dropped fast-clear-eliminate draw changed the target");
+          // Either way a bind of the target with its metadata shows the clear and consumes
+          // the key (materialized here, or already by the eliminate).
+          bind();
+          Require(name, "bind after fast clear eliminate",
+                  ReadCachedTexel(name, context, color.image_id) ==
+                      std::vector<u32>(fill_case.texel.begin(), fill_case.texel.end()),
+                  "binding the target after the eliminate lost or repeated the clear");
+          RenderExecutorTestAccess::ResetBindings(executor);
+        }
+
         ImageDesc previous_depth{};
         previous_depth.type = BindingType::DepthTarget;
         previous_depth.info.data = {base + 0x180000, 0x10000};

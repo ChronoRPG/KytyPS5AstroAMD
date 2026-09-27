@@ -331,6 +331,7 @@ private:
 	enum class ResidencyMode : uint8_t { Off, On, Poison };
 	ResidencyMode                            m_residency            = ResidencyMode::On;
 	uint64_t                                 m_residency_violations = 0;
+	uint64_t                                 m_residency_overlap_logs = 0;
 	// Partially resident images (stale ids are dropped by the once-per-frame scan).
 	std::vector<ImageId>                     m_partial_images;
 	uint64_t                                 m_partial_scan_frame   = 0;
