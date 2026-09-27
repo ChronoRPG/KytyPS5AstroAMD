@@ -1,0 +1,124 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// Native indirect mesh draws (KYTY_NATIVE_INDIRECT_MESH, renderer/meshIndirect.h). Converts one
+// guest DrawIndexedIndirect (5 dwords) or DrawIndirect (4 dwords) record into the host mesh
+// dispatches the CPU path (DrawIndex/DrawAuto -> ExecutePreparedDraw) records from the same
+// bytes, and the six draw dwords each dispatch pushes. MeshIndirect::Convert is the C++ twin of
+// this shader; the two must stay identical (verify mode compares them).
+//
+// Slot layout (dwords from out_word): RECORDS dispatch commands {x, y, z}, RECORDS parameter
+// blocks of 8 dwords {count, vertex offset, first instance, index size, index address lo/hi,
+// 0, 0}, a status word, a copy of the 5 argument dwords as read, and the generation the host
+// recorded the dispatch with (its completion check ignores a slot rewritten since).
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer Args { uint words[]; } args;
+layout(set = 0, binding = 1, std430) writeonly buffer Out { uint words[]; } slot;
+layout(push_constant) uniform Push {
+	uint args_word;
+	uint out_word;
+	uint indexed;
+	uint index_base_lo;
+	uint index_base_hi;
+	uint index_size;
+	uint index_buffer_size;
+	uint primitive_size;
+	uint primitive_step;
+	uint primitives_per_group;
+	uint max_groups_x;
+	uint max_groups_y;
+	uint max_groups_total;
+	uint generation;
+} push_data;
+
+const uint RECORDS = 4u;
+const uint PARAMS_WORD = RECORDS * 3u;
+const uint STATUS_WORD = PARAMS_WORD + RECORDS * 8u;
+const uint ARGS_COPY_WORD = STATUS_WORD + 1u;
+const uint GENERATION_WORD = ARGS_COPY_WORD + 5u;
+// Status bits (MeshIndirect::Status).
+const uint STATUS_OVERFLOW = 1u;      // more dispatches needed than RECORDS: instances dropped
+const uint STATUS_LIMITS = 2u;        // the CPU path would stop the emulator (host limits)
+const uint STATUS_INDEX_RANGE = 4u;   // indices past INDEX_BASE + INDEX_BUFFER_SIZE are read
+
+void main() {
+	const uint a = push_data.args_word;
+	const uint o = push_data.out_word;
+	const bool indexed = push_data.indexed != 0u;
+	uint w[5];
+	w[0] = args.words[a];
+	w[1] = args.words[a + 1u];
+	w[2] = args.words[a + 2u];
+	w[3] = args.words[a + 3u];
+	w[4] = indexed ? args.words[a + 4u] : 0u;
+	for (uint i = 0u; i < 5u; ++i) {
+		slot.words[o + ARGS_COPY_WORD + i] = w[i];
+	}
+
+	uint status = 0u;
+	uint count = w[0];
+	const uint instances = w[1];
+	uint vertex_offset;
+	uint first_instance;
+	uint64_t address = 0ul;
+	if (indexed) {
+		// CommandProcessor::DrawIndirect: the count is clamped to INDEX_BUFFER_SIZE (the start
+		// index is not), then the address is INDEX_BASE + start * index size.
+		if (push_data.index_buffer_size != 0u) {
+			count = min(count, push_data.index_buffer_size);
+			if (uint64_t(w[2]) + uint64_t(count) > uint64_t(push_data.index_buffer_size)) {
+				status |= STATUS_INDEX_RANGE;
+			}
+		}
+		const uint64_t base =
+		    (uint64_t(push_data.index_base_hi) << 32u) | uint64_t(push_data.index_base_lo);
+		address = base + uint64_t(w[2]) * uint64_t(push_data.index_size);
+		vertex_offset = w[3];
+		first_instance = w[4];
+	} else {
+		vertex_offset = w[2];
+		first_instance = w[3];
+	}
+
+	// DrawIndex/DrawAuto draw nothing without indices or instances; ExecutePreparedDraw nothing
+	// without a primitive.
+	uint groups = 0u;
+	uint per_dispatch = 0u;
+	if (count != 0u && instances != 0u) {
+		const uint size = push_data.primitive_size;
+		const uint primitives = count < size ? 0u : (count - size) / push_data.primitive_step + 1u;
+		if (primitives != 0u) {
+			groups = (primitives - 1u) / push_data.primitives_per_group + 1u;
+			per_dispatch = groups > push_data.max_groups_x
+			                   ? 0u
+			                   : min(push_data.max_groups_y, push_data.max_groups_total / groups);
+			if (per_dispatch == 0u) {
+				status |= STATUS_LIMITS;
+				groups = 0u;
+			} else if ((instances - 1u) / per_dispatch >= RECORDS) {
+				status |= STATUS_OVERFLOW;
+			}
+		}
+	}
+
+	const uint index_size = indexed ? push_data.index_size : 0u;
+	for (uint k = 0u; k < RECORDS; ++k) {
+		// k * per_dispatch <= 3 * 65535: no overflow.
+		const uint first = k * per_dispatch;
+		const bool live = groups != 0u && first < instances;
+		const uint c = o + k * 3u;
+		slot.words[c] = live ? groups : 0u;
+		slot.words[c + 1u] = live ? min(per_dispatch, instances - first) : 0u;
+		slot.words[c + 2u] = live ? 1u : 0u;
+		const uint p = o + PARAMS_WORD + k * 8u;
+		slot.words[p] = count;
+		slot.words[p + 1u] = vertex_offset;
+		slot.words[p + 2u] = first_instance + first;
+		slot.words[p + 3u] = index_size;
+		slot.words[p + 4u] = uint(address);
+		slot.words[p + 5u] = uint(address >> 32u);
+		slot.words[p + 6u] = 0u;
+		slot.words[p + 7u] = 0u;
+	}
+	slot.words[o + STATUS_WORD] = status;
+	slot.words[o + GENERATION_WORD] = push_data.generation;
+}

@@ -377,6 +377,23 @@ foreach(shader_name IN LISTS gpu_dcc_shader_names)
 	list(APPEND kyty_emulator_src "${shader_header}")
 endforeach()
 
+# Native indirect mesh draws (renderer/meshIndirect.h): guest argument record -> mesh dispatches.
+set(gpu_mesh_generated_dir "${PROJECT_BINARY_DIR}/gpu_mesh_shaders")
+set(gpu_mesh_indirect_source "${gpu_tiler_shader_dir}/gpu_mesh_indirect.comp")
+set(gpu_mesh_indirect_spv "${gpu_mesh_generated_dir}/gpu_mesh_indirect.spv")
+set(gpu_mesh_indirect_header "${gpu_mesh_generated_dir}/gpu_mesh_indirect_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_mesh_indirect_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_mesh_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${gpu_mesh_indirect_spv}" "${gpu_mesh_indirect_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_mesh_indirect_spv} -DOUTPUT=${gpu_mesh_indirect_header}
+	        -DSYMBOL=GPU_MESH_INDIRECT_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_mesh_indirect_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gpu_mesh_indirect_header}")
+
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
@@ -819,6 +836,35 @@ if(BUILD_TESTING)
 	# Tracker-gap detectors: the page states they classify host writes by.
 	add_test(NAME tracker_gap_detectors
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tracker-gap-detectors-only)
+	# KYTY_NATIVE_INDIRECT_MESH: the GPU conversion against the CPU path (default mode, and the
+	# completion verify with exit), and the mesh shaders' parameter-block codegen.
+	add_test(NAME mesh_indirect
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mesh-indirect-only)
+	add_test(NAME mesh_indirect_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mesh-indirect-only)
+	set_tests_properties(mesh_indirect_verify PROPERTIES
+		ENVIRONMENT "KYTY_NATIVE_INDIRECT_MESH=exit")
+	add_test(NAME mesh_indirect_on
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mesh-indirect-only)
+	set_tests_properties(mesh_indirect_on PROPERTIES
+		ENVIRONMENT "KYTY_NATIVE_INDIRECT_MESH=1")
+	add_test(NAME mesh_indirect_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mesh-indirect-only)
+	set_tests_properties(mesh_indirect_off PROPERTIES
+		ENVIRONMENT "KYTY_NATIVE_INDIRECT_MESH=0")
+	add_test(NAME mesh_indirect_codegen
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --mesh-indirect-only)
+	# The set-associative sampler memo; KYTY_SET_REUSE_FRESH: default, off, verify.
+	add_test(NAME sampler_memo
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampler-memo-only)
+	add_test(NAME set_reuse_fresh
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --set-reuse-fresh-only)
+	add_test(NAME set_reuse_fresh_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --set-reuse-fresh-only)
+	set_tests_properties(set_reuse_fresh_off PROPERTIES ENVIRONMENT "KYTY_SET_REUSE_FRESH=0")
+	add_test(NAME set_reuse_fresh_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --set-reuse-fresh-only)
+	set_tests_properties(set_reuse_fresh_verify PROPERTIES ENVIRONMENT "KYTY_SET_REUSE_FRESH=verify")
 	# KYTY_TEXTURE_MEMO_REVALIDATE: default, verify mode, off.
 	add_test(NAME texture_memo_revalidate
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-memo-revalidate-only)

@@ -19,12 +19,14 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/meshIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -1077,6 +1079,10 @@ struct DrawEmitInfo {
 	// Non-null: counts and offsets are GPU data in these records, emitted with
 	// vkCmdDraw*Indirect*; the fields above are unused.
 	const DrawIndirectSource* indirect = nullptr;
+	// KYTY_NATIVE_INDIRECT_MESH: the indirect record feeds a mesh draw through a GPU conversion
+	// (meshIndirect.h) with these inputs.
+	bool                 mesh_indirect = false;
+	MeshIndirect::Inputs mesh_inputs;
 };
 
 struct DrawIndexBufferSource {
@@ -1968,6 +1974,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Reused per thread (draws run on the GPU thread under the render mutex).
 	static thread_local std::vector<MeshDrawSegment> mesh_segments;
 	mesh_segments.clear();
+	// KYTY_NATIVE_INDIRECT_MESH: the counts are GPU data, converted into the dispatches right
+	// before the draw (meshIndirect.h); nothing below may read them.
+	const bool mesh_indirect = mesh_active && emit.mesh_indirect;
+	EXIT_IF(emit.mesh_indirect && (!mesh_active || emit.indirect == nullptr));
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		static std::atomic_bool restart_warned = false;
@@ -1980,6 +1990,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
 			     static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed(), primitive_restart_enable);
 		}
+	}
+	if (mesh_active && !mesh_indirect) {
+		const auto& mesh = state.vertex_info[0].mesh;
 		const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
 		if (primitives == 0 || draw.instance_count == 0) {
 			return;
@@ -2021,20 +2034,24 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
-		// synchronizes registered BDA ranges before any draw commands are committed.
+		// synchronizes registered BDA ranges before any draw commands are committed. A native
+		// indirect draw registers the bound range [INDEX_BASE, +INDEX_BUFFER_SIZE) (its count and
+		// start index are GPU data).
 		(void)m_context.GetBufferCache().FindBuffer(
-		    index_source.address, static_cast<uint64_t>(draw.index_count) *
-		                              index_source.guest_element_size);
+		    index_source.address, mesh_indirect ? index_source.size
+		                                        : static_cast<uint64_t>(draw.index_count) *
+		                                              index_source.guest_element_size);
 	}
 	const auto* indirect = emit.indirect;
-	EXIT_IF(indirect != nullptr && mesh_active);
+	EXIT_IF(indirect != nullptr && mesh_active && !mesh_indirect);
 	if (indirect != nullptr) {
 		// ObtainBuffer can merge cache buffers, which must not retire buffers that the shader
 		// bindings below already resolved. Acquire the argument, count and whole index ranges
 		// first; acquiring them again after the bindings then finds the same or a merged,
-		// still covering, buffer and merges nothing.
+		// still covering, buffer and merges nothing. Mesh shaders read indices by address (the
+		// range registered above), not through an index buffer binding.
 		(void)ObtainIndirectBuffers(buffer, *indirect);
-		if (index_source.size != 0) {
+		if (index_source.size != 0 && !mesh_active) {
 			(void)m_context.GetBufferCache().ObtainBuffer(index_source.address, index_source.size,
 			                                              false);
 		}
@@ -2079,6 +2096,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
 	PreparedIndirectBuffers indirect_buffers;
+	MeshIndirect::Converter::Slot mesh_slot;
+	if (mesh_indirect) {
+		// Still preparation: a ring wrap may submit the recording here.
+		if (m_mesh_indirect == nullptr) {
+			m_mesh_indirect = std::make_unique<MeshIndirect::Converter>(m_context);
+		}
+		mesh_slot = m_mesh_indirect->Reserve();
+	}
 	if (indirect != nullptr) {
 		indirect_buffers = ObtainIndirectBuffers(buffer, *indirect);
 	}
@@ -2116,6 +2141,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    *programs);
+	if (mesh_indirect) {
+		// The conversion of the argument record into this draw's dispatches and draw dwords:
+		// outside rendering (it ends the active instance, before the targets are acquired for the
+		// new one), after every earlier write, before the draw (MeshIndirect::Converter::Record).
+		m_mesh_indirect->Record(buffer, mesh_slot, emit.mesh_inputs, indirect_buffers.args,
+		                        indirect_buffers.args_offset);
+	}
 	vk::ImageAspectFlags feedback_aspects;
 	// Where this draw can write its colour targets (KYTY_ALIAS_BYTES ownership claims).
 	vk::Rect2D written {};
@@ -2210,7 +2242,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x500u);
 	}
-	if (mesh_active) {
+	if (mesh_indirect) {
+		// One indirect dispatch per conversion record, each reading its draw dwords from its own
+		// parameter block (a record the draw does not need has no workgroups).
+		for (uint32_t record = 0; record < MeshIndirect::Records; record++) {
+			const auto     address = mesh_slot.ParamsAddress(record);
+			const uint32_t draw_data[] {static_cast<uint32_t>(address),
+			                            static_cast<uint32_t>(address >> 32u), 0u,
+			                            ShaderRecompiler::IR::PushData::MeshIndirectSentinel, 0u, 0u};
+			static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+			vk_buffer.pushConstants(pipeline.pipeline_layout,
+			    vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eFragment, 0,
+			    sizeof(draw_data), draw_data);
+			vk_buffer.drawMeshTasksIndirectEXT(mesh_slot.buffer, mesh_slot.CommandOffset(record), 1,
+			                                   MeshIndirect::CommandDwords * 4u);
+		}
+	} else if (mesh_active) {
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
 		for (const auto& segment: mesh_segments) {
 			const auto address = index_source.address +
@@ -2657,11 +2704,71 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 		ResetBindings();
 		return true;
 	}
-	// Mesh draws derive group counts, restart segments and push data from the counts.
+	DrawEmitInfo emit {};
+	emit.indirect = &source;
+	// Mesh draws derive group counts, restart segments and push data from the counts: on the GPU
+	// (KYTY_NATIVE_INDIRECT_MESH, meshIndirect.h), or on the CPU path.
 	if (state.vertex_info[0].stage.program->stage == ShaderType::Mesh) {
-		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectFallbackMesh);
-		ResetBindings();
-		return false;
+		const auto decline = [&](std::optional<Profiler::FrameEvent> reason) {
+			if (reason) {
+				Profiler::CountFrameEvent(*reason);
+			}
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawIndirectFallbackMesh);
+			ResetBindings();
+			return false;
+		};
+		if (MeshIndirect::GetMode() == MeshIndirect::Mode::Off) {
+			return decline(std::nullopt);
+		}
+		const auto& program         = *state.vertex_info[0].stage.program;
+		const auto& mesh            = state.vertex_info[0].mesh;
+		const auto& limits          = graphics.mesh_shader_properties;
+		auto&       inputs          = emit.mesh_inputs;
+		inputs.indexed              = source.indexed;
+		inputs.index_base           = index_source.address;
+		inputs.index_size           = index_source.guest_element_size;
+		inputs.index_buffer_size    = source.indexed ? source.index_buffer_size : 0u;
+		inputs.primitive_size       = mesh.InputPrimitiveSize();
+		inputs.primitive_step       = mesh.InputPrimitiveStep();
+		inputs.primitives_per_group = mesh.primitives_per_group;
+		inputs.max_groups_x         = limits.maxMeshWorkGroupCount[0];
+		inputs.max_groups_y         = limits.maxMeshWorkGroupCount[1];
+		inputs.max_groups_total     = limits.maxMeshWorkGroupTotalCount;
+		if (MeshIndirect::AlwaysEmpty(inputs)) {
+			// No record can reach a primitive (every record's count is clamped below one input
+			// primitive): the CPU path would read the records and draw nothing, returning before
+			// the render targets are acquired (ExecutePreparedDraw) or, for zero counts, before
+			// the render state is resolved (DrawIndex). Target operations and restart values only
+			// an index scan decides took the CPU path above.
+			MeshIndirect::GetTotals().always_empty.fetch_add(1, std::memory_order_relaxed);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::MeshIndirectAlwaysEmpty);
+			ResetBindings();
+			return true;
+		}
+		if (!MeshIndirect::ConversionEnabled()) {
+			return decline(std::nullopt);
+		}
+		// One record without a count: the CPU path draws a multi-draw record by record.
+		if (source.max_count != 1 || source.count_addr != 0) {
+			return decline(Profiler::FrameEvent::MeshIndirectDeclinedMulti);
+		}
+		// Restart segments come from a CPU scan of the indices (KYTY_MESH_RESTART=1).
+		if (primitive_restart && MeshRestartEnabled()) {
+			return decline(Profiler::FrameEvent::MeshIndirectDeclinedRestart);
+		}
+		// A clear-enable draw clears its depth/stencil attachment when its rendering instance
+		// begins, which a draw with zero counts on the CPU path never does.
+		if (state.depth_info.image_id &&
+		    (state.depth_info.depth_clear_enable || state.depth_info.stencil_clear_enable)) {
+			return decline(Profiler::FrameEvent::MeshIndirectDeclinedClear);
+		}
+		// Programs generated with the parameter-block loads (the codegen option follows the
+		// mode); the CPU path reports an unusable primitive group itself.
+		if (!ShaderRecompiler::GetCodegenOptions().mesh_indirect_params ||
+		    program.stage != ShaderType::Mesh || mesh.primitives_per_group == 0) {
+			return decline(Profiler::FrameEvent::MeshIndirectDeclinedProgram);
+		}
+		emit.mesh_indirect = true;
 	}
 	if (!source.indexed && Prospero::IsRectList(ucfg.GetPrimType()) &&
 	    state.vertex_info[0].buffers_num == 0 &&
@@ -2673,9 +2780,6 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 
 	LogDrawStateIfNeeded(buffer, draw, state, source.index_type_and_size,
 	                     reinterpret_cast<const void*>(source.index_base_addr));
-
-	DrawEmitInfo emit {};
-	emit.indirect = &source;
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
 	ResetBindings();

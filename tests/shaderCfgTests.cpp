@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -9660,6 +9661,132 @@ void TestMeshExportStorage() {
   }
 }
 
+// What a mesh module does with the indirect draw parameters, counted on the binary (independent
+// of disassembly names): address loads (OpConvertUToPtr), compares against the uint constant
+// MeshIndirectSentinel (OpIEqual), and whether it declares physical storage buffer addresses.
+struct MeshIndirectCode {
+  uint32_t address_loads = 0;
+  uint32_t sentinel_compares = 0;
+  bool physical_addresses = false;
+};
+
+MeshIndirectCode CountMeshIndirectCode(const std::vector<uint32_t> &binary) {
+  const auto op = [](spv::Op opcode) { return static_cast<uint32_t>(opcode); };
+  MeshIndirectCode code;
+  std::unordered_set<uint32_t> uint_types;
+  std::unordered_set<uint32_t> sentinels;
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t words = binary[i] >> 16u;
+    const uint32_t opcode = binary[i] & 0xffffu;
+    Check(words != 0 && i + words <= binary.size(), "malformed SPIR-V instruction");
+    if (opcode == op(spv::OpCapability) && words == 2 &&
+        binary[i + 1] ==
+            static_cast<uint32_t>(spv::CapabilityPhysicalStorageBufferAddresses)) {
+      code.physical_addresses = true;
+    } else if (opcode == op(spv::OpTypeInt) && words == 4 && binary[i + 2] == 32u &&
+               binary[i + 3] == 0u) {
+      uint_types.insert(binary[i + 1]);
+    } else if (opcode == op(spv::OpConstant) && words == 4 &&
+               uint_types.contains(binary[i + 1]) &&
+               binary[i + 3] == ShaderRecompiler::IR::PushData::MeshIndirectSentinel) {
+      sentinels.insert(binary[i + 2]);
+    } else if (opcode == op(spv::OpConvertUToPtr)) {
+      code.address_loads++;
+    } else if (opcode == op(spv::OpIEqual) && words == 5 &&
+               (sentinels.contains(binary[i + 3]) || sentinels.contains(binary[i + 4]))) {
+      code.sentinel_compares++;
+    }
+    i += words;
+  }
+  return code;
+}
+
+// KYTY_NATIVE_INDIRECT_MESH (renderer/meshIndirect.h): with CodegenOptions::mesh_indirect_params
+// every mesh draw dword is read from push constants unless dword 3 holds MeshIndirectSentinel,
+// in which case it is loaded from the parameter block at the device address in dwords 0-1. The
+// pushed path is unchanged (the same push-constant loads, as the phi's default), and the module
+// stays valid for both lane layouts. The prologue's draw dwords only feed s3 (the wave's vertex
+// and primitive counts), v5 (the vertex index, through the index load when indexed) and v8 (the
+// instance index): a program that consumes none of them may read no draw dword at all, one that
+// consumes the vertex index (reads_vertex_index) reads several.
+void CheckMeshIndirectParams(std::span<const uint32_t> code, bool dma, bool reads_vertex_index) {
+  using ShaderRecompiler::IR::PushData;
+  ShaderVertexInputInfo input{};
+  auto &mesh = input.mesh;
+  mesh.threads_num[0] = 192;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.primitives_per_group = 62;
+  mesh.vertices_per_group = 64;
+  mesh.max_vertices = 192;
+  mesh.max_primitives = 176;
+  ShaderRecompiler::CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.input_info.vertex = &input;
+  const auto saved = ShaderRecompiler::GetCodegenOptions();
+  for (const uint32_t subgroup_size : {32u, 64u}) {
+    mesh.host_subgroup_size = subgroup_size;
+    auto codegen = saved;
+    codegen.mesh_indirect_params = false;
+    ShaderRecompiler::SetCodegenOptions(codegen);
+    const auto pushed = RecompileForTest(code, options, nullptr, nullptr,
+                                         PushData::MeshDrawDwordCount);
+    codegen.mesh_indirect_params = true;
+    ShaderRecompiler::SetCodegenOptions(codegen);
+    const auto indirect = RecompileForTest(code, options, nullptr, nullptr,
+                                           PushData::MeshDrawDwordCount);
+    ShaderRecompiler::SetCodegenOptions(saved);
+    CheckSpirvBinaryValidates(pushed.spirv);
+    CheckSpirvBinaryValidates(indirect.spirv);
+    Check(pushed.program.info.uses_dma == dma && indirect.program.info.uses_dma == dma,
+          "the vertex-index consumer decides whether the mesh program reads guest addresses");
+    // Without the option only a program that reads guest memory declares physical addresses;
+    // with it every mesh program does (UsesPhysicalAddresses).
+    const auto pushed_code = CountMeshIndirectCode(pushed.spirv);
+    const auto indirect_code = CountMeshIndirectCode(indirect.spirv);
+    Check(pushed_code.physical_addresses == dma && indirect_code.physical_addresses,
+          "physical addresses are declared for the wrong mesh programs");
+    // The option adds exactly one sentinel compare and one parameter-block load per draw dword
+    // read (nothing when none is read); the rest of the module is the pushed one.
+    Check(indirect_code.address_loads >= pushed_code.address_loads &&
+              indirect_code.sentinel_compares >= pushed_code.sentinel_compares,
+          "the indirect mesh module lost code of the pushed one");
+    const auto loads = indirect_code.address_loads - pushed_code.address_loads;
+    const auto compares = indirect_code.sentinel_compares - pushed_code.sentinel_compares;
+    Check(loads == compares && (loads != 0 || !reads_vertex_index),
+          "the indirect mesh draw dwords are not loaded through their device address");
+    if (loads != 0) {
+      const auto pushed_source = DisassembleSpirvBinary(pushed.spirv);
+      const auto indirect_source = DisassembleSpirvBinary(indirect.spirv);
+      Check(CountSourceOccurrences(indirect_source, "Aligned 4") >=
+                CountSourceOccurrences(pushed_source, "Aligned 4") + loads,
+            "parameter-block loads must be aligned dword loads");
+    }
+  }
+}
+
+void TestMeshIndirectParams() {
+  // Without and with a consumer of the vertex index (v5): only the latter keeps the prologue's
+  // index load, so only it uses guest device addresses (uses_dma) and surely reads draw dwords.
+  const uint32_t constant[] = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9), // GS allocation
+      EncodeVop1(0x01, 0, 128),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), // primitive
+      EncodeSopp(0x01),
+  };
+  const uint32_t indexed[] = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9), // GS allocation
+      EncodeVop1(0x01, 0, 256 + 5),                // v0 = the vertex index
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), // primitive
+      EncodeSopp(0x01),
+  };
+  CheckMeshIndirectParams(constant, false, false);
+  CheckMeshIndirectParams(indexed, true, true);
+}
+
 void TestMergedShaderUserDataSnapshot() {
   using namespace ShaderRecompiler;
   const uint32_t front[] = {
@@ -13782,6 +13909,12 @@ int main(int argc, char **argv) {
     TestRdna2LdsWaitcntBarrierAndFloatControls();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--mesh-indirect-only") == 0) {
+    TestMeshExportStorage();
+    TestMeshIndirectParams();
+    std::printf("shader_cfg --mesh-indirect-only: ok\n");
+    return 0;
+  }
   TestRayTracingDispatchDetection();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
@@ -13883,6 +14016,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerSetpcBranch();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
+  TestMeshIndirectParams();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
   TestEmbeddedFetchPreservesSharedScalarLoad();

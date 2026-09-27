@@ -709,6 +709,24 @@ enum class FrameEvent : uint32_t {
 	DrawIndirectFallbackQuadList,
 	DrawIndirectFallbackRestart,
 	DrawIndirectFallbackMesh,
+	// KYTY_NATIVE_INDIRECT_MESH (renderer/meshIndirect.h): indirect mesh draws recorded with GPU
+	// arguments; those skipped without a read because INDEX_BUFFER_SIZE makes every record empty;
+	// why an indirect mesh draw kept the CPU-read path (a multi-draw or count record, primitive
+	// restart split by an index scan, a depth/stencil clear-enable draw, a program without the
+	// indirect parameters); the completion checks (verify modes), their mismatches, and
+	// conversions whose status word reported a difference from the CPU path.
+	MeshIndirectDraws,
+	MeshIndirectAlwaysEmpty,
+	MeshIndirectDeclinedMulti,
+	MeshIndirectDeclinedRestart,
+	MeshIndirectDeclinedClear,
+	MeshIndirectDeclinedProgram,
+	MeshIndirectVerifyChecks,
+	MeshIndirectVerifyMismatches,
+	MeshIndirectStatus,
+	// KYTY_SET_REUSE_FRESH: descriptor-set commits that skipped the reuse lookup because the set
+	// refers to a shader-data or flattened-SRT upload made for this draw (no earlier set can hold it).
+	DescriptorSetReuseSkippedFresh,
 	// KYTY_BUFFER_RANGE_MEMO (bufferCache.h): read-only synchronizations skipped because the
 	// range's tracker bits did not change since one that found nothing to upload; small read
 	// bindings that reused their stream-copy decision; facts recorded; and the verify mode's

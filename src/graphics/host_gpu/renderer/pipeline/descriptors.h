@@ -71,6 +71,9 @@ struct PreparedBindings {
 		std::vector<TextureBinding>                         images;
 	};
 	std::array<TextureSet, 3> texture_history {};
+	// RebindBuffers: flattened_srt or shader_data_buffer was allocated for this binding (not a
+	// reused upload of the same recording), so no earlier descriptor set refers to it.
+	bool                                  fresh_upload = false;
 };
 
 [[nodiscard]] vk::DescriptorType

@@ -28,6 +28,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/meshIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
@@ -532,6 +533,52 @@ struct RenderExecutorTestAccess {
   static void DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
     executor.DrawAuto(0, command, args);
+  }
+
+  static void DrawIndex(RenderExecutor &executor, CommandBuffer &command,
+                        const DrawIndexArgs &args) {
+    executor.DrawIndex(0, command, args);
+  }
+
+  static bool DrawIndirectNative(RenderExecutor &executor, CommandBuffer &command,
+                                 const DrawIndirectSource &source) {
+    return executor.DrawIndirectNative(0, command, source);
+  }
+
+  static vk::Sampler NativeSampler(RenderExecutor &executor,
+                                   const ShaderRecompiler::IR::CompiledShaderInfo &program,
+                                   uint32_t index,
+                                   const ShaderRecompiler::IR::DescriptorValue &value) {
+    return executor.NativeSampler(program, index, value);
+  }
+
+  // The sampler memo's entries (fields, handle) in order: sets of SamplerMemoWays ways.
+  static std::vector<std::pair<std::array<uint32_t, 4>, vk::Sampler>>
+  SamplerMemo(const RenderExecutor &executor) {
+    std::vector<std::pair<std::array<uint32_t, 4>, vk::Sampler>> entries;
+    for (const auto &entry : executor.m_sampler_memo) {
+      entries.emplace_back(entry.fields, entry.sampler);
+    }
+    return entries;
+  }
+  static constexpr uint32_t SamplerMemoWays = RenderExecutor::SamplerMemoWays;
+
+  static void CommitDescriptorSet(RenderExecutor &executor, CommandBuffer &buffer,
+                                  const PipelineCache::Pipeline &pipeline,
+                                  std::span<const vk::WriteDescriptorSet> writes, bool fresh) {
+    executor.m_descriptor_writes.assign(writes.begin(), writes.end());
+    executor.CommitDescriptorSet(buffer, vk::PipelineBindPoint::eGraphics, pipeline, fresh);
+  }
+
+  static vk::DescriptorSet FindReusableSet(RenderExecutor &executor, uint64_t tick,
+                                           vk::DescriptorSetLayout layout,
+                                           std::span<const vk::WriteDescriptorSet> writes) {
+    return executor.m_descriptor_set_reuse.Find(tick, layout, writes,
+                                                DescriptorSetReuse::Hash(layout, writes));
+  }
+
+  static uint64_t SetReuseFreshMismatches(const RenderExecutor &executor) {
+    return executor.m_set_reuse_fresh_mismatches;
   }
 
   static bool TryConsumeComputeImageClear(RenderExecutor &executor,
@@ -2238,6 +2285,50 @@ public:
     EnsureRuntimeContext();
     return std::make_unique<RenderContext>(m_runtime_context);
   }
+  // While it lives, the runtime context reports what the emulator's device reports: mesh
+  // shaders (with their limits and the subgroup size FinishMeshStage reads) and the native
+  // indirect draw features, all enabled on the harness device whenever supported. Checks that
+  // draw NGG stages as mesh shaders open one before MakeRenderContext and keep it past the
+  // context (RenderContext reads the runtime context live); every other check keeps the context
+  // it always had. Supported() is false without VK_EXT_mesh_shader.
+  class MeshShaderScope {
+   public:
+    explicit MeshShaderScope(VulkanHarness &harness)
+        : m_context(harness.RuntimeContext()), m_supported(harness.m_mesh_shader),
+          m_mesh(m_context.mesh_shader_enabled), m_properties(m_context.mesh_shader_properties),
+          m_subgroup_size(m_context.subgroup_size),
+          m_first_instance(m_context.draw_indirect_first_instance_enabled),
+          m_multi_draw(m_context.multi_draw_indirect_enabled),
+          m_draw_count(m_context.draw_indirect_count_enabled) {
+      m_context.mesh_shader_enabled = harness.m_mesh_shader;
+      m_context.mesh_shader_properties = harness.m_mesh_properties;
+      m_context.subgroup_size = harness.SubgroupSize();
+      m_context.draw_indirect_first_instance_enabled = harness.m_draw_indirect_first_instance;
+      m_context.multi_draw_indirect_enabled = harness.m_multi_draw_indirect;
+      m_context.draw_indirect_count_enabled = harness.m_draw_indirect_count;
+    }
+    ~MeshShaderScope() {
+      m_context.mesh_shader_enabled = m_mesh;
+      m_context.mesh_shader_properties = m_properties;
+      m_context.subgroup_size = m_subgroup_size;
+      m_context.draw_indirect_first_instance_enabled = m_first_instance;
+      m_context.multi_draw_indirect_enabled = m_multi_draw;
+      m_context.draw_indirect_count_enabled = m_draw_count;
+    }
+    MeshShaderScope(const MeshShaderScope &) = delete;
+    MeshShaderScope &operator=(const MeshShaderScope &) = delete;
+    [[nodiscard]] bool Supported() const { return m_supported; }
+
+   private:
+    GraphicContext &m_context;
+    bool m_supported;
+    bool m_mesh;
+    vk::PhysicalDeviceMeshShaderPropertiesEXT m_properties;
+    u32 m_subgroup_size;
+    bool m_first_instance;
+    bool m_multi_draw;
+    bool m_draw_count;
+  };
   // Runs `work` on the context's guest GPU thread (RenderContext::InitializeGpu) and returns
   // its result. Garbage collection and image downloads begin backing publications, which the
   // product issues only from that thread (BufferCache::BeginBackingPublication asserts it):
@@ -5085,6 +5176,408 @@ public:
                 direct_offset, allocation_size) == 0,
             "dirty-GC direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // KYTY_NATIVE_INDIRECT_MESH (renderer/meshIndirect.h). The CPU path an indirect mesh draw used
+  // to take, spelled out step by step (CommandProcessor::DrawIndirect, RenderExecutor::DrawIndex /
+  // DrawAuto, ExecutePreparedDraw's mesh branch): the host dispatches it records, each with the
+  // six draw dwords it pushes. Written independently of MeshIndirect::Convert, which it checks.
+  struct SimulatedMeshDispatch {
+    u32 groups = 0;
+    u32 instances = 0;
+    std::array<u32, 6> push{};
+  };
+  static std::vector<SimulatedMeshDispatch>
+  SimulateCpuMeshDraw(const ShaderMeshInputInfo &mesh, bool indexed, uint64_t index_base,
+                      u32 index_size, u32 index_buffer_size, u32 max_x, u32 max_y, u32 max_total,
+                      const std::array<u32, 5> &args, bool &stops) {
+    stops = false;
+    // CommandProcessor::DrawIndirect.
+    u32 count = args[0];
+    const u32 instances = args[1];
+    uint64_t index_address = 0;
+    u32 offset = 0;
+    u32 first_instance = 0;
+    if (indexed) {
+      count = index_buffer_size != 0 ? std::min(args[0], index_buffer_size) : args[0];
+      index_address = index_base + static_cast<uint64_t>(args[2]) * index_size;
+      offset = args[3]; // static_cast<uint32_t>(emit.vertex_offset), vertex_offset 0 + base
+      first_instance = args[4];
+    } else {
+      offset = args[2]; // emit.first_vertex
+      first_instance = args[3];
+    }
+    std::vector<SimulatedMeshDispatch> dispatches;
+    // DrawIndex / DrawAuto.
+    if (count == 0 || instances == 0) {
+      return dispatches;
+    }
+    // ExecutePreparedDraw, mesh branch (no restart segments).
+    const u32 primitives = mesh.InputPrimitiveCount(count);
+    if (primitives == 0) {
+      return dispatches;
+    }
+    const u32 groups = (primitives - 1u) / mesh.primitives_per_group + 1u;
+    const u32 per_dispatch = groups == 0 || groups > max_x ? 0u : std::min(max_y, max_total / groups);
+    if (per_dispatch == 0) {
+      stops = true; // EXIT("mesh draw exceeds host workgroup limits")
+      return dispatches;
+    }
+    for (uint64_t base = 0; base < instances; base += per_dispatch) {
+      SimulatedMeshDispatch dispatch;
+      dispatch.groups = groups;
+      dispatch.instances = static_cast<u32>(std::min<uint64_t>(per_dispatch, instances - base));
+      dispatch.push = {count, offset, first_instance + static_cast<u32>(base),
+                       indexed ? index_size : 0u, static_cast<u32>(index_address),
+                       static_cast<u32>(index_address >> 32u)};
+      dispatches.push_back(dispatch);
+    }
+    return dispatches;
+  }
+
+  // The GPU conversion (gpu_mesh_indirect.comp through MeshIndirect::Converter) and
+  // MeshIndirect::Convert both equal the simulated CPU path: live commands are its dispatches
+  // in order, parameter blocks its pushed dwords, the status its differences (more dispatches
+  // than MeshIndirect::Records, a draw the CPU path stops on, indices read past
+  // INDEX_BUFFER_SIZE); AlwaysEmpty holds exactly when no record can yield a primitive. With
+  // KYTY_NATIVE_INDIRECT_MESH=verify|exit every conversion is also compared on completion.
+  void CheckMeshIndirectConversion() {
+    constexpr const char *name = "MeshIndirectConversion";
+    namespace MI = MeshIndirect;
+    struct Case {
+      Prospero::PrimitiveType primitive;
+      u32 primitives_per_group;
+      bool indexed;
+      u32 index_size;
+      u32 index_buffer_size;
+      std::array<u32, 5> args;
+    };
+    // Synthetic host limits keep instance splits and limit violations small.
+    constexpr u32 max_x = 100, max_y = 10, max_total = 500;
+    constexpr uint64_t index_base = 0x0000000123456780ull;
+    using P = Prospero::PrimitiveType;
+    const std::vector<Case> cases{
+        // 12 triangles, 4 per group: 3 groups; one instance; negative base vertex.
+        {P::kTriList, 4, true, 2, 100, {36, 1, 10, 0xfffffffbu, 7}},
+        // Count clamped to INDEX_BUFFER_SIZE, start 0: no index-range difference.
+        {P::kTriList, 4, true, 4, 64, {1000, 2, 0, 0, 0}},
+        // Clamped count past INDEX_BUFFER_SIZE from a nonzero start: flagged.
+        {P::kTriList, 4, true, 4, 64, {60, 1, 10, 3, 1}},
+        // INDEX_BUFFER_SIZE 1: always empty (the per-flip draw in Astro Bot).
+        {P::kTriList, 1, true, 2, 1, {3, 1, 0, 0, 0}},
+        // No instances / no indices: nothing.
+        {P::kTriList, 4, true, 2, 100, {36, 0, 0, 0, 0}},
+        {P::kTriList, 4, true, 2, 0, {0, 5, 0, 0, 0}},
+        // Fewer vertices than one triangle.
+        {P::kTriList, 4, false, 0, 0, {2, 1, 100, 3, 0}},
+        // Non-indexed: first vertex and first instance from the record.
+        {P::kTriList, 2, false, 0, 0, {6, 1, 100, 3, 0}},
+        // Lines, points and strips.
+        {P::kLineList, 5, false, 0, 0, {2, 1, 0, 0, 0}},
+        {P::kPointList, 64, true, 1, 0, {130, 1, 5, 1, 0}},
+        {P::kTriStrip, 3, true, 2, 0, {10, 1, 0, 0, 0}},
+        {P::kTriFan, 3, false, 0, 0, {9, 2, 0, 0, 9}},
+        // Instance splits: 2 groups -> 10 instances per dispatch -> 3 dispatches.
+        {P::kTriList, 1, false, 0, 0, {6, 25, 0, 0, 1000}},
+        // 45 instances need 5 dispatches: the fifth is dropped (overflow).
+        {P::kTriList, 1, false, 0, 0, {6, 45, 0, 0, 0}},
+        // 101 groups exceed max_x: the CPU path stops, the conversion draws nothing.
+        {P::kTriList, 1, false, 0, 0, {303, 1, 0, 0, 0}},
+        // A wrapping first instance.
+        {P::kTriList, 1, false, 0, 0, {3, 12, 0, 0, 0xfffffff8u}},
+    };
+
+    const auto make_inputs = [&](const Case &c, ShaderMeshInputInfo &mesh) {
+      mesh = {};
+      mesh.input_primitive = static_cast<u32>(c.primitive);
+      mesh.primitives_per_group = c.primitives_per_group;
+      MI::Inputs inputs;
+      inputs.indexed = c.indexed;
+      inputs.index_base = c.indexed ? index_base : 0;
+      inputs.index_size = c.indexed ? c.index_size : 0;
+      inputs.index_buffer_size = c.indexed ? c.index_buffer_size : 0;
+      inputs.primitive_size = mesh.InputPrimitiveSize();
+      inputs.primitive_step = mesh.InputPrimitiveStep();
+      inputs.primitives_per_group = mesh.primitives_per_group;
+      inputs.max_groups_x = max_x;
+      inputs.max_groups_y = max_y;
+      inputs.max_groups_total = max_total;
+      return inputs;
+    };
+    // The reference against the simulation.
+    const auto expect = [&](const Case &c, const MI::Conversion &conversion, const char *what) {
+      ShaderMeshInputInfo mesh;
+      const auto inputs = make_inputs(c, mesh);
+      bool stops = false;
+      const auto dispatches = SimulateCpuMeshDraw(mesh, c.indexed, inputs.index_base,
+                                                  inputs.index_size, inputs.index_buffer_size,
+                                                  max_x, max_y, max_total, c.args, stops);
+      u32 status = 0;
+      if (dispatches.size() > MI::Records) status |= MI::StatusOverflow;
+      if (stops) status |= MI::StatusLimits;
+      if (c.indexed && c.index_buffer_size != 0 &&
+          static_cast<uint64_t>(c.args[2]) + std::min(c.args[0], c.index_buffer_size) >
+              c.index_buffer_size) {
+        status |= MI::StatusIndexRange;
+      }
+      Require(name, what, conversion.status == status,
+              "status " + Hex(conversion.status) + ", expected " + Hex(status));
+      for (u32 k = 0; k < MI::Records; k++) {
+        const auto &command = conversion.commands[k];
+        if (k < dispatches.size()) {
+          const auto &dispatch = dispatches[k];
+          Require(name, what,
+                  command[0] == dispatch.groups && command[1] == dispatch.instances &&
+                      command[2] == 1u,
+                  "record " + std::to_string(k) + " dispatches " + std::to_string(command[0]) +
+                      "x" + std::to_string(command[1]) + "x" + std::to_string(command[2]) +
+                      ", expected " + std::to_string(dispatch.groups) + "x" +
+                      std::to_string(dispatch.instances) + "x1");
+          for (u32 i = 0; i < 6; i++) {
+            Require(name, what, conversion.params[k][i] == dispatch.push[i],
+                    "record " + std::to_string(k) + " draw dword " + std::to_string(i) + " is " +
+                        Hex(conversion.params[k][i]) + ", expected " + Hex(dispatch.push[i]));
+          }
+        } else {
+          Require(name, what, command[0] == 0 && command[1] == 0 && command[2] == 0,
+                  "record " + std::to_string(k) + " dispatches workgroups the CPU path does not");
+        }
+      }
+    };
+    for (const auto &c : cases) {
+      ShaderMeshInputInfo mesh;
+      const auto inputs = make_inputs(c, mesh);
+      expect(c, MI::Convert(inputs, c.args), "reference");
+      // AlwaysEmpty: every record of this binding yields no primitive.
+      const bool empty = c.indexed && c.index_buffer_size != 0 &&
+                         mesh.InputPrimitiveCount(c.index_buffer_size) == 0;
+      Require(name, "always empty", MI::AlwaysEmpty(inputs) == empty,
+              "AlwaysEmpty disagrees with InputPrimitiveCount(INDEX_BUFFER_SIZE)");
+      if (empty) {
+        for (const u32 count : {0u, 1u, 2u, 3u, 1000u}) {
+          auto args = c.args;
+          args[0] = count;
+          args[1] = 7;
+          bool stops = false;
+          Require(name, "always empty",
+                  SimulateCpuMeshDraw(mesh, c.indexed, inputs.index_base, inputs.index_size,
+                                      inputs.index_buffer_size, max_x, max_y, max_total, args,
+                                      stops)
+                          .empty() &&
+                      !stops,
+                  "an always-empty binding drew on the CPU path");
+        }
+      }
+    }
+
+    // The GPU conversion of every record, in one recording.
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    {
+      auto &graphics = context.GetGraphics();
+      constexpr uint64_t record_stride = 64; // arguments at odd dword offsets inside the binding
+      Libs::Graphics::Buffer args_buffer(graphics, scheduler, MemoryUsage::Upload, 0,
+                                         vk::BufferUsageFlagBits::eStorageBuffer,
+                                         record_stride * (cases.size() + 1));
+      Require(name, "argument buffer", !args_buffer.Mapped().empty(),
+              "the argument buffer is not host visible");
+      MI::Converter converter(context);
+      const auto &totals = MI::GetTotals();
+      const auto checks = totals.checks.load();
+      const auto mismatches = totals.mismatches.load();
+      std::vector<MI::Converter::Slot> slots;
+      for (size_t i = 0; i < cases.size(); i++) {
+        const auto offset = record_stride * i + 4u * (i % 3u);
+        std::memcpy(args_buffer.Mapped().data() + offset, cases[i].args.data(),
+                    cases[i].indexed ? 20u : 16u);
+        args_buffer.Flush(offset, 20);
+        ShaderMeshInputInfo mesh;
+        const auto inputs = make_inputs(cases[i], mesh);
+        slots.push_back(converter.Reserve());
+        converter.Record(scheduler.Current(), slots.back(), inputs, args_buffer.Handle(), offset);
+      }
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      for (size_t i = 0; i < cases.size(); i++) {
+        const auto words = converter.ReadSlot(slots[i]);
+        MI::Conversion gpu;
+        for (u32 k = 0; k < MI::Records; k++) {
+          std::copy_n(words.begin() + k * MI::CommandDwords, MI::CommandDwords,
+                      gpu.commands[k].begin());
+          std::copy_n(words.begin() + MI::ParamsWord + k * MI::ParamDwords, MI::ParamDwords,
+                      gpu.params[k].begin());
+        }
+        gpu.status = words[MI::StatusWord];
+        const auto what = "gpu case " + std::to_string(i);
+        expect(cases[i], gpu, what.c_str());
+        Require(name, what.c_str(),
+                std::equal(cases[i].args.begin(), cases[i].args.begin() + (cases[i].indexed ? 5 : 4),
+                           words.begin() + MI::ArgsCopyWord) &&
+                    words[MI::GenerationWord] == slots[i].generation,
+                "the slot does not hold the record as read or its generation");
+        ShaderMeshInputInfo mesh;
+        Require(name, what.c_str(), gpu == MI::Convert(make_inputs(cases[i], mesh), cases[i].args),
+                "the GPU conversion differs from MeshIndirect::Convert");
+      }
+      const auto mode = MI::GetMode();
+      if (mode == MI::Mode::Verify || mode == MI::Mode::VerifyExit) {
+        Require(name, "completion checks",
+                totals.checks.load() - checks == cases.size() &&
+                    totals.mismatches.load() == mismatches,
+                "the verify mode did not check every conversion, or found a difference");
+      }
+    }
+    scheduler.Finish();
+    context.ShutdownGpu();
+    std::printf("[gpu]     %-32s ok (%zu records, mode %u)\n", name, cases.size(),
+                static_cast<unsigned>(MI::GetMode()));
+  }
+
+  // KYTY_SAMPLER_MEMO, set-associative: SamplerMemoWays S#s whose memo slot collides all stay
+  // remembered (the desert stamps' eight samplers missed twice per draw with one way), a further
+  // one evicts the least recently used, and every answer is the SamplerCache's own sampler.
+  void CheckSamplerMemo() {
+    constexpr const char *name = "SamplerMemoWays";
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &executor = context.GetRenderExecutor();
+    ShaderRecompiler::IR::CompiledShaderInfo program{};
+    program.info.samplers.resize(1);
+    // Point samplers differing in MAX_LOD, all in one memo set (slot = hash >> 26).
+    const auto fields = [](u32 max_lod) {
+      return std::array<u32, 4>{2u | (2u << 3u) | (2u << 6u), (max_lod & 0xfffu) << 12u, 0, 0};
+    };
+    const auto slot = [](const std::array<u32, 4> &f) {
+      return (f[0] * 0x9e3779b1u ^ f[1] * 0x85ebca6bu ^ f[2] * 0xc2b2ae35u ^ f[3]) >> 26u;
+    };
+    constexpr u32 ways = RenderExecutorTestAccess::SamplerMemoWays;
+    std::vector<std::array<u32, 4>> colliding;
+    for (u32 max_lod = 0; max_lod < 4096 && colliding.size() < ways + 1; max_lod++) {
+      if (slot(fields(max_lod)) == slot(fields(0))) {
+        colliding.push_back(fields(max_lod));
+      }
+    }
+    Require(name, "colliding samplers", colliding.size() == ways + 1,
+            "could not find enough S# words sharing one memo set");
+    const auto lookup = [&](const std::array<u32, 4> &f) {
+      ShaderRecompiler::IR::DescriptorValue value;
+      std::copy(f.begin(), f.end(), value.dwords.begin());
+      value.dword_count = 4;
+      const auto sampler = RenderExecutorTestAccess::NativeSampler(executor, program, 0, value);
+      ShaderSamplerResource descriptor{{f[0], f[1], f[2], f[3]}};
+      Require(name, "exact", sampler != nullptr &&
+                                 sampler == context.GetSamplerCache().GetSampler(descriptor),
+              "the memo answered with another sampler than the cache's");
+      return sampler;
+    };
+    const auto remembered = [&](const std::array<u32, 4> &f) {
+      const auto entries = RenderExecutorTestAccess::SamplerMemo(executor);
+      return std::ranges::any_of(entries, [&](const auto &entry) {
+        return entry.second != nullptr && entry.first == f;
+      });
+    };
+    for (u32 i = 0; i < ways; i++) {
+      (void)lookup(colliding[i]);
+    }
+    for (u32 round = 0; round < 3; round++) {
+      for (u32 i = 0; i < ways; i++) {
+        (void)lookup(colliding[i]);
+        Require(name, "all ways kept", std::all_of(colliding.begin(), colliding.begin() + ways,
+                                                   remembered),
+                "a colliding sampler was evicted although the set has room for it");
+      }
+    }
+    // colliding[0] is now the least recently used: the fifth sampler takes its place.
+    (void)lookup(colliding[ways]);
+    Require(name, "least recently used evicted",
+            !remembered(colliding[0]) && remembered(colliding[ways]) &&
+                std::all_of(colliding.begin() + 1, colliding.begin() + ways, remembered),
+            "the fifth colliding sampler did not replace the least recently used one");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // KYTY_SET_REUSE_FRESH (RenderExecutor::CommitDescriptorSet): a set referring to a fresh upload
+  // is written without the reuse lookup and is not remembered; a set without one is found again
+  // (same tick, same writes) as before; verify mode reports a fresh set that the lookup finds
+  // (here forced by committing remembered writes as fresh, which the renderer never does).
+  void CheckSetReuseFresh() {
+    constexpr const char *name = "SetReuseFresh";
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &executor = context.GetRenderExecutor();
+    auto device = context.GetGraphics().device;
+    const vk::DescriptorSetLayoutBinding binding{0, vk::DescriptorType::eStorageBuffer, 1,
+                                                 vk::ShaderStageFlagBits::eFragment};
+    vk::DescriptorSetLayoutCreateInfo layout_info{};
+    layout_info.bindingCount = 1;
+    layout_info.pBindings = &binding;
+    PipelineCache::Pipeline pipeline{};
+    RequireVk(name, "set layout",
+              device.createDescriptorSetLayout(&layout_info, nullptr,
+                                               &pipeline.descriptor_set_layout),
+              "vkCreateDescriptorSetLayout");
+    vk::PipelineLayoutCreateInfo pipeline_info{};
+    pipeline_info.setLayoutCount = 1;
+    pipeline_info.pSetLayouts = &pipeline.descriptor_set_layout;
+    RequireVk(name, "pipeline layout",
+              device.createPipelineLayout(&pipeline_info, nullptr, &pipeline.pipeline_layout),
+              "vkCreatePipelineLayout");
+    auto &stream = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+    const vk::DescriptorBufferInfo info{stream.Handle(), 0, 256};
+    vk::WriteDescriptorSet write{};
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = vk::DescriptorType::eStorageBuffer;
+    write.pBufferInfo = &info;
+    const std::span writes{&write, 1};
+    const auto tick = scheduler.CurrentTick();
+    const auto mode = std::getenv("KYTY_SET_REUSE_FRESH");
+    const bool off = mode != nullptr && std::strcmp(mode, "0") == 0;
+    const bool verify = mode != nullptr && std::strcmp(mode, "verify") == 0;
+    auto &command = scheduler.Current();
+    // Not fresh: remembered, then found again.
+    RenderExecutorTestAccess::CommitDescriptorSet(executor, command, pipeline, writes, false);
+    const auto first =
+        RenderExecutorTestAccess::FindReusableSet(executor, tick, pipeline.descriptor_set_layout,
+                                                  writes);
+    Require(name, "reuse kept", first != nullptr, "a set without a fresh upload was not remembered");
+    // A fresh set the lookup would find contradicts the rule: verify mode reports it. Checked
+    // before the next commit, which may take the first set's slot of the direct-mapped cache
+    // (these writes differ only in bit 8 of the offset, which the slot index does not see).
+    const auto mismatches = RenderExecutorTestAccess::SetReuseFreshMismatches(executor);
+    RenderExecutorTestAccess::CommitDescriptorSet(executor, command, pipeline, writes, true);
+    Require(name, "verify", RenderExecutorTestAccess::SetReuseFreshMismatches(executor) ==
+                                mismatches + (verify ? 1u : 0u),
+            "verify mode did not report a reused set that refers to a fresh upload");
+    // Fresh, other writes: not remembered (off and verify: remembered as before).
+    const vk::DescriptorBufferInfo other_info{stream.Handle(), 256, 256};
+    auto other = write;
+    other.pBufferInfo = &other_info;
+    const std::span other_writes{&other, 1};
+    RenderExecutorTestAccess::CommitDescriptorSet(executor, command, pipeline, other_writes, true);
+    const bool remembered =
+        RenderExecutorTestAccess::FindReusableSet(executor, tick, pipeline.descriptor_set_layout,
+                                                  other_writes) != nullptr;
+    Require(name, "fresh skipped", remembered == (off || verify),
+            "a set referring to a fresh upload was remembered (or, with the switch off, was not)");
+    scheduler.Finish();
+    device.destroyPipelineLayout(pipeline.pipeline_layout);
+    device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout);
+    std::printf("[gpu]     %-32s ok (%s)\n", name, off ? "off" : verify ? "verify" : "on");
   }
 
   // KYTY_READBACK_EAGER (BufferCache::IssueEagerReadbacks): a page whose GPU-written bytes a
@@ -11881,6 +12374,271 @@ public:
                                                                allocation_size) == 0,
             "code allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // KYTY_NATIVE_INDIRECT_MESH end to end with an NGG (mesh) vertex stage: a fullscreen triangle
+  // per instance, additively blended, so the target counts the instances drawn. The CPU path
+  // (RenderExecutor::DrawIndex with the record's values) is the reference. A GPU-written indexed
+  // record whose INDEX_BUFFER_SIZE is below one triangle is consumed without a draw and without a
+  // readback (the record stays GPU-owned) unless the switch is 0. A drawable record is declined
+  // in the default (empty) mode and off, and drawn by the GPU conversion (on/verify/exit) with
+  // the reference's pixels: one dispatch, and an instance count needing two dispatches.
+  void CheckMeshIndirectDraw() {
+    constexpr const char *name = "MeshIndirectDraw";
+    constexpr uintptr_t base = 0x0000000206600000ull;
+    constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t vertex_offset = 0x1000;
+    constexpr uint64_t pixel_offset = 0x2000;
+    constexpr uint64_t user_data_offset = 0x4000;
+    constexpr uint64_t index_offset = 0x6000;
+    constexpr uint64_t args_offset = 0x8000;
+    constexpr uint64_t target_offset = 0x20000;
+    constexpr uint32_t extent = 32;
+    constexpr u32 start_index = 6;
+    // (0.25, 0, 0, 0.5) per instance with ONE/ONE blending over a zero clear.
+    constexpr std::array<u32, 4> color{0x3e800000u, 0u, 0u, 0x3f000000u};
+    namespace MI = MeshIndirect;
+
+    // NGG: allocate 3 vertices and 1 primitive, a fullscreen triangle from the vertex index (v5,
+    // the record's base vertex added), the primitive (0, 1, 2) from every lane.
+    std::vector<u32> mesh_code;
+    AppendSMovLiteral(&mesh_code, 124, 0x1003u);
+    mesh_code.push_back(EncodeSopp(0x10, 9)); // s_sendmsg MSG_GS_ALLOC_REQ
+    AppendVMovLiteral(&mesh_code, 1, 0xbf800000u);
+    AppendVMovLiteral(&mesh_code, 2, 0x40400000u);
+    mesh_code.push_back(EncodeVopc(0xc2, InlineU32(1), 5));
+    mesh_code.push_back(EncodeVop2(0x01, 3, Vgpr(1), 2));
+    mesh_code.push_back(EncodeVopc(0xc2, InlineU32(2), 5));
+    mesh_code.push_back(EncodeVop2(0x01, 4, Vgpr(1), 2));
+    AppendVMovU32(&mesh_code, 0, 0);
+    AppendVMovLiteral(&mesh_code, 6, 0x3f800000u);
+    mesh_code.push_back(EncodeExp0(0x0c, 0xf, false));
+    mesh_code.push_back(EncodeExp1(3, 4, 0, 6));
+    for (u32 parameter = 0; parameter < 8; parameter++) {
+      mesh_code.push_back(EncodeExp0(0x20 + parameter, 0xf, false));
+      mesh_code.push_back(EncodeExp1(0, 0, 0, 0));
+    }
+    AppendVMovLiteral(&mesh_code, 7, 0x00200400u);
+    mesh_code.push_back(EncodeExp0(0x14, 0x1));
+    mesh_code.push_back(EncodeExp1(7, 0, 0, 0));
+    AppendEnd(&mesh_code);
+    std::vector<u32> pixel_code;
+    for (u32 component = 0; component < 4; component++) {
+      AppendVMovU32(&pixel_code, component, color[component]);
+    }
+    pixel_code.push_back(EncodeExp0(0x00, 0xf));
+    pixel_code.push_back(EncodeExp1(0, 1, 2, 3));
+    AppendEnd(&pixel_code);
+
+    // Outlives the render context below.
+    const MeshShaderScope mesh_scope(*this);
+    if (!mesh_scope.Supported()) {
+      std::printf("[gpu]     %-32s skipped (no VK_EXT_mesh_shader)\n", name);
+      return;
+    }
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "draw allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "draw mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    std::memset(memory, 0, allocation_size);
+    const auto vertex_address = base + vertex_offset;
+    const auto pixel_address = base + pixel_offset;
+    const auto index_base = base + index_offset;
+    const auto args_address = base + args_offset;
+    auto *user_data = reinterpret_cast<ShaderUserData *>(memory + user_data_offset);
+    std::memcpy(memory + vertex_offset, mesh_code.data(), mesh_code.size() * sizeof(u32));
+    std::memcpy(memory + pixel_offset, pixel_code.data(), pixel_code.size() * sizeof(u32));
+    ShaderMapUserData(vertex_address,
+                      {.type = Prospero::ShaderBinaryType::kGs,
+                       .user_data = user_data,
+                       .code_size_bytes = static_cast<uint32_t>(mesh_code.size() * sizeof(u32))});
+    ShaderMapUserData(pixel_address,
+                      {.type = Prospero::ShaderBinaryType::kPs,
+                       .user_data = user_data,
+                       .code_size_bytes = static_cast<uint32_t>(pixel_code.size() * sizeof(u32))});
+    // Indices 5, 6, 7 at start_index: with base vertex -5 the vertex indices are 0, 1, 2.
+    const std::array<uint16_t, 3> indices{5, 6, 7};
+    std::memcpy(memory + index_offset + start_index * sizeof(uint16_t), indices.data(),
+                sizeof(indices));
+
+    const auto &totals = MI::GetTotals();
+    const auto mode = MI::GetMode();
+    const bool conversion = MI::ConversionEnabled();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      GraphicsInitJmpTables();
+      CommandProcessor processor(context, 0);
+      processor.Reset();
+      processor.BufferInit();
+      context.MapMemory(base, allocation_size);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &executor = context.GetRenderExecutor();
+      auto &texture_cache = context.GetTextureCache();
+      auto &cache = context.GetBufferCache();
+      auto &registers = processor.GetCtx();
+      auto &shaders = processor.GetShCtx();
+      registers.SetViewportTransformControl(0x300);
+      registers.SetViewportScaleOffset(0, extent / 2, extent / 2, extent / 2, extent / 2, 1, 0);
+      registers.SetViewportZMax(0, 1);
+      registers.SetScreenScissor(0, 0, extent, extent);
+      registers.SetWindowScissor(0, 0, extent, extent, false);
+      registers.SetGenericScissor(0, 0, extent, extent, false);
+      registers.SetViewportScissor(0, 0, 0, extent, extent, false);
+      registers.SetRenderTargetMask(0xf);
+      registers.SetShaderMask(0xf);
+      registers.SetPsInControl(0x8000);
+      registers.SetColorBase(0, {.addr = base + target_offset});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32_32_32_32,
+                                 .channel_type = Prospero::ChannelType::kFloat,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = extent - 1, .width = extent - 1});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+      registers.SetTargetOutputMode(0, 4);
+      auto blend = registers.GetBlendControl(0);
+      blend.enable = true;
+      blend.color_srcblend = blend.color_destblend = blend.alpha_srcblend =
+          blend.alpha_destblend = static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+      registers.SetBlendControl(0, blend);
+      auto target_info = registers.GetRenderTarget(0).info;
+      target_info.blend_bypass = false;
+      registers.SetColorInfo(0, target_info);
+      // A merged (NGG) geometry stage: the vertex stage runs as a mesh shader.
+      registers.SetShaderStages(0x20);
+      registers.SetMaxOutputPerSubgroup(3);
+      registers.SetGsMaxVertOut(3);
+      registers.SetGsOutPrimType(2);
+      processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      processor.GetUcfg().SetGeControl({.primitive_group_size = 1, .vertex_group_size = 3});
+      shaders.SetEsShaderBase(vertex_address);
+      shaders.SetGsShaderResource1({.gs_vgpr_component_count = 3});
+      shaders.SetGsShaderResource2({.es_vgpr_component_count = 3});
+      shaders.SetPsShaderBase(pixel_address);
+
+      RenderColorInfo target{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), target, 0);
+      Require(name, "color target", static_cast<bool>(target.image_id),
+              "the 32x32 RGBA32F target was not created");
+      const auto clear = [&] {
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), target.image_id,
+                                           {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+      };
+      const auto read = [&] {
+        return ReadCachedTexel(name, context, target.image_id, {}, {extent, extent, 1});
+      };
+      const auto uniform = [&](const std::vector<u32> &pixels, u32 instances) {
+        const std::array<float, 4> per{0.25f, 0.0f, 0.0f, 0.5f};
+        for (size_t i = 0; i < pixels.size(); i++) {
+          if (pixels[i] != std::bit_cast<u32>(per[i % 4] * static_cast<float>(instances))) {
+            return false;
+          }
+        }
+        return pixels.size() == size_t{extent} * extent * 4u;
+      };
+      // The record as a producing shader would leave it: written on the GPU, CPU backing stale.
+      const auto gpu_record = [&](const std::array<u32, 5> &record) {
+        (void)cache.ObtainBuffer(args_address, sizeof(record), true, false);
+        Require(name, "gpu record", cache.TryWriteDataGpu(args_address, record.data(),
+                                                          sizeof(record)),
+                "the argument record could not be written on the GPU");
+      };
+      const auto source = [&](u32 index_buffer_size) {
+        DrawIndirectSource s;
+        s.args_addr = args_address;
+        s.stride = 20;
+        s.max_count = 1;
+        s.indexed = true;
+        s.index_base_addr = index_base;
+        s.index_buffer_size = index_buffer_size;
+        s.index_type_and_size = static_cast<u32>(Prospero::IndexType::kIndex16);
+        return s;
+      };
+      const auto reference = [&](u32 instances) {
+        clear();
+        RenderExecutorTestAccess::DrawIndex(
+            executor, scheduler.Current(),
+            {.index_count = 3,
+             .index_addr = reinterpret_cast<const void *>(index_base + start_index * 2u),
+             .instance_count = instances,
+             .index_type_and_size = static_cast<u32>(Prospero::IndexType::kIndex16),
+             .base_vertex = -5,
+             .first_instance = 0,
+             .offset_source = DrawOffsetSource::IndirectArgs});
+        RenderExecutorTestAccess::ResetBindings(executor);
+        return read();
+      };
+
+      // Always empty: INDEX_BUFFER_SIZE 1 (Astro Bot's per-flip indirect mesh draw).
+      clear();
+      gpu_record({3, 1, start_index, static_cast<u32>(-5), 0});
+      const auto empties = totals.always_empty.load();
+      const bool empty_taken =
+          RenderExecutorTestAccess::DrawIndirectNative(executor, scheduler.Current(), source(1));
+      RenderExecutorTestAccess::ResetBindings(executor);
+      Require(name, "always empty",
+              empty_taken == (mode != MI::Mode::Off) &&
+                  totals.always_empty.load() - empties == (mode != MI::Mode::Off ? 1u : 0u),
+              "a provably empty indirect mesh draw was not consumed (or was, with the switch off)");
+      if (empty_taken) {
+        Require(name, "always empty", cache.HasGpuDirtyBytes(args_address, 20),
+                "the provably empty draw read its record back");
+        Require(name, "always empty", uniform(read(), 0), "the provably empty draw drew");
+      }
+
+      // Drawable records: one dispatch, and 70,000 instances needing two host dispatches.
+      for (const u32 instances : {3u, 70000u}) {
+        const auto expected = reference(instances);
+        Require(name, "reference", uniform(expected, instances),
+                "the CPU path did not draw " + std::to_string(instances) + " instances");
+        clear();
+        gpu_record({3, instances, start_index, static_cast<u32>(-5), 0});
+        const auto draws = totals.draws.load();
+        const bool taken =
+            RenderExecutorTestAccess::DrawIndirectNative(executor, scheduler.Current(), source(64));
+        RenderExecutorTestAccess::ResetBindings(executor);
+        Require(name, "conversion", taken == conversion && totals.draws.load() - draws ==
+                                                              (conversion ? 1u : 0u),
+                "a drawable indirect mesh draw was converted with the conversion off (or not "
+                "with it on)");
+        if (taken) {
+          const auto pixels = read();
+          Require(name, "conversion", pixels == expected,
+                  "the GPU-converted draw differs from the CPU path (" +
+                      std::to_string(instances) + " instances)");
+        }
+      }
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      if (mode == MI::Mode::Verify || mode == MI::Mode::VerifyExit) {
+        Require(name, "verify", totals.mismatches.load() == 0 && totals.checks.load() >= 2,
+                "the completion check did not run or found a difference");
+      }
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "draw mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "draw allocation release failed");
+    std::printf("[gpu]     %-32s ok (mode %u)\n", name, static_cast<unsigned>(mode));
   }
 
   // Draw-prep end to end: the same two native draws recorded serially (RenderExecutor directly)
@@ -21875,6 +22633,23 @@ private:
     vk::PhysicalDeviceRobustness2FeaturesEXT available_robustness2{};
     available_robustness2.pNext = available_min_lod.pNext;
     available_min_lod.pNext = &available_robustness2;
+    // Optional: mesh shaders (the NGG vertex stages of the mesh draw checks).
+    bool mesh_extension = false;
+    {
+      u32 count = 0;
+      (void)m_physical_device.enumerateDeviceExtensionProperties(nullptr, &count, nullptr);
+      std::vector<vk::ExtensionProperties> extensions(count);
+      (void)m_physical_device.enumerateDeviceExtensionProperties(nullptr, &count,
+                                                                 extensions.data());
+      mesh_extension = std::ranges::any_of(extensions, [](const auto &extension) {
+        return std::strcmp(extension.extensionName, VK_EXT_MESH_SHADER_EXTENSION_NAME) == 0;
+      });
+    }
+    vk::PhysicalDeviceMeshShaderFeaturesEXT available_mesh{};
+    if (mesh_extension) {
+      available_mesh.pNext = available_min_lod.pNext;
+      available_min_lod.pNext = &available_mesh;
+    }
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_min_lod;
@@ -22021,6 +22796,21 @@ private:
     device_features.shaderInt64 = true;
     device_features.fillModeNonSolid = true;
     device_features.tessellationShader = true;
+    // Optional, as in the emulator: native indirect draws.
+    device_features.drawIndirectFirstInstance = available_features.drawIndirectFirstInstance;
+    device_features.multiDrawIndirect = available_features.multiDrawIndirect;
+    device_features12.drawIndirectCount = available_features12.drawIndirectCount;
+    m_draw_indirect_first_instance = available_features.drawIndirectFirstInstance == VK_TRUE;
+    m_multi_draw_indirect = available_features.multiDrawIndirect == VK_TRUE;
+    m_draw_indirect_count = available_features12.drawIndirectCount == VK_TRUE;
+    // Optional: mesh shaders, reported to the checks that open a MeshShaderScope.
+    vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features{};
+    m_mesh_shader = mesh_extension && available_mesh.meshShader == VK_TRUE;
+    if (m_mesh_shader) {
+      mesh_features.meshShader = VK_TRUE;
+      mesh_features.pNext = const_cast<void *>(device_info.pNext);
+      device_info.pNext = &mesh_features;
+    }
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -22035,6 +22825,12 @@ private:
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
     if (robustness2_supported) {
       device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    }
+    if (m_mesh_shader) {
+      device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+      vk::PhysicalDeviceProperties2 properties{};
+      properties.pNext = &m_mesh_properties;
+      m_physical_device.getProperties2(&properties);
     }
     // KYTY_PIPELINE_LIBRARY=1 runs the renderer's pipeline creation through graphics pipeline
     // libraries (pipelineLibrary.h), as on a production device that supports them. Checks that
@@ -22400,6 +23196,13 @@ private:
   bool m_pipeline_library = false;
   bool m_storage_image_read_without_format = false;
   bool m_sampler_filter_minmax = false;
+  // Enabled on the device when supported; the runtime context reports them only inside
+  // MeshShaderScope, so every other check keeps the context it always had.
+  bool m_mesh_shader = false;
+  vk::PhysicalDeviceMeshShaderPropertiesEXT m_mesh_properties{};
+  bool m_draw_indirect_first_instance = false;
+  bool m_multi_draw_indirect = false;
+  bool m_draw_indirect_count = false;
   std::unique_ptr<RenderContext> m_renderer;
 };
 
@@ -41112,6 +41915,22 @@ int main(int argc, char **argv) {
     vulkan.CheckEagerReadback();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--mesh-indirect-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckMeshIndirectConversion();
+    vulkan.CheckMeshIndirectDraw();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sampler-memo-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSamplerMemo();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--set-reuse-fresh-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSetReuseFresh();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
@@ -41340,6 +42159,10 @@ int main(int argc, char **argv) {
   vulkan.CheckBindingEpochMemo();
   vulkan.CheckTrackerGapDetectors();
   vulkan.CheckEagerReadback();
+  vulkan.CheckMeshIndirectConversion();
+  vulkan.CheckMeshIndirectDraw();
+  vulkan.CheckSamplerMemo();
+  vulkan.CheckSetReuseFresh();
 #endif
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckTexelSyncOverStaleGpuDirtyBytes();

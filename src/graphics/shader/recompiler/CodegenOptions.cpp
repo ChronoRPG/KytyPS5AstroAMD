@@ -57,6 +57,13 @@ CodegenOptions FromEnvironment() {
 		}
 	}
 	options.srt_variant_reads = EnvFlag("KYTY_SRT_VARIANT_READS", options.srt_variant_reads);
+	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit (renderer/meshIndirect.h: GPU-converted indirect
+	// mesh draws); unset, 0 and "empty" keep the pushed-dword-only mesh draw parameters.
+	if (const auto* mode = std::getenv("KYTY_NATIVE_INDIRECT_MESH"); mode != nullptr) {
+		options.mesh_indirect_params =
+		    std::strcmp(mode, "1") == 0 || std::strcmp(mode, "on") == 0 ||
+		    std::strcmp(mode, "verify") == 0 || std::strcmp(mode, "exit") == 0;
+	}
 	if (const auto* mode = std::getenv("KYTY_MAD_MODE"); mode != nullptr) {
 		if (std::strcmp(mode, "exact") == 0) {
 			options.mad_mode = MadMode::Exact;

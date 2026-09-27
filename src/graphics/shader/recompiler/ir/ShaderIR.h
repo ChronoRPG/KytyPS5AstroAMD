@@ -313,6 +313,11 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 51u);
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// Mesh draw dword 3 (the index size: 0, 1, 2 or 4 when pushed by the CPU) marking a native
+	// indirect mesh draw: dwords 0-1 then hold the device address of the dispatch's parameter
+	// block, whose first MeshDrawDwordCount dwords replace the pushed ones (CodegenOptions::
+	// mesh_indirect_params, renderer/meshIndirect.h).
+	static constexpr uint32_t MeshIndirectSentinel = 0xffffffffu;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
