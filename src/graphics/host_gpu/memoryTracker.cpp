@@ -40,6 +40,36 @@ void MemoryTracker::DemoteHotPages(uint64_t vaddr, uint64_t size) {
 	MemoryStats::Count(MemoryStats::Counter::HotDemotions, demoted);
 }
 
+std::vector<uint64_t> MemoryTracker::SettleHotPages(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	std::vector<uint64_t> pages;
+	if (m_hot_count.load(std::memory_order_relaxed) == 0) {
+		return pages;
+	}
+	const auto collect = [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		(void)manager->SettleHot(manager->GetCpuAddr() + offset, bytes, m_hot_count,
+		                         [&pages](uint64_t page) { pages.push_back(page); });
+	};
+	if (size != 0) {
+		Iterate<false>(vaddr, size, collect);
+	} else {
+		std::vector<RegionManager*> managers;
+		{
+			std::lock_guard lock(m_region_mutex);
+			managers.reserve(m_region_storage.size());
+			for (const auto& manager: m_region_storage) {
+				managers.push_back(manager.get());
+			}
+		}
+		for (auto* manager: managers) {
+			collect(manager, 0, TRACKER_REGION_SIZE);
+		}
+	}
+	MemoryStats::Count(MemoryStats::Counter::HotDemotions, pages.size());
+	return pages;
+}
+
 void MemoryTracker::SweepHotPages(uint32_t idle_frames) {
 	CheckNotInUploadCallback();
 	if (m_hot_count.load(std::memory_order_relaxed) == 0) {

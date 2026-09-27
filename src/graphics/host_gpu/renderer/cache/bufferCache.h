@@ -187,6 +187,11 @@ private:
 	                     std::vector<vk::BufferCopy>& copies, uint64_t& total_size,
 	                     std::vector<uint64_t>& demote);
 	void EraseHotShadows(uint64_t vaddr, uint64_t size);
+	// Before (or right after recording) a GPU-side write of the range that tracked GPU ownership
+	// does not cover (image downloads into the buffer, unbounded address writers; size 0 = all):
+	// returns its hot pages to normal tracking, clean unless their contents changed since their
+	// last upload. From then on the ordinary fault tracking decides their next upload.
+	void SettleHotPages(uint64_t vaddr, uint64_t size);
 	void MaintainHotPages();
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Records a download of a GPU-modified image into `buffer` at the image's own guest address
@@ -262,9 +267,11 @@ private:
 	std::atomic<bool>                                 m_has_known_fills {false};
 	const bool                                        m_bda_incremental_sync;
 	MemoryTracker                                     m_memory_tracker;
-	// Hot pages: exact copy of the last contents uploaded for each hot page, valid for the buffer
-	// registered at that page until any other upload or GPU-side write of the page, an unbounded
-	// writer, or the buffer's unregistration erases it (GPU thread only).
+	// Hot pages: exact copy of the last contents uploaded for each hot page (GPU thread only).
+	// While a page is hot its buffer bytes equal this copy: every other write of them either
+	// returns the page to normal tracking first (written uploads, SettleHotPages for image
+	// downloads and address writers, untracking) or keeps the bytes (joins copy them). A normal
+	// upload of the page erases the copy.
 	struct HotShadow {
 		std::unique_ptr<uint8_t[]> data;
 		uint32_t                   last_change = 0;

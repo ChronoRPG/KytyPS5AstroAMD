@@ -2504,15 +2504,24 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		return false;
 	}
 
-	std::scoped_lock lock {m_texture_cache.m_lock};
-	auto& image = m_texture_cache.m_slot_images[selected];
-	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
-	if (!m_texture_cache.SafeToDownload(image)) {
+	uint64_t image_address = 0;
+	uint64_t copied        = 0;
+	{
+		std::scoped_lock lock {m_texture_cache.m_lock};
+		auto&            image = m_texture_cache.m_slot_images[selected];
+		// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
+		if (!m_texture_cache.SafeToDownload(image)) {
+			return false;
+		}
+		image_address = image.info.data.address;
+		copied        = RecordImageDownload(buffer, selected);
+	}
+	if (copied == 0) {
 		return false;
 	}
-	if (RecordImageDownload(buffer, selected) == 0) {
-		return false;
-	}
+	// The image bytes now in the buffer are not tracked as GPU-owned: hot pages there go back to
+	// the ordinary fault tracking (MemoryTracker hot pages, SettleHotPages).
+	SettleHotPages(image_address, copied);
 	MemoryStats::Count(MemoryStats::Counter::BufferFromImageSyncs);
 	return true;
 }

@@ -927,6 +927,44 @@ void TestWrittenUploadCopiesOutsideLock() {
   Release(memory);
 }
 
+void TestHotPageSettle() {
+  MemoryTracker::FaultPolicy policy;
+  policy.hot_frames = 1;
+  policy.hot_max = 8;
+  PolicyHarness harness(policy);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  UploadAll(tracker, address, page_size * 4);
+  WriteFault(tracker, address);
+  WriteFault(tracker, address + page_size * 2);
+  Check(tracker.HotPageCount() == 2, "pages were not promoted for settling");
+
+  // A ranged settle only touches its hot pages: they become clean and write-protected.
+  const auto settled = tracker.SettleHotPages(address, page_size * 2);
+  Check(settled.size() == 1 && settled[0] == address && tracker.HotPageCount() == 1 &&
+            !tracker.IsRegionCpuModified(address, page_size) && !IsWritable(memory) &&
+            tracker.IsRegionHot(address + page_size * 2, page_size) &&
+            IsWritable(memory + page_size * 2),
+        "ranged settle did not return exactly its hot page to clean tracking");
+  // The caller found the contents changed: dirty and writable again.
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
+        "settled page could not be re-dirtied");
+
+  // Settling everything (size 0) reaches every region.
+  const auto all = tracker.SettleHotPages(0, 0);
+  Check(all.size() == 1 && all[0] == address + page_size * 2 &&
+            tracker.HotPageCount() == 0 && !IsWritable(memory + page_size * 2),
+        "global settle missed a hot page");
+  Check(tracker.SettleHotPages(0, 0).empty(), "settle without hot pages reported pages");
+
+  tracker.UntrackMemory(address, page_size * 4);
+  Release(memory);
+}
+
 void TestCrossRegionUpload() {
   constexpr uintptr_t base = 0x0000000200010000ull;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
@@ -1477,6 +1515,7 @@ int main(int argc, char **argv) {
   TestHotPageDemotionPaths();
   TestForeignWatcherFaultsDoNotPromote();
   TestWrittenUploadCopiesOutsideLock();
+  TestHotPageSettle();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();

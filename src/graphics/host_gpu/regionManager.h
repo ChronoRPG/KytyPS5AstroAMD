@@ -305,6 +305,31 @@ public:
 		return demoted;
 	}
 
+	// Returns the hot pages of the range to normal tracking as CLEAN pages: clears their CPU-dirty
+	// bits and write-protects them, reporting each page to func(address). The caller compares each
+	// with its last uploaded contents afterwards and marks changed ones CPU-dirty again; a write
+	// landing after the protection faults and marks the page itself.
+	template <typename Func>
+	uint32_t SettleHot(uint64_t vaddr, uint64_t size, std::atomic_uint32_t& hot_count,
+	                   Func&& func) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		const RegionBits hot(m_hot, start, end);
+		const auto       settled = static_cast<uint32_t>(hot.Count());
+		if (settled == 0) {
+			return 0;
+		}
+		m_hot ^= hot;
+		hot_count.fetch_sub(settled, std::memory_order_relaxed);
+		m_cpu_dirty ^= hot;
+		UpdateProtection<true, false>();
+		for (const auto [first, last]: hot) {
+			for (auto page = first; page < last; page++) {
+				func(m_cpu_addr + page * TRACKER_PAGE_SIZE);
+			}
+		}
+		return settled;
+	}
+
 	// Demotes hot pages no upload visited for more than `idle_frames` frames.
 	uint32_t SweepHot(uint32_t frame, uint32_t idle_frames, std::atomic_uint32_t& hot_count) {
 		if (m_hot.None()) {

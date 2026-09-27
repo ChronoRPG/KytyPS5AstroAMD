@@ -80,8 +80,9 @@ uint64_t ParseEnvU64(const char* name, uint64_t fallback) {
 //                         uploads copy it only when its contents differ from the last copy
 //                         uploaded (exact shadow compare). It returns to normal tracking after
 //                         KYTY_HOT_PAGE_QUIET_FRAMES frames (default 8) without a change or
-//                         without an upload, on a GPU write, or when its buffer goes away. At most
-//                         KYTY_HOT_PAGE_MAX pages (default 1024, 4 KiB shadow each) are hot.
+//                         without an upload, on any GPU-side write that can reach it, or when its
+//                         buffer is untracked. At most KYTY_HOT_PAGE_MAX pages (default 1024,
+//                         4 KiB shadow each) are hot.
 //   KYTY_UPLOAD_COPY_OUTSIDE_LOCK  0 copies written uploads with their region locks held (the
 //                         previous behaviour) instead of MemoryTracker::ForEachWrittenUploadRange.
 MemoryTracker::FaultPolicy BufferFaultPolicy() {
@@ -285,8 +286,6 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_bda_pagetable_buffer.Fill(pages.first * sizeof(vk::DeviceAddress),
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
-		// Hot-page shadows describe this buffer's contents only.
-		EraseHotShadows(buffer.CpuAddress(), buffer.Size());
 	}
 }
 
@@ -488,6 +487,25 @@ void BufferCache::EraseHotShadows(uint64_t vaddr, uint64_t size) {
 	auto it = m_hot_shadows.lower_bound(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE));
 	while (it != m_hot_shadows.end() && it->first < vaddr + size) {
 		it = m_hot_shadows.erase(it);
+	}
+}
+
+void BufferCache::SettleHotPages(uint64_t vaddr, uint64_t size) {
+	if (m_memory_tracker.HotPageCount() == 0) {
+		return;
+	}
+	for (const auto page: m_memory_tracker.SettleHotPages(vaddr, size)) {
+		// The page is write-protected now: its contents can no longer change unobserved. If they
+		// differ from the last upload (or nothing was uploaded while hot), the CPU wrote since.
+		const auto shadow = m_hot_shadows.find(page);
+		if (shadow == m_hot_shadows.end() ||
+		    std::memcmp(shadow->second.data.get(), reinterpret_cast<const void*>(page),
+		                TRACKER_PAGE_SIZE) != 0) {
+			m_memory_tracker.MarkRegionAsCpuModified(page, TRACKER_PAGE_SIZE);
+		}
+		if (shadow != m_hot_shadows.end()) {
+			m_hot_shadows.erase(shadow);
+		}
 	}
 }
 
@@ -958,8 +976,6 @@ void BufferCache::CompleteAllSideReadbacks() {
 }
 
 void BufferCache::NoteBufferContentWrite(uint64_t vaddr, uint64_t size) {
-	// A GPU-side write makes the buffer differ from any hot-page shadow of the range.
-	EraseHotShadows(vaddr, size);
 	if (m_side == nullptr) {
 		return;
 	}
@@ -1605,8 +1621,8 @@ void BufferCache::InvalidateContentRevisions() {
 	// Unbounded GPU writes follow; retire clean-read verdicts along with the revisions.
 	CleanVerdict::Invalidate();
 	++m_content_revision_epoch;
-	// They may change any buffer byte, so no hot-page shadow still describes its buffer.
-	m_hot_shadows.clear();
+	// They may change any buffer byte, including bytes of hot pages.
+	SettleHotPages(0, 0);
 	// Their bytes carry no writer tick, so no readback may skip this recording.
 	m_unbounded_write_tick = m_scheduler.CurrentTick();
 }

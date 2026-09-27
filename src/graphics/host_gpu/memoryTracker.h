@@ -120,6 +120,10 @@ public:
 	void DemoteHotPages(uint64_t vaddr, uint64_t size);
 	// Demotes hot pages no upload visited for more than idle_frames frames.
 	void SweepHotPages(uint32_t idle_frames);
+	// Returns the hot pages of [vaddr, vaddr + size) (every hot page when size is 0) to normal
+	// tracking as clean, write-protected pages (RegionManager::SettleHot) and lists them. The
+	// caller must mark each one whose contents changed since its last upload CPU-dirty again.
+	[[nodiscard]] std::vector<uint64_t> SettleHotPages(uint64_t vaddr, uint64_t size);
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                           const char* operation) const noexcept;
