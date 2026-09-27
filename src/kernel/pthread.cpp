@@ -11,6 +11,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "kernel/memory.h"
+#include "kernel/pendingSignals.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/runtimeLinker.h"
@@ -22,6 +23,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <memory>
@@ -502,22 +504,37 @@ void PthreadWakeForSignal(Pthread thread) {
 
 void KernelDispatchPendingSignalForCurrentThread();
 
+// sched_yield (FreeBSD sched_relinquish): another thread that is ready on this CPU runs first;
+// with none, the call returns at once. SwitchToThread is exactly that. The legacy path followed an
+// empty SwitchToThread with Sleep(0), a second system call per yield. In Astro Bot's GPU-fence
+// poll (eboot 0x114b2f0: scePthreadYield + sceKernelUsleep(0) in a loop) that Sleep(0) was about
+// 15 of the thread's 48 ms/flip (DEEP-TRACE-U52 section 3.6).
 static void SchedulerBackoffOnce() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (SwitchToThread() == 0) {
-		Sleep(0);
+	if (GuestSchedLegacy()) {
+		if (SwitchToThread() == 0) {
+			Sleep(0);
+		}
+		return;
 	}
-#else
-	std::this_thread::yield();
 #endif
+	(void)Common::YieldToReadyThread();
 }
 
+// A sleep of at most 1 us. FreeBSD's nanosleep blocks for at least the requested time
+// (kern_nanosleep sleeps to an absolute deadline). A Windows wait cannot be that short, so the
+// thread yields once like a block would, then pauses until the microsecond has passed. The legacy
+// path only yielded, and could return early.
 static bool SleepMicroSchedulerBackoff(uint64_t microseconds) {
 	if (microseconds > 1) {
 		return false;
 	}
 
-	SchedulerBackoffOnce();
+	if (GuestSchedLegacy()) {
+		SchedulerBackoffOnce();
+		return true;
+	}
+	Common::YieldAndPauseMicro(static_cast<uint32_t>(microseconds));
 	return true;
 }
 
@@ -3128,6 +3145,21 @@ bool PthreadTakePendingSignal(Pthread thread, int signum) {
 	return (thread->pending_signal_mask.fetch_and(~mask, std::memory_order_acq_rel) & mask) != 0;
 }
 
+int PthreadTakeLowestPendingSignal(Pthread thread, int limit) {
+	if (thread == nullptr) {
+		return -1;
+	}
+	return TakeLowestPendingSignal(thread->pending_signal_mask, limit);
+}
+
+bool GuestSchedLegacy() {
+	static const bool legacy = [] {
+		const auto* value = std::getenv("KYTY_GUEST_SCHED");
+		return value != nullptr && std::strcmp(value, "legacy") == 0;
+	}();
+	return legacy;
+}
+
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size) {
 	if (thread == nullptr || thread->attr == nullptr || stack_addr == nullptr ||
 	    stack_size == nullptr) {
@@ -3842,11 +3874,9 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
-	Common::Timer t;
-	t.Start();
+	// usleep(0) returns at once, as FreeBSD's nanosleep does for a zero time, after the pending
+	// signal check a system call return makes (SleepMicroWithSignalPoll).
 	SleepMicroWithSignalPoll(microseconds);
-	// double ts = t.GetTimeS();
-	// LOGF("\tactual: %g microseconds\n", ts * 1000000.0);
 	return OK;
 }
 

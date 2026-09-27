@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
@@ -345,6 +346,9 @@ void CommandScheduler::SetProgressHook(ProgressHook hook, void* context) {
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	// It blocks on the operation queue and on the timeline semaphore; the CP waits for it
+	// (WaitPriorityOperations) and so does the guest (end-of-pipe interrupts, flips, readbacks).
+	Common::RaiseServiceThreadPriority();
 	const bool batched       = PriorityWakeupsBatched();
 	bool       has_previous  = false;
 	uint64_t   previous_tick = 0;

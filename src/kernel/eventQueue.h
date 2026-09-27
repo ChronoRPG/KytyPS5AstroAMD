@@ -53,8 +53,43 @@ struct KernelEqueueEvent {
 	uint64_t                deadline_ns = 0;
 	KernelEvent             event;
 	KernelFilter            filter;
+	// Legacy mode only (KYTY_EQUEUE_COALESCE=0): one entry per trigger that arrived while the
+	// event was already pending. By default such triggers are merged into `event`, the way a
+	// kqueue knote is updated in place (see KernelEqueueApplyTrigger).
 	std::deque<KernelEvent> pending_events;
+	// The event's place in its queue's active list, which sets the delivery order (kqueue_scan):
+	// assigned when the event becomes pending, and again when a level-triggered event is re-queued
+	// behind the others after its delivery.
+	uint64_t active_seq = 0;
+	// Triggers merged into the pending state since its last delivery, and whether one of them
+	// replaced a different `data` value. Diagnostics only (FrameEvent.EqueueCoalesced*, and the
+	// KYTY_EQUEUE_COALESCE=verify log).
+	uint64_t coalesced             = 0;
+	bool     coalesced_data_change = false;
+	uint64_t verify_logged         = 0;
 };
+
+// How a trigger reaches an event that is already pending (KYTY_EQUEUE_COALESCE):
+// - Coalesce (default, "1"): the pending state absorbs it. The filter's counters keep counting
+//   and `data` holds the newest value, so one bounded state per registered event, as in kqueue.
+// - Legacy ("0"): the old behaviour, one queued copy per trigger (unbounded).
+// - Verify ("verify"): Coalesce, and also prints every event whose merged-trigger count reaches a
+//   new power of two, with its queue, ident, filter and whether `data` changed.
+enum class EqueueCoalesceMode { Legacy, Coalesce, Verify };
+[[nodiscard]] EqueueCoalesceMode KernelEqueueCoalesceMode();
+void                             KernelEqueueSetCoalesceModeForTests(EqueueCoalesceMode mode);
+
+// For filters' trigger functions, under the queue lock: `next` is the event state after one more
+// trigger, computed from the event's current state (the pending one, or the cleared one).
+void KernelEqueueApplyTrigger(KernelEqueueEvent* event, const KernelEvent& next);
+
+struct EqueueCoalesceStats {
+	uint64_t coalesced_triggers = 0; // triggers merged into an already pending event
+	uint64_t data_changes       = 0; // of those, triggers that replaced a different `data`
+	uint64_t merged_deliveries  = 0; // deliveries that carried at least one merged trigger
+	uint64_t max_merged         = 0; // most triggers merged into one delivery
+};
+[[nodiscard]] EqueueCoalesceStats KernelEqueueGetCoalesceStats();
 
 [[nodiscard]] KernelEqueueRef KernelPinEqueue(KernelEqueue eq);
 

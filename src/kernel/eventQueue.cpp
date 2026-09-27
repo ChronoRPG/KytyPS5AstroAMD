@@ -3,14 +3,20 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/eventQueueFilters.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <list>
@@ -30,6 +36,95 @@ static uint64_t MonotonicTimeNs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())
 	                                 .count());
+}
+
+namespace {
+
+std::atomic<int> g_coalesce_mode_for_tests {-1};
+
+struct CoalesceStatsCounters {
+	std::atomic<uint64_t> coalesced_triggers {0};
+	std::atomic<uint64_t> data_changes {0};
+	std::atomic<uint64_t> merged_deliveries {0};
+	std::atomic<uint64_t> max_merged {0};
+};
+CoalesceStatsCounters g_coalesce_stats;
+
+EqueueCoalesceMode ReadCoalesceMode() {
+	const auto* value = std::getenv("KYTY_EQUEUE_COALESCE");
+	auto        mode  = EqueueCoalesceMode::Coalesce;
+	if (value != nullptr && std::strcmp(value, "0") == 0) {
+		mode = EqueueCoalesceMode::Legacy;
+	} else if (value != nullptr && std::strcmp(value, "verify") == 0) {
+		mode = EqueueCoalesceMode::Verify;
+	}
+	std::printf("Kyty event queues: %s (KYTY_EQUEUE_COALESCE)\n",
+	            mode == EqueueCoalesceMode::Legacy ? "one queued copy per trigger (legacy)"
+	            : mode == EqueueCoalesceMode::Verify
+	                ? "repeated triggers coalesce, merges reported (verify)"
+	                : "repeated triggers coalesce");
+	std::fflush(stdout);
+	return mode;
+}
+
+} // namespace
+
+EqueueCoalesceMode KernelEqueueCoalesceMode() {
+	const int forced = g_coalesce_mode_for_tests.load(std::memory_order_relaxed);
+	if (forced >= 0) [[unlikely]] {
+		return static_cast<EqueueCoalesceMode>(forced);
+	}
+	static const EqueueCoalesceMode mode = ReadCoalesceMode();
+	return mode;
+}
+
+void KernelEqueueSetCoalesceModeForTests(EqueueCoalesceMode mode) {
+	g_coalesce_mode_for_tests.store(static_cast<int>(mode), std::memory_order_relaxed);
+}
+
+EqueueCoalesceStats KernelEqueueGetCoalesceStats() {
+	EqueueCoalesceStats stats;
+	stats.coalesced_triggers = g_coalesce_stats.coalesced_triggers.load(std::memory_order_relaxed);
+	stats.data_changes       = g_coalesce_stats.data_changes.load(std::memory_order_relaxed);
+	stats.merged_deliveries  = g_coalesce_stats.merged_deliveries.load(std::memory_order_relaxed);
+	stats.max_merged         = g_coalesce_stats.max_merged.load(std::memory_order_relaxed);
+	return stats;
+}
+
+void KernelEqueueApplyTrigger(KernelEqueueEvent* event, const KernelEvent& next) {
+	EXIT_IF(event == nullptr);
+	if (!event->triggered) {
+		event->event     = next;
+		event->triggered = true;
+		return;
+	}
+	if (KernelEqueueCoalesceMode() == EqueueCoalesceMode::Legacy) {
+		event->pending_events.push_back(next);
+		return;
+	}
+	// Exact coalescing: `next` was derived from the pending state, so the filter's counters
+	// include this trigger and `data` is the newest value. Nothing else is kept.
+	const bool data_change = next.data != event->event.data;
+	event->event           = next;
+	event->coalesced++;
+	event->coalesced_data_change |= data_change;
+	g_coalesce_stats.coalesced_triggers.fetch_add(1, std::memory_order_relaxed);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::EqueueCoalescedTriggers);
+	if (data_change) {
+		g_coalesce_stats.data_changes.fetch_add(1, std::memory_order_relaxed);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::EqueueCoalescedDataChanges);
+	}
+	// Events the guest does not consume (the legacy queue grew without bound on these): reported
+	// at 1024 merged triggers and at every power of two after it.
+	const auto merged = event->coalesced;
+	if (merged >= 1024u && (merged & (merged - 1u)) == 0u &&
+	    KernelEqueueCoalesceMode() == EqueueCoalesceMode::Verify) {
+		std::printf("Equeue coalesce verify: ident=0x%" PRIx64 " filter=%d udata=0x%016" PRIx64
+		            " has %" PRIu64 " triggers pending as one\n",
+		            static_cast<uint64_t>(event->event.ident), static_cast<int>(event->event.filter),
+		            reinterpret_cast<uint64_t>(event->event.udata), merged + 1u);
+		std::fflush(stdout);
+	}
 }
 
 static std::unordered_map<KernelEqueue, KernelEqueueRef> g_equeues;
@@ -55,6 +150,8 @@ public:
 	void Close();
 
 private:
+	int  GetTriggeredEventsLegacy(KernelEvent* ev, int num);
+	void NoteDelivery(KernelEqueueEvent& event);
 	void TriggerExpiredTimers(uint64_t now_ns);
 	bool GetNextTimerWaitMicros(uint64_t now_ns, uint32_t* wait_micros) const;
 
@@ -62,8 +159,9 @@ private:
 	Common::Mutex                m_mutex;
 	Common::CondVar              m_cond_var;
 	std::string                  m_name;
-	KernelEqueue                 m_handle = KERNEL_EQUEUE_INVALID;
-	bool                         m_closed = false;
+	KernelEqueue                 m_handle          = KERNEL_EQUEUE_INVALID;
+	bool                         m_closed          = false;
+	uint64_t                     m_next_active_seq = 1;
 };
 
 KernelEqueuePrivate::~KernelEqueuePrivate() {
@@ -97,6 +195,79 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 
 	TriggerExpiredTimers(MonotonicTimeNs());
 
+	if (KernelEqueueCoalesceMode() == EqueueCoalesceMode::Legacy) {
+		return GetTriggeredEventsLegacy(ev, num);
+	}
+
+	// As kqueue_scan: every event pending when the scan starts is reported at most once, in the
+	// order it became pending. A level-triggered event that is still pending after its delivery
+	// (no EV_CLEAR and no reset) goes to the back of the list, past this scan's marker.
+	const uint64_t marker = m_next_active_seq;
+	int            ret    = 0;
+	while (ret < num) {
+		auto next = m_events.end();
+		for (auto it = m_events.begin(); it != m_events.end(); ++it) {
+			if (it->triggered && it->active_seq < marker &&
+			    (next == m_events.end() || it->active_seq < next->active_seq)) {
+				next = it;
+			}
+		}
+		if (next == m_events.end()) {
+			break;
+		}
+		auto& event = *next;
+		ev[ret++]   = event.event;
+		NoteDelivery(event);
+		if ((event.event.flags & EV_ONESHOT) != 0) {
+			m_events.erase(next);
+			continue;
+		}
+		if (event.filter.reset_func != nullptr) {
+			event.filter.reset_func(&event);
+		} else if ((event.event.flags & EV_CLEAR) != 0) {
+			event.triggered    = false;
+			event.event.fflags = 0;
+			event.event.data   = 0;
+		}
+		if (event.triggered) {
+			event.active_seq = m_next_active_seq++;
+		}
+	}
+
+	return ret;
+}
+
+void KernelEqueuePrivate::NoteDelivery(KernelEqueueEvent& event) {
+	const auto merged      = event.coalesced;
+	const bool data_change = event.coalesced_data_change;
+	event.coalesced             = 0;
+	event.coalesced_data_change = false;
+	if (merged == 0) {
+		return;
+	}
+	g_coalesce_stats.merged_deliveries.fetch_add(1, std::memory_order_relaxed);
+	auto seen = g_coalesce_stats.max_merged.load(std::memory_order_relaxed);
+	while (seen < merged && !g_coalesce_stats.max_merged.compare_exchange_weak(
+	                            seen, merged, std::memory_order_relaxed)) {
+	}
+	if (KernelEqueueCoalesceMode() != EqueueCoalesceMode::Verify) {
+		return;
+	}
+	// Report each event's first merge and every new power of two after it (bounded output).
+	if (event.verify_logged != 0 && merged < event.verify_logged * 2u) {
+		return;
+	}
+	event.verify_logged = merged;
+	std::printf("Equeue coalesce verify: queue '%s' ident=0x%" PRIx64
+	            " filter=%d delivered %" PRIu64 " triggers as one (data %s, fflags=0x%" PRIx32
+	            ")\n",
+	            m_name.c_str(), static_cast<uint64_t>(event.event.ident),
+	            static_cast<int>(event.event.filter), merged + 1u,
+	            data_change ? "changed" : "unchanged", event.event.fflags);
+	std::fflush(stdout);
+}
+
+int KernelEqueuePrivate::GetTriggeredEventsLegacy(KernelEvent* ev, int num) {
 	int ret = 0;
 
 	for (auto it = m_events.begin(); it != m_events.end();) {
@@ -137,10 +308,20 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 }
 
 void KernelEqueuePrivate::TriggerExpiredTimers(uint64_t now_ns) {
-	for (auto& event: m_events) {
-		if (!event.triggered && event.deadline_ns != 0 && event.deadline_ns <= now_ns) {
-			event.triggered = true;
+	// Expired timers become pending in deadline order, the order their callouts would have fired.
+	for (;;) {
+		KernelEqueueEvent* earliest = nullptr;
+		for (auto& event: m_events) {
+			if (!event.triggered && event.deadline_ns != 0 && event.deadline_ns <= now_ns &&
+			    (earliest == nullptr || event.deadline_ns < earliest->deadline_ns)) {
+				earliest = &event;
+			}
 		}
+		if (earliest == nullptr) {
+			return;
+		}
+		earliest->triggered  = true;
+		earliest->active_seq = m_next_active_seq++;
 	}
 }
 
@@ -215,7 +396,12 @@ int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
 			pending.udata = event.event.udata;
 		}
 	} else {
-		m_events.push_back(event);
+		auto& added = m_events.emplace_back(event);
+		added.pending_events.clear();
+		added.coalesced             = 0;
+		added.coalesced_data_change = false;
+		added.verify_logged         = 0;
+		added.active_seq            = added.triggered ? m_next_active_seq++ : 0;
 	}
 
 	m_cond_var.Signal();
@@ -232,12 +418,18 @@ int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tri
 		return e.event.ident == ident && e.event.filter == filter;
 	});
 	if (it != m_events.end()) {
-		auto& event = *it;
+		auto&      event          = *it;
+		const bool was_triggered = event.triggered;
 
 		if (event.filter.trigger_func != nullptr) {
 			event.filter.trigger_func(&event, trigger_data);
 		} else {
 			event.triggered = true;
+		}
+		// An event that is already pending keeps its place in the active list (kqueue does not
+		// re-queue an active knote); a newly pending one goes to the back.
+		if (!was_triggered && event.triggered) {
+			event.active_seq = m_next_active_seq++;
 		}
 
 		m_cond_var.Signal();
@@ -257,14 +449,9 @@ static void UserEventTriggerFunc(KernelEqueueEvent* event, void* trigger_data) {
 
 static void AmprEventTriggerFunc(KernelEqueueEvent* event, void* trigger_data) {
 	EXIT_IF(event == nullptr);
-	auto triggered_event = event->event;
-	triggered_event.data = static_cast<intptr_t>(reinterpret_cast<uintptr_t>(trigger_data));
-	if (event->triggered) {
-		event->pending_events.push_back(triggered_event);
-	} else {
-		event->event     = triggered_event;
-		event->triggered = true;
-	}
+	KernelEqueueApplyTrigger(
+	    event, AmprNextState(event->event, static_cast<uint64_t>(
+	                                           reinterpret_cast<uintptr_t>(trigger_data))));
 }
 
 static void UserEventResetFunc(KernelEqueueEvent* event) {

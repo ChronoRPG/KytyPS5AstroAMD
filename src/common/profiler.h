@@ -854,6 +854,12 @@ enum class FrameEvent : uint32_t {
 	// KYTY_DRAW_SEQUENCE_FAST, textures: stages whose T# words matched one of their earlier sets
 	// (PreparedBindings::texture_history), before that set's repeat was checked.
 	DrawSequenceTextureHistoryHits,
+	// KYTY_EQUEUE_COALESCE: kernel-event triggers merged into an event that was already pending
+	// (instead of queued), and those of them that replaced a different data value.
+	EqueueCoalescedTriggers,
+	EqueueCoalescedDataChanges,
+	// KYTY_DRAW_PREP_HOT: parked (cold) draw-prep workers woken because the unclaimed backlog grew.
+	DrawPrepColdWakes,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

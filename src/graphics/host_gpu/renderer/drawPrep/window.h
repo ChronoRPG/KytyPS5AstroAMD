@@ -76,6 +76,13 @@ public:
 		       m_published.load(std::memory_order_seq_cst);
 	}
 
+	// Published slots no thread has claimed yet. The claim counter is read first: it never passes
+	// the published count, so the difference cannot underflow. Any thread.
+	[[nodiscard]] uint64_t Unclaimed() const noexcept {
+		const auto claimed = m_next_claim.load(std::memory_order_acquire);
+		return m_published.load(std::memory_order_seq_cst) - claimed;
+	}
+
 	// Claims the oldest published slot no one has claimed. Null when there is none.
 	[[nodiscard]] Payload* TryClaim(uint64_t& seq) noexcept {
 		for (;;) {
