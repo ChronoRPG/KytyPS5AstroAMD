@@ -705,7 +705,6 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.CpRecorderRingFull.Calls.Cumulative",
     "FrameWait.CpRecorderExecute.Calls.Cumulative",
     "FrameWait.DrawPrepSteal.Calls.Cumulative",
-    "FrameWait.EopTimestampPublish.Calls.Cumulative",
     "FrameWait.DrawPrepBindingPlan.Calls.Cumulative",
     "FrameWait.DrawPrepWorker1.Calls.Cumulative",
     "FrameWait.DrawPrepWorker2.Calls.Cumulative",
@@ -715,6 +714,7 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.DrawPrepWorker6.Calls.Cumulative",
     "FrameWait.DrawPrepWorker7.Calls.Cumulative",
     "FrameWait.DrawPrepWorker8.Calls.Cumulative",
+    "FrameWait.EopTimestampPublish.Calls.Cumulative",
 };
 static_assert(kFrameWaitCallNames.back() != nullptr, "FrameWait names must match the enum");
 constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
@@ -764,7 +764,6 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.CpRecorderRingFull.Nanoseconds.Cumulative",
     "FrameWait.CpRecorderExecute.Nanoseconds.Cumulative",
     "FrameWait.DrawPrepSteal.Nanoseconds.Cumulative",
-    "FrameWait.EopTimestampPublish.Nanoseconds.Cumulative",
     "FrameWait.DrawPrepBindingPlan.Nanoseconds.Cumulative",
     "FrameWait.DrawPrepWorker1.Nanoseconds.Cumulative",
     "FrameWait.DrawPrepWorker2.Nanoseconds.Cumulative",
@@ -774,6 +773,7 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.DrawPrepWorker6.Nanoseconds.Cumulative",
     "FrameWait.DrawPrepWorker7.Nanoseconds.Cumulative",
     "FrameWait.DrawPrepWorker8.Nanoseconds.Cumulative",
+    "FrameWait.EopTimestampPublish.Nanoseconds.Cumulative",
 };
 static_assert(kFrameWaitTimeNames.back() != nullptr, "FrameWait names must match the enum");
 

@@ -1216,9 +1216,6 @@ enum class FrameWait : uint32_t {
 	// KYTY_DRAW_PREP_STEAL: command-processor time preparing stolen slots while a worker held the
 	// head (DrawPrepCommitWait is then only the idle spin after nothing was left to claim).
 	DrawPrepSteal,
-	// KYTY_EOP_TIMESTAMPS=gpu: command-processor time reading completed timestamp queries and
-	// rewriting the guest slots (one call per publication).
-	EopTimestampPublish,
 	// KYTY_DRAW_PREP_BINDINGS: binding-plan time on the preparing threads (inside the worker times
 	// below, or DrawPrepSteal on the command processor).
 	DrawPrepBindingPlan,
@@ -1233,6 +1230,9 @@ enum class FrameWait : uint32_t {
 	DrawPrepWorker6,
 	DrawPrepWorker7,
 	DrawPrepWorker8,
+	// KYTY_EOP_TIMESTAMPS=gpu: command-processor time reading completed timestamp queries and
+	// rewriting the guest slots (one call per publication).
+	EopTimestampPublish,
 	Count,
 };
 
