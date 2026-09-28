@@ -447,6 +447,8 @@ private:
 	[[nodiscard]] bool SkipGpuWriteImageWalk(uint64_t address, uint64_t size);
 	bool m_gpu_write_skip        = true;
 	int  m_gpu_write_skip_verify = 0;
+	// Why TryMaterializeGpuMetadataClear last refused an image (DccImageState* FrameEvent).
+	Profiler::FrameEvent m_image_state_reason = Profiler::FrameEvent::DccImageStateUnregistered;
 	struct GpuWriteSkipTotals {
 		std::atomic<uint64_t> skips {0};
 		std::atomic<uint64_t> verify_checks {0};

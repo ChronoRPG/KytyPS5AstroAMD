@@ -1287,14 +1287,19 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	if (m_unbounded_write_tick == current) {
 		return SideIssueResult::Unbounded;
 	}
+	// Why a read is refused as Other (ReadbackSideOther* counters).
+	const auto other = [](Profiler::FrameEvent cause) {
+		Profiler::CountFrameEvent(cause);
+		return SideIssueResult::Other;
+	};
 	// Never create a buffer here: GPU-dirty bytes always live in a registered buffer.
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner == nullptr || !*owner || IsBufferInvalid(*owner)) {
-		return SideIssueResult::Other;
+		return other(Profiler::FrameEvent::ReadbackSideOtherOwner);
 	}
 	auto& buffer = m_slot_buffers[*owner];
 	if (!buffer.IsInBounds(vaddr, size)) {
-		return SideIssueResult::Other;
+		return other(Profiler::FrameEvent::ReadbackSideOtherOwner);
 	}
 	const auto buffer_begin = buffer.CpuAddress();
 	const auto buffer_end   = buffer_begin + buffer.Size();
@@ -1304,7 +1309,7 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	const auto window_begin = std::max(aligned, buffer_begin);
 	const auto window_end   = std::min(aligned + side.window, buffer_end);
 	if (((page_begin | page_end | window_begin | window_end) % TRACKER_PAGE_SIZE) != 0) {
-		return SideIssueResult::Other;
+		return other(Profiler::FrameEvent::ReadbackSideOtherAlignment);
 	}
 
 	// Prefer the aligned window (neighbouring polled values share one copy); fall back to the
@@ -1318,6 +1323,8 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	std::optional<Candidate>       chosen;
 	uint64_t                       producer = 0;
 	auto                           reason   = SideIssueResult::Other;
+	// The cause of an Other result: no candidate fits the window unless one says otherwise.
+	auto other_cause = Profiler::FrameEvent::ReadbackSideOtherWindow;
 	for (size_t index = 0; index < candidates.size(); ++index) {
 		const auto& candidate = candidates[index];
 		if (index != 0 && candidate.begin == candidates[0].begin &&
@@ -1335,7 +1342,8 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 		// A queued drain/texture publication decides these bytes' final backing contents;
 		// publishing next to it could reorder the backing writes.
 		if (HasPendingBackingPublication(candidate.begin, candidate.end - candidate.begin)) {
-			reason = SideIssueResult::Other;
+			reason      = SideIssueResult::Other;
+			other_cause = Profiler::FrameEvent::ReadbackSideOtherPublication;
 			continue;
 		}
 		dirty.clear();
@@ -1346,7 +1354,8 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 			    newest = std::max(newest, m_write_ticks.MaxTick(start, end - start));
 		    });
 		if (dirty.empty()) {
-			reason = SideIssueResult::Other;
+			reason      = SideIssueResult::Other;
+			other_cause = Profiler::FrameEvent::ReadbackSideOtherNoDirty;
 			continue;
 		}
 		if (newest >= current) {
@@ -1356,6 +1365,9 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 		chosen   = candidate;
 		producer = newest;
 		break;
+	}
+	if (!chosen && reason == SideIssueResult::Other) {
+		Profiler::CountFrameEvent(other_cause);
 	}
 	if (!chosen) {
 		return reason;
@@ -1369,7 +1381,7 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 		}
 	}
 	if (slot_index == SideReadbackState::SlotCount) {
-		return SideIssueResult::Other;
+		return other(Profiler::FrameEvent::ReadbackSideOtherSlot);
 	}
 	auto&      slot         = side.slots[slot_index];
 	const auto staging_base = uint64_t {slot_index} * side.window;

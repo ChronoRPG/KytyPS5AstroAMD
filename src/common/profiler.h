@@ -915,6 +915,27 @@ enum class FrameEvent : uint32_t {
 	GpuWriteImageSkipVerifyChecks,
 	GpuWriteImageSkipVerifyRaces,
 	GpuWriteImageSkipVerifyMismatches,
+	// DccFallbackImageState by cause (TextureCache::TryMaterializeGpuMetadataClear refused the GPU
+	// inspection of a DCC slice's image): the image is not registered, has a stencil association,
+	// does not match the view's description, or is not safe to download because it is not
+	// GPU-modified, buffer-modified, CPU-dirty, partially resident, or has GPU-dirty buffer bytes.
+	DccImageStateUnregistered,
+	DccImageStateStencil,
+	DccImageStateMismatch,
+	DccImageStateNotGpuModified,
+	DccImageStateBufferModified,
+	DccImageStateCpuDirty,
+	DccImageStatePartial,
+	DccImageStateGpuDirtyBytes,
+	// ReadbackSideFallbackOther by cause (BufferCache::TryIssueSideReadback): no registered owner,
+	// unaligned window, read larger than the side-copy window, a pending backing publication, no
+	// GPU-dirty bytes in the window, no free side-copy slot.
+	ReadbackSideOtherOwner,
+	ReadbackSideOtherAlignment,
+	ReadbackSideOtherWindow,
+	ReadbackSideOtherPublication,
+	ReadbackSideOtherNoDirty,
+	ReadbackSideOtherSlot,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

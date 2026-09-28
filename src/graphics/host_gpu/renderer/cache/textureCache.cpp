@@ -2485,6 +2485,24 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		if (image == nullptr || !image->registered || image->depth_id ||
 		    image->info.data != desc.info.data || image->info.extent != desc.info.extent ||
 		    !SafeToDownload(*image)) {
+			// Which condition refused it (DccImageState* counters, MaterializeDccClear).
+			if (image == nullptr || !image->registered) {
+				m_image_state_reason = Event::DccImageStateUnregistered;
+			} else if (image->depth_id) {
+				m_image_state_reason = Event::DccImageStateStencil;
+			} else if (image->info.data != desc.info.data || image->info.extent != desc.info.extent) {
+				m_image_state_reason = Event::DccImageStateMismatch;
+			} else if (!image->IsGpuModified()) {
+				m_image_state_reason = Event::DccImageStateNotGpuModified;
+			} else if (image->IsBufferModified()) {
+				m_image_state_reason = Event::DccImageStateBufferModified;
+			} else if (image->IsCpuDirty()) {
+				m_image_state_reason = Event::DccImageStateCpuDirty;
+			} else if (!image->FullyResident()) {
+				m_image_state_reason = Event::DccImageStatePartial;
+			} else {
+				m_image_state_reason = Event::DccImageStateGpuDirtyBytes;
+			}
 			return Event::DccFallbackImageState;
 		}
 		if (image->backing.extent.width != desc.info.extent.width ||
@@ -2661,6 +2679,24 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 				++m_gpu_dcc_fallbacks;
 				Profiler::CountFrameEvent(Profiler::FrameEvent::DccCpuFallbacks);
 				Profiler::CountFrameEvent(outcome);
+				if (outcome == Profiler::FrameEvent::DccFallbackImageState) {
+					Profiler::CountFrameEvent(m_image_state_reason);
+					// The first few of every cause, also in release builds (LOGF may be off).
+					static std::array<std::atomic<uint32_t>,
+					                  static_cast<size_t>(Profiler::FrameEvent::Count)>
+					    cause_logged {};
+					if (cause_logged[static_cast<size_t>(m_image_state_reason)].fetch_add(
+					        1, std::memory_order_relaxed) < 4) {
+						std::fprintf(stderr,
+						             "DCC CPU fallback, image state cause %u: metadata=0x%016" PRIx64
+						             " bytes=%" PRIu64 " data=0x%016" PRIx64 " size=0x%" PRIx64
+						             " extent=%ux%u type=%u\n",
+						             static_cast<uint32_t>(m_image_state_reason), range.address,
+						             range.size, desc.info.data.address, desc.info.data.size,
+						             desc.info.extent.width, desc.info.extent.height,
+						             static_cast<uint32_t>(desc.type));
+					}
+				}
 				// The first few fallbacks of every reason, with what decided it.
 				static std::array<std::atomic<uint32_t>, static_cast<size_t>(
 				                                             Profiler::FrameEvent::Count)>
