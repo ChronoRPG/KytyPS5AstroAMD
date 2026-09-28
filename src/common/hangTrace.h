@@ -104,6 +104,16 @@ extern std::atomic<int8_t> g_enabled;
 // renderer threads start), empty otherwise.
 extern uint64_t g_cp_watch_begin;
 extern uint64_t g_cp_watch_end;
+// RecordTexture's count of resolved textures, one block per recording thread (written only by
+// that thread; summary.csv tex_resolved sums them). Never freed.
+struct alignas(64) TextureTally {
+	std::atomic<uint64_t> resolved {0};
+	TextureTally*         next = nullptr;
+};
+extern constinit thread_local TextureTally* t_texture_tally;
+[[nodiscard]] TextureTally& AcquireTextureTally() noexcept;
+// A resolved descriptor with the mip-statistics bit (tex_mipstats, texstats.csv).
+void RecordMipStatsTexture(const uint32_t* fields) noexcept;
 } // namespace Detail
 
 // Inlined: checked on hot renderer paths.
@@ -151,8 +161,22 @@ void ArmLodReportWatch(const void* destination, uint32_t size);
 [[nodiscard]] bool HandleLodWatchFault(uint64_t fault_vaddr, bool write, uint64_t pc,
                                        const uint64_t* gpr16, std::string_view thread_name);
 
-// Texture descriptor (8 dwords) resolved for a draw/dispatch.
-void RecordTexture(const uint32_t* fields);
+// Texture descriptor (8 dwords) resolved for a draw/dispatch. Inlined: every resolved texture,
+// ~50k per flip at the Sky Garden start view.
+inline void RecordTexture(const uint32_t* fields) {
+	if (!Enabled()) {
+		return;
+	}
+	auto* tally = Detail::t_texture_tally;
+	if (tally == nullptr) [[unlikely]] {
+		tally = &Detail::AcquireTextureTally();
+	}
+	tally->resolved.store(tally->resolved.load(std::memory_order_relaxed) + 1,
+	                      std::memory_order_relaxed);
+	if (((fields[5] >> 25u) & 1u) != 0) [[unlikely]] {
+		Detail::RecordMipStatsTexture(fields);
+	}
+}
 
 // GPU->CPU readbacks (BufferCache::ReadMemory), attributed to the path that requested them.
 // FaultReadSide / FaultReadDuplicate: a guest read fault served by a side copy (no drain of the
@@ -265,6 +289,14 @@ private:
 void NoteGpuWrite(uint64_t vaddr, uint64_t size);
 // Kind name of the last recorded GPU buffer write to the page holding vaddr ("unknown" if none).
 [[nodiscard]] const char* LastGpuWriteKind(uint64_t vaddr);
+// Tests: what NoteGpuWrite recorded for the page holding vaddr (readbacks.csv reports it).
+struct GpuPageWriter {
+	bool         found = false;
+	uint64_t     t_ms  = 0;
+	uint64_t     size  = 0;
+	GpuWriteKind kind  = GpuWriteKind::ShaderStorage;
+};
+[[nodiscard]] GpuPageWriter PageWriterForTest(uint64_t vaddr);
 
 // Texture-cache image deletion reasons (set around FreeImage calls) and native image churn.
 enum class ImageFreeReason : uint8_t {

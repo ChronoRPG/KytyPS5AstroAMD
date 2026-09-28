@@ -1,3 +1,4 @@
+#include "common/hangTrace.h"
 #include "common/profiler.h"
 
 #include <algorithm>
@@ -211,14 +212,145 @@ void BenchmarkCounting() {
 	report("previous, connected (shared atomics)", measure(Path::SharedAtomics));
 }
 
+
+// HangTrace::NoteGpuWrite skips a note identical to one of its thread's recent notes in the same
+// millisecond while nothing changed the page map since: the map must end exactly as if every note
+// had been applied (kind and size per page; the time is the same millisecond either way).
+void TestNoteGpuWriteRepeats() {
+	using HangTrace::GpuWriteKind;
+	constexpr uint64_t base = 0x7f0000000ull;
+	const auto check = [](uint64_t vaddr, GpuWriteKind kind, uint64_t size, const char* what) {
+		const auto writer = HangTrace::PageWriterForTest(vaddr);
+		Check(writer.found && writer.kind == kind && writer.size == size, what);
+	};
+	for (int round = 0; round < 50; round++) {
+		const uint64_t a = base + static_cast<uint64_t>(round) * 0x10000u;
+		// A two-page write, repeated: the map keeps it.
+		HangTrace::NoteGpuWrite(a, 0x2000);
+		HangTrace::NoteGpuWrite(a, 0x2000);
+		check(a + 0x1000, GpuWriteKind::ShaderStorage, 0x2000, "repeat");
+		// An overlapping write of another kind by this thread, then the first write again: the
+		// repeat must not be skipped (its second page changed).
+		{
+			const HangTrace::ScopedGpuWriteKind kind(GpuWriteKind::Copy);
+			HangTrace::NoteGpuWrite(a + 0x1000, 0x1000);
+		}
+		check(a + 0x1000, GpuWriteKind::Copy, 0x1000, "overlap");
+		HangTrace::NoteGpuWrite(a, 0x2000);
+		check(a + 0x1000, GpuWriteKind::ShaderStorage, 0x2000, "repeat after an overlap");
+		// Another thread writes the page; the repeat here must not be skipped either.
+		std::thread([a] {
+			const HangTrace::ScopedGpuWriteKind kind(GpuWriteKind::Fill);
+			HangTrace::NoteGpuWrite(a + 0x1000, 0x1000);
+		}).join();
+		check(a + 0x1000, GpuWriteKind::Fill, 0x1000, "other thread");
+		HangTrace::NoteGpuWrite(a, 0x2000);
+		check(a, GpuWriteKind::ShaderStorage, 0x2000, "repeat after another thread (first page)");
+		check(a + 0x1000, GpuWriteKind::ShaderStorage, 0x2000,
+		      "repeat after another thread (second page)");
+		// A large binding notes its first and last pages only; repeated, the same.
+		HangTrace::NoteGpuWrite(a + 0x100000, 0x100000);
+		HangTrace::NoteGpuWrite(a + 0x100000, 0x100000);
+		check(a + 0x100000, GpuWriteKind::ShaderStorage, 0x100000, "large binding, first page");
+		check(a + 0x1ff000, GpuWriteKind::ShaderStorage, 0x100000, "large binding, last page");
+	}
+	std::puts("ProfilerCounterTests: NoteGpuWrite repeats ok");
+}
+
+
+// Residual instrumentation on the command processor (DEEP-TRACE-U54 4.1 item 7), per call on one
+// thread, in noinline functions like the renderer's call sites:
+//  - a counted event through the per-thread sink (a profiler connected);
+//  - a profiler block with zones off (every KYTY_PROFILER_BLOCK scope in frame-only runs);
+//  - HangTrace::RecordTexture (every resolved texture, ~50k per flip at the start view; 1% carry
+//    mip statistics);
+//  - HangTrace::NoteGpuWrite over eight written bindings noted again and again (every draw's
+//    writable bindings), and over fresh ranges.
+// Printed only: timings depend on the machine and its load.
+volatile uint64_t g_bench_sink = 0;
+
+[[gnu::noinline]] void BenchCountEvent(uint64_t i) {
+	Profiler::CountFrameEvent((i & 1u) != 0 ? FrameEvent::TextureBindingMemoHits
+	                                        : FrameEvent::TextureViewMemoHits);
+}
+[[gnu::noinline]] void BenchBlock(uint64_t i) {
+	KYTY_PROFILER_BLOCK("InstrumentationBench");
+	g_bench_sink = g_bench_sink + i;
+}
+[[gnu::noinline]] void BenchRecordTexture(const uint32_t* fields) {
+	HangTrace::RecordTexture(fields);
+}
+// The renderer's call sites store to memory around the record; a locked instruction then waits
+// for those stores (the store buffer drains).
+std::array<uint64_t, 1024> g_bench_stores {};
+[[gnu::noinline]] void BenchRecordTextureAfterStores(uint64_t i, const uint32_t* fields) {
+	for (uint64_t k = 0; k < 8; k++) {
+		g_bench_stores[(i * 8u + k) & 1023u] = i + k;
+	}
+	HangTrace::RecordTexture(fields);
+}
+[[gnu::noinline]] void BenchNoteGpuWrite(uint64_t vaddr, uint64_t size) {
+	HangTrace::NoteGpuWrite(vaddr, size);
+}
+
+void BenchmarkInstrumentation() {
+	constexpr uint64_t calls  = 400000;
+	constexpr uint32_t rounds = 7;
+	const auto best = [&](auto&& body) {
+		double best_ns = 1e30;
+		for (uint32_t round = 0; round < rounds; round++) {
+			const auto start = std::chrono::steady_clock::now();
+			for (uint64_t i = 0; i < calls; i++) {
+				body(i);
+			}
+			best_ns = std::min(best_ns, std::chrono::duration<double, std::nano>(
+			                                std::chrono::steady_clock::now() - start)
+			                                .count());
+		}
+		return best_ns / calls;
+	};
+	const auto report = [](const char* name, double ns) {
+		std::printf("ProfilerCounterTests: %-40s %6.2f ns/call\n", name, ns);
+	};
+	SetSink(CounterSink::Thread);
+	report("instrumentation: counted event", best([](uint64_t i) { BenchCountEvent(i); }));
+	SetSink(CounterSink::Off);
+	report("instrumentation: block, zones off", best([](uint64_t i) { BenchBlock(i); }));
+	// Texture descriptors: 1 in 100 with the mip-statistics bit (fields[5] bit 25).
+	std::array<uint32_t, 8> plain {0x10000u, 0x2u, 0, 0x00f0f000u, 0, 0, 0x7u, 0};
+	std::array<uint32_t, 8> mips = plain;
+	mips[5] |= 1u << 25u;
+	report("instrumentation: RecordTexture", best([&](uint64_t i) {
+		       BenchRecordTexture(i % 100u == 0 ? mips.data() : plain.data());
+	       }));
+	report("instrumentation: RecordTexture, 8 stores", best([&](uint64_t i) {
+		       BenchRecordTextureAfterStores(i, i % 100u == 0 ? mips.data() : plain.data());
+	       }));
+	// Eight bindings of 4 KiB to 64 KiB written again and again.
+	report("instrumentation: NoteGpuWrite, repeated", best([](uint64_t i) {
+		       const uint64_t slot = i & 7u;
+		       BenchNoteGpuWrite(0x200000000ull + slot * 0x100000ull, 0x1000ull << (slot & 4u));
+	       }));
+	report("instrumentation: NoteGpuWrite, fresh", best([](uint64_t i) {
+		       BenchNoteGpuWrite(0x300000000ull + (i % 200000u) * 0x2000ull, 0x1000);
+	       }));
+}
 } // namespace
 
 int main(int argc, char** argv) {
+	// HangTrace::Enabled (read once), for the instrumentation timing; nothing here writes files.
+#if defined(_WIN32)
+	(void)_putenv_s("KYTY_HANG_TRACE", "1");
+#else
+	(void)setenv("KYTY_HANG_TRACE", "1", 1);
+#endif
 	TestTotalsAcrossThreads();
 	TestBlockReuse();
 	TestFrameWaitWithoutProfiler();
+	TestNoteGpuWriteRepeats();
 	if (argc < 2 || std::strcmp(argv[1], "--no-benchmark") != 0) {
 		BenchmarkCounting();
+		BenchmarkInstrumentation();
 	}
 	std::puts("ProfilerCounterTests: all cases passed");
 	return 0;

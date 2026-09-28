@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <tracy/Tracy.hpp>
@@ -1053,7 +1054,7 @@ std::atomic<int8_t>      g_detailed {-1};
 std::atomic<int8_t>      g_shared_counters {-1};
 std::atomic<bool>        g_zones {false};
 std::atomic<CounterSink> g_event_sink {CounterSink::Off};
-thread_local ThreadCounters* t_counters = nullptr;
+constinit thread_local ThreadCounters* t_counters = nullptr;
 
 namespace {
 
@@ -1179,13 +1180,15 @@ ThreadCounters& AcquireThreadCounters() noexcept {
 } // namespace Detail
 
 void ScopedBlock::Begin(const tracy::SourceLocationData* source_location) {
-	m_zone.emplace(source_location, TRACY_CALLSTACK, true);
+	new (m_zone) tracy::ScopedZone(source_location, TRACY_CALLSTACK, true);
+	m_active = true;
 	g_block_stack.push_back(this);
 }
 
-void ScopedBlock::End() {
-	if (m_zone.has_value()) {
-		m_zone.reset();
+void ScopedBlock::End() noexcept {
+	if (m_active) {
+		std::launder(reinterpret_cast<tracy::ScopedZone*>(m_zone))->~ScopedZone();
+		m_active = false;
 		RemoveBlock(this);
 	}
 }
