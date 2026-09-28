@@ -6506,6 +6506,160 @@ public:
                 static_cast<unsigned long long>(planted.verify_mismatches));
   }
 
+  // KYTY_IMAGE_TRANSIT_SKIP (Image::Transit, Image::TransitIsNoOp): whenever the pre-check says a
+  // transition is a no-op, GetBarriers returns no barrier and changes no state, for every
+  // combination of states, per-subresource states, full and partial ranges, volumes and repeated
+  // writes; the common case (whole image, same read state) is taken; and Transit counts its skips
+  // (or, in the verify mode, its checks) without mismatches.
+  void CheckImageTransitSkip() {
+    constexpr const char *name = "ImageTransitSkip";
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+
+    ImageInfo array_info{};
+    array_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+    array_info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
+    array_info.type = Prospero::ImageType::kColor2D;
+    array_info.extent = {8, 8, 1};
+    array_info.resources = {2, 2};
+    array_info.pitch = 8;
+    array_info.bytes_per_block = 4;
+    array_info.samples = 1;
+    array_info.tile_mode = Prospero::TileMode::kLinear;
+    array_info.mip_layout[0] = {0, 512, 8, 8};
+    array_info.mip_layout[1] = {512, 128, 4, 4};
+    auto volume_info = array_info;
+    volume_info.type = Prospero::ImageType::kColor3D;
+    volume_info.extent = {8, 8, 4};
+    volume_info.resources = {2, 1};
+
+    const char *skip_env = std::getenv("KYTY_IMAGE_TRANSIT_SKIP");
+    const bool skip_on = skip_env == nullptr || std::strcmp(skip_env, "0") != 0;
+    const char *verify_env = std::getenv("KYTY_IMAGE_TRANSIT_SKIP_VERIFY");
+    const bool verify_on =
+        verify_env != nullptr && *verify_env != '\0' && std::strcmp(verify_env, "0") != 0;
+    uint64_t cases = 0;
+    uint64_t predicted = 0;
+    uint64_t skips = 0;
+    uint64_t checks = 0;
+    {
+      Libs::Graphics::Image array(m_runtime_context, scheduler, array_info);
+      Libs::Graphics::Image volume(m_runtime_context, scheduler, volume_info);
+      const auto same = [](const VulkanImageState &a, const VulkanImageState &b) {
+        return a.pl_stage == b.pl_stage && a.access_mask == b.access_mask && a.layout == b.layout;
+      };
+      const std::array layouts{vk::ImageLayout::eUndefined, vk::ImageLayout::eShaderReadOnlyOptimal,
+                               vk::ImageLayout::eGeneral, vk::ImageLayout::eColorAttachmentOptimal};
+      const std::array<vk::AccessFlags2, 6> accesses{
+          vk::AccessFlags2{},
+          vk::AccessFlagBits2::eShaderRead,
+          vk::AccessFlagBits2::eShaderWrite,
+          vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+          vk::AccessFlagBits2::eColorAttachmentWrite | vk::AccessFlagBits2::eShaderRead,
+          vk::AccessFlagBits2::eTransferRead};
+      const std::array<std::optional<ImageSubresourceRange>, 6> ranges{
+          std::nullopt,
+          ImageSubresourceRange{0, 2, 0, 2},  // every level and layer of the array
+          ImageSubresourceRange{1, 1, 0, 2},  // one level
+          ImageSubresourceRange{0, 2, 1, 1},  // one layer (a volume: every layer)
+          ImageSubresourceRange{0, 2, 0, 1},  // the volume's whole range
+          ImageSubresourceRange{0, 1, 0, 1}}; // one level of one layer
+      for (auto *image : {&array, &volume}) {
+        const auto subresources =
+            static_cast<size_t>(image->info.resources.levels) * image->info.resources.layers;
+        for (const auto layout : layouts) {
+          for (const auto access : accesses) {
+            for (const bool per_subresource : {false, true}) {
+              const VulkanImageState initial{vk::PipelineStageFlagBits2::eFragmentShader, access,
+                                             layout};
+              for (const auto destination_layout : layouts) {
+                for (const auto destination_access : accesses) {
+                  for (const auto &range : ranges) {
+                    image->backing.state = initial;
+                    image->backing.subresource_states.assign(per_subresource ? subresources : 0,
+                                                             initial);
+                    const bool noop =
+                        image->TransitIsNoOp(destination_layout, destination_access, range);
+                    const auto barriers =
+                        image->GetBarriers(destination_layout, destination_access,
+                                           vk::PipelineStageFlagBits2::eAllGraphics, range);
+                    cases++;
+                    predicted += noop ? 1u : 0u;
+                    if (noop) {
+                      Require(name, "sound",
+                              barriers.empty() && same(image->backing.state, initial) &&
+                                  image->backing.subresource_states.empty(),
+                              "a transition the pre-check calls a no-op needed a barrier or "
+                              "changed the image's state");
+                    }
+                    const bool whole = !range.has_value() ||
+                                       (range->base_level == 0 &&
+                                        range->level_count == image->info.resources.levels &&
+                                        (image->info.IsVolume() ||
+                                         (range->base_layer == 0 &&
+                                          range->layer_count == image->info.resources.layers)));
+                    if (!per_subresource && whole && layout == destination_layout &&
+                        access == destination_access &&
+                        !(access & (vk::AccessFlagBits2::eShaderWrite |
+                                    vk::AccessFlagBits2::eTransferWrite |
+                                    vk::AccessFlagBits2::eMemoryWrite))) {
+                      Require(name, "common case", noop,
+                              "the pre-check missed a whole-image transition to the same read "
+                              "state");
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      array.backing.state = {};
+      array.backing.subresource_states.clear();
+
+      // Transit itself: a barrier, a no-op (skipped, or checked by the verify mode), a write,
+      // and a repeated write (never skipped).
+      using Profiler::FrameEvent;
+      Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Thread);
+      const auto skips0 = Profiler::FrameEventTotal(FrameEvent::ImageTransitSkips);
+      const auto checks0 = Profiler::FrameEventTotal(FrameEvent::ImageTransitVerifyChecks);
+      const auto mismatches0 = Profiler::FrameEventTotal(FrameEvent::ImageTransitVerifyMismatches);
+      const auto full = std::optional<ImageSubresourceRange>(ImageSubresourceRange{0, 2, 0, 2});
+      const auto command = scheduler.Current().Handle();
+      array.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, full,
+                    command, true);
+      array.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, full,
+                    command, true);
+      array.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, std::nullopt,
+                    command, true);
+      array.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, std::nullopt,
+                    command, true);
+      skips = Profiler::FrameEventTotal(FrameEvent::ImageTransitSkips) - skips0;
+      checks = Profiler::FrameEventTotal(FrameEvent::ImageTransitVerifyChecks) - checks0;
+      const auto mismatches =
+          Profiler::FrameEventTotal(FrameEvent::ImageTransitVerifyMismatches) - mismatches0;
+      Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Off);
+      Require(name, "transit",
+              array.backing.state.layout == vk::ImageLayout::eGeneral &&
+                  array.backing.state.access_mask == vk::AccessFlagBits2::eShaderWrite &&
+                  mismatches == 0 &&
+                  skips == (skip_on && !verify_on ? 1u : 0u) &&
+                  checks == (skip_on && verify_on ? 1u : 0u),
+              "Transit did not skip exactly the no-op transition (or its verify mode did not "
+              "check it)");
+      scheduler.Finish();
+    }
+    std::printf("[host]    %-32s ok (%llu cases, %llu no-ops; skip %s, verify %s)\n", name,
+                static_cast<unsigned long long>(cases), static_cast<unsigned long long>(predicted),
+                skip_on ? "on" : "off", verify_on ? "on" : "off");
+  }
+
   // KYTY_GPU_WRITE_IMAGE_SKIP (TextureCache::SkipGpuWriteImageWalk): a GPU buffer write's image
   // checks skip the texture-cache lock and page walk when no image is registered on the write's
   // 1 MiB pages, and never miss an image whose registration races the check.
@@ -40364,6 +40518,11 @@ int main(int argc, char **argv) {
     vulkan.CheckImageLruSkip();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-transit-skip-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImageTransitSkip();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--tracker-gap-detectors-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTrackerGapDetectors();
@@ -40616,6 +40775,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuWriteImageSkip();
   vulkan.CheckDccGpuRefresh();
   vulkan.CheckImageLruSkip();
+  vulkan.CheckImageTransitSkip();
   vulkan.CheckTrackerGapDetectors();
   vulkan.CheckEagerReadback();
 #endif

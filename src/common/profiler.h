@@ -947,6 +947,11 @@ enum class FrameEvent : uint32_t {
 	ImageLruTouchSkips,
 	ImageLruVerifyChecks,
 	ImageLruVerifyMismatches,
+	// KYTY_IMAGE_TRANSIT_SKIP (Image::Transit): transitions that return before GetBarriers
+	// because nothing would change, and the verify mode's checks of that decision.
+	ImageTransitSkips,
+	ImageTransitVerifyChecks,
+	ImageTransitVerifyMismatches,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

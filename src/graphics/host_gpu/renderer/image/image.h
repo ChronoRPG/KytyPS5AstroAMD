@@ -60,9 +60,20 @@ public:
 	                                   std::optional<ImageSubresourceRange> range);
 	// deferrable: see CommandBuffer::BatchImageBarriers (render.h); only for callers that record
 	// no memory-accessing command through command_buffer before the next barrier flush point.
+	// KYTY_IMAGE_TRANSIT_SKIP (default on; =0 off): returns at once when TransitIsNoOp.
+	// KYTY_IMAGE_TRANSIT_SKIP_VERIFY=1|exit runs GetBarriers after such a decision and records
+	// what it returns: a barrier there is a mismatch (counted, logged; exit stops). FrameEvents
+	// ImageTransitSkips, ImageTransitVerify{Checks,Mismatches}.
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
 	             bool deferrable = false);
+	// GetBarriers would return no barrier and change no state: the image has one state (no
+	// per-subresource states), `range` covers every level and layer (a volume's range counts as
+	// one layer, as in GetBarriers), and that state already has the layout and the access, which
+	// includes no write (a repeated write needs a barrier). GetBarriers' early return.
+	[[nodiscard]] bool TransitIsNoOp(vk::ImageLayout                             destination_layout,
+	                                 vk::AccessFlags2                            destination_access,
+	                                 const std::optional<ImageSubresourceRange>& range) const noexcept;
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,

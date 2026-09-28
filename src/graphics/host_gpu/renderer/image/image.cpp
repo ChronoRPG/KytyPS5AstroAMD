@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
@@ -22,6 +23,29 @@
 namespace Libs::Graphics {
 
 namespace {
+
+// KYTY_IMAGE_TRANSIT_SKIP / _VERIFY (Image::Transit).
+struct TransitSkipConfig {
+	bool enabled = true;
+	int  verify  = 0; // 1: count and log mismatches, 2: exit on one
+};
+const TransitSkipConfig& TransitSkip() {
+	static const TransitSkipConfig config = [] {
+		TransitSkipConfig result;
+		const auto* value = std::getenv("KYTY_IMAGE_TRANSIT_SKIP");
+		result.enabled    = value == nullptr || std::strcmp(value, "0") != 0;
+		const auto* verify = std::getenv("KYTY_IMAGE_TRANSIT_SKIP_VERIFY");
+		if (verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0) {
+			result.verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
+		}
+		return result;
+	}();
+	return config;
+}
+
+constexpr vk::AccessFlags2 TransitWriteAccess = vk::AccessFlagBits2::eTransferWrite |
+                                                vk::AccessFlagBits2::eShaderWrite |
+                                                vk::AccessFlagBits2::eMemoryWrite;
 
 // KYTY_COPY_VIA_BUFFER_BATCH=0: Image::CopyImageWithBuffer copies one region per barrier pair.
 bool CopyViaBufferBatchEnabled() {
@@ -240,9 +264,40 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	return barriers;
 }
 
+bool Image::TransitIsNoOp(vk::ImageLayout                             destination_layout,
+                          vk::AccessFlags2                            destination_access,
+                          const std::optional<ImageSubresourceRange>& range) const noexcept {
+	// GetBarriers' conditions, in its order: per-subresource states or a partial range take its
+	// per-subresource path (which may create those states); otherwise it returns before changing
+	// anything exactly when the layout and access match and the access includes no write.
+	if (!backing.subresource_states.empty()) {
+		return false;
+	}
+	if (range) {
+		const bool     volume      = info.IsVolume();
+		const uint32_t base_layer  = volume ? 0u : range->base_layer;
+		const uint32_t layer_count = volume ? 1u : range->layer_count;
+		if (range->base_level != 0 || range->level_count != info.resources.levels ||
+		    base_layer != 0 || layer_count != info.resources.layers) {
+			return false;
+		}
+	}
+	const auto& state = backing.state;
+	return state.layout == destination_layout && state.access_mask == destination_access &&
+	       !static_cast<bool>(state.access_mask & TransitWriteAccess);
+}
+
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
                     bool deferrable) {
+	// KYTY_IMAGE_TRANSIT_SKIP: GetBarriers would record nothing and change nothing.
+	const auto& skip       = TransitSkip();
+	const bool  predicted  = skip.enabled && TransitIsNoOp(destination_layout, destination_access,
+	                                                      range);
+	if (predicted && skip.verify == 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageTransitSkips);
+		return;
+	}
 	KYTY_GPU_OP_SITE("image.transition");
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
@@ -257,6 +312,30 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	}
 	const auto barriers =
 	    GetBarriers(destination_layout, destination_access, destination_stage, range);
+	if (predicted) {
+		// KYTY_IMAGE_TRANSIT_SKIP_VERIFY: the skip's decision against GetBarriers (whose barriers,
+		// if any, are recorded below as without the skip).
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageTransitVerifyChecks);
+		if (!barriers.empty()) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ImageTransitVerifyMismatches);
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::fprintf(stderr,
+				             "ImageTransitVerify: a skipped transition of image 0x%016llx needs %zu "
+				             "barrier(s) (layout %d -> %d, access 0x%llx -> 0x%llx)\n",
+				             static_cast<unsigned long long>(info.data.address), barriers.size(),
+				             static_cast<int>(barriers.front().oldLayout),
+				             static_cast<int>(destination_layout),
+				             static_cast<unsigned long long>(
+				                 static_cast<VkAccessFlags2>(barriers.front().srcAccessMask)),
+				             static_cast<unsigned long long>(
+				                 static_cast<VkAccessFlags2>(destination_access)));
+			}
+			if (skip.verify == 2) {
+				EXIT("ImageTransitVerify: a transition the skip decided against needs a barrier\n");
+			}
+		}
+	}
 	if (barriers.empty()) {
 		return;
 	}
