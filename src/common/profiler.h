@@ -986,6 +986,12 @@ enum class FrameEvent : uint32_t {
 	// found quiet (skipped), and draws whose viewports and scissors came from their plan.
 	DrawPrepBindingHwChecksSkipped,
 	DrawPrepBindingViewportsUsed,
+	// KYTY_DRAW_PREP_BINDINGS texturememo (P4b-2): texture bindings a preparing thread found a
+	// memo entry for (hints), and bindings resolved and views acquired in runs of memo hits under
+	// one texture-cache lock.
+	DrawPrepBindingTextureHints,
+	DrawPrepBindingTextureRunHits,
+	DrawPrepBindingViewRunHits,
 	// KYTY_DESCRIPTOR_OFFSET_AUDIT=1 (P4b-D0, descriptors.cpp): descriptor sets written and push
 	// updates, how many repeat the previous one or any earlier one of the same command buffer
 	// with the per-draw buffer descriptors' offsets ignored (the reuse potential of dynamic

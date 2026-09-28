@@ -163,21 +163,35 @@ bool PlanSamplers(SamplerCache& cache, const CompiledShaderInfo& program,
 	return true;
 }
 
-// ResolveTexture's memo hashes.
+// ResolveTexture's memo hashes; with `memo` (P4b-2) also the tags of the entries that hold the
+// keys now (TextureBindingMemo::FindHint), valid in `stage.texture_tags_valid`.
 bool PlanTextureHashes(const CompiledShaderInfo& program, const ResourceSnapshot& resources,
-                       StagePlan& stage) {
+                       const TextureBindingMemo* memo, StagePlan& stage) {
 	const auto count = program.info.images.size();
 	if (resources.images.size() < count) {
 		return false;
 	}
 	stage.texture_hashes.resize(count);
+	if (memo != nullptr) {
+		stage.texture_tags.assign(count, 0);
+	}
+	uint32_t hints = 0;
 	for (size_t i = 0; i < count; i++) {
 		ShaderTextureResource descriptor {};
 		if (!TryDecode(resources.images[i], descriptor)) {
 			return false;
 		}
-		stage.texture_hashes[i] = TextureBindingMemo::Hash(
-		    TextureBindingMemo::MakeKey(program.info.images[i], descriptor.fields));
+		const auto key          = TextureBindingMemo::MakeKey(program.info.images[i], descriptor.fields);
+		stage.texture_hashes[i] = TextureBindingMemo::Hash(key);
+		uint64_t tag            = 0;
+		if (memo != nullptr && memo->FindHint(key, stage.texture_hashes[i], tag)) {
+			stage.texture_tags[i] = tag;
+			hints++;
+		}
+	}
+	stage.texture_tags_valid = memo != nullptr;
+	if (hints != 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepBindingTextureHints, hints);
 	}
 	return true;
 }
@@ -422,10 +436,12 @@ uint32_t BindingParts() {
 					result |= static_cast<uint32_t>(BindingPart::HwCheck);
 				} else if (name == "dynamic") {
 					result |= static_cast<uint32_t>(BindingPart::Dynamic);
+				} else if (name == "texturememo") {
+					result |= static_cast<uint32_t>(BindingPart::TextureMemo);
 				} else if (!name.empty()) {
 					EXIT("KYTY_DRAW_PREP_BINDINGS: unknown part '%.*s' (expected 0, 1 or a list of "
 					     "pipeline, buffers, userdata, samplers, textures, statics, hwcheck, "
-					     "dynamic)\n",
+					     "dynamic, texturememo)\n",
 					     static_cast<int>(name.size()), name.data());
 				}
 			}
@@ -515,8 +531,13 @@ void ComputeBindingPlan(const BindingPlanContext& context, const RegisterSnapsho
 		if (BindingPartEnabled(parts, BindingPart::Samplers)) {
 			stage.samplers_valid = PlanSamplers(*context.samplers, program, data, stage);
 		}
-		if (BindingPartEnabled(parts, BindingPart::Textures)) {
-			stage.texture_hashes_valid = PlanTextureHashes(program, data, stage);
+		// The memo part needs the hashes too (a run finds its entries by them).
+		const bool memo = BindingPartEnabled(parts, BindingPart::TextureMemo) &&
+		                  context.texture_memo != nullptr && TextureBindingMemo::Enabled();
+		if (BindingPartEnabled(parts, BindingPart::Textures) || memo) {
+			stage.texture_hashes_valid =
+			    PlanTextureHashes(program, data, memo ? context.texture_memo : nullptr, stage);
+			stage.texture_tags_valid = stage.texture_tags_valid && stage.texture_hashes_valid;
 		}
 	};
 	plan_stage(vertex_program, vertex_data, plan.vertex);

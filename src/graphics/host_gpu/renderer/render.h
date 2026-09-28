@@ -944,6 +944,8 @@ public:
 		return m_binding_plan;
 	}
 	void ActivateBindingPlan() noexcept { m_binding_plan_active = m_binding_plan != nullptr; }
+	// KYTY_DRAW_PREP_BINDINGS texturememo: the memo draw-prep threads read hints from (FindHint).
+	[[nodiscard]] const TextureBindingMemo& GetTextureMemo() const noexcept { return m_texture_memo; }
 
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
@@ -960,10 +962,11 @@ private:
 
 	// Resolves into `binding` (image, description) in place; its view and mip views are left
 	// for RebindImages. Writing in place avoids copying the ~0.5 KB description twice.
-	// hash_hint: TextureBindingMemo::Hash of the binding's key, computed by a draw-prep worker.
+	// hash_hint: TextureBindingMemo::Hash of the binding's key, computed by a draw-prep worker;
+	// tag_hint: the memo entry tag it found for the key (TextureBindingMemo::FindHint, 0: none).
 	void ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	                    const ShaderRecompiler::IR::DescriptorValue& value, TextureBinding& binding,
-	                    const uint64_t* hash_hint = nullptr);
+	                    const uint64_t* hash_hint = nullptr, uint64_t tag_hint = 0);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 	// ResolveTexture's full resolution (no memo lookup); `memo` records the answer.
@@ -1164,6 +1167,8 @@ private:
 	// slot's preparation (the plan was derived from it), cleared by the engine after the draw.
 	DrawPrep::BindingPlan* m_binding_plan        = nullptr;
 	bool                   m_binding_plan_active = false;
+	// KYTY_DRAW_PREP_BINDINGS_VERIFY (P4b-2): the views a predicted view run claims (RebindImages).
+	std::vector<vk::ImageView> m_claimed_run_views;
 	// KYTY_NATIVE_INDIRECT_MESH (meshIndirect.h): created by the first native indirect mesh draw.
 	std::unique_ptr<MeshIndirect::Converter> m_mesh_indirect;
 

@@ -732,7 +732,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                     const ShaderRecompiler::IR::DescriptorValue& value,
-                                    TextureBinding& binding, const uint64_t* hash_hint) {
+                                    TextureBinding& binding, const uint64_t* hash_hint,
+                                    uint64_t tag_hint) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	// The same state a freshly returned binding had: no view yet, no mip views (their capacity
 	// is kept), undefined layout.
@@ -763,7 +764,8 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 	}
 	// Exactly the answer of the full resolution below (see textureBindingMemo.h), including the
 	// FindImage access bookkeeping; validation of the key's resource already passed.
-	if (memo && m_texture_memo.TryResolve(texture_cache, memo_key, hash, binding)) {
+	if (memo && m_texture_memo.TryResolve(texture_cache, memo_key, hash, binding, tag_hint,
+	                                      tag_hint != 0 && DrawPrep::BindingsVerifyMode() != 0)) {
 		if (!descriptor.IsNull() && HangTrace::Enabled()) {
 			HangTrace::RecordTexture(descriptor.fields);
 		}
@@ -1268,14 +1270,73 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	const bool verify = plan != nullptr && DrawPrep::BindingsVerifyMode() != 0;
 	if (!RepeatStageTextures(program, snapshot, prepared)) {
 		// KYTY_DRAW_PREP_BINDINGS textures: the memo hashes the preparing worker computed.
+		const auto count  = static_cast<uint32_t>(program.info.images.size());
 		const bool hashes = plan != nullptr && plan->texture_hashes_valid &&
-		                    plan->texture_hashes.size() == program.info.images.size();
-		prepared.images.resize(program.info.images.size());
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		                    plan->texture_hashes.size() == count;
+		// KYTY_DRAW_PREP_BINDINGS texturememo (P4b-2): the memo entries the preparing worker found
+		// for the keys (their tags). Runs of hits take the texture-cache lock once
+		// (TextureBindingMemo::TryResolveRun); the first binding a run does not hit is resolved as
+		// before, and the next run starts after it, so the order of effects is unchanged.
+		const bool tags = hashes && plan->texture_tags_valid && plan->texture_tags.size() == count &&
+		                  TextureBindingMemo::Enabled();
+		const auto storage = [](const TextureBinding& binding) {
+			return binding.desc.type == TextureCache::BindingType::Storage;
+		};
+		auto& texture_cache = m_context.GetTextureCache();
+		prepared.images.resize(count);
+		uint32_t run_end = 0; // verify: [i, run_end) predicted as run hits
+		for (uint32_t i = 0; i < count;) {
+			if (tags) {
+				const auto rest = count - i;
+				const std::span<const uint64_t> run_hashes(plan->texture_hashes.data() + i, rest);
+				const std::span<const uint64_t> run_tags(plan->texture_tags.data() + i, rest);
+				const std::span<TextureBinding> run_bindings(prepared.images.data() + i, rest);
+				if (!verify) {
+					const auto run = m_texture_memo.TryResolveRun(texture_cache, run_hashes, run_tags,
+					                                              run_bindings);
+					for (uint32_t j = i; j < i + run; j++) {
+						// ResolveTexture's work besides the memo hit.
+						auto& binding      = prepared.images[j];
+						binding.image_view = nullptr;
+						binding.layout     = vk::ImageLayout::eUndefined;
+						binding.mip_views.clear();
+						if (HangTrace::Enabled()) {
+							const auto descriptor =
+							    DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[j]);
+							if (!descriptor.IsNull()) {
+								HangTrace::RecordTexture(descriptor.fields);
+							}
+						}
+						BindImage(binding.image_id, storage(binding));
+					}
+					if (run != 0) {
+						DrawPrep::GetBindingTotals().texture_run_hits.fetch_add(
+						    run, std::memory_order_relaxed);
+						Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepBindingTextureRunHits,
+						                          run);
+					}
+					i += run;
+					if (i == count) {
+						break;
+					}
+				} else if (i >= run_end) {
+					run_end = i + m_texture_memo.TryResolveRun(texture_cache, run_hashes, run_tags,
+					                                           run_bindings, false);
+				}
+			}
 			auto& binding = prepared.images[i];
 			ResolveTexture(program.info.images[i], snapshot.images[i], binding,
-			               hashes ? &plan->texture_hashes[i] : nullptr);
-			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+			               hashes ? &plan->texture_hashes[i] : nullptr,
+			               tags ? plan->texture_tags[i] : 0);
+			if (verify && i < run_end) {
+				// A predicted run hit is TryResolve's plain hit on the hinted entry.
+				DrawPrep::CountBindingVerifyCheck();
+				if (binding.memo_tag != plan->texture_tags[i] || m_texture_memo.LastHitRevalidated()) {
+					DrawPrep::ReportBindingMismatch("texture memo run", i);
+				}
+			}
+			BindImage(binding.image_id, storage(binding));
+			i++;
 		}
 		prepared.texture_program = &program;
 		prepared.texture_words.assign(snapshot.images.begin(), snapshot.images.end());
@@ -1658,7 +1719,50 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
 	}
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+	// KYTY_DRAW_PREP_BINDINGS texturememo (P4b-2): runs of TryAcquireView hits take the
+	// texture-cache lock once (TextureBindingMemo::TryAcquireViewRun); the first binding a run does
+	// not hit takes the path below, and the next run starts after it.
+	const bool view_runs = prepared.plan != nullptr && prepared.plan->texture_tags_valid &&
+	                       TextureBindingMemo::Enabled();
+	const bool verify_runs  = view_runs && DrawPrep::BindingsVerifyMode() != 0;
+	const auto count        = static_cast<uint32_t>(program.info.images.size());
+	uint32_t   view_run_end = 0; // verify: [i, view_run_end) predicted as run hits
+	const auto run_length   = [&](uint32_t first) {
+        uint32_t end = first;
+        while (end < count &&
+               program.info.images[end].mip_mode != ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
+            end++;
+        }
+        return end - first;
+	};
+	for (uint32_t i = 0; i < count; i++) {
+		if (view_runs && !verify_runs) {
+			const auto run = m_texture_memo.TryAcquireViewRun(
+			    texture_cache, std::span<TextureBinding>(images.data() + i, run_length(i)));
+			for (uint32_t j = i; j < i + run; j++) {
+				images[j].mip_views.clear();
+				// Sampled bindings only (TryAcquireView).
+				texture_cache.GetImage(images[j].image_id).usage.texture = true;
+			}
+			if (run != 0) {
+				DrawPrep::GetBindingTotals().view_run_hits.fetch_add(run, std::memory_order_relaxed);
+				Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepBindingViewRunHits, run);
+			}
+			i += run;
+			if (i == count) {
+				break;
+			}
+		} else if (verify_runs && i >= view_run_end) {
+			const std::span<TextureBinding> rest(images.data() + i, run_length(i));
+			view_run_end = i + m_texture_memo.TryAcquireViewRun(texture_cache, rest, false);
+			m_claimed_run_views.clear();
+			for (uint32_t j = i; j < view_run_end; j++) {
+				m_claimed_run_views.push_back(m_texture_memo.EntryView(images[j]));
+			}
+		}
+		const auto claimed_view = verify_runs && i < view_run_end
+		                              ? m_claimed_run_views[i - (view_run_end - m_claimed_run_views.size())]
+		                              : vk::ImageView {};
 		auto& binding = images[i];
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
@@ -1681,6 +1785,13 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
+		if (verify_runs && i < view_run_end) {
+			// A predicted run hit acquires the entry's view.
+			DrawPrep::CountBindingVerifyCheck();
+			if (binding.image_view != claimed_view) {
+				DrawPrep::ReportBindingMismatch("texture view run", i);
+			}
+		}
 	}
 	if (verify_views) {
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {

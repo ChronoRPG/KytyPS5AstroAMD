@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include <atomic>
@@ -35,6 +36,12 @@ struct TextureBindingMemo::Entry {
 	bool                    exact_format = false;
 	vk::ImageView           view        = nullptr;
 	TextureCache::ImageDesc desc;
+	// FindHint's view of `key` and `tag` (P4b-2): Record makes `seq` odd, stores the packed key
+	// and the tag, and makes it even again (release); a reader that sees the same even value
+	// before and after its loads read a pair Record wrote together.
+	std::atomic<uint32_t>                         seq {0};
+	std::atomic<uint64_t>                         published_tag {0};
+	std::array<std::atomic<uint64_t>, KeyWords>   packed_key {};
 };
 
 namespace {
@@ -160,8 +167,110 @@ void TextureBindingMemo::Forget(TextureBinding& binding) {
 	binding.memo_slot = 0;
 }
 
+TextureBindingMemo::PackedKey TextureBindingMemo::PackKey(const Key& key) {
+	PackedKey packed {};
+	for (uint32_t i = 0; i < 4; i++) {
+		packed[i] = key.words[2 * i] | (static_cast<uint64_t>(key.words[2 * i + 1]) << 32u);
+	}
+	packed[4] = key.mip_count | (static_cast<uint64_t>(key.shader_swizzle) << 32u);
+	packed[5] = static_cast<uint32_t>(key.resource_class) |
+	            (static_cast<uint64_t>(static_cast<uint32_t>(key.numeric_class)) << 32u);
+	packed[6] = static_cast<uint32_t>(key.dimension) |
+	            (static_cast<uint64_t>(static_cast<uint32_t>(key.mip_mode)) << 32u);
+	const uint64_t flags = (key.read ? 1u : 0u) | (key.written ? 2u : 0u) | (key.atomic ? 4u : 0u) |
+	                       (key.depth_compare ? 8u : 0u) | (key.cube ? 16u : 0u) |
+	                       (key.r128 ? 32u : 0u);
+	packed[7] = static_cast<uint32_t>(key.conversion_format) | (flags << 32u);
+	return packed;
+}
+
+bool TextureBindingMemo::FindHint(const Key& key, uint64_t hash, uint64_t& tag) const {
+	const auto* entries = m_published.load(std::memory_order_acquire);
+	if (entries == nullptr) {
+		return false;
+	}
+	const auto& entry  = entries[hash % Slots];
+	const auto  packed = PackKey(key);
+	const auto  before = entry.seq.load(std::memory_order_acquire);
+	if ((before & 1u) != 0) {
+		return false; // being rewritten
+	}
+	const auto found = entry.published_tag.load(std::memory_order_relaxed);
+	bool       same  = found != 0;
+	for (uint32_t i = 0; i < KeyWords; i++) {
+		same = entry.packed_key[i].load(std::memory_order_relaxed) == packed[i] && same;
+	}
+	std::atomic_thread_fence(std::memory_order_acquire);
+	if (!same || entry.seq.load(std::memory_order_relaxed) != before) {
+		return false;
+	}
+	tag = found;
+	return true;
+}
+
+Image* TextureBindingMemo::HitImage(TextureCache& cache, const Entry& entry) {
+	auto* image = cache.m_slot_images.try_get(entry.image);
+	if (image == nullptr || !image->registered || image->depth_id ||
+	    image->binding.needs_rebind || entry.requested_first < image->resident_first ||
+	    cache.PageVersion(entry.page) != entry.page_version ||
+	    (entry.has_partner && !image->alias_owner && !image->info.HasStencil())) {
+		return nullptr;
+	}
+	return image;
+}
+
+void TextureBindingMemo::ApplyHit(Entry& entry, uint32_t slot, TextureBinding& binding) {
+	binding.image_id = entry.image;
+	if (binding.memo_tag == entry.tag && binding.memo_slot == slot) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingDescCopiesAvoided);
+	} else {
+		binding.desc      = entry.desc;
+		binding.memo_tag  = entry.tag;
+		binding.memo_slot = slot;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoHits);
+	m_totals.hits++;
+}
+
+uint32_t TextureBindingMemo::TryResolveRun(TextureCache& cache, std::span<const uint64_t> hashes,
+                                           std::span<const uint64_t> tags,
+                                           std::span<TextureBinding> bindings, bool apply) {
+	m_last_revalidated = false;
+	EXIT_IF(hashes.size() < bindings.size() || tags.size() < bindings.size());
+	if (!m_entries || bindings.empty() || tags[0] == 0) {
+		return 0;
+	}
+	uint32_t         hits = 0;
+	std::scoped_lock lock {cache.m_lock};
+	const auto       tick = cache.m_scheduler.CurrentTick();
+	for (; hits < bindings.size(); hits++) {
+		const auto slot  = static_cast<uint32_t>(hashes[hits] % Slots);
+		auto&      entry = m_entries[slot];
+		if (tags[hits] == 0 || entry.tag != tags[hits]) {
+			break;
+		}
+		Image* image = nullptr;
+		if (!entry.null_image) {
+			image = HitImage(cache, entry);
+			if (image == nullptr) {
+				break; // TryResolve decides: stale, or a revalidation
+			}
+		}
+		if (!apply) {
+			continue;
+		}
+		if (image != nullptr) {
+			// FindImage's access bookkeeping for the returned image (as TryResolve).
+			image->tick_accessed_last = tick;
+			cache.TouchImage(*image);
+		}
+		ApplyHit(entry, slot, bindings[hits]);
+	}
+	return hits;
+}
+
 bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_t hash,
-                                    TextureBinding& binding) {
+                                    TextureBinding& binding, uint64_t tag_hint, bool verify_hint) {
 	m_last_revalidated = false;
 	if (!m_entries) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoMisses);
@@ -169,7 +278,15 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 	}
 	const auto slot  = static_cast<uint32_t>(hash % Slots);
 	auto&      entry = m_entries[slot];
-	if (entry.tag == 0 || !(entry.key == key)) {
+	// A hint naming this entry's tag proves the key (FindHint); otherwise compare it.
+	const bool hinted = tag_hint != 0 && entry.tag == tag_hint;
+	if (hinted && verify_hint) {
+		DrawPrep::CountBindingVerifyCheck();
+		if (!(entry.key == key)) {
+			DrawPrep::ReportBindingMismatch("texture memo hint");
+		}
+	}
+	if (entry.tag == 0 || !(hinted || entry.key == key)) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoMisses);
 		return false;
 	}
@@ -210,16 +327,7 @@ bool TextureBindingMemo::TryResolve(TextureCache& cache, const Key& key, uint64_
 		image->tick_accessed_last = cache.m_scheduler.CurrentTick();
 		cache.TouchImage(*image);
 	}
-	binding.image_id = entry.image;
-	if (binding.memo_tag == entry.tag && binding.memo_slot == slot) {
-		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingDescCopiesAvoided);
-	} else {
-		binding.desc      = entry.desc;
-		binding.memo_tag  = entry.tag;
-		binding.memo_slot = slot;
-	}
-	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoHits);
-	m_totals.hits++;
+	ApplyHit(entry, slot, binding);
 	m_last_revalidated = revalidated;
 	return true;
 }
@@ -277,11 +385,23 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 	}
 	if (!m_entries) {
 		m_entries = std::make_unique<Entry[]>(Slots);
+		m_published.store(m_entries.get(), std::memory_order_release);
 	}
 	const auto slot  = static_cast<uint32_t>(hash % Slots);
 	auto&      entry = m_entries[slot];
+	// FindHint's readers: odd while the key and tag change (the fence orders the odd value before
+	// the new words), even again once both are stored (release).
+	const auto seq = entry.seq.load(std::memory_order_relaxed);
+	entry.seq.store(seq + 1, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_release);
 	entry.key             = key;
 	entry.tag             = m_next_tag++;
+	const auto packed     = PackKey(key);
+	for (uint32_t i = 0; i < KeyWords; i++) {
+		entry.packed_key[i].store(packed[i], std::memory_order_relaxed);
+	}
+	entry.published_tag.store(entry.tag, std::memory_order_relaxed);
+	entry.seq.store(seq + 2, std::memory_order_release);
 	entry.page            = page;
 	entry.page_version    = page_version;
 	entry.image           = found;
@@ -296,36 +416,70 @@ void TextureBindingMemo::Record(TextureCache& cache, const Key& key, uint64_t ha
 	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureBindingMemoFills);
 }
 
+const TextureBindingMemo::Entry* TextureBindingMemo::ViewEntry(const TextureBinding& binding) const {
+	if (!m_entries || binding.memo_tag == 0 ||
+	    binding.desc.type != TextureCache::BindingType::Texture) {
+		return nullptr;
+	}
+	const auto& entry = m_entries[binding.memo_slot % Slots];
+	if (entry.tag != binding.memo_tag || entry.image != binding.image_id || entry.view == nullptr) {
+		return nullptr;
+	}
+	return &entry;
+}
+
+bool TextureBindingMemo::ViewImageReady(const Entry& entry, const Image& image) {
+	// FindTexture's rediscovery checks, a no-op EnsureResidency (the view's levels are resident),
+	// a no-op RefreshImage, and no stencil plane refresh.
+	return image.info.data.Empty() ||
+	       (image.registered && !image.depth_id && !image.binding.needs_rebind &&
+	        entry.requested_first >= image.resident_first && !image.info.HasStencil() &&
+	        RefreshIsNoOp(image));
+}
+
 bool TextureBindingMemo::TryAcquireView(TextureCache& cache, TextureBinding& binding) {
 	if (!m_entries || binding.memo_tag == 0 ||
 	    binding.desc.type != TextureCache::BindingType::Texture) {
 		return false;
 	}
-	const auto& entry = m_entries[binding.memo_slot % Slots];
-	if (entry.tag != binding.memo_tag || entry.image != binding.image_id || entry.view == nullptr) {
+	const auto* entry = ViewEntry(binding);
+	if (entry == nullptr) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureViewMemoMisses);
 		return false;
 	}
 	std::scoped_lock lock {cache.m_lock};
 	auto*            image = cache.m_slot_images.try_get(binding.image_id);
-	if (image == nullptr) {
+	if (image == nullptr || !ViewImageReady(*entry, *image)) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::TextureViewMemoMisses);
 		return false;
 	}
-	if (!image->info.data.Empty()) {
-		// FindTexture's rediscovery checks, a no-op EnsureResidency (the view's levels are
-		// resident), a no-op RefreshImage, and no stencil plane refresh.
-		if (!image->registered || image->depth_id || image->binding.needs_rebind ||
-		    entry.requested_first < image->resident_first || image->info.HasStencil() ||
-		    !RefreshIsNoOp(*image)) {
-			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureViewMemoMisses);
-			return false;
-		}
-	}
 	cache.TouchImage(*image);
-	binding.image_view = entry.view;
+	binding.image_view = entry->view;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::TextureViewMemoHits);
 	return true;
+}
+
+uint32_t TextureBindingMemo::TryAcquireViewRun(TextureCache& cache,
+                                               std::span<TextureBinding> bindings, bool apply) {
+	if (!m_entries || bindings.empty() || ViewEntry(bindings[0]) == nullptr) {
+		return 0;
+	}
+	uint32_t         hits = 0;
+	std::scoped_lock lock {cache.m_lock};
+	for (; hits < bindings.size(); hits++) {
+		auto&       binding = bindings[hits];
+		const auto* entry   = ViewEntry(binding);
+		auto*       image   = entry != nullptr ? cache.m_slot_images.try_get(binding.image_id) : nullptr;
+		if (image == nullptr || !ViewImageReady(*entry, *image)) {
+			break; // TryAcquireView decides
+		}
+		if (apply) {
+			cache.TouchImage(*image);
+			binding.image_view = entry->view;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::TextureViewMemoHits);
+		}
+	}
+	return hits;
 }
 
 bool TextureBindingMemo::TryRepeatResolve(TextureCache& cache, std::span<TextureBinding> bindings,

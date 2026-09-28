@@ -1152,6 +1152,24 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_inline_bindings_checks_verify PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=hwcheck,dynamic;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit")
+	# P4b-2 texture memo hints and runs: alone, verified, and with the draw-sequence texture
+	# repeats off (the view runs then take every view).
+	add_test(NAME draw_prep_engine_inline_bindings_texturememo
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_inline_bindings_texturememo PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=texturememo")
+	add_test(NAME draw_prep_engine_inline_bindings_texturememo_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_inline_bindings_texturememo_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=texturememo;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit")
+	add_test(NAME draw_prep_engine_inline_bindings_texturememo_nosequence
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_inline_bindings_texturememo_nosequence PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=texturememo;KYTY_DRAW_SEQUENCE_FAST=0")
+	add_test(NAME draw_prep_engine_parallel_bindings_texturememo_nosequence_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_bindings_texturememo_nosequence_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit;KYTY_DRAW_SEQUENCE_FAST=0")
 	add_test(NAME shader_recompiler_compute_bindings_verify
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	set_tests_properties(shader_recompiler_compute_bindings_verify PROPERTIES

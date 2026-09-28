@@ -34,7 +34,7 @@
 // stays on the command processor.
 //
 // KYTY_DRAW_PREP_BINDINGS=0 (default) | 1 (every part) | a comma list of parts: pipeline, buffers,
-// userdata, samplers, textures, statics (P4b-1); hwcheck, dynamic (P4b-1b). Plans come from the preparing worker threads (and the
+// userdata, samplers, textures, statics (P4b-1); hwcheck, dynamic (P4b-1b); texturememo (P4b-2). Plans come from the preparing worker threads (and the
 // command processor's KYTY_DRAW_PREP_STEAL preparations); a head the command processor prepares
 // itself has none. KYTY_DRAW_PREP=inline computes them on the command processor (tests).
 // KYTY_DRAW_PREP_BINDINGS_VERIFY=1|exit: every plan item the command processor would use is also
@@ -44,6 +44,7 @@ namespace Libs::Graphics {
 struct DrawIndexArgs;
 struct GraphicContext;
 class SamplerCache;
+class TextureBindingMemo;
 
 namespace DrawPrep {
 
@@ -59,8 +60,9 @@ enum class BindingPart : uint32_t {
 	Statics  = 1u << 5u, // program flags (shader writes, barrier sinking, scissor union), export map
 	HwCheck  = 1u << 6u, // P4b-1b: uc_check/hw_check verdict
 	Dynamic  = 1u << 7u, // P4b-1b: dynamic viewports and scissors
+	TextureMemo = 1u << 8u, // P4b-2: texture memo hints, runs of memo hits under one lock
 };
-inline constexpr uint32_t AllBindingParts = (1u << 8u) - 1u;
+inline constexpr uint32_t AllBindingParts = (1u << 9u) - 1u;
 
 // 0: off.
 [[nodiscard]] uint32_t BindingParts();
@@ -87,6 +89,8 @@ struct BindingTotals {
 	std::atomic<uint64_t> statics_used {0};
 	std::atomic<uint64_t> hw_checks_skipped {0}; // P4b-1b
 	std::atomic<uint64_t> viewports_used {0};    // P4b-1b
+	std::atomic<uint64_t> texture_run_hits {0};  // P4b-2: bindings resolved in runs
+	std::atomic<uint64_t> view_run_hits {0};     // P4b-2: views acquired in runs
 	// Pipelines left to the command processor by the preparing threads (not created yet, or a key
 	// the serial path refuses; the map lock busy), and plan pipelines whose certificate failed.
 	std::atomic<uint64_t> pipeline_abstains {0};
@@ -119,6 +123,9 @@ struct StagePlan {
 	// PrepareBindings: TextureBindingMemo::Hash of every image binding's key.
 	bool                  texture_hashes_valid = false;
 	std::vector<uint64_t> texture_hashes;
+	// P4b-2: the memo entry tag found for every image binding's key (0: none).
+	bool                  texture_tags_valid = false;
+	std::vector<uint64_t> texture_tags;
 
 	void Reset() {
 		ranges_valid         = false;
@@ -126,6 +133,7 @@ struct StagePlan {
 		mip_stats_active     = false;
 		samplers_valid       = false;
 		texture_hashes_valid = false;
+		texture_tags_valid   = false;
 	}
 };
 
@@ -208,9 +216,10 @@ struct BindingPlan {
 
 // What a preparing thread may use besides the slot: lookups only.
 struct BindingPlanContext {
-	PipelineCache*        pipelines = nullptr;
-	SamplerCache*         samplers  = nullptr;
-	const GraphicContext* graphics  = nullptr;
+	PipelineCache*            pipelines    = nullptr;
+	SamplerCache*             samplers     = nullptr;
+	const GraphicContext*     graphics     = nullptr;
+	const TextureBindingMemo* texture_memo = nullptr; // FindHint only
 };
 
 // The plan of a draw whose preparation succeeded (prepared.ok), on the preparing thread, from the
