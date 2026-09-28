@@ -3,11 +3,13 @@
 
 #include "common/assert.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/command_processor/cpOps.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <span>
 #include <vector>
@@ -17,6 +19,13 @@ namespace Libs::Graphics {
 namespace DrawPrep {
 class Engine;
 } // namespace DrawPrep
+
+namespace CpSeq {
+class Verifier;
+class Sequencer;
+struct Intake;
+struct RegisterState;
+} // namespace CpSeq
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 
@@ -31,6 +40,11 @@ template <typename T>
 	ReadGuestForCp(vaddr, sizeof(T), &value);
 	return value;
 }
+
+// A CPU write of guest memory by the command processor (labels, WRITE_DATA, DUMP_CONST_RAM, ...),
+// after the bytes are written. With KYTY_CP_SEQ=1 draw preparations span such writes, so they are
+// logged for the draw-prep certificate (Coherence::Source::CpWrite); otherwise a no-op.
+void NoteCpWrite(uint64_t address, uint64_t size);
 
 enum class Pm4ProcessResult { Complete, Blocked };
 
@@ -49,10 +63,17 @@ public:
 
 private:
 	friend class CommandProcessor;
+	friend class CpSeq::Verifier;
 
 	struct BufferCursor {
 		std::span<const uint32_t> commands;
 		uint32_t                  offset_dw = 0;
+		// KYTY_CP_SEQ=1, the sequencer's parse: the barrier epoch at which the rest of this buffer
+		// was proven readable (0: not yet), and, when it had to be read in lockstep, the copy that
+		// `commands` now points into and the guest address of the copy's first dword.
+		uint64_t                               checked_epoch = 0;
+		std::shared_ptr<std::vector<uint32_t>> copy;
+		uint64_t                               guest_address = 0;
 	};
 
 	std::vector<BufferCursor> m_buffer_stack;
@@ -62,8 +83,29 @@ private:
 	bool                      m_made_progress = false;
 	bool                      m_yield         = false; // stop after the current packet
 	bool                      m_yielded       = false;
+	// KYTY_CP_SEQ (cpOps.h): the stream this execution parses (assigned when it starts; stable
+	// while the owning submission moves between queues), the packets completed in it, and with
+	// KYTY_CP_SEQ_VERIFY the running hash of their dwords. m_verify = false: the reference front
+	// does not follow this stream (constant-engine submissions).
+	uint64_t m_stream_id    = 0;
+	uint64_t m_packets      = 0;
+	uint64_t m_packets_hash = 0;
+	bool     m_verify       = true;
+
+public:
+	// KYTY_CP_SEQ_VERIFY: the reference front does not follow this stream.
+	void DisableSequencerVerify() noexcept { m_verify = false; }
 };
 
+// P3 (cpOps.h): the packet handlers call the "front" methods below. Front state (the register
+// files, context push state, user-data marker, index and indirect-argument state, the known
+// instance count, DE/CE counters, constant RAM, flip info, predication state) belongs to the
+// parse. Every effect beyond it is an op (CpSeq::OpKind) that the front hands to Submit(), and
+// that the "back" executes with ExecuteOp()/Exec*(), which own the back state (submission id,
+// flush batching, label deferral, idle flushes, slice draws, instance counts read back from guest
+// memory, draw prep). KYTY_CP_SEQ=0 executes ops directly (FrontMode::Direct); =inline passes
+// them through the op ring and executes them at once (FrontMode::Inline). A reference front
+// (FrontMode::Reference, KYTY_CP_SEQ_VERIFY) only captures its ops for comparison.
 class CommandProcessor {
 public:
 	struct FlipInfo {
@@ -73,8 +115,11 @@ public:
 		int64_t flip_arg  = 0;
 	};
 
-	CommandProcessor(RenderContext& renderer, int interrupt_event_id)
-	    : m_renderer(renderer), m_interrupt_event_id(interrupt_event_id) {}
+	// Thread: the graphics queue's front on the sequencer thread (KYTY_CP_SEQ=1); ops go to the
+	// resolver through the op ring, lockstep ops wait for its answer.
+	enum class FrontMode : uint8_t { Direct, Inline, Reference, Thread };
+
+	CommandProcessor(RenderContext& renderer, int interrupt_event_id);
 	~CommandProcessor();
 
 	KYTY_CLASS_NO_COPY(CommandProcessor);
@@ -85,10 +130,6 @@ public:
 	void            BufferInit();
 	void            BufferFlush();
 	void            BufferFlushAndWait();
-	// Flush requested by an end-of-pipe interrupt. Interrupts fire when their tick completes, so
-	// only every KYTY_EOP_FLUSH_BATCH-th request flushes (default 8; 1 = flush every time); a
-	// slice always ends with a flush, so a pending interrupt is submitted before the CP blocks.
-	void            BufferFlushForEop();
 	static uint32_t EopFlushPacketLimit();
 	void            BufferWait();
 	// Early submit when the GPU ran out of submitted work (KYTY_IDLE_FLUSH_DRAWS). Call after
@@ -113,7 +154,8 @@ public:
 	void DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	void DrawIndexAuto(DrawAutoArgs args);
-	void ReportLodStats(uint64_t destination, uint32_t size, uint32_t control);
+	// GET_LOD_STATS: the packet's 4 body dwords (the report, or its KYTY_LOD_STATS_MODE fallback).
+	void GetLodStats(const uint32_t* body);
 	void DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
@@ -132,19 +174,29 @@ public:
 	                       uint32_t value);
 	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
-	void EmitGlobalBarrier();
-	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
+	// RELEASE_MEM: the packet's 7 body dwords (barrier, dropped data, interrupt, end-of-pipe
+	// write and flush batching, as the handler decoded them).
+	void ReleaseMem(const uint32_t* body);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
+	// COND_EXEC: whether the condition dword at `address` is non-zero (read in order).
+	[[nodiscard]] bool CondExec(uint64_t address);
+	// Conditional INDIRECT_BUFFER: whether the then-buffer is taken (the 64-bit value at
+	// `compare_addr` compared as WAIT_REG_MEM does, read in order).
+	[[nodiscard]] bool Branch(uint64_t compare_addr, uint64_t mask, uint64_t reference,
+	                          uint32_t function);
+	// SET_*_REG_INDIRECT: the register pairs (offset, value), read once, synchronized, before any
+	// register is applied. Valid until the next call on this processor.
+	[[nodiscard]] const uint32_t* ReadRegisterPairs(uint64_t address, uint32_t num_regs);
 
 	void SetUserDataMarker(HW::UserSgprType type) { m_user_data_marker = type; }
 	[[nodiscard]] HW::UserSgprType GetUserDataMarker() const { return m_user_data_marker; }
 
 	void ResetDeCe();
-	void SetCeComplete(bool complete) { m_ce_complete = complete; }
+	void SetCeComplete(bool complete);
 	void WaitCe();
 	void WaitDeDiff(uint32_t diff);
 	void WaitForRewind(bool valid);
@@ -175,14 +227,122 @@ public:
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
+	[[nodiscard]] FrontMode GetFrontMode() const noexcept { return m_front_mode; }
+	// A reference front (KYTY_CP_SEQ_VERIFY) only parses: packet handlers skip their counters and
+	// diagnostics for it.
+	[[nodiscard]] bool IsReferenceFront() const noexcept {
+		return m_front_mode == FrontMode::Reference;
+	}
+
+	// ---- P3b, KYTY_CP_SEQ=1 (cpSequencer.h) ----
+	// GuestGpu, before any submission: the graphics processor's front moves to the sequencer's
+	// thread. Creates the draw-prep engine (its producer is then the sequencer).
+	void AttachSequencer(CpSeq::Sequencer* sequencer);
+	[[nodiscard]] bool Sequenced() const noexcept { return m_sequencer != nullptr; }
+	// Resolver (GPU thread): executes the ops of graphics submission `submission` (admission
+	// sequence) until its end (Complete), a suspended op, a slice yield, or an empty op ring
+	// (Blocked; `execution` tells yielded from suspended). `handoff`: the submission is to be
+	// parsed and executed by this thread itself (constant engine): run it with Process() in
+	// Direct mode, then EndHandoff().
+	Pm4ProcessResult ResolveSubmission(Pm4Execution& execution, uint64_t submission,
+	                                   std::span<const uint32_t> commands, bool& handoff);
+	void             BeginHandoff();
+	void             EndHandoff(uint64_t submission);
+	// Tests: back to Direct once the sequencer is stopped and its ops are executed.
+	void             DetachSequencer();
+
 private:
+	friend class CpSeq::Verifier;
+	friend class CpSeq::Sequencer;
+
+	// ---- P3: ops ----
+	// The front hands an op to the back: executed directly (Direct), through the op ring
+	// (Inline), or captured (Reference). Returns the op's result (lockstep ops).
+	CpSeq::Result Submit(CpSeq::OpKind kind, const void* payload, uint32_t payload_size,
+	                     const void* data = nullptr, uint32_t data_size = 0);
+	template <typename T>
+	CpSeq::Result Submit(const T& payload, const void* data = nullptr, uint32_t data_size = 0) {
+		return Submit(CpSeq::KindOf<T>::Kind, &payload, static_cast<uint32_t>(sizeof(T)), data,
+		              data_size);
+	}
+	CpSeq::Result SubmitInline(CpSeq::OpKind kind, const void* payload, uint32_t payload_size,
+	                           const void* data, uint32_t data_size);
+	// Thread mode: encodes the op for the resolver; a lockstep op waits for its result.
+	CpSeq::Result SubmitThread(CpSeq::OpKind kind, const void* payload, uint32_t payload_size,
+	                           const void* data, uint32_t data_size);
+	// Sequencer thread: parses one admitted submission and emits its ops. False when stopping.
+	[[nodiscard]] bool SequenceSubmission(const CpSeq::Intake& intake);
+	// Sequencer thread: before a packet of `cursor`: the rest of its buffer may be parsed (no
+	// pending CP write over it, and never GPU-touched, else it is read in lockstep).
+	[[nodiscard]] bool CheckCommandBytes(Pm4Execution::BufferCursor& cursor);
+	// Sequencer thread: waits until no pending CP write overlaps [begin, end). False: stopping.
+	[[nodiscard]] bool AwaitPendingWrites(uint64_t begin, uint64_t end);
+	// Sequencer thread: reads guest bytes the resolver may have to read in order (lockstep).
+	[[nodiscard]] bool ReadGuestForFront(uint64_t address, uint64_t size, void* dst);
+	// Sequencer thread: a snapshot of the front registers for an op; its index.
+	[[nodiscard]] uint32_t TakeSnapshot();
+	// Sequencer thread: waits for a free draw-prep window slot. False: stopping.
+	[[nodiscard]] bool WaitForWindowSpace();
+	// Sequencer thread: the oldest of `ops` still pending, as a wake threshold (op + 1).
+	[[nodiscard]] uint64_t OldestPendingOp(std::deque<uint64_t>& ops) const;
+	// The guest range a CP-write op writes (empty when none), for the pending-write set.
+	[[nodiscard]] static bool CpWriteRange(CpSeq::OpKind kind, const void* payload,
+	                                       uint64_t& begin, uint64_t& end);
+	// Resolver: register state for an op with a snapshot (bound around its execution).
+	[[nodiscard]] CpSeq::RegisterState* OpSnapshot(CpSeq::OpKind kind, const void* payload);
+	CpSeq::Result ExecLockstepRead(const CpSeq::LockstepReadOp& op);
+	// The back: executes one op with today's code (the direct path's bodies).
+	CpSeq::Result ExecuteOp(CpSeq::OpKind kind, const void* payload, const void* data);
+	void          ExecDrawIndex(const CpSeq::DrawIndexOp& op);
+	void          ExecDrawAuto(const CpSeq::DrawAutoOp& op);
+	void          ExecDrawIndirect(const CpSeq::DrawIndirectOp& op);
+	void          ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op);
+	void          ExecDispatchDirect(const CpSeq::DispatchDirectOp& op);
+	void          ExecDispatchIndirect(const CpSeq::DispatchIndirectOp& op);
+	void          ExecEndOfPipe(const CpSeq::EndOfPipeOp& op);
+	void          ExecReleaseMem(const CpSeq::ReleaseMemOp& op);
+	void          ExecEventWrite(const CpSeq::EventWriteOp& op);
+	void          ExecWriteData(const CpSeq::WriteDataOp& op, const uint32_t* src);
+	void          ExecReferenceClock(const CpSeq::ReferenceClockOp& op);
+	void          ExecDmaData(const CpSeq::DmaDataOp& op);
+	void          ExecLodStats(const CpSeq::LodStatsOp& op);
+	void          ExecFlip(const CpSeq::FlipOp& op);
+	CpSeq::Result ExecWaitRegMem(const CpSeq::WaitRegMemOp& op);
+	template <typename T>
+	CpSeq::Result ExecWaitRegMemSized(const CpSeq::WaitRegMemOp& op);
+	CpSeq::Result ExecWaitFlipDone(const CpSeq::WaitFlipDoneOp& op);
+	void          ExecDumpConstRam(const CpSeq::DumpConstRamOp& op, const uint32_t* src);
+	CpSeq::Result ExecPredication(const CpSeq::PredicationOp& op);
+	CpSeq::Result ExecCondExec(const CpSeq::CondExecOp& op);
+	CpSeq::Result ExecBranch(const CpSeq::BranchOp& op);
+	// The front's state of an indirect draw packet.
+	[[nodiscard]] CpSeq::DrawIndirectOp IndirectDrawOp(uint32_t data_offset,
+	                                                   uint32_t draw_initiator, bool indexed);
+	// Reference front: one step of the parse of `execution` (KYTY_CP_SEQ_VERIFY). Returns whether
+	// the step left it suspended.
+	[[nodiscard]] bool ReferenceStep(Pm4Execution& execution);
+	// Reference front: takes the primary's front state at the start of a stream.
+	void CopyFrontState(const CommandProcessor& from);
+	// A back-only helper: GET_LOD_STATS with KYTY_LOD_STATS_MODE=gpu.
+	void ReportLodStats(uint64_t destination, uint32_t size, uint32_t control);
+	// Back-only helpers of RELEASE_MEM and EVENT_WRITE.
+	void EmitGlobalBarrier();
+	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
+	// Flush requested by an end-of-pipe interrupt. Interrupts fire when their tick completes, so
+	// only every KYTY_EOP_FLUSH_BATCH-th request flushes (default 8; 1 = flush every time); a
+	// slice always ends with a flush, so a pending interrupt is submitted before the CP blocks.
+	void BufferFlushForEop();
+
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
-	void SuspendPm4();
+	// One step of the parse: pops a finished buffer, or processes one packet. Returns false when
+	// the parse stops there (the packet suspended, or the slice yields after it).
+	[[nodiscard]] bool ProcessPacket(Pm4Execution& execution);
+	void               SuspendPm4();
 	// Defers an end-of-pipe label (and its interrupt) to the completion of the current tick when
 	// a visibility-proxy dump armed it (KYTY_OCCLUSION_PROXY_MODE=defer-label), every label is
 	// deferred (KYTY_LABEL_MODE=completion), or an older deferred label to the same address is
@@ -209,15 +369,14 @@ private:
 	[[nodiscard]] bool WriteDroppedLabel(void* dst, uint64_t value, uint32_t size, bool interrupt,
 	                                     uint32_t interrupt_context_id,
 	                                     Profiler::FrameEvent counter, bool timestamp = false);
-
-public:
 	// RELEASE_MEM with INT_SEL=4 and DATA_SEL != 0 (previously no data was written): writes the
 	// data (1: 32-bit, 2: 64-bit, 3: reference clock). Returns true when a deferred write took
 	// over raising the interrupt (the caller then only flushes).
 	[[nodiscard]] bool WriteReleaseMemDroppedData(void* dst, uint64_t value, uint32_t data_sel,
 	                                              bool interrupt, uint32_t interrupt_context_id);
 
-private:
+	// The source's index state (index_base_addr, index_buffer_size, index_type_and_size) is the
+	// packet's (front state carried by the op).
 	[[nodiscard]] bool  TryDrawIndirectNative(DrawIndirectSource source);
 	void                ValidateIndirectSource(const DrawIndirectSource& source);
 	[[nodiscard]] uint32_t NumInstances();
@@ -243,6 +402,16 @@ private:
 	uint64_t         m_index_base_addr                  = 0;
 	uint64_t         m_draw_indirect_args_base_addr     = 0;
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
+	// Front view of the persistent instance count (KYTY_CP_SEQ inline/reference): the last
+	// SET_NUM_INSTANCES value while no indirect draw followed it (known), which draws without
+	// their own count use. After an indirect draw the count is back state (m_num_instances,
+	// possibly GPU data): such draws inherit it (DrawFlagInheritInstances), and the next indirect
+	// draw applies a newer SET_NUM_INSTANCES first (IndirectFlagSetInstances). Direct mode keeps
+	// the back state current at every packet instead, as before.
+	uint32_t m_front_num_instances   = 1;
+	bool     m_front_instances_known = true;
+	// SET_*_REG_INDIRECT pairs of the current packet (ReadRegisterPairs).
+	std::vector<uint32_t> m_register_pairs;
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
 	// After native indirect draws the instance count is still GPU data: instance_count of the
@@ -288,6 +457,53 @@ private:
 	std::unique_ptr<DrawPrep::Engine, DrawPrepDeleter> m_draw_prep;
 	// Packets processed, for the CP's placement samples (common/cpuPlacement.h).
 	uint32_t m_placement_packets = 0;
+
+	// ---- P3 (cpOps.h) ----
+	FrontMode m_front_mode = FrontMode::Direct;
+	// Inline: an op is being executed (ops never emit ops).
+	bool      m_executing  = false;
+	// Streams started on this processor (Pm4Execution::m_stream_id).
+	uint64_t  m_next_stream_id = 0;
+	struct OpStreamDeleter {
+		void operator()(CpSeq::OpStream* stream) const noexcept;
+	};
+	struct VerifierDeleter {
+		void operator()(CpSeq::Verifier* verifier) const noexcept;
+	};
+	// Inline: the op ring (created on the first op).
+	std::unique_ptr<CpSeq::OpStream, OpStreamDeleter> m_ops;
+	// KYTY_CP_SEQ_VERIFY: the reference front following this processor's streams.
+	std::unique_ptr<CpSeq::Verifier, VerifierDeleter> m_verifier;
+	// Reference front: the verifier its ops are captured by.
+	CpSeq::Verifier* m_capture = nullptr;
+
+	// ---- P3b, thread mode ----
+	CpSeq::Sequencer* m_sequencer = nullptr;
+	// Front (sequencer thread): a sync-epoch fence packet was parsed since the last op; the
+	// barrier epoch (bumped after every lockstep wait, CheckCommandBytes); CP writes emitted but
+	// maybe not executed yet (range, op sequence).
+	bool     m_epoch_pending = false;
+	uint64_t m_barrier_epoch = 1;
+	struct PendingWrite {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t op    = 0;
+	};
+	std::vector<PendingWrite> m_pending_writes;
+	// The draw ops of published window slots and the ops of taken snapshots, oldest first: the
+	// op whose execution frees the next slot or snapshot (the sequencer's wake threshold).
+	std::deque<uint64_t> m_published_ops;
+	std::deque<uint64_t> m_snapshot_ops;
+	// Resolver (GPU thread): the register files bound outside ops with a snapshot; the packet
+	// count of the last op (EOP flush batching); a suspended op that is retried (sequence + 1;
+	// the verifier compared it at its first execution).
+	HW::Context    m_back_ctx;
+	HW::UserConfig m_back_ucfg;
+	HW::Shader     m_back_sh;
+	uint64_t       m_resolver_packets = 0;
+	uint64_t       m_retry_op         = 0;
+	// Process(): the draw-prep packet hook runs for this slice's packets (decided per slice).
+	bool m_packet_hook = false;
 };
 
 } // namespace Libs::Graphics

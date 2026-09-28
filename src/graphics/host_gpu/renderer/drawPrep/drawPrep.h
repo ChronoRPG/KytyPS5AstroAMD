@@ -218,6 +218,23 @@ public:
 	void Drain();
 	[[nodiscard]] bool Pending() const noexcept;
 
+	// P3b (KYTY_CP_SEQ=1, cpSequencer.h): the sequencer thread publishes each direct draw (the
+	// window's producer) and the resolver commits it when it executes the draw's op, so the
+	// window spans every packet but the ordering points. Parallel mode only.
+	[[nodiscard]] bool Parallel() const noexcept { return m_workers != nullptr; }
+	// Sequencer: publishes a draw from the front's registers and returns its window position.
+	// While the window is full it calls `wait_for_space`, which returns false when the caller
+	// stops (then nothing is published and the result is UINT64_MAX). The submission id and an
+	// inherited instance count are only known at commit (CommitPublished).
+	[[nodiscard]] uint64_t Publish(const DrawIndexArgs* index_args, const DrawAutoArgs* auto_args,
+	                               const HW::Context& context, const HW::UserConfig& user_config,
+	                               const HW::Shader& shaders,
+	                               const std::function<bool()>& wait_for_space);
+	[[nodiscard]] bool WindowHasSpace() const noexcept;
+	// Resolver: commits the draw at window position `position` (the head), recorded with
+	// `submit_id` and, unless UINT32_MAX, `instance_count` (resolved in order).
+	void CommitPublished(uint64_t position, uint64_t submit_id, uint32_t instance_count);
+
 	// Per-packet hook of the command processor (before the packet's handler runs). fence_kind
 	// only matters for a fence (counted as FrameEvent DrawPrepFence<kind>).
 	void OnPacket(PacketClass packet_class, FenceKind fence_kind = FenceKind::Other);
@@ -228,7 +245,8 @@ private:
 	struct Workers;
 
 	void Commit(Slot& slot);
-	void CommitHead();
+	// `patch` (P3b): applied to the head once no other thread works on it, before its commit.
+	void CommitHead(const std::function<void(Slot&)>* patch = nullptr);
 	void NoteFence();
 	void FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index_args,
 	              const DrawAutoArgs* auto_args, const HW::Context& context,

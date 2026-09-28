@@ -21,6 +21,10 @@ namespace Libs::Graphics {
 
 class RenderContext;
 
+namespace CpSeq {
+class Sequencer;
+} // namespace CpSeq
+
 class GuestGpu final {
 public:
 	explicit GuestGpu(RenderContext& renderer);
@@ -96,6 +100,9 @@ private:
 		uint64_t frame_fence = 0;
 		// When the scheduler first passed this front over for the fence (safety timeout), or 0.
 		uint64_t fence_hold_ns = 0;
+		// KYTY_CP_SEQ=1: the resolver parses and executes this (constant-engine) submission
+		// itself, in Direct mode, instead of executing the sequencer's ops.
+		bool handoff = false;
 	};
 
 	void              Enqueue(Submission submission);
@@ -105,6 +112,10 @@ private:
 		return m_pending_commands.load(std::memory_order_acquire) != 0;
 	}
 	bool              Process(Submission& submission);
+	// KYTY_CP_SEQ=1: a queue-0 submission, executed from the sequencer's ops.
+	bool              ProcessSequenced(Submission& submission);
+	// The graphics submission's CE/DE streams parsed and executed on this thread (Direct).
+	bool              ProcessGraphicsDirect(Submission& submission, CommandProcessor& cp);
 	// The submission may start (or continue) now as far as the frame fence is concerned.
 	// Requires m_queue_mutex.
 	[[nodiscard]] bool FrameFencePassed(const Submission& submission) const;
@@ -141,6 +152,11 @@ private:
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
+	// KYTY_CP_SEQ=1 (cpSequencer.h): the graphics queue's front thread; destroyed before m_gfx_cp.
+	struct SequencerDeleter {
+		void operator()(CpSeq::Sequencer* sequencer) const noexcept;
+	};
+	std::unique_ptr<CpSeq::Sequencer, SequencerDeleter> m_sequencer;
 
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;

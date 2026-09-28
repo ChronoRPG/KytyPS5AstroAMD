@@ -460,6 +460,9 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 		const auto outcome =
 		    Coherence::g_log.Check(prepared.coherence_generation, Coherence::Generation(),
 		                           CommitCertificateRanges(prepared, log_scratch));
+		// The walk's length grows with the preparation-to-commit interval (KYTY_CP_SEQ=1).
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepLogChecks);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepLogEntries, outcome.entries);
 		if (outcome.result == Coherence::CheckResult::Clean) {
 			if (!prepared.reads.AllClean(LibKernel::Memory::IsGpuCleanForRead)) {
 				return fail(Failure::CertUnclean);
@@ -486,11 +489,12 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 		const auto result = ValidateValues(prepared.reads);
 		if (LogAuditEnabled()) {
 			// Would the log-mode certificate have decided the same? (Unclean ranges fail both.)
-			const bool log_clean = Coherence::g_log
-			                           .Check(prepared.coherence_generation,
-			                                  Coherence::Generation(),
-			                                  CommitCertificateRanges(prepared, log_scratch))
-			                           .result == Coherence::CheckResult::Clean;
+			const auto audit =
+			    Coherence::g_log.Check(prepared.coherence_generation, Coherence::Generation(),
+			                           CommitCertificateRanges(prepared, log_scratch));
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepLogChecks);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepLogEntries, audit.entries);
+			const bool log_clean = audit.result == Coherence::CheckResult::Clean;
 			if (log_clean && result == ValidateResult::Changed) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepLogMissed);
 			} else if (!log_clean && result == ValidateResult::Ok) {
@@ -893,7 +897,51 @@ bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
 	return true;
 }
 
-void Engine::CommitHead() {
+uint64_t Engine::Publish(const DrawIndexArgs* index_args, const DrawAutoArgs* auto_args,
+                         const HW::Context& context, const HW::UserConfig& user_config,
+                         const HW::Shader& shaders, const std::function<bool()>& wait_for_space) {
+	EXIT_IF(m_workers == nullptr);
+	EXIT_IF((index_args == nullptr) == (auto_args == nullptr));
+	auto& window = m_workers->window;
+	if (window.Full()) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqWindowFull);
+		if (!wait_for_space()) {
+			return UINT64_MAX;
+		}
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSubmitted);
+	const auto position = window.Tail();
+	// The submission id is the resolver's (CommitPublished); the repeat trace is off in this mode.
+	FillSlot(window.Reserve(), 0, index_args, auto_args, context, user_config, shaders);
+	window.Publish();
+	m_workers->Wake();
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepPublished);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepWindowOccupancy, window.Occupancy());
+	return position;
+}
+
+bool Engine::WindowHasSpace() const noexcept {
+	return m_workers != nullptr && !m_workers->window.Full();
+}
+
+void Engine::CommitPublished(uint64_t position, uint64_t submit_id, uint32_t instance_count) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	EXIT_IF(m_workers == nullptr || m_workers->window.Empty() ||
+	        m_workers->window.Head() != position);
+	const std::function<void(Slot&)> patch = [submit_id, instance_count](Slot& slot) {
+		slot.submit_id = submit_id;
+		if (instance_count != UINT32_MAX) {
+			if (slot.kind == DrawKind::Index) {
+				slot.index_args.instance_count = instance_count;
+			} else {
+				slot.auto_args.instance_count = instance_count;
+			}
+		}
+	};
+	CommitHead(&patch);
+}
+
+void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 	auto& window = m_workers->window;
 	EXIT_IF(window.Empty());
 	// Commits happen at packet boundaries, never inside a preparation: the recorder and the
@@ -942,6 +990,10 @@ void Engine::CommitHead() {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSteals, stats.stolen);
 		}
 	}
+	if (patch != nullptr) {
+		// The preparation (and the preparing thread's reads of the slot) is complete.
+		(*patch)(slot);
+	}
 	Commit(slot);
 	window.Retire();
 }
@@ -958,6 +1010,7 @@ void Engine::Drain() {
 }
 
 void Engine::Commit(Slot& slot) {
+	Profiler::ScopedFrameWait commit_time(Profiler::FrameWait::DrawPrepCommit);
 	auto&      scheduler = m_renderer.GetCommandScheduler();
 	auto&      executor  = m_renderer.GetRenderExecutor();
 	const auto previous  = scheduler.BindRegisters(slot.registers.context,

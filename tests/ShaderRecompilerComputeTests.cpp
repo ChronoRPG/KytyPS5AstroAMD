@@ -6,6 +6,8 @@
 #include "common/threads.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/command_processor/cpOps.h"
+#include "graphics/guest_gpu/command_processor/cpSequencer.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -4020,6 +4022,132 @@ public:
     std::printf("[host]    %-32s ok\n", "StreamBufferRing");
   }
 
+  // P3 (cpOps.h, cpSequencer.h): CheckCpSeqOps's kinds of ops as a guest submission through the
+  // GPU thread (GuestGpu::Submit): with KYTY_CP_SEQ=1 the sequencer thread parses it and the GPU
+  // thread resolves it; the wait suspends the resolver until the label is written, while the
+  // sequencer waits at that ordering point. Also run in the other modes.
+  void CheckCpSeqGuestGpu() {
+    constexpr const char *name = "CpSeqGuestGpu";
+    EnsureRuntimeContext();
+    auto &context = Renderer();
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    auto &totals = CpSeq::GetVerifyTotals();
+    const bool verify = CpSeq::ConfiguredMode() != CpSeq::Mode::Off && CpSeq::VerifyMode() != 0;
+    const auto checks_before = totals.checks.load();
+    const auto mismatches_before = totals.mismatches.load();
+    const auto divergences_before = totals.read_divergences.load();
+
+    const auto lo = [](const void *value) {
+      return static_cast<uint32_t>(reinterpret_cast<uint64_t>(value));
+    };
+    const auto hi = [](const void *value) {
+      return static_cast<uint32_t>(reinterpret_cast<uint64_t>(value) >> 32u);
+    };
+    alignas(16) std::array<uint32_t, 4> pairs{Pm4::SPI_SHADER_PGM_LO_PS, 0x05000104u,
+                                              Pm4::SPI_SHADER_PGM_HI_PS, 0u};
+    alignas(8) uint32_t cond_zero = 0;
+    alignas(8) uint32_t cond_one = 1;
+    alignas(8) uint32_t label = 0;
+    alignas(16) uint64_t predicate = 0;
+    alignas(8) uint64_t branch_value = 1;
+    uint32_t written = 0, skipped = 0, executed = 0, predicated = 0, branched = 0, suffix = 0;
+    alignas(16) std::array<uint32_t, 3> dump{};
+    const auto write = [&](std::vector<uint32_t> &out, uint32_t *dst, uint32_t value,
+                           bool tagged = false) {
+      out.insert(out.end(), {KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0) | (tagged ? 1u : 0u), 0u,
+                             lo(dst), hi(dst), value});
+    };
+    std::vector<uint32_t> then_commands;
+    write(then_commands, &branched, 55);
+    const std::array<uint32_t, 14> branch{
+        KYTY_PM4(14, Pm4::IT_INDIRECT_BUFFER, 0), 1u | (3u << 8u), lo(&branch_value),
+        hi(&branch_value), UINT32_MAX, UINT32_MAX, 1u, 0u, lo(then_commands.data()),
+        hi(then_commands.data()), static_cast<uint32_t>(then_commands.size()), 0u, 0u, 0u};
+    std::vector<uint32_t> stream;
+    write(stream, &written, 11);
+    stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_SET_SH_REG_INDIRECT, Pm4::R_ZERO),
+                                 lo(pairs.data()), hi(pairs.data()), 0x80000000u, 2u});
+    stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_COND_EXEC, 0), lo(&cond_zero),
+                                 hi(&cond_zero), 0u, 5u});
+    write(stream, &skipped, 22);
+    stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_COND_EXEC, 0), lo(&cond_one), hi(&cond_one),
+                                 0u, 5u});
+    write(stream, &executed, 33);
+    stream.insert(stream.end(),
+                  {KYTY_PM4(5, Pm4::IT_WRITE_CONST_RAM, 0), 0x40u, 0xa1u, 0xb2u, 0xc3u});
+    stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_DUMP_CONST_RAM, 0), 0x40u, 3u,
+                                 lo(dump.data()), hi(dump.data())});
+    stream.insert(stream.end(), {0xc0022000u, (3u << 16u) | (1u << 8u), lo(&predicate),
+                                 hi(&predicate)});
+    write(stream, &predicated, 44, true);
+    stream.insert(stream.end(), {0xc0022000u, 0u, 0u, 0u});
+    stream.insert(stream.end(), {KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0), lo(branch.data()),
+                                 hi(branch.data()),
+                                 0x0f200000u | static_cast<uint32_t>(branch.size())});
+    stream.insert(stream.end(), {KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0), 0x10u | 3u, lo(&label),
+                                 hi(&label), 1u, UINT32_MAX, 0u});
+    write(stream, &suffix, 66);
+
+    gpu.Submit(stream, {});
+    // A constant-engine submission (with KYTY_CP_SEQ=1 handed to the GPU thread, which parses
+    // and executes it itself), then a plain one: the sequencer continues after the handoff.
+    uint32_t ce_suffix = 0;
+    uint32_t after_ce = 0;
+    const std::array<uint32_t, 2> constant_stream{0xc0008400u, 1u}; // INCREMENT_CE_COUNTER
+    std::vector<uint32_t> ce_draw_stream{0xc0008600u, 1u,           // WAIT_ON_CE_COUNTER
+                                         0xc0008500u, 0u};          // INCREMENT_DE_COUNTER
+    write(ce_draw_stream, &ce_suffix, 77);
+    std::vector<uint32_t> after_stream;
+    write(after_stream, &after_ce, 88);
+    gpu.Submit(ce_draw_stream, constant_stream);
+    gpu.Submit(after_stream, {});
+    // Barrier stress: every wait is an ordering point the sequencer stops at (each one passes at
+    // once: the write before it has executed by then).
+    alignas(8) uint32_t counter = 0;
+    std::vector<uint32_t> barriers;
+    constexpr uint32_t barrier_count = 400;
+    for (uint32_t i = 1; i <= barrier_count; i++) {
+      write(barriers, &counter, i);
+      barriers.insert(barriers.end(), {KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0), 0x10u | 3u,
+                                       lo(&counter), hi(&counter), i, UINT32_MAX, 0u});
+    }
+    gpu.Submit(barriers, {});
+    std::atomic<bool> drained{false};
+    std::jthread drainer([&] {
+      gpu.Done();
+      gpu.Done();
+      drained = true;
+    });
+    // The wait suspends the stream; the label is written on the GPU thread between slices.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    gpu.SendCommandSync([&] {
+      Require(name, "wait holds", !drained.load() && suffix == 0 && ce_suffix == 0,
+              "the stream passed its unsatisfied wait");
+      label = 1;
+    });
+    drainer.join();
+    Require(name, "effects",
+            written == 11 && skipped == 0 && executed == 33 && predicated == 0 &&
+                branched == 55 && suffix == 66 &&
+                dump == std::array<uint32_t, 3>{0xa1u, 0xb2u, 0xc3u} && ce_suffix == 77 &&
+                after_ce == 88 && counter == barrier_count,
+            "an op executed with different arguments than its packet's");
+    if (verify) {
+      Require(name, "verify",
+              totals.checks.load() > checks_before + 8 &&
+                  totals.mismatches.load() == mismatches_before &&
+                  totals.read_divergences.load() == divergences_before,
+              "KYTY_CP_SEQ_VERIFY compared too few ops, or the reference front differed");
+    }
+    // The lane check initializes the GPU of the same context again.
+    context.ShutdownGpu();
+    std::printf("[gpu]     %-32s ok (%s)\n", name,
+                CpSeq::ConfiguredMode() == CpSeq::Mode::Thread   ? "sequencer thread"
+                : CpSeq::ConfiguredMode() == CpSeq::Mode::Inline ? "inline"
+                                                                 : "direct");
+  }
+
   void CheckGpuCommandLane() {
     EnsureRuntimeContext();
     auto &context = Renderer();
@@ -4297,23 +4425,51 @@ public:
       packet[4] = value;
     };
 
-    uint32_t live_graphics_value = 0;
-    std::array<uint32_t, 5> live_graphics_commands{};
-    write_packet(live_graphics_commands.data(), &live_graphics_value, 11);
-    std::binary_semaphore graphics_gate_entered{0};
-    std::binary_semaphore graphics_gate_release{0};
-    gpu.SendCommand([&] {
-      graphics_gate_entered.release();
-      graphics_gate_release.acquire();
-    });
-    gpu.Submit(live_graphics_commands, {});
-    graphics_gate_entered.acquire();
-    live_graphics_commands[4] = 22;
-    graphics_gate_release.release();
-    drain_submissions();
-    Require("GpuCommandLane", "borrowed graphics commands",
-            live_graphics_value == 22,
-            "graphics submission executed a copied PM4 stream");
+    // With KYTY_CP_SEQ=1 the sequencer parses a graphics submission as soon as it is admitted
+    // (P3-SEQUENCER.md 2.5, 3(d)): a CPU write after Submit that no CP wait orders is a race
+    // there, as with the hardware CP's prefetch. The gate below orders the write with the GPU
+    // thread only, so that form runs in the other modes; the second form orders it with a CP wait
+    // and runs in every mode.
+    if (CpSeq::ConfiguredMode() != CpSeq::Mode::Thread) {
+      uint32_t live_graphics_value = 0;
+      std::array<uint32_t, 5> live_graphics_commands{};
+      write_packet(live_graphics_commands.data(), &live_graphics_value, 11);
+      std::binary_semaphore graphics_gate_entered{0};
+      std::binary_semaphore graphics_gate_release{0};
+      gpu.SendCommand([&] {
+        graphics_gate_entered.release();
+        graphics_gate_release.acquire();
+      });
+      gpu.Submit(live_graphics_commands, {});
+      graphics_gate_entered.acquire();
+      live_graphics_commands[4] = 22;
+      graphics_gate_release.release();
+      drain_submissions();
+      Require("GpuCommandLane", "borrowed graphics commands",
+              live_graphics_value == 22,
+              "graphics submission executed a copied PM4 stream (value " +
+                  std::to_string(live_graphics_value) + ")");
+    }
+    {
+      // The stream waits on a label; the CPU patches the packet after the wait and only then
+      // has the label written (on the GPU thread, which also retries the wait at once).
+      alignas(8) uint32_t ordered_label = 0;
+      uint32_t ordered_value = 0;
+      const auto ordered_label_address = reinterpret_cast<uint64_t>(&ordered_label);
+      std::array<uint32_t, 12> ordered_commands{
+          KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0), 0x10u | 3u,
+          static_cast<uint32_t>(ordered_label_address),
+          static_cast<uint32_t>(ordered_label_address >> 32u), 1u, UINT32_MAX, 0u};
+      write_packet(ordered_commands.data() + 7, &ordered_value, 11);
+      gpu.Submit(ordered_commands, {});
+      ordered_commands[11] = 22;
+      gpu.SendCommandSync([&] { ordered_label = 1; });
+      drain_submissions();
+      Require("GpuCommandLane", "borrowed graphics commands after a wait",
+              ordered_value == 22,
+              "graphics submission executed PM4 bytes read before its wait passed (value " +
+                  std::to_string(ordered_value) + ")");
+    }
 
     uint32_t live_compute_value = 0;
     std::array<uint32_t, 5> live_compute_commands{};
@@ -4551,17 +4707,24 @@ public:
     stream_gate_release.release();
     uint32_t packet_marker_a_at_callback = UINT32_MAX;
     uint32_t packet_marker_b_at_callback = UINT32_MAX;
-    for (uint32_t attempt = 0; attempt < 8 && packet_marker_a_at_callback != 11;
-         attempt++) {
+    // Host commands run between packets, or between ops with KYTY_CP_SEQ=1, where the first op
+    // can come after many host commands (the sequencer parses on its own thread): retry until
+    // the stream is in its loop, for up to 5 s, then end the loop anyway so a failure cannot hang.
+    const auto polling_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (bool patched = false; !patched;) {
+      const bool last_attempt = std::chrono::steady_clock::now() > polling_deadline;
       gpu.SendCommandSync([&] {
-        if (packet_marker_a == 11 && packet_marker_b == 0) {
+        if ((packet_marker_a == 11 && packet_marker_b == 0) || last_attempt) {
           packet_marker_a_at_callback = packet_marker_a;
           packet_marker_b_at_callback = packet_marker_b;
           polling_commands[13] = 33;
+          // A sequencer reads the stream concurrently: the new value before the loop's exit.
+          std::atomic_thread_fence(std::memory_order_release);
           polling_loop[1020] = KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO);
           polling_loop[1021] = 0;
           polling_loop[1022] = KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO);
           polling_loop[1023] = 0;
+          patched = true;
         }
       });
       std::this_thread::yield();
@@ -15057,6 +15220,67 @@ public:
                     "; expected " + std::to_string(prebuilt) + ", " + std::to_string(verified) +
                     " and 0");
       }
+
+      // KYTY_CP_SEQ=1: the same stream through a sequencer thread, resolved on this (GPU)
+      // thread. Parallel draw prep publishes the draws from the sequencer and commits them per
+      // op (no drain); otherwise the draws carry register snapshots.
+      if (CpSeq::ConfiguredMode() == CpSeq::Mode::Thread) {
+        clear();
+        shaders.SetPsShaderBase(pixel_addresses[0]);
+        const auto seq_committed = totals.committed.load();
+        const auto seq_fallbacks = totals.fallbacks.load();
+        const auto seq_drains = totals.drains.load();
+        auto &verify_totals = CpSeq::GetVerifyTotals();
+        const auto verify_checks = verify_totals.checks.load();
+        const auto verify_mismatches = verify_totals.mismatches.load();
+        const auto verify_divergences = verify_totals.read_divergences.load();
+        {
+          CpSeq::Sequencer sequencer(processor);
+          processor.AttachSequencer(&sequencer);
+          sequencer.Start();
+          processor.BufferInit();
+          CpSeq::Intake intake;
+          intake.sequence = 1;
+          intake.commands = stream;
+          sequencer.Admit(intake);
+          Pm4Execution execution;
+          bool handoff = false;
+          bool complete = false;
+          for (uint32_t slice = 0; slice < 100000 && !complete && !handoff; slice++) {
+            complete = processor.ResolveSubmission(execution, 1, stream, handoff) ==
+                       Pm4ProcessResult::Complete;
+          }
+          Require(name, "sequenced stream", complete && !handoff,
+                  "the sequencer's ops did not complete the stream");
+          sequencer.Stop();
+          processor.DetachSequencer();
+        }
+        processor.BufferInit();
+        const auto sequenced = read();
+        check("draws through the sequencer", sequenced);
+        Require(name, "serial and sequenced pixels", sequenced == serial,
+                "the sequenced draws differ from the serial draws");
+        if (mode != DrawPrep::Mode::Off) {
+          const auto *code_cert = std::getenv("KYTY_DRAW_PREP_CODE_CERT");
+          const uint64_t commits =
+              code_cert == nullptr || std::strcmp(code_cert, "0") != 0 ? 2u : 0u;
+          Require(name, "sequenced preparations",
+                  totals.committed.load() - seq_committed == commits &&
+                      totals.fallbacks.load() - seq_fallbacks == 2u - commits &&
+                      totals.drains.load() == seq_drains,
+                  "committed " + std::to_string(totals.committed.load() - seq_committed) +
+                      ", fell back " + std::to_string(totals.fallbacks.load() - seq_fallbacks) +
+                      ", drains " + std::to_string(totals.drains.load() - seq_drains) +
+                      "; expected " + std::to_string(commits) + " commits and no drain");
+        }
+        if (CpSeq::VerifyMode() != 0) {
+          Require(name, "sequenced verify",
+                  verify_totals.checks.load() - verify_checks >= 3u &&
+                      verify_totals.mismatches.load() == verify_mismatches &&
+                      verify_totals.read_divergences.load() == verify_divergences,
+                  "the reference front compared too few ops or differed");
+        }
+      }
       RenderExecutorTestAccess::ResetBindings(executor);
 
       // The same draws with a D32 depth target, tested (ALWAYS) but not written: a binding plan
@@ -15136,7 +15360,8 @@ public:
     const char *mode_name = DrawPrep::GetMode() == DrawPrep::Mode::Parallel ? "parallel"
                             : DrawPrep::GetMode() == DrawPrep::Mode::Inline ? "inline"
                                                                             : "off";
-    std::printf("[gpu]     %-32s ok (draw-prep %s)\n", name, mode_name);
+    std::printf("[gpu]     %-32s ok (draw-prep %s%s)\n", name, mode_name,
+                CpSeq::ConfiguredMode() == CpSeq::Mode::Thread ? ", sequenced" : "");
   }
 
   // KYTY_EOP_TIMESTAMPS: end-of-pipe clock writes (RELEASE_MEM, data select 3).
@@ -43815,6 +44040,135 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
 }
 
+// P3 (cpOps.h): one PM4 stream whose packets become ops of the kinds the parse can check without
+// drawing: WRITE_DATA, SET_SH_REG_INDIRECT pairs (a ReadCheck op under verify), COND_EXEC with
+// both outcomes, WRITE_CONST_RAM + DUMP_CONST_RAM (constant RAM as inline data), a boolean
+// SET_PREDICATION with a tagged packet, a conditional INDIRECT_BUFFER in a called buffer, and a
+// WAIT_REG_MEM that suspends the stream and resumes it. The results are the same in every
+// KYTY_CP_SEQ mode. With KYTY_CP_SEQ_VERIFY every op is compared with the reference front and
+// none differs; in count mode (=1) a front-state change the reference cannot see (a predicate set
+// between two slices of a stream) must be detected.
+void CheckCpSeqOps(RenderContext &renderer) {
+  constexpr const char *name = "CpSeqOps";
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  processor.BufferInit();
+  auto &totals = CpSeq::GetVerifyTotals();
+  const bool verify = CpSeq::ConfiguredMode() == CpSeq::Mode::Inline && CpSeq::VerifyMode() != 0;
+  const auto checks_before = totals.checks.load();
+  const auto mismatches_before = totals.mismatches.load();
+  const auto divergences_before = totals.read_divergences.load();
+  const auto answers_before = totals.lockstep_answers.load();
+
+  const auto lo = [](const void *value) {
+    return static_cast<uint32_t>(reinterpret_cast<uint64_t>(value));
+  };
+  const auto hi = [](const void *value) {
+    return static_cast<uint32_t>(reinterpret_cast<uint64_t>(value) >> 32u);
+  };
+  alignas(16) std::array<uint32_t, 4> pairs{Pm4::SPI_SHADER_PGM_LO_PS, 0x05000104u,
+                                            Pm4::SPI_SHADER_PGM_HI_PS, 0u};
+  alignas(8) uint32_t cond_zero = 0;
+  alignas(8) uint32_t cond_one = 1;
+  alignas(8) uint32_t label = 0;
+  alignas(16) uint64_t predicate = 0;
+  alignas(8) uint64_t branch_value = 1;
+  uint32_t written = 0, skipped = 0, executed = 0, predicated = 0, branched = 0, suffix = 0;
+  alignas(16) std::array<uint32_t, 3> dump{};
+  const auto write = [&](std::vector<uint32_t> &out, uint32_t *dst, uint32_t value,
+                         bool tagged = false) {
+    out.insert(out.end(), {KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0) | (tagged ? 1u : 0u), 0u, lo(dst),
+                           hi(dst), value});
+  };
+  std::vector<uint32_t> then_commands;
+  write(then_commands, &branched, 55);
+  // A taken branch replaces the rest of its buffer: it sits alone in a called buffer.
+  const std::array<uint32_t, 14> branch{
+      KYTY_PM4(14, Pm4::IT_INDIRECT_BUFFER, 0), 1u | (3u << 8u), lo(&branch_value),
+      hi(&branch_value), UINT32_MAX, UINT32_MAX, 1u, 0u, lo(then_commands.data()),
+      hi(then_commands.data()), static_cast<uint32_t>(then_commands.size()), 0u, 0u, 0u};
+  std::vector<uint32_t> stream;
+  write(stream, &written, 11);
+  stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_SET_SH_REG_INDIRECT, Pm4::R_ZERO),
+                               lo(pairs.data()), hi(pairs.data()), 0x80000000u, 2u});
+  // COND_EXEC on a zero dword skips the next packet (5 dwords); on a non-zero one it runs it.
+  stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_COND_EXEC, 0), lo(&cond_zero), hi(&cond_zero),
+                               0u, 5u});
+  write(stream, &skipped, 22);
+  stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_COND_EXEC, 0), lo(&cond_one), hi(&cond_one),
+                               0u, 5u});
+  write(stream, &executed, 33);
+  stream.insert(stream.end(),
+                {KYTY_PM4(5, Pm4::IT_WRITE_CONST_RAM, 0), 0x40u, 0xa1u, 0xb2u, 0xc3u});
+  stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_DUMP_CONST_RAM, 0), 0x40u, 3u, lo(dump.data()),
+                               hi(dump.data())});
+  // Boolean predication, condition 1 (skip when the value is 0): the tagged packet is skipped;
+  // op 0 clears it again.
+  stream.insert(stream.end(), {0xc0022000u, (3u << 16u) | (1u << 8u), lo(&predicate),
+                               hi(&predicate)});
+  write(stream, &predicated, 44, true);
+  stream.insert(stream.end(), {0xc0022000u, 0u, 0u, 0u});
+  stream.insert(stream.end(), {KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0), lo(branch.data()),
+                               hi(branch.data()),
+                               0x0f200000u | static_cast<uint32_t>(branch.size())});
+  stream.insert(stream.end(), {KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0), 0x10u | 3u, lo(&label),
+                               hi(&label), 1u, UINT32_MAX, 0u});
+  write(stream, &suffix, 66);
+
+  Pm4Execution execution;
+  Require(name, "wait suspends",
+          processor.Process(execution, stream) == Pm4ProcessResult::Blocked && suffix == 0 &&
+              processor.Process(execution, stream) == Pm4ProcessResult::Blocked &&
+              !execution.MadeProgress(),
+          "the stream did not stop at its unsatisfied wait");
+  label = 1;
+  Require(name, "wait resumes",
+          processor.Process(execution, stream) == Pm4ProcessResult::Complete && suffix == 66,
+          "the stream did not resume after its wait passed");
+  Require(name, "effects",
+          written == 11 && skipped == 0 && executed == 33 && predicated == 0 &&
+              branched == 55 && dump == std::array<uint32_t, 3>{0xa1u, 0xb2u, 0xc3u} &&
+              processor.GetShCtx().GetPs().ps_regs.data_addr == 0x500010400ull &&
+              !processor.ShouldSkipPredicatedPackets(),
+          "an op executed with different arguments than its packet's");
+  if (verify) {
+    Require(name, "verify",
+            totals.checks.load() > checks_before + 8 &&
+                totals.mismatches.load() == mismatches_before &&
+                totals.read_divergences.load() == divergences_before &&
+                totals.lockstep_answers.load() >= answers_before + 4,
+            "KYTY_CP_SEQ_VERIFY compared too few ops, or the reference front differed");
+  }
+  if (verify && CpSeq::VerifyMode() == 1) {
+    // Negative: the predicate changes between two slices of a stream, outside it. The front
+    // skips the tagged packet; the reference front, which took the front state at the stream's
+    // start, runs it: an op the front never emitted.
+    alignas(16) uint64_t zero = 0;
+    uint32_t tagged = 0;
+    label = 0;
+    std::vector<uint32_t> raced;
+    raced.insert(raced.end(), {KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0), 0x10u | 3u, lo(&label),
+                               hi(&label), 1u, UINT32_MAX, 0u});
+    write(raced, &tagged, 77, true);
+    Pm4Execution raced_execution;
+    const bool blocked = processor.Process(raced_execution, raced) == Pm4ProcessResult::Blocked;
+    processor.SetPredication(1, 3, 0, &zero, 0);
+    label = 1;
+    const bool complete =
+        processor.Process(raced_execution, raced) == Pm4ProcessResult::Complete;
+    processor.SetPredication(0, 0, 0, nullptr, 0);
+    Require(name, "verify detects",
+            blocked && complete && tagged == 0 &&
+                totals.mismatches.load() == mismatches_before + 1,
+            "KYTY_CP_SEQ_VERIFY missed a front-state difference");
+  }
+  processor.BufferWait();
+  std::printf("[host]    %-32s ok (%s)\n", name,
+              CpSeq::ConfiguredMode() == CpSeq::Mode::Inline
+                  ? (verify ? "inline, verified" : "inline")
+                  : "direct");
+}
+
 #include "ShaderCodegenTests.inc"
 #include "ShaderGiProbeTests.inc"
 #include "ShaderSrtVariantTests.inc"
@@ -44219,6 +44573,23 @@ int main(int argc, char **argv) {
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
     CheckPm4CeCompletion(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cp-seq-only") == 0) {
+    // KYTY_CP_SEQ (cpOps.h): the PM4 checks whose packets become ops (waits, predication,
+    // branches, rewind, constant engine, context state, events) and the scheduler lane.
+    VulkanHarness vulkan;
+    CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
+    CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
+    CheckPm4Predication(vulkan.RuntimeRenderer());
+    CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
+    CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
+    CheckPm4WaitResume(vulkan.RuntimeRenderer());
+    CheckPm4RewindResume(vulkan.RuntimeRenderer());
+    CheckPm4CeCompletion(vulkan.RuntimeRenderer());
+    CheckCpSeqOps(vulkan.RuntimeRenderer());
+    vulkan.CheckCpSeqGuestGpu();
+    vulkan.CheckGpuCommandLane();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
@@ -44725,6 +45096,7 @@ int main(int argc, char **argv) {
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckPm4CeCompletion(vulkan.RuntimeRenderer());
+  CheckCpSeqOps(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
@@ -44798,6 +45170,7 @@ int main(int argc, char **argv) {
   for (const auto &test : graphics_tests) {
     RunGraphicsCase(&vulkan, test);
   }
+  vulkan.CheckCpSeqGuestGpu();
   vulkan.CheckGpuCommandLane();
   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
   return 0;

@@ -10,6 +10,8 @@
 #include <span>
 #include <thread>
 
+#include "graphics/host_gpu/gpuTouchedPages.h"
+
 // Draw-prep S4: the coherence generation and its range log.
 //
 // Every transition that can change whether a guest range is clean for a GPU-backing read, or
@@ -101,6 +103,13 @@ public:
 	// the caller's state change, so any thread that later observes that change (through the lock
 	// or atomic publishing it) also observes this generation.
 	uint64_t Append(Range range, Source source) noexcept {
+		// KYTY_CP_SEQ=1: the sticky GPU-touched pages (gpuTouchedPages.h), set before the
+		// transition becomes observable, for the transitions that can make a range unclean.
+		GpuTouched::NoteTransition(range.begin, range.end,
+		                           source == Source::BufferDirtyAdd ||
+		                               source == Source::TrackerGpuMark ||
+		                               source == Source::ImageGpuModified ||
+		                               source == Source::PublicationBegin);
 		const auto generation = m_generation.fetch_add(1, std::memory_order_seq_cst) + 1u;
 		auto&      entry      = m_entries[generation & (Capacity - 1u)];
 		// Slots are written in turn: the writer of this lap waits until the previous lap's writer
