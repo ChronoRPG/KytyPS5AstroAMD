@@ -16,6 +16,8 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <shared_mutex>
 
 namespace Libs::Graphics {
@@ -236,6 +238,45 @@ void RenderContext::NoteHostBackingWrite(uint64_t vaddr, uint64_t size,
 		             writer == HostWriter::LodStats ? "LOD-statistics report" : "occlusion result",
 		             vaddr, size, states.gpu_dirty, states.clean);
 	}
+}
+
+// KYTY_HOST_WRITE_TRACKING=0 leaves emulator writes of guest bytes untold to the tracker again
+// (only NoteHostBackingWrite counts them). Same spellings as the other renderer switches.
+static bool HostWriteTrackingEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_HOST_WRITE_TRACKING");
+		if (value == nullptr || value[0] == '\0') {
+			return true;
+		}
+		return !(std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
+		         std::strcmp(value, "off") == 0);
+	}();
+	return enabled;
+}
+
+void RenderContext::PrepareHostBackingWrite(uint64_t vaddr, uint64_t size,
+                                            HostWriter writer) noexcept {
+	// Only the GPU thread: it alone marks pages GPU-dirty, so the ownership checked below cannot
+	// change before the invalidation (which would then download from a completion runner).
+	if (!HostWriteTrackingEnabled() || !GuestGpu::IsGpuThread() || !IsMapped(vaddr, size)) {
+		NoteHostBackingWrite(vaddr, size, writer);
+		return;
+	}
+	const auto states = m_buffer_cache.CountPageStates(vaddr, size);
+	if (states.gpu_dirty == 0 && states.clean != 0 &&
+	    !m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		// Clean tracked pages and no GPU-owned bytes: the transition a guest write fault makes
+		// (CPU-dirty and writable, fills forgotten, images over them invalidated), before the
+		// bytes land. The next GPU use of the range then uploads them, as after a guest write.
+		Profiler::CountFrameEvent(Profiler::FrameEvent::HostBackingWrites);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::HostBackingWriteCleanPages, states.clean);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::HostBackingWritesTracked);
+		(void)InvalidateMemory(vaddr, size);
+		return;
+	}
+	// GPU-owned bytes (a guest write would first download them, which a write made in a
+	// completion cannot), or nothing tracked as clean: counted and reported as before.
+	NoteHostBackingWrite(vaddr, size, writer);
 }
 
 void RenderContext::NoteGuestProtection(uint64_t vaddr, uint64_t size, bool allows_read,

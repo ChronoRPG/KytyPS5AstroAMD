@@ -446,6 +446,121 @@ void TestWriteTickMap() {
   ticks.Prune(4);
   Check(ticks.Size() == 1 && ticks.MaxTick(0x8000, 1) == 0 && ticks.MaxTick(0x1000, 1) == 9,
         "write-tick prune removed the wrong entries");
+  // Covered by an entry of the same tick (the early return): nothing changes.
+  ticks.Assign(0x2000, 0x800, 9);
+  ticks.Assign(0x1000, 0x5000, 9);
+  Check(ticks.Size() == 1 && ticks.MaxTick(0x1000, 0x5000) == 9 && ticks.MaxTick(0x6000, 1) == 0,
+        "a covered same-tick assignment changed the map");
+  ticks.Assign(0x2000, 0x800, 10);
+  Check(ticks.Size() == 3 && ticks.MaxTick(0x2000, 1) == 10 && ticks.MaxTick(0x1fff, 1) == 9 &&
+            ticks.MaxTick(0x2800, 1) == 9,
+        "a covered newer-tick assignment did not split its entry");
+}
+
+uint64_t NextRandom(uint64_t &state) {
+  state ^= state << 13u;
+  state ^= state >> 7u;
+  state ^= state << 17u;
+  return state;
+}
+
+// RangeSet against a byte map: random adds and subtractions keep exactly the covered bytes, as
+// ascending, disjoint and non-touching ranges (the form Add's early return relies on).
+void TestRangeSetModel() {
+  constexpr uint64_t span = 512;
+  constexpr uint64_t origin = 0x1000;
+  RangeSet ranges;
+  std::vector<bool> covered(span, false);
+  uint64_t state = 0x9e3779b97f4a7c15ull;
+  std::vector<std::pair<uint64_t, uint64_t>> listed;
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
+  for (int step = 0; step < 20000; step++) {
+    const uint64_t begin = NextRandom(state) % span;
+    const uint64_t size = 1 + NextRandom(state) % std::min<uint64_t>(48, span - begin);
+    const bool add = NextRandom(state) % 3 != 0;
+    if (add) {
+      ranges.Add(origin + begin, size);
+    } else {
+      ranges.Subtract(origin + begin, size);
+    }
+    for (uint64_t unit = begin; unit < begin + size; unit++) {
+      covered[unit] = add;
+    }
+    listed.clear();
+    ranges.ForEach([&](uint64_t first, uint64_t last) { listed.emplace_back(first, last); });
+    runs.clear();
+    for (uint64_t unit = 0; unit < span;) {
+      if (!covered[unit]) {
+        unit++;
+        continue;
+      }
+      uint64_t last = unit;
+      while (last < span && covered[last]) {
+        last++;
+      }
+      runs.emplace_back(origin + unit, origin + last);
+      unit = last;
+    }
+    Check(listed == runs, "range set diverged from its byte model");
+    const uint64_t query = NextRandom(state) % span;
+    const uint64_t query_size = 1 + NextRandom(state) % std::min<uint64_t>(64, span - query);
+    bool all = true;
+    for (uint64_t unit = query; unit < query + query_size; unit++) {
+      all = all && covered[unit];
+    }
+    Check(ranges.Contains(origin + query, query_size) == all,
+          "range set containment diverged from its byte model");
+  }
+}
+
+// WriteTickMap against a per-byte tick model: random assignments and prunes keep every byte's
+// newest tick, one entry per maximal run of an equal tick (the coalesced form Assign's early
+// return relies on).
+void TestWriteTickMapModel() {
+  constexpr uint64_t span = 256;
+  constexpr uint64_t origin = 0x10000;
+  WriteTickMap ticks;
+  std::vector<uint64_t> model(span, 0);
+  uint64_t state = 0x2545f4914f6cdd1dull;
+  uint64_t tick = 1;
+  for (int step = 0; step < 8000; step++) {
+    const auto op = NextRandom(state) % 16;
+    if (op == 0) {
+      const uint64_t completed = tick > 3 ? tick - 1 - NextRandom(state) % 3 : 0;
+      ticks.Prune(completed);
+      for (auto &value : model) {
+        if (value <= completed) {
+          value = 0;
+        }
+      }
+    } else if (op < 5) {
+      tick++;
+    } else {
+      const uint64_t begin = NextRandom(state) % span;
+      const uint64_t size = 1 + NextRandom(state) % std::min<uint64_t>(40, span - begin);
+      ticks.Assign(origin + begin, size, tick);
+      for (uint64_t unit = begin; unit < begin + size; unit++) {
+        model[unit] = tick;
+      }
+    }
+    size_t runs = 0;
+    for (uint64_t unit = 0; unit < span; unit++) {
+      if (model[unit] != 0 && (unit == 0 || model[unit - 1] != model[unit])) {
+        runs++;
+      }
+      Check(ticks.MaxTick(origin + unit, 1) == model[unit],
+            "write-tick map diverged from its per-byte model");
+    }
+    Check(ticks.Size() == runs, "write-tick map was not one entry per equal-tick run");
+    const uint64_t query = NextRandom(state) % span;
+    const uint64_t query_size = 1 + NextRandom(state) % std::min<uint64_t>(64, span - query);
+    uint64_t newest = 0;
+    for (uint64_t unit = query; unit < query + query_size; unit++) {
+      newest = std::max(newest, model[unit]);
+    }
+    Check(ticks.MaxTick(origin + query, query_size) == newest,
+          "write-tick range query diverged from its per-byte model");
+  }
 }
 
 void TestEagerReadbackPages() {
@@ -588,6 +703,58 @@ void TestReadbackPendingUnmark() {
   tracker.UnmarkRegionAsGpuModified(address, page_size * 3);
   tracker.MarkRegionAsCpuModified(address, page_size * 3);
   tracker.UntrackMemory(address, page_size * 3);
+  Release(memory);
+}
+
+// MemoryTracker::IsRangeGpuOwned (KYTY_WRITTEN_SYNC_SKIP): every page GPU-dirty, none
+// readback-pending, no region missing; a written upload of such a range collects nothing and
+// leaves its signature alone.
+void TestRangeGpuOwned() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  Check(!tracker.IsRangeGpuOwned(address, page_size) &&
+            tracker.RangeSignature(address, page_size) == 0,
+        "a range without a tracker region was owned (or the query created the region)");
+  tracker.ForEachUploadRange(
+      address, page_size * 4, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  Check(!tracker.IsRangeGpuOwned(address, page_size), "a clean range was owned");
+  const auto written = [&](uint64_t offset, uint64_t size) {
+    uint64_t collected = 0;
+    tracker.ForEachUploadRange(
+        address + offset, size, true,
+        [&](uint64_t, uint64_t bytes) noexcept { collected += bytes; }, []() noexcept {});
+    return collected;
+  };
+  Check(written(page_size, page_size * 2) == 0, "a clean range had pages to upload");
+  Check(tracker.IsRangeGpuOwned(address + page_size, page_size * 2) &&
+            tracker.IsRangeGpuOwned(address + page_size + 16, 32) &&
+            !tracker.IsRangeGpuOwned(address, page_size * 2) &&
+            !tracker.IsRangeGpuOwned(address + page_size * 2, page_size * 2),
+        "ownership did not require every page of the range");
+  const auto signature = tracker.RangeSignature(address, page_size * 4);
+  Check(written(page_size, page_size * 2) == 0 &&
+            tracker.RangeSignature(address, page_size * 4) == signature,
+        "a written upload of an owned range collected pages or changed tracker state");
+  // A readback mark ends ownership until a newer writer takes the page again.
+  tracker.MarkReadbackPending(address + page_size * 2, page_size);
+  Check(!tracker.IsRangeGpuOwned(address + page_size, page_size * 2) &&
+            tracker.IsRangeGpuOwned(address + page_size, page_size),
+        "a readback-pending page was owned");
+  (void)written(page_size * 2, page_size);
+  Check(tracker.IsRangeGpuOwned(address + page_size, page_size * 2),
+        "a page a newer writer took again was not owned");
+  // A download ends ownership.
+  tracker.UnmarkRegionAsGpuModified(address + page_size, page_size);
+  Check(!tracker.IsRangeGpuOwned(address + page_size, page_size * 2) &&
+            tracker.IsRangeGpuOwned(address + page_size * 2, page_size),
+        "a downloaded page was owned");
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 4);
+  tracker.MarkRegionAsCpuModified(address, page_size * 4);
+  tracker.UntrackMemory(address, page_size * 4);
   Release(memory);
 }
 
@@ -1055,6 +1222,52 @@ void TestFaultMutationEpochWithHotPages() {
         "idle sweep did not move the fault epoch");
 
   tracker.UntrackMemory(address, page_size * 4);
+  Release(memory);
+}
+
+// KYTY_BDA_DIRTY_LOG (BufferCache::SynchronizeBdaBuffersNow): every transition FaultMutationEpoch()
+// covers also records the range it can make CPU-dirty, and a take returns the ranges with the
+// epoch they account for.
+void TestDirtiedLog() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 4;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  tracker.EnableDirtiedLog();
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 16);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  RangeSet ranges;
+  uint64_t epoch = 0;
+
+  // The region is created (entirely CPU-dirty) by the first upload.
+  UploadAll(tracker, address, page_size * 16);
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && epoch == tracker.FaultMutationEpoch() &&
+            ranges.Contains(address, page_size * 16),
+        "a new region was not logged with the epoch it produced");
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Empty() &&
+            epoch == tracker.FaultMutationEpoch(),
+        "a take without transitions returned ranges or another epoch");
+
+  // A write fault logs its fault-ahead window (pages 4-7 around page 5), nothing else.
+  const auto before = tracker.FaultMutationEpoch();
+  WriteFault(tracker, address + page_size * 5 + 8);
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && epoch != before &&
+            epoch == tracker.FaultMutationEpoch() &&
+            ranges.Contains(address + page_size * 4, page_size * 4) &&
+            !ranges.Intersects(address, page_size * 4) &&
+            !ranges.Intersects(address + page_size * 8, page_size * 8),
+        "a write fault did not log exactly its fault-ahead window");
+
+  // Explicit CPU-dirty marks log their range.
+  UploadAll(tracker, address, page_size * 16);
+  tracker.MarkRegionAsCpuModified(address + page_size * 12, page_size);
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && epoch == tracker.FaultMutationEpoch() &&
+            ranges.Contains(address + page_size * 12, page_size) &&
+            !ranges.Intersects(address, page_size * 12),
+        "an explicit CPU-dirty mark was not logged");
+
+  tracker.UntrackMemory(address, page_size * 16);
   Release(memory);
 }
 
@@ -2462,8 +2675,11 @@ int main(int argc, char **argv) {
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
   TestWriteTickMap();
+  TestRangeSetModel();
+  TestWriteTickMapModel();
   TestEagerReadbackPages();
   TestReadbackPendingUnmark();
+  TestRangeGpuOwned();
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();
@@ -2479,6 +2695,7 @@ int main(int argc, char **argv) {
   TestHotPagePromotionAndUpload();
   TestHotPageDemotionPaths();
   TestFaultMutationEpochWithHotPages();
+  TestDirtiedLog();
   TestForeignWatcherFaultsDoNotPromote();
   TestWrittenUploadCopiesOutsideLock();
   TestHotPageSettle();

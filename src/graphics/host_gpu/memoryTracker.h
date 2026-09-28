@@ -53,6 +53,14 @@ public:
 	[[nodiscard]] bool IsRegionGpuModifiedRelaxed(uint64_t vaddr, uint64_t size) const;
 	// Verify mode: under each region lock, whether the mirror equals the GPU-dirty bits.
 	[[nodiscard]] bool GpuMirrorMatches(uint64_t vaddr, uint64_t size);
+	// Under each region lock: every page of the range is GPU-dirty and none is readback-pending
+	// (false when a region of it does not exist). On the GPU thread the answer stays true until
+	// that thread changes it: only it sets GPU-dirty bits and readback marks, other threads clear
+	// GPU-dirty bits only of marked pages (readback completion), and a CPU access to a GPU-dirty
+	// page waits for the GPU thread. A written upload of such a range (ForEachUploadRange or
+	// ForEachWrittenUploadRange with is_written) then collects nothing and changes no bit, serial
+	// or protection (KYTY_WRITTEN_SYNC_SKIP, BufferCache::SynchronizeBuffer).
+	[[nodiscard]] bool IsRangeGpuOwned(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
@@ -85,6 +93,20 @@ public:
 	[[nodiscard]] uint64_t FaultMutationEpoch() const noexcept {
 		return m_cpu_mutation_epoch.load(std::memory_order_acquire);
 	}
+	// KYTY_BDA_DIRTY_LOG (BufferCache::SynchronizeBdaBuffersNow). Once enabled, every transition
+	// FaultMutationEpoch() covers also records the range it can make CPU-dirty (a write fault's
+	// whole fault-ahead window, a whole new region, a demoted or swept region's hot pages, ...),
+	// under the same log lock as its epoch advance. Needs the tracker's CPU-mutation tracking.
+	void EnableDirtiedLog() noexcept { m_dirtied_log.store(true, std::memory_order_release); }
+	[[nodiscard]] bool DirtiedLogEnabled() const noexcept {
+		return m_dirtied_log.load(std::memory_order_acquire);
+	}
+	// Moves the ranges recorded since the last take into `ranges` (replacing its contents) and
+	// returns in `epoch` the FaultMutationEpoch() value they account for: every transition that
+	// advanced the epoch up to that value recorded its range before, in this take or an earlier
+	// one. False when ranges were dropped since the last take (overflow): the caller must
+	// re-examine everything.
+	[[nodiscard]] bool TakeDirtiedRanges(RangeSet& ranges, uint64_t& epoch);
 	// The sum of the mutation serials (RegionManager::Serial) of the regions [vaddr, vaddr + size)
 	// spans, or 0 when one of them does not exist yet (or the range is invalid). Serials only grow,
 	// so while this sum is unchanged no CPU-dirty, GPU-dirty, hot or readback-pending bit of any
@@ -136,7 +158,12 @@ private:
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
-				NotifyCpuMutation();
+				if (write_fault) {
+					const auto [begin, end] = FaultWindow(offset, bytes);
+					NotifyCpuMutation(manager->GetCpuAddr() + begin, end - begin);
+				} else {
+					NotifyCpuMutation(manager->GetCpuAddr() + offset, bytes);
+				}
 				if (write_fault) {
 					fault = manager->MarkWriteFault(manager->GetCpuAddr() + offset, bytes,
 					                                m_fault_policy, Frame(), m_hot_count,
@@ -369,7 +396,15 @@ private:
 
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
-	void           NotifyCpuMutation() noexcept;
+	// Advances FaultMutationEpoch() for a transition that can make pages of [vaddr, vaddr + size)
+	// CPU-dirty, and records the range in the dirtied log when that is enabled (both under the log
+	// lock, so a take sees the range together with the epoch it produced).
+	void           NotifyCpuMutation(uint64_t vaddr, uint64_t size) noexcept;
+	void           AdvanceCpuMutationEpoch() noexcept;
+	// The region-relative byte window a write fault of [offset, offset + bytes) can make CPU-dirty
+	// (RegionManager::MarkWriteFault's fault-ahead window).
+	[[nodiscard]] std::pair<uint64_t, uint64_t> FaultWindow(uint64_t offset,
+	                                                        uint64_t bytes) const noexcept;
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
@@ -380,6 +415,13 @@ private:
 	const FaultPolicy                              m_fault_policy;
 	std::atomic_uint32_t                           m_frame {1};
 	std::atomic_uint32_t                           m_hot_count {0};
+	// Dirtied-range log (EnableDirtiedLog). A set of disjoint ranges; past DirtiedLogMaxRanges it
+	// is dropped and the next take reports the loss.
+	static constexpr size_t DirtiedLogMaxRanges = 4096;
+	std::atomic_bool        m_dirtied_log {false};
+	std::mutex              m_dirtied_mutex;
+	RangeSet                m_dirtied;
+	bool                    m_dirtied_overflow = false;
 };
 
 } // namespace Libs::Graphics

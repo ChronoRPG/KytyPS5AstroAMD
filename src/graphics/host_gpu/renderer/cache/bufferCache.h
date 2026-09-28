@@ -254,10 +254,25 @@ private:
 	// KYTY_BDA_HOT_SYNC_VERIFY: the full scan after a hot pass that relied on these epochs.
 	void VerifyBdaHotPass(const RangeSet& mapped_ranges, uint64_t fault_epoch,
 	                      uint64_t structure_epoch);
+	// The full scan a pass that relied on these epochs replaced (it uploads whatever it finds):
+	// the normal CPU-dirty pages it finds while both epochs still hold, which that pass missed.
+	[[nodiscard]] uint64_t VerifyBdaFullScan(const RangeSet& mapped_ranges, uint64_t fault_epoch,
+	                                         uint64_t structure_epoch);
+	// KYTY_BDA_DIRTY_LOG pass (SynchronizeBdaBuffersNow): synchronizes the ranges the tracker
+	// logged since the last pass (m_bda_dirtied) and the recorded hot runs, instead of every
+	// mapped buffer. False (nothing done) when a recorded hot run's buffer is gone.
+	[[nodiscard]] bool SynchronizeBdaDirtied(const RangeSet& mapped_ranges);
 	// The BDA synchronization pass itself (SynchronizeBdaBuffers decides whether it runs).
 	void SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges);
 	// KYTY_BDA_SYNC_EPOCH_VERIFY: the full scan a skipped pass replaced.
 	void VerifyBdaEpochSkip(const RangeSet& mapped_ranges);
+	// KYTY_WRITTEN_SYNC_SKIP (default on; =0 off): a written synchronization (not a BDA pass; GPU
+	// thread) of a range every page of which is GPU-dirty and none readback-pending
+	// (MemoryTracker::IsRangeGpuOwned, under the region locks) returns at once: the written upload
+	// would collect nothing and change no tracker bit, serial or protection. A writable binding
+	// written again before any CPU access. FrameEvent WrittenSyncSkips.
+	// KYTY_WRITTEN_SYNC_SKIP_VERIFY=1|exit: such a range goes through the normal path anyway, and
+	// one that collected anything is a mismatch (WrittenSyncSkipVerifyMismatches; exit stops).
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer,
 	                                     BdaSyncStats* stats = nullptr,
@@ -355,6 +370,19 @@ private:
 	// offset while no tracker transition raced the check is a mismatch (exit stops on the first);
 	// a stream copy whose bytes changed, or a cache-buffer range with CPU-dirty pages the normal
 	// path uploads, counts as a race (BindingEpochMemoVerifyRaces).
+	// KYTY_BINDING_MEMO_CROSS_EPOCH (default on; =0 off): a cache-buffer memo from an EARLIER epoch
+	// whose signature and buffer structure still hold is reused when, under the region locks, no
+	// page of the range is CPU-dirty (normal or hot) and the signature is still the same after that
+	// check (the memo then moves to the current epoch). With no CPU-dirty page, every guest write to
+	// the range faults first, which is a tracker transition; the normal path would then decide no
+	// stream copy, find the same buffer and offset, and upload nothing (its only other inputs, the
+	// tracker bits, are unchanged since the signature). The epoch only covers writes that do not
+	// fault: to CPU-dirty pages, which this excludes. Emulator writes of backing bytes that bypass
+	// the tracker are invisible to the normal path as well (RenderContext::PrepareHostBackingWrite).
+	// A stream memo stays within its epoch (its bytes may have changed without a fault). Counters:
+	// BindingEpochMemoCrossHits / CrossRejects, and why lookups missed (BindingEpochMemoMiss*).
+	// In verify mode a cross-epoch hit finding CPU-dirty pages with the signature unchanged is a
+	// mismatch, not a race.
 	enum class BindingMemoKind : uint8_t { Empty, Stream, Cached };
 	struct BindingMemo {
 		uint64_t        vaddr     = 0;
@@ -380,9 +408,10 @@ private:
 	                                                           BufferId id, BufferId* obtained);
 	void RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, uint64_t before,
 	                   const std::pair<Buffer*, uint64_t>& result, BufferId id);
+	// `cross`: the hit came from another epoch (KYTY_BINDING_MEMO_CROSS_EPOCH).
 	[[nodiscard]] std::pair<Buffer*, uint64_t> VerifyBindingHit(const BindingMemo& memo,
 	                                                            std::pair<Buffer*, uint64_t> hit,
-	                                                            BufferId id);
+	                                                            BufferId id, bool cross);
 	// `deferred` (KYTY_UPLOAD_DMA_HOST_COPY): guest copies with a backing alias are listed there
 	// instead of copied, for StageUploadDma; the staging ring space is reserved either way.
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
@@ -546,15 +575,27 @@ private:
 	// KYTY_BINDING_EPOCH_MEMO (nullptr when disabled; GPU thread) and its outcomes (tests read them).
 	std::unique_ptr<BindingMemo[]>                    m_binding_memo;
 	int                                               m_binding_memo_verify = 0;
+	bool                                              m_binding_memo_cross  = false;
 	struct BindingMemoTotals {
 		uint64_t stream_hits       = 0;
-		uint64_t cached_hits       = 0;
+		uint64_t cached_hits       = 0; // cross-epoch hits included
+		uint64_t cross_hits        = 0;
+		uint64_t cross_rejects     = 0;
 		uint64_t records           = 0;
 		uint64_t verify_checks     = 0;
 		uint64_t verify_mismatches = 0;
 		uint64_t verify_races      = 0;
 	};
 	BindingMemoTotals                                 m_binding_memo_totals;
+	// KYTY_WRITTEN_SYNC_SKIP (SynchronizeBuffer) and its outcomes (tests read them).
+	bool m_written_sync_skip        = false;
+	int  m_written_sync_skip_verify = 0;
+	struct WrittenSyncTotals {
+		uint64_t skips             = 0;
+		uint64_t verify_checks     = 0;
+		uint64_t verify_mismatches = 0;
+	};
+	WrittenSyncTotals m_written_sync_totals;
 	uint32_t                                          m_upload_batch_depth = 0;
 	uint32_t                                          m_hot_sweep_frame  = 0;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};
@@ -564,7 +605,29 @@ private:
 	// Hot page runs inside the buffers the last full BDA pass scanned (KYTY_BDA_HOT_SYNC; GPU
 	// thread). Valid while the epochs of that pass hold: a page can only become hot through a
 	// write fault, which changes the fault epoch, and buffers only change with the structure one.
+	// Dirty-log passes add the hot runs they find in the logged ranges.
 	std::vector<BdaHotRange>                          m_bda_hot_ranges;
+	// KYTY_BDA_DIRTY_LOG (default on with KYTY_BDA_HOT_SYNC; =0 off). A BDA pass whose structure
+	// epoch is unchanged but whose fault epoch moved synchronizes only the ranges the tracker
+	// logged since the last pass (MemoryTracker::TakeDirtiedRanges, taken with the epoch they
+	// account for) and the recorded hot runs, instead of every mapped buffer. After the last pass
+	// every page of a mapped buffer was clean or hot; one can only have turned CPU-dirty since
+	// through a transition that advanced the fault epoch, and each such transition logged its
+	// range before advancing it, under its region lock and before changing the page's bits. A
+	// full scan runs when the log overflowed, the buffers changed (structure epoch), or no full
+	// scan with the log has run yet (m_bda_log_baseline).
+	bool                                              m_bda_dirty_log    = false;
+	bool                                              m_bda_log_baseline = false;
+	int                                               m_bda_log_verify   = 0;
+	RangeSet                                          m_bda_dirtied;
+	struct BdaLogTotals {
+		uint64_t passes                = 0;
+		uint64_t ranges                = 0;
+		uint64_t overflows             = 0;
+		uint64_t verify_checks         = 0;
+		uint64_t verify_mismatch_pages = 0;
+	};
+	BdaLogTotals                                      m_bda_log_totals;
 	// KYTY_BDA_SYNC_EPOCH (SynchronizeBdaBuffers): the sync, BDA structure and fault epochs taken
 	// before the last completed pass (GPU thread; 0: none yet), and the outcomes (tests read them).
 	bool     m_bda_epoch_skip        = false;

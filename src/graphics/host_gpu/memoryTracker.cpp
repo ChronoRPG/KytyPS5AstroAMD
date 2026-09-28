@@ -38,7 +38,7 @@ void MemoryTracker::DemoteHotPages(uint64_t vaddr, uint64_t size) {
 		if (manager->IsHot(manager->GetCpuAddr() + offset, bytes)) {
 			// The demoted pages stay CPU-dirty and writable, now outside the hot set: publish
 			// before the change like every other transition FaultMutationEpoch() covers.
-			NotifyCpuMutation();
+			NotifyCpuMutation(manager->GetCpuAddr() + offset, bytes);
 		}
 		demoted += manager->DemoteHot(manager->GetCpuAddr() + offset, bytes, m_hot_count);
 	});
@@ -95,7 +95,7 @@ void MemoryTracker::SweepHotPages(uint32_t idle_frames) {
 		// Swept pages stay CPU-dirty and writable outside the hot set (see DemoteHotPages). A
 		// region without hot pages cannot change here; otherwise publish conservatively.
 		if (manager->IsHot(manager->GetCpuAddr(), TRACKER_REGION_SIZE)) {
-			NotifyCpuMutation();
+			NotifyCpuMutation(manager->GetCpuAddr(), TRACKER_REGION_SIZE);
 		}
 		demoted += manager->SweepHot(frame, idle_frames, m_hot_count);
 	}
@@ -104,10 +104,7 @@ void MemoryTracker::SweepHotPages(uint32_t idle_frames) {
 
 MemoryTracker::~MemoryTracker() = default;
 
-void MemoryTracker::NotifyCpuMutation() noexcept {
-	if (!m_track_cpu_mutations) {
-		return;
-	}
+void MemoryTracker::AdvanceCpuMutationEpoch() noexcept {
 	// Publish before dirtying/unprotecting under the region lock. A scanner observing this
 	// token still acquires that lock; saturation permanently disables token reuse, avoiding ABA.
 	auto epoch = m_cpu_mutation_epoch.load(std::memory_order_relaxed);
@@ -115,6 +112,54 @@ void MemoryTracker::NotifyCpuMutation() noexcept {
 	       !m_cpu_mutation_epoch.compare_exchange_weak(epoch, epoch + 1,
 	                                                   std::memory_order_release,
 	                                                   std::memory_order_relaxed)) {}
+}
+
+void MemoryTracker::NotifyCpuMutation(uint64_t vaddr, uint64_t size) noexcept {
+	if (!m_track_cpu_mutations) {
+		return;
+	}
+	if (!m_dirtied_log.load(std::memory_order_acquire)) {
+		AdvanceCpuMutationEpoch();
+		return;
+	}
+	// The range and the epoch advance under one lock: a take (TakeDirtiedRanges) that sees the
+	// advanced epoch also sees the range. Callers hold the region lock and change the pages'
+	// bits after this, so whoever handles a taken range under that lock sees the new bits.
+	std::scoped_lock lock(m_dirtied_mutex);
+	if (!m_dirtied_overflow && size != 0) {
+		if (m_dirtied.Size() >= DirtiedLogMaxRanges) {
+			m_dirtied_overflow = true;
+			m_dirtied.Clear();
+		} else {
+			m_dirtied.Add(vaddr, size);
+		}
+	}
+	AdvanceCpuMutationEpoch();
+}
+
+bool MemoryTracker::TakeDirtiedRanges(RangeSet& ranges, uint64_t& epoch) {
+	std::scoped_lock lock(m_dirtied_mutex);
+	ranges.Clear();
+	std::swap(ranges, m_dirtied);
+	epoch                 = m_cpu_mutation_epoch.load(std::memory_order_acquire);
+	const bool complete   = !m_dirtied_overflow;
+	m_dirtied_overflow    = false;
+	return complete;
+}
+
+std::pair<uint64_t, uint64_t> MemoryTracker::FaultWindow(uint64_t offset,
+                                                         uint64_t bytes) const noexcept {
+	// Page indices as RegionManager::MarkWriteFault computes its window.
+	const uint64_t ahead = m_fault_policy.ahead_pages;
+	const uint64_t start = offset / TRACKER_PAGE_SIZE;
+	const uint64_t end   = (offset + bytes + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE;
+	if (ahead <= 1) {
+		return {start * TRACKER_PAGE_SIZE, end * TRACKER_PAGE_SIZE};
+	}
+	const uint64_t window_begin = start / ahead * ahead;
+	const uint64_t window_end =
+	    std::min<uint64_t>((end + ahead - 1) / ahead * ahead, TRACKER_REGION_PAGES);
+	return {window_begin * TRACKER_PAGE_SIZE, std::max(end, window_end) * TRACKER_PAGE_SIZE};
 }
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
@@ -167,7 +212,7 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	// New regions start entirely CPU dirty. Notify before making the region visible.
-	NotifyCpuMutation();
+	NotifyCpuMutation(index * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE);
 	m_regions[index].store(ptr, std::memory_order_release);
 	return ptr;
 }
@@ -246,6 +291,31 @@ bool MemoryTracker::IsRegionGpuModifiedRelaxed(uint64_t vaddr, uint64_t size) co
 	return false;
 }
 
+bool MemoryTracker::IsRangeGpuOwned(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	ValidateRange(vaddr, size);
+	uint64_t remaining = size;
+	uint64_t index     = vaddr / TRACKER_REGION_SIZE;
+	uint64_t offset    = vaddr % TRACKER_REGION_SIZE;
+	while (remaining != 0) {
+		const auto bytes   = std::min(TRACKER_REGION_SIZE - offset, remaining);
+		auto*      manager = m_regions[index].load(std::memory_order_acquire);
+		if (manager == nullptr) {
+			return false; // a missing region is entirely CPU dirty once created
+		}
+		{
+			std::scoped_lock lock(manager->lock);
+			if (!manager->IsGpuOwned(offset, bytes)) {
+				return false;
+			}
+		}
+		remaining -= bytes;
+		offset = 0;
+		index++;
+	}
+	return true;
+}
+
 bool MemoryTracker::GpuMirrorMatches(uint64_t vaddr, uint64_t size) {
 	bool matches = true;
 	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -259,7 +329,7 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
-		NotifyCpuMutation();
+		NotifyCpuMutation(manager->GetCpuAddr() + offset, bytes);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
 }
@@ -327,7 +397,7 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	}
 	uint32_t demoted = 0;
 	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		NotifyCpuMutation();
+		NotifyCpuMutation(manager->GetCpuAddr() + offset, bytes);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 		demoted += manager->DemoteHot(manager->GetCpuAddr() + offset, bytes, m_hot_count);
 	});

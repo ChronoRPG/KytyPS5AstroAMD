@@ -840,6 +840,15 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-epoch-only)
 	set_tests_properties(bda_sync_epoch_off PROPERTIES
 		ENVIRONMENT "KYTY_BDA_SYNC_EPOCH=0")
+	# KYTY_BDA_DIRTY_LOG (with incremental BDA synchronization): verify mode and off.
+	add_test(NAME bda_sync_dirty_log_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-epoch-only)
+	set_tests_properties(bda_sync_dirty_log_verify PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_DIRTY_LOG_VERIFY=exit;KYTY_BDA_HOT_SYNC_VERIFY=exit")
+	add_test(NAME bda_sync_dirty_log_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-sync-epoch-only)
+	set_tests_properties(bda_sync_dirty_log_off PROPERTIES
+		ENVIRONMENT "KYTY_BDA_INCREMENTAL_SYNC=1;KYTY_BDA_DIRTY_LOG=0")
 	# KYTY_BINDING_EPOCH_MEMO: default, verify mode, off, and off through KYTY_SYNC_EPOCH=0.
 	add_test(NAME binding_epoch_memo
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-epoch-memo-only)
@@ -855,9 +864,28 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-epoch-memo-only)
 	set_tests_properties(binding_epoch_memo_no_sync_epoch PROPERTIES
 		ENVIRONMENT "KYTY_SYNC_EPOCH=0")
+	add_test(NAME binding_epoch_memo_cross_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-epoch-memo-only)
+	set_tests_properties(binding_epoch_memo_cross_off PROPERTIES
+		ENVIRONMENT "KYTY_BINDING_MEMO_CROSS_EPOCH=0")
+	# KYTY_WRITTEN_SYNC_SKIP: default, verify mode, off.
+	add_test(NAME written_sync_skip
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --written-sync-skip-only)
+	add_test(NAME written_sync_skip_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --written-sync-skip-only)
+	set_tests_properties(written_sync_skip_verify PROPERTIES
+		ENVIRONMENT "KYTY_WRITTEN_SYNC_SKIP_VERIFY=exit")
+	add_test(NAME written_sync_skip_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --written-sync-skip-only)
+	set_tests_properties(written_sync_skip_off PROPERTIES
+		ENVIRONMENT "KYTY_WRITTEN_SYNC_SKIP=0")
 	# Tracker-gap detectors: the page states they classify host writes by.
 	add_test(NAME tracker_gap_detectors
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tracker-gap-detectors-only)
+	add_test(NAME tracker_gap_host_write_tracking_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tracker-gap-detectors-only)
+	set_tests_properties(tracker_gap_host_write_tracking_off PROPERTIES
+		ENVIRONMENT "KYTY_HOST_WRITE_TRACKING=0")
 	# KYTY_NATIVE_INDIRECT_MESH: the GPU conversion against the CPU path (default mode, and the
 	# completion verify with exit), and the mesh shaders' parameter-block codegen.
 	add_test(NAME mesh_indirect

@@ -282,7 +282,7 @@ bool OcclusionCounter::Dump(uint64_t address) {
 	auto publish = [this, address, slot_offset] {
 		m_publish->Invalidate(slot_offset, 248);
 		const auto* source = m_publish->Mapped().data() + slot_offset;
-		m_context.NoteHostBackingWrite(address, 248, RenderContext::HostWriter::Occlusion);
+		m_context.PrepareHostBackingWrite(address, 248, RenderContext::HostWriter::Occlusion);
 		for (uint32_t db = 0; db < 16u; db++) {
 			(void)LibKernel::Memory::TryWriteBacking(address + db * 16u, source + db * 16u,
 			                                         sizeof(uint64_t));

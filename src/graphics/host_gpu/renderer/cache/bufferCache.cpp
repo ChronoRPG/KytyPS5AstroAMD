@@ -71,6 +71,25 @@ bool BdaHotSyncVerifyEnabled() {
 	return BdaHotSyncVerifyMode() != 0;
 }
 
+// KYTY_BDA_DIRTY_LOG=0 restores the full scan of every mapped buffer whenever the fault epoch
+// moved (bufferCache.h). Only meaningful with KYTY_BDA_INCREMENTAL_SYNC=1 and KYTY_BDA_HOT_SYNC.
+bool BdaDirtyLogEnabled() {
+	const auto* value = std::getenv("KYTY_BDA_DIRTY_LOG");
+	return value == nullptr || !(value[0] == '0' && value[1] == '\0');
+}
+
+// KYTY_BDA_DIRTY_LOG_VERIFY=1 follows every dirty-log pass with the full scan it replaced and
+// counts the CPU-dirty non-hot pages that scan finds while the pass's epochs still hold
+// (BdaSyncLogVerifyMismatches, expected 0); "exit" stops on the first one. Diagnostic: it costs
+// the full scans again.
+int BdaDirtyLogVerifyMode() {
+	const auto* value = std::getenv("KYTY_BDA_DIRTY_LOG_VERIFY");
+	if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	return std::strcmp(value, "exit") == 0 ? 2 : 1;
+}
+
 // KYTY_UPLOAD_BATCH_SCOPED_FLUSH=0 restores recording every pending barrier at the end of each
 // outermost UploadBatch scope, even when the scope queued no upload.
 bool UploadBatchScopedFlushEnabled() {
@@ -216,6 +235,31 @@ int BindingEpochMemoVerifyMode() {
 		return std::strcmp(value, "exit") == 0 ? 2 : 1;
 	}();
 	return mode;
+}
+
+// 0 when the variable is unset, empty or "0"; 2 for "exit"; 1 otherwise. Read per cache, so tests
+// can build caches with either setting.
+int EnvVerifyMode(const char* name) {
+	const auto* value = std::getenv(name);
+	if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	return std::strcmp(value, "exit") == 0 ? 2 : 1;
+}
+
+// KYTY_BINDING_MEMO_CROSS_EPOCH (default on; =0 off): a cache-buffer read-binding memo from an
+// earlier sync epoch is reused once the range is proven to have no CPU-dirty page
+// (BufferCache::ObtainReadBinding).
+bool BindingMemoCrossEpochEnabled() {
+	return ParseEnvU64("KYTY_BINDING_MEMO_CROSS_EPOCH", 1) != 0;
+}
+
+// KYTY_WRITTEN_SYNC_SKIP (default on; =0 off): a written synchronization of a range that is
+// entirely GPU-owned does nothing and is skipped (BufferCache::SynchronizeBuffer).
+// KYTY_WRITTEN_SYNC_SKIP_VERIFY=1|exit runs the normal path anyway and counts skips it would
+// have made while that path found pages to upload (WrittenSyncSkipVerifyMismatches).
+bool WrittenSyncSkipEnabled() {
+	return ParseEnvU64("KYTY_WRITTEN_SYNC_SKIP", 1) != 0;
 }
 
 // KYTY_BDA_SYNC_EPOCH_VERIFY=1|exit: every skipped BDA pass runs anyway and counts the pages the
@@ -601,6 +645,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_texture_cache(texture_cache) {
 	m_range_memo_verify = m_range_memo != nullptr ? RangeMemoVerifyMode() : 0;
 	m_relaxed_queries = RelaxedQueriesEnabled();
+	m_bda_dirty_log   = m_bda_hot_sync && BdaDirtyLogEnabled();
+	if (m_bda_dirty_log) {
+		m_memory_tracker.EnableDirtiedLog();
+		m_bda_log_verify = BdaDirtyLogVerifyMode();
+	}
 	m_bda_epoch_skip  = SyncEpoch::Enabled() && ParseEnvU64("KYTY_BDA_SYNC_EPOCH", 1) != 0;
 	// The verify mode tells guest writes from missed pages by the fault epoch, which the tracker
 	// keeps only with incremental BDA synchronization.
@@ -608,6 +657,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	if (SyncEpoch::Enabled() && BindingEpochMemoEnabled()) {
 		m_binding_memo        = std::make_unique<BindingMemo[]>(BindingMemoSlots);
 		m_binding_memo_verify = BindingEpochMemoVerifyMode();
+		m_binding_memo_cross  = BindingMemoCrossEpochEnabled();
+	}
+	m_written_sync_skip = WrittenSyncSkipEnabled();
+	if (m_written_sync_skip) {
+		m_written_sync_skip_verify = EnvVerifyMode("KYTY_WRITTEN_SYNC_SKIP_VERIFY");
 	}
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
@@ -1679,6 +1733,18 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    RelaxedNothingToUpload(vaddr, size)) {
 		return false;
 	}
+	// KYTY_WRITTEN_SYNC_SKIP (bufferCache.h): a range the GPU already owns entirely. (Only texel
+	// READS do more than the tracker work below.)
+	bool written_skip_verify = false;
+	if (is_written && stats == nullptr && m_written_sync_skip && GuestGpu::IsGpuThread() &&
+	    m_memory_tracker.IsRangeGpuOwned(vaddr, size)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::WrittenSyncSkips);
+		m_written_sync_totals.skips++;
+		if (m_written_sync_skip_verify == 0) {
+			return false;
+		}
+		written_skip_verify = true;
+	}
 	// KYTY_BUFFER_RANGE_MEMO: a read-only synchronization of a range that is still Clean does
 	// nothing (bufferCache.h). Texel reads also download GPU-written images (not tracker state);
 	// the BDA hot-pass verification scans in full.
@@ -1805,6 +1871,27 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    });
 	} else {
 		m_memory_tracker.ForEachUploadRange(vaddr, size, is_written, collect, upload);
+	}
+	if (written_skip_verify) {
+		// Nothing a CPU access could have changed since the check: it waits for this thread.
+		Profiler::CountFrameEvent(Profiler::FrameEvent::WrittenSyncSkipVerifyChecks);
+		m_written_sync_totals.verify_checks++;
+		if (!copies.empty() || !hot_ranges.empty() || !late_copies.empty()) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::WrittenSyncSkipVerifyMismatches);
+			m_written_sync_totals.verify_mismatches++;
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+				std::fprintf(stderr,
+				             "WrittenSyncSkipVerify: a GPU-owned range had pages to upload: "
+				             "addr=0x%016" PRIx64 " size=0x%" PRIx64 "\n",
+				             vaddr, size);
+			}
+			if (m_written_sync_skip_verify == 2) {
+				EXIT("WrittenSyncSkipVerify: a GPU-owned range had pages to upload: addr=0x%016" PRIx64
+				     " size=0x%" PRIx64 "\n",
+				     vaddr, size);
+			}
+		}
 	}
 	if (memo_applies) {
 		// Nothing collected: no page of the range was CPU-dirty (hot pages are CPU-dirty too).
@@ -2171,12 +2258,43 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 	// KYTY_BINDING_EPOCH_MEMO (bufferCache.h).
 	const auto epoch  = SyncEpoch::Current();
 	const auto before = m_memory_tracker.RangeSignature(vaddr, size);
-	if (const auto& memo = BindingMemoSlot(vaddr, size);
-	    before != 0 && memo.signature == before && memo.epoch == epoch && memo.vaddr == vaddr &&
-	    memo.size == size && memo.kind != BindingMemoKind::Empty) {
-		const bool stream = memo.kind == BindingMemoKind::Stream;
-		if (memo.guard == (stream ? m_scheduler.CurrentTick()
-		                          : m_bda_structure_epoch.load(std::memory_order_acquire))) {
+	auto&      memo   = BindingMemoSlot(vaddr, size);
+	if (before == 0 || memo.vaddr != vaddr || memo.size != size ||
+	    memo.kind == BindingMemoKind::Empty) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissSlot);
+	} else if (memo.signature != before) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissSignature);
+	} else if (const bool stream = memo.kind == BindingMemoKind::Stream;
+	           memo.guard != (stream ? m_scheduler.CurrentTick()
+	                                 : m_bda_structure_epoch.load(std::memory_order_acquire))) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissGuard);
+	} else {
+		bool cross = false;
+		if (memo.epoch != epoch) {
+			// KYTY_BINDING_MEMO_CROSS_EPOCH (bufferCache.h): only a cache-buffer memo, and only
+			// once no page of the range is CPU-dirty while the signature still holds. The relaxed
+			// mirror answers "CPU-dirty" exactly on this thread (only it clears those bits); the
+			// locked query also waits for a transition that advanced the serial but has not
+			// changed its bits yet.
+			MemoryTracker::DirtyState relaxed;
+			cross = !stream && m_binding_memo_cross &&
+			        m_memory_tracker.QueryDirtyRelaxed(vaddr, size, relaxed) && !relaxed.cpu &&
+			        !m_memory_tracker.IsRegionCpuModified(vaddr, size) &&
+			        m_memory_tracker.RangeSignature(vaddr, size) == before;
+			if (!cross) {
+				if (!stream && m_binding_memo_cross) {
+					Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoCrossRejects);
+					m_binding_memo_totals.cross_rejects++;
+				} else {
+					Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissEpoch);
+				}
+			} else {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoCrossHits);
+				m_binding_memo_totals.cross_hits++;
+				memo.epoch = epoch;
+			}
+		}
+		if (memo.epoch == epoch) {
 			std::pair<Buffer*, uint64_t> hit {nullptr, memo.offset};
 			if (stream) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoStreamHits);
@@ -2190,7 +2308,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 			}
 			if (m_binding_memo_verify != 0) {
 				const auto copy = memo;
-				return VerifyBindingHit(copy, hit, id);
+				return VerifyBindingHit(copy, hit, id, cross);
 			}
 			return hit;
 		}
@@ -2248,7 +2366,7 @@ void BufferCache::RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, u
 
 std::pair<Buffer*, uint64_t> BufferCache::VerifyBindingHit(const BindingMemo&           memo,
                                                            std::pair<Buffer*, uint64_t> hit,
-                                                           BufferId                     id) {
+                                                           BufferId id, bool cross) {
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoVerifyChecks);
 	m_binding_memo_totals.verify_checks++;
 	const auto vaddr = memo.vaddr;
@@ -2276,6 +2394,10 @@ std::pair<Buffer*, uint64_t> BufferCache::VerifyBindingHit(const BindingMemo&   
 		problem = "a cache-buffer hit whose range is now a stream copy";
 	} else if (fresh != hit) {
 		problem = "a cache-buffer hit bound a different buffer or offset";
+	} else if (cross && state.cpu) {
+		// The cross-epoch check found no CPU-dirty page under the region locks with this
+		// signature: one now needs a transition since, which `quiet` rules out below.
+		problem = "a cross-epoch cache-buffer hit whose range has CPU-dirty pages";
 	} else {
 		// Pages the synchronization uploaded: hot pages written since, or pages a racing fault
 		// dirtied before the hit's signature was taken.
@@ -2401,10 +2523,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferNow(uint64_t vaddr, uint64
 		// An Add that changes nothing cannot stale a cached clean page, because pages with
 		// dirty bytes are never cached clean. The tracker GPU bits that SynchronizeBuffer just
 		// set are only ever set together with this Add; clean-read verdicts never read them.
+		// A range already contained is left as it is (the Add would change nothing).
 		if (!m_gpu_modified_ranges.Contains(vaddr, size)) {
 			CleanVerdict::Invalidate(vaddr, size, Coherence::Source::BufferDirtyAdd);
+			m_gpu_modified_ranges.Add(vaddr, size);
 		}
-		m_gpu_modified_ranges.Add(vaddr, size);
 		NoteBufferContentWrite(vaddr, size);
 		ForgetKnownFills(vaddr, size);
 		HangTrace::NoteGpuWrite(vaddr, size);
@@ -2443,8 +2566,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainWrittenBuffer(uint64_t vaddr, ui
 		PreserveImagesForGpuWrite(id, range.address, range.size);
 		if (!m_gpu_modified_ranges.Contains(range.address, range.size)) {
 			CleanVerdict::Invalidate(range.address, range.size, Coherence::Source::BufferDirtyAdd);
+			m_gpu_modified_ranges.Add(range.address, range.size);
 		}
-		m_gpu_modified_ranges.Add(range.address, range.size);
 		NoteBufferContentWrite(range.address, range.size);
 		ForgetKnownFills(range.address, range.size);
 		HangTrace::NoteGpuWrite(range.address, range.size);
@@ -3015,13 +3138,26 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	// Every other page of those buffers was uploaded (clean and write-protected) by that pass and
 	// can only become CPU-dirty again through a transition that changes one of the epochs,
 	// including the write fault that promotes a page to hot and a hot page's demotion.
+	// KYTY_BDA_DIRTY_LOG: the fault epoch comes with the ranges logged up to it, taken together.
+	uint64_t fault_epoch  = 0;
+	bool     log_complete = false;
+	if (m_bda_dirty_log) {
+		log_complete = m_memory_tracker.TakeDirtiedRanges(m_bda_dirtied, fault_epoch);
+		if (!log_complete) {
+			m_bda_log_totals.overflows++;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncLogOverflows);
+		}
+	}
 	const auto cpu_epoch = !m_bda_incremental_sync ? 0
+	                       : m_bda_dirty_log       ? fault_epoch
 	                       : m_bda_hot_sync        ? m_memory_tracker.FaultMutationEpoch()
 	                                               : m_memory_tracker.CpuMutationEpoch();
 	const auto structure_epoch =
 	    m_bda_incremental_sync ? m_bda_structure_epoch.load(std::memory_order_acquire) : 0;
-	if (m_bda_incremental_sync && cpu_epoch != UINT64_MAX && structure_epoch != UINT64_MAX &&
-	    cpu_epoch == m_bda_scanned_cpu_epoch && structure_epoch == m_bda_scanned_structure_epoch) {
+	const bool structure_holds = m_bda_incremental_sync && cpu_epoch != UINT64_MAX &&
+	                             structure_epoch != UINT64_MAX &&
+	                             structure_epoch == m_bda_scanned_structure_epoch;
+	if (structure_holds && cpu_epoch == m_bda_scanned_cpu_epoch) {
 		if (m_bda_hot_ranges.empty()) {
 			if (collect) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncSkips);
@@ -3044,6 +3180,29 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 			return;
 		}
 		// A recorded buffer is gone although the structure epoch held: scan everything.
+	} else if (structure_holds && m_bda_dirty_log && log_complete && m_bda_log_baseline &&
+	           SynchronizeBdaDirtied(mapped_ranges)) {
+		m_bda_scanned_cpu_epoch = cpu_epoch;
+		if (m_bda_log_verify != 0) {
+			m_bda_log_totals.verify_checks++;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncLogVerifyChecks);
+			const auto missed = VerifyBdaFullScan(mapped_ranges, cpu_epoch, structure_epoch);
+			if (missed != 0) {
+				m_bda_log_totals.verify_mismatch_pages += missed;
+				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncLogVerifyMismatches, missed);
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+					std::fprintf(stderr,
+					             "BdaDirtyLogVerify: a dirty-log pass missed %" PRIu64
+					             " CPU-dirty page(s) (fault epoch %" PRIu64 ")\n",
+					             missed, cpu_epoch);
+				}
+				if (m_bda_log_verify == 2) {
+					EXIT("BdaDirtyLogVerify: a dirty-log pass missed CPU-dirty pages\n");
+				}
+			}
+		}
+		return;
 	}
 
 	BdaSyncStats stats;
@@ -3063,6 +3222,8 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 		m_bda_scanned_cpu_epoch       = cpu_epoch;
 		m_bda_scanned_structure_epoch = structure_epoch;
 	}
+	// The log taken above holds nothing this scan did not cover; later transitions log again.
+	m_bda_log_baseline = m_bda_dirty_log;
 	if (collect) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncPasses);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncScannedBuffers, stats.scanned_buffers);
@@ -3071,10 +3232,65 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	}
 }
 
-void BufferCache::VerifyBdaHotPass(const RangeSet& mapped_ranges, uint64_t fault_epoch,
-                                   uint64_t structure_epoch) {
-	// The full scan the hot pass replaced. It uploads whatever it finds, so this mode stays
-	// correct even when it reports a mismatch.
+bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges) {
+	// A hot run grows at most a few entries per pass; past this, rebuild the list in a full scan.
+	constexpr size_t MaxHotRanges = 4096;
+	if (m_bda_hot_ranges.size() > MaxHotRanges) {
+		return false;
+	}
+	for (const auto& range: m_bda_hot_ranges) {
+		const auto* buffer = m_slot_buffers.try_get(range.id);
+		if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(range.address, range.size)) {
+			return false;
+		}
+	}
+	// The logged ranges report the hot runs they turn up (new hot pages, which a write fault
+	// logged when it promoted them); the recorded runs are re-examined as in a hot pass.
+	std::vector<BdaHotRange> found;
+	BdaSyncStats             stats;
+	stats.hot_ranges = &found;
+	uint64_t logged  = 0;
+	{
+		const UploadBatch upload_batch(*this);
+		m_bda_dirtied.ForEach([&](uint64_t begin, uint64_t end) {
+			logged++;
+			mapped_ranges.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
+				SynchronizeBuffersInRange(start, finish - start, &stats);
+			});
+		});
+		BdaSyncStats hot_stats;
+		for (const auto& range: m_bda_hot_ranges) {
+			(void)SynchronizeBuffer(m_slot_buffers[range.id], range.address, range.size, false,
+			                        false, &hot_stats);
+		}
+		stats.upload_bytes += hot_stats.upload_bytes;
+		stats.upload_copies += hot_stats.upload_copies;
+	}
+	for (const auto& range: found) {
+		const bool known =
+		    std::any_of(m_bda_hot_ranges.begin(), m_bda_hot_ranges.end(), [&](const auto& other) {
+			    return other.id == range.id && other.address == range.address &&
+			           other.size == range.size;
+		    });
+		if (!known) {
+			m_bda_hot_ranges.push_back(range);
+		}
+	}
+	m_bda_log_totals.passes++;
+	m_bda_log_totals.ranges += logged;
+	if (Profiler::AggregateEnabled()) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncLogPasses);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncLogRanges, logged);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncScannedBuffers, stats.scanned_buffers);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncUploadBytes, stats.upload_bytes);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncUploadCopies, stats.upload_copies);
+	}
+	return true;
+}
+
+uint64_t BufferCache::VerifyBdaFullScan(const RangeSet& mapped_ranges, uint64_t fault_epoch,
+                                        uint64_t structure_epoch) {
+	// It uploads whatever it finds, so a verify mode stays correct when it reports a mismatch.
 	BdaSyncStats verify;
 	verify.verify_fault_epoch     = fault_epoch;
 	verify.verify_structure_epoch = structure_epoch;
@@ -3084,18 +3300,24 @@ void BufferCache::VerifyBdaHotPass(const RangeSet& mapped_ranges, uint64_t fault
 			SynchronizeBuffersInRange(start, end - start, &verify);
 		});
 	}
+	return verify.verify_mismatch_pages;
+}
+
+void BufferCache::VerifyBdaHotPass(const RangeSet& mapped_ranges, uint64_t fault_epoch,
+                                   uint64_t structure_epoch) {
+	// The full scan the hot pass replaced.
+	const auto missed = VerifyBdaFullScan(mapped_ranges, fault_epoch, structure_epoch);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncHotVerifyChecks);
-	if (verify.verify_mismatch_pages == 0) {
+	if (missed == 0) {
 		return;
 	}
-	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncHotVerifyMismatches,
-	                          verify.verify_mismatch_pages);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncHotVerifyMismatches, missed);
 	static std::atomic<uint32_t> logged {0};
 	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
 		std::fprintf(stderr,
 		             "BdaHotSyncVerify: a hot pass would have missed %" PRIu64
 		             " CPU-dirty page(s) (fault epoch %" PRIu64 ", structure epoch %" PRIu64 ")\n",
-		             verify.verify_mismatch_pages, fault_epoch, structure_epoch);
+		             missed, fault_epoch, structure_epoch);
 	}
 	if (BdaHotSyncVerifyMode() == 2) {
 		EXIT("BdaHotSyncVerify: a hot pass missed CPU-dirty pages\n");
