@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
+#include "graphics/host_gpu/renderer/eopTimestamps.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 
@@ -109,6 +110,12 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 		m_gpu_timing = std::make_unique<GpuTimestampRing>(graphics, GpuTimestampRing::GuestPairs);
 		if (!m_gpu_timing->Valid()) {
 			m_gpu_timing.reset();
+		}
+	}
+	if (role == Role::Guest && EopTimestamps::GpuEnabled()) {
+		m_eop_timestamps = std::make_unique<EopTimestampRing>(graphics);
+		if (!m_eop_timestamps->Valid()) {
+			m_eop_timestamps.reset();
 		}
 	}
 	m_gpu_ops = role == Role::Guest && GpuOpProfiler::Enabled();
@@ -466,6 +473,10 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 		// without waiting, then reset and stamp this buffer's pair before any rendering begins.
 		m_gpu_timing->Collect(m_master.KnownGpuTick());
 		m_gpu_timing->BeginCommand(m_command.m_buffer);
+	}
+	if (m_eop_timestamps) {
+		// Outside rendering: reset the guest timestamp slots whose results were read.
+		m_eop_timestamps->BeginCommand(m_command.m_buffer);
 	}
 	if (m_gpu_ops) {
 		GpuOpProfiler::OnBeginCommand(m_graphics, m_command.m_buffer, m_master.CurrentTick(),

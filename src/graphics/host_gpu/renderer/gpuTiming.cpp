@@ -4,6 +4,7 @@
 #include "common/hangTrace.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/eopTimestamps.h"
 
 #include <algorithm>
 #include <array>
@@ -152,7 +153,8 @@ uint64_t NowNs() noexcept {
 }
 
 const char* SelectCalibrationExtension(const std::vector<vk::ExtensionProperties>& available) {
-	if (!Enabled()) {
+	// KYTY_EOP_TIMESTAMPS=gpu converts guest timestamps with the same calibration.
+	if (!Enabled() && !EopTimestamps::GpuEnabled()) {
 		return nullptr;
 	}
 	for (const char* name:
@@ -169,6 +171,10 @@ const char* SelectCalibrationExtension(const std::vector<vk::ExtensionProperties
 
 void NoteCalibrationExtensionEnabled(const char* name) {
 	g_calibration_extension = name;
+}
+
+bool CalibrationEnabled() {
+	return g_calibration_extension != nullptr;
 }
 
 void OnGuestFlip() {

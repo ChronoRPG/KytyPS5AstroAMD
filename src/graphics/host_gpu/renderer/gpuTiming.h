@@ -40,6 +40,8 @@ namespace GpuTiming {
     const std::vector<vk::ExtensionProperties>& available);
 // Records that the extension returned above was enabled on the created device.
 void NoteCalibrationExtensionEnabled(const char* name);
+// Whether a calibrated-timestamp extension was enabled (also for KYTY_EOP_TIMESTAMPS=gpu).
+[[nodiscard]] bool CalibrationEnabled();
 
 // Called once per completed guest flip, before Profiler::PublishFrameWork(). Aggregates the
 // samples collected since the previous flip and publishes them to HangTrace and Profiler.

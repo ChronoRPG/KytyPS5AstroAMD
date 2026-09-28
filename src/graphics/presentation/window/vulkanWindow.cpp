@@ -1373,8 +1373,9 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
-		// Diagnostic only (KYTY_GPU_TIMING): maps GPU timestamps to the CPU clock and extends
-		// timestamp ordering guarantees across submissions. Not enabled for normal play.
+		// KYTY_GPU_TIMING (diagnostic) and KYTY_EOP_TIMESTAMPS=gpu only: maps GPU timestamps to the
+		// CPU clock and extends timestamp ordering guarantees across submissions. Not enabled for
+		// normal play.
 		if (const auto* calibration = GpuTiming::SelectCalibrationExtension(available_extensions);
 		    calibration != nullptr) {
 			device_extensions.push_back(calibration);

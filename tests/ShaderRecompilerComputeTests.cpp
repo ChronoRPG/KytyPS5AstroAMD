@@ -23,6 +23,8 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
+#include "graphics/host_gpu/renderer/eopTimestamps.h"
+#include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -11344,6 +11346,143 @@ public:
     std::printf("[gpu]     %-32s ok (draw-prep %s)\n", name, mode_name);
   }
 
+  // KYTY_EOP_TIMESTAMPS: end-of-pipe clock writes (RELEASE_MEM, data select 3).
+  // - record: the slots keep their record-time values.
+  // - gpu: the record-time values are written at once. Once the tick has completed, the next clock
+  //   write rewrites them with the GPU time converted to the guest clock:
+  //   record <= begin <= end <= now. A slot the guest wrote again keeps the guest's value.
+  // - gpu with KYTY_LABEL_MODE=completion: every label is deferred, and the deferred write carries
+  //   the GPU time.
+  void CheckEopTimestamps() {
+    constexpr const char *name = "EopTimestamps";
+    // Calibration deviation: a GPU value may lead a CPU reading by this much (20 us).
+    constexpr uint64_t tolerance = 2000;
+    const auto mode = EopTimestamps::GetMode();
+    const bool gpu_mode = mode != EopTimestamps::Mode::Record;
+    const auto *label_mode = std::getenv("KYTY_LABEL_MODE");
+    const bool deferred =
+        label_mode != nullptr && std::strcmp(label_mode, "completion") == 0;
+    const auto clock_write = [](void *destination) {
+      std::array<uint32_t, 8> packet{};
+      const auto address = reinterpret_cast<uint64_t>(destination);
+      packet[0] = KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM);
+      packet[1] = 0x28u | (5u << 8u); // BOTTOM_OF_PIPE_TS, end of pipe, no cache action
+      packet[2] = 3u << 29u;           // data select 3: the 64-bit clock; no interrupt
+      packet[3] = static_cast<uint32_t>(address);
+      packet[4] = static_cast<uint32_t>(address >> 32u);
+      return packet;
+    };
+
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &gpu = context.GetGpu();
+    auto processor = std::make_unique<CommandProcessor>(context, 0);
+    alignas(uint64_t) uint64_t begin = 0;
+    alignas(uint64_t) uint64_t end = 0;
+    alignas(uint64_t) uint64_t trigger = 0;
+    alignas(uint64_t) uint64_t reused = 0;
+    uint64_t before = 0;
+    uint64_t begin_record = 0;
+    uint64_t end_record = 0;
+    const auto process = [&](std::initializer_list<void *> slots) {
+      std::vector<u32> stream;
+      for (auto *slot : slots) {
+        const auto packet = clock_write(slot);
+        stream.insert(stream.end(), packet.begin(), packet.end());
+      }
+      Pm4Execution execution;
+      return processor->Process(execution, stream) == Pm4ProcessResult::Complete;
+    };
+    // Phase 1: two clock writes, their tick completed. Deferred writes are queued to this (GPU)
+    // thread by the completion runner and run once the phase returns.
+    gpu.SendCommandSync([&] {
+      GraphicsInitJmpTables();
+      processor->Reset();
+      processor->BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      Require(name, "query ring",
+              (scheduler.GuestTimestamps() != nullptr) == gpu_mode,
+              "the GPU timestamp ring must exist exactly in GPU mode (it needs calibrated "
+              "timestamps)");
+      before = Sync::ReadReferenceClock();
+      Require(name, "clock writes", process({&begin, &end}),
+              "the clock-write stream did not complete");
+      begin_record = begin;
+      end_record = end;
+      scheduler.FlushAndWait();
+      scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+    });
+    // Phase 2: another clock write publishes the completed timestamps (not deferred ones, which
+    // the queued deferred writes delivered before this phase).
+    uint64_t after = 0;
+    gpu.SendCommandSync([&] {
+      after = Sync::ReadReferenceClock();
+      Require(name, "trigger", process({&trigger}), "the trigger clock write did not complete");
+    });
+    const auto hex = [](uint64_t value) {
+      char text[24];
+      std::snprintf(text, sizeof(text), "0x%016llx", static_cast<unsigned long long>(value));
+      return std::string(text);
+    };
+    if (!gpu_mode) {
+      Require(name, "record time",
+              begin == begin_record && end == end_record && before <= begin_record &&
+                  begin_record <= end_record && end_record <= after,
+              "record mode changed the timestamps: " + hex(begin_record) + " -> " + hex(begin));
+    } else if (deferred) {
+      Require(name, "deferred GPU times",
+              begin_record == 0 && end_record == 0 && begin != 0 && end != 0 &&
+                  before <= begin + tolerance && begin <= end + tolerance &&
+                  end <= after + tolerance,
+              "deferred timestamps " + hex(begin) + ", " + hex(end) + " outside [" +
+                  hex(before) + ", " + hex(after) + "] or written at record time");
+    } else {
+      Require(name, "rewritten",
+              begin != begin_record && end != end_record,
+              "the completed timestamps kept their record-time values " + hex(begin) + ", " +
+                  hex(end));
+      Require(name, "GPU order",
+              before <= begin_record && begin_record <= begin + tolerance &&
+                  end_record <= end + tolerance && begin <= end + tolerance &&
+                  end <= after + tolerance,
+              "record " + hex(begin_record) + "/" + hex(end_record) + ", GPU " + hex(begin) +
+                  "/" + hex(end) + ", window [" + hex(before) + ", " + hex(after) + "]");
+      // A slot the guest writes again before the rewrite keeps the guest's value.
+      gpu.SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        Require(name, "reused slot", process({&reused}), "the clock write did not complete");
+        reused = 42;
+        scheduler.FlushAndWait();
+        Require(name, "reused trigger", process({&trigger}),
+                "the trigger clock write did not complete");
+      });
+      Require(name, "guest write kept", reused == 42,
+              "a slot the guest wrote again was rewritten: " + hex(reused));
+    }
+    gpu.SendCommandSync([&] {
+      auto &scheduler = context.GetCommandScheduler();
+      scheduler.Finish();
+      scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+      processor.reset();
+    });
+    // Deferred writes queued to the GPU thread by the last completions (into this function's
+    // slots) run before this empty command.
+    gpu.SendCommandSync([] {});
+    Require(name, "verify", EopTimestamps::VerifyMismatches() == 0,
+            "gpu-verify found " + std::to_string(EopTimestamps::VerifyMismatches()) +
+                " published timestamps before their recording or an earlier timestamp");
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    std::printf("[gpu]     %-32s ok (%s%s)\n", name,
+                mode == EopTimestamps::Mode::Record ? "record"
+                : mode == EopTimestamps::Mode::Gpu  ? "gpu"
+                                                    : "gpu-verify",
+                deferred ? ", deferred labels" : "");
+  }
+
   // KYTY_CMASK_FAST_CLEAR: a colour target with CB_COLOR0_INFO.FAST_CLEAR whose CMASK the game's
   // metadata fill set to 0 (every tile fast-cleared) is cleared to CLEAR_WORD0/1 when it is
   // bound, and its CMASK is left expanded (0xFF), as after the eliminate. Rebinding afterwards,
@@ -20318,6 +20457,22 @@ private:
       device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
       m_pipeline_library = true;
+    }
+    // KYTY_GPU_TIMING and KYTY_EOP_TIMESTAMPS=gpu map GPU timestamps to the CPU clock
+    // (VK_KHR/EXT_calibrated_timestamps), as on the emulator's device.
+    {
+      uint32_t extension_count = 0;
+      (void)m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                                 nullptr);
+      std::vector<vk::ExtensionProperties> available_extensions(extension_count);
+      (void)m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                                 available_extensions.data());
+      available_extensions.resize(extension_count);
+      if (const auto *calibration = GpuTiming::SelectCalibrationExtension(available_extensions);
+          calibration != nullptr) {
+        device_extensions.push_back(calibration);
+        GpuTiming::NoteCalibrationExtensionEnabled(calibration);
+      }
     }
     device_info.enabledExtensionCount = static_cast<u32>(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.data();
@@ -39330,6 +39485,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--draw-prep-engine-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDrawPrepEngineDraw();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--eop-timestamps-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckEopTimestamps();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--readback-eager-only") == 0) {

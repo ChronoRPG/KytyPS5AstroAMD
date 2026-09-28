@@ -19,6 +19,7 @@
 namespace Libs::Graphics {
 
 class GpuTimestampRing;
+class EopTimestampRing;
 
 // Host work that commands of the current recording read and that finishes after recording
 // (TextureCache staging copies made on a worker). Submit makes the batch wait for it on the
@@ -106,6 +107,8 @@ public:
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
+	// KYTY_EOP_TIMESTAMPS=gpu: the guest timestamp query ring; null in record mode.
+	[[nodiscard]] EopTimestampRing* GuestTimestamps() const noexcept { return m_eop_timestamps.get(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
@@ -176,6 +179,10 @@ private:
 	bool                         m_diagnostic_generic_completion = false;
 	// KYTY_GPU_TIMING ring; null when disabled. Owned by the recording producer, like m_command.
 	std::unique_ptr<GpuTimestampRing> m_gpu_timing;
+	// KYTY_EOP_TIMESTAMPS=gpu query ring (guest scheduler only); null otherwise. Recording
+	// producer, except the deferred-label reads (EopTimestampRing::TakeDeferred) on the priority
+	// runner, which is joined before members declared above it are destroyed.
+	std::unique_ptr<EopTimestampRing> m_eop_timestamps;
 	// Guest scheduler with KYTY_GPU_OP_PROFILE / counters enabled (gpuOpProfiler.h).
 	bool m_gpu_ops = false;
 	std::array<SubmitDependency*, SubmitDependencySlots> m_submit_dependencies {};

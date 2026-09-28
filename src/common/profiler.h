@@ -796,6 +796,15 @@ enum class FrameEvent : uint32_t {
 	// KYTY_DRAW_PREP_STEAL: slots the command processor prepared, as a worker would, while a worker
 	// held the head it had to commit (FrameWait DrawPrepSteal is their time).
 	DrawPrepSteals,
+	// KYTY_EOP_TIMESTAMPS=gpu: guest clock writes rewritten with GPU times, left alone because the
+	// guest had written the slot again, kept at record time (no query slot, result or calibration),
+	// and given GPU times through deferred label writes; gpu-verify checks and mismatches.
+	EopTimestampsRewritten,
+	EopTimestampsSkipped,
+	EopTimestampsUnavailable,
+	EopTimestampsDeferred,
+	EopTimestampsVerifyChecks,
+	EopTimestampsVerifyMismatches,
 	Count,
 };
 void CountFrameEvent(FrameEvent kind, uint64_t amount = 1);
@@ -876,6 +885,9 @@ enum class FrameWait : uint32_t {
 	// KYTY_DRAW_PREP_STEAL: command-processor time preparing stolen slots while a worker held the
 	// head (DrawPrepCommitWait is then only the idle spin after nothing was left to claim).
 	DrawPrepSteal,
+	// KYTY_EOP_TIMESTAMPS=gpu: command-processor time reading completed timestamp queries and
+	// rewriting the guest slots (one call per publication).
+	EopTimestampPublish,
 	Count,
 };
 
