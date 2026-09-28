@@ -968,6 +968,17 @@ enum class FrameEvent : uint32_t {
 	DrawPrepBindingPipelinesUsed,
 	DrawPrepBindingVerifyChecks,
 	DrawPrepBindingVerifyMismatches,
+	// KYTY_DESCRIPTOR_OFFSET_AUDIT=1 (P4b-D0, descriptors.cpp): descriptor sets written and push
+	// updates, how many repeat the previous one or any earlier one of the same command buffer
+	// with the per-draw buffer descriptors' offsets ignored (the reuse potential of dynamic
+	// offsets), and how many have more per-draw buffer descriptors than the dynamic limit.
+	DescriptorOffsetAuditSets,
+	DescriptorOffsetAuditSetRepeatsPrevious,
+	DescriptorOffsetAuditSetRepeatsAny,
+	DescriptorOffsetAuditPushes,
+	DescriptorOffsetAuditPushRepeatsPrevious,
+	DescriptorOffsetAuditPushRepeatsAny,
+	DescriptorOffsetAuditOverLimit,
 	// KYTY_EOP_TIMESTAMPS=gpu: guest clock writes rewritten with GPU times, left alone because the
 	// guest had written the slot again, kept at record time (no query slot, result or calibration),
 	// and given GPU times through deferred label writes; gpu-verify checks and mismatches.

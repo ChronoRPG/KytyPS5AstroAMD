@@ -45,6 +45,7 @@
 #include <limits>
 #include <span>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <xxhash.h>
 
@@ -1730,6 +1731,122 @@ static void CountDescriptorPushMiss(int32_t result, std::span<const vk::WriteDes
 	}
 }
 
+// KYTY_DESCRIPTOR_OFFSET_AUDIT=1 (P4b-D0, a measurement; P4B-WORKER-LOOKUPS.md 2.8): how many
+// descriptor sets written and push-descriptor updates would repeat the previous one, or any
+// earlier one, of the same command buffer if the per-draw buffer descriptors were dynamic (their
+// offsets passed at bind time). Those are the flattened SRT and shader-data tables of every stage
+// (new stream-ring ranges each draw), then the V# storage buffers in write order, as many as
+// maxDescriptorSetStorageBuffersDynamic allows: their buffer offsets are left out of the digest,
+// their buffers and ranges are not. Push layouts cannot hold dynamic descriptors, so their counts
+// are the potential of splitting them (a pushed set and a dynamic one). Counted as
+// DescriptorOffsetAudit* frame events (with a connected profiler).
+static bool DescriptorOffsetAuditEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DESCRIPTOR_OFFSET_AUDIT");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+namespace {
+
+class DescriptorOffsetAudit {
+public:
+	struct Result {
+		bool previous   = false; // the previous one of its kind in this command buffer
+		bool any        = false; // any earlier one of its kind in this command buffer
+		bool over_limit = false; // more per-draw buffer descriptors than the dynamic limit
+	};
+
+	Result Note(uint64_t tick, vk::DescriptorSetLayout layout,
+	            std::span<const vk::WriteDescriptorSet> writes, uint32_t dynamic_limit,
+	            bool push) {
+		if (tick != m_tick) {
+			m_tick = tick;
+			m_sets = {};
+			m_pushes = {};
+		}
+		Result result;
+		const auto digest = MaskedDigest(layout, writes, dynamic_limit, result.over_limit);
+		auto&      track  = push ? m_pushes : m_sets;
+		result.previous   = track.has_previous && track.previous == digest;
+		result.any        = !track.seen.insert(digest).second;
+		track.previous     = digest;
+		track.has_previous = true;
+		return result;
+	}
+
+private:
+	struct Track {
+		uint64_t                     previous     = 0;
+		bool                         has_previous = false;
+		std::unordered_set<uint64_t> seen;
+	};
+
+	template <typename T>
+	static uint64_t HandleBits(T handle) {
+		return static_cast<uint64_t>(
+		    reinterpret_cast<uintptr_t>(static_cast<typename T::CType>(handle)));
+	}
+
+	static uint64_t MaskedDigest(vk::DescriptorSetLayout                  layout,
+	                             std::span<const vk::WriteDescriptorSet> writes,
+	                             uint32_t dynamic_limit, bool& over_limit) {
+		// The leading elements of each write that would be dynamic: the per-draw tables first,
+		// then V# buffers, in write order, up to the limit.
+		thread_local std::vector<uint32_t> masked;
+		thread_local std::vector<uint64_t> words;
+		masked.assign(writes.size(), 0);
+		const auto kind_of = [](const vk::WriteDescriptorSet& write) {
+			// NativeBinding(stage, kind) = kind + stage group * DescriptorBindingKind::Count.
+			return static_cast<BindingKind>(write.dstBinding %
+			                                static_cast<uint32_t>(BindingKind::Count));
+		};
+		uint32_t budget = dynamic_limit;
+		for (const bool tables: {true, false}) {
+			for (size_t i = 0; i < writes.size(); i++) {
+				const auto& write = writes[i];
+				const auto  kind  = kind_of(write);
+				const bool  table = kind == BindingKind::FlattenedSrt || kind == BindingKind::ShaderData;
+				if (write.pBufferInfo == nullptr || (tables ? !table : kind != BindingKind::Buffers)) {
+					continue;
+				}
+				masked[i] = std::min(write.descriptorCount, budget);
+				budget -= masked[i];
+				over_limit |= masked[i] < write.descriptorCount;
+			}
+		}
+		words.clear();
+		words.push_back(HandleBits(layout));
+		for (size_t w = 0; w < writes.size(); w++) {
+			const auto& write = writes[w];
+			words.push_back((static_cast<uint64_t>(write.dstBinding) << 32u) | write.descriptorCount);
+			words.push_back((static_cast<uint64_t>(write.descriptorType) << 32u) |
+			                write.dstArrayElement);
+			for (uint32_t i = 0; i < write.descriptorCount; i++) {
+				if (write.pBufferInfo != nullptr) {
+					const auto& info = write.pBufferInfo[i];
+					words.push_back(HandleBits(info.buffer));
+					words.push_back(i < masked[w] ? UINT64_MAX : info.offset);
+					words.push_back(info.range);
+				} else if (write.pImageInfo != nullptr) {
+					const auto& info = write.pImageInfo[i];
+					words.push_back(HandleBits(info.sampler));
+					words.push_back(HandleBits(info.imageView));
+					words.push_back(static_cast<uint64_t>(info.imageLayout));
+				}
+			}
+		}
+		return XXH3_64bits(words.data(), words.size() * sizeof(uint64_t));
+	}
+
+	uint64_t m_tick = UINT64_MAX;
+	Track    m_sets;
+	Track    m_pushes;
+};
+
+} // namespace
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -1972,6 +2089,32 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 
 	if (!m_descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
+		if (DescriptorOffsetAuditEnabled()) [[unlikely]] {
+			// Draws and dispatches are recorded under the render mutex, one at a time.
+			static DescriptorOffsetAudit audit;
+			using E           = Profiler::FrameEvent;
+			const bool push   = pipeline.uses_push_descriptors;
+			const auto result = audit.Note(
+			    m_context.GetCommandScheduler().CurrentTick(), pipeline.descriptor_set_layout,
+			    m_descriptor_writes,
+			    m_context.GetGraphics()
+			        .GetPhysicalDeviceProperties()
+			        .limits.maxDescriptorSetStorageBuffersDynamic,
+			    push);
+			Profiler::CountFrameEvent(push ? E::DescriptorOffsetAuditPushes
+			                               : E::DescriptorOffsetAuditSets);
+			if (result.previous) {
+				Profiler::CountFrameEvent(push ? E::DescriptorOffsetAuditPushRepeatsPrevious
+				                               : E::DescriptorOffsetAuditSetRepeatsPrevious);
+			}
+			if (result.any) {
+				Profiler::CountFrameEvent(push ? E::DescriptorOffsetAuditPushRepeatsAny
+				                               : E::DescriptorOffsetAuditSetRepeatsAny);
+			}
+			if (result.over_limit) {
+				Profiler::CountFrameEvent(E::DescriptorOffsetAuditOverLimit);
+			}
+		}
 		if (pipeline.uses_push_descriptors) {
 			const auto result = buffer.PushDescriptors(
 			    pipeline_bind_point, pipeline.pipeline_layout, 0,

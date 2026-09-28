@@ -1023,6 +1023,11 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	set_tests_properties(shader_recompiler_compute_bindings_verify PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit")
+	# KYTY_DESCRIPTOR_OFFSET_AUDIT (P4b-D0, a measurement): the whole suite with the audit's digests.
+	add_test(NAME shader_recompiler_compute_offset_audit
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(shader_recompiler_compute_offset_audit PROPERTIES
+		ENVIRONMENT "KYTY_DESCRIPTOR_OFFSET_AUDIT=1;KYTY_DESCRIPTOR_SET_REUSE_AUDIT=1")
 	# KYTY_DRAW_PREP_STEAL (off by default): the command processor stealing whenever a slot waits,
 	# with six workers and with a single one (a held head with unclaimed slots behind it, where it
 	# steals most).
