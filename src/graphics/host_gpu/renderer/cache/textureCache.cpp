@@ -2485,19 +2485,20 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		if (image == nullptr || !image->registered || image->depth_id ||
 		    image->info.data != desc.info.data || image->info.extent != desc.info.extent ||
 		    !SafeToDownload(*image)) {
-			// Which condition refused it (DccImageState* counters, MaterializeDccClear).
+			// Which condition refused it (DccImageState* counters, MaterializeDccClear). The
+			// pending-refresh states come before "not GPU-modified", which they usually imply.
 			if (image == nullptr || !image->registered) {
 				m_image_state_reason = Event::DccImageStateUnregistered;
 			} else if (image->depth_id) {
 				m_image_state_reason = Event::DccImageStateStencil;
 			} else if (image->info.data != desc.info.data || image->info.extent != desc.info.extent) {
 				m_image_state_reason = Event::DccImageStateMismatch;
-			} else if (!image->IsGpuModified()) {
-				m_image_state_reason = Event::DccImageStateNotGpuModified;
 			} else if (image->IsBufferModified()) {
 				m_image_state_reason = Event::DccImageStateBufferModified;
 			} else if (image->IsCpuDirty()) {
 				m_image_state_reason = Event::DccImageStateCpuDirty;
+			} else if (!image->IsGpuModified()) {
+				m_image_state_reason = Event::DccImageStateNotGpuModified;
 			} else if (!image->FullyResident()) {
 				m_image_state_reason = Event::DccImageStatePartial;
 			} else {

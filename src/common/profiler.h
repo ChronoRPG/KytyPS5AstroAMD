@@ -916,9 +916,10 @@ enum class FrameEvent : uint32_t {
 	GpuWriteImageSkipVerifyRaces,
 	GpuWriteImageSkipVerifyMismatches,
 	// DccFallbackImageState by cause (TextureCache::TryMaterializeGpuMetadataClear refused the GPU
-	// inspection of a DCC slice's image): the image is not registered, has a stencil association,
-	// does not match the view's description, or is not safe to download because it is not
-	// GPU-modified, buffer-modified, CPU-dirty, partially resident, or has GPU-dirty buffer bytes.
+	// inspection of a DCC slice's image), checked in this order: the image is not registered, has a
+	// stencil association, does not match the view's description, or is not safe to download
+	// because it is buffer-modified, CPU-dirty, not GPU-modified, partially resident, or has
+	// GPU-dirty buffer bytes. (Enumerated in declaration order below, which differs.)
 	DccImageStateUnregistered,
 	DccImageStateStencil,
 	DccImageStateMismatch,
