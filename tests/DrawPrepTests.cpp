@@ -495,6 +495,123 @@ void TestReadSetDigests() {
 	      "one digest over the limit is refused");
 }
 
+// The commit-time certificate-range function of drawPrep.cpp (CertificateRanges, before
+// KYTY_DRAW_PREP_CERT_RANGES), reproduced as the reference for ReadSet::BuildCertificate.
+std::vector<Coherence::Range> ReferenceCertificateRanges(const DrawPrep::ReadSet& reads) {
+	const auto digests = reads.DigestRanges();
+	if (digests.empty()) {
+		return {reads.Ranges().begin(), reads.Ranges().end()};
+	}
+	std::vector<Coherence::Range> scratch(reads.Ranges().begin(), reads.Ranges().end());
+	scratch.insert(scratch.end(), digests.begin(), digests.end());
+	std::sort(scratch.begin(), scratch.end(),
+	          [](const Coherence::Range& a, const Coherence::Range& b) { return a.begin < b.begin; });
+	size_t merged = 0;
+	for (const auto& range: scratch) {
+		if (merged != 0 && range.begin <= scratch[merged - 1].end) {
+			scratch[merged - 1].end = std::max(scratch[merged - 1].end, range.end);
+		} else {
+			scratch[merged++] = range;
+		}
+	}
+	scratch.resize(merged);
+	return scratch;
+}
+
+// KYTY_DRAW_PREP_CERT_RANGES: ReadSet::BuildCertificate (built by the preparing thread) equals the
+// commit-time list for every read set, is sorted and non-overlapping (Coherence::Log::Check's
+// precondition), and covers exactly the bytes of the byte and digest ranges.
+void TestReadSetCertificate() {
+	std::vector<Coherence::Range> built;
+	const std::array<uint8_t, 16> bytes {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+
+	// No digests: the byte ranges themselves, split at a touching page boundary as Finish keeps
+	// them.
+	DrawPrep::ReadSet plain;
+	Check(plain.Record(0x20ff8, bytes.data(), 8) && plain.Record(0x21000, bytes.data() + 8, 8) &&
+	          plain.Record(0x30000, bytes.data(), 4),
+	      "record plain reads");
+	Check(plain.Finish(), "plain reads finish");
+	plain.BuildCertificate(built);
+	Check(built == ReferenceCertificateRanges(plain) && built.size() == 3 &&
+	          built[0] == Coherence::Range {0x20ff8, 0x21000} &&
+	          built[1] == Coherence::Range {0x21000, 0x21008},
+	      "without digests the certificate is the byte ranges");
+
+	// Digests overlapping, touching and apart from byte ranges, recorded out of order.
+	DrawPrep::ReadSet mixed;
+	Check(mixed.Record(0x40000, bytes.data(), 8) && mixed.Record(0x40100, bytes.data(), 8),
+	      "record mixed reads");
+	Check(mixed.RecordDigest(0x40108, 0x10, 1) && mixed.RecordDigest(0x3ff00, 0x100, 2) &&
+	          mixed.RecordDigest(0x50000, 0x20, 3) && mixed.RecordDigest(0x40004, 0x8, 4),
+	      "record mixed digests");
+	Check(mixed.Finish(), "mixed reads finish");
+	mixed.BuildCertificate(built);
+	Check(built == ReferenceCertificateRanges(mixed) && built.size() == 3 &&
+	          built[0] == Coherence::Range {0x3ff00, 0x4000c} &&
+	          built[1] == Coherence::Range {0x40100, 0x40118} &&
+	          built[2] == Coherence::Range {0x50000, 0x50020},
+	      "digests merge with touching and overlapping byte ranges");
+
+	// Random read sets against the reference and a byte-coverage oracle.
+	std::mt19937_64 rng(0x5eed2026u);
+	constexpr uint64_t Base   = 0x100000;
+	constexpr uint64_t Window = 0x6000; // six pages, so reads meet at page boundaries
+	std::vector<uint8_t> memory(Window);
+	for (auto& byte: memory) {
+		byte = static_cast<uint8_t>(rng());
+	}
+	bool equal = true;
+	bool sorted = true;
+	bool covered = true;
+	for (int iteration = 0; iteration < 2000; iteration++) {
+		DrawPrep::ReadSet set;
+		std::vector<uint8_t> expected(Window, 0);
+		const auto reads = rng() % 24u;
+		for (uint64_t i = 0; i < reads; i++) {
+			const auto size    = 1u + rng() % 96u;
+			const auto offset  = rng() % (Window - size);
+			(void)set.Record(Base + offset, memory.data() + offset, size);
+			std::fill(expected.begin() + static_cast<ptrdiff_t>(offset),
+			          expected.begin() + static_cast<ptrdiff_t>(offset + size), uint8_t {1});
+		}
+		const auto digests = rng() % 5u;
+		for (uint64_t i = 0; i < digests; i++) {
+			const auto size   = 1u + rng() % 0x800u;
+			const auto offset = rng() % (Window - size);
+			(void)set.RecordDigest(Base + offset, size, rng());
+			std::fill(expected.begin() + static_cast<ptrdiff_t>(offset),
+			          expected.begin() + static_cast<ptrdiff_t>(offset + size), uint8_t {1});
+		}
+		if (!set.Finish()) {
+			continue; // cannot happen: every read comes from one memory image
+		}
+		set.BuildCertificate(built);
+		equal &= built == ReferenceCertificateRanges(set);
+		std::vector<uint8_t> coverage(Window, 0);
+		for (size_t i = 0; i < built.size(); i++) {
+			sorted &= built[i].begin < built[i].end;
+			if (i != 0) {
+				sorted &= built[i - 1].end <= built[i].begin;
+			}
+			for (auto address = built[i].begin; address < built[i].end; address++) {
+				coverage[address - Base] = 1;
+			}
+		}
+		covered &= coverage == expected;
+	}
+	Check(equal, "BuildCertificate equals the commit-time list on random read sets");
+	Check(sorted, "the certificate ranges are sorted, non-empty and non-overlapping");
+	Check(covered, "the certificate ranges cover exactly the read and digest bytes");
+
+	// The output vector keeps no stale entries from an earlier, longer certificate.
+	DrawPrep::ReadSet one;
+	Check(one.Record(0x60000, bytes.data(), 4) && one.Finish(), "record one read");
+	one.BuildCertificate(built);
+	Check(built.size() == 1 && built[0] == Coherence::Range {0x60000, 0x60004},
+	      "a rebuilt certificate replaces the previous one");
+}
+
 // ReadSet::ValidateInPlace (KYTY_BACKING_INPLACE) returns what Validate returns for the same
 // memory: the byte ranges first, then the digests, the first failing range deciding.
 void TestReadSetValidateInPlace() {
@@ -1642,6 +1759,7 @@ int main(int argc, char** argv) {
 	TestReadSetInconsistent();
 	TestReadSetLimits();
 	TestReadSetDigests();
+	TestReadSetCertificate();
 	TestReadSetValidateInPlace();
 	TestRecordScopeNests();
 	TestPacketClassification();

@@ -1058,6 +1058,29 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_steal_one_worker PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_STEAL=1;KYTY_DRAW_PREP_WORKERS=1;KYTY_DRAW_PREP_HOT=1")
+	# KYTY_DRAW_PREP_CERT_RANGES: the preparing thread's certificate ranges checked against the
+	# commit-time list (parallel, inline, and the log audit over value certificates), the commit-time
+	# path (=commit), and the whole compute/renderer suite under the verify mode.
+	add_test(NAME draw_prep_engine_parallel_cert_ranges_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_cert_ranges_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_CERT_RANGES_VERIFY=exit")
+	add_test(NAME draw_prep_engine_inline_cert_ranges_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_inline_cert_ranges_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_CERT_RANGES_VERIFY=exit")
+	add_test(NAME draw_prep_engine_parallel_value_audit_cert_ranges_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_value_audit_cert_ranges_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_CERT=value;KYTY_DRAW_PREP_LOG_AUDIT=1;KYTY_DRAW_PREP_CERT_RANGES_VERIFY=exit")
+	add_test(NAME draw_prep_engine_parallel_cert_ranges_commit
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_cert_ranges_commit PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_CERT_RANGES=commit")
+	add_test(NAME shader_recompiler_compute_cert_ranges_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(shader_recompiler_compute_cert_ranges_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_CERT_RANGES_VERIFY=exit")
 	# KYTY_EOP_TIMESTAMPS: record time (default), GPU times, their verify mode, and GPU times
 	# delivered by deferred label writes (every label deferred).
 	add_test(NAME eop_timestamps

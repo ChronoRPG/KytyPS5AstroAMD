@@ -176,6 +176,32 @@ public:
 	[[nodiscard]] bool Finished() const noexcept { return m_finished; }
 	// Sorted, non-overlapping; valid after a successful Finish().
 	[[nodiscard]] std::span<const Coherence::Range> Ranges() const noexcept { return m_ranges; }
+
+	// Every range the certificate covers (byte ranges and digest ranges), sorted by begin, with
+	// overlapping and touching ranges merged: the form Coherence::Log::Check requires. Without
+	// digest ranges it is Ranges() itself. A pure function of a finished read set, so the
+	// preparing thread builds it once (KYTY_DRAW_PREP_CERT_RANGES) instead of every commit.
+	// Only for the coherence-log check: touching ranges merge across 4 KiB boundaries here, which
+	// a clean-read verdict must not do (AllClean keeps the separate lists).
+	void BuildCertificate(std::vector<Coherence::Range>& out) const {
+		out.assign(m_ranges.begin(), m_ranges.end());
+		if (m_digest_ranges.empty()) {
+			return;
+		}
+		out.insert(out.end(), m_digest_ranges.begin(), m_digest_ranges.end());
+		std::sort(out.begin(), out.end(), [](const Coherence::Range& a, const Coherence::Range& b) {
+			return a.begin < b.begin;
+		});
+		size_t merged = 0;
+		for (const auto& range: out) {
+			if (merged != 0 && range.begin <= out[merged - 1].end) {
+				out[merged - 1].end = std::max(out[merged - 1].end, range.end);
+			} else {
+				out[merged++] = range;
+			}
+		}
+		out.resize(merged);
+	}
 	[[nodiscard]] std::span<const uint8_t> RangeBytes(size_t index) const noexcept {
 		const auto& range = m_ranges[index];
 		return {m_merged.data() + m_range_offsets[index], range.end - range.begin};

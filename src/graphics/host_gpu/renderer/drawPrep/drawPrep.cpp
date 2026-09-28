@@ -193,6 +193,74 @@ static bool LogAuditEnabled() {
 	return enabled;
 }
 
+bool CertRangesOnWorker() {
+	static const bool enabled = [] {
+		// The preparing thread builds the list by default: it is a pure function of the finished
+		// read set (ReadSet::BuildCertificate). =commit builds it in Validate, as before.
+		const auto* value = EnvValue("KYTY_DRAW_PREP_CERT_RANGES");
+		if (value == nullptr || std::strcmp(value, "worker") == 0) {
+			return true;
+		}
+		if (std::strcmp(value, "commit") == 0) {
+			return false;
+		}
+		EXIT("KYTY_DRAW_PREP_CERT_RANGES must be worker or commit (got '%s')\n", value);
+	}();
+	return enabled;
+}
+
+int CertRangesVerifyMode() {
+	static const int mode = [] {
+		const auto* value = EnvValue("KYTY_DRAW_PREP_CERT_RANGES_VERIFY");
+		if (value == nullptr || std::strcmp(value, "0") == 0) {
+			return 0;
+		}
+		return std::strcmp(value, "exit") == 0 ? 2 : 1;
+	}();
+	return mode;
+}
+
+// Whether a successful preparation's certificate ranges are needed at commit: the log check
+// (log mode), or its audit on top of value certificates.
+static bool CertificateRangesUsed() {
+	return GetCertMode() == CertMode::Log || LogAuditEnabled();
+}
+
+// The certificate ranges of the log check at commit. A preparation that built them
+// (KYTY_DRAW_PREP_CERT_RANGES=worker) hands over its list; otherwise they are built here into
+// `scratch`, the path before this switch. KYTY_DRAW_PREP_CERT_RANGES_VERIFY rebuilds a handed-over
+// list with that commit-time function and compares the two.
+static std::span<const Coherence::Range> CommitCertificateRanges(
+    const PreparedDraw& prepared, std::vector<Coherence::Range>& scratch) {
+	if (!prepared.certificate_built) {
+		return CertificateRanges(prepared.reads, scratch);
+	}
+	g_totals.cert_ranges_prebuilt.fetch_add(1, std::memory_order_relaxed);
+	if (CertRangesVerifyMode() != 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCertRangesVerifyChecks);
+		g_totals.cert_ranges_verify_checks.fetch_add(1, std::memory_order_relaxed);
+		const auto reference = CertificateRanges(prepared.reads, scratch);
+		if (!std::equal(reference.begin(), reference.end(), prepared.certificate.begin(),
+		                prepared.certificate.end())) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCertRangesVerifyMismatches);
+			g_totals.cert_ranges_verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+				LOGF("DrawPrepCertRangesVerify: prepared certificate has %zu ranges, the commit-time "
+				     "list %zu (%zu byte ranges, %zu digest ranges)\n",
+				     prepared.certificate.size(), reference.size(), prepared.reads.Ranges().size(),
+				     prepared.reads.DigestRanges().size());
+			}
+			if (CertRangesVerifyMode() == 2) {
+				EXIT("DrawPrepCertRangesVerify: prepared certificate ranges differ from the "
+				     "commit-time list\n");
+			}
+			return reference; // the commit-time list decides, as before the switch
+		}
+	}
+	return prepared.certificate;
+}
+
 bool PacketHookEnabled() {
 	static const bool enabled = [] {
 		const auto* value = EnvValue("KYTY_DRAW_PREP_HISTOGRAM");
@@ -229,6 +297,8 @@ void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, b
 	prepared.programs   = {};
 	prepared.pixel_info = {};
 	prepared.reads.Reset();
+	prepared.certificate.clear();
+	prepared.certificate_built = false;
 	if (!eligible) {
 		prepared.failure = Failure::Ineligible;
 		return;
@@ -269,6 +339,12 @@ void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, b
 	if (!prepared.reads.Finish()) {
 		prepared.failure = FromReadFailure(prepared.reads.Failure());
 		return;
+	}
+	if (CertRangesOnWorker() && CertificateRangesUsed()) {
+		// The read set is final: its certificate ranges are too. Validate on the command
+		// processor uses them instead of sorting and merging there (KYTY_DRAW_PREP_CERT_RANGES).
+		prepared.reads.BuildCertificate(prepared.certificate);
+		prepared.certificate_built = true;
 	}
 	prepared.ok = true;
 }
@@ -381,7 +457,7 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 	if (GetCertMode() == CertMode::Log) {
 		const auto outcome =
 		    Coherence::g_log.Check(prepared.coherence_generation, Coherence::Generation(),
-		                           CertificateRanges(prepared.reads, log_scratch));
+		                           CommitCertificateRanges(prepared, log_scratch));
 		if (outcome.result == Coherence::CheckResult::Clean) {
 			if (!prepared.reads.AllClean(LibKernel::Memory::IsGpuCleanForRead)) {
 				return fail(Failure::CertUnclean);
@@ -411,7 +487,7 @@ bool Validate(PreparedDraw& prepared, bool pixel_active,
 			const bool log_clean = Coherence::g_log
 			                           .Check(prepared.coherence_generation,
 			                                  Coherence::Generation(),
-			                                  CertificateRanges(prepared.reads, log_scratch))
+			                                  CommitCertificateRanges(prepared, log_scratch))
 			                           .result == Coherence::CheckResult::Clean;
 			if (log_clean && result == ValidateResult::Changed) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepLogMissed);

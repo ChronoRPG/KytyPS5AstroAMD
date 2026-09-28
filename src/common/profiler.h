@@ -1047,6 +1047,10 @@ enum class FrameEvent : uint32_t {
 	DccGpuRefreshes,
 	DccGpuRefreshVerifyChecks,
 	DccGpuRefreshVerifyMismatches,
+	// KYTY_DRAW_PREP_CERT_RANGES_VERIFY (drawPrep.cpp): certificate ranges built by the preparing
+	// thread compared at commit with the commit-time list, and the differences.
+	DrawPrepCertRangesVerifyChecks,
+	DrawPrepCertRangesVerifyMismatches,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip
