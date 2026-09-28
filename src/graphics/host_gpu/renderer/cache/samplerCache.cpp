@@ -68,6 +68,18 @@ SamplerCache::~SamplerCache() {
 	}
 }
 
+uint64_t SamplerCache::NextInstance() noexcept {
+	static std::atomic<uint64_t> instances {0};
+	return instances.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+vk::Sampler SamplerCache::FindSampler(const ShaderSamplerResource& r) {
+	Common::LockGuard lock(m_mutex);
+	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3]};
+	const auto       iter = m_samplers.find(key);
+	return iter != m_samplers.end() ? iter->second : vk::Sampler {};
+}
+
 vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	Common::LockGuard lock(m_mutex);
 

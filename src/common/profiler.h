@@ -948,6 +948,26 @@ enum class FrameEvent : uint32_t {
 	// KYTY_DRAW_PREP_STEAL: slots the command processor prepared, as a worker would, while a worker
 	// held the head it had to commit (FrameWait DrawPrepSteal is their time).
 	DrawPrepSteals,
+	// KYTY_DRAW_PREP_BINDINGS (drawPrep/bindingPlan.h): binding plans computed by the preparing
+	// threads; plans the command processor used (DrawPrep::Validate accepted the slot's
+	// preparation) or dropped (a fallback, or a draw that returned before its programs); items a
+	// preparing thread left to the command processor: a V# or vertex range its clamp would change,
+	// a sampler not created yet, a pipeline not created yet (or a key the serial path refuses), the
+	// pipeline cache busy (its lock taken); plan items not used at commit because the guest virtual
+	// ranges changed or the pipeline's certificate failed (targets, topology, restart, generation);
+	// pipelines taken from plans; verify mode's comparisons and differences.
+	DrawPrepBindingPlans,
+	DrawPrepBindingPlansUsed,
+	DrawPrepBindingPlansDropped,
+	DrawPrepBindingAbstainRanges,
+	DrawPrepBindingAbstainSamplers,
+	DrawPrepBindingAbstainPipeline,
+	DrawPrepBindingAbstainPipelineBusy,
+	DrawPrepBindingFallbackVm,
+	DrawPrepBindingFallbackPipeline,
+	DrawPrepBindingPipelinesUsed,
+	DrawPrepBindingVerifyChecks,
+	DrawPrepBindingVerifyMismatches,
 	// KYTY_EOP_TIMESTAMPS=gpu: guest clock writes rewritten with GPU times, left alone because the
 	// guest had written the slot again, kept at record time (no query slot, result or calibration),
 	// and given GPU times through deferred label writes; gpu-verify checks and mismatches.
@@ -1074,6 +1094,20 @@ enum class FrameWait : uint32_t {
 	// KYTY_EOP_TIMESTAMPS=gpu: command-processor time reading completed timestamp queries and
 	// rewriting the guest slots (one call per publication).
 	EopTimestampPublish,
+	// KYTY_DRAW_PREP_BINDINGS: binding-plan time on the preparing threads (inside the worker times
+	// below, or DrawPrepSteal on the command processor).
+	DrawPrepBindingPlan,
+	// Draw-prep worker load: the busy time of DrawPrep#k (preparation, repeat-trace hashes and
+	// binding plan of each slot it claimed; calls = slots). Workers past the eighth add to
+	// DrawPrepWorker8. Idle time is the flip interval minus this.
+	DrawPrepWorker1,
+	DrawPrepWorker2,
+	DrawPrepWorker3,
+	DrawPrepWorker4,
+	DrawPrepWorker5,
+	DrawPrepWorker6,
+	DrawPrepWorker7,
+	DrawPrepWorker8,
 	Count,
 };
 

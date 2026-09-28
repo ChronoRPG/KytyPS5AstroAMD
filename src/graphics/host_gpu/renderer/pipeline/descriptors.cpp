@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/lodStats.h"
@@ -730,7 +731,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                     const ShaderRecompiler::IR::DescriptorValue& value,
-                                    TextureBinding&                              binding) {
+                                    TextureBinding& binding, const uint64_t* hash_hint) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	// The same state a freshly returned binding had: no view yet, no mip views (their capacity
 	// is kept), undefined layout.
@@ -746,7 +747,18 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 	uint64_t                hash = 0;
 	if (memo || description_cache) {
 		memo_key = TextureBindingMemo::MakeKey(resource, descriptor.fields);
-		hash     = TextureBindingMemo::Hash(memo_key);
+		// KYTY_DRAW_PREP_BINDINGS textures: the preparing worker hashed the same key.
+		if (hash_hint != nullptr && DrawPrep::BindingsVerifyMode() == 0) {
+			hash = *hash_hint;
+		} else {
+			hash = TextureBindingMemo::Hash(memo_key);
+			if (hash_hint != nullptr) {
+				DrawPrep::CountBindingVerifyCheck();
+				if (*hash_hint != hash) {
+					DrawPrep::ReportBindingMismatch("texture memo hash");
+				}
+			}
+		}
 	}
 	// Exactly the answer of the full resolution below (see textureBindingMemo.h), including the
 	// FindImage access bookkeeping; validation of the key's resource already passed.
@@ -870,9 +882,9 @@ static bool SamplerMemoEnabled() {
 	return enabled;
 }
 
-vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                          uint32_t                                        index,
-                                          const ShaderRecompiler::IR::DescriptorValue&    value) {
+ShaderSamplerResource NativeSamplerDescriptor(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                              uint32_t                                        index,
+                                              const ShaderRecompiler::IR::DescriptorValue&    value) {
 	auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	if (!program.info.samplers[index].depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
@@ -880,6 +892,44 @@ vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledSh
 	if (program.info.samplers[index].force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
+	return descriptor;
+}
+
+void AppendUserShaderData(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                          const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
+                          std::vector<uint32_t>&                          shader_data) {
+	for (const auto reg: program.bindings.user_data_registers) {
+		shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
+	}
+}
+
+bool WriteMipStatsFields(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                         const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
+                         std::vector<uint32_t>&                          shader_data) {
+	// GET_LOD_STATS field per image, 32 bits (LodStatsReport::ImageField): MipStatsCntId, the
+	// BASE_LEVEL added to recorded levels, a no-counter flag and the LOD threshold below which a
+	// sample is counted (the T# MIN_LOD with KYTY_LOD_STATS_COUNT=clamp, every sample otherwise).
+	// KYTY_MIP_STATS_BASE_LEVEL=0 reports levels relative to BASE_LEVEL (the U27 behaviour).
+	static const bool absolute_levels = [] {
+		const char* value = std::getenv("KYTY_MIP_STATS_BASE_LEVEL");
+		return !(value != nullptr && value[0] == '0');
+	}();
+	const auto& layout        = program.bindings;
+	const bool  count_clamped = LodStatsCounter::CountClamped();
+	bool        active        = false;
+	for (uint32_t i = 0; i < layout.mip_stats_count; i++) {
+		const auto field = LodStatsReport::ImageField(snapshot.images.at(i).dwords.data(),
+		                                              absolute_levels, count_clamped);
+		shader_data[layout.MipStatsOffsetDword() + i] = field;
+		active |= (field & LodStatsReport::NoCounterFlag) == 0u;
+	}
+	return active;
+}
+
+vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                          uint32_t                                        index,
+                                          const ShaderRecompiler::IR::DescriptorValue&    value) {
+	auto descriptor = NativeSamplerDescriptor(program, index, value);
 	if (!SamplerMemoEnabled()) {
 		return m_context.GetSamplerCache().GetSampler(descriptor);
 	}
@@ -1169,12 +1219,14 @@ bool RenderExecutor::RepeatStageTextures(const ShaderRecompiler::IR::CompiledSha
 }
 
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
-                                     PreparedBindings& prepared) {
+                                     PreparedBindings& prepared, DrawPrep::StagePlan* plan) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
 	prepared.runtime = &runtime;
+	prepared.plan             = plan;
+	prepared.plan_shader_data = false;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
@@ -1182,25 +1234,70 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.buffers.clear();
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
+	const bool verify = plan != nullptr && DrawPrep::BindingsVerifyMode() != 0;
 	if (!RepeatStageTextures(program, snapshot, prepared)) {
+		// KYTY_DRAW_PREP_BINDINGS textures: the memo hashes the preparing worker computed.
+		const bool hashes = plan != nullptr && plan->texture_hashes_valid &&
+		                    plan->texture_hashes.size() == program.info.images.size();
 		prepared.images.resize(program.info.images.size());
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& binding = prepared.images[i];
-			ResolveTexture(program.info.images[i], snapshot.images[i], binding);
+			ResolveTexture(program.info.images[i], snapshot.images[i], binding,
+			               hashes ? &plan->texture_hashes[i] : nullptr);
 			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		}
 		prepared.texture_program = &program;
 		prepared.texture_words.assign(snapshot.images.begin(), snapshot.images.end());
 	}
+	// KYTY_DRAW_PREP_BINDINGS samplers: the handles the worker found (never evicted); a null one is
+	// resolved here as before.
+	const bool plan_samplers = plan != nullptr && plan->samplers_valid &&
+	                           plan->samplers.size() == program.info.samplers.size();
 	prepared.samplers.reserve(program.info.samplers.size());
+	uint32_t planned_samplers = 0;
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(program, i, snapshot.samplers[i]));
+		auto sampler = plan_samplers ? plan->samplers[i] : vk::Sampler {};
+		planned_samplers += sampler != nullptr ? 1u : 0u;
+		if (sampler == nullptr || verify) {
+			const auto serial = NativeSampler(program, i, snapshot.samplers[i]);
+			if (sampler != nullptr) {
+				DrawPrep::CountBindingVerifyCheck();
+				if (sampler != serial) {
+					DrawPrep::ReportBindingMismatch("sampler handle", i);
+				}
+			}
+			sampler = serial;
+		}
+		prepared.samplers.push_back(sampler);
 	}
-	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
-	for (const auto reg: program.bindings.user_data_registers) {
-		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
+	if (planned_samplers != 0 && !verify) {
+		DrawPrep::GetBindingTotals().samplers_used.fetch_add(planned_samplers,
+		                                                      std::memory_order_relaxed);
 	}
-	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
+	// KYTY_DRAW_PREP_BINDINGS userdata: the worker's shader data (user dwords and mip-statistics
+	// fields, memory offsets zero) is taken as it is; RebindBuffers only packs the offsets in.
+	const auto dwords = program.bindings.ShaderDataDwords();
+	if (plan != nullptr && plan->shader_data_valid && plan->shader_data.size() == dwords &&
+	    !verify) {
+		prepared.shader_data.swap(plan->shader_data);
+		prepared.plan_shader_data = true;
+		DrawPrep::GetBindingTotals().shader_data_used.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		prepared.shader_data.reserve(dwords);
+		AppendUserShaderData(program, snapshot, prepared.shader_data);
+		prepared.shader_data.resize(dwords);
+		if (verify && plan->shader_data_valid) {
+			// The worker's vector is the serial one after RebindBuffers' reset and fields.
+			static thread_local std::vector<uint32_t> serial;
+			serial.assign(prepared.shader_data.begin(), prepared.shader_data.end());
+			std::fill(serial.begin() + program.bindings.memory_offset_dword, serial.end(), 0);
+			const bool active = WriteMipStatsFields(program, snapshot, serial);
+			DrawPrep::CountBindingVerifyCheck();
+			if (serial != plan->shader_data || active != plan->mip_stats_active) {
+				DrawPrep::ReportBindingMismatch("shader data", static_cast<uint32_t>(program.stage));
+			}
+		}
+	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
@@ -1212,11 +1309,16 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 // V# OOB_SELECT (RDNA2 ISA 8.1.5, Table 35: 0 also checks offset < stride, 1 checks the index
 // only, 2 disables the check, 3 counts NUM_RECORDS in bytes). Log each OOB_SELECT / stride /
 // swizzle / ADD_TID combination once so a run shows which modes a title uses.
+static std::atomic<uint32_t> g_buffer_out_of_bounds_seen {0};
+
+uint32_t BufferOutOfBoundsCombination(const ShaderBufferResource& descriptor) {
+	return static_cast<uint32_t>(descriptor.OutOfBounds()) | (descriptor.Stride() != 0 ? 4u : 0u) |
+	       (descriptor.SwizzleEnabled() ? 8u : 0u) | (descriptor.AddTid() ? 16u : 0u);
+}
+
 static void NoteBufferOutOfBoundsMode(const ShaderBufferResource& descriptor, uint64_t address) {
-	static std::atomic<uint32_t> seen {0};
-	const auto combination = static_cast<uint32_t>(descriptor.OutOfBounds()) |
-	                         (descriptor.Stride() != 0 ? 4u : 0u) |
-	                         (descriptor.SwizzleEnabled() ? 8u : 0u) | (descriptor.AddTid() ? 16u : 0u);
+	auto&      seen        = g_buffer_out_of_bounds_seen;
+	const auto combination = BufferOutOfBoundsCombination(descriptor);
 	const auto bit = 1u << combination;
 	if ((seen.load(std::memory_order_relaxed) & bit) != 0u ||
 	    (seen.fetch_or(bit, std::memory_order_relaxed) & bit) != 0u) {
@@ -1238,16 +1340,61 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 
 	prepared.buffer_sources.clear();
 	prepared.buffer_sources.reserve(program.info.buffers.size());
+	// KYTY_DRAW_PREP_BINDINGS buffers: the ranges the worker decoded and clamped, while the guest
+	// virtual ranges are the ones it clamped against. FindBuffer (it may create and join buffers)
+	// runs here, in the same order, either way.
+	const auto* plan = prepared.plan;
+	const bool  use_plan = plan != nullptr && plan->ranges_valid &&
+	                      plan->ranges.size() == program.info.buffers.size() &&
+	                      m_binding_plan != nullptr &&
+	                      m_binding_plan->vm_generation == LibKernel::Memory::VirtualRangesGeneration();
+	if (plan != nullptr && plan->ranges_valid && !use_plan) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepBindingFallbackVm);
+	}
+	if (use_plan) {
+		DrawPrep::GetBindingTotals().ranges_used.fetch_add(1, std::memory_order_relaxed);
+	}
+	const bool verify = use_plan && DrawPrep::BindingsVerifyMode() != 0;
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
-		const auto address = descriptor.Base48();
-		const auto requested_size = descriptor.GetSize();
-		NoteBufferOutOfBoundsMode(descriptor, address);
-		if (address == 0 || requested_size == 0) {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		if (use_plan) {
+			const auto& range = plan->ranges[i];
+			if ((g_buffer_out_of_bounds_seen.load(std::memory_order_relaxed) &
+			     (1u << range.out_of_bounds_mode)) == 0u) {
+				const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+				NoteBufferOutOfBoundsMode(descriptor, descriptor.Base48());
+			}
+			address = range.address;
+			size    = range.size;
+		}
+		if (!use_plan || verify) {
+			auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+			const auto serial_address = descriptor.Base48();
+			const auto requested_size = descriptor.GetSize();
+			if (!use_plan) {
+				NoteBufferOutOfBoundsMode(descriptor, serial_address);
+			}
+			uint64_t serial_size = 0;
+			uint64_t serial_base = 0;
+			if (serial_address != 0 && requested_size != 0) {
+				serial_base = serial_address;
+				serial_size = Libs::LibKernel::Memory::ClampRangeSize(serial_address, requested_size);
+			}
+			if (verify) {
+				DrawPrep::CountBindingVerifyCheck();
+				if (serial_base != address || serial_size != size ||
+				    BufferOutOfBoundsCombination(descriptor) != plan->ranges[i].out_of_bounds_mode) {
+					DrawPrep::ReportBindingMismatch("buffer range", i);
+				}
+			}
+			address = serial_base;
+			size    = serial_size;
+		}
+		if (address == 0 && size == 0) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
-		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}
 }
@@ -1382,8 +1529,14 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	prepared.buffers.clear();
 	prepared.buffers.reserve(program.info.buffers.size());
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
-	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
-	          prepared.shader_data.end(), 0);
+	// A plan's shader data (PrepareBindings) holds zero offsets and the fields until the offsets
+	// are packed below; a later rebind of these bindings starts from the reset again.
+	const bool plan_shader_data = prepared.plan_shader_data;
+	prepared.plan_shader_data   = false;
+	if (!plan_shader_data) {
+		std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
+		          prepared.shader_data.end(), 0);
+	}
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
 		const auto dword = layout.memory_offset_dword + index / 4u;
 		const auto shift = (index % 4u) * 8u;
@@ -1402,23 +1555,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               buffer_offset, written));
 		pack_memory_offset(i, buffer_offset);
 	}
-	// GET_LOD_STATS field per image, 32 bits (LodStatsReport::ImageField): MipStatsCntId, the
-	// BASE_LEVEL added to recorded levels, a no-counter flag and the LOD threshold below which a
-	// sample is counted (the T# MIN_LOD with KYTY_LOD_STATS_COUNT=clamp, every sample otherwise).
-	// KYTY_MIP_STATS_BASE_LEVEL=0 reports levels relative to BASE_LEVEL (the U27 behaviour).
-	static const bool absolute_levels = [] {
-		const char* value = std::getenv("KYTY_MIP_STATS_BASE_LEVEL");
-		return !(value != nullptr && value[0] == '0');
-	}();
-	const bool count_clamped = LodStatsCounter::CountClamped();
-	prepared.mip_stats_active = false;
 	prepared.mip_stats_canary = false;
-	for (uint32_t i = 0; i < layout.mip_stats_count; i++) {
-		const auto field = LodStatsReport::ImageField(snapshot.images.at(i).dwords.data(),
-		                                              absolute_levels, count_clamped);
-		prepared.shader_data[layout.MipStatsOffsetDword() + i] = field;
-		prepared.mip_stats_active |= (field & LodStatsReport::NoCounterFlag) == 0u;
-	}
+	prepared.mip_stats_active = plan_shader_data
+	                                ? prepared.plan->mip_stats_active
+	                                : WriteMipStatsFields(program, snapshot, prepared.shader_data);
 	// Upload sites: stage type and table kind (the dedup checks the site's last entry first).
 	const auto site = static_cast<uint32_t>(program.stage) * 2u;
 	prepared.fresh_upload = false;

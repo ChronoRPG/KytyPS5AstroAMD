@@ -56,6 +56,10 @@
 #include <vector>
 #include <xxhash.h>
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 namespace Libs::Graphics {
 
 namespace {
@@ -3222,6 +3226,286 @@ ShaderProgram PipelineCache::PlainPixelProgram(const StagePrep& prep) {
 	return prep.permutation != nullptr ? prep.permutation->plain : ShaderProgram {};
 }
 
+// Pipeline: temporary acceptance of EXEC_ON_NOOP with the depth test enabled (first 16 draws).
+static void NoteExecOnNoop(const RenderDepthInfo& depth, const ShaderPixelInputInfo* ps_input_info) {
+	if (ps_input_info != nullptr && depth.depth_test_enable && ps_input_info->ps_execute_on_noop) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("Pipeline: temporary: accepting EXEC_ON_NOOP with depth test enabled\n");
+		}
+	}
+}
+
+bool PipelineCache::SamePipelineTargets(const PipelineTargets&           targets,
+                                        std::span<const RenderColorInfo> colors,
+                                        const RenderDepthInfo&           depth) {
+	if (colors.size() != targets.color_count) {
+		return false;
+	}
+	for (uint32_t i = 0; i < targets.color_count; i++) {
+		const auto& planned = targets.colors[i];
+		const auto& color   = colors[i];
+		if (color.target_slot != planned.slot || !color.image_id ||
+		    color.desc.view_info.format != planned.format ||
+		    color.desc.info.samples != planned.samples ||
+		    color.export_mapping.packed != planned.export_mapping.packed) {
+			return false;
+		}
+	}
+	const bool with_depth =
+	    depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
+	if (with_depth != targets.with_depth ||
+	    (with_depth && (depth.desc.view_info.format != targets.depth_format ||
+	                    depth.desc.info.samples != targets.depth_samples))) {
+		return false;
+	}
+	return depth.depth_bounds_test_enable == targets.depth_bounds_test_enable &&
+	       std::bit_cast<uint32_t>(depth.depth_min_bounds) ==
+	           std::bit_cast<uint32_t>(targets.depth_min_bounds) &&
+	       std::bit_cast<uint32_t>(depth.depth_max_bounds) ==
+	           std::bit_cast<uint32_t>(targets.depth_max_bounds);
+}
+
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
+bool PipelineCache::BuildGraphicsPipelineKey(const PipelineTargets& targets, const HW::Context& ctx,
+                                             const HW::UserConfig&        user_config,
+                                             const ShaderVertexInputInfo& vs_input_info,
+                                             const ShaderPixelInputInfo*  ps_input_info,
+                                             vk::PrimitiveTopology        topology,
+                                             bool                         primitive_restart_enable,
+                                             const GraphicsPrograms& programs, bool fatal,
+                                             GraphicsPipelineKey& key) const {
+	// Where the serial lookup stops the emulator, a plan's lookup gives up.
+	const auto refuse = [fatal](bool condition, const char* what) {
+		if (condition && fatal) {
+			EXIT("Pipeline: unsupported graphics pipeline key input: %s\n", what);
+		}
+		return condition;
+	};
+	const auto& vertex_program = programs.vertex[0];
+	const auto& pixel_program  = programs.pixel;
+	const bool  ps_active      = ps_input_info != nullptr;
+	if (refuse(!vertex_program, "no vertex program") ||
+	    refuse(ps_active && !pixel_program, "no pixel program")) {
+		return false;
+	}
+
+	const HW::ModeControl& mc = ctx.GetModeControl();
+
+	for (uint32_t i = 0; i < programs.vertex.size(); i++) {
+		key.vertex_shader_ids[i] = programs.vertex[i].id;
+	}
+	key.ps_shader_id            = ps_active ? pixel_program.id : 0;
+	auto& static_params         = key.static_params;
+	auto& rendering             = key.rendering;
+	rendering.color_count       = 0;
+	uint32_t attachment_samples = 0;
+	for (uint32_t i = 0; i < targets.color_count; i++) {
+		const auto& color = targets.colors[i];
+		const auto  slot  = color.slot;
+		if (refuse(slot >= RENDER_COLOR_ATTACHMENTS_MAX, "colour slot") ||
+		    refuse(color.format == vk::Format::eUndefined, "colour format")) {
+			return false;
+		}
+		rendering.color_count = std::max(rendering.color_count, slot + 1);
+		static_params.color_mask[slot] =
+		    color.export_mapping.ApplyMask(render_target_mask_slot(ctx.GetRenderTargetMask(), slot));
+		rendering.color_formats[slot] = color.format;
+		if (attachment_samples == 0) {
+			attachment_samples = color.samples;
+		} else if (attachment_samples != color.samples) {
+			if (fatal) {
+				EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
+				     attachment_samples, color.samples);
+			}
+			return false;
+		}
+		const auto& rt                        = ctx.GetRenderTarget(slot);
+		const auto& bc                        = ctx.GetBlendControl(slot);
+		static_params.color_srcblend[slot]       = bc.color_srcblend;
+		static_params.color_comb_fcn[slot]       = bc.color_comb_fcn;
+		static_params.color_destblend[slot]      = bc.color_destblend;
+		static_params.alpha_srcblend[slot]       = bc.alpha_srcblend;
+		static_params.alpha_comb_fcn[slot]       = bc.alpha_comb_fcn;
+		static_params.alpha_destblend[slot]      = bc.alpha_destblend;
+		static_params.separate_alpha_blend[slot] = bc.separate_alpha_blend;
+		static_params.blend_enable[slot]         = bc.enable && !rt.info.blend_bypass;
+	}
+	const bool with_depth = targets.with_depth;
+	if (with_depth) {
+		const auto aspects       = ImageViewOps::DepthAspectMask(targets.depth_format);
+		rendering.depth_format   = aspects & vk::ImageAspectFlagBits::eDepth ? targets.depth_format
+		                                                                     : vk::Format::eUndefined;
+		rendering.stencil_format = aspects & vk::ImageAspectFlagBits::eStencil
+		                               ? targets.depth_format
+		                               : vk::Format::eUndefined;
+		if (attachment_samples == 0) {
+			attachment_samples = targets.depth_samples;
+		} else if (attachment_samples != targets.depth_samples) {
+			if (fatal) {
+				EXIT("mixed color/depth sample counts are unsupported: %u and %u\n",
+				     attachment_samples, targets.depth_samples);
+			}
+			return false;
+		}
+	}
+	if (targets.color_count == 0 && !with_depth) {
+		attachment_samples = render_sample_count(ctx.GetAaConfig().msaa_num_samples);
+		if (refuse(!static_cast<bool>(m_graphics.GetPhysicalDeviceProperties()
+		                                  .limits.framebufferNoAttachmentsSampleCounts &
+		                              vulkan_sample_count(attachment_samples)),
+		           "sample count without attachments")) {
+			return false;
+		}
+	}
+	if (refuse(attachment_samples == 0 ||
+	               vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {},
+	           "sample count")) {
+		return false;
+	}
+
+	const auto& clip_control               = ctx.GetClipControl();
+	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
+	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
+	static_params.topology                 = topology;
+	static_params.primitive_restart_enable = primitive_restart_enable;
+	static_params.samples                  = attachment_samples;
+	static_params.sample_shading_enable =
+	    ps_active && attachment_samples > 1 && ps_input_info->ps_sample_shading;
+	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
+		if (fatal) {
+			EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
+		}
+		return false;
+	}
+	static_params.depth_bounds_test_enable = targets.depth_bounds_test_enable;
+	static_params.depth_min_bounds         = targets.depth_min_bounds;
+	static_params.depth_max_bounds         = targets.depth_max_bounds;
+	const bool rect_list = Prospero::IsRectList(user_config.GetPrimType());
+	static_params.cull_back  = !rect_list && mc.cull_back;
+	static_params.cull_front = !rect_list && mc.cull_front;
+	static_params.face       = mc.face;
+	static_params.provoking_vtx_last = mc.provoking_vtx_last;
+	static_params.polygon_mode =
+	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
+	NormalizePipelineKey(static_params, with_depth);
+
+	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
+		if (refuse(vs_input_info.buffers_num < 0 ||
+		               vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
+		               vs_input_info.resources_num < 0 ||
+		               vs_input_info.resources_num > ShaderVertexInputInfo::RES_MAX,
+		           "vertex input counts")) {
+			return false;
+		}
+		key.vertex_input.binding_count   = static_cast<uint8_t>(vs_input_info.buffers_num);
+		key.vertex_input.attribute_count = static_cast<uint8_t>(vs_input_info.resources_num);
+		uint32_t attributes_num          = 0;
+		for (int binding = 0; binding < vs_input_info.buffers_num; binding++) {
+			const auto& buffer = vs_input_info.buffers[binding];
+			if (refuse(buffer.attr_num < 0 || buffer.attr_num > ShaderVertexInputBuffer::ATTR_MAX,
+			           "vertex attribute count")) {
+				return false;
+			}
+			attributes_num += static_cast<uint32_t>(buffer.attr_num);
+			if (refuse(attributes_num > static_cast<uint32_t>(vs_input_info.resources_num),
+			           "vertex attributes")) {
+				return false;
+			}
+			key.vertex_input.bindings[binding] = {.stride   = buffer.stride,
+			                                      .instance = buffer.fetch_index != 0};
+			for (int attribute = 0; attribute < buffer.attr_num; attribute++) {
+				const auto index = buffer.attr_indices[attribute];
+				if (refuse(index < 0 || index >= vs_input_info.resources_num, "vertex attribute")) {
+					return false;
+				}
+				key.vertex_input.attributes[index] = {
+				    .offset  = buffer.attr_offsets[attribute],
+				    .binding = static_cast<uint8_t>(binding),
+				};
+			}
+		}
+		if (refuse(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num),
+		           "vertex attribute total")) {
+			return false;
+		}
+	}
+	return true;
+}
+
+PipelineCache::PlanLookup PipelineCache::FindGraphicsPipelineForPlan(
+    const PipelineTargets& targets, const HW::Context& ctx, const HW::UserConfig& user_config,
+    const ShaderVertexInputInfo& vs_input_info, const ShaderPixelInputInfo* ps_input_info,
+    vk::PrimitiveTopology topology, bool primitive_restart_enable, const GraphicsPrograms& programs,
+    const Pipeline*& pipeline, uint64_t& generation) {
+	pipeline = nullptr;
+	GraphicsPipelineKey key {};
+	if (!BuildGraphicsPipelineKey(targets, ctx, user_config, vs_input_info, ps_input_info, topology,
+	                              primitive_restart_enable, programs, false, key)) {
+		return PlanLookup::Unsupported;
+	}
+	// A per-thread memo of the keys this thread found. An entry keeps the generation its object
+	// was found under: while it is unchanged the map still holds that object for the key (objects
+	// are never freed, a replacement bumps the generation, and every cache instance counts its
+	// generations in a range of its own). It points at the map's own key: map nodes are never
+	// erased and their keys never change, so the key is read only while the generation proves the
+	// entry is this cache's.
+	struct Remembered {
+		const PipelineCache*       cache      = nullptr;
+		const GraphicsPipelineKey* key        = nullptr;
+		const Pipeline*            pipeline   = nullptr;
+		uint64_t                   generation = 0;
+		std::size_t                hash       = 0;
+	};
+	static thread_local std::array<Remembered, 1024> memo {};
+	const auto hash    = GraphicsPipelineKeyHash {}(key);
+	auto&      entry   = memo[hash % memo.size()];
+	const auto current = m_pipeline_generation.load(std::memory_order_acquire);
+	if (entry.cache == this && entry.generation == current && entry.hash == hash &&
+	    entry.key != nullptr && *entry.key == key) {
+		pipeline   = entry.pipeline;
+		generation = current;
+		return PlanLookup::Found;
+	}
+	// The lock is held briefly by lookups (the command processor's, other threads'), for tens of
+	// milliseconds by a creation: a short bounded retry covers the former only.
+	bool locked = m_mutex.TryLock();
+	for (uint32_t attempt = 0; !locked && attempt < 8; attempt++) {
+		for (uint32_t pause = 0; pause < 16; pause++) {
+#if defined(_M_X64) || defined(__x86_64__)
+			_mm_pause();
+#endif
+		}
+		locked = m_mutex.TryLock();
+	}
+	if (!locked) {
+		return PlanLookup::Busy;
+	}
+	const auto iter  = m_graphics_pipelines.find(key);
+	const auto found = iter != m_graphics_pipelines.end() ? iter->second.get() : nullptr;
+	const auto* found_key = iter != m_graphics_pipelines.end() ? &iter->first : nullptr;
+	// Read under the lock, so it matches the object found (replacements bump it under the lock).
+	const auto found_generation = m_pipeline_generation.load(std::memory_order_relaxed);
+	m_mutex.Unlock();
+	if (found == nullptr) {
+		return PlanLookup::Absent;
+	}
+	entry.cache      = this;
+	entry.key        = found_key;
+	entry.pipeline   = found;
+	entry.generation = found_generation;
+	entry.hash       = hash;
+	pipeline         = found;
+	generation       = found_generation;
+	return PlanLookup::Found;
+}
+
+void PipelineCache::NotePlannedPipeline(const RenderDepthInfo&      depth,
+                                        const ShaderPixelInputInfo* ps_input_info) {
+	NoteExecOnNoop(depth, ps_input_info);
+	FlushCompileStall();
+}
+
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
@@ -3236,132 +3520,34 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_IF(!vertex_program);
 	const bool ps_active = ps_input_info != nullptr;
 	EXIT_IF(ps_active && !pixel_program);
-	const auto color_count = static_cast<uint32_t>(colors.size());
 
 	// The key is built from the draw's registers and inputs only; m_mutex guards the map below.
-	auto& ctx = command.GetRegisters();
-
-	const HW::ModeControl& mc = ctx.GetModeControl();
+	PipelineTargets targets;
+	targets.color_count = static_cast<uint32_t>(colors.size());
+	for (uint32_t i = 0; i < targets.color_count; i++) {
+		EXIT_IF(colors[i].target_slot >= RENDER_COLOR_ATTACHMENTS_MAX);
+		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
+		targets.colors[i] = {.slot           = colors[i].target_slot,
+		                     .format         = colors[i].desc.view_info.format,
+		                     .samples        = colors[i].desc.info.samples,
+		                     .export_mapping = colors[i].export_mapping};
+	}
+	targets.with_depth =
+	    depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
+	targets.depth_format             = depth.desc.view_info.format;
+	targets.depth_samples            = depth.desc.info.samples;
+	targets.depth_bounds_test_enable = depth.depth_bounds_test_enable;
+	targets.depth_min_bounds         = depth.depth_min_bounds;
+	targets.depth_max_bounds         = depth.depth_max_bounds;
 
 	const auto vs_id = vertex_program.id;
 	const auto ps_id = ps_active ? pixel_program.id : 0;
 
 	GraphicsPipelineKey key {};
-	for (uint32_t i = 0; i < programs.vertex.size(); i++) {
-		key.vertex_shader_ids[i] = programs.vertex[i].id;
-	}
-	key.ps_shader_id            = ps_id;
-	auto& static_params         = key.static_params;
-	auto& rendering             = key.rendering;
-	rendering.color_count       = 0;
-	uint32_t attachment_samples = 0;
-	for (uint32_t i = 0; i < color_count; i++) {
-		const auto slot = colors[i].target_slot;
-		EXIT_IF(slot >= RENDER_COLOR_ATTACHMENTS_MAX);
-		rendering.color_count = std::max(rendering.color_count, slot + 1);
-		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
-		static_params.color_mask[slot] = colors[i].export_mapping.ApplyMask(
-		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
-		rendering.color_formats[slot] = colors[i].desc.view_info.format;
-		if (attachment_samples == 0) {
-			attachment_samples = colors[i].desc.info.samples;
-		} else if (attachment_samples != colors[i].desc.info.samples) {
-			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
-			     attachment_samples, colors[i].desc.info.samples);
-		}
-		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
-		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
-		static_params.color_srcblend[slot]       = bc.color_srcblend;
-		static_params.color_comb_fcn[slot]       = bc.color_comb_fcn;
-		static_params.color_destblend[slot]      = bc.color_destblend;
-		static_params.alpha_srcblend[slot]       = bc.alpha_srcblend;
-		static_params.alpha_comb_fcn[slot]       = bc.alpha_comb_fcn;
-		static_params.alpha_destblend[slot]      = bc.alpha_destblend;
-		static_params.separate_alpha_blend[slot] = bc.separate_alpha_blend;
-		static_params.blend_enable[slot]         = bc.enable && !rt.info.blend_bypass;
-	}
-	const bool with_depth =
-	    depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
-	if (with_depth) {
-		const auto aspects       = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
-		rendering.depth_format   = aspects & vk::ImageAspectFlagBits::eDepth
-		                               ? depth.desc.view_info.format
-		                               : vk::Format::eUndefined;
-		rendering.stencil_format = aspects & vk::ImageAspectFlagBits::eStencil
-		                               ? depth.desc.view_info.format
-		                               : vk::Format::eUndefined;
-		if (attachment_samples == 0) {
-			attachment_samples = depth.desc.info.samples;
-		} else if (attachment_samples != depth.desc.info.samples) {
-			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
-			     depth.desc.info.samples);
-		}
-	}
-	if (color_count == 0 && !with_depth) {
-		attachment_samples = render_sample_count(ctx.GetAaConfig().msaa_num_samples);
-		EXIT_IF(!static_cast<bool>(
-		    m_graphics.GetPhysicalDeviceProperties().limits.framebufferNoAttachmentsSampleCounts &
-		    vulkan_sample_count(attachment_samples)));
-	}
-	EXIT_IF(attachment_samples == 0 ||
-	        vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {});
-
-	if (ps_active && depth.depth_test_enable && ps_input_info->ps_execute_on_noop) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-			LOGF("Pipeline: temporary: accepting EXEC_ON_NOOP with depth test enabled\n");
-		}
-	}
-
-	const auto& clip_control               = ctx.GetClipControl();
-	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
-	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
-	static_params.topology                 = topology;
-	static_params.primitive_restart_enable = primitive_restart_enable;
-	static_params.samples                  = attachment_samples;
-	static_params.sample_shading_enable =
-	    ps_active && attachment_samples > 1 && ps_input_info->ps_sample_shading;
-	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
-		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
-	}
-	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
-	static_params.depth_min_bounds         = depth.depth_min_bounds;
-	static_params.depth_max_bounds         = depth.depth_max_bounds;
-	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
-	static_params.cull_back  = !rect_list && mc.cull_back;
-	static_params.cull_front = !rect_list && mc.cull_front;
-	static_params.face       = mc.face;
-	static_params.provoking_vtx_last = mc.provoking_vtx_last;
-	static_params.polygon_mode =
-	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
-	NormalizePipelineKey(static_params, with_depth);
-
-	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
-		EXIT_IF(vs_input_info.buffers_num < 0 ||
-		        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
-		        vs_input_info.resources_num < 0 ||
-		        vs_input_info.resources_num > ShaderVertexInputInfo::RES_MAX);
-		key.vertex_input.binding_count   = static_cast<uint8_t>(vs_input_info.buffers_num);
-		key.vertex_input.attribute_count = static_cast<uint8_t>(vs_input_info.resources_num);
-		uint32_t attributes_num          = 0;
-		for (int binding = 0; binding < vs_input_info.buffers_num; binding++) {
-			const auto& buffer = vs_input_info.buffers[binding];
-			EXIT_IF(buffer.attr_num < 0 || buffer.attr_num > ShaderVertexInputBuffer::ATTR_MAX);
-			attributes_num += static_cast<uint32_t>(buffer.attr_num);
-			EXIT_IF(attributes_num > static_cast<uint32_t>(vs_input_info.resources_num));
-			key.vertex_input.bindings[binding] = {.stride   = buffer.stride,
-			                                      .instance = buffer.fetch_index != 0};
-			for (int attribute = 0; attribute < buffer.attr_num; attribute++) {
-				const auto index = buffer.attr_indices[attribute];
-				EXIT_IF(index < 0 || index >= vs_input_info.resources_num);
-				key.vertex_input.attributes[index] = {
-				    .offset  = buffer.attr_offsets[attribute],
-				    .binding = static_cast<uint8_t>(binding),
-				};
-			}
-		}
-		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
-	}
+	(void)BuildGraphicsPipelineKey(targets, command.GetRegisters(), command.GetUserConfig(),
+	                               vs_input_info, ps_input_info, topology, primitive_restart_enable,
+	                               programs, true, key);
+	NoteExecOnNoop(depth, ps_input_info);
 
 	// Last-key memo (KYTY_PIPELINE_MEMO): most draws use their predecessor's pipeline. Exact:
 	// the comparison is the map's own key equality, and pipeline objects are never destroyed
@@ -3432,8 +3618,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 	{
 		Profiler::ScopedFrameWait pipeline_create(Profiler::FrameWait::GraphicsPipelineCreate);
-		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-		                       ps_input_info, programs, static_params, m_driver_cache,
+		CreatePipelineInternal(m_graphics, *cached, key.rendering, key.vertex_input, vertex_info,
+		                       ps_input_info, programs, key.static_params, m_driver_cache,
 		                       m_library != nullptr ? &library_hook : nullptr);
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);

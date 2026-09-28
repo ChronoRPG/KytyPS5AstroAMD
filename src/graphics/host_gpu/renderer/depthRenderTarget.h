@@ -11,6 +11,12 @@
 
 namespace Libs::Graphics {
 
+struct GraphicContext;
+
+namespace HW {
+class Context;
+} // namespace HW
+
 // Without a stencil plane, Hi-Stencil fields are inactive. An active plane is compatible when
 // Hi-Stencil is disabled or HTile backing is present.
 inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stencil, bool has_htile,
@@ -43,6 +49,22 @@ struct RenderDepthInfo {
 
 // Every field compared one by one (floats by their bits, padding excluded).
 [[nodiscard]] bool SameRenderDepthInfo(const RenderDepthInfo& a, const RenderDepthInfo& b);
+
+// Draw-prep binding plans (KYTY_DRAW_PREP_BINDINGS): what ResolveRenderDepthTarget gives a draw
+// with these registers, as far as the graphics pipeline key uses it, assuming the target's image
+// is found: whether there is a depth target, its view format and sample count, and the
+// depth-bounds state (RenderDepthInfo's defaults without a target). False where that resolution
+// would stop the emulator for a reason seen here. Any thread.
+struct DepthTargetPrediction {
+	bool       with_depth         = false;
+	vk::Format format             = vk::Format::eUndefined;
+	uint32_t   samples            = 0;
+	bool       bounds_test_enable = false;
+	float      min_bounds         = 0.0f;
+	float      max_bounds         = 0.0f;
+};
+[[nodiscard]] bool PredictRenderDepthTarget(const GraphicContext& graphics, const HW::Context& hw,
+                                            DepthTargetPrediction& prediction);
 
 inline vk::ImageAspectFlags DepthFeedbackAspects(vk::ImageAspectFlags draw_writes,
                                                  const ImageViewInfo& target,

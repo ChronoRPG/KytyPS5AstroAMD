@@ -191,6 +191,56 @@ public:
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                              const GraphicsPrograms& programs);
+
+	// Draw-prep binding plans (KYTY_DRAW_PREP_BINDINGS, drawPrep/bindingPlan.h). Everything the
+	// graphics pipeline key takes from a draw's resolved colour and depth targets: the key is a
+	// function of this, the draw's registers, its vertex and pixel interfaces, its programs, its
+	// topology and its primitive-restart flag.
+	struct PipelineTargets {
+		struct Color {
+			uint32_t                        slot    = 0;
+			vk::Format                      format  = vk::Format::eUndefined;
+			uint32_t                        samples = 0;
+			Prospero::ColorComponentMapping export_mapping {};
+		};
+		std::array<Color, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
+		uint32_t                                        color_count = 0;
+		// A depth attachment (a view format and an image), its view format and sample count.
+		bool       with_depth    = false;
+		vk::Format depth_format  = vk::Format::eUndefined;
+		uint32_t   depth_samples = 0;
+		// RenderDepthInfo's depth-bounds state (whether or not there is a depth attachment).
+		bool  depth_bounds_test_enable = false;
+		float depth_min_bounds         = 0.0f;
+		float depth_max_bounds         = 0.0f;
+	};
+	// Whether resolved targets are the ones `targets` describes (floats compared by their bits).
+	[[nodiscard]] static bool SamePipelineTargets(const PipelineTargets&           targets,
+	                                              std::span<const RenderColorInfo> colors,
+	                                              const RenderDepthInfo&           depth);
+	enum class PlanLookup : uint8_t {
+		Found,
+		Absent,      // no pipeline for the key yet (GetGraphicsPipeline creates it)
+		Busy,        // the map lock is held (a creation can hold it for tens of milliseconds)
+		Unsupported, // GetGraphicsPipeline would stop the emulator for these inputs
+	};
+	// On a draw-prep thread: the pipeline GetGraphicsPipeline returns for a draw with these inputs
+	// when it exists already, and the generation it was found under (PipelineGeneration). Never
+	// creates, waits for the map lock (it is only tried), logs or exits; a small per-thread memo
+	// answers repeated keys without the lock.
+	[[nodiscard]] PlanLookup FindGraphicsPipelineForPlan(
+	    const PipelineTargets& targets, const HW::Context& ctx, const HW::UserConfig& user_config,
+	    const ShaderVertexInputInfo& vs_input_info, const ShaderPixelInputInfo* ps_input_info,
+	    vk::PrimitiveTopology topology, bool primitive_restart_enable,
+	    const GraphicsPrograms& programs, const Pipeline*& pipeline, uint64_t& generation);
+	// Advanced whenever a cached pipeline object is replaced. Unchanged since a lookup: the
+	// lookup's object is still the one the map holds for its key.
+	[[nodiscard]] uint64_t PipelineGeneration() const noexcept {
+		return m_pipeline_generation.load(std::memory_order_acquire);
+	}
+	// The command processor taking a plan's pipeline in place of GetGraphicsPipeline: what that
+	// lookup does besides finding the object (the EXEC_ON_NOOP note, the compile-stall report).
+	void NotePlannedPipeline(const RenderDepthInfo& depth, const ShaderPixelInputInfo* ps_input_info);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
@@ -275,6 +325,16 @@ private:
 	// build), so that per-thread lookup memos do not keep returning the replaced object. Starts in
 	// a range of its own per cache instance, so memos never match another instance.
 	std::atomic<uint64_t> m_pipeline_generation {0};
+
+	// GetGraphicsPipeline's key. fatal: stop the emulator where the key's inputs are unsupported,
+	// as the serial lookup does, and note EXEC_ON_NOOP; otherwise return false for them, silently.
+	bool BuildGraphicsPipelineKey(const PipelineTargets& targets, const HW::Context& ctx,
+	                              const HW::UserConfig&        user_config,
+	                              const ShaderVertexInputInfo& vs_input_info,
+	                              const ShaderPixelInputInfo* ps_input_info,
+	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
+	                              const GraphicsPrograms& programs, bool fatal,
+	                              GraphicsPipelineKey& key) const;
 
 	void InitializeDriverCache();
 	// Serializes m_driver_cache and atomically replaces the cache file. Returns the payload size

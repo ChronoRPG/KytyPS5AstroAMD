@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
@@ -13402,13 +13403,16 @@ public:
   void CheckDrawPrepEngineDraw() {
     constexpr const char *name = "DrawPrepEngineDraw";
     constexpr uintptr_t base = 0x0000000206200000ull;
-    constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t allocation_size = 0x80000;
     constexpr uint64_t allocation_alignment = 0x10000;
     constexpr uint64_t vertex_offset = 0x1000;
     constexpr std::array<uint64_t, 2> pixel_offsets{0x2000, 0x3000};
     constexpr uint64_t user_data_offset = 0x4000;
     constexpr uint64_t pairs_offset = 0x5000;
     constexpr uint64_t target_offset = 0x20000;
+    // The second phase's D32 depth target (64 KB aligned) and its HTile (32 KB aligned).
+    constexpr uint64_t depth_offset = 0x40000;
+    constexpr uint64_t htile_offset = 0x60000;
     constexpr uint32_t extent = 32;
     // (0.25, 0, 0, 0.5) and (0, 0.5, 0, 0.5), blended with ONE/ONE over a zero clear.
     constexpr std::array<std::array<u32, 4>, 2> colors{{
@@ -13581,6 +13585,43 @@ public:
       const auto serial = read();
       check("serial draws", serial);
 
+      // KYTY_DRAW_PREP_BINDINGS (bindingPlan.h): with plans on, verify mode compared every item
+      // the draws used without a difference, and in inline mode each committed draw had a plan
+      // (computed on this thread) and took its pipeline from it: the serial draws created both.
+      struct BindingCounts {
+        uint64_t plans = 0, used = 0, pipelines = 0, mismatches = 0;
+      };
+      const auto binding_counts = [] {
+        const auto &binding = DrawPrep::GetBindingTotals();
+        return BindingCounts{binding.plans.load(), binding.used.load(),
+                             binding.pipelines_used.load(), binding.verify_mismatches.load()};
+      };
+      const auto check_bindings = [&](const char *stage, const BindingCounts &before) {
+        const auto parts = DrawPrep::BindingParts();
+        if (parts == 0 || DrawPrep::GetMode() == DrawPrep::Mode::Off) {
+          return;
+        }
+        const auto after = binding_counts();
+        const auto *code_cert = std::getenv("KYTY_DRAW_PREP_CODE_CERT");
+        const uint64_t commits =
+            code_cert == nullptr || std::strcmp(code_cert, "0") != 0 ? 2u : 0u;
+        const bool pipelines =
+            DrawPrep::BindingPartEnabled(parts, DrawPrep::BindingPart::Pipeline);
+        const bool inline_mode = DrawPrep::GetMode() == DrawPrep::Mode::Inline;
+        Require(name, stage,
+                after.mismatches == before.mismatches &&
+                    (!inline_mode ||
+                     (after.plans - before.plans == commits &&
+                      after.used - before.used == commits &&
+                      (!pipelines || after.pipelines - before.pipelines == commits))),
+                "plans " + std::to_string(after.plans - before.plans) + ", used " +
+                    std::to_string(after.used - before.used) + ", pipelines " +
+                    std::to_string(after.pipelines - before.pipelines) + ", mismatches " +
+                    std::to_string(after.mismatches - before.mismatches) + "; expected " +
+                    std::to_string(commits) + " of each in inline mode and no mismatch");
+      };
+      const auto bindings_before = binding_counts();
+
       // The same draws as a command stream (the programs are published now).
       clear();
       shaders.SetPsShaderBase(pixel_addresses[0]);
@@ -13602,6 +13643,8 @@ public:
       check("draws through the command processor", processed);
       Require(name, "serial and command-processor pixels", processed == serial,
               "the command processor's draws differ from the serial draws");
+      check_bindings("binding plans", bindings_before);
+
 
       const auto mode = DrawPrep::GetMode();
       if (mode != DrawPrep::Mode::Off) {
@@ -13628,6 +13671,57 @@ public:
                     std::to_string(window_drains));
       }
       RenderExecutorTestAccess::ResetBindings(executor);
+
+      // The same draws with a D32 depth target, tested (ALWAYS) but not written: a binding plan
+      // predicts the depth attachment of its pipeline key from the registers, and the commit
+      // compares the prediction with the resolved target.
+      {
+        HW::DepthRenderTarget depth_target{};
+        depth_target.z_info = HW::DepthZInfo::Decode(0x22900983u);
+        depth_target.stencil_info = HW::DepthStencilInfo::Decode(0x00100980u);
+        depth_target.z_read_base_addr = base + depth_offset;
+        depth_target.z_write_base_addr = base + depth_offset;
+        depth_target.htile_data_base_addr = base + htile_offset;
+        depth_target.size = {extent - 1, extent - 1, true};
+        registers.SetDepthRenderTarget(depth_target);
+        HW::DepthControl depth_control{};
+        depth_control.z_enable = true;
+        depth_control.zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways);
+        registers.SetDepthControl(depth_control);
+        clear();
+        shaders.SetPsShaderBase(pixel_addresses[0]);
+        RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                           {.vertex_count = 3, .instance_count = 1});
+        {
+          Pm4Execution execution;
+          Require(name, "serial register load with depth",
+                  processor.Process(execution, load_pixel_shader) == Pm4ProcessResult::Complete,
+                  "SET_SH_REG_INDIRECT did not load the second pixel shader");
+        }
+        RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                           {.vertex_count = 3, .instance_count = 1});
+        const auto depth_serial = read();
+        check("serial draws with depth", depth_serial);
+        clear();
+        shaders.SetPsShaderBase(pixel_addresses[0]);
+        const auto depth_bindings_before = binding_counts();
+        {
+          Pm4Execution execution;
+          Require(name, "command stream with depth",
+                  processor.Process(execution, stream) == Pm4ProcessResult::Complete,
+                  "the draw stream with depth did not complete");
+        }
+        const auto depth_processed = read();
+        check("draws with depth through the command processor", depth_processed);
+        Require(name, "serial and command-processor pixels with depth",
+                depth_processed == depth_serial,
+                "the command processor's draws with depth differ from the serial draws");
+        check_bindings("binding plans with depth", depth_bindings_before);
+        registers.SetDepthControl({});
+        registers.SetDepthRenderTarget({});
+        shaders.SetPsShaderBase(pixel_addresses[0]);
+      }
+      RenderExecutorTestAccess::ResetBindings(executor);
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     });
@@ -13643,7 +13737,20 @@ public:
     const char *mode_name = DrawPrep::GetMode() == DrawPrep::Mode::Parallel ? "parallel"
                             : DrawPrep::GetMode() == DrawPrep::Mode::Inline ? "inline"
                                                                             : "off";
-    std::printf("[gpu]     %-32s ok (draw-prep %s)\n", name, mode_name);
+    if (DrawPrep::BindingParts() != 0) {
+      const auto &binding = DrawPrep::GetBindingTotals();
+      std::printf("[gpu]     %-32s ok (draw-prep %s; binding plans %llu, used %llu, pipelines "
+                  "%llu, left %llu, busy %llu, refused %llu, verify checks %llu)\n",
+                  name, mode_name, static_cast<unsigned long long>(binding.plans.load()),
+                  static_cast<unsigned long long>(binding.used.load()),
+                  static_cast<unsigned long long>(binding.pipelines_used.load()),
+                  static_cast<unsigned long long>(binding.pipeline_abstains.load()),
+                  static_cast<unsigned long long>(binding.pipeline_busy.load()),
+                  static_cast<unsigned long long>(binding.pipeline_fallbacks.load()),
+                  static_cast<unsigned long long>(binding.verify_checks.load()));
+    } else {
+      std::printf("[gpu]     %-32s ok (draw-prep %s)\n", name, mode_name);
+    }
   }
 
   // KYTY_EOP_TIMESTAMPS: end-of-pipe clock writes (RELEASE_MEM, data select 3).
