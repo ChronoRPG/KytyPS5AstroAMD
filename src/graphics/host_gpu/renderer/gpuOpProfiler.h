@@ -42,6 +42,13 @@
 //   KYTY_GPU_OP_PROFILE_MAX=<n>        stop after n captures (default 0 = unlimited)
 //   KYTY_GPU_OP_PROFILE_QUERIES=<n>    timestamp query capacity per capture (default 262144)
 //   KYTY_GPU_OP_PROFILE_DIR=<dir>      output directory when the hang trace is off
+//   KYTY_GPU_OP_PROFILE_STAMPS=ops|passes|alternate
+//                                      ops (default): a stamp after every op (serializes the
+//                                      GPU: a Sky Garden frame inflates about 5x). passes: stamps
+//                                      only around render passes, between guest dispatches and
+//                                      other work outside passes, and at command-buffer ends;
+//                                      draws and dispatch runs keep their overlap. alternate:
+//                                      every second capture uses passes.
 //   KYTY_GPU_OP_COUNTERS=1/0           force the cheap counters on/off. Unset, they follow
 //                                      KYTY_GPU_OP_PROFILE, KYTY_HANG_TRACE=1 or Profiler
 //                                      aggregate diagnostics. Counters: guest render-pass

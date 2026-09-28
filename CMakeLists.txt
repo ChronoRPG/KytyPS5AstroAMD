@@ -785,6 +785,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
 	set_tests_properties(command_scheduler_ready_ops_wait PROPERTIES
 		ENVIRONMENT "KYTY_PENDING_OPS_NOWAIT=0")
+	# KYTY_GPU_OP_PROFILE_STAMPS: a per-op capture and a pass-stamp capture of the same work.
+	add_test(NAME gpu_op_profiler_stamps
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-op-profile-only)
 	add_test(NAME command_scheduler_priority_spin
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
 	set_tests_properties(command_scheduler_priority_spin PROPERTIES

@@ -65,12 +65,21 @@ using Detail::t_site;
 // ------------------------------------------------------------------------------------------------
 // Configuration
 
+// KYTY_GPU_OP_PROFILE_STAMPS: where a capture writes its timestamps.
+//   ops (default): after every hooked operation (the GPU runs serialized; totals inflate).
+//   passes: only around render passes (before the begin, after the end), at each change between
+//     guest dispatches and emulator work outside passes, and before the command buffer ends. Draws
+//     and consecutive guest dispatches keep their overlap.
+//   alternate: even captures ops, odd captures passes.
+enum class StampMode : uint8_t { Ops, Passes, Alternate };
+
 struct Config {
-	bool     counters     = false; // publish per-flip counters
-	bool     capture      = false; // sampled timestamp captures
-	double   period_s     = 0.0;
-	uint64_t max_captures = 0;
-	uint32_t queries      = 262144;
+	bool      counters     = false; // publish per-flip counters
+	bool      capture      = false; // sampled timestamp captures
+	double    period_s     = 0.0;
+	uint64_t  max_captures = 0;
+	uint32_t  queries      = 262144;
+	StampMode stamps       = StampMode::Ops;
 };
 
 bool EnvSet(const char* name) {
@@ -96,6 +105,13 @@ const Config& GetConfig() {
 			if (queries != 0) {
 				c.queries = static_cast<uint32_t>(
 				    std::clamp<unsigned long long>(queries, 4096ull, 1ull << 22u));
+			}
+		}
+		if (const auto* value = std::getenv("KYTY_GPU_OP_PROFILE_STAMPS"); value != nullptr) {
+			if (std::strcmp(value, "passes") == 0) {
+				c.stamps = StampMode::Passes;
+			} else if (std::strcmp(value, "alternate") == 0) {
+				c.stamps = StampMode::Alternate;
 			}
 		}
 		if (EnvSet("KYTY_GPU_OP_COUNTERS")) {
@@ -125,6 +141,9 @@ uint64_t HandleBits(Handle handle) noexcept {
 
 std::atomic<Site*> g_sites {nullptr};
 constinit Site     g_unknown_site {"?"};
+// KYTY_GPU_OP_PROFILE_STAMPS=passes: the site of a segment stamp names the work it closes.
+constinit Site g_segment_compute {"segment.compute"};
+constinit Site g_segment_emulator {"segment.emulator"};
 
 } // namespace
 
@@ -224,6 +243,7 @@ struct RealFunctions {
 	PFN_vkCmdBeginQuery                    vkCmdBeginQuery                    = nullptr;
 	PFN_vkCmdEndQuery                      vkCmdEndQuery                      = nullptr;
 	PFN_vkCmdCopyQueryPoolResults          vkCmdCopyQueryPoolResults          = nullptr;
+	PFN_vkEndCommandBuffer                 vkEndCommandBuffer                 = nullptr;
 	PFN_vkQueueSubmit                      vkQueueSubmit                      = nullptr;
 	PFN_vkQueueSubmit2                     vkQueueSubmit2                     = nullptr;
 	PFN_vkCreateImageView                  vkCreateImageView                  = nullptr;
@@ -269,6 +289,7 @@ enum class OpKind : uint8_t {
 	BeginQuery,
 	EndQuery,
 	CopyQueryResults,
+	Segment, // KYTY_GPU_OP_PROFILE_STAMPS=passes: closes a stretch of work outside render passes
 	Count,
 };
 
@@ -307,6 +328,7 @@ constexpr std::array<KindInfo, static_cast<size_t>(OpKind::Count)> kKinds {{
     {"begin_query", "query"},
     {"end_query", "query"},
     {"copy_query_results", "query"},
+    {"segment", "segment"},
 }};
 
 constexpr uint32_t kNone = std::numeric_limits<uint32_t>::max();
@@ -367,6 +389,7 @@ struct CaptureData {
 	uint64_t                overflow   = 0;
 	bool                    truncated  = false;
 	bool                    read_error = false;
+	bool                    pass_stamps = false; // KYTY_GPU_OP_PROFILE_STAMPS=passes
 	double                  period_ns  = 1.0;
 	uint32_t                valid_bits = 64;
 	uint64_t                submit_calls   = 0;
@@ -414,6 +437,9 @@ VkFormat ViewFormat(VkImageView view) {
 
 enum class Phase : uint8_t { Idle, Active, Pending };
 
+// The stretch of work outside render passes since the last stamp (pass stamps).
+enum class SegmentClass : uint8_t { None, Compute, Emulator };
+
 struct State {
 	std::mutex                   mutex;
 	Phase                        phase      = Phase::Idle;
@@ -428,6 +454,7 @@ struct State {
 	uint32_t                     current_cb   = 0;
 	uint32_t                     current_pass = kNone;
 	uint32_t                     views        = 1;
+	SegmentClass                 segment      = SegmentClass::None;
 	std::array<uint64_t, 2>      bound {}; // graphics, compute
 	// Query pool, created on the first capture.
 	vk::Device    device     = nullptr;
@@ -484,8 +511,42 @@ void Record(VkCommandBuffer cb, OpKind kind, uintptr_t caller, Fill&& fill) {
 		op.pipeline = s.bound[1];
 	}
 	fill(op, s);
+	// Pass stamps: after a render pass ends; everything else is stamped by SegmentBoundary.
+	op.query = !data->pass_stamps || kind == OpKind::EndRendering ? AllocateStamp(cb) : kNone;
+	data->ops.push_back(op);
+}
+
+// Pass stamps, before an op outside a render pass: when it starts a different kind of work than
+// the stretch since the last stamp, a stamp closes that stretch. `close`: before a render pass
+// begins and before the command buffer ends, whatever follows.
+void SegmentBoundary(VkCommandBuffer cb, SegmentClass next, bool close = false) {
+	auto&           s = g_state;
+	std::lock_guard lock(s.mutex);
+	auto*           data = s.data.get();
+	if (data == nullptr || !data->pass_stamps || !IsCapture(cb) || s.current_pass != kNone) {
+		return;
+	}
+	if (s.segment == SegmentClass::None || (!close && s.segment == next)) {
+		s.segment = close ? SegmentClass::None : next;
+		return;
+	}
+	OpRecord op;
+	op.kind  = OpKind::Segment;
+	op.cb    = s.current_cb;
+	op.site  = s.segment == SegmentClass::Compute ? &g_segment_compute : &g_segment_emulator;
+	op.scope = op.site;
 	op.query = AllocateStamp(cb);
 	data->ops.push_back(op);
+	s.segment = close ? SegmentClass::None : next;
+}
+
+// A guest dispatch (renderCompute's "dispatch" sites) or emulator work.
+SegmentClass DispatchClass() noexcept {
+	const auto* site = t_site;
+	return site != nullptr && (std::strcmp(site->name, "dispatch") == 0 ||
+	                           std::strcmp(site->name, "dispatch.indirect") == 0)
+	           ? SegmentClass::Compute
+	           : SegmentClass::Emulator;
 }
 
 void Record(VkCommandBuffer cb, OpKind kind, uintptr_t caller) {
@@ -566,6 +627,14 @@ ATTRIBUTION CAVEAT
   cb_begin rows carry the gap since the previous captured command buffer's last stamp (idle,
   presenter work, CPU starvation); it is excluded from op totals.
 
+PASS STAMPS (KYTY_GPU_OP_PROFILE_STAMPS=passes, or alternate: every second capture)
+  Stamps only before each render pass begins, after it ends, at each change between guest
+  dispatches and other work outside passes ("segment" rows: site segment.compute or
+  segment.emulator names the work they close), and before the command buffer ends. Draws and
+  consecutive guest dispatches keep their overlap, so totals stay close to gpu_busy_us. Other
+  rows have an empty delta_ns: they are timed together by the next stamped row of their command
+  buffer (end_rendering: the whole pass from its begin). totals: pass_stamps=1, unstamped_ops.
+
 gpuops-<flip>.csv (one row per op; <flip> = guest flip counter at capture start)
   seq                 recording order within the capture
   cb, tick            capture-local command buffer index and its scheduler tick
@@ -596,8 +665,9 @@ gpuops-summary.csv (appended per capture; long format)
   (top 50, ops recorded inside passes on that target), caller (top 50), barrier_site (count =
   barrier calls, extra = layout transitions), render_pass_site (count = begins, gpu_ns = begin
   deltas), end_rendering_site (who ended passes).
-  totals keys: ops, stamped_ops, unavailable_stamps, overflow_ops, command_buffers,
-  vk_queue_submit_calls, vk_submit_batches, vk_submitted_cbs, render_pass_begins, barriers,
+  totals keys: ops, stamped_ops, unavailable_stamps, pass_stamps, unstamped_ops, overflow_ops,
+  command_buffers, vk_queue_submit_calls, vk_submit_batches, vk_submitted_cbs, render_pass_begins,
+  barriers,
   layout_transitions, draws, dispatches, op_gpu_ns, cb_span_gpu_ns, cb_gap_gpu_ns,
   first_to_last_gpu_ns, queries_used, query_capacity, capture_cpu_ns, truncated.
   vk_queue_submit_* count every vkQueueSubmit on the device during the capture window
@@ -791,7 +861,7 @@ void Writer::Write(CaptureData& capture) {
 
 	AggregateMap by_kind, by_category, by_site, by_scope, by_scope_site, by_pipeline, by_target,
 	    by_caller, barrier_sites, pass_sites, end_sites;
-	uint64_t stamped = 0, unavailable = 0, draws = 0, dispatches = 0, barriers = 0;
+	uint64_t stamped = 0, unavailable = 0, unstamped = 0, draws = 0, dispatches = 0, barriers = 0;
 	uint64_t transitions = 0, pass_begins = 0, op_ns = 0, span_ns = 0, gap_ns = 0;
 	bool     have_first = false, have_last = false;
 	uint64_t first_stamp = 0, last_stamp = 0;
@@ -870,6 +940,8 @@ void Writer::Write(CaptureData& capture) {
 			have_last  = true;
 			last_stamp = value;
 			op_ns += delta;
+		} else if (op.query == kNone && capture.pass_stamps) {
+			++unstamped; // pass stamps: timed by the next stamp of its command buffer
 		} else {
 			++unavailable;
 		}
@@ -1027,6 +1099,8 @@ void Writer::Write(CaptureData& capture) {
 	totals("ops", capture.ops.size());
 	totals("stamped_ops", stamped);
 	totals("unavailable_stamps", unavailable);
+	totals("pass_stamps", capture.pass_stamps ? 1 : 0);
+	totals("unstamped_ops", unstamped);
 	totals("overflow_ops", capture.overflow);
 	totals("command_buffers", capture.cbs.size());
 	totals("vk_queue_submit_calls", capture.submit_calls);
@@ -1221,6 +1295,9 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDrawMeshTasksIndirectCountEXT(
 
 VKAPI_ATTR void VKAPI_CALL HookCmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y,
                                            uint32_t z) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, DispatchClass());
+	}
 	g_real.vkCmdDispatch(cb, x, y, z);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::Dispatch, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
@@ -1233,6 +1310,9 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDispatch(VkCommandBuffer cb, uint32_t x, uint3
 
 VKAPI_ATTR void VKAPI_CALL HookCmdDispatchIndirect(VkCommandBuffer cb, VkBuffer buffer,
                                                    VkDeviceSize offset) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, DispatchClass());
+	}
 	g_real.vkCmdDispatchIndirect(cb, buffer, offset);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::DispatchIndirect, KYTY_GPU_OP_CALLER);
@@ -1241,6 +1321,9 @@ VKAPI_ATTR void VKAPI_CALL HookCmdDispatchIndirect(VkCommandBuffer cb, VkBuffer 
 
 VKAPI_ATTR void VKAPI_CALL HookCmdCopyBuffer(VkCommandBuffer cb, VkBuffer src, VkBuffer dst,
                                              uint32_t count, const VkBufferCopy* regions) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::Emulator);
+	}
 	g_real.vkCmdCopyBuffer(cb, src, dst, count, regions);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::CopyBuffer, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
@@ -1260,6 +1343,9 @@ uint64_t Texels(const VkExtent3D& extent, uint32_t layers) {
 VKAPI_ATTR void VKAPI_CALL HookCmdCopyImage(VkCommandBuffer cb, VkImage src, VkImageLayout src_layout,
                                             VkImage dst, VkImageLayout dst_layout, uint32_t count,
                                             const VkImageCopy* regions) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::Emulator);
+	}
 	g_real.vkCmdCopyImage(cb, src, src_layout, dst, dst_layout, count, regions);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::CopyImage, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
@@ -1274,6 +1360,9 @@ VKAPI_ATTR void VKAPI_CALL HookCmdCopyImage(VkCommandBuffer cb, VkImage src, VkI
 VKAPI_ATTR void VKAPI_CALL HookCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst,
                                                     VkImageLayout layout, uint32_t count,
                                                     const VkBufferImageCopy* regions) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::Emulator);
+	}
 	g_real.vkCmdCopyBufferToImage(cb, src, dst, layout, count, regions);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::CopyBufferToImage, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
@@ -1289,6 +1378,9 @@ VKAPI_ATTR void VKAPI_CALL HookCmdCopyImageToBuffer(VkCommandBuffer cb, VkImage 
                                                     VkImageLayout layout, VkBuffer dst,
                                                     uint32_t count,
                                                     const VkBufferImageCopy* regions) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::Emulator);
+	}
 	g_real.vkCmdCopyImageToBuffer(cb, src, layout, dst, count, regions);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::CopyImageToBuffer, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
@@ -1303,6 +1395,9 @@ VKAPI_ATTR void VKAPI_CALL HookCmdCopyImageToBuffer(VkCommandBuffer cb, VkImage 
 VKAPI_ATTR void VKAPI_CALL HookCmdBlitImage(VkCommandBuffer cb, VkImage src, VkImageLayout src_layout,
                                             VkImage dst, VkImageLayout dst_layout, uint32_t count,
                                             const VkImageBlit* regions, VkFilter filter) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::Emulator);
+	}
 	g_real.vkCmdBlitImage(cb, src, src_layout, dst, dst_layout, count, regions, filter);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::BlitImage, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
@@ -1323,6 +1418,9 @@ VKAPI_ATTR void VKAPI_CALL HookCmdResolveImage(VkCommandBuffer cb, VkImage src,
                                                VkImageLayout src_layout, VkImage dst,
                                                VkImageLayout dst_layout, uint32_t count,
                                                const VkImageResolve* regions) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::Emulator);
+	}
 	g_real.vkCmdResolveImage(cb, src, src_layout, dst, dst_layout, count, regions);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::ResolveImage, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
@@ -1338,6 +1436,9 @@ VKAPI_ATTR void VKAPI_CALL HookCmdClearColorImage(VkCommandBuffer cb, VkImage im
                                                   VkImageLayout layout,
                                                   const VkClearColorValue* color, uint32_t count,
                                                   const VkImageSubresourceRange* ranges) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::Emulator);
+	}
 	g_real.vkCmdClearColorImage(cb, image, layout, color, count, ranges);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::ClearColorImage, KYTY_GPU_OP_CALLER,
@@ -1348,6 +1449,9 @@ VKAPI_ATTR void VKAPI_CALL HookCmdClearColorImage(VkCommandBuffer cb, VkImage im
 VKAPI_ATTR void VKAPI_CALL HookCmdClearDepthStencilImage(
     VkCommandBuffer cb, VkImage image, VkImageLayout layout, const VkClearDepthStencilValue* value,
     uint32_t count, const VkImageSubresourceRange* ranges) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::Emulator);
+	}
 	g_real.vkCmdClearDepthStencilImage(cb, image, layout, value, count, ranges);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::ClearDepthStencilImage, KYTY_GPU_OP_CALLER,
@@ -1375,6 +1479,9 @@ VKAPI_ATTR void VKAPI_CALL HookCmdClearAttachments(VkCommandBuffer cb, uint32_t 
 VKAPI_ATTR void VKAPI_CALL HookCmdFillBuffer(VkCommandBuffer cb, VkBuffer buffer,
                                              VkDeviceSize offset, VkDeviceSize size,
                                              uint32_t data) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::Emulator);
+	}
 	g_real.vkCmdFillBuffer(cb, buffer, offset, size, data);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::FillBuffer, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
@@ -1387,6 +1494,9 @@ VKAPI_ATTR void VKAPI_CALL HookCmdFillBuffer(VkCommandBuffer cb, VkBuffer buffer
 VKAPI_ATTR void VKAPI_CALL HookCmdUpdateBuffer(VkCommandBuffer cb, VkBuffer buffer,
                                                VkDeviceSize offset, VkDeviceSize size,
                                                const void* data) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::Emulator);
+	}
 	g_real.vkCmdUpdateBuffer(cb, buffer, offset, size, data);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::UpdateBuffer, KYTY_GPU_OP_CALLER, [&](OpRecord& op, State&) {
@@ -1401,6 +1511,9 @@ VKAPI_ATTR void VKAPI_CALL HookCmdPipelineBarrier(
     VkDependencyFlags flags, uint32_t memory_count, const VkMemoryBarrier* memory,
     uint32_t buffer_count, const VkBufferMemoryBarrier* buffers, uint32_t image_count,
     const VkImageMemoryBarrier* images) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::Emulator);
+	}
 	g_real.vkCmdPipelineBarrier(cb, src_stages, dst_stages, flags, memory_count, memory,
 	                            buffer_count, buffers, image_count, images);
 	if (!IsGuest(cb)) {
@@ -1425,6 +1538,9 @@ VKAPI_ATTR void VKAPI_CALL HookCmdPipelineBarrier(
 
 VKAPI_ATTR void VKAPI_CALL HookCmdPipelineBarrier2(VkCommandBuffer         cb,
                                                    const VkDependencyInfo* dependency) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::Emulator);
+	}
 	g_real.vkCmdPipelineBarrier2(cb, dependency);
 	if (!IsGuest(cb) || dependency == nullptr) {
 		return;
@@ -1458,6 +1574,9 @@ VKAPI_ATTR void VKAPI_CALL HookCmdPipelineBarrier2(VkCommandBuffer         cb,
 }
 
 VKAPI_ATTR void VKAPI_CALL HookCmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* info) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::None, true);
+	}
 	g_real.vkCmdBeginRendering(cb, info);
 	if (!IsGuest(cb) || info == nullptr) {
 		return;
@@ -1508,12 +1627,16 @@ VKAPI_ATTR void VKAPI_CALL HookCmdEndRendering(VkCommandBuffer cb) {
 		Record(cb, OpKind::EndRendering, KYTY_GPU_OP_CALLER, [&](OpRecord&, State& s) {
 			s.current_pass = kNone;
 			s.views        = 1;
+			s.segment      = SegmentClass::None; // this stamp closes the pass
 		});
 	}
 }
 
 VKAPI_ATTR void VKAPI_CALL HookCmdBeginQuery(VkCommandBuffer cb, VkQueryPool pool, uint32_t query,
                                              VkQueryControlFlags flags) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::Emulator);
+	}
 	g_real.vkCmdBeginQuery(cb, pool, query, flags);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::BeginQuery, KYTY_GPU_OP_CALLER);
@@ -1521,6 +1644,9 @@ VKAPI_ATTR void VKAPI_CALL HookCmdBeginQuery(VkCommandBuffer cb, VkQueryPool poo
 }
 
 VKAPI_ATTR void VKAPI_CALL HookCmdEndQuery(VkCommandBuffer cb, VkQueryPool pool, uint32_t query) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::Emulator);
+	}
 	g_real.vkCmdEndQuery(cb, pool, query);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::EndQuery, KYTY_GPU_OP_CALLER);
@@ -1532,11 +1658,21 @@ VKAPI_ATTR void VKAPI_CALL HookCmdCopyQueryPoolResults(VkCommandBuffer cb, VkQue
                                                        VkBuffer buffer, VkDeviceSize offset,
                                                        VkDeviceSize stride,
                                                        VkQueryResultFlags flags) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::Emulator);
+	}
 	g_real.vkCmdCopyQueryPoolResults(cb, pool, first, count, buffer, offset, stride, flags);
 	if (IsCapture(cb)) [[unlikely]] {
 		Record(cb, OpKind::CopyQueryResults, KYTY_GPU_OP_CALLER,
 		       [&](OpRecord& op, State&) { op.regions = count; });
 	}
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL HookEndCommandBuffer(VkCommandBuffer cb) {
+	if (IsCapture(cb)) [[unlikely]] {
+		SegmentBoundary(cb, SegmentClass::None, true);
+	}
+	return g_real.vkEndCommandBuffer(cb);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL HookQueueSubmit(VkQueue queue, uint32_t count,
@@ -1642,6 +1778,7 @@ void BeginCapturedBuffer(VkCommandBuffer cb, uint64_t tick) {
 	s.current_pass   = kNone;
 	s.views          = 1;
 	s.bound          = {};
+	s.segment        = SegmentClass::None;
 	CbRecord record;
 	record.tick  = tick;
 	record.query = AllocateStamp(cb);
@@ -1655,6 +1792,9 @@ void StartCapture(VkCommandBuffer cb, uint64_t tick, uint64_t flip) {
 	auto            data = std::make_unique<CaptureData>();
 	data->index      = s.captures;
 	data->flip       = flip;
+	const auto stamps = GetConfig().stamps;
+	data->pass_stamps =
+	    stamps == StampMode::Passes || (stamps == StampMode::Alternate && (s.captures & 1u) != 0);
 	data->start_ns   = NowNs();
 	data->capacity   = s.capacity;
 	data->period_ns  = s.period_ns;
@@ -1821,6 +1961,7 @@ void InstallHooks(GraphicContext& /*graphics*/) {
 		KYTY_GPU_OP_HOOK(vkCmdBeginQuery, &HookCmdBeginQuery);
 		KYTY_GPU_OP_HOOK(vkCmdEndQuery, &HookCmdEndQuery);
 		KYTY_GPU_OP_HOOK(vkCmdCopyQueryPoolResults, &HookCmdCopyQueryPoolResults);
+		KYTY_GPU_OP_HOOK(vkEndCommandBuffer, &HookEndCommandBuffer);
 		KYTY_GPU_OP_HOOK(vkQueueSubmit, &HookQueueSubmit);
 		KYTY_GPU_OP_HOOK(vkQueueSubmit2, &HookQueueSubmit2);
 		KYTY_GPU_OP_HOOK(vkCreateImageView, &HookCreateImageView);
