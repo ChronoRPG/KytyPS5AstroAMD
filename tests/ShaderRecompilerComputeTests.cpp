@@ -250,6 +250,12 @@ struct BufferCacheTestAccess {
   static BufferCache::WrittenSyncTotals WrittenSyncTotals(const BufferCache &cache) {
     return cache.m_written_sync_totals;
   }
+  // KYTY_FALSE_SHARING_WRITES.
+  static bool FalseSharing(const BufferCache &cache) { return cache.m_false_sharing; }
+  static int FalseSharingVerify(const BufferCache &cache) { return cache.m_false_sharing_verify; }
+  static const BufferCache::FalseSharingTotals &FalseSharingTotals(const BufferCache &cache) {
+    return cache.m_false_sharing_totals;
+  }
 };
 
 // Sets (or with nullptr removes) an environment switch read when a cache is constructed.
@@ -6117,6 +6123,201 @@ public:
     std::printf("[host]    %-32s ok (skip %s, verify %s)\n", name,
                 BufferCacheTestAccess::WrittenSyncSkip(context.GetBufferCache()) ? "on" : "off",
                 BufferCacheTestAccess::WrittenSyncSkipVerify(context.GetBufferCache()) != 0
+                    ? "on"
+                    : "off");
+  }
+
+  // KYTY_FALSE_SHARING_WRITES (BufferCache::TryFalseSharingWrite): one tracker page holds the tail
+  // of a GPU-written binding and bytes the CPU writes (the GI G-buffer and the per-frame block
+  // after it). A CPU write there releases the page without draining the GPU when the switch is
+  // on; either way the buffer keeps the GPU's bytes, guest memory receives them, and the CPU's
+  // bytes reach the buffer. A CPU write to the GPU's bytes before their publication is the case
+  // the release gets wrong: the publication overwrites it (the verify mode counts it).
+  void CheckFalseSharingWrites() {
+    constexpr const char *name = "FalseSharingWrites";
+    constexpr uintptr_t base = 0x0000000208800000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t gpu_offset = 0x20000; // the GPU-written binding [0x20000, 0x21b20)
+    constexpr uint64_t gpu_size = 0x1b20;
+    constexpr uint64_t shared_page = 0x21000; // its last page, shared with CPU bytes
+    constexpr uint64_t cpu_offset = 0x21c00;  // CPU-written bytes on that page
+    constexpr uint64_t span = 0x2000;         // [0x20000, 0x22000): both pages
+    static_assert(gpu_offset + gpu_size > shared_page && gpu_offset + gpu_size < cpu_offset);
+
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "false-sharing direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "false-sharing fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    for (uint64_t index = 0; index < allocation_size; index++) {
+      memory[index] = static_cast<uint8_t>((index * 23 + index / 4096) & 0xffu);
+    }
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const bool on = BufferCacheTestAccess::FalseSharing(cache);
+      const int verify = BufferCacheTestAccess::FalseSharingVerify(cache);
+      const auto &totals = BufferCacheTestAccess::FalseSharingTotals(cache);
+      const auto current_tick = [&] {
+        return OnGpuThread(context, [&] { return scheduler.CurrentTick(); });
+      };
+      // The GPU writes the whole binding: a writable binding of it, then a fill.
+      const auto gpu_write = [&](uint32_t value) {
+        OnGpuThread(context, [&] {
+          const auto [buffer, offset] =
+              cache.ObtainBuffer(base + gpu_offset, gpu_size, true, false);
+          scheduler.Current().Handle().fillBuffer(buffer->Handle(), offset, gpu_size, value);
+        });
+      };
+      // As a guest thread writes: the write faults through the tracker (from this thread, so a
+      // drain is a GPU-thread command it waits for), then lands.
+      const auto cpu_write = [&](uint64_t offset, uint32_t value) {
+        Require(name, "write fault",
+                context.HandleFault(PageFaultAccess::Write, base + offset),
+                "a CPU write to a tracked page did not fault through the tracker");
+        std::memcpy(memory + offset, &value, sizeof(value));
+      };
+      // Everything recorded so far completes and publishes.
+      const auto settle = [&] {
+        OnGpuThread(context, [&] { scheduler.Finish(); });
+        scheduler.WaitPriorityOperations(current_tick() - 1);
+      };
+      const auto read_native = [&](const Libs::Graphics::Buffer &buffer, uint64_t offset,
+                                   uint64_t bytes) {
+        auto readback = CreateHostBuffer(name, bytes, vk::BufferUsageFlagBits::eTransferDst, {0});
+        OnGpuThread(context, [&] {
+          const vk::BufferCopy copy{offset, 0, bytes};
+          scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+          vk::BufferMemoryBarrier barrier{};
+          barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+          barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+          barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          barrier.buffer = readback.buffer;
+          barrier.size = readback.size;
+          scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                                       vk::PipelineStageFlagBits::eHost, {}, 0,
+                                                       nullptr, 1, &barrier, 0, nullptr);
+          scheduler.Finish();
+        });
+        auto words = ReadBuffer(name, readback, static_cast<uint32_t>(bytes / 4));
+        DestroyBuffer(&readback);
+        return words;
+      };
+      const auto filled = [&](const uint8_t *bytes, uint64_t size, uint32_t value) {
+        for (uint64_t index = 0; index < size; index += 4) {
+          uint32_t word = 0;
+          std::memcpy(&word, bytes + index, sizeof(word));
+          if (word != value) {
+            return false;
+          }
+        }
+        return true;
+      };
+
+      // Round 1: the CPU writes only its own bytes of the shared page.
+      constexpr uint32_t gpu_value = 0xa5a5a5a5u;
+      gpu_write(gpu_value);
+      const auto tick_before = current_tick();
+      constexpr uint32_t cpu_value = 0x600dbeefu;
+      cpu_write(cpu_offset, cpu_value);
+      const auto tick_after = current_tick();
+      if (on) {
+        Require(name, "released without a drain",
+                totals.writes == 1 && totals.bytes == gpu_offset + gpu_size - shared_page &&
+                    tick_after == tick_before,
+                "a write to CPU bytes of a GPU-owned page drained the GPU (or released wrongly)");
+        // The GPU's bytes wait for their publication: still old in guest memory, GPU-dirty to
+        // the cache, and left out of the page's upload.
+        Require(name, "publication pending",
+                !filled(memory + shared_page, gpu_offset + gpu_size - shared_page, gpu_value) &&
+                    OnGpuThread(context, [&] {
+                      return cache.HasGpuDirtyBytes(base + shared_page, 0x40);
+                    }),
+                "a released page's GPU bytes were published early, or not reported GPU-dirty");
+      } else {
+        Require(name, "drained",
+                totals.writes == 0 && tick_after != tick_before &&
+                    filled(memory + shared_page, gpu_offset + gpu_size - shared_page, gpu_value),
+                "the write fault did not drain the GPU with the switch off");
+      }
+      const auto bound = OnGpuThread(
+          context, [&] { return cache.ObtainBuffer(base + gpu_offset, span, false, false); });
+      Require(name, "upload skips the GPU's bytes", !on || totals.upload_splits == 1,
+              "the released page's upload did not leave out the unpublished bytes");
+      settle();
+      // (The binding's first page stays GPU-owned with the switch on: not read from here.)
+      Require(name, "published",
+              filled(memory + shared_page, gpu_offset + gpu_size - shared_page, gpu_value) &&
+                  OnGpuThread(context, [&] {
+                    return !cache.HasGpuDirtyBytes(base + shared_page, 0x40);
+                  }),
+              "the GPU's bytes did not reach guest memory");
+      const auto words = read_native(*bound.first, bound.second, span);
+      const auto *native = reinterpret_cast<const uint8_t *>(words.data());
+      Require(name, "buffer bytes",
+              filled(native, gpu_size, gpu_value) &&
+                  std::memcmp(native + gpu_size, memory + gpu_offset + gpu_size,
+                              span - gpu_size) == 0,
+              "the buffer lost the GPU's bytes or the CPU's write");
+      Require(name, "no conflict", totals.verify_conflicts.load() == 0 &&
+                                       totals.verify_checks.load() == (on && verify != 0 ? 1u : 0u),
+              "the verify mode saw a conflict where the CPU wrote only its own bytes");
+
+      // Round 2: the CPU also writes a byte the GPU owns before the publication lands.
+      constexpr uint32_t gpu_value2 = 0x5a5a5a5au;
+      gpu_write(gpu_value2);
+      cpu_write(cpu_offset + 0x40, cpu_value);
+      constexpr uint32_t intruder = 0x0badf00du;
+      constexpr uint64_t intruder_offset = shared_page + 0x100;
+      std::memcpy(memory + intruder_offset, &intruder, sizeof(intruder));
+      settle();
+      uint32_t landed = 0;
+      std::memcpy(&landed, memory + intruder_offset, sizeof(landed));
+      if (on) {
+        Require(name, "publication overwrites the CPU write",
+                totals.writes == 2 && landed == gpu_value2 &&
+                    totals.verify_conflicts.load() == (verify != 0 ? 1u : 0u),
+                "the released page's publication did not behave as documented");
+      } else {
+        Require(name, "the CPU write stands", landed == intruder,
+                "with the switch off, a CPU write after the drain was lost");
+      }
+      settle();
+      context.UnmapMemory(base, allocation_size);
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "false-sharing direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "false-sharing direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok (release %s, verify %s)\n", name,
+                BufferCacheTestAccess::FalseSharing(context.GetBufferCache()) ? "on" : "off",
+                BufferCacheTestAccess::FalseSharingVerify(context.GetBufferCache()) != 0
                     ? "on"
                     : "off");
   }
@@ -39635,6 +39836,11 @@ int main(int argc, char **argv) {
     vulkan.CheckWrittenSyncSkip();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--false-sharing-writes-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckFalseSharingWrites();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--tracker-gap-detectors-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTrackerGapDetectors();
@@ -39882,6 +40088,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaSyncEpoch();
   vulkan.CheckBindingEpochMemo();
   vulkan.CheckWrittenSyncSkip();
+  vulkan.CheckFalseSharingWrites();
   vulkan.CheckTrackerGapDetectors();
   vulkan.CheckEagerReadback();
 #endif

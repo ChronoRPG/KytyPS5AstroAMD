@@ -152,6 +152,8 @@ public:
 	}
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
+	// GPU-written bytes whose guest copy is not current: the exact GPU-dirty ranges, and the
+	// bytes an early release left to their publication (KYTY_FALSE_SHARING_WRITES).
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	// A native-buffer revision only: callers must separately rule out newer image ownership.
 	// No buffer is created or synchronized. CPU-dirty and pending-publication ranges have no token.
@@ -444,8 +446,19 @@ private:
 	// writer is recorded and before InvalidateMemoryFromGPU.
 	void PreserveImagesForGpuWrite(BufferId id, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] static bool ImageWritebackOnGpuWriteEnabled();
+	// KYTY_FALSE_SHARING_WRITES (TryFalseSharingWrite): a download whose tracker pages were handed
+	// to a CPU writer before its publication landed. GPU thread only, except `published` (set by
+	// the publication, after it wrote the backing) and the verify fields (read by it).
+	struct EarlyReleasedDownload {
+		std::atomic<bool>       published {false};
+		std::vector<GuestRange> ranges;   // the GPU-owned bytes being published
+		std::vector<uint8_t>    snapshot; // verify: their guest bytes when the pages were released
+		bool                    verify = false;
+	};
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
-	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// `early`: the pages are released before the publication lands (KYTY_FALSE_SHARING_WRITES).
+	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                        const std::shared_ptr<EarlyReleasedDownload>& early = {});
 	struct ReadMemoryTrace {
 		uint64_t begin      = 0;
 		uint64_t size       = 0;
@@ -453,6 +466,33 @@ private:
 	};
 	// The drain path: GPU thread only.
 	void ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write, ReadMemoryTrace& trace);
+	// KYTY_FALSE_SHARING_WRITES (default off; =1 on). A guest write fault on a GPU-owned tracker
+	// page whose written bytes the GPU never wrote (m_gpu_modified_ranges is byte-exact while
+	// protection is per page: e.g. a per-frame CPU block right after a GPU-written binding that
+	// ends inside the page). Instead of draining the GPU (submit, wait, download, then release the
+	// page), it queues the download of the page's GPU-owned bytes and releases the page at once:
+	// CPU-dirty and writable, those bytes left to their publication. Until it lands, uploads of
+	// the page skip them (the buffer keeps the GPU's bytes), HasGpuDirtyBytes reports them (images
+	// refresh from the buffer, CP reads wait for the publication) and side readbacks there keep
+	// draining. GPU thread, called for a write fault. Kept for:
+	//  - write faults whose bytes the GPU owns, an unbounded writer not known complete, pages
+	//    with an image over them, or pages outside one registered buffer: the drain as before.
+	// NOT exact: until the publication lands (the GPU finishes the recording that copies them), a
+	// guest CPU read of the page's GPU-owned bytes sees their old guest contents, and a guest CPU
+	// write to them is overwritten by the publication. The drain made both see the GPU's bytes.
+	// KYTY_FALSE_SHARING_WRITES_VERIFY=1|exit compares those bytes at publication with their
+	// contents at the release: a difference is a CPU write the publication overwrites
+	// (FalseSharingVerifyConflicts; exit stops). Reads cannot be observed.
+	[[nodiscard]] bool TryFalseSharingWrite(uint64_t vaddr, uint64_t size, ReadMemoryTrace& trace);
+	// Early-released bytes whose publication has not landed (GPU thread).
+	void PruneEarlyReleased();
+	// KYTY_FALSE_SHARING_WRITES_VERIFY, on the priority worker right before a publication.
+	void VerifyEarlyRelease(const EarlyReleasedDownload& early);
+	[[nodiscard]] bool OverlapsUnpublished(uint64_t address, uint64_t size) const;
+	// emit(address, bytes) for each part of [address, address + size) outside every unpublished
+	// early-released range, in address order (GPU thread).
+	template <typename Emit>
+	void ForEachPublishedPart(uint64_t address, uint64_t size, Emit&& emit) const;
 
 	// Side readbacks. Issue runs on the GPU thread; completion on any thread.
 	struct SideReadback;
@@ -587,6 +627,20 @@ private:
 		uint64_t verify_mismatches = 0;
 	};
 	WrittenSyncTotals m_written_sync_totals;
+	// KYTY_FALSE_SHARING_WRITES (TryFalseSharingWrite): switch, verify mode, the releases whose
+	// publication has not been seen landed yet (GPU thread), and the outcomes (tests read them;
+	// the verify counts are updated by the publications).
+	bool m_false_sharing        = false;
+	int  m_false_sharing_verify = 0;
+	std::vector<std::shared_ptr<EarlyReleasedDownload>> m_early_released;
+	struct FalseSharingTotals {
+		uint64_t              writes        = 0;
+		uint64_t              bytes         = 0;
+		uint64_t              upload_splits = 0;
+		std::atomic<uint64_t> verify_checks {0};
+		std::atomic<uint64_t> verify_conflicts {0};
+	};
+	FalseSharingTotals m_false_sharing_totals;
 	uint32_t                                          m_upload_batch_depth = 0;
 	uint32_t                                          m_hot_sweep_frame  = 0;
 	std::atomic_uint64_t                               m_bda_structure_epoch {1};

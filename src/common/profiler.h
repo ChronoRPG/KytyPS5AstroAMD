@@ -901,6 +901,14 @@ enum class FrameEvent : uint32_t {
 	WrittenSyncSkips,
 	WrittenSyncSkipVerifyChecks,
 	WrittenSyncSkipVerifyMismatches,
+	// KYTY_FALSE_SHARING_WRITES (BufferCache::TryFalseSharingWrite): write faults that released a
+	// GPU-owned page without draining the GPU, the GPU-owned bytes left to their publication,
+	// uploads that skipped such bytes, and the verify mode (CPU writes to them before publication).
+	FalseSharingWrites,
+	FalseSharingBytes,
+	FalseSharingUploadSplits,
+	FalseSharingVerifyChecks,
+	FalseSharingVerifyConflicts,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip
