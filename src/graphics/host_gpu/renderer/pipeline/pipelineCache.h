@@ -24,6 +24,7 @@
 namespace Libs::Graphics {
 
 struct GraphicContext;
+class ProgramDiskCache;
 struct RenderColorInfo;
 struct RenderDepthInfo;
 class CommandBuffer;
@@ -114,7 +115,8 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	// Final save of the driver pipeline cache (exit). Stops the periodic saver first, then
-	// destroys the driver cache; later pipelines are created without one.
+	// destroys the driver cache; later pipelines are created without one. Also writes the
+	// persistent program cache's pending records (it stays usable).
 	void Save();
 
 	struct Pipeline {
@@ -194,6 +196,23 @@ public:
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
+	// Process-wide totals of the program caches (tests and diagnostics): permutations created
+	// (emitted or reloaded), TranslateProgram runs, and the persistent program cache's reloads and
+	// verify-mode comparisons (KYTY_PROGRAM_CACHE, programDiskCache.h).
+	struct ProgramTotals {
+		uint64_t programs          = 0;
+		uint64_t translations      = 0;
+		uint64_t source_hits       = 0;
+		uint64_t permutation_hits  = 0;
+		uint64_t verify_checks     = 0;
+		uint64_t verify_mismatches = 0;
+	};
+	[[nodiscard]] static ProgramTotals Totals();
+	// The persistent program cache; null when KYTY_PROGRAM_CACHE is off.
+	[[nodiscard]] ProgramDiskCache* GetProgramDiskCache() const { return m_program_disk.get(); }
+	// Returns once the checks KYTY_PROGRAM_CACHE_VERIFY=background has queued are done (tests).
+	void WaitProgramChecks();
+
 private:
 	struct ProgramCache;
 	struct PipelineDiagnostics;
@@ -257,6 +276,9 @@ private:
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
+	// Persistent translated-program cache (KYTY_PROGRAM_CACHE, programDiskCache.h); null when
+	// off. m_program_cache refers to it.
+	std::unique_ptr<ProgramDiskCache> m_program_disk;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
@@ -277,6 +299,7 @@ private:
 	std::atomic<uint64_t> m_pipeline_generation {0};
 
 	void InitializeDriverCache();
+	void InitializeProgramDiskCache();
 	// Serializes m_driver_cache and atomically replaces the cache file. Returns the payload size
 	// written, 0 on failure, or UINT64_MAX for a periodic save skipped over the size cap.
 	uint64_t WriteDriverCache(bool periodic);

@@ -16,11 +16,14 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
+#include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
 #include "graphics/host_gpu/renderer/pipeline/stagePrepWorker.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/CodegenFingerprint.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/ProgramCodec.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -44,6 +47,7 @@
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
@@ -52,6 +56,7 @@
 #include <system_error>
 #include <thread>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -237,6 +242,14 @@ struct CompileTotals {
 	std::atomic<uint64_t> gpl_library_ns {0};
 	std::atomic<uint64_t> gpl_optimized {0};
 	std::atomic<uint64_t> gpl_optimize_ns {0};
+	// Persistent program cache (KYTY_PROGRAM_CACHE): sources and permutations reloaded instead
+	// of translated and emitted, time spent reloading, and verify-mode comparisons.
+	std::atomic<uint64_t> translations {0};
+	std::atomic<uint64_t> disk_source_hits {0};
+	std::atomic<uint64_t> disk_permutation_hits {0};
+	std::atomic<uint64_t> disk_load_ns {0};
+	std::atomic<uint64_t> disk_verify_checks {0};
+	std::atomic<uint64_t> disk_verify_mismatches {0};
 };
 CompileTotals g_compile_totals;
 
@@ -278,6 +291,10 @@ struct ProgramCompileTimes {
 	uint64_t module_ns    = 0;
 	uint64_t spirv_words  = 0;
 	bool     reused       = false;
+	// Persistent program cache: key, lookups and decoding (all zero with it off), and whether
+	// the permutation was reloaded instead of emitted.
+	uint64_t load_ns   = 0;
+	bool     from_disk = false;
 };
 
 void RecordProgramCompile(const char* stage_name, uint64_t guest_hash, uint64_t id,
@@ -297,6 +314,10 @@ void RecordProgramCompile(const char* stage_name, uint64_t guest_hash, uint64_t 
 		Profiler::AddFrameWait(Profiler::FrameWait::ShaderValidate, 1, times.validate_ns);
 	}
 	Profiler::AddFrameWait(Profiler::FrameWait::ShaderModuleCreate, 1, times.module_ns);
+	if (times.load_ns != 0) {
+		totals.disk_load_ns.fetch_add(times.load_ns, std::memory_order_relaxed);
+		Profiler::AddFrameWait(Profiler::FrameWait::ShaderDiskLoad, 1, times.load_ns);
+	}
 	if (HangTrace::Enabled()) {
 		HangTrace::RecordCompile({.kind         = HangTrace::CompileKind::Program,
 		                          .stage        = stage_name,
@@ -310,7 +331,9 @@ void RecordProgramCompile(const char* stage_name, uint64_t guest_hash, uint64_t 
 		                          .spirv_words  = times.spirv_words,
 		                          .detail       = detail,
 		                          .clone_ns     = times.clone_ns,
-		                          .reused       = times.reused});
+		                          .reused       = times.reused,
+		                          .load_ns      = times.load_ns,
+		                          .from_disk    = times.from_disk});
 	}
 }
 
@@ -351,6 +374,16 @@ void LogCompileTotals() {
 		                 links, ms(t.gpl_link_ns), cache_hits, monolithic,
 		                 t.gpl_libraries.load(std::memory_order_relaxed), ms(t.gpl_library_ns),
 		                 t.gpl_optimized.load(std::memory_order_relaxed), ms(t.gpl_optimize_ns));
+	}
+	const auto disk_sources      = t.disk_source_hits.load(std::memory_order_relaxed);
+	const auto disk_permutations = t.disk_permutation_hits.load(std::memory_order_relaxed);
+	const auto disk_checks       = t.disk_verify_checks.load(std::memory_order_relaxed);
+	if (disk_sources != 0 || disk_permutations != 0 || disk_checks != 0) {
+		PipelineCacheLog("Program cache: {} sources and {} permutations reloaded instead of "
+		                 "translated (keys, lookups and decoding {:.1f} ms); verify: {} checks, {} "
+		                 "mismatches",
+		                 disk_sources, disk_permutations, ms(t.disk_load_ns), disk_checks,
+		                 t.disk_verify_mismatches.load(std::memory_order_relaxed));
 	}
 }
 
@@ -1196,6 +1229,10 @@ struct PipelineCache::ProgramCache {
 		std::list<SourceEntry*>::iterator      kept_position;
 		// Set when a reused translation failed verification: always translate this source.
 		bool                                   kept_disabled = false;
+		// Persistent program cache: the record this source's plan was reloaded from (UINT32_MAX
+		// when translated here) and its stored encoding. Set at insertion, then immutable.
+		uint32_t                               disk_record = UINT32_MAX;
+		std::span<const uint8_t>               disk_plan;
 	};
 
 	// The last source found per stage by this thread and the permutation it last matched.
@@ -1347,13 +1384,22 @@ struct PipelineCache::ProgramCache {
 		return "";
 	}
 
-	Permutation CompilePermutation(const ShaderParams&                          params,
-	                               const ShaderRecompiler::CompileOptions&      options,
-	                               ShaderRecompiler::TranslateResult            translated,
-	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword,
-	                               std::span<const uint32_t> static_state,
-	                               ProgramCompileTimes&      times) {
+	// One emitted permutation: what the persistent program cache stores and reloads.
+	struct EmittedProgram {
+		std::vector<uint32_t>                    spirv;
+		std::vector<uint32_t>                    spirv_plain;
+		ShaderRecompiler::IR::CompiledShaderInfo info;
+	};
+
+	// Specialization and SPIR-V emission (CompileProgram) of a translation, and the debug dumps.
+	static EmittedProgram EmitPermutation(const ShaderParams&                     params,
+	                                      const ShaderRecompiler::CompileOptions& options,
+	                                      ShaderRecompiler::TranslateResult       translated,
+	                                      const ShaderRecompiler::IR::ResourceSpecialization&
+	                                          specialization,
+	                                      uint32_t                  push_data_start_dword,
+	                                      std::span<const uint32_t> static_state,
+	                                      ProgramCompileTimes&      times) {
 		const char* stage_name = ProgramStageName(options.stage);
 		const auto  emit_begin = CompileClockNs();
 		ShaderRecompiler::CompileResult result;
@@ -1367,57 +1413,74 @@ struct PipelineCache::ProgramCache {
 		DumpMatchedShaderInputs(params, options, stage_name, static_state,
 		                        push_data_start_dword, result.spirv, result.ir_dump);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
+		return {.spirv       = std::move(result.spirv),
+		        .spirv_plain = std::move(result.spirv_plain),
+		        .info        = std::move(result.program).TakeCompiledInfo()};
+	}
+
+	// Validation (here, or queued to the background validator), shader modules and ids of an
+	// emitted or reloaded permutation. With `words`, the SPIR-V is copied there first (for the
+	// persistent program cache).
+	Permutation FinishPermutation(const ShaderRecompiler::CompileOptions&      options,
+	                              EmittedProgram                               emitted,
+	                              ShaderRecompiler::IR::ResourceSpecialization specialization,
+	                              ProgramCompileTimes& times, EmittedProgram* words = nullptr) {
+		const char* stage_name = ProgramStageName(options.stage);
+		if (words != nullptr) {
+			words->spirv       = emitted.spirv;
+			words->spirv_plain = emitted.spirv_plain;
+		}
 		if (validator == nullptr) {
 			const auto validate_begin = CompileClockNs();
 			bool       valid          = false;
 			{
 				KYTY_PROFILER_BLOCK("Shader::Validate");
-				valid = ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv);
+				valid = ValidateShaderSpirv(options.dump_label, options.shader_hash, emitted.spirv);
 			}
 			if (Config::ShaderValidationEnabled()) {
 				times.validate_ns = CompileClockNs() - validate_begin;
 			}
 			if (!valid) {
-				DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+				DumpShaderSpirv(stage_name, options.shader_hash, emitted.spirv);
 				EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n",
 				     options.dump_label, options.shader_hash);
 			}
 		}
-		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		DumpShaderSpirv(stage_name, options.shader_hash, emitted.spirv);
 
 		const auto       module_begin = CompileClockNs();
 		vk::ShaderModule module       = nullptr;
 		{
 			KYTY_PROFILER_BLOCK("Shader::CreateModule");
-			module = CompileSPV(result.spirv, device);
+			module = CompileSPV(emitted.spirv, device);
 		}
 		times.module_ns = CompileClockNs() - module_begin;
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
-			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
+			     static_cast<uint64_t>(emitted.spirv.size()), options.wave_size);
 		}
 		if (validator != nullptr) {
 			validator->Submit(options.dump_label, stage_name, options.shader_hash,
-			                  std::move(result.spirv));
+			                  std::move(emitted.spirv));
 		}
 		const auto id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
 		GpuOpProfiler::RegisterShader(id, stage_name, options.shader_hash);
 		ShaderProgram plain {};
-		if (!result.spirv_plain.empty()) {
+		if (!emitted.spirv_plain.empty()) {
 			if (validator == nullptr) {
 				if (!ValidateShaderSpirv(options.dump_label, options.shader_hash,
-				                         result.spirv_plain)) {
-					DumpShaderSpirv(stage_name, options.shader_hash, result.spirv_plain);
+				                         emitted.spirv_plain)) {
+					DumpShaderSpirv(stage_name, options.shader_hash, emitted.spirv_plain);
 					EXIT("%s failed hash=0x%016" PRIx64 ": plain variant SPIR-V validation failed\n",
 					     options.dump_label, options.shader_hash);
 				}
 			}
-			const auto plain_module = CompileSPV(result.spirv_plain, device);
+			const auto plain_module = CompileSPV(emitted.spirv_plain, device);
 			EXIT_IF(plain_module == nullptr);
 			if (validator != nullptr) {
 				validator->Submit(options.dump_label, stage_name, options.shader_hash,
-				                  std::move(result.spirv_plain));
+				                  std::move(emitted.spirv_plain));
 			}
 			const auto plain_id = next_shader_id.fetch_add(1, std::memory_order_relaxed) + 1u;
 			GpuOpProfiler::RegisterShader(plain_id, stage_name, options.shader_hash);
@@ -1425,7 +1488,7 @@ struct PipelineCache::ProgramCache {
 		}
 		return {
 		    .specialization = std::move(specialization),
-		    .program        = std::move(result.program).TakeCompiledInfo(),
+		    .program        = std::move(emitted.info),
 		    .handle         = {.id = id, .module = module},
 		    .plain          = plain,
 		};
@@ -1694,6 +1757,333 @@ struct PipelineCache::ProgramCache {
 		kept_lru.splice(kept_lru.end(), kept_lru, source.kept_position);
 	}
 
+	// Persistent program cache (KYTY_PROGRAM_CACHE, programDiskCache.h); null when off.
+	ProgramDiskCache* disk = nullptr;
+
+	// KYTY_PROGRAM_CACHE_VERIFY:
+	// - unset/0: off.
+	// - 1: every reloaded source and permutation is translated and emitted anyway and compared
+	//   with the stored one (plans by their encoding, permutations by SPIR-V, plain variant and
+	//   every metadata member); a difference is logged and counted, the stored record dropped and
+	//   the fresh result used. As slow as no cache; exact even if a key were incomplete.
+	// - exit: 1, and the emulator stops on the first difference.
+	// - background: the reloaded program is used at once and a background thread translates,
+	//   emits and compares it (BackgroundChecks); a difference is logged and counted and drops
+	//   the record for later runs, while this run keeps the reloaded program. Costs the command
+	//   processor nothing.
+	enum class DiskVerify : int { Off, Sync, SyncExit, Background };
+	static DiskVerify DiskVerifyMode() {
+		static const DiskVerify mode = [] {
+			const auto* value = std::getenv("KYTY_PROGRAM_CACHE_VERIFY");
+			if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) {
+				return DiskVerify::Off;
+			}
+			if (std::strcmp(value, "exit") == 0) return DiskVerify::SyncExit;
+			if (std::strcmp(value, "background") == 0) return DiskVerify::Background;
+			return DiskVerify::Sync;
+		}();
+		return mode;
+	}
+	static bool SyncVerify() {
+		return DiskVerifyMode() == DiskVerify::Sync || DiskVerifyMode() == DiskVerify::SyncExit;
+	}
+
+	// Shader logging and the debug dumps describe a translation while it runs; they bypass the
+	// persistent cache.
+	[[nodiscard]] bool DiskEnabled(const ShaderRecompiler::CompileOptions& options) const {
+		return disk != nullptr && !options.dump_ir && !Config::GraphicsDebugDumpEnabled();
+	}
+
+#if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
+	// CompileOptions (11 members): stage, wave_size, user_data_base, shader_hash (the guest hash)
+	// and plain_mip_stats_variant are key fields; user_data is read for its size only (the
+	// user-data count); back_code is keyed word for word; input_info through the stage static key;
+	// dump_ir, early_dump and dump_label only select logs and dumps (which bypass the cache). A
+	// new member must join BuildDiskKey (or be shown not to change a translation) before this
+	// size is updated.
+	static_assert(sizeof(ShaderRecompiler::CompileOptions) == 88,
+	              "CompileOptions changed: add the new member to the program cache key");
+#endif
+
+	// The exact key of a source: every input of TranslateProgram outside the file identity (the
+	// codegen state). The code words are the ones translation reads (it reads params.code): from
+	// the clean backing when that holds them, like HashShaderCode (no fault), else through the
+	// guest mapping as translation would. `code_words`/`back_code_words` receive them.
+	static void BuildDiskKey(const ShaderParams& params, const ShaderRecompiler::CompileOptions& options,
+	                         const ProgramKey& key, ProgramDiskCache::SourceKey& disk_key,
+	                         std::vector<uint32_t>& code_words, std::vector<uint32_t>& back_code_words) {
+		const auto copy = [](std::span<const uint32_t> guest, std::vector<uint32_t>& words) {
+			words.resize(guest.size());
+			if (guest.empty()) return;
+			if (!LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(guest.data()),
+			                                               words.data(), guest.size_bytes())) {
+				std::memcpy(words.data(), guest.data(), guest.size_bytes());
+			}
+		};
+		copy(params.code, code_words);
+		copy(params.back_code, back_code_words);
+		ProgramDiskCache::BuildSourceKey(
+		    {.stage                   = static_cast<uint32_t>(key.stage),
+		     .hash                    = key.hash,
+		     .user_data_count         = key.user_data_count,
+		     .code_size               = key.code_size,
+		     .static_state            = key.static_state,
+		     .wave_size               = options.wave_size,
+		     .user_data_base          = options.user_data_base,
+		     .plain_mip_stats_variant = options.plain_mip_stats_variant,
+		     .code                    = code_words,
+		     .back_code               = back_code_words},
+		    disk_key);
+	}
+
+	// KYTY_PROGRAM_CACHE_VERIFY=background: one reloaded permutation (and, when its source was
+	// reloaded in the same compile, the source's plan) with everything needed to translate and
+	// emit it again. The stored spans stay valid for the disk cache's lifetime.
+	struct BackgroundCheck {
+		ShaderType                                   stage           = ShaderType::Unknown;
+		uint64_t                                     shader_hash     = 0;
+		uint32_t                                     wave_size       = 64;
+		uint32_t                                     user_data_base  = 0;
+		uint32_t                                     user_data_count = 0;
+		bool                                         plain_mip_stats_variant = false;
+		std::vector<uint32_t>                        code;
+		std::vector<uint32_t>                        back_code;
+		std::unique_ptr<ShaderVertexInputInfo>       vertex;
+		std::unique_ptr<ShaderPixelInputInfo>        pixel;
+		std::unique_ptr<ShaderComputeInputInfo>      compute;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		uint32_t                                     push_data_cursor   = 0;
+		uint32_t                                     source_record      = UINT32_MAX;
+		std::span<const uint8_t>                     stored_plan;
+		uint32_t                                     permutation_record = UINT32_MAX;
+		std::span<const uint8_t>                     stored_info;
+		std::span<const uint8_t>                     stored_spirv;
+		std::span<const uint8_t>                     stored_spirv_plain;
+	};
+
+	// The background thread of KYTY_PROGRAM_CACHE_VERIFY=background (started on first use).
+	// Stop() drops what is still queued; Wait() returns once the queue is empty and no check runs.
+	class BackgroundChecks {
+	public:
+		explicit BackgroundChecks(ProgramCache& owner): m_owner(owner) {
+			m_thread = std::jthread([this](std::stop_token stop) { Run(stop); });
+		}
+		~BackgroundChecks() { Stop(); }
+		BackgroundChecks(const BackgroundChecks&)            = delete;
+		BackgroundChecks& operator=(const BackgroundChecks&) = delete;
+
+		void Submit(BackgroundCheck check) {
+			{
+				std::scoped_lock lock(m_mutex);
+				if (m_stopped) return;
+				m_jobs.push_back(std::move(check));
+			}
+			m_wake.notify_all();
+		}
+		void Wait() {
+			std::unique_lock lock(m_mutex);
+			m_idle.wait(lock, [this] { return (m_jobs.empty() && !m_busy) || m_stopped; });
+		}
+		void Stop() {
+			{
+				std::scoped_lock lock(m_mutex);
+				m_stopped = true;
+				m_jobs.clear();
+			}
+			m_wake.notify_all();
+			m_idle.notify_all();
+			if (m_thread.joinable()) {
+				m_thread.request_stop();
+				m_thread.join();
+			}
+		}
+
+	private:
+		void Run(const std::stop_token& stop) {
+			Profiler::SetThreadName("ProgramCacheCheck");
+			for (;;) {
+				BackgroundCheck job;
+				{
+					std::unique_lock lock(m_mutex);
+					m_busy = false;
+					m_idle.notify_all();
+					if (!m_wake.wait(lock, stop, [this] { return !m_jobs.empty(); })) {
+						return;
+					}
+					job = std::move(m_jobs.front());
+					m_jobs.pop_front();
+					m_busy = true;
+				}
+				m_owner.RunBackgroundCheck(job);
+			}
+		}
+
+		ProgramCache&               m_owner;
+		std::mutex                  m_mutex;
+		std::condition_variable_any m_wake;
+		std::condition_variable_any m_idle;
+		std::deque<BackgroundCheck> m_jobs;
+		bool                        m_busy    = false;
+		bool                        m_stopped = false;
+		std::jthread                m_thread; // Last: joined before the members it uses go away.
+	};
+
+	// Guarded by m_checks_mutex; created on first use.
+	std::unique_ptr<BackgroundChecks> checks;
+	std::mutex                        m_checks_mutex;
+
+	void SubmitBackgroundCheck(BackgroundCheck check) {
+		std::scoped_lock lock(m_checks_mutex);
+		if (checks == nullptr) {
+			checks = std::make_unique<BackgroundChecks>(*this);
+		}
+		checks->Submit(std::move(check));
+	}
+	void WaitBackgroundChecks() {
+		std::scoped_lock lock(m_checks_mutex);
+		if (checks != nullptr) checks->Wait();
+	}
+	// Before the disk cache goes (the checks invalidate its records).
+	void StopBackgroundChecks() {
+		std::scoped_lock lock(m_checks_mutex);
+		checks.reset();
+	}
+
+	// Translates and emits a reloaded program again and compares it with the stored bytes.
+	void RunBackgroundCheck(const BackgroundCheck& job) {
+		ShaderRecompiler::CompileOptions options;
+		options.stage                   = job.stage;
+		options.shader_hash             = job.shader_hash;
+		options.wave_size               = job.wave_size;
+		options.user_data_base          = job.user_data_base;
+		options.plain_mip_stats_variant = job.plain_mip_stats_variant;
+		options.dump_ir                 = false;
+		options.early_dump              = false;
+		options.dump_label              = "ProgramCache check";
+		// Translation reads the user data's size only (the count is part of the key).
+		const std::vector<uint32_t> user_data(job.user_data_count);
+		options.user_data = user_data;
+		options.back_code = job.back_code;
+		if (job.vertex != nullptr) {
+			options.input_info.vertex = job.vertex.get();
+		} else if (job.pixel != nullptr) {
+			options.input_info.pixel = job.pixel.get();
+		} else {
+			options.input_info.compute = job.compute.get();
+		}
+		auto translated = ShaderRecompiler::TranslateProgram(job.code, options);
+		if (job.source_record != UINT32_MAX) {
+			bool same = !translated.skip_dispatch;
+			if (same) {
+				const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+				std::vector<uint8_t> encoded;
+				same = ShaderRecompiler::IR::EncodeResourcePlan(plan, encoded) &&
+				       std::ranges::equal(encoded, job.stored_plan);
+			}
+			NoteDiskVerify(same, "resource plan (background check)", options, false);
+			if (!same) disk->Invalidate(job.source_record);
+		}
+		if (translated.skip_dispatch) {
+			if (job.source_record == UINT32_MAX) {
+				NoteDiskVerify(false, "skip-dispatch verdict (background check)", options, false);
+			}
+			disk->Invalidate(job.permutation_record);
+			return;
+		}
+		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
+		                                               job.specialization, job.push_data_cursor);
+		const auto info = std::move(result.program).TakeCompiledInfo();
+		ShaderRecompiler::IR::CompiledShaderInfo stored_info;
+		const auto words = [](const std::vector<uint32_t>& spirv) {
+			return std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(spirv.data()),
+			                                spirv.size() * sizeof(uint32_t));
+		};
+		const char* what =
+		    !std::ranges::equal(words(result.spirv), job.stored_spirv) ? "SPIR-V (background check)"
+		    : !std::ranges::equal(words(result.spirv_plain), job.stored_spirv_plain)
+		        ? "plain-variant SPIR-V (background check)"
+		    : !ShaderRecompiler::IR::DecodeCompiledShaderInfo(job.stored_info, stored_info) ||
+		            !(stored_info == info)
+		        ? "shader metadata (background check)"
+		        : nullptr;
+		NoteDiskVerify(what == nullptr, what != nullptr ? what : "", options, false);
+		if (what != nullptr) disk->Invalidate(job.permutation_record);
+	}
+
+	static bool CopyStoredWords(std::span<const uint8_t> bytes, std::vector<uint32_t>& words) {
+		if (bytes.size() % sizeof(uint32_t) != 0) return false;
+		words.resize(bytes.size() / sizeof(uint32_t));
+		if (!bytes.empty()) std::memcpy(words.data(), bytes.data(), bytes.size());
+		return true;
+	}
+
+	// One comparison of a stored record with a fresh translation (`what` names the first
+	// difference). `fresh_used`: this run uses the fresh result instead of the stored one (false
+	// for a plan already in use when a later permutation found it different).
+	static void NoteDiskVerify(bool same, const char* what,
+	                           const ShaderRecompiler::CompileOptions& options,
+	                           bool fresh_used = true) {
+		g_compile_totals.disk_verify_checks.fetch_add(1, std::memory_order_relaxed);
+		if (same) return;
+		g_compile_totals.disk_verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ProgramDiskVerifyMismatches);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+			PipelineCacheLog("Program cache: the stored {} of {} 0x{:016x} differs from a fresh "
+			                 "translation; the stored record is dropped{}",
+			                 what, ProgramStageName(options.stage), options.shader_hash,
+			                 fresh_used ? " and the fresh result used"
+			                            : " (this run keeps the stored one for this source)");
+		}
+		if (DiskVerifyMode() == DiskVerify::SyncExit) {
+			EXIT("Program cache: the stored %s of 0x%016" PRIx64
+			     " differs from a fresh translation\n",
+			     what, options.shader_hash);
+		}
+	}
+
+	static bool DiskSourceMatches(const ShaderRecompiler::TranslateResult&  translated,
+	                              const ProgramDiskCache::SourceRecord&     stored,
+	                              const ShaderRecompiler::CompileOptions&   options) {
+		bool        same = translated.skip_dispatch == stored.skip_dispatch;
+		const char* what = "skip-dispatch verdict";
+		if (same && !stored.skip_dispatch) {
+			const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			std::vector<uint8_t> encoded;
+			same = ShaderRecompiler::IR::EncodeResourcePlan(plan, encoded) &&
+			       std::ranges::equal(encoded, stored.plan);
+			what = "resource plan";
+		}
+		NoteDiskVerify(same, what, options);
+		return same;
+	}
+
+	static bool DiskPermutationMatches(const EmittedProgram& fresh, const EmittedProgram& stored,
+	                                   const ShaderRecompiler::CompileOptions& options) {
+		const char* what = fresh.spirv != stored.spirv               ? "SPIR-V"
+		                   : fresh.spirv_plain != stored.spirv_plain ? "plain-variant SPIR-V"
+		                   : !(fresh.info == stored.info)            ? "shader metadata"
+		                                                             : nullptr;
+		NoteDiskVerify(what == nullptr, what != nullptr ? what : "", options);
+		return what == nullptr;
+	}
+
+	// A skip-dispatch verdict reloaded from disk: the translation that found it would have logged
+	// why (ray tracing, KYTY_SRT_VARIANT_READS); say once per program that it is skipped.
+	static void NoteDiskSkip(const ShaderRecompiler::CompileOptions& options) {
+		static std::mutex                   mutex;
+		static std::unordered_set<uint64_t> logged;
+		{
+			std::scoped_lock lock(mutex);
+			if (!logged.insert(options.shader_hash ^ static_cast<uint64_t>(options.stage)).second) {
+				return;
+			}
+		}
+		PipelineCacheLog("Program cache: {} 0x{:016x} is not dispatched or drawn (the verdict of "
+		                 "its translation, reloaded; KYTY_PROGRAM_CACHE=0 logs the reason)",
+		                 ProgramStageName(options.stage), options.shader_hash);
+	}
+
 	// KYTY_TRANSLATION_CACHE_VERIFY: compiles the permutation from a copy of `kept` and from a
 	// fresh translation and compares the outputs that reach the GPU and the renderer.
 	bool VerifyKeptTranslation(const ShaderParams& params,
@@ -1763,9 +2153,21 @@ struct PipelineCache::ProgramCache {
 		InFlightScope& operator=(const InFlightScope&) = delete;
 	};
 
-	// The compile path: translates, inserts a new source, materializes it into `prep` when
-	// `prep` was not prepared from an existing entry, compiles and publishes the permutation.
-	// Returns null for skip-dispatch shaders and for a failed materialization.
+	// The compile path: translates (or reloads), inserts a new source, materializes it into
+	// `prep` when `prep` was not prepared from an existing entry, compiles (or reloads) and
+	// publishes the permutation. Returns null for skip-dispatch shaders and for a failed
+	// materialization.
+	//
+	// Persistent program cache (KYTY_PROGRAM_CACHE, programDiskCache.h): a source that is not in
+	// `programs` is looked up on disk by its exact key (every guest code word included) before it
+	// is translated; a stored plan is decoded and inserted exactly where the translation's own
+	// would be, and a stored skip-dispatch verdict is taken as the translation's. A permutation
+	// that is not published is looked up by (source, push-data cursor, specialization bytes)
+	// before a translation is emitted; stored SPIR-V and metadata go through the same validation,
+	// module creation and publication as emitted ones. Whatever this run translates and emits is
+	// added. KYTY_PROGRAM_CACHE_VERIFY translates and emits anyway and compares (DiskVerifyMode).
+	// Without it, a reloaded source that needs a translation for a new permutation after all has
+	// its stored plan compared with the fresh one at no extra translation cost.
 	//
 	// Locking (draw-prep S2 noted that compiles held m_programs_mutex exclusively throughout,
 	// blocking every FindSource): the exclusive lock is now held only to look up, to register the
@@ -1897,63 +2299,148 @@ struct PipelineCache::ProgramCache {
 		}
 		ProgramCompileTimes               times;
 		ShaderRecompiler::TranslateResult translated;
-		// An existing source's kept translation replaces translating the guest code again.
-		std::shared_ptr<const KeptTranslation> kept;
-		if (source != nullptr && TranslationCacheEnabled()) {
-			lock.lock();
-			kept = source->kept_translation;
-			if (kept != nullptr) TouchTranslation(*source);
-			lock.unlock();
-		}
-		if (kept != nullptr) {
-			const auto clone_begin = CompileClockNs();
-			{
-				KYTY_PROFILER_BLOCK("Shader::CopyTranslation");
-				times.reused = CopyTranslation(kept->translated, translated);
-			}
-			if (times.reused && TranslationVerifyMode() != 0 &&
-			    !VerifyKeptTranslation(params, options, *kept, prep.specialization,
-			                           push_data_cursor)) {
-				times.reused = false;
-				lock.lock();
-				ForgetTranslation(*source, dropped);
-				source->kept_disabled = true;
-				lock.unlock();
-			}
-			times.clone_ns = CompileClockNs() - clone_begin;
-		}
-		// Released unlocked: it may be the last reference to a translation evicted meanwhile.
-		const bool had_kept = kept != nullptr;
-		kept.reset();
+		// `translated` holds a translation of this source that nothing has consumed yet.
+		bool translated_now = false;
+		// A copy of a fresh translation to keep for this source's later permutations
+		// (KYTY_TRANSLATION_CACHE), taken before anything reads or changes the program.
 		std::shared_ptr<KeptTranslation> keep;
-		if (!times.reused) {
+		bool                             had_kept = false;
+		const auto translate_now = [&] {
 			const auto translate_begin = CompileClockNs();
 			{
 				KYTY_PROFILER_BLOCK("Shader::Translate");
 				translated = ShaderRecompiler::TranslateProgram(params.code, options);
 			}
-			times.translate_ns = CompileClockNs() - translate_begin;
-			// Keep an unmodified copy for this source's later permutations, taken before
-			// anything below (plan extraction, specialization) reads or changes the program.
-			if (TranslationCacheEnabled() && !had_kept && !translated.skip_dispatch) {
+			times.translate_ns += CompileClockNs() - translate_begin;
+			translated_now = true;
+			g_compile_totals.translations.fetch_add(1, std::memory_order_relaxed);
+			if (TranslationCacheEnabled() && !had_kept && !translated.skip_dispatch &&
+			    keep == nullptr) {
 				const auto copy_begin = CompileClockNs();
 				auto       copy       = std::make_shared<KeptTranslation>();
 				if (CopyTranslation(translated, copy->translated)) {
 					copy->bytes = EstimateTranslationBytes(copy->translated);
 					keep        = std::move(copy);
 				}
-				times.clone_ns = CompileClockNs() - copy_begin;
+				times.clone_ns += CompileClockNs() - copy_begin;
+			}
+		};
+		// A translation to emit from: the unconsumed fresh one, a copy of the source's kept one,
+		// or a new one.
+		const auto obtain_translation = [&] {
+			if (translated_now) return;
+			// An existing source's kept translation replaces translating the guest code again.
+			std::shared_ptr<const KeptTranslation> kept;
+			if (source != nullptr && TranslationCacheEnabled()) {
+				lock.lock();
+				kept = source->kept_translation;
+				if (kept != nullptr) TouchTranslation(*source);
+				lock.unlock();
+			}
+			if (kept != nullptr) {
+				const auto clone_begin = CompileClockNs();
+				{
+					KYTY_PROFILER_BLOCK("Shader::CopyTranslation");
+					times.reused = CopyTranslation(kept->translated, translated);
+				}
+				if (times.reused && TranslationVerifyMode() != 0 &&
+				    !VerifyKeptTranslation(params, options, *kept, prep.specialization,
+				                           push_data_cursor)) {
+					times.reused = false;
+					lock.lock();
+					ForgetTranslation(*source, dropped);
+					source->kept_disabled = true;
+					lock.unlock();
+				}
+				times.clone_ns += CompileClockNs() - clone_begin;
+			}
+			// Released unlocked: it may be the last reference to a translation evicted meanwhile.
+			had_kept = kept != nullptr;
+			kept.reset();
+			if (!times.reused) {
+				translate_now();
+			}
+		};
+
+		// Persistent program cache: the source (programDiskCache.h).
+		const bool                  disk_on = DiskEnabled(options);
+		ProgramDiskCache::SourceKey disk_key;
+		std::vector<uint32_t>       code_words;
+		std::vector<uint32_t>       back_code_words;
+		std::optional<ProgramDiskCache::SourceRecord> disk_source;
+		if (disk_on) {
+			const auto load_begin = CompileClockNs();
+			BuildDiskKey(params, options, key, disk_key, code_words, back_code_words);
+			if (source == nullptr) {
+				disk_source = disk->FindSource(disk_key);
+			}
+			times.load_ns += CompileClockNs() - load_begin;
+		}
+		bool from_disk    = false;
+		bool plan_checked = false; // verify mode compared the stored plan with a fresh one
+		if (disk_source.has_value()) {
+			const auto load_begin = CompileClockNs();
+			ShaderRecompiler::IR::ResourcePlan stored_plan;
+			bool usable = disk_source->skip_dispatch ||
+			              ShaderRecompiler::IR::DecodeResourcePlan(disk_source->plan, stored_plan);
+			times.load_ns += CompileClockNs() - load_begin;
+			if (usable && SyncVerify()) {
+				translate_now();
+				usable       = DiskSourceMatches(translated, *disk_source, options);
+				plan_checked = true;
+			}
+			if (!usable) {
+				disk->Invalidate(disk_source->id);
+			} else if (disk_source->skip_dispatch) {
+				NoteDiskSkip(options);
+				lock.lock();
+				const auto entry =
+				    programs.try_emplace(key, ShaderRecompiler::IR::ResourcePlan {}).first;
+				entry->second.skip_dispatch.store(true, std::memory_order_relaxed);
+				FinishInFlight(record);
+				g_compile_totals.disk_source_hits.fetch_add(1, std::memory_order_relaxed);
+				return nullptr;
+			} else {
+				// The stored plan takes the place of the translation's own.
+				lock.lock();
+				// Nobody else inserts this key while `record` covers it.
+				source = &programs.try_emplace(key, std::move(stored_plan)).first->second;
+				source->disk_record = disk_source->id;
+				source->disk_plan   = disk_source->plan;
+				record.source       = source; // Still covers every permutation of it.
+				KeepTranslation(*source, std::move(keep), dropped);
+				lock.unlock();
+				dropped.clear();
+				g_compile_totals.disk_source_hits.fetch_add(1, std::memory_order_relaxed);
+				const bool materialized =
+				    Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
+				lock.lock();
+				if (!materialized) {
+					FinishInFlight(record);
+					return nullptr;
+				}
+				record.specialization       = prep.specialization;
+				record.specialization_known = true;
+				compile_done.notify_all(); // Other permutations of the source may proceed.
+				lock.unlock();
 			}
 		}
-		if (translated.skip_dispatch) {
-			lock.lock();
-			// An existing source never reaches here: it would have skip_dispatch set already.
-			const auto entry = programs.try_emplace(key, ShaderRecompiler::IR::ResourcePlan {}).first;
-			entry->second.skip_dispatch.store(true, std::memory_order_relaxed);
-			FinishInFlight(record);
-			return nullptr;
-		}
 		if (source == nullptr) {
+			if (!translated_now) {
+				translate_now();
+			}
+			if (translated.skip_dispatch) {
+				if (disk_on) {
+					disk->AddSource(disk_key, true, {});
+				}
+				lock.lock();
+				// An existing source never reaches here: it would have skip_dispatch set already.
+				const auto entry =
+				    programs.try_emplace(key, ShaderRecompiler::IR::ResourcePlan {}).first;
+				entry->second.skip_dispatch.store(true, std::memory_order_relaxed);
+				FinishInFlight(record);
+				return nullptr;
+			}
 			// Pure function of the translated program; no lock needed.
 			auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 			lock.lock();
@@ -1963,6 +2450,13 @@ struct PipelineCache::ProgramCache {
 			KeepTranslation(*source, std::move(keep), dropped);
 			lock.unlock();
 			dropped.clear();
+			if (disk_on) {
+				// The plan is sealed; other threads only read it.
+				std::vector<uint8_t> encoded;
+				if (ShaderRecompiler::IR::EncodeResourcePlan(source->resource_plan, encoded)) {
+					disk->AddSource(disk_key, false, encoded);
+				}
+			}
 			const bool materialized =
 			    Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
 			lock.lock();
@@ -1977,9 +2471,100 @@ struct PipelineCache::ProgramCache {
 			compile_done.notify_all(); // Other permutations of the source may proceed.
 			lock.unlock();
 		}
-		auto compiled = CompilePermutation(params, options, std::move(translated),
-		                                   prep.specialization, push_data_cursor,
-		                                   key.static_state, times);
+
+		// Only for a source whose plan was reloaded from a stale record (the stored verdict was
+		// not skip-dispatch, a fresh translation is): nothing can be emitted, so the source is
+		// skipped from here on, as a fresh run would skip it.
+		const auto skip_after_all = [&] {
+			NoteDiskVerify(false, "skip-dispatch verdict", options, false);
+			if (source->disk_record != UINT32_MAX) {
+				disk->Invalidate(source->disk_record);
+			}
+			lock.lock();
+			source->skip_dispatch.store(true, std::memory_order_relaxed);
+			FinishInFlight(record);
+			return nullptr;
+		};
+
+		// The permutation: stored, or emitted from a translation.
+		std::optional<Permutation>                         compiled;
+		std::optional<ProgramDiskCache::PermutationRecord> reloaded; // from_disk
+		std::vector<uint8_t>       specialization_bytes;
+		EmittedProgram             words; // SPIR-V of an emitted permutation, for the disk cache
+		bool                       store = false;
+		if (disk_on) {
+			ShaderRecompiler::IR::EncodeSpecialization(prep.specialization, specialization_bytes);
+			const auto load_begin = CompileClockNs();
+			const auto stored =
+			    disk->FindPermutation(disk_key.digest, push_data_cursor, specialization_bytes);
+			EmittedProgram loaded;
+			bool usable = stored.has_value() &&
+			              ShaderRecompiler::IR::DecodeCompiledShaderInfo(stored->info, loaded.info) &&
+			              CopyStoredWords(stored->spirv, loaded.spirv) &&
+			              CopyStoredWords(stored->spirv_plain, loaded.spirv_plain);
+			times.load_ns += CompileClockNs() - load_begin;
+			if (stored.has_value() && !usable) {
+				disk->Invalidate(stored->id);
+			}
+			if (usable && SyncVerify()) {
+				obtain_translation();
+				if (translated.skip_dispatch) {
+					return skip_after_all();
+				}
+				auto fresh = EmitPermutation(params, options, std::move(translated),
+				                             prep.specialization, push_data_cursor,
+				                             key.static_state, times);
+				translated_now = false;
+				if (!DiskPermutationMatches(fresh, loaded, options)) {
+					disk->Invalidate(stored->id);
+					compiled = FinishPermutation(options, std::move(fresh), prep.specialization,
+					                             times, &words);
+					store    = true;
+					usable   = false;
+				}
+			}
+			if (usable) {
+				from_disk         = true;
+				reloaded          = stored;
+				times.spirv_words = loaded.spirv.size();
+				compiled = FinishPermutation(options, std::move(loaded), prep.specialization, times);
+				g_compile_totals.disk_permutation_hits.fetch_add(1, std::memory_order_relaxed);
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ProgramDiskHits);
+			}
+		}
+		if (!compiled.has_value()) {
+			obtain_translation();
+			if (disk_on && translated_now && source->disk_record != UINT32_MAX && !plan_checked) {
+				// A source reloaded from disk needed a translation after all (a permutation that
+				// was not stored): compare the stored plan with the fresh one at no extra cost (a
+				// fresh skip-dispatch verdict is handled below).
+				if (!translated.skip_dispatch) {
+					const auto fresh_plan =
+					    ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+					std::vector<uint8_t> encoded;
+					const bool same = ShaderRecompiler::IR::EncodeResourcePlan(fresh_plan, encoded) &&
+					                  std::ranges::equal(encoded, source->disk_plan);
+					NoteDiskVerify(same, "resource plan (checked at a later permutation)", options,
+					               false);
+					if (!same) {
+						disk->Invalidate(source->disk_record);
+					}
+				}
+			}
+			if (translated.skip_dispatch) {
+				return skip_after_all();
+			}
+			auto emitted = EmitPermutation(params, options, std::move(translated),
+			                               prep.specialization, push_data_cursor, key.static_state,
+			                               times);
+			translated_now = false;
+			compiled = FinishPermutation(options, std::move(emitted), prep.specialization, times,
+			                             disk_on ? &words : nullptr);
+			store    = disk_on;
+			if (disk_on) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ProgramDiskMisses);
+			}
+		}
 		lock.lock();
 		// An existing source that had none kept. Anything dropped is freed after the lock.
 		KeepTranslation(*source, std::move(keep), dropped);
@@ -1987,9 +2572,9 @@ struct PipelineCache::ProgramCache {
 		        FindPermutation(*source, prep.specialization, push_data_cursor, true)) {
 			// Only possible when another cursor mapped to the same push-data start (both
 			// NoStart): keep permutations unique and drop this equal copy.
-			device.destroyShaderModule(compiled.handle.module, nullptr);
-			if (compiled.plain.module != nullptr) {
-				device.destroyShaderModule(compiled.plain.module, nullptr);
+			device.destroyShaderModule(compiled->handle.module, nullptr);
+			if (compiled->plain.module != nullptr) {
+				device.destroyShaderModule(compiled->plain.module, nullptr);
 			}
 			Profiler::CountFrameEvent(Profiler::FrameEvent::ProgramCompileDuplicates);
 			FinishInFlight(record);
@@ -2004,16 +2589,56 @@ struct PipelineCache::ProgramCache {
 		const char* reason = source->permutations.Size() == 0 ? "first"
 		                     : same_specialization            ? "push"
 		                                                      : "spec";
-		const auto& permutation = source->permutations.Append(std::move(compiled));
+		const auto& permutation = source->permutations.Append(std::move(*compiled));
 		FinishInFlight(record);
+		lock.unlock();
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderProgramsCreated);
 		if (times.reused) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TranslationReuses);
 		}
-		const auto detail = fmt::format("{}{}", reason, times.reused ? "+reused" : "");
+		times.from_disk   = from_disk;
+		const auto detail = fmt::format("{}{}{}", reason, times.reused ? "+reused" : "",
+		                                from_disk ? "+disk" : "");
 		RecordProgramCompile(ProgramStageName(stage), params.hash, permutation.handle.id, times,
 		                     CompileClockNs() - stall.begin, detail);
 		CountCompiledPermutation(stage);
+		if (from_disk && DiskVerifyMode() == DiskVerify::Background) {
+			BackgroundCheck check;
+			check.stage                   = stage;
+			check.shader_hash             = options.shader_hash;
+			check.wave_size               = options.wave_size;
+			check.user_data_base          = options.user_data_base;
+			check.user_data_count         = static_cast<uint32_t>(options.user_data.size());
+			check.plain_mip_stats_variant = options.plain_mip_stats_variant;
+			check.code                    = std::move(code_words);
+			check.back_code               = std::move(back_code_words);
+			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+				check.vertex = std::make_unique<ShaderVertexInputInfo>(input_info);
+			} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+				check.pixel = std::make_unique<ShaderPixelInputInfo>(input_info);
+			} else {
+				check.compute = std::make_unique<ShaderComputeInputInfo>(input_info);
+			}
+			check.specialization   = permutation.specialization;
+			check.push_data_cursor = push_data_cursor;
+			if (disk_source.has_value() && source->disk_record == disk_source->id) {
+				// The source was reloaded by this compile: check its plan too.
+				check.source_record = disk_source->id;
+				check.stored_plan   = disk_source->plan;
+			}
+			check.permutation_record = reloaded->id;
+			check.stored_info        = reloaded->info;
+			check.stored_spirv       = reloaded->spirv;
+			check.stored_spirv_plain = reloaded->spirv_plain;
+			SubmitBackgroundCheck(std::move(check));
+		}
+		if (store) {
+			// The published permutation is immutable; its metadata is encoded from it.
+			std::vector<uint8_t> info;
+			ShaderRecompiler::IR::EncodeCompiledShaderInfo(permutation.program, info);
+			disk->AddPermutation(disk_key.digest, push_data_cursor, specialization_bytes, info,
+			                     words.spirv, words.spirv_plain);
+		}
 		return publish_index(*source, permutation);
 	}
 
@@ -2533,6 +3158,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	if (m_driver_cache != nullptr && DriverCacheSaveSettings::Get().enabled) {
 		m_saver = std::make_unique<DriverCacheSaver>(*this);
 	}
+	InitializeProgramDiskCache();
 	if (GraphicsPipelineLibrary::Enabled(m_graphics)) {
 		m_library = std::make_unique<LibraryState>(*this);
 		PipelineCacheLog("Graphics pipeline libraries: enabled (fast link, {})",
@@ -2549,7 +3175,17 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 }
 
 PipelineCache::~PipelineCache() {
+	m_program_cache->StopBackgroundChecks();
 	LogCompileTotals();
+	if (m_program_disk != nullptr) {
+		const auto stats = m_program_disk->GetStats();
+		PipelineCacheLog("Program cache: lookups hit {} sources and {} permutations, missed {} and "
+		                 "{}; added {} sources and {} permutations; {} stored records dropped "
+		                 "(verification or damage)",
+		                 stats.source_hits, stats.permutation_hits, stats.source_misses,
+		                 stats.permutation_misses, stats.added_sources, stats.added_permutations,
+		                 stats.invalidated);
+	}
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -2636,6 +3272,60 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
+}
+
+// KYTY_PROGRAM_CACHE=0|1: the persistent translated-program cache (programDiskCache.h), next to
+// the driver cache as _PipelineCache/<title>.programs.bin (KYTY_PROGRAM_CACHE_PATH names another
+// file; tests use it). Default: ProgramDiskCacheDefault. KYTY_PROGRAM_CACHE_SAVE=0: no periodic
+// saves, only the one at exit. KYTY_PROGRAM_CACHE_VERIFY: see ProgramCache::DiskVerifyMode.
+constexpr bool ProgramDiskCacheDefault = false;
+
+void PipelineCache::InitializeProgramDiskCache() {
+	const auto* setting = std::getenv("KYTY_PROGRAM_CACHE");
+	const bool  enabled = setting == nullptr || *setting == '\0' ? ProgramDiskCacheDefault
+	                                                              : std::strcmp(setting, "0") != 0;
+	if (!enabled) {
+		return;
+	}
+	std::filesystem::path path;
+	if (const auto* custom = std::getenv("KYTY_PROGRAM_CACHE_PATH");
+	    custom != nullptr && *custom != '\0') {
+		path = std::filesystem::path(custom);
+	} else {
+		const auto title_id = PipelineCacheTitleId();
+		if (title_id.empty()) {
+			return;
+		}
+		if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+			PipelineCacheLog("Program cache: disabled (non-Release build)");
+			return;
+		}
+		path = std::filesystem::path("_PipelineCache") / (title_id + ".programs.bin");
+	}
+	// The file's identity: the codegen version and runtime codegen state, and the device (its
+	// state that the emitter reads is part of the fingerprint already; the device and driver are
+	// named as well, so that no device-dependent input can be missed).
+	ProgramDiskCache::Settings settings;
+	settings.path           = path;
+	settings.identity       = ShaderRecompiler::CodegenFingerprint();
+	settings.periodic_saves = EnvU64("KYTY_PROGRAM_CACHE_SAVE", 1) != 0;
+	const auto& properties  = m_graphics.GetPhysicalDeviceProperties();
+	const auto  device      = fmt::format("device {:08x}:{:08x}:{:08x}", properties.vendorID,
+	                                      properties.deviceID, properties.driverVersion);
+	settings.identity.insert(settings.identity.end(), device.begin(), device.end());
+	m_program_disk            = std::make_unique<ProgramDiskCache>(std::move(settings));
+	m_program_cache->disk     = m_program_disk.get();
+	PipelineCacheLog("Program cache: enabled ({}; codegen {}{})", Common::PathToString(path),
+	                 ShaderRecompiler::CodegenVersion().substr(0, 16),
+	                 [] {
+		                 switch (ProgramCache::DiskVerifyMode()) {
+			                 case ProgramCache::DiskVerify::Sync: return "; verify";
+			                 case ProgramCache::DiskVerify::SyncExit:
+				                 return "; verify, exit on a difference";
+			                 case ProgramCache::DiskVerify::Background: return "; background verify";
+			                 default: return "";
+		                 }
+	                 }());
 }
 
 // Background saver of the driver pipeline cache. The cache used to be written only by the clean
@@ -2822,6 +3512,11 @@ uint64_t PipelineCache::WriteDriverCache(bool periodic) {
 }
 
 void PipelineCache::Save() {
+	if (m_program_disk != nullptr) {
+		// Pending background checks are dropped; a check never outlives the disk cache.
+		m_program_cache->StopBackgroundChecks();
+		m_program_disk->Flush();
+	}
 	// From here on no periodic save runs, so destroying the driver cache below is safe.
 	if (m_saver != nullptr) {
 		m_saver->Stop();
@@ -2842,6 +3537,20 @@ void PipelineCache::Save() {
 	}
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	m_driver_cache = nullptr;
+}
+
+void PipelineCache::WaitProgramChecks() {
+	m_program_cache->WaitBackgroundChecks();
+}
+
+PipelineCache::ProgramTotals PipelineCache::Totals() {
+	const auto& t = g_compile_totals;
+	return {.programs          = t.programs.load(std::memory_order_relaxed),
+	        .translations      = t.translations.load(std::memory_order_relaxed),
+	        .source_hits       = t.disk_source_hits.load(std::memory_order_relaxed),
+	        .permutation_hits  = t.disk_permutation_hits.load(std::memory_order_relaxed),
+	        .verify_checks     = t.disk_verify_checks.load(std::memory_order_relaxed),
+	        .verify_mismatches = t.disk_verify_mismatches.load(std::memory_order_relaxed)};
 }
 
 bool PipelineDynamicRasterStateEnabled() {

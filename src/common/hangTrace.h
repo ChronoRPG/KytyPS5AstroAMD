@@ -404,6 +404,11 @@ struct CompileEvent {
 	// Programs: copy of a kept translation (reused, translate_ns 0) or of a new one being kept.
 	uint64_t         clone_ns = 0;
 	bool             reused   = false;
+	// Programs, persistent program cache (KYTY_PROGRAM_CACHE): key, lookups and decoding
+	// (compiles.csv load_us), and whether the permutation was reloaded instead of emitted
+	// (translate_ns and emit_ns 0; detail "+disk").
+	uint64_t         load_ns   = 0;
+	bool             from_disk = false;
 };
 void RecordCompile(const CompileEvent& event);
 // A draw or dispatch spent stall_ns in the compile paths (new programs and pipelines, including

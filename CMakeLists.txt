@@ -394,6 +394,48 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${gpu_mesh_indirect_header}")
 
+# Persistent program cache (KYTY_PROGRAM_CACHE, pipeline/programDiskCache.h): the codegen version
+# (recompiler/CodegenFingerprint.h) hashes these files, the code that determines what translating
+# a program produces. src/codegen_version.cmake fails the build when one of them includes a
+# project header outside this set (unless the script exempts it).
+file(GLOB_RECURSE kyty_codegen_sources CONFIGURE_DEPENDS
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.inc"
+)
+list(APPEND kyty_codegen_sources
+	"${KYTY_SOURCE_DIR}/graphics/shader/shader.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderBindings.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderBindings.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderCompiler.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStaticKey.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_defs.h"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.h"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.h"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.cpp"
+)
+list(SORT kyty_codegen_sources)
+string(REPLACE ";" "\n" kyty_codegen_source_lines "${kyty_codegen_sources}")
+file(CONFIGURE OUTPUT "${PROJECT_BINARY_DIR}/kytyCodegenSources.txt"
+	CONTENT "${kyty_codegen_source_lines}\n")
+set(kyty_codegen_header "${PROJECT_BINARY_DIR}/kytyCodegenVersion.h")
+add_custom_command(
+	OUTPUT "${kyty_codegen_header}"
+	COMMAND ${CMAKE_COMMAND}
+	        "-DSOURCE_ROOT=${KYTY_SOURCE_DIR}"
+	        "-DFILE_LIST=${PROJECT_BINARY_DIR}/kytyCodegenSources.txt"
+	        "-DOUTPUT_FILE=${kyty_codegen_header}"
+	        "-DCOMPILER=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_BUILD_TYPE} ${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELEASE}"
+	        -P "${KYTY_SOURCE_DIR}/codegen_version.cmake"
+	DEPENDS ${kyty_codegen_sources} "${PROJECT_BINARY_DIR}/kytyCodegenSources.txt"
+	        "${KYTY_SOURCE_DIR}/codegen_version.cmake"
+	COMMENT "Generate kytyCodegenVersion.h"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${kyty_codegen_header}")
+
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
@@ -1045,6 +1087,40 @@ if(BUILD_TESTING)
 	# KYTY_SRT_VARIANT_READS: loop-variant scalar reads and runtime S_BUFFER_LOAD V#s through BDA.
 	add_test(NAME srt_variant_reads
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srt-variant-only)
+	# KYTY_PROGRAM_CACHE (pipeline/programDiskCache.h): source keys, codegen fingerprint and cache
+	# file (truncation, corruption, identity, verification); programs reloaded from the file
+	# render what translated ones render, with and without verify mode; and the renderer suites
+	# with the cache on and every reloaded program compared with a fresh translation (the files
+	# stay in the build directory, so later runs start warm).
+	add_test(NAME program_cache
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-only)
+	add_test(NAME program_cache_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-gpu-only)
+	add_test(NAME program_cache_gpu_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-gpu-only)
+	set_tests_properties(program_cache_gpu_verify PROPERTIES
+		ENVIRONMENT "KYTY_PROGRAM_CACHE_VERIFY=exit")
+	add_test(NAME program_cache_gpu_background
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-gpu-only)
+	set_tests_properties(program_cache_gpu_background PROPERTIES
+		ENVIRONMENT "KYTY_PROGRAM_CACHE_VERIFY=background")
+	# Verify catches a stored record that differs from a fresh translation, and heals it.
+	add_test(NAME program_cache_verify_tamper
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-tamper-only)
+	set_tests_properties(program_cache_verify_tamper PROPERTIES
+		ENVIRONMENT "KYTY_PROGRAM_CACHE_VERIFY=1")
+	add_test(NAME program_cache_verify_tamper_background
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-tamper-only)
+	set_tests_properties(program_cache_verify_tamper_background PROPERTIES
+		ENVIRONMENT "KYTY_PROGRAM_CACHE_VERIFY=background")
+	add_test(NAME shader_recompiler_compute_program_cache
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(shader_recompiler_compute_program_cache PROPERTIES
+		ENVIRONMENT "KYTY_PROGRAM_CACHE=1;KYTY_PROGRAM_CACHE_PATH=program-cache-suite.bin;KYTY_PROGRAM_CACHE_VERIFY=exit")
+	add_test(NAME draw_prep_engine_program_cache
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_program_cache PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PROGRAM_CACHE=1;KYTY_PROGRAM_CACHE_PATH=program-cache-draw-prep.bin;KYTY_PROGRAM_CACHE_VERIFY=exit")
 
 	# KYTY_CP_RECORDER (renderer/commandRecorder.h): the recorder's own GPU checks (recorder
 	# thread, 1 MiB ring, verify log mode), and the renderer and compute suites with the recorder

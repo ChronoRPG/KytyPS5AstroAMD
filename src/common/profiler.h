@@ -603,6 +603,12 @@ enum class FrameEvent : uint32_t {
 	// KYTY_TRANSLATION_CACHE_VERIFY found different from a fresh one.
 	TranslationReuses,
 	TranslationVerifyMismatches,
+	// Persistent program cache (KYTY_PROGRAM_CACHE): permutations reloaded from disk instead of
+	// translated and emitted, permutations emitted with the cache on (not stored), and
+	// KYTY_PROGRAM_CACHE_VERIFY comparisons that found a stored record different.
+	ProgramDiskHits,
+	ProgramDiskMisses,
+	ProgramDiskVerifyMismatches,
 	// Graphics pipeline libraries (KYTY_PIPELINE_LIBRARY): pipelines fast-linked from libraries,
 	// monolithic pipelines found in the driver cache instead, and libraries created.
 	PipelineLibraryLinks,
@@ -1057,6 +1063,8 @@ enum class FrameWait : uint32_t {
 	ShaderEmit,
 	ShaderValidate,
 	ShaderModuleCreate,
+	// Persistent program cache: key, lookups and decoding of stored plans and permutations.
+	ShaderDiskLoad,
 	// vkCreateGraphicsPipelines alone (nested in GraphicsPipelineCreate), and a whole new compute
 	// pipeline (layouts and vkCreateComputePipelines).
 	GraphicsPipelineDriver,

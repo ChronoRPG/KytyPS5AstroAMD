@@ -352,6 +352,8 @@ struct Totals {
 	std::atomic<uint64_t> pcache_save_overlap_ns {0};
 	std::atomic<uint64_t> compile_translation_reuses {0};
 	std::atomic<uint64_t> compile_clone_ns {0};
+	std::atomic<uint64_t> compile_disk_loads {0};
+	std::atomic<uint64_t> compile_disk_load_ns {0};
 	std::atomic<uint64_t> validate_async {0};
 	std::atomic<uint64_t> validate_async_ns {0};
 	using PerLibraryEvent =
@@ -934,6 +936,9 @@ void Publish() {
 		line += fmt::format(",{},{},{},{}", take(g_totals.apr_grow_reads),
 		                    take(g_totals.apr_shrink_reads),
 		                    take(g_totals.apr_shrink_max_per_flip), stream_bytes >> 20u);
+		// Persistent program cache (appended last so that no existing column moves).
+		line += fmt::format(",{},{}", take(g_totals.compile_disk_loads),
+		                    take(g_totals.compile_disk_load_ns) / 1000u);
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
@@ -1065,11 +1070,14 @@ void Initialize() {
 	// reads between two flips, and the texture-streamer footprint (MiB): streamed-texture
 	// residency changes.
 	summary_header += ",apr_grow_reads,apr_shrink_reads,apr_shrink_max_per_flip,apr_stream_mib";
+	// Persistent program cache (KYTY_PROGRAM_CACHE): permutations reloaded instead of translated
+	// and emitted, and the time their keys, lookups and decoding took.
+	summary_header += ",compile_disk_loads,compile_disk_load_us";
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.compiles = OpenFile("compiles.csv",
 	                            "t_ms,kind,stage,guest_hash,id,id2,origin,translate_us,emit_us,"
 	                            "validate_us,module_us,pipeline_us,total_us,spirv_words,host_tid,"
-	                            "detail,clone_us");
+	                            "detail,clone_us,load_us");
 	g_files.transfers = OpenFile("transfers.csv",
 	                             "t_ms,kind,reason,detail,address,format,width,height,count,bytes,"
 	                             "span_bytes");
@@ -1854,6 +1862,8 @@ void RecordCompile(const CompileEvent& event) {
 			add(g_totals.compile_translate_ns, event.translate_ns);
 			add(g_totals.compile_clone_ns, event.clone_ns);
 			if (event.reused) add(g_totals.compile_translation_reuses, 1);
+			if (event.from_disk) add(g_totals.compile_disk_loads, 1);
+			add(g_totals.compile_disk_load_ns, event.load_ns);
 			add(g_totals.compile_emit_ns, event.emit_ns);
 			add(g_totals.compile_validate_ns, event.validate_ns);
 			add(g_totals.compile_module_ns, event.module_ns);
@@ -1877,13 +1887,14 @@ void RecordCompile(const CompileEvent& event) {
 	const auto origin = static_cast<size_t>(event.origin) < std::size(kPipelineOriginNames)
 	                        ? kPipelineOriginNames[static_cast<size_t>(event.origin)]
 	                        : "";
-	auto row = fmt::format("{},{},{},0x{:016x},{},{},{},{},{},{},{},{},{},{},{},{},{}", NowMs(),
+	auto row = fmt::format("{},{},{},0x{:016x},{},{},{},{},{},{},{},{},{},{},{},{},{},{}", NowMs(),
 	                       kCompileKindNames[static_cast<size_t>(event.kind)],
 	                       event.stage != nullptr ? event.stage : "", event.guest_hash, event.id,
 	                       event.id2, origin, event.translate_ns / 1000u, event.emit_ns / 1000u,
 	                       event.validate_ns / 1000u, event.module_ns / 1000u,
 	                       event.pipeline_ns / 1000u, event.total_ns / 1000u, event.spirv_words,
-	                       OsThreadId(), CsvEscape(event.detail), event.clone_ns / 1000u);
+	                       OsThreadId(), CsvEscape(event.detail), event.clone_ns / 1000u,
+	                       event.load_ns / 1000u);
 	std::scoped_lock lock(g_compile_mutex);
 	if (g_compile_rows_total >= kCompileRowLimit) {
 		return;
