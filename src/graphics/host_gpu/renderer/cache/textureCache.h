@@ -449,6 +449,11 @@ private:
 	int  m_gpu_write_skip_verify = 0;
 	// Why TryMaterializeGpuMetadataClear last refused an image (DccImageState* FrameEvent).
 	Profiler::FrameEvent m_image_state_reason = Profiler::FrameEvent::DccImageStateUnregistered;
+	// Why the last MaterializeDccClear / MaterializeCmaskClear decision was not a provable no-op
+	// (TargetRecordDcc* / TargetRecordCmask* FrameEvents; FindImage counts them for draw-sequence
+	// target records that end invalid). Instrumentation only.
+	Profiler::FrameEvent m_dcc_noop_refusal   = Profiler::FrameEvent::TargetRecordDccGuest;
+	Profiler::FrameEvent m_cmask_noop_refusal = Profiler::FrameEvent::TargetRecordCmaskOther;
 	// KYTY_DCC_GPU_REFRESH (default off; =1 on, needs KYTY_DCC_GPU=1): the native DCC inspection
 	// (TryMaterializeGpuMetadataClear) also accepts a registered, matching, fully resident image
 	// that waits for a refresh (buffer-modified, CPU-dirty) or is not GPU-owned, which the CPU

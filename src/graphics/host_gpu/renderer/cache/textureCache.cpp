@@ -2824,6 +2824,8 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	uint64_t diagnostic_readback = 0;
+	// Why this decision is not a provable no-op (instrumentation; the paths below refine it).
+	m_dcc_noop_refusal = Profiler::FrameEvent::TargetRecordDccGuest;
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
 		// The guest's DCC fast clear is a uniform fill of the metadata. When the whole range still
 		// holds a recorded fill (nothing wrote it since), every slice's code is that byte: no
@@ -2850,9 +2852,12 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 					decided.gpu_range_count = 1;
 					decided.provable        = true;
 					*noop                   = decided;
+				} else {
+					m_dcc_noop_refusal = Profiler::FrameEvent::TargetRecordDccPages;
 				}
 				return; // e.g. 0xFF: not a clear code, nothing to materialize
 			}
+			m_dcc_noop_refusal    = Profiler::FrameEvent::TargetRecordDccClear;
 			const auto slice_size = range.size / layers;
 			for (uint32_t slice = 0; slice < count; slice++) {
 				{
@@ -2873,6 +2878,8 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			const auto outcome = TryMaterializeGpuDccClear(id, desc, metadata_base_layer);
 			const bool native  = outcome == Profiler::FrameEvent::DccGpuRecords ||
 			                    outcome == Profiler::FrameEvent::DccGpuReuses;
+			m_dcc_noop_refusal = native ? Profiler::FrameEvent::TargetRecordDccNative
+			                            : Profiler::FrameEvent::TargetRecordDccFallback;
 			if (!native) {
 				++m_gpu_dcc_fallbacks;
 				Profiler::CountFrameEvent(Profiler::FrameEvent::DccCpuFallbacks);
@@ -3171,7 +3178,11 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		m_buffer_cache.FillBuffer(metadata.address, metadata.size, UINT32_MAX, false);
 		Profiler::CountFrameEvent(Event::CmaskFastClears);
 	}
-	if (std::ranges::find(native, uint8_t {1}) == native.end()) {
+	// Why this decision is not a provable no-op, when it is not (instrumentation).
+	const bool any_native = std::ranges::find(native, uint8_t {1}) != native.end();
+	m_cmask_noop_refusal  = any_native ? Profiler::FrameEvent::TargetRecordCmaskNative
+	                                   : Profiler::FrameEvent::TargetRecordCmaskOther;
+	if (!any_native) {
 		if (provable) {
 			decided.provable = true;
 			*noop            = decided;
@@ -3322,6 +3333,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
+	// Instrumentation: why a record did not become valid before the metadata decisions.
+	auto lookup_refusal = Profiler::FrameEvent::TargetRecordNotFirstPage;
 	{
 		std::scoped_lock lock {m_lock};
 		ImageIds candidates;
@@ -3437,6 +3450,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 			record->exact_format    = exact_format;
 			record->has_partner     = HasAliasPartner(pages.first, result, image);
 			record->valid           = true;
+		} else if (first_page_answer) {
+			lookup_refusal = Profiler::FrameEvent::TargetRecordChanged;
 		}
 	}
 	const bool recording = record != nullptr && record->valid;
@@ -3444,6 +3459,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 	MaterializeCmaskClear(result, desc, metadata_base_layer, recording ? &record->cmask : nullptr);
 	if (recording) {
 		record->valid = record->dcc.provable && record->cmask.provable;
+		if (!record->valid) {
+			Profiler::CountFrameEvent(!record->dcc.provable ? m_dcc_noop_refusal
+			                                                : m_cmask_noop_refusal);
+		}
+	} else if (record != nullptr) {
+		Profiler::CountFrameEvent(lookup_refusal);
 	}
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {

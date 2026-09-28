@@ -12745,6 +12745,11 @@ public:
         auto &executor = context.GetRenderExecutor();
         context.MapMemory(base, allocation_size);
         const auto totals = [&] { return RenderExecutorTestAccess::DrawSequenceTotals(executor); };
+        // Why a target record ends invalid (FrameEvent TargetRecord*, counted per thread).
+        Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Thread);
+        const auto cmask_refusals = [] {
+          return Profiler::FrameEventTotal(Profiler::FrameEvent::TargetRecordCmaskOther);
+        };
 
         // Targets.
         RenderColorInfo color{};
@@ -12764,9 +12769,11 @@ public:
                                              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
                                              clear);
         };
+        const auto r0 = cmask_refusals();
         Require(name, "guest CMASK bytes",
-                lookup() == color.image_id && !record.valid,
-                "a decision that read CMASK bytes in guest memory was recorded as repeatable");
+                lookup() == color.image_id && !record.valid && cmask_refusals() == r0 + one,
+                "a decision that read CMASK bytes in guest memory was recorded as repeatable "
+                "(or not counted as a CMASK refusal)");
 
         // GPU-owned CMASK bytes holding a recorded fill of 0xFFFFFFFF (every tile expanded).
         (void)buffer_cache.ObtainBuffer(cmask_address, cmask_size.size, true);
@@ -12783,11 +12790,14 @@ public:
         paint();
         buffer_cache.FillBuffer(cmask_address, cmask_size.size, 0, false);
         const auto t1 = totals();
+        const auto r1 = cmask_refusals();
         Require(name, "new fill",
                 lookup() == color.image_id && totals().target_repeats == t1.target_repeats &&
                     totals().target_misses == t1.target_misses + one &&
+                    cmask_refusals() == r1 + one &&
                     ReadCachedTexel(name, context, color.image_id) == cleared_texel,
-                "a lookup after a newly recorded fast clear repeated, or did not clear");
+                "a lookup after a newly recorded fast clear repeated, did not clear, or its "
+                "applied clear was not counted as a CMASK refusal");
         // The consumed clear left a recorded fill of 0xFFFFFFFF again.
         (void)lookup();
         paint();
@@ -12828,6 +12838,7 @@ public:
         Require(name, "repeat after the alias left",
                 lookup() == color.image_id && totals().target_repeats == t4.target_repeats + one,
                 "a lookup after the alias was freed did not repeat");
+        Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Off);
 
         // Textures: one stage binding the same texture twice.
         ShaderTextureResource descriptor{{
