@@ -13589,6 +13589,9 @@ public:
       const auto fallbacks = totals.fallbacks.load();
       const auto drains = totals.drains.load();
       const auto kept = totals.register_indirect_kept.load();
+      const auto cert_prebuilt = totals.cert_ranges_prebuilt.load();
+      const auto cert_checks = totals.cert_ranges_verify_checks.load();
+      const auto cert_mismatches = totals.cert_ranges_verify_mismatches.load();
       std::vector<u32> stream(draw.begin(), draw.end());
       stream.insert(stream.end(), load_pixel_shader.begin(), load_pixel_shader.end());
       stream.insert(stream.end(), draw.begin(), draw.end());
@@ -13626,6 +13629,27 @@ public:
                     ", drains " + std::to_string(totals.drains.load() - drains) +
                     "; expected " + std::to_string(window ? 1 : 0) + " and " +
                     std::to_string(window_drains));
+        // KYTY_DRAW_PREP_CERT_RANGES: every committed preparation's log check used the ranges its
+        // preparing thread built (log mode, or the log audit over value certificates); the verify
+        // mode compared each with the commit-time list, without a difference.
+        const auto *audit = std::getenv("KYTY_DRAW_PREP_LOG_AUDIT");
+        const bool log_checked =
+            DrawPrep::GetCertMode() == DrawPrep::CertMode::Log ||
+            (audit != nullptr && *audit != '\0' && std::strcmp(audit, "0") != 0);
+        const uint64_t prebuilt = DrawPrep::CertRangesOnWorker() && log_checked ? commits : 0u;
+        const uint64_t verified = DrawPrep::CertRangesVerifyMode() != 0 ? prebuilt : 0u;
+        Require(name, "certificate ranges",
+                totals.cert_ranges_prebuilt.load() - cert_prebuilt == prebuilt &&
+                    totals.cert_ranges_verify_checks.load() - cert_checks == verified &&
+                    totals.cert_ranges_verify_mismatches.load() - cert_mismatches == 0u,
+                "prebuilt " + std::to_string(totals.cert_ranges_prebuilt.load() - cert_prebuilt) +
+                    ", verified " +
+                    std::to_string(totals.cert_ranges_verify_checks.load() - cert_checks) +
+                    ", mismatches " +
+                    std::to_string(totals.cert_ranges_verify_mismatches.load() -
+                                   cert_mismatches) +
+                    "; expected " + std::to_string(prebuilt) + ", " + std::to_string(verified) +
+                    " and 0");
       }
       RenderExecutorTestAccess::ResetBindings(executor);
       context.UnmapMemory(base, allocation_size);

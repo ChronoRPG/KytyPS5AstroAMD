@@ -31,6 +31,12 @@
 // KYTY_DRAW_PREP_VERIFY=1|exit: after every committed preparation the serial preparation runs
 // on copies and the outputs are compared (logged and counted; "exit" stops on a difference).
 // KYTY_DRAW_PREP_CERT=log (default)|value: see Validate() in drawPrep.cpp.
+// KYTY_DRAW_PREP_CERT_RANGES=worker (default)|commit: where the coherence-log check's merged
+// certificate ranges are built (ReadSet::BuildCertificate). "worker": by the preparing thread,
+// once, after the read set is finished; "commit": by the command processor in Validate, as
+// before (0.41 ms/flip of CP time at the Sky Garden start, U55). The list is a pure function of
+// the finished read set either way. KYTY_DRAW_PREP_CERT_RANGES_VERIFY=1|exit rebuilds it at
+// commit with the commit-time function and compares (DrawPrepCertRangesVerify* events).
 // KYTY_DRAW_PREP_WORKERS (default 6, 1..32), KYTY_DRAW_PREP_WINDOW (default 32 slots, rounded
 // up to a power of two), KYTY_DRAW_PREP_SPIN_US (default 200: how long an idle hot worker spins
 // before parking): parallel mode only.
@@ -59,6 +65,10 @@ enum class CertMode : uint8_t { Value, Log };
 [[nodiscard]] Mode     GetMode();
 [[nodiscard]] int      VerifyMode(); // 0 off, 1 count/log, 2 exit on difference
 [[nodiscard]] CertMode GetCertMode();
+// KYTY_DRAW_PREP_CERT_RANGES: the preparing thread builds the log check's certificate ranges.
+[[nodiscard]] bool CertRangesOnWorker();
+// KYTY_DRAW_PREP_CERT_RANGES_VERIFY: 0 off, 1 count/log, 2 exit on difference.
+[[nodiscard]] int CertRangesVerifyMode();
 // The command processor's per-packet hook (window fences and the S0 histogram) is needed.
 [[nodiscard]] bool PacketHookEnabled();
 // KYTY_DRAW_PREP_REG_INDIRECT_WINDOW (default on; =0 keeps them fences): a SET_*_REG_INDIRECT
@@ -109,6 +119,11 @@ struct Totals {
 	std::atomic<uint64_t> drains {0};                 // Drain calls that found pending draws
 	std::atomic<uint64_t> register_indirect_kept {0}; // SET_*_REG_INDIRECT packets kept in a window
 	std::atomic<Failure>  last_failure {Failure::None};
+	// KYTY_DRAW_PREP_CERT_RANGES: log checks that used the preparing thread's certificate ranges,
+	// and KYTY_DRAW_PREP_CERT_RANGES_VERIFY comparisons and differences.
+	std::atomic<uint64_t> cert_ranges_prebuilt {0};
+	std::atomic<uint64_t> cert_ranges_verify_checks {0};
+	std::atomic<uint64_t> cert_ranges_verify_mismatches {0};
 };
 [[nodiscard]] Totals& GetTotals();
 
@@ -127,6 +142,10 @@ struct PreparedDraw {
 	ReadSet                                             reads;
 	uint64_t                                            coherence_generation  = 0;
 	uint64_t                                            shader_map_generation = 0;
+	// KYTY_DRAW_PREP_CERT_RANGES=worker: reads.BuildCertificate() of a successful preparation,
+	// built by the preparing thread (certificate_built); Validate uses it for the log check.
+	std::vector<Coherence::Range> certificate;
+	bool                          certificate_built = false;
 };
 
 // Whether the draw path would reach its program preparation for a draw with these registers and
