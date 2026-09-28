@@ -97,8 +97,10 @@ namespace Detail {
 // Written once by InstallHooks() before any renderer thread records commands.
 extern bool g_active;
 // The calling thread's innermost and outermost site (see ScopedSite).
-extern thread_local Site* t_site;
-extern thread_local Site* t_scope;
+// constinit: ScopedSite (every KYTY_GPU_OP_SITE scope) reads them without the thread-local
+// initialization guard of an extern thread_local.
+extern constinit thread_local Site* t_site;
+extern constinit thread_local Site* t_scope;
 // Links a site into the published list the first time it is entered.
 void        LinkSite(Site& site) noexcept;
 // ScopedSite's work, for callers that set the calling thread's site themselves (e.g. a thread

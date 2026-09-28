@@ -53,8 +53,8 @@ namespace Libs::Graphics::GpuOpProfiler {
 namespace Detail {
 bool g_active = false;
 // The innermost and outermost KYTY_GPU_OP_SITE of the calling thread (ScopedSite, EnterSite).
-thread_local Site* t_site  = nullptr;
-thread_local Site* t_scope = nullptr;
+constinit thread_local Site* t_site  = nullptr;
+constinit thread_local Site* t_scope = nullptr;
 } // namespace Detail
 
 namespace {

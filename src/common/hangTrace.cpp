@@ -158,6 +158,26 @@ struct PageWriter {
 constexpr const char* kGpuWriteKindNames[] = {"shader-storage", "occlusion-dump", "fill", "copy"};
 std::mutex                                  g_page_writer_mutex;
 std::unordered_map<uint64_t, PageWriter>    g_page_writers;
+// Every change of g_page_writers (NoteGpuWrite updates and clears). A thread's recent ranges below
+// are what the map holds for their pages only while this is still the value after that thread's
+// last update.
+std::atomic<uint64_t> g_page_writer_version {0};
+constexpr size_t      kClearPageWriters = 1'000'000;
+
+// The last ranges this thread noted (NoteGpuWrite), invalidated by its own overlapping or clearing
+// updates.
+struct RecentGpuWrite {
+	uint64_t     first = 0;
+	uint64_t     last  = 0;
+	uint64_t     t_ms  = 0;
+	uint64_t     size  = 0;
+	GpuWriteKind kind  = GpuWriteKind::ShaderStorage;
+	bool         valid = false;
+};
+constinit thread_local std::array<RecentGpuWrite, 8> t_recent_writes {};
+constinit thread_local uint64_t                      t_recent_version    = UINT64_MAX;
+constinit thread_local uint32_t                      t_recent_next       = 0;
+constinit thread_local bool                          t_recent_below_clear = false;
 
 std::mutex               g_readback_mutex;
 std::vector<std::string> g_pending_readback_rows;
@@ -285,6 +305,21 @@ std::vector<std::string> g_pending_watch_rows;
 std::array<std::atomic<uint32_t>, 256> g_tex_count {};
 std::array<std::atomic<uint64_t>, 256> g_tex_base {};
 std::array<std::atomic<uint32_t>, 256> g_tex_info {};
+// RecordTexture's per-thread counts (Detail::TextureTally), newest first.
+std::atomic<Detail::TextureTally*> g_texture_tallies {nullptr};
+
+// Textures resolved since the previous call, over every recording thread (the publisher only).
+uint64_t TakeTexturesResolved() {
+	static uint64_t published = 0;
+	uint64_t        sum       = 0;
+	for (auto* tally = g_texture_tallies.load(std::memory_order_acquire); tally != nullptr;
+	     tally       = tally->next) {
+		sum += tally->resolved.load(std::memory_order_relaxed);
+	}
+	const auto delta = sum - published;
+	published        = sum;
+	return delta;
+}
 
 struct Totals {
 	std::atomic<uint64_t> flips {0};
@@ -299,7 +334,6 @@ struct Totals {
 	std::atomic<uint64_t> pending_ops_max {0};
 	std::atomic<uint64_t> lod_packets {0};
 	std::atomic<uint64_t> lod_prior_nonzero {0};
-	std::atomic<uint64_t> tex_total {0};
 	std::atomic<uint64_t> tex_mipstats {0};
 	std::atomic<uint64_t> done_waits {0};
 	std::atomic<uint64_t> done_ns {0};
@@ -838,7 +872,7 @@ void Publish() {
 		const auto apr_errors  = take(g_totals.apr_errors);
 		const auto lod         = take(g_totals.lod_packets);
 		const auto lod_prior   = take(g_totals.lod_prior_nonzero);
-		const auto tex_total   = take(g_totals.tex_total);
+		const auto tex_total   = TakeTexturesResolved();
 		const auto tex_mip     = take(g_totals.tex_mipstats);
 		const auto done_n      = take(g_totals.done_waits);
 		const auto done_ns     = take(g_totals.done_ns);
@@ -1503,14 +1537,20 @@ bool HandleLodWatchFault(uint64_t fault_vaddr, bool write, uint64_t pc, const ui
 #endif
 }
 
-void RecordTexture(const uint32_t* fields) {
-	if (!Enabled()) {
-		return;
-	}
-	g_totals.tex_total.fetch_add(1, std::memory_order_relaxed);
-	if (((fields[5] >> 25u) & 1u) == 0) {
-		return;
-	}
+constinit thread_local Detail::TextureTally* Detail::t_texture_tally = nullptr;
+
+Detail::TextureTally& Detail::AcquireTextureTally() noexcept {
+	auto* tally = new TextureTally;
+	auto* head  = g_texture_tallies.load(std::memory_order_relaxed);
+	do {
+		tally->next = head;
+	} while (!g_texture_tallies.compare_exchange_weak(head, tally, std::memory_order_release,
+	                                                  std::memory_order_relaxed));
+	t_texture_tally = tally;
+	return *tally;
+}
+
+void Detail::RecordMipStatsTexture(const uint32_t* fields) noexcept {
 	g_totals.tex_mipstats.fetch_add(1, std::memory_order_relaxed);
 	const auto id   = fields[6] & 0xffu;
 	const auto base = ((fields[0] | (static_cast<uint64_t>(fields[1]) << 32u)) & 0xFFFFFFFFFFull)
@@ -1639,19 +1679,56 @@ void NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	const PageWriter writer {NowMs(), size, g_gpu_write_kind};
 	const auto       first = vaddr >> 12u;
 	const auto       last  = (vaddr + size - 1) >> 12u;
+	// The same range again (every draw notes its writable bindings) within the same millisecond:
+	// if the map has not changed since this thread's last update, it already holds exactly these
+	// values for these pages, so the update would change nothing. Not below the clearing size:
+	// that update would clear the map.
+	if (t_recent_below_clear &&
+	    g_page_writer_version.load(std::memory_order_acquire) == t_recent_version) {
+		for (const auto& recent: t_recent_writes) {
+			if (recent.valid && recent.first == first && recent.last == last &&
+			    recent.t_ms == writer.t_ms && recent.size == size && recent.kind == writer.kind) {
+				return;
+			}
+		}
+	}
 	std::scoped_lock lock(g_page_writer_mutex);
-	if (g_page_writers.size() > 1'000'000) {
+	const bool       cleared = g_page_writers.size() > kClearPageWriters;
+	if (cleared) {
 		g_page_writers.clear();
 	}
 	// Large writable bindings: note only their first and last pages (sync pages are small).
 	if (last - first > 64) {
 		g_page_writers[first] = writer;
 		g_page_writers[last]  = writer;
-		return;
+	} else {
+		for (auto page = first; page <= last; page++) {
+			g_page_writers[page] = writer;
+		}
 	}
-	for (auto page = first; page <= last; page++) {
-		g_page_writers[page] = writer;
+	const auto version = g_page_writer_version.load(std::memory_order_relaxed) + 1;
+	g_page_writer_version.store(version, std::memory_order_release);
+	for (auto& recent: t_recent_writes) {
+		// This update cleared the map or overwrote some of the range's pages, or another thread
+		// changed the map since this thread's last update.
+		if (cleared || t_recent_version + 1 != version ||
+		    (recent.first <= last && first <= recent.last)) {
+			recent.valid = false;
+		}
 	}
+	t_recent_writes[t_recent_next++ % t_recent_writes.size()] = {first, last, writer.t_ms, size,
+	                                                             writer.kind, true};
+	t_recent_version     = version;
+	t_recent_below_clear = g_page_writers.size() <= kClearPageWriters;
+}
+
+GpuPageWriter PageWriterForTest(uint64_t vaddr) {
+	std::scoped_lock lock(g_page_writer_mutex);
+	const auto       it = g_page_writers.find(vaddr >> 12u);
+	if (it == g_page_writers.end()) {
+		return {};
+	}
+	return {true, it->second.t_ms, it->second.size, it->second.kind};
 }
 
 const char* LastGpuWriteKind(uint64_t vaddr) {

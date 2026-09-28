@@ -55,18 +55,26 @@ public:
 	ScopedBlock& operator=(const ScopedBlock&) = delete;
 	ScopedBlock(ScopedBlock&&)                 = delete;
 	ScopedBlock& operator=(ScopedBlock&&)      = delete;
+	// Always inlined: one flag test per scope (with zones off it is the whole cost).
+#if defined(__clang__) || defined(__GNUC__)
+	__attribute__((always_inline))
+#endif
 	~ScopedBlock() {
-		if (m_zone.has_value()) [[unlikely]] {
+		if (m_active) [[unlikely]] {
 			End();
 		}
 	}
 
-	void End();
+	void End() noexcept;
 
 private:
 	void Begin(const tracy::SourceLocationData* source_location);
 
-	std::optional<tracy::ScopedZone> m_zone;
+	// The zone, constructed in place by Begin while zones are on. Not a std::optional: its
+	// destructor would inline Tracy's zone-end code into every scope, so compilers kept this
+	// destructor out of line (a call per scope with zones off).
+	alignas(tracy::ScopedZone) unsigned char m_zone[sizeof(tracy::ScopedZone)];
+	bool m_active = false;
 };
 
 void EndBlock();
@@ -1128,7 +1136,9 @@ struct alignas(64) ThreadCounters {
 	std::atomic<bool>                                    in_use {false};
 	ThreadCounters*                                      next = nullptr; // registry, immutable
 };
-extern thread_local ThreadCounters* t_counters;
+// constinit: other translation units read it directly, without the thread-local initialization
+// guard an extern thread_local otherwise needs (which kept CurrentThreadCounters out of line).
+extern constinit thread_local ThreadCounters* t_counters;
 // Registers the calling thread's block (reusing a released one) and sets t_counters.
 [[nodiscard]] ThreadCounters& AcquireThreadCounters() noexcept;
 [[nodiscard]] inline ThreadCounters& CurrentThreadCounters() noexcept {
