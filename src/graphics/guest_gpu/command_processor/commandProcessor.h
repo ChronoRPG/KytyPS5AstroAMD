@@ -286,6 +286,8 @@ private:
 		void operator()(DrawPrep::Engine* engine) const noexcept;
 	};
 	std::unique_ptr<DrawPrep::Engine, DrawPrepDeleter> m_draw_prep;
+	// Packets processed, for the CP's placement samples (common/cpuPlacement.h).
+	uint32_t m_placement_packets = 0;
 };
 
 } // namespace Libs::Graphics

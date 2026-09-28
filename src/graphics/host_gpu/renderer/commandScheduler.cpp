@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/cpuPlacement.h"
+#include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
@@ -17,6 +19,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <thread>
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -264,6 +271,30 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
+	PopOperations(true);
+}
+
+// KYTY_PENDING_OPS_NOWAIT (default on; =0 waits as PopPendingOperations does).
+static bool PendingOpsNoWait() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PENDING_OPS_NOWAIT");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+void CommandScheduler::PopReadyOperations() {
+	PopOperations(!PendingOpsNoWait());
+}
+
+bool CommandScheduler::PriorityDoneLocked(uint64_t tick) const noexcept {
+	const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
+	const bool queued_before_or_at =
+	    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
+	return !active_before_or_at && !queued_before_or_at;
+}
+
+void CommandScheduler::PopOperations(bool wait_for_priority) {
 	if (Common::RendererBatchEnabled()) {
 		uint64_t first_tick = 0;
 		{
@@ -286,10 +317,24 @@ void CommandScheduler::PopPendingOperations() {
 			    !m_master.IsFree(m_pending_operations.front().tick)) {
 				return;
 			}
+			if (!wait_for_priority && !PriorityDoneLocked(m_pending_operations.front().tick)) {
+				// The runner has not finished this tick's priority operations. Leave this operation
+				// and the ones after it queued, in order: a later pop runs them, and every blocking
+				// pop (Finish, the fault manager) waits as before.
+				Profiler::CountFrameEvent(Profiler::FrameEvent::PendingOpsDeferred);
+				Profiler::CountFrameEvent(Profiler::FrameEvent::PendingOpsDeferredDepth,
+				                          m_pending_operations.size());
+				HangTrace::NotePendingOperations(m_pending_operations.size());
+				return;
+			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
 		}
-		WaitPriorityOperations(operation.tick);
+		if (wait_for_priority) {
+			WaitPriorityOperations(operation.tick);
+		}
+		// Without waiting, the priority operations of this tick and earlier are done: new ones
+		// carry the recording tick, which is later than any completed one.
 		RunOperation(std::move(operation.callback));
 	}
 }
@@ -376,9 +421,10 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 	// It blocks on the operation queue and on the timeline semaphore; the CP waits for it
 	// (WaitPriorityOperations) and so does the guest (end-of-pipe interrupts, flips, readbacks).
 	Common::RaiseServiceThreadPriority();
-	const bool batched       = PriorityWakeupsBatched();
-	bool       has_previous  = false;
-	uint64_t   previous_tick = 0;
+	const bool batched         = PriorityWakeupsBatched();
+	bool       has_previous    = false;
+	uint64_t   previous_tick   = 0;
+	uint32_t   placement_count = 0; // placement samples (common/cpuPlacement.h), every 16th
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		ProgressHook     hook         = nullptr;
@@ -389,6 +435,9 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 				has_previous           = false;
 				m_priority_active      = false;
 				m_priority_active_tick = 0;
+				// After the state change, under the lock: a spinning waiter that sees the new
+				// value and then takes the lock finds the operation finished.
+				m_priority_progress.fetch_add(1, std::memory_order_release);
 				// Waiters need every operation of their tick done. Wake them when the next queued
 				// operation belongs to a later tick or the queue is empty, and only if any wait.
 				const bool tick_done = m_priority_operations.empty() ||
@@ -417,6 +466,9 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 			Profiler::CountFrameEvent(Profiler::FrameEvent::PriorityOperationsRun);
+			if ((++placement_count & 15u) == 0u) {
+				Common::SamplePlacement(Common::ThreadRole::Host);
+			}
 			// Still marked active: an owner clearing the hook and then draining this runner
 			// never races with this call.
 			if (hook != nullptr) {
@@ -431,6 +483,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			std::lock_guard lock(m_operation_mutex);
 			m_priority_active      = false;
 			m_priority_active_tick = 0;
+			m_priority_progress.fetch_add(1, std::memory_order_release);
 		}
 		m_operation_available.notify_all();
 	}
@@ -445,16 +498,57 @@ void CommandScheduler::DrainPriorityOperations() {
 	--m_priority_waiters;
 }
 
+// KYTY_PRIORITY_WAIT_SPIN_US (default 0): WaitPriorityOperations spins this long before blocking.
+static uint64_t PriorityWaitSpinNs() {
+	static const uint64_t spin_ns = [] {
+		const auto* value = std::getenv("KYTY_PRIORITY_WAIT_SPIN_US");
+		const auto  us    = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+		return std::min<unsigned long long>(us, 100'000ull) * 1000u;
+	}();
+	return spin_ns;
+}
+
+static void PriorityWaitRelax() {
+#if defined(_M_X64) || defined(__x86_64__)
+	_mm_pause();
+#else
+	std::this_thread::yield();
+#endif
+}
+
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
+	if (PriorityDoneLocked(tick)) {
+		return;
+	}
+	if (const auto spin_ns = PriorityWaitSpinNs(); spin_ns != 0) {
+		// Spin on the runner's progress counter and take the lock only when it moves: the
+		// runner needs the lock to finish each operation.
+		Profiler::CountFrameEvent(Profiler::FrameEvent::PriorityWaitSpins);
+		auto       seen  = m_priority_progress.load(std::memory_order_acquire);
+		const auto start = GpuTiming::NowNs();
+		lock.unlock();
+		for (uint32_t spins = 1;; spins++) {
+			PriorityWaitRelax();
+			if (const auto progress = m_priority_progress.load(std::memory_order_acquire);
+			    progress != seen) {
+				seen = progress;
+				lock.lock();
+				if (PriorityDoneLocked(tick)) {
+					Profiler::CountFrameEvent(Profiler::FrameEvent::PriorityWaitSpinHits);
+					return;
+				}
+				lock.unlock();
+			}
+			if ((spins & 63u) == 0u && GpuTiming::NowNs() - start > spin_ns) {
+				break;
+			}
+		}
+		lock.lock();
+	}
 	++m_priority_waiters;
-	m_operation_available.wait(lock, [this, tick] {
-		const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
-		const bool queued_before_or_at =
-		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
-		return !active_before_or_at && !queued_before_or_at;
-	});
+	m_operation_available.wait(lock, [this, tick] { return PriorityDoneLocked(tick); });
 	--m_priority_waiters;
 }
 

@@ -2359,7 +2359,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::DrainPendingOperations");
-		m_context.GetCommandScheduler().PopPendingOperations();
+		m_context.GetCommandScheduler().PopReadyOperations();
 	}
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
@@ -2482,7 +2482,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::DrainPendingOperations");
-		m_context.GetCommandScheduler().PopPendingOperations();
+		m_context.GetCommandScheduler().PopReadyOperations();
 	}
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
@@ -2632,7 +2632,7 @@ bool RenderExecutor::DrawIndirectNative(uint64_t submit_id, CommandBuffer& buffe
 
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::DrainPendingOperations");
-		m_context.GetCommandScheduler().PopPendingOperations();
+		m_context.GetCommandScheduler().PopReadyOperations();
 	}
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();

@@ -984,6 +984,28 @@ enum class FrameEvent : uint32_t {
 	WrittenSyncSkips,
 	WrittenSyncSkipVerifyChecks,
 	WrittenSyncSkipVerifyMismatches,
+	// KYTY_PENDING_OPS_NOWAIT: draw/dispatch pops that left completed operations queued because
+	// the priority runner had not finished their tick, and the queue depth summed over them.
+	PendingOpsDeferred,
+	PendingOpsDeferredDepth,
+	// KYTY_PRIORITY_WAIT_SPIN_US: WaitPriorityOperations spins, and spins that saw the wait end.
+	PriorityWaitSpins,
+	PriorityWaitSpinHits,
+	// Placement samples (cpuPlacement.h): the CP, and off its reserved core; guest threads, and on
+	// the physical core of the CP's latest sample; draw-prep workers and service threads, and on
+	// that core; the recorder off its reserved core (cp+recorder). Threads found with a hard affinity
+	// other than the process's, those confined to reserved cores, and those moved to the general
+	// processors (KYTY_CPU_RESERVE_REPIN), each thread counted once.
+	CpuPlacementCpSamples,
+	CpuPlacementCpOffCore,
+	CpuPlacementGuestSamples,
+	CpuPlacementGuestOnCpCore,
+	CpuPlacementHostSamples,
+	CpuPlacementHostOnCpCore,
+	CpuPlacementRecorderOffCore,
+	CpuPlacementHardAffinity,
+	CpuPlacementHardAffinityReserved,
+	CpuPlacementRepinned,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip
