@@ -670,6 +670,9 @@ add_executable(image_cache_gc_policy_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(image_cache_gc_policy_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+add_executable(host_input_pulse_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/HostInputPulseTests.cpp")
+target_include_directories(host_input_pulse_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(eop_timestamp_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EopTimestampTests.cpp"
 )
@@ -782,6 +785,7 @@ if(BUILD_TESTING)
 	add_test(NAME ampr_counter_bank COMMAND $<TARGET_FILE:ampr_counter_bank_tests>)
 	add_test(NAME draw_prep COMMAND $<TARGET_FILE:draw_prep_tests>)
 	add_test(NAME eop_timestamp COMMAND $<TARGET_FILE:eop_timestamp_tests>)
+	add_test(NAME host_input_pulse COMMAND $<TARGET_FILE:host_input_pulse_tests>)
 	add_test(NAME repeat_trace COMMAND $<TARGET_FILE:repeat_trace_tests>)
 	add_test(NAME binding_path COMMAND $<TARGET_FILE:binding_path_tests>)
 	add_test(NAME cp_recorder COMMAND $<TARGET_FILE:cp_recorder_tests>)

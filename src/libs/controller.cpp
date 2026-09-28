@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/hostInputTrace.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -283,8 +285,17 @@ void EmergencyShutdown() {
 	}
 }
 
+static bool HostInputOnly() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_HOST_INPUT_ONLY");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 void GameController::Connect(int id) {
 	Common::LockGuard lock(m_mutex);
+	if (HostInputOnly() && id != HOST_INPUT_CONTROLLER_ID) { return; }
 
 	if (std::find(m_connected_ids.begin(), m_connected_ids.end(), id) != m_connected_ids.end()) {
 		return;
@@ -309,6 +320,8 @@ void GameController::Connect(int id) {
 
 void GameController::Disconnect(int id) {
 	Common::LockGuard lock(m_mutex);
+	// An ignored pad can still emit its SDL removal event.
+	if (HostInputOnly() && id != HOST_INPUT_CONTROLLER_ID) { return; }
 
 	const auto it = std::find(m_connected_ids.begin(), m_connected_ids.end(), id);
 	EXIT_IF(it == m_connected_ids.end());
@@ -384,6 +397,7 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
 		EXIT_IF(axis_id < 0 || axis_id >= static_cast<int>(Controller::Axis::AxisMax));
 
 		m_state.axes[axis_id] = value;
+		Common::HostInputTrace("axis", id, axis_id, value);
 
 		uint32_t trigger = 0;
 		if (axis == Controller::Axis::TriggerLeft) {
