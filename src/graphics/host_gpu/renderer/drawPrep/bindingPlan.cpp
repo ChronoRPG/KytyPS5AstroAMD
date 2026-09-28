@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -337,11 +338,14 @@ void PlanStatics(const RegisterSnapshot& registers, const PreparedDraw& prepared
 	plan.written_valid = false;
 	if (TextureCache::AliasBytesEnabled()) {
 		const auto& outputs = vertex_program.info.outputs;
-		plan.written        = DrawScissorUnion(
-            registers.context, std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
-                return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
-            }));
-		plan.written_valid = true;
+		// Quiet: an unsupported clip-rect rule is left to the command processor, which logs it.
+		plan.written_valid = DrawScissorUnionQuiet(
+		    registers.context,
+		    std::any_of(outputs.begin(), outputs.end(),
+		                [](const auto& output) {
+			                return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+		                }),
+		    plan.written);
 	}
 	plan.statics_valid = true;
 }
@@ -414,9 +418,14 @@ uint32_t BindingParts() {
 					result |= static_cast<uint32_t>(BindingPart::Textures);
 				} else if (name == "statics") {
 					result |= static_cast<uint32_t>(BindingPart::Statics);
+				} else if (name == "hwcheck") {
+					result |= static_cast<uint32_t>(BindingPart::HwCheck);
+				} else if (name == "dynamic") {
+					result |= static_cast<uint32_t>(BindingPart::Dynamic);
 				} else if (!name.empty()) {
 					EXIT("KYTY_DRAW_PREP_BINDINGS: unknown part '%.*s' (expected 0, 1 or a list of "
-					     "pipeline, buffers, userdata, samplers, textures, statics)\n",
+					     "pipeline, buffers, userdata, samplers, textures, statics, hwcheck, "
+					     "dynamic)\n",
 					     static_cast<int>(name.size()), name.data());
 				}
 			}
@@ -536,6 +545,19 @@ void ComputeBindingPlan(const BindingPlanContext& context, const RegisterSnapsho
 	}
 	if (BindingPartEnabled(parts, BindingPart::Pipeline)) {
 		PlanPipeline(context, registers, index_args, prepared, plan);
+	}
+	if (BindingPartEnabled(parts, BindingPart::HwCheck)) {
+		plan.hw_checks_quiet = hw_checks_quiet(registers.context, registers.user_config);
+	}
+	if (BindingPartEnabled(parts, BindingPart::Dynamic)) {
+		const auto& outputs = vertex_program.info.outputs;
+		(void)PlanDynamicViewports(
+		    registers.context, context.graphics->GetPhysicalDeviceProperties().limits,
+		    std::any_of(outputs.begin(), outputs.end(),
+		                [](const auto& output) {
+			                return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+		                }),
+		    plan.viewports);
 	}
 	plan.valid = true;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepBindingPlans);

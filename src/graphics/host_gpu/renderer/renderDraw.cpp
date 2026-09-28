@@ -442,7 +442,10 @@ private:
 // The union of the scissors a draw rasterizes with (SetGraphicsDynamicParams), not yet clamped to
 // the framebuffer: every pixel the draw can write lies inside it (KYTY_ALIAS_BYTES claims only
 // the render-target blocks under it).
-vk::Rect2D DrawScissorUnion(const HW::Context& ctx, bool indexed_viewports) {
+// quiet: on a draw-prep thread, where calc_final_scissor must not log: false for a clip-rect rule
+// it does not support (the command processor computes the union then, logging it).
+static bool ScissorUnion(const HW::Context& ctx, bool indexed_viewports, bool quiet,
+                         vk::Rect2D& result) {
 	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
 	const auto&        vp             = ctx.GetScreenViewport();
 	const vk::Extent2D unbounded {16384, 16384};
@@ -454,7 +457,15 @@ vk::Rect2D DrawScissorUnion(const HW::Context& ctx, bool indexed_viewports) {
 		if (!ctx.GetClipControl().clip_disable && vp.viewports[i].xscale == 0.0f) {
 			continue; // an empty slot: zero scissor
 		}
-		const auto scissor = calc_final_scissor(vp, ctx.GetScanModeControl(), unbounded, i);
+		ScissorRect scissor;
+		if (quiet) {
+			if (!calc_scissor_unclamped(vp, ctx.GetScanModeControl(), i, scissor)) {
+				return false;
+			}
+			scissor = clamp_scissor(scissor, unbounded);
+		} else {
+			scissor = calc_final_scissor(vp, ctx.GetScanModeControl(), unbounded, i);
+		}
 		if (scissor.right <= scissor.left || scissor.bottom <= scissor.top) {
 			continue;
 		}
@@ -464,58 +475,136 @@ vk::Rect2D DrawScissorUnion(const HW::Context& ctx, bool indexed_viewports) {
 		bottom = std::max<int64_t>(bottom, scissor.bottom);
 	}
 	if (right <= left || bottom <= top) {
-		return {};
+		result = {};
+		return true;
 	}
-	return {{static_cast<int32_t>(left), static_cast<int32_t>(top)},
-	        {static_cast<uint32_t>(right - left), static_cast<uint32_t>(bottom - top)}};
+	result = {{static_cast<int32_t>(left), static_cast<int32_t>(top)},
+	          {static_cast<uint32_t>(right - left), static_cast<uint32_t>(bottom - top)}};
+	return true;
 }
 
+vk::Rect2D DrawScissorUnion(const HW::Context& ctx, bool indexed_viewports) {
+	vk::Rect2D result {};
+	(void)ScissorUnion(ctx, indexed_viewports, false, result);
+	return result;
+}
+
+bool DrawScissorUnionQuiet(const HW::Context& ctx, bool indexed_viewports, vk::Rect2D& result) {
+	return ScissorUnion(ctx, indexed_viewports, true, result);
+}
+
+// SetGraphicsDynamicParams' viewport for slot `i`, before an empty slot's width is made positive.
+static vk::Viewport MakeDynamicViewport(const HW::Context& ctx, const vk::PhysicalDeviceLimits& limits,
+                                        uint32_t i) {
+	const auto&  guest = ctx.GetScreenViewport().viewports[i];
+	vk::Viewport viewport {};
+	if (ctx.GetClipControl().clip_disable) {
+		viewport.width  = static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u));
+		viewport.height = static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u));
+	} else {
+		viewport.x      = guest.xoffset - guest.xscale;
+		viewport.y      = guest.yoffset - guest.yscale;
+		viewport.width  = guest.xscale * 2.0f;
+		viewport.height = guest.yscale * 2.0f;
+	}
+	viewport.minDepth = guest.zoffset - (ctx.GetClipControl().dx_clip_space ? 0.0f : guest.zscale);
+	viewport.maxDepth = guest.zscale + guest.zoffset;
+	return viewport;
+}
+
+bool DrawPrep::PlanDynamicViewports(const HW::Context& ctx, const vk::PhysicalDeviceLimits& limits,
+                                    bool indexed_viewports, DynamicViewportPlan& plan) {
+	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
+	static_assert(viewport_slots <= DynamicViewportPlan::MaxViewports);
+	plan.valid      = false;
+	plan.count      = indexed_viewports ? viewport_slots : 1;
+	plan.empty_mask = 0;
+	for (uint32_t i = 0; i < plan.count; i++) {
+		auto& viewport = plan.viewports[i];
+		viewport       = MakeDynamicViewport(ctx, limits, i);
+		if (!calc_scissor_unclamped(ctx.GetScreenViewport(), ctx.GetScanModeControl(), i,
+		                            plan.scissors[i])) {
+			return false;
+		}
+		if (viewport.width == 0.0f) {
+			viewport.width = 1.0f;
+			plan.empty_mask |= 1u << i;
+		}
+	}
+	plan.valid = true;
+	return true;
+}
+
+// planned: the viewports and unclamped scissors of the draw's binding plan (KYTY_DRAW_PREP_BINDINGS
+// dynamic, computed from the same registers and vertex program), or null.
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandSink& vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
                                      const RenderDepthInfo& depth, const RenderState& rendering,
-                                     GraphicsDynamicStateShadow& shadow) {
+                                     GraphicsDynamicStateShadow&            shadow,
+                                     const DrawPrep::DynamicViewportPlan* planned) {
 	KYTY_PROFILER_FUNCTION();
 	DynamicStateRecorder recorder(shadow, buffer, vk_buffer.Identity());
 
 	const auto& ctx = buffer.GetRegisters();
 	const auto&        vp  = ctx.GetScreenViewport();
 	const vk::Extent2D framebuffer_extent {rendering.width, rendering.height};
-	const auto& outputs = vs_input_info.stage.program->info.outputs;
-	const bool  indexed_viewports =
-	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
-		    return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
-	    });
 	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
 	std::array<vk::Viewport, viewport_slots> viewports {};
 	std::array<vk::Rect2D, viewport_slots>   scissors {};
-	const uint32_t viewport_count = indexed_viewports ? viewport_slots : 1;
-	for (uint32_t i = 0; i < viewport_count; i++) {
-		const auto& guest    = vp.viewports[i];
-		auto&       viewport = viewports[i];
-		if (ctx.GetClipControl().clip_disable) {
-			const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
-			viewport.width  = static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u));
-			viewport.height = static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u));
-		} else {
-			viewport.x      = guest.xoffset - guest.xscale;
-			viewport.y      = guest.yoffset - guest.yscale;
-			viewport.width  = guest.xscale * 2.0f;
-			viewport.height = guest.yscale * 2.0f;
+	const auto scissor_rect = [](const ScissorRect& final_scissor) {
+		return vk::Rect2D {{final_scissor.left, final_scissor.top},
+		                   {static_cast<uint32_t>(final_scissor.right - final_scissor.left),
+		                    static_cast<uint32_t>(final_scissor.bottom - final_scissor.top)}};
+	};
+	const bool verify = planned != nullptr && DrawPrep::BindingsVerifyMode() != 0;
+	uint32_t   viewport_count = 0;
+	if (planned != nullptr && !verify) {
+		viewport_count = planned->count;
+		for (uint32_t i = 0; i < viewport_count; i++) {
+			viewports[i] = planned->viewports[i];
+			scissors[i]  = scissor_rect(clamp_scissor(planned->scissors[i], framebuffer_extent));
+			if ((planned->empty_mask & (1u << i)) != 0) {
+				scissors[i].extent = vk::Extent2D {0, 0};
+			}
 		}
-		viewport.minDepth =
-		    guest.zoffset - (ctx.GetClipControl().dx_clip_space ? 0.0f : guest.zscale);
-		viewport.maxDepth = guest.zscale + guest.zoffset;
+		DrawPrep::GetBindingTotals().viewports_used.fetch_add(1, std::memory_order_relaxed);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepBindingViewportsUsed);
+	} else {
+		const auto& outputs = vs_input_info.stage.program->info.outputs;
+		const bool  indexed_viewports =
+		    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
+			    return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+		    });
+		viewport_count = indexed_viewports ? viewport_slots : 1;
+		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
+		for (uint32_t i = 0; i < viewport_count; i++) {
+			auto& viewport = viewports[i];
+			viewport       = MakeDynamicViewport(ctx, limits, i);
 
-		const auto final_scissor =
-		    calc_final_scissor(vp, ctx.GetScanModeControl(), framebuffer_extent, i);
-		auto& scissor  = scissors[i];
-		scissor.offset = {final_scissor.left, final_scissor.top};
-		scissor.extent = {static_cast<uint32_t>(final_scissor.right - final_scissor.left),
-		                  static_cast<uint32_t>(final_scissor.bottom - final_scissor.top)};
-		if (viewport.width == 0.0f) {
-			// Keep empty slots at their guest index; Vulkan requires a positive viewport width.
-			viewport.width = 1.0f;
-			scissor.extent = {0, 0};
+			const auto final_scissor =
+			    calc_final_scissor(vp, ctx.GetScanModeControl(), framebuffer_extent, i);
+			auto& scissor = scissors[i];
+			scissor       = scissor_rect(final_scissor);
+			if (viewport.width == 0.0f) {
+				// Keep empty slots at their guest index; Vulkan requires a positive viewport width.
+				viewport.width = 1.0f;
+				scissor.extent = vk::Extent2D {0, 0};
+			}
+		}
+		if (verify) {
+			DrawPrep::CountBindingVerifyCheck();
+			bool same = planned->count == viewport_count;
+			for (uint32_t i = 0; same && i < viewport_count; i++) {
+				auto scissor = scissor_rect(clamp_scissor(planned->scissors[i], framebuffer_extent));
+				if ((planned->empty_mask & (1u << i)) != 0) {
+					scissor.extent = vk::Extent2D {0, 0};
+				}
+				same = std::memcmp(&planned->viewports[i], &viewports[i], sizeof(vk::Viewport)) == 0 &&
+				       std::memcmp(&scissor, &scissors[i], sizeof(vk::Rect2D)) == 0;
+			}
+			if (!same) {
+				DrawPrep::ReportBindingMismatch("dynamic viewports", viewport_count);
+			}
 		}
 	}
 	static_assert(viewport_slots <= GraphicsDynamicStateShadow::MaxViewports);
@@ -674,6 +763,28 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandS
 		}
 	}
 #endif
+}
+
+// uc_check and hw_check of DrawIndex/DrawAuto. KYTY_DRAW_PREP_BINDINGS hwcheck: skipped when the
+// committed draw's binding plan found they would neither stop the emulator nor log for these
+// registers, the draw's snapshot bound for its commit (the verdict needs no validated
+// preparation: it is a function of the registers and of log state that only moves one way).
+static void RunDrawChecks(const CommandBuffer& buffer, const HW::UserConfig& ucfg,
+                          const DrawPrep::BindingPlan* plan) {
+	if (plan != nullptr && plan->hw_checks_quiet) {
+		if (DrawPrep::BindingsVerifyMode() == 0) {
+			DrawPrep::GetBindingTotals().hw_checks_skipped.fetch_add(1, std::memory_order_relaxed);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepBindingHwChecksSkipped);
+			return;
+		}
+		DrawPrep::CountBindingVerifyCheck();
+		if (!hw_checks_quiet(buffer.GetRegisters(), ucfg)) {
+			DrawPrep::ReportBindingMismatch("hw checks");
+		}
+	}
+	uc_check(ucfg);
+
+	hw_check(buffer);
 }
 
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
@@ -2385,7 +2496,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::DynamicState");
 		SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info,
-		                         rendering, m_dynamic_state);
+		                         rendering, m_dynamic_state,
+		                         plan_stages && plan->viewports.valid ? &plan->viewports : nullptr);
 		if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
 			// Declared dynamic by every renderer pipeline; the shadow (valid for this command
 			// buffer and bound pipeline, established just above) covers it too.
@@ -2610,9 +2722,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		     static_cast<uint32_t>(args.base_vertex), args.first_instance);
 	}
 
-	uc_check(ucfg);
-
-	hw_check(buffer);
+	RunDrawChecks(buffer, ucfg, m_binding_plan);
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
@@ -2727,9 +2837,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		     args.vertex_count, args.instance_count, args.first_vertex, args.first_instance);
 	}
 
-	uc_check(ucfg);
-
-	hw_check(buffer);
+	RunDrawChecks(buffer, ucfg, m_binding_plan);
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
 	                         args.vertex_count, args.instance_count, args.first_instance};

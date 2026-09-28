@@ -564,6 +564,8 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.DrawPrepBindingPipelinesUsed.Cumulative",
     "FrameEvent.DrawPrepBindingVerifyChecks.Cumulative",
     "FrameEvent.DrawPrepBindingVerifyMismatches.Cumulative",
+    "FrameEvent.DrawPrepBindingHwChecksSkipped.Cumulative",
+    "FrameEvent.DrawPrepBindingViewportsUsed.Cumulative",
     "FrameEvent.DescriptorOffsetAuditSets.Cumulative",
     "FrameEvent.DescriptorOffsetAuditSetRepeatsPrevious.Cumulative",
     "FrameEvent.DescriptorOffsetAuditSetRepeatsAny.Cumulative",

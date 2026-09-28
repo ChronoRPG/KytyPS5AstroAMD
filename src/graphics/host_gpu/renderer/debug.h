@@ -37,6 +37,18 @@ void                     hw_check(const CommandBuffer& buffer);
 void                     LogDrawPhase(const char* draw_name, const char* phase);
 ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc,
                                vk::Extent2D extent, uint32_t viewport_index);
+// calc_final_scissor before its clamp to the framebuffer, without its log: false for a clip-rect
+// rule it does not support (the scissor is then left as the other rectangles make it, which
+// calc_final_scissor reports). Any thread.
+[[nodiscard]] bool calc_scissor_unclamped(const HW::ScreenViewport& vp,
+                                          const HW::ScanModeControl& smc, uint32_t viewport_index,
+                                          ScissorRect& scissor);
+// calc_final_scissor's clamp of an unclamped scissor to the framebuffer.
+[[nodiscard]] ScissorRect clamp_scissor(const ScissorRect& scissor, vk::Extent2D extent);
+// Draw-prep binding plans (KYTY_DRAW_PREP_BINDINGS hwcheck): whether uc_check and hw_check would
+// neither stop the emulator nor log for these registers (their log-once flags and counters only
+// move one way, so true stays true). Any thread.
+[[nodiscard]] bool hw_checks_quiet(const HW::Context& hw, const HW::UserConfig& uc);
 
 } // namespace Libs::Graphics
 

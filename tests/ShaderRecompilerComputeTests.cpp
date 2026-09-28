@@ -15108,6 +15108,55 @@ public:
         registers.SetDepthRenderTarget({});
         shaders.SetPsShaderBase(pixel_addresses[0]);
       }
+
+      // KYTY_DRAW_PREP_BINDINGS hwcheck and dynamic (P4b-1b), inline mode: once the logs these
+      // registers trigger are spent (each at most 16 times), uc_check and hw_check are quiet, so
+      // each committed draw skips them; its viewports and scissors come from its plan. Verify
+      // mode runs the checks and compares instead.
+      const auto parts = DrawPrep::BindingParts();
+      if (parts != 0 && DrawPrep::GetMode() == DrawPrep::Mode::Inline) {
+        for (int i = 0; i < 16; i++) {
+          uc_check(processor.GetUcfg());
+          hw_check(scheduler.Current());
+        }
+        Require(name, "quiet checks", hw_checks_quiet(registers, processor.GetUcfg()),
+                "uc_check/hw_check still log for the test's registers after 16 runs");
+        const auto &binding = DrawPrep::GetBindingTotals();
+        const auto skipped = binding.hw_checks_skipped.load();
+        const auto viewports = binding.viewports_used.load();
+        const auto quiet_before = binding_counts();
+        clear();
+        shaders.SetPsShaderBase(pixel_addresses[0]);
+        {
+          Pm4Execution execution;
+          Require(name, "command stream with quiet checks",
+                  processor.Process(execution, stream) == Pm4ProcessResult::Complete,
+                  "the draw stream did not complete");
+        }
+        const auto quiet_pixels = read();
+        check("draws with quiet checks", quiet_pixels);
+        Require(name, "serial and command-processor pixels with quiet checks",
+                quiet_pixels == serial,
+                "the draws with planned checks and viewports differ from the serial draws");
+        check_bindings("binding plans with quiet checks", quiet_before);
+        const auto *code_cert = std::getenv("KYTY_DRAW_PREP_CODE_CERT");
+        const uint64_t commits =
+            code_cert == nullptr || std::strcmp(code_cert, "0") != 0 ? 2u : 0u;
+        const bool verify = DrawPrep::BindingsVerifyMode() != 0;
+        const auto expected = [&](DrawPrep::BindingPart part) {
+          return !verify && DrawPrep::BindingPartEnabled(parts, part) ? commits : 0u;
+        };
+        Require(name, "planned checks and viewports",
+                binding.hw_checks_skipped.load() - skipped ==
+                        expected(DrawPrep::BindingPart::HwCheck) &&
+                    binding.viewports_used.load() - viewports ==
+                        expected(DrawPrep::BindingPart::Dynamic),
+                "checks skipped " + std::to_string(binding.hw_checks_skipped.load() - skipped) +
+                    ", planned viewports " +
+                    std::to_string(binding.viewports_used.load() - viewports) + "; expected " +
+                    std::to_string(expected(DrawPrep::BindingPart::HwCheck)) + " and " +
+                    std::to_string(expected(DrawPrep::BindingPart::Dynamic)));
+      }
       RenderExecutorTestAccess::ResetBindings(executor);
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();

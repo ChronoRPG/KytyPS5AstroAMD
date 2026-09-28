@@ -1143,6 +1143,15 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_inline_bindings_parts PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=buffers,userdata,samplers,textures;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit")
+	# P4b-1b parts alone: the check verdict and the dynamic viewports, used and verified.
+	add_test(NAME draw_prep_engine_inline_bindings_checks
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_inline_bindings_checks PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=hwcheck,dynamic")
+	add_test(NAME draw_prep_engine_inline_bindings_checks_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_inline_bindings_checks_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=hwcheck,dynamic;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit")
 	add_test(NAME shader_recompiler_compute_bindings_verify
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	set_tests_properties(shader_recompiler_compute_bindings_verify PROPERTIES
