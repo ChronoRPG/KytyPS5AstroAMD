@@ -593,6 +593,12 @@ struct RenderExecutorTestAccess {
     return executor.m_draw_sequence_totals;
   }
 
+  // KYTY_UPLOAD_DEDUP / KYTY_UPLOAD_DEDUP_TABLE.
+  static vk::DescriptorBufferInfo UploadShaderData(RenderExecutor &executor,
+                                                   std::span<const uint32_t> data, uint32_t site) {
+    return executor.UploadShaderData(data, site);
+  }
+
   static auto PrepareGraphicsBindings(RenderExecutor &executor,
                                       const ShaderStageRuntime &vertex,
                                       const ShaderStageRuntime &pixel,
@@ -6125,6 +6131,58 @@ public:
                 BufferCacheTestAccess::WrittenSyncSkipVerify(context.GetBufferCache()) != 0
                     ? "on"
                     : "off");
+  }
+
+  // KYTY_UPLOAD_DEDUP (RenderExecutor::UploadShaderData): shader-data uploads equal to their
+  // site's last upload in the same tick reuse its allocation; with KYTY_UPLOAD_DEDUP_TABLE=1 any
+  // equal upload of the tick does (hashed table). Every returned allocation holds the bytes.
+  void CheckShaderUploadDedup() {
+    constexpr const char *name = "ShaderUploadDedup";
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &executor = context.GetRenderExecutor();
+    auto &stream = context.GetBufferCache().GetUtilityBuffer(Libs::Graphics::MemoryUsage::Stream);
+    const char *table_env = std::getenv("KYTY_UPLOAD_DEDUP_TABLE");
+    const bool table = table_env != nullptr && std::strcmp(table_env, "1") == 0;
+
+    std::vector<uint32_t> a(40);
+    for (uint32_t index = 0; index < a.size(); index++) {
+      a[index] = 0x1000u + index * 7u;
+    }
+    auto b = a;
+    b[17] ^= 0xffffu;
+    const auto upload = [&](const std::vector<uint32_t> &data, uint32_t site) {
+      const auto info = RenderExecutorTestAccess::UploadShaderData(executor, data, site);
+      Require(name, "uploaded bytes",
+              info.buffer == stream.Handle() && info.range == data.size() * sizeof(uint32_t) &&
+                  std::memcmp(stream.Mapped().data() + info.offset, data.data(), info.range) == 0,
+              "a shader-data allocation does not hold its bytes");
+      return info.offset;
+    };
+    const auto a1 = upload(a, 0);
+    Require(name, "site repeat", upload(a, 0) == a1,
+            "an upload equal to its site's last one in the tick was not reused");
+    const auto b1 = upload(b, 0);
+    Require(name, "different bytes", b1 != a1, "different shader data shared an allocation");
+    const auto a2 = upload(a, 0);
+    const auto a_other_site = upload(a, 1);
+    Require(name, "table lookups",
+            table ? a2 == a1 && a_other_site == a1 : a2 != a1 && a_other_site != a1,
+            table ? "the content table did not find an equal upload of the tick"
+                  : "an upload equal to an older one of another site or position was reused");
+    Require(name, "other site repeat", upload(a, 1) == a_other_site,
+            "a site's repeated upload was not reused");
+    scheduler.Flush();
+    Require(name, "new tick", upload(a, 1) != a_other_site && upload(a, 0) != a2,
+            "an allocation of an earlier tick was reused");
+    scheduler.Finish();
+    std::printf("[host]    %-32s ok (table %s)\n", name, table ? "on" : "off");
   }
 
   // KYTY_FALSE_SHARING_WRITES (BufferCache::TryFalseSharingWrite): one tracker page holds the tail
@@ -39841,6 +39899,11 @@ int main(int argc, char **argv) {
     vulkan.CheckFalseSharingWrites();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--shader-upload-dedup-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckShaderUploadDedup();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--tracker-gap-detectors-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTrackerGapDetectors();
@@ -40089,6 +40152,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBindingEpochMemo();
   vulkan.CheckWrittenSyncSkip();
   vulkan.CheckFalseSharingWrites();
+  vulkan.CheckShaderUploadDedup();
   vulkan.CheckTrackerGapDetectors();
   vulkan.CheckEagerReadback();
 #endif

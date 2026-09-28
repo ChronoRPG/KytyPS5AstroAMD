@@ -821,6 +821,13 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --false-sharing-writes-only)
 	set_tests_properties(false_sharing_writes_verify PROPERTIES
 		ENVIRONMENT "KYTY_FALSE_SHARING_WRITES=1;KYTY_FALSE_SHARING_WRITES_VERIFY=1")
+	# KYTY_UPLOAD_DEDUP_TABLE: off (default, the site's last upload only) and on.
+	add_test(NAME shader_upload_dedup
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shader-upload-dedup-only)
+	add_test(NAME shader_upload_dedup_table
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shader-upload-dedup-only)
+	set_tests_properties(shader_upload_dedup_table PROPERTIES
+		ENVIRONMENT "KYTY_UPLOAD_DEDUP_TABLE=1")
 	# Tracker-gap detectors: the page states they classify host writes by.
 	add_test(NAME tracker_gap_detectors
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tracker-gap-detectors-only)
