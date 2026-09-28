@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <span>
 #include <vector>
@@ -21,6 +22,9 @@ class Engine;
 
 namespace CpSeq {
 class Verifier;
+class Sequencer;
+struct Intake;
+struct RegisterState;
 } // namespace CpSeq
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
@@ -36,6 +40,11 @@ template <typename T>
 	ReadGuestForCp(vaddr, sizeof(T), &value);
 	return value;
 }
+
+// A CPU write of guest memory by the command processor (labels, WRITE_DATA, DUMP_CONST_RAM, ...),
+// after the bytes are written. With KYTY_CP_SEQ=1 draw preparations span such writes, so they are
+// logged for the draw-prep certificate (Coherence::Source::CpWrite); otherwise a no-op.
+void NoteCpWrite(uint64_t address, uint64_t size);
 
 enum class Pm4ProcessResult { Complete, Blocked };
 
@@ -59,6 +68,12 @@ private:
 	struct BufferCursor {
 		std::span<const uint32_t> commands;
 		uint32_t                  offset_dw = 0;
+		// KYTY_CP_SEQ=1, the sequencer's parse: the barrier epoch at which the rest of this buffer
+		// was proven readable (0: not yet), and, when it had to be read in lockstep, the copy that
+		// `commands` now points into and the guest address of the copy's first dword.
+		uint64_t                               checked_epoch = 0;
+		std::shared_ptr<std::vector<uint32_t>> copy;
+		uint64_t                               guest_address = 0;
 	};
 
 	std::vector<BufferCursor> m_buffer_stack;
@@ -100,7 +115,9 @@ public:
 		int64_t flip_arg  = 0;
 	};
 
-	enum class FrontMode : uint8_t { Direct, Inline, Reference };
+	// Thread: the graphics queue's front on the sequencer thread (KYTY_CP_SEQ=1); ops go to the
+	// resolver through the op ring, lockstep ops wait for its answer.
+	enum class FrontMode : uint8_t { Direct, Inline, Reference, Thread };
 
 	CommandProcessor(RenderContext& renderer, int interrupt_event_id);
 	~CommandProcessor();
@@ -217,8 +234,26 @@ public:
 		return m_front_mode == FrontMode::Reference;
 	}
 
+	// ---- P3b, KYTY_CP_SEQ=1 (cpSequencer.h) ----
+	// GuestGpu, before any submission: the graphics processor's front moves to the sequencer's
+	// thread. Creates the draw-prep engine (its producer is then the sequencer).
+	void AttachSequencer(CpSeq::Sequencer* sequencer);
+	[[nodiscard]] bool Sequenced() const noexcept { return m_sequencer != nullptr; }
+	// Resolver (GPU thread): executes the ops of graphics submission `submission` (admission
+	// sequence) until its end (Complete), a suspended op, a slice yield, or an empty op ring
+	// (Blocked; `execution` tells yielded from suspended). `handoff`: the submission is to be
+	// parsed and executed by this thread itself (constant engine): run it with Process() in
+	// Direct mode, then EndHandoff().
+	Pm4ProcessResult ResolveSubmission(Pm4Execution& execution, uint64_t submission,
+	                                   std::span<const uint32_t> commands, bool& handoff);
+	void             BeginHandoff();
+	void             EndHandoff(uint64_t submission);
+	// Tests: back to Direct once the sequencer is stopped and its ops are executed.
+	void             DetachSequencer();
+
 private:
 	friend class CpSeq::Verifier;
+	friend class CpSeq::Sequencer;
 
 	// ---- P3: ops ----
 	// The front hands an op to the back: executed directly (Direct), through the op ring
@@ -232,6 +267,30 @@ private:
 	}
 	CpSeq::Result SubmitInline(CpSeq::OpKind kind, const void* payload, uint32_t payload_size,
 	                           const void* data, uint32_t data_size);
+	// Thread mode: encodes the op for the resolver; a lockstep op waits for its result.
+	CpSeq::Result SubmitThread(CpSeq::OpKind kind, const void* payload, uint32_t payload_size,
+	                           const void* data, uint32_t data_size);
+	// Sequencer thread: parses one admitted submission and emits its ops. False when stopping.
+	[[nodiscard]] bool SequenceSubmission(const CpSeq::Intake& intake);
+	// Sequencer thread: before a packet of `cursor`: the rest of its buffer may be parsed (no
+	// pending CP write over it, and never GPU-touched, else it is read in lockstep).
+	[[nodiscard]] bool CheckCommandBytes(Pm4Execution::BufferCursor& cursor);
+	// Sequencer thread: waits until no pending CP write overlaps [begin, end). False: stopping.
+	[[nodiscard]] bool AwaitPendingWrites(uint64_t begin, uint64_t end);
+	// Sequencer thread: reads guest bytes the resolver may have to read in order (lockstep).
+	[[nodiscard]] bool ReadGuestForFront(uint64_t address, uint64_t size, void* dst);
+	// Sequencer thread: a snapshot of the front registers for an op; its index.
+	[[nodiscard]] uint32_t TakeSnapshot();
+	// Sequencer thread: waits for a free draw-prep window slot. False: stopping.
+	[[nodiscard]] bool WaitForWindowSpace();
+	// Sequencer thread: the oldest of `ops` still pending, as a wake threshold (op + 1).
+	[[nodiscard]] uint64_t OldestPendingOp(std::deque<uint64_t>& ops) const;
+	// The guest range a CP-write op writes (empty when none), for the pending-write set.
+	[[nodiscard]] static bool CpWriteRange(CpSeq::OpKind kind, const void* payload,
+	                                       uint64_t& begin, uint64_t& end);
+	// Resolver: register state for an op with a snapshot (bound around its execution).
+	[[nodiscard]] CpSeq::RegisterState* OpSnapshot(CpSeq::OpKind kind, const void* payload);
+	CpSeq::Result ExecLockstepRead(const CpSeq::LockstepReadOp& op);
 	// The back: executes one op with today's code (the direct path's bodies).
 	CpSeq::Result ExecuteOp(CpSeq::OpKind kind, const void* payload, const void* data);
 	void          ExecDrawIndex(const CpSeq::DrawIndexOp& op);
@@ -415,6 +474,34 @@ private:
 	std::unique_ptr<CpSeq::Verifier, VerifierDeleter> m_verifier;
 	// Reference front: the verifier its ops are captured by.
 	CpSeq::Verifier* m_capture = nullptr;
+
+	// ---- P3b, thread mode ----
+	CpSeq::Sequencer* m_sequencer = nullptr;
+	// Front (sequencer thread): a sync-epoch fence packet was parsed since the last op; the
+	// barrier epoch (bumped after every lockstep wait, CheckCommandBytes); CP writes emitted but
+	// maybe not executed yet (range, op sequence).
+	bool     m_epoch_pending = false;
+	uint64_t m_barrier_epoch = 1;
+	struct PendingWrite {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t op    = 0;
+	};
+	std::vector<PendingWrite> m_pending_writes;
+	// The draw ops of published window slots and the ops of taken snapshots, oldest first: the
+	// op whose execution frees the next slot or snapshot (the sequencer's wake threshold).
+	std::deque<uint64_t> m_published_ops;
+	std::deque<uint64_t> m_snapshot_ops;
+	// Resolver (GPU thread): the register files bound outside ops with a snapshot; the packet
+	// count of the last op (EOP flush batching); a suspended op that is retried (sequence + 1;
+	// the verifier compared it at its first execution).
+	HW::Context    m_back_ctx;
+	HW::UserConfig m_back_ucfg;
+	HW::Shader     m_back_sh;
+	uint64_t       m_resolver_packets = 0;
+	uint64_t       m_retry_op         = 0;
+	// Process(): the draw-prep packet hook runs for this slice's packets (decided per slice).
+	bool m_packet_hook = false;
 };
 
 } // namespace Libs::Graphics

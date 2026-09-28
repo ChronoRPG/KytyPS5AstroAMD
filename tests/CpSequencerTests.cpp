@@ -7,8 +7,12 @@
 //  - the op table (payload sizes, lockstep kinds, names).
 
 #include "graphics/guest_gpu/command_processor/cpOps.h"
+#include "graphics/guest_gpu/command_processor/cpSequencer.h"
+#include "graphics/host_gpu/gpuTouchedPages.h"
 
 #include <array>
+#include <atomic>
+#include <memory>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -225,6 +229,111 @@ void TestThreaded() {
 	Check(ok, "threaded ops arrive intact and in order");
 }
 
+// The sticky GPU-touched page bitmap (gpuTouchedPages.h): page granularity, leaf boundaries, the
+// universe flag, and marks racing checks (a mark finished before a check starts is seen).
+void TestTouchedPages() {
+	using GpuTouched::Pages;
+	auto pages = std::make_unique<Pages>();
+	constexpr uint64_t base = 0x0000000203000000ull;
+	Check(!pages->AnyTouched(base, base + 0x100000), "a fresh bitmap is clean");
+	pages->Mark(base + 0x1234, base + 0x1238);
+	Check(pages->AnyTouched(base + 0x1000, base + 0x1001) &&
+	          pages->AnyTouched(base + 0x1fff, base + 0x2000) &&
+	          !pages->AnyTouched(base + 0x2000, base + 0x3000) &&
+	          !pages->AnyTouched(base, base + 0x1000) &&
+	          pages->AnyTouched(base, base + 0x100000),
+	      "a mark covers its whole 4 KiB page and nothing else");
+	// A range across a 64 GiB leaf boundary.
+	constexpr uint64_t leaf = uint64_t {1} << GpuTouched::LeafShift;
+	pages->Mark(4u * leaf - 0x10, 4u * leaf + 0x10);
+	Check(pages->AnyTouched(4u * leaf - 1u, 4u * leaf) &&
+	          pages->AnyTouched(4u * leaf, 4u * leaf + 1u) &&
+	          !pages->AnyTouched(4u * leaf + 0x1000, 4u * leaf + 0x2000) &&
+	          !pages->AnyTouched(4u * leaf - 0x2000, 4u * leaf - 0x1000),
+	      "marks across a leaf boundary");
+	// A large range: every page of it, word boundaries included.
+	pages->Mark(base + 0x400000, base + 0x400000 + 257u * 0x1000u);
+	bool all = true;
+	for (uint64_t page = 0; page < 257u; page++) {
+		const auto address = base + 0x400000 + page * 0x1000u;
+		all = all && pages->AnyTouched(address, address + 1u);
+	}
+	Check(all && !pages->AnyTouched(base + 0x400000 + 257u * 0x1000u,
+	                                base + 0x400000 + 258u * 0x1000u),
+	      "a multi-word range marks exactly its pages");
+	Check(!pages->Universe() && !pages->AnyTouched(0x7000000000ull, 0x7000001000ull),
+	      "no universe yet");
+	pages->Mark(0, UINT64_MAX);
+	Check(pages->Universe() && pages->AnyTouched(0x7000000000ull, 0x7000001000ull),
+	      "an unknown range makes every range touched");
+	pages->ResetForTest();
+	Check(!pages->Universe() && !pages->AnyTouched(base, base + 0x1000000),
+	      "reset for the next check");
+
+	// Two threads: one marks pages in order and publishes how far it got; the other checks that
+	// every page published as marked reads as touched.
+	std::atomic<uint64_t> published {0};
+	std::atomic<bool>     seen_all {true};
+	constexpr uint64_t    count = 20000;
+	std::thread           marker([&] {
+        for (uint64_t page = 0; page < count; page++) {
+            const auto address = base + page * 0x1000u;
+            pages->Mark(address, address + 8u);
+            published.store(page + 1u, std::memory_order_seq_cst);
+        }
+    });
+	for (uint64_t checked = 0; checked < count;) {
+		const auto limit = published.load(std::memory_order_seq_cst);
+		for (; checked < limit; checked++) {
+			const auto address = base + checked * 0x1000u;
+			if (!pages->AnyTouched(address, address + 0x1000u)) {
+				seen_all.store(false);
+			}
+		}
+	}
+	marker.join();
+	Check(seen_all.load(), "a mark finished before a check is seen by it");
+}
+
+// The register snapshot ring of thread mode (cpSequencer.h): in-order release, capacity.
+void TestSnapshotRing() {
+	CpSeq::SnapshotRing ring(4);
+	std::array<uint32_t, 4> taken {};
+	for (auto& index: taken) {
+		Check(ring.HasFree(), "free entries while fewer than capacity are in use");
+		index = ring.Acquire();
+	}
+	Check(!ring.HasFree(), "full at capacity");
+	Check(taken == std::array<uint32_t, 4> {0, 1, 2, 3}, "entries in order");
+	ring.Release();
+	Check(ring.HasFree() && ring.Acquire() == 0, "a released entry is reused in order");
+	Check(!ring.HasFree(), "full again");
+	// Threads: the producer writes an entry's value, the consumer reads it back in order.
+	constexpr uint32_t    count = 5000;
+	std::atomic<uint32_t> produced {0};
+	CpSeq::SnapshotRing   shared(8);
+	std::thread           producer([&] {
+        for (uint32_t i = 0; i < count; i++) {
+            while (!shared.HasFree()) {
+                std::this_thread::yield();
+            }
+            const auto index = shared.Acquire();
+            shared.Entry(index).context.SetPsInControl(i);
+            produced.store(i + 1u, std::memory_order_release);
+        }
+    });
+	bool ordered = true;
+	for (uint32_t i = 0; i < count; i++) {
+		while (produced.load(std::memory_order_acquire) <= i) {
+			std::this_thread::yield();
+		}
+		ordered = ordered && shared.Entry(i % 8u).context.GetShaderRegisters().ps_in_control == i;
+		shared.Release();
+	}
+	producer.join();
+	Check(ordered, "snapshots arrive intact and in order");
+}
+
 } // namespace
 
 int main() {
@@ -232,6 +341,8 @@ int main() {
 	TestRoundTrip();
 	TestWrap();
 	TestThreaded();
+	TestTouchedPages();
+	TestSnapshotRing();
 	if (g_failures != 0) {
 		std::printf("cp sequencer tests: %d failure(s)\n", g_failures);
 		return EXIT_FAILURE;

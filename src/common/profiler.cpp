@@ -575,6 +575,17 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.CpSeqVerifyChecks.Cumulative",
     "FrameEvent.CpSeqVerifyMismatches.Cumulative",
     "FrameEvent.CpSeqVerifyReadDivergences.Cumulative",
+    "FrameEvent.CpSeqBarriers.Cumulative",
+    "FrameEvent.CpSeqLockstepReads.Cumulative",
+    "FrameEvent.CpSeqLockstepBuffers.Cumulative",
+    "FrameEvent.CpSeqPendingWriteStops.Cumulative",
+    "FrameEvent.CpSeqSnapshots.Cumulative",
+    "FrameEvent.CpSeqWindowFull.Cumulative",
+    "FrameEvent.CpSeqFrontWaits.Cumulative",
+    "FrameEvent.CpSeqResolverStarved.Cumulative",
+    "FrameEvent.CpSeqDirectReads.Cumulative",
+    "FrameEvent.DrawPrepLogChecks.Cumulative",
+    "FrameEvent.DrawPrepLogEntries.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
@@ -631,6 +642,9 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.CpRecorderExecute.Calls.Cumulative",
     "FrameWait.DrawPrepSteal.Calls.Cumulative",
     "FrameWait.EopTimestampPublish.Calls.Cumulative",
+    "FrameWait.CpSeqSequencerWait.Calls.Cumulative",
+    "FrameWait.CpSeqResolverStarved.Calls.Cumulative",
+    "FrameWait.DrawPrepCommit.Calls.Cumulative",
 };
 static_assert(kFrameWaitCallNames.back() != nullptr, "FrameWait names must match the enum");
 constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
@@ -680,6 +694,9 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.CpRecorderExecute.Nanoseconds.Cumulative",
     "FrameWait.DrawPrepSteal.Nanoseconds.Cumulative",
     "FrameWait.EopTimestampPublish.Nanoseconds.Cumulative",
+    "FrameWait.CpSeqSequencerWait.Nanoseconds.Cumulative",
+    "FrameWait.CpSeqResolverStarved.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepCommit.Nanoseconds.Cumulative",
 };
 static_assert(kFrameWaitTimeNames.back() != nullptr, "FrameWait names must match the enum");
 

@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 
+#include <array>
 #include <atomic>
 #include <cinttypes>
 #include <cstring>
@@ -79,7 +80,10 @@ void Verifier::Fail(bool read_divergence, const char* what, const OpView* op,
 		     reference != nullptr ? OpKindName(reference->kind) : "-",
 		     reference != nullptr ? reference->packet : 0, address);
 	}
-	if (VerifyMode() == 2) {
+	// "exit" stops at a mismatch. A read divergence is the race class E2 (the fronts read
+	// different guest bytes at their different times): counted and logged only; tests without
+	// races assert that there is none.
+	if (VerifyMode() == 2 && !read_divergence) {
 		EXIT("CpSeqVerify: %s (%s)\n", what,
 		     op != nullptr ? OpKindName(op->Kind()) : "end of stream");
 	}
@@ -106,16 +110,20 @@ void Verifier::Before(const OpView& op) {
 	const auto reference = std::move(m_captured.front());
 	m_captured.pop_front();
 	const auto payload_size = PayloadSize(op.Kind());
-	if (reference.kind != op.Kind()) {
-		Fail(false, "different op kind", &op, &reference);
-		return;
-	}
+	// The fronts parsed different command bytes (another packet count or content before this op):
+	// a command buffer changed between the front's read and the reference's, which only a guest
+	// race can do (e.g. the CPU patching a buffer the CP loops over). Later ops are not
+	// comparable.
 	if (reference.packet != op.header->packet) {
-		Fail(false, "different packet position", &op, &reference);
+		Fail(true, "the fronts parsed a different number of packets", &op, &reference);
 		return;
 	}
 	if (reference.packets_hash != op.header->packets_hash) {
-		Fail(false, "different packet bytes parsed before the op", &op, &reference);
+		Fail(true, "the fronts parsed different packet bytes before the op", &op, &reference);
+		return;
+	}
+	if (reference.kind != op.Kind()) {
+		Fail(false, "different op kind", &op, &reference);
 		return;
 	}
 	if (reference.data_size != op.DataSize() || reference.payload_size != payload_size) {
@@ -133,7 +141,15 @@ void Verifier::Before(const OpView& op) {
 		}
 		return;
 	}
-	if (std::memcmp(reference.bytes.data(), op.payload, payload_size) != 0 ||
+	// Thread-mode transport fields (window slot, snapshot) exist on the front's side only.
+	alignas(8) std::array<uint8_t, 128> front {};
+	alignas(8) std::array<uint8_t, 128> serial {};
+	EXIT_IF(payload_size > front.size());
+	std::memcpy(front.data(), op.payload, payload_size);
+	std::memcpy(serial.data(), reference.bytes.data(), payload_size);
+	NormalizeForCompare(op.Kind(), front.data());
+	NormalizeForCompare(op.Kind(), serial.data());
+	if (std::memcmp(serial.data(), front.data(), payload_size) != 0 ||
 	    (op.DataSize() != 0 &&
 	     std::memcmp(reference.bytes.data() + payload_size, op.data, op.DataSize()) != 0)) {
 		Fail(false, "different payload", &op, &reference);

@@ -24,7 +24,10 @@ Mode ConfiguredMode() {
 		if (std::strcmp(value, "inline") == 0) {
 			return Mode::Inline;
 		}
-		EXIT("KYTY_CP_SEQ must be 0 or inline (got '%s')\n", value);
+		if (std::strcmp(value, "1") == 0 || std::strcmp(value, "thread") == 0) {
+			return Mode::Thread;
+		}
+		EXIT("KYTY_CP_SEQ must be 0, inline or 1 (got '%s')\n", value);
 		return Mode::Off;
 	}();
 	return mode;
@@ -74,6 +77,10 @@ const char* OpKindName(OpKind kind) noexcept {
 		case OpKind::CondExec: return "CondExec";
 		case OpKind::Branch: return "Branch";
 		case OpKind::ReadCheck: return "ReadCheck";
+		case OpKind::StreamBegin: return "StreamBegin";
+		case OpKind::StreamEnd: return "StreamEnd";
+		case OpKind::Handoff: return "Handoff";
+		case OpKind::LockstepRead: return "LockstepRead";
 		case OpKind::Count: break;
 	}
 	return "?";
@@ -102,9 +109,52 @@ uint32_t PayloadSize(OpKind kind) noexcept {
 		case OpKind::CondExec: return sizeof(CondExecOp);
 		case OpKind::Branch: return sizeof(BranchOp);
 		case OpKind::ReadCheck: return sizeof(ReadCheckOp);
+		case OpKind::StreamBegin: return sizeof(StreamBeginOp);
+		case OpKind::StreamEnd: return sizeof(StreamEndOp);
+		case OpKind::Handoff: return sizeof(HandoffOp);
+		case OpKind::LockstepRead: return sizeof(LockstepReadOp);
 		case OpKind::Count: break;
 	}
 	return 0;
+}
+
+void NormalizeForCompare(OpKind kind, void* payload) noexcept {
+	switch (kind) {
+		case OpKind::DrawIndex: {
+			auto* op = static_cast<DrawIndexOp*>(payload);
+			op->flags &= ~(DrawFlagPublished | DrawFlagSnapshot);
+			op->window   = 0;
+			op->snapshot = 0;
+			break;
+		}
+		case OpKind::DrawAuto: {
+			auto* op = static_cast<DrawAutoOp*>(payload);
+			op->flags &= ~(DrawFlagPublished | DrawFlagSnapshot);
+			op->window   = 0;
+			op->snapshot = 0;
+			break;
+		}
+		case OpKind::DrawIndirect:
+		case OpKind::DrawIndirectMulti: {
+			auto* op = static_cast<DrawIndirectOp*>(payload);
+			op->flags &= ~IndirectFlagSnapshot;
+			op->snapshot = 0;
+			break;
+		}
+		case OpKind::DispatchDirect: {
+			auto* op = static_cast<DispatchDirectOp*>(payload);
+			op->flags &= ~DispatchFlagSnapshot;
+			op->snapshot = 0;
+			break;
+		}
+		case OpKind::DispatchIndirect: {
+			auto* op = static_cast<DispatchIndirectOp*>(payload);
+			op->flags &= ~DispatchFlagSnapshot;
+			op->snapshot = 0;
+			break;
+		}
+		default: break;
+	}
 }
 
 uint64_t HashOp(OpKind kind, const void* payload, uint32_t payload_size, const void* data,
@@ -124,7 +174,8 @@ OpStream::OpStream(uint64_t capacity): m_ring(capacity) {
 OpStream::~OpStream() = default;
 
 uint64_t OpStream::Emit(OpKind kind, const void* payload, uint32_t payload_size, const void* data,
-                        uint32_t data_size, uint64_t packet, uint64_t packets_hash, bool verify) {
+                        uint32_t data_size, uint64_t packet, uint64_t packets_hash, bool verify,
+                        uint16_t flags) {
 	EXIT_IF(payload_size != PayloadSize(kind));
 	const auto bytes = RecordSize(payload_size, data_size);
 	if (bytes > m_ring.MaxPacket()) {
@@ -138,7 +189,7 @@ uint64_t OpStream::Emit(OpKind kind, const void* payload, uint32_t payload_size,
 	header->ring.flags   = 0;
 	header->ring.size    = bytes;
 	header->kind         = kind;
-	header->flags        = verify ? FlagVerify : 0u;
+	header->flags        = static_cast<uint16_t>(flags | (verify ? FlagVerify : 0u));
 	header->data_size    = data_size;
 	header->sequence     = m_next_sequence;
 	header->packet       = packet;

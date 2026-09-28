@@ -17,6 +17,11 @@
 // Every state word carries its seq, so a slow worker holding an old position can never claim
 // the reused slot of a later position (no ABA). The release store of Published (and of Done)
 // publishes the payload written before it; the acquiring CAS (or load) makes it visible.
+//
+// P3b (KYTY_CP_SEQ=1): the producer's two roles may run on two threads. The sequencer reserves
+// and publishes; the resolver claims the head, commits and retires. The head is then read by the
+// publishing thread (Full), so it is atomic, stored and loaded seq_cst (the sequencer parks on
+// it, cpSequencer.h).
 namespace Libs::Graphics::DrawPrep {
 
 template <typename Payload>
@@ -34,11 +39,11 @@ public:
 	[[nodiscard]] uint32_t Capacity() const noexcept { return m_mask + 1u; }
 
 	// Producer.
-	[[nodiscard]] uint64_t Head() const noexcept { return m_head; }
+	[[nodiscard]] uint64_t Head() const noexcept { return m_head.load(std::memory_order_seq_cst); }
 	[[nodiscard]] uint64_t Tail() const noexcept { return m_published.load(std::memory_order_relaxed); }
-	[[nodiscard]] bool     Empty() const noexcept { return m_head == Tail(); }
-	[[nodiscard]] bool     Full() const noexcept { return Tail() - m_head > m_mask; }
-	[[nodiscard]] uint64_t Occupancy() const noexcept { return Tail() - m_head; }
+	[[nodiscard]] bool     Empty() const noexcept { return Head() == Tail(); }
+	[[nodiscard]] bool     Full() const noexcept { return Tail() - Head() > m_mask; }
+	[[nodiscard]] uint64_t Occupancy() const noexcept { return Tail() - Head(); }
 
 	// The payload of the next position; valid until Publish. Requires !Full().
 	[[nodiscard]] Payload& Reserve() noexcept { return m_slots[Tail() & m_mask].payload; }
@@ -49,25 +54,28 @@ public:
 		m_published.store(seq + 1u, std::memory_order_seq_cst);
 	}
 
-	[[nodiscard]] Payload& HeadPayload() noexcept { return m_slots[m_head & m_mask].payload; }
+	[[nodiscard]] Payload& HeadPayload() noexcept { return m_slots[Head() & m_mask].payload; }
 
 	// Claims the head for the producer when no worker has; true when it did.
 	[[nodiscard]] bool TryClaimHead() noexcept {
-		auto expected = Encode(m_head, State::Published);
-		return m_slots[m_head & m_mask].state.compare_exchange_strong(
-		    expected, Encode(m_head, State::Claimed), std::memory_order_acq_rel);
+		const auto head     = Head();
+		auto       expected = Encode(head, State::Published);
+		return m_slots[head & m_mask].state.compare_exchange_strong(
+		    expected, Encode(head, State::Claimed), std::memory_order_acq_rel);
 	}
 
 	// The head was claimed by a worker that has finished.
 	[[nodiscard]] bool HeadDone() const noexcept {
-		return m_slots[m_head & m_mask].state.load(std::memory_order_acquire) ==
-		       Encode(m_head, State::Done);
+		const auto head = Head();
+		return m_slots[head & m_mask].state.load(std::memory_order_acquire) ==
+		       Encode(head, State::Done);
 	}
 
 	// Retires the head after its commit.
 	void Retire() noexcept {
-		m_slots[m_head & m_mask].state.store(Encode(m_head, State::Free), std::memory_order_relaxed);
-		m_head++;
+		const auto head = Head();
+		m_slots[head & m_mask].state.store(Encode(head, State::Free), std::memory_order_relaxed);
+		m_head.store(head + 1u, std::memory_order_seq_cst);
 	}
 
 	// Workers.
@@ -123,7 +131,8 @@ private:
 
 	std::vector<Slot>     m_slots;
 	uint32_t              m_mask = 0;
-	uint64_t              m_head = 0; // producer only
+	// The committing thread writes it; a separate publishing thread (P3b) reads it.
+	alignas(64) std::atomic<uint64_t> m_head {0};
 	alignas(64) std::atomic<uint64_t> m_published {0};
 	alignas(64) std::atomic<uint64_t> m_next_claim {0};
 };

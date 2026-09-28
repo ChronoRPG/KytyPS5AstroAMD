@@ -2770,6 +2770,7 @@ void CommandProcessor::ExecLodStats(const CpSeq::LodStatsOp& op) {
 			auto* label = static_cast<uint32_t*>(dst);
 			*label      = 1;
 		}
+		NoteCpWrite(reinterpret_cast<uint64_t>(dst), buffer_size);
 	}
 	HangTrace::ArmLodReportWatch(dst, buffer_size);
 }

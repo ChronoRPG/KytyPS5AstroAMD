@@ -9,11 +9,13 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
+#include "graphics/guest_gpu/command_processor/cpSequencer.h"
 #include "graphics/guest_gpu/command_processor/cpVerify.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/coherenceLog.h"
+#include "graphics/host_gpu/gpuTouchedPages.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
@@ -48,6 +50,10 @@
 #include <vector>
 #include <xxhash.h>
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 namespace Libs::Graphics {
 
 static thread_local CommandProcessor* g_current_processor = nullptr;
@@ -55,6 +61,8 @@ static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_mutex_owned   = false;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
+// KYTY_CP_SEQ=1: the sequencer thread (the graphics front); only it emits thread-mode ops.
+static thread_local bool g_sequencer_thread = false;
 
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
@@ -199,6 +207,19 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
+	if (CpSeq::ConfiguredMode() == CpSeq::Mode::Thread) {
+		if (RepeatTrace::Enabled()) {
+			std::printf("Kyty CP sequencer: off (KYTY_CP_REPEAT_TRACE needs the direct CP)\n");
+		} else {
+			// P3b (cpSequencer.h): the graphics queue's front runs on its own thread.
+			m_sequencer.reset(new CpSeq::Sequencer(*m_gfx_cp));
+			m_gfx_cp->AttachSequencer(m_sequencer.get());
+			m_sequencer->Start();
+			std::printf("Kyty CP sequencer: on (KYTY_CP_SEQ=1, verify=%d, %u snapshots of %zu "
+			            "bytes)\n",
+			            CpSeq::VerifyMode(), CpSeq::SnapshotCount(), sizeof(CpSeq::RegisterState));
+		}
+	}
 	if (CpWakeupsEnabled()) {
 		m_renderer.GetCommandScheduler().SetProgressHook(
 		    [](void* context) { static_cast<GuestGpu*>(context)->NotifyProgress(); }, this);
@@ -223,6 +244,10 @@ void GuestGpu::Shutdown() {
 	}
 	if (m_thread.joinable()) {
 		m_thread.join();
+	}
+	if (m_sequencer != nullptr) {
+		// The GPU thread executed every admitted submission's ops; the sequencer is idle.
+		m_sequencer->Stop();
 	}
 	// No completion-runner call may reach this object once it is destroyed.
 	m_renderer.GetCommandScheduler().SetProgressHook(nullptr, nullptr);
@@ -511,6 +536,10 @@ CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 	return *processor;
 }
 
+void GuestGpu::SequencerDeleter::operator()(CpSeq::Sequencer* sequencer) const noexcept {
+	delete sequencer;
+}
+
 CommandProcessor::CommandProcessor(RenderContext& renderer, int interrupt_event_id)
     : m_renderer(renderer), m_interrupt_event_id(interrupt_event_id),
       m_front_mode(CpSeq::ConfiguredMode() == CpSeq::Mode::Inline ? FrontMode::Inline
@@ -556,11 +585,29 @@ bool CommandProcessor::TrySubmitPreparedDraw(const DrawIndexArgs* index_args,
 		return false;
 	}
 	auto* engine = DrawPrepEngine();
-	return engine != nullptr &&
-	       engine->Submit(m_submit_id, index_args, auto_args, m_ctx, m_ucfg, m_sh_ctx);
+	if (engine == nullptr) {
+		return false;
+	}
+	if (m_front_mode == FrontMode::Thread) {
+		// The resolver: a draw the sequencer did not publish (indirect draws' CPU path, or draw
+		// prep inline). The parallel window's producer is the sequencer: such draws are drawn
+		// serially. Inline preparation uses the op's registers, which the command buffer binds.
+		if (engine->Parallel()) {
+			return false;
+		}
+		auto& command = CurrentBuffer();
+		return engine->Submit(m_submit_id, index_args, auto_args, command.GetRegisters(),
+		                      command.GetUserConfig(), command.GetShaders());
+	}
+	return engine->Submit(m_submit_id, index_args, auto_args, m_ctx, m_ucfg, m_sh_ctx);
 }
 
 void CommandProcessor::DrainPreparedDraws() {
+	// KYTY_CP_SEQ=1: every published draw belongs to an op the resolver has not reached yet (the
+	// earlier ones are committed); each is committed by its own op.
+	if (m_front_mode == FrontMode::Thread) {
+		return;
+	}
 	if (m_draw_prep != nullptr) {
 		m_draw_prep->Drain();
 	}
@@ -606,6 +653,12 @@ void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operatio
 }
 
 void CommandProcessor::BufferInit() {
+	if (m_front_mode == FrontMode::Thread) {
+		// The resolver: the live registers belong to the sequencer. Ops that read registers bind
+		// their snapshot (or draw-prep slot); the others read none (P3-SEQUENCER.md 9.3).
+		GetScheduler().Begin(m_back_ctx, m_back_ucfg, m_back_sh);
+		return;
+	}
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
 }
 
@@ -786,6 +839,7 @@ void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_
 
 void CommandProcessor::ExecDumpConstRam(const CpSeq::DumpConstRamOp& op, const uint32_t* src) {
 	memcpy(reinterpret_cast<uint32_t*>(op.dst), src, static_cast<size_t>(op.dw_num) * 4);
+	NoteCpWrite(op.dst, uint64_t {op.dw_num} * 4u);
 }
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
@@ -947,6 +1001,7 @@ void CommandProcessor::ExecWriteData(const CpSeq::WriteDataOp& op, const uint32_
 	} else {
 		memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
 	}
+	NoteCpWrite(op.dst, write_one_address ? sizeof(uint32_t) : uint64_t {dw_num} * 4u);
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -966,6 +1021,7 @@ void CommandProcessor::ExecReferenceClock(const CpSeq::ReferenceClockOp& op) {
 	}
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	NoteCpWrite(dst_address, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -1101,6 +1157,17 @@ void GuestGpu::Enqueue(Submission submission) {
 		HangTrace::RecordCp(event);
 	}
 	m_in_flight.insert(submission.sequence);
+	if (m_sequencer != nullptr && submission.queue_id == 0) {
+		// Admission order is the sequencer's parse order (and the resolver's queue-0 order).
+		CpSeq::Intake intake;
+		intake.sequence          = submission.sequence;
+		intake.frame_fence       = submission.frame_fence;
+		intake.commands          = submission.commands;
+		intake.constant_commands = submission.constant_commands;
+		intake.graphics          = submission.type == SubmissionType::Graphics;
+		intake.reset_processor   = submission.reset_processor;
+		m_sequencer->Admit(intake);
+	}
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -1296,6 +1363,9 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
+	if (m_sequencer != nullptr && submission.queue_id == 0) {
+		return ProcessSequenced(submission);
+	}
 	const bool first_slice = !submission.started;
 	auto& cp = GetProcessor(submission.queue_id);
 	// A new submission, or a slice after other queues ran (syncEpoch.h).
@@ -1332,41 +1402,7 @@ bool GuestGpu::Process(Submission& submission) {
 	bool complete = true;
 
 	switch (submission.type) {
-		case SubmissionType::Graphics: {
-			bool progressed = false;
-			submission.constant_complete |= submission.constant_commands.empty();
-			for (;;) {
-				bool round_progress = false;
-				if (!submission.constant_complete) {
-					submission.constant_complete =
-					    cp.Process(submission.constant_execution, submission.constant_commands) ==
-					    Pm4ProcessResult::Complete;
-					round_progress |= submission.constant_execution.MadeProgress();
-				}
-				cp.SetCeComplete(submission.constant_complete);
-				if (!submission.command_complete) {
-					submission.command_complete =
-					    cp.Process(submission.command_execution, submission.commands) ==
-					    Pm4ProcessResult::Complete;
-					round_progress |= submission.command_execution.MadeProgress();
-				}
-				progressed |= round_progress;
-				complete = submission.command_complete && submission.constant_complete;
-				if (complete || !round_progress || submission.command_execution.Yielded()) {
-					break;
-				}
-			}
-			submission.slice_progress = progressed;
-			if (progressed) {
-				if (complete) {
-					m_renderer.RunGarbageCollector();
-				}
-				cp.BufferFlush();
-			} else if (complete) {
-				m_renderer.RunGarbageCollector();
-			}
-			break;
-		}
+		case SubmissionType::Graphics: complete = ProcessGraphicsDirect(submission, cp); break;
 		case SubmissionType::Compute: {
 			const auto      num_dw = static_cast<uint32_t>(submission.commands.size());
 			const auto*     buffer = submission.commands.data();
@@ -1403,6 +1439,104 @@ bool GuestGpu::Process(Submission& submission) {
 	return complete;
 }
 
+bool GuestGpu::ProcessGraphicsDirect(Submission& submission, CommandProcessor& cp) {
+	bool complete   = true;
+	bool progressed = false;
+	submission.constant_complete |= submission.constant_commands.empty();
+	for (;;) {
+		bool round_progress = false;
+		if (!submission.constant_complete) {
+			submission.constant_complete =
+			    cp.Process(submission.constant_execution, submission.constant_commands) ==
+			    Pm4ProcessResult::Complete;
+			round_progress |= submission.constant_execution.MadeProgress();
+		}
+		cp.SetCeComplete(submission.constant_complete);
+		if (!submission.command_complete) {
+			submission.command_complete =
+			    cp.Process(submission.command_execution, submission.commands) ==
+			    Pm4ProcessResult::Complete;
+			round_progress |= submission.command_execution.MadeProgress();
+		}
+		progressed |= round_progress;
+		complete = submission.command_complete && submission.constant_complete;
+		if (complete || !round_progress || submission.command_execution.Yielded()) {
+			break;
+		}
+	}
+	submission.slice_progress = progressed;
+	if (progressed) {
+		if (complete) {
+			m_renderer.RunGarbageCollector();
+		}
+		cp.BufferFlush();
+	} else if (complete) {
+		m_renderer.RunGarbageCollector();
+	}
+	return complete;
+}
+
+// KYTY_CP_SEQ=1 (cpSequencer.h): a queue-0 submission. The sequencer has applied its front setup
+// (processor reset, DE/CE counters, flip info) and emits its ops; this thread executes them.
+bool GuestGpu::ProcessSequenced(Submission& submission) {
+	auto&      cp          = *m_gfx_cp;
+	const bool first_slice = !submission.started;
+	// A new submission, or a slice after other queues ran (syncEpoch.h).
+	SyncEpoch::Advance();
+	if (first_slice) {
+		submission.started = true;
+		cp.SetSubmitId(++m_submit_id);
+		// The frame fence's ordering point: the sequencer reads a fenced submission's command
+		// bytes only from here on.
+		m_sequencer->NoteStarted(submission.sequence);
+	}
+	cp.BufferInit();
+	if (submission.handoff) {
+		const bool complete = ProcessGraphicsDirect(submission, cp);
+		if (complete) {
+			cp.EndHandoff(submission.sequence);
+		}
+		return complete;
+	}
+	bool       handoff = false;
+	const auto result  = cp.ResolveSubmission(submission.command_execution, submission.sequence,
+	                                          submission.commands, handoff);
+	if (handoff) {
+		// A constant-engine submission: parsed and executed here, in Direct mode, while the
+		// sequencer waits (it applied the front setup already).
+		submission.handoff = true;
+		submission.command_execution.DisableSequencerVerify();
+		submission.constant_execution.DisableSequencerVerify();
+		cp.BeginHandoff();
+		cp.BufferInit();
+		const bool complete = ProcessGraphicsDirect(submission, cp);
+		if (complete) {
+			cp.EndHandoff(submission.sequence);
+		}
+		return complete;
+	}
+	const bool complete   = result == Pm4ProcessResult::Complete;
+	const bool progressed = submission.command_execution.MadeProgress();
+	if (submission.type == SubmissionType::FlipPreparation) {
+		submission.slice_progress = complete;
+		if (complete) {
+			m_renderer.RunGarbageCollector();
+			cp.PrepareCpuFlip(submission.flip_request_id);
+		}
+		return complete;
+	}
+	submission.slice_progress = progressed;
+	if (progressed) {
+		if (complete) {
+			m_renderer.RunGarbageCollector();
+		}
+		cp.BufferFlush();
+	} else if (complete) {
+		m_renderer.RunGarbageCollector();
+	}
+	return complete;
+}
+
 Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
                                            std::span<const uint32_t> commands) {
 	KYTY_PROFILER_BLOCK("CommandProcessor::Process");
@@ -1431,6 +1565,10 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	execution.m_yield         = false;
 	execution.m_yielded       = false;
 	m_slice_draws             = 0;
+	// The draw-prep packet hook, decided once per slice instead of per packet: with draw prep on
+	// it is on for the process (PacketHookEnabled); only the Tracy-gated fence histogram of draw
+	// prep off can change, and it now follows a connection at the next slice.
+	m_packet_hook = DrawPrep::PacketHookActive() && DrawPrepEngine() != nullptr;
 
 	struct ExecutionScope {
 		ExecutionScope(CommandProcessor& processor, Pm4Execution& execution)
@@ -1495,20 +1633,23 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 // KYTY_CP_SEQ: a completed (or skipped) packet of the stream is counted and, in verify mode,
 // hashed with its address: what the fronts parsed is compared through it.
 static void CountPacket(Pm4Execution& execution, const uint32_t* packet, uint32_t packet_dw,
-                        uint64_t& packets, uint64_t& packets_hash) {
+                        uint64_t& packets, uint64_t& packets_hash, uint64_t guest_address) {
 	(void)execution;
 	packets++;
 	if (CpSeq::PacketHashing()) {
 		packets_hash = XXH3_64bits_withSeed(packet, uint64_t {packet_dw} * sizeof(uint32_t),
-		                                    packets_hash ^ reinterpret_cast<uint64_t>(packet));
+		                                    packets_hash ^ guest_address);
 	}
 }
 
 bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 	// A reference front (KYTY_CP_SEQ_VERIFY) only parses: no services, sync epochs, draw-prep
-	// window or flush batching, and none of the parse's counters.
+	// window or flush batching, and none of the parse's counters. The sequencer (thread mode)
+	// parses too: the resolver runs services and flush batching between ops, and the sync epoch
+	// advance travels with the next op.
 	const bool reference = m_front_mode == FrontMode::Reference;
-	if (g_gpu_state != nullptr && !reference) {
+	const bool sequencer = m_front_mode == FrontMode::Thread;
+	if (g_gpu_state != nullptr && !reference && !sequencer) {
 		if (m_draw_prep != nullptr && m_draw_prep->Pending()) {
 			// Draw-prep: service commands (readbacks, unmaps) observe every parsed draw, so
 			// they only run with an empty window.
@@ -1526,8 +1667,16 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 		execution.m_buffer_stack.pop_back();
 		return true;
 	}
+	if (sequencer && cursor.checked_epoch != m_barrier_epoch && !CheckCommandBytes(cursor)) {
+		execution.m_suspended = true; // stopping
+		return false;
+	}
 
 	const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
+	// The packet's guest address (a lockstep copy of a command buffer is parsed elsewhere).
+	const uint64_t guest_packet =
+	    cursor.copy != nullptr ? cursor.guest_address + uint64_t {cursor.offset_dw} * 4u
+	                           : reinterpret_cast<uint64_t>(packet);
 	const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
 	const auto        remaining_dw  = total_dw - cursor.offset_dw;
 	const auto        packet_header = packet[0];
@@ -1537,7 +1686,8 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 	if (packet_header == 0x80000000u) {
 		cursor.offset_dw++;
 		execution.m_made_progress = true;
-		CountPacket(execution, packet, 1, execution.m_packets, execution.m_packets_hash);
+		CountPacket(execution, packet, 1, execution.m_packets, execution.m_packets_hash,
+		            guest_packet);
 		return true;
 	}
 
@@ -1579,7 +1729,8 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 		}
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
-		CountPacket(execution, packet, packet_dw, execution.m_packets, execution.m_packets_hash);
+		CountPacket(execution, packet, packet_dw, execution.m_packets, execution.m_packets_hash,
+		            guest_packet);
 		return true;
 	}
 
@@ -1601,16 +1752,22 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 		     total_dw - remaining_dw, packet_header);
 	}
 
-	if (!reference) {
+	if (sequencer) {
+		// The resolver advances the epoch before the next op, i.e. before the next GPU work.
+		if (SyncEpoch::Enabled() &&
+		    DrawPrep::AdvancesSyncEpoch(packet_header & ~1u, packet + 1, remaining_dw)) {
+			m_epoch_pending = true;
+		}
+	} else if (!reference) {
 		// KYTY_SYNC_EPOCH (syncEpoch.h): every fence but a register load from memory is a point
 		// where guest CPU writes must become visible to the GPU work that follows it.
 		if (SyncEpoch::Enabled() &&
 		    DrawPrep::AdvancesSyncEpoch(packet_header & ~1u, packet + 1, remaining_dw)) {
 			SyncEpoch::Advance();
 		}
-		if (DrawPrep::PacketHookActive()) [[unlikely]] {
+		if (m_packet_hook) [[unlikely]] {
 			// Window fences commit every pending draw before their handler runs.
-			if (auto* engine = DrawPrepEngine(); engine != nullptr) {
+			if (auto* engine = m_draw_prep.get(); engine != nullptr) {
 				const auto header       = packet_header & ~1u;
 				auto       packet_class = DrawPrep::ClassifyPacket(header, packet + 1, remaining_dw);
 				auto       fence_kind   = DrawPrep::FenceKind::Other;
@@ -1645,8 +1802,9 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 	}
 	cursor.offset_dw += packet_dw;
 	execution.m_made_progress = true;
-	CountPacket(execution, packet, packet_dw, execution.m_packets, execution.m_packets_hash);
-	if (!reference && m_deferred_eop_flushes != 0 &&
+	CountPacket(execution, packet, packet_dw, execution.m_packets, execution.m_packets_hash,
+	            guest_packet);
+	if (!reference && !sequencer && m_deferred_eop_flushes != 0 &&
 	    ++m_packets_since_eop_request >= EopFlushPacketLimit()) {
 		// Bound how long a batched end-of-pipe interrupt can wait inside a long slice.
 		BufferFlush();
@@ -1805,6 +1963,60 @@ CpSeq::Result CommandProcessor::ExecPredication(const CpSeq::PredicationOp& payl
 	return {false, skip ? 1u : 0u};
 }
 
+// The DrawIndexArgs / DrawAutoArgs of a draw op (what the direct path passes to the executor).
+static DrawIndexArgs DrawArgsOf(const CpSeq::DrawIndexOp& op) {
+	DrawIndexArgs args;
+	args.index_count                = op.index_count;
+	args.index_addr                 = reinterpret_cast<const void*>(op.index_addr);
+	args.instance_count             = op.instance_count;
+	args.index_type_and_size        = op.index_type_and_size;
+	args.base_vertex                = op.base_vertex;
+	args.first_instance             = op.first_instance;
+	args.offset_source              = static_cast<DrawOffsetSource>(op.offset_source);
+	args.render_target_slice_offset = op.render_target_slice_offset;
+	return args;
+}
+
+static DrawAutoArgs DrawArgsOf(const CpSeq::DrawAutoOp& op) {
+	DrawAutoArgs args;
+	args.vertex_count               = op.vertex_count;
+	args.instance_count             = op.instance_count;
+	args.first_vertex               = op.first_vertex;
+	args.first_instance             = op.first_instance;
+	args.offset_source              = static_cast<DrawOffsetSource>(op.offset_source);
+	args.render_target_slice_offset = op.render_target_slice_offset;
+	return args;
+}
+
+// Thread mode: a direct draw's registers reach the resolver as a draw-prep window slot (parallel
+// draw prep: the slot's snapshot, prepared by the workers meanwhile) or as a register snapshot.
+template <typename Op, typename Args>
+static void AttachDrawRegisters(Op& op, Args args, DrawPrep::Engine* engine,
+                                const HW::Context& context, const HW::UserConfig& user_config,
+                                const HW::Shader& shaders, const std::function<bool()>& wait,
+                                const std::function<uint32_t()>& take_snapshot) {
+	if (engine != nullptr && engine->Parallel()) {
+		if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
+			// Resolved at commit; the preparation assumes the draw draws (an unused one is
+			// dropped, DrawPrepUnused).
+			args.instance_count = 1;
+		}
+		uint64_t position = UINT64_MAX;
+		if constexpr (std::is_same_v<Args, DrawIndexArgs>) {
+			position = engine->Publish(&args, nullptr, context, user_config, shaders, wait);
+		} else {
+			position = engine->Publish(nullptr, &args, context, user_config, shaders, wait);
+		}
+		if (position != UINT64_MAX) {
+			op.flags |= CpSeq::DrawFlagPublished;
+			op.window = position;
+		}
+		return;
+	}
+	op.flags |= CpSeq::DrawFlagSnapshot;
+	op.snapshot = take_snapshot();
+}
+
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	CpSeq::DrawIndexOp op;
 	op.index_addr                 = reinterpret_cast<uint64_t>(args.index_addr);
@@ -1822,25 +2034,37 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 			op.flags |= CpSeq::DrawFlagInheritInstances;
 		}
 	}
+	if (m_front_mode == FrontMode::Thread) {
+		const auto draw_op = m_ops->Emitted();
+		AttachDrawRegisters(
+		    op, DrawArgsOf(op), m_draw_prep.get(), m_ctx, m_ucfg, m_sh_ctx,
+		    [this] { return WaitForWindowSpace(); }, [this] { return TakeSnapshot(); });
+		if ((op.flags & CpSeq::DrawFlagPublished) != 0) {
+			m_published_ops.push_back(draw_op);
+			if (m_published_ops.size() > 256u) {
+				(void)OldestPendingOp(m_published_ops);
+			}
+		}
+	}
 	(void)Submit(op);
 }
 
 void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
-	DrawIndexArgs args;
-	args.index_count                = op.index_count;
-	args.index_addr                 = reinterpret_cast<const void*>(op.index_addr);
-	args.instance_count             = op.instance_count;
-	args.index_type_and_size        = op.index_type_and_size;
-	args.base_vertex                = op.base_vertex;
-	args.first_instance             = op.first_instance;
-	args.offset_source              = static_cast<DrawOffsetSource>(op.offset_source);
-	args.render_target_slice_offset = op.render_target_slice_offset;
+	auto args = DrawArgsOf(op);
 	if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
 		if (!m_pending_num_instances.empty()) {
 			// The inherited count may be GPU data an earlier (pending) draw writes.
 			DrainPreparedDraws();
 		}
 		args.instance_count = NumInstances();
+	}
+	if ((op.flags & CpSeq::DrawFlagPublished) != 0) {
+		// Thread mode: the sequencer published the draw; commit its prepared slot now, in order.
+		m_draw_prep->CommitPublished(
+		    op.window, m_submit_id,
+		    (op.flags & CpSeq::DrawFlagInheritInstances) != 0 ? args.instance_count : UINT32_MAX);
+		MaybeYieldSlice();
+		return;
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
@@ -2034,6 +2258,10 @@ CpSeq::DrawIndirectOp CommandProcessor::IndirectDrawOp(uint32_t data_offset,
 		}
 		// From here on the count is back state (read from the arguments, maybe GPU data).
 		m_front_instances_known = false;
+	}
+	if (m_front_mode == FrontMode::Thread) {
+		op.flags |= CpSeq::IndirectFlagSnapshot;
+		op.snapshot = TakeSnapshot();
 	}
 	return op;
 }
@@ -2231,6 +2459,10 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	op.y    = thread_group_y;
 	op.z    = thread_group_z;
 	op.mode = mode;
+	if (m_front_mode == FrontMode::Thread) {
+		op.flags |= CpSeq::DispatchFlagSnapshot;
+		op.snapshot = TakeSnapshot();
+	}
 	(void)Submit(op);
 }
 
@@ -2311,6 +2543,10 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	CpSeq::DispatchIndirectOp op;
 	op.args_addr = args_addr;
 	op.mode      = mode;
+	if (m_front_mode == FrontMode::Thread) {
+		op.flags |= CpSeq::DispatchFlagSnapshot;
+		op.snapshot = TakeSnapshot();
+	}
 	(void)Submit(op);
 }
 
@@ -2321,7 +2557,7 @@ void CommandProcessor::ExecDispatchIndirect(const CpSeq::DispatchIndirectOp& op)
 		direct.x    = args.x;
 		direct.y    = args.y;
 		direct.z    = args.z;
-		direct.mode = op.mode;
+		direct.mode = op.mode; // (thread mode: the op's snapshot is bound)
 		ExecDispatchDirect(direct);
 		return;
 	}
@@ -2351,22 +2587,35 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 			op.flags |= CpSeq::DrawFlagInheritInstances;
 		}
 	}
+	if (m_front_mode == FrontMode::Thread) {
+		const auto draw_op = m_ops->Emitted();
+		AttachDrawRegisters(
+		    op, DrawArgsOf(op), m_draw_prep.get(), m_ctx, m_ucfg, m_sh_ctx,
+		    [this] { return WaitForWindowSpace(); }, [this] { return TakeSnapshot(); });
+		if ((op.flags & CpSeq::DrawFlagPublished) != 0) {
+			m_published_ops.push_back(draw_op);
+			if (m_published_ops.size() > 256u) {
+				(void)OldestPendingOp(m_published_ops);
+			}
+		}
+	}
 	(void)Submit(op);
 }
 
 void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
-	DrawAutoArgs args;
-	args.vertex_count               = op.vertex_count;
-	args.instance_count             = op.instance_count;
-	args.first_vertex               = op.first_vertex;
-	args.first_instance             = op.first_instance;
-	args.offset_source              = static_cast<DrawOffsetSource>(op.offset_source);
-	args.render_target_slice_offset = op.render_target_slice_offset;
+	auto args = DrawArgsOf(op);
 	if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
 		if (!m_pending_num_instances.empty()) {
 			DrainPreparedDraws();
 		}
 		args.instance_count = NumInstances();
+	}
+	if ((op.flags & CpSeq::DrawFlagPublished) != 0) {
+		m_draw_prep->CommitPublished(
+		    op.window, m_submit_id,
+		    (op.flags & CpSeq::DrawFlagInheritInstances) != 0 ? args.instance_count : UINT32_MAX);
+		MaybeYieldSlice();
+		return;
 	}
 	if (RepeatTrace::Enabled()) {
 		NoteRepeatTraceDrawPacket();
@@ -2555,6 +2804,7 @@ bool CommandProcessor::WriteDroppedLabel(void* dst, uint64_t value, uint32_t siz
 	}
 	KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel");
 	std::memcpy(dst, &value, size);
+	NoteCpWrite(reinterpret_cast<uint64_t>(dst), size);
 	QueueEopTimestamp(timestamp_slot, dst, value);
 	TraceCpLabel("label-dropped", dst, value, size);
 	return false;
@@ -2786,6 +3036,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel32");
 			std::memcpy(dst, &data, sizeof(data));
 		}
+		NoteCpWrite(reinterpret_cast<uint64_t>(dst), sizeof(data));
 		TraceCpLabel("label-eop", dst, data, sizeof(data));
 
 		if (with_interrupt) {
@@ -2820,6 +3071,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					SynchronizeGpu();
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
+					NoteCpWrite(reinterpret_cast<uint64_t>(dst), uint64_t {value >> 16u} * 4u);
 					TraceCpLabel("label-gds", dst, *dst, value >> 16u);
 					Sync::WriteAtEndOfPipeGds32(m_submit_id, command, dst, value & 0xffffu,
 					                            value >> 16u);
@@ -2869,6 +3121,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 						KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel64");
 						std::memcpy(dst, &value, sizeof(value));
 					}
+					NoteCpWrite(reinterpret_cast<uint64_t>(dst), sizeof(value));
 					QueueEopTimestamp(timestamp_slot, dst, value);
 					TraceCpLabel("label-eop", dst, value, sizeof(value));
 
@@ -3163,6 +3416,7 @@ void CommandProcessor::ExecEventWrite(const CpSeq::EventWriteOp& op) {
 			for (uint32_t db = 0; db < 16u; db++) {
 				results[db * 2u] = value;
 			}
+			NoteCpWrite(event_address, 16u * 2u * sizeof(uint64_t));
 			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
 			break;
 		}
@@ -3259,6 +3513,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 			}
 
 			std::memcpy(dst_gpu_addr, &value, sizeof(value));
+			NoteCpWrite(op.dst, sizeof(value));
 			auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 			                                         flip.flip_mode, flip.flip_arg);
 			Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command,
@@ -3288,6 +3543,7 @@ void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
 				EXIT("unknown event type\n");
 			}
 			std::memcpy(dst_gpu_addr, &value, sizeof(value));
+			NoteCpWrite(op.dst, sizeof(value));
 			auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
 			                                         flip.flip_mode, flip.flip_arg);
 			Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(
@@ -3350,6 +3606,7 @@ CpSeq::Result CommandProcessor::Submit(CpSeq::OpKind kind, const void* payload,
 			                          g_current_execution->m_packets,
 			                          g_current_execution->m_packets_hash);
 		}
+		case FrontMode::Thread: return SubmitThread(kind, payload, payload_size, data, data_size);
 	}
 	EXIT("unknown front mode\n");
 	return {};
@@ -3434,6 +3691,11 @@ CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payloa
 		case OpKind::CondExec: return ExecCondExec(*static_cast<const CpSeq::CondExecOp*>(payload));
 		case OpKind::Branch: return ExecBranch(*static_cast<const CpSeq::BranchOp*>(payload));
 		case OpKind::ReadCheck: break; // compared by the verifier only
+		case OpKind::LockstepRead:
+			return ExecLockstepRead(*static_cast<const CpSeq::LockstepReadOp*>(payload));
+		case OpKind::StreamBegin:
+		case OpKind::StreamEnd:
+		case OpKind::Handoff: EXIT("stream ops are consumed by ResolveSubmission\n"); break;
 		case OpKind::Count: EXIT("invalid op kind\n");
 	}
 	return {};
@@ -3480,10 +3742,19 @@ CpSeq::Result CommandProcessor::ExecBranch(const CpSeq::BranchOp& op) {
 const uint32_t* CommandProcessor::ReadRegisterPairs(uint64_t address, uint32_t num_regs) {
 	m_register_pairs.resize(static_cast<size_t>(num_regs) * 2u);
 	const auto bytes = static_cast<uint64_t>(m_register_pairs.size()) * sizeof(uint32_t);
-	ReadGuestForCp(address, bytes, m_register_pairs.data());
+	if (m_front_mode == FrontMode::Thread) {
+		// The sequencer: the backing when the pages were never GPU-touched and no pending CP
+		// write covers them, else the resolver reads them in order.
+		if (!ReadGuestForFront(address, bytes, m_register_pairs.data())) {
+			std::memset(m_register_pairs.data(), 0, bytes); // stopping
+		}
+	} else {
+		ReadGuestForCp(address, bytes, m_register_pairs.data());
+	}
 	// KYTY_CP_SEQ_VERIFY: the front's read is compared with the reference front's serial read.
 	const bool check =
 	    m_front_mode == FrontMode::Reference ||
+	    (m_front_mode == FrontMode::Thread && CpSeq::VerifyMode() != 0) ||
 	    (m_front_mode == FrontMode::Inline && m_verifier != nullptr &&
 	     g_current_execution != nullptr && m_verifier->Follows(g_current_execution->m_stream_id));
 	if (check) {
@@ -3555,6 +3826,621 @@ void CommandProcessor::CopyFrontState(const CommandProcessor& from) {
 	std::memcpy(m_const_ram, from.m_const_ram, sizeof(m_const_ram));
 	m_flip           = from.m_flip;
 	m_predicate_skip = from.m_predicate_skip;
+}
+
+// ---- P3b: the sequencer thread (KYTY_CP_SEQ=1, cpSequencer.h) --------------------------------
+
+// Every CPU write of guest memory by the command processor is logged while the sequencer runs:
+// draw preparations then span the packets between ordering points, and a preparation that read
+// the written bytes must fail its certificate at commit (drawPrep.h, P3-SEQUENCER.md 2.6).
+void NoteCpWrite(uint64_t address, uint64_t size) {
+	if (CpSeq::ConfiguredMode() == CpSeq::Mode::Thread && address != 0 && size != 0) {
+		Coherence::NoteContentWrite(address, size, Coherence::Source::CpWrite);
+	}
+}
+
+void CommandProcessor::AttachSequencer(CpSeq::Sequencer* sequencer) {
+	EXIT_IF(sequencer == nullptr || m_sequencer != nullptr || IsAsyncComputeQueue());
+	m_sequencer  = sequencer;
+	m_front_mode = FrontMode::Thread;
+	m_ops.reset(new CpSeq::OpStream(OpRingBytes()));
+	m_ops->SetSpinNs(CpSeq::SequencerSpinNs());
+	// The draw-prep engine's producer is the sequencer from now on: create it before either
+	// thread can look at it.
+	(void)DrawPrepEngine();
+	if (m_draw_prep != nullptr && !m_draw_prep->Parallel() &&
+	    DrawPrep::GetMode() != DrawPrep::Mode::Off) {
+		std::printf("Kyty CP sequencer: KYTY_DRAW_PREP=inline prepares on the resolver\n");
+	}
+}
+
+void CommandProcessor::DetachSequencer() {
+	EXIT_IF(m_front_mode != FrontMode::Thread || m_sequencer == nullptr);
+	CpSeq::OpView view;
+	EXIT_IF(m_ops->Peek(view)); // every op executed
+	m_front_mode = FrontMode::Direct;
+	m_sequencer  = nullptr;
+	m_pending_writes.clear();
+}
+
+void CommandProcessor::BeginHandoff() {
+	EXIT_IF(m_front_mode != FrontMode::Thread);
+	m_front_mode = FrontMode::Direct;
+}
+
+void CommandProcessor::EndHandoff(uint64_t submission) {
+	EXIT_IF(m_front_mode != FrontMode::Direct || m_sequencer == nullptr);
+	// The direct path drained its draws at the slice's end.
+	EXIT_IF(m_draw_prep != nullptr && m_draw_prep->Pending());
+	m_front_mode = FrontMode::Thread;
+	m_sequencer->NoteHandoffDone(submission);
+}
+
+bool CommandProcessor::CpWriteRange(CpSeq::OpKind kind, const void* payload, uint64_t& begin,
+                                    uint64_t& end) {
+	using CpSeq::OpKind;
+	uint64_t address = 0;
+	uint64_t size    = 0;
+	switch (kind) {
+		case OpKind::WriteData: {
+			const auto& op = *static_cast<const CpSeq::WriteDataOp*>(payload);
+			const bool  one_address = ((op.write_control >> 16u) & 0x1u) != 0;
+			address                 = op.dst;
+			size = one_address ? sizeof(uint32_t) : uint64_t {op.dw_num} * sizeof(uint32_t);
+			break;
+		}
+		case OpKind::DumpConstRam: {
+			const auto& op = *static_cast<const CpSeq::DumpConstRamOp*>(payload);
+			address        = op.dst;
+			size           = uint64_t {op.dw_num} * sizeof(uint32_t);
+			break;
+		}
+		case OpKind::ReferenceClock: {
+			const auto& op = *static_cast<const CpSeq::ReferenceClockOp*>(payload);
+			address        = op.dst;
+			size           = op.num_bytes;
+			break;
+		}
+		case OpKind::EndOfPipe: {
+			const auto& op = *static_cast<const CpSeq::EndOfPipeOp*>(payload);
+			address        = op.dst;
+			// A GDS read (32-bit form, source 1) writes value >> 16 dwords.
+			size = op.size == sizeof(uint32_t) && op.event_write_source == 1u
+			           ? uint64_t {static_cast<uint32_t>(op.value) >> 16u} * sizeof(uint32_t)
+			           : 8u;
+			break;
+		}
+		case OpKind::ReleaseMem: {
+			const auto& op = *static_cast<const CpSeq::ReleaseMemOp*>(payload);
+			address        = op.body[2] | (uint64_t {op.body[3]} << 32u);
+			const auto data_sel = (op.body[1] >> 29u) & 0x7u;
+			size = data_sel == 5u ? uint64_t {op.body[4] >> 16u} * sizeof(uint32_t) : 8u;
+			break;
+		}
+		case OpKind::Flip: {
+			const auto& op = *static_cast<const CpSeq::FlipOp*>(payload);
+			address        = op.dst;
+			size           = sizeof(uint32_t);
+			break;
+		}
+		case OpKind::EventWrite: {
+			const auto& op = *static_cast<const CpSeq::EventWriteOp*>(payload);
+			if (op.event_type == 0x39u) {
+				address = op.address;
+				size    = 16u * 2u * sizeof(uint64_t); // one begin/end pair per DB
+			}
+			break;
+		}
+		case OpKind::LodStats: {
+			const auto& op = *static_cast<const CpSeq::LodStatsOp*>(payload);
+			address = (op.body[1] & 0xffffffc0u) | (uint64_t {op.body[2]} << 32u);
+			size    = op.body[0];
+			break;
+		}
+		case OpKind::DmaData: {
+			const auto& op = *static_cast<const CpSeq::DmaDataOp*>(payload);
+			// Memory destinations (0, 3); GDS (1) and nowhere (2) are not guest memory.
+			if (op.dst_sel == 0u || op.dst_sel == 3u) {
+				address = op.dst;
+				size    = op.num_bytes;
+			}
+			break;
+		}
+		default: break;
+	}
+	if (address == 0 || size == 0) {
+		return false;
+	}
+	begin = address;
+	end   = size > UINT64_MAX - address ? UINT64_MAX : address + size;
+	return true;
+}
+
+CpSeq::Result CommandProcessor::SubmitThread(CpSeq::OpKind kind, const void* payload,
+                                             uint32_t payload_size, const void* data,
+                                             uint32_t data_size) {
+	// Only the sequencer emits; an op's execution on the resolver never emits another op.
+	EXIT_IF(!g_sequencer_thread || m_sequencer == nullptr);
+	auto*      execution = g_current_execution;
+	const auto sequence  = m_ops->Emitted();
+	uint16_t   flags     = 0;
+	if (m_epoch_pending) {
+		flags |= CpSeq::FlagAdvanceEpoch;
+		m_epoch_pending = false;
+	}
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+	if (CpWriteRange(kind, payload, begin, end)) {
+		// Command bytes under it are parsed only after it executed (CheckCommandBytes).
+		if (m_pending_writes.size() >= 64u) {
+			const auto executed = m_sequencer->Executed();
+			std::erase_if(m_pending_writes,
+			              [executed](const PendingWrite& write) { return write.op < executed; });
+		}
+		m_pending_writes.push_back({begin, end, sequence});
+		if (execution != nullptr) {
+			for (auto& cursor: execution->m_buffer_stack) {
+				const auto rest_begin =
+				    cursor.copy != nullptr ? cursor.guest_address + uint64_t {cursor.offset_dw} * 4u
+				                           : reinterpret_cast<uint64_t>(cursor.commands.data() +
+				                                                        cursor.offset_dw);
+				const auto rest_end =
+				    rest_begin + (cursor.commands.size() - cursor.offset_dw) * sizeof(uint32_t);
+				if (begin < rest_end && rest_begin < end) {
+					cursor.checked_epoch = 0;
+				}
+			}
+		}
+	}
+	(void)m_ops->Emit(kind, payload, payload_size, data, data_size,
+	                  execution != nullptr ? execution->m_packets : 0,
+	                  execution != nullptr ? execution->m_packets_hash : 0,
+	                  CpSeq::VerifyMode() != 0, flags);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqOps);
+	if (!CpSeq::IsLockstep(kind)) {
+		return {};
+	}
+	// An ordering point: the resolver executes everything before it, then this op.
+	const auto value = m_sequencer->AwaitAnswer(sequence);
+	m_pending_writes.clear();
+	m_barrier_epoch++;
+	return {false, value};
+}
+
+bool CommandProcessor::AwaitPendingWrites(uint64_t begin, uint64_t end) {
+	uint64_t needed = 0; // op sequence + 1 that must have executed
+	for (const auto& write: m_pending_writes) {
+		if (write.begin < end && begin < write.end) {
+			needed = std::max(needed, write.op + 1u);
+		}
+	}
+	if (needed == 0 || m_sequencer->Executed() >= needed) {
+		return true;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqPendingWriteStops);
+	if (!m_sequencer->Wait([this, needed] { return m_sequencer->Executed() >= needed; }, needed,
+	                       needed)) {
+		return false;
+	}
+	const auto executed = m_sequencer->Executed();
+	std::erase_if(m_pending_writes,
+	              [executed](const PendingWrite& write) { return write.op < executed; });
+	m_barrier_epoch++;
+	return true;
+}
+
+bool CommandProcessor::ReadGuestForFront(uint64_t address, uint64_t size, void* dst) {
+	if (size == 0) {
+		return true;
+	}
+	if (!AwaitPendingWrites(address, address + size)) {
+		return false;
+	}
+	if (!GpuTouched::g_pages.AnyTouched(address, address + size)) {
+		// Never GPU-touched: the backing is authoritative and the read cannot fault
+		// (gpuTouchedPages.h); the serial CP would read the same bytes (P3-SEQUENCER.md 2.5).
+		Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqDirectReads);
+		std::memcpy(dst, reinterpret_cast<const void*>(address), size);
+		return true;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqLockstepReads);
+	CpSeq::LockstepReadOp op;
+	op.address     = address;
+	op.size        = size;
+	op.destination = reinterpret_cast<uint64_t>(dst);
+	(void)SubmitThread(CpSeq::OpKind::LockstepRead, &op, sizeof(op), nullptr, 0);
+	return !m_sequencer->Stopping();
+}
+
+CpSeq::Result CommandProcessor::ExecLockstepRead(const CpSeq::LockstepReadOp& op) {
+	ReadGuestForCp(op.address, op.size, reinterpret_cast<void*>(op.destination));
+	return {};
+}
+
+bool CommandProcessor::CheckCommandBytes(Pm4Execution::BufferCursor& cursor) {
+	const auto rest_dw    = cursor.commands.size() - cursor.offset_dw;
+	const auto rest_begin = cursor.copy != nullptr
+	                            ? cursor.guest_address + uint64_t {cursor.offset_dw} * 4u
+	                            : reinterpret_cast<uint64_t>(cursor.commands.data() +
+	                                                         cursor.offset_dw);
+	const auto rest_end = rest_begin + rest_dw * sizeof(uint32_t);
+	if (!AwaitPendingWrites(rest_begin, rest_end)) {
+		return false;
+	}
+	if (cursor.copy == nullptr && !GpuTouched::g_pages.AnyTouched(rest_begin, rest_end)) {
+		cursor.checked_epoch = m_barrier_epoch;
+		return true;
+	}
+	if (cursor.copy != nullptr && cursor.checked_epoch != 0) {
+		// A copy taken in order stays what the serial CP reads, unless a CP write since then
+		// covered it (checked_epoch 0, below).
+		cursor.checked_epoch = m_barrier_epoch;
+		return true;
+	}
+	// GPU-touched command bytes (or a copy a CP write made stale): the resolver copies the rest
+	// of the buffer at this point of the stream.
+	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqLockstepBuffers);
+	auto copy = std::make_shared<std::vector<uint32_t>>(rest_dw);
+	CpSeq::LockstepReadOp op;
+	op.address     = rest_begin;
+	op.size        = rest_dw * sizeof(uint32_t);
+	op.destination = reinterpret_cast<uint64_t>(copy->data());
+	(void)SubmitThread(CpSeq::OpKind::LockstepRead, &op, sizeof(op), nullptr, 0);
+	if (m_sequencer->Stopping()) {
+		return false;
+	}
+	cursor.commands      = {copy->data(), rest_dw};
+	cursor.offset_dw     = 0;
+	cursor.guest_address = rest_begin;
+	cursor.copy          = std::move(copy);
+	cursor.checked_epoch = m_barrier_epoch;
+	return true;
+}
+
+uint32_t CommandProcessor::TakeSnapshot() {
+	auto& ring = m_sequencer->Snapshots();
+	if (!ring.HasFree()) {
+		const auto wake_at = OldestPendingOp(m_snapshot_ops);
+		if (!m_sequencer->Wait([&ring] { return ring.HasFree(); }, wake_at, wake_at)) {
+			return 0; // stopping
+		}
+	}
+	// The op this snapshot is for is the next one emitted.
+	m_snapshot_ops.push_back(m_ops->Emitted());
+	if (m_snapshot_ops.size() > 2u * ring.Capacity()) {
+		(void)OldestPendingOp(m_snapshot_ops);
+	}
+	const auto index   = ring.Acquire();
+	auto&      entry   = ring.Entry(index);
+	entry.context      = m_ctx;
+	entry.user_config  = m_ucfg;
+	entry.shaders      = m_sh_ctx;
+	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqSnapshots);
+	return index;
+}
+
+CpSeq::RegisterState* CommandProcessor::OpSnapshot(CpSeq::OpKind kind, const void* payload) {
+	using CpSeq::OpKind;
+	uint32_t index = UINT32_MAX;
+	switch (kind) {
+		case OpKind::DrawIndex: {
+			const auto& op = *static_cast<const CpSeq::DrawIndexOp*>(payload);
+			index          = (op.flags & CpSeq::DrawFlagSnapshot) != 0 ? op.snapshot : UINT32_MAX;
+			break;
+		}
+		case OpKind::DrawAuto: {
+			const auto& op = *static_cast<const CpSeq::DrawAutoOp*>(payload);
+			index          = (op.flags & CpSeq::DrawFlagSnapshot) != 0 ? op.snapshot : UINT32_MAX;
+			break;
+		}
+		case OpKind::DrawIndirect:
+		case OpKind::DrawIndirectMulti: {
+			const auto& op = *static_cast<const CpSeq::DrawIndirectOp*>(payload);
+			index = (op.flags & CpSeq::IndirectFlagSnapshot) != 0 ? op.snapshot : UINT32_MAX;
+			break;
+		}
+		case OpKind::DispatchDirect: {
+			const auto& op = *static_cast<const CpSeq::DispatchDirectOp*>(payload);
+			index = (op.flags & CpSeq::DispatchFlagSnapshot) != 0 ? op.snapshot : UINT32_MAX;
+			break;
+		}
+		case OpKind::DispatchIndirect: {
+			const auto& op = *static_cast<const CpSeq::DispatchIndirectOp*>(payload);
+			index = (op.flags & CpSeq::DispatchFlagSnapshot) != 0 ? op.snapshot : UINT32_MAX;
+			break;
+		}
+		default: break;
+	}
+	if (index == UINT32_MAX || m_sequencer == nullptr) {
+		return nullptr;
+	}
+	return &m_sequencer->Snapshots().Entry(index);
+}
+
+uint64_t CommandProcessor::OldestPendingOp(std::deque<uint64_t>& ops) const {
+	const auto executed = m_sequencer->Executed();
+	while (!ops.empty() && ops.front() < executed) {
+		ops.pop_front();
+	}
+	return ops.empty() ? 0u : ops.front() + 1u;
+}
+
+bool CommandProcessor::WaitForWindowSpace() {
+	auto*      engine  = m_draw_prep.get();
+	const auto wake_at = OldestPendingOp(m_published_ops);
+	return m_sequencer->Wait([engine] { return engine->WindowHasSpace(); }, wake_at, wake_at);
+}
+
+bool CommandProcessor::SequenceSubmission(const CpSeq::Intake& intake) {
+	EXIT_IF(m_sequencer == nullptr || m_front_mode != FrontMode::Thread);
+	g_sequencer_thread = true;
+	// Like a draw-prep worker, the sequencer never reaches the scheduler or the caches:
+	// CommandScheduler::CheckActive stops the emulator if a front path does.
+	DrawPrep::t_worker_thread = true;
+	auto& sequencer = *m_sequencer;
+	if (intake.graphics && intake.frame_fence != 0) {
+		// Ordering point (the frame fence): the command bytes of a fenced submission are read only
+		// once the resolver has started it, i.e. once the work the fence orders has completed.
+		if (!sequencer.Wait([&] { return sequencer.Started() >= intake.sequence; })) {
+			return false;
+		}
+		m_pending_writes.clear();
+		m_barrier_epoch++;
+	}
+	// The front's part of GuestGpu::Process's first slice.
+	if (intake.reset_processor) {
+		Reset();
+	}
+	ResetDeCe();
+	SetFlip({});
+	m_ce_complete = intake.constant_commands.empty();
+
+	const bool handoff = intake.graphics && !intake.constant_commands.empty();
+	CpSeq::StreamBeginOp begin;
+	begin.submission = intake.sequence;
+	if (CpSeq::VerifyMode() != 0 && intake.graphics && !handoff) {
+		// The reference front starts from this front state (owned by the op).
+		auto* state = new CommandProcessor(m_renderer, m_interrupt_event_id);
+		state->CopyFrontState(*this);
+		begin.state  = reinterpret_cast<uint64_t>(state);
+		begin.verify = 1;
+	}
+	(void)SubmitThread(CpSeq::OpKind::StreamBegin, &begin, sizeof(begin), nullptr, 0);
+	if (!intake.graphics) {
+		CpSeq::StreamEndOp end;
+		end.submission = intake.sequence;
+		(void)SubmitThread(CpSeq::OpKind::StreamEnd, &end, sizeof(end), nullptr, 0);
+		return true;
+	}
+	if (handoff) {
+		// Constant engine: the resolver parses and executes this submission itself, with this
+		// front state, while this thread waits.
+		CpSeq::HandoffOp op;
+		op.submission = intake.sequence;
+		(void)SubmitThread(CpSeq::OpKind::Handoff, &op, sizeof(op), nullptr, 0);
+		if (!sequencer.Wait([&] { return sequencer.HandoffsDone() >= intake.sequence; })) {
+			return false;
+		}
+		m_pending_writes.clear();
+		m_barrier_epoch++;
+		return true;
+	}
+
+	Pm4Execution execution;
+	execution.m_buffer_stack.push_back({intake.commands});
+	execution.m_stream_id = intake.sequence;
+	struct Scope {
+		Scope(CommandProcessor& processor, Pm4Execution& execution)
+		    : previous_processor(g_current_processor), previous_execution(g_current_execution) {
+			g_current_processor = &processor;
+			g_current_execution = &execution;
+		}
+		~Scope() {
+			g_current_processor = previous_processor;
+			g_current_execution = previous_execution;
+		}
+		CommandProcessor* previous_processor;
+		Pm4Execution*     previous_execution;
+	} scope(*this, execution);
+	while (!execution.m_buffer_stack.empty()) {
+		if (sequencer.Stopping()) {
+			return false;
+		}
+		execution.m_suspended = false;
+		if (ProcessPacket(execution) || !execution.m_suspended) {
+			continue;
+		}
+		if (sequencer.Stopping()) {
+			return false;
+		}
+		// A wait of the front alone (REWIND before its valid bit): the packet is parsed again,
+		// from memory, shortly.
+		Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqFrontWaits);
+		std::this_thread::sleep_for(std::chrono::microseconds(50));
+		m_barrier_epoch++;
+	}
+	CpSeq::StreamEndOp end;
+	end.submission = intake.sequence;
+	end.packets    = execution.m_packets;
+	g_current_execution = nullptr; // the end op carries its own packet count
+	(void)SubmitThread(CpSeq::OpKind::StreamEnd, &end, sizeof(end), nullptr, 0);
+	return true;
+}
+
+Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, uint64_t submission,
+                                                     std::span<const uint32_t> commands,
+                                                     bool&                     handoff) {
+	KYTY_PROFILER_BLOCK("CommandProcessor::Resolve");
+	EXIT_IF(g_current_execution != nullptr || m_front_mode != FrontMode::Thread);
+	handoff                   = false;
+	execution.m_suspended     = false;
+	execution.m_made_progress = false;
+	execution.m_yield         = false;
+	execution.m_yielded       = false;
+	execution.m_stream_id     = submission;
+	m_slice_draws             = 0;
+	struct Scope {
+		Scope(CommandProcessor& processor, Pm4Execution& execution)
+		    : previous_processor(g_current_processor), previous_execution(g_current_execution) {
+			g_current_processor = &processor;
+			g_current_execution = &execution;
+		}
+		~Scope() {
+			g_current_processor = previous_processor;
+			g_current_execution = previous_execution;
+		}
+		CommandProcessor* previous_processor;
+		Pm4Execution*     previous_execution;
+	} scope(*this, execution);
+	auto& sequencer = *m_sequencer;
+	for (;;) {
+		// Service commands run between ops: every op before this one has executed and no later
+		// one has, the serial point (P3-SEQUENCER.md 2.4).
+		if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
+			g_gpu_state->ProcessCommands();
+		}
+		CpSeq::OpView view;
+		if (!m_ops->Peek(view)) {
+			// The sequencer has not produced the next op yet: spin briefly, then let other queues
+			// and services run while it parses.
+			Profiler::ScopedFrameWait starved(Profiler::FrameWait::CpSeqResolverStarved);
+			Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqResolverStarved);
+			const auto start    = CpNowNs();
+			bool       produced = false;
+			for (uint32_t spins = 0;; spins++) {
+				if (m_ops->Peek(view)) {
+					produced = true;
+					break;
+				}
+				if ((spins & 63u) != 63u) {
+#if defined(_M_X64) || defined(__x86_64__)
+					_mm_pause();
+#endif
+					continue;
+				}
+				const auto elapsed = CpNowNs() - start;
+				if (elapsed < CpSeq::ResolverSpinNs()) {
+					continue;
+				}
+				if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
+					break;
+				}
+				if (elapsed > 2'000'000u ||
+				    (g_gpu_state != nullptr && g_gpu_state->HasRunnableComputeWork())) {
+					break;
+				}
+				std::this_thread::yield();
+			}
+			if (!produced) {
+				if (g_gpu_state != nullptr && g_gpu_state->HasPendingCommands()) {
+					continue;
+				}
+				execution.m_yielded = true;
+				return Pm4ProcessResult::Blocked;
+			}
+		}
+		const auto  kind     = view.Kind();
+		const auto  sequence = view.header->sequence;
+		const auto  packet   = view.header->packet;
+		const auto& header   = *view.header;
+		if (kind == CpSeq::OpKind::StreamBegin) {
+			const auto& begin = view.As<CpSeq::StreamBeginOp>();
+			EXIT_IF(begin.submission != submission);
+			m_resolver_packets = 0;
+			m_retry_op         = 0;
+			if (begin.state != 0) {
+				auto* state = reinterpret_cast<CommandProcessor*>(begin.state);
+				if (begin.verify != 0) {
+					if (m_verifier == nullptr) {
+						m_verifier.reset(new CpSeq::Verifier(m_renderer, m_interrupt_event_id));
+					}
+					m_verifier->Attach(*state, submission, commands);
+				}
+				delete state;
+			} else if (m_verifier != nullptr) {
+				m_verifier->Detach();
+			}
+			m_ops->Pop();
+			sequencer.NoteExecuted(sequence + 1u);
+			continue;
+		}
+		if (kind == CpSeq::OpKind::StreamEnd) {
+			EXIT_IF(view.As<CpSeq::StreamEndOp>().submission != submission);
+			if (m_verifier != nullptr && m_verifier->Follows(submission)) {
+				m_verifier->Finish();
+			}
+			m_ops->Pop();
+			sequencer.NoteExecuted(sequence + 1u);
+			execution.m_made_progress = true;
+			return Pm4ProcessResult::Complete;
+		}
+		if (kind == CpSeq::OpKind::Handoff) {
+			EXIT_IF(view.As<CpSeq::HandoffOp>().submission != submission);
+			m_ops->Pop();
+			sequencer.NoteExecuted(sequence + 1u);
+			handoff = true;
+			return Pm4ProcessResult::Complete;
+		}
+		// The back's per-packet work of the packets parsed since the previous op.
+		if ((header.flags & CpSeq::FlagAdvanceEpoch) != 0) {
+			SyncEpoch::Advance();
+		}
+		if (packet > m_resolver_packets) {
+			if (m_deferred_eop_flushes != 0) {
+				m_packets_since_eop_request +=
+				    static_cast<uint32_t>(std::min<uint64_t>(packet - m_resolver_packets, 1u << 20u));
+				if (m_packets_since_eop_request >= EopFlushPacketLimit()) {
+					// Bound how long a batched end-of-pipe interrupt waits (at an op, not a packet).
+					BufferFlush();
+				}
+			}
+			m_resolver_packets = packet;
+		}
+		const bool retry     = m_retry_op == sequence + 1u;
+		const bool following = m_verifier != nullptr && m_verifier->Follows(submission) &&
+		                       !CpSeq::IsTransport(kind);
+		if (following && !retry) {
+			m_verifier->Before(view);
+		}
+		auto*                             snapshot = OpSnapshot(kind, view.payload);
+		CommandScheduler::RegisterBinding previous {};
+		if (snapshot != nullptr) {
+			previous = GetScheduler().BindRegisters(snapshot->context, snapshot->user_config,
+			                                        snapshot->shaders);
+		}
+		m_executing       = true;
+		const auto result = ExecuteOp(kind, view.payload, view.data);
+		m_executing       = false;
+		if (snapshot != nullptr) {
+			GetScheduler().RestoreRegisters(previous);
+		}
+		if (result.suspended) {
+			// A wait that has not passed: the op stays at the ring's head and is executed again
+			// in the next slice. Only lockstep ops suspend; they carry no snapshot.
+			EXIT_IF(snapshot != nullptr);
+			m_retry_op            = sequence + 1u;
+			execution.m_suspended = true;
+			return Pm4ProcessResult::Blocked;
+		}
+		m_retry_op = 0;
+		if (following && m_verifier->Follows(submission)) {
+			m_verifier->After(view, result);
+		}
+		if (snapshot != nullptr) {
+			sequencer.Snapshots().Release();
+		}
+		m_ops->Pop();
+		if (CpSeq::IsLockstep(kind)) {
+			sequencer.Answer(sequence, result.value);
+		}
+		sequencer.NoteExecuted(sequence + 1u);
+		execution.m_made_progress = true;
+		if (execution.m_yield) {
+			execution.m_yield   = false;
+			execution.m_yielded = true;
+			return Pm4ProcessResult::Blocked;
+		}
+	}
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

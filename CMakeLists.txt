@@ -1086,6 +1086,68 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --eop-timestamps-only)
 	set_tests_properties(eop_timestamps_gpu_deferred_cp_seq_inline_verify PROPERTIES
 		ENVIRONMENT "KYTY_EOP_TIMESTAMPS=gpu;KYTY_LABEL_MODE=completion;KYTY_CP_SEQ=inline;KYTY_CP_SEQ_VERIFY=exit")
+	# KYTY_CP_SEQ=1 (cpSequencer.h): the graphics front on the sequencer thread, the GPU thread
+	# resolving its ops. The PM4 checks and GuestGpu submissions (the lane test: waits, the frame
+	# fence, interrupts), the draw-prep engine's draws sequenced with parallel (published per op),
+	# inline and off draw prep (register snapshots), the whole suite with the verify modes, with
+	# the CP recorder, and the EOP timestamp modes.
+	add_test(NAME cp_seq_thread
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cp-seq-only)
+	set_tests_properties(cp_seq_thread PROPERTIES ENVIRONMENT "KYTY_CP_SEQ=1")
+	add_test(NAME cp_seq_thread_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cp-seq-only)
+	set_tests_properties(cp_seq_thread_verify PROPERTIES
+		ENVIRONMENT "KYTY_CP_SEQ=1;KYTY_CP_SEQ_VERIFY=exit")
+	# The park/wake protocol: no spinning on either side, a 2-slot window and 4 snapshots, so the
+	# sequencer parks at every barrier, full window and full snapshot ring.
+	add_test(NAME cp_seq_thread_park_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --cp-seq-only)
+	set_tests_properties(cp_seq_thread_park_verify PROPERTIES
+		ENVIRONMENT "KYTY_CP_SEQ=1;KYTY_CP_SEQ_VERIFY=exit;KYTY_CP_SEQ_SPIN_US=0;KYTY_CP_SEQ_RESOLVER_SPIN_US=0;KYTY_CP_SEQ_SNAPSHOTS=4")
+	add_test(NAME draw_prep_engine_parallel_cp_seq_thread_park
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_cp_seq_thread_park PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_WINDOW=2;KYTY_DRAW_PREP_VERIFY=exit;KYTY_CP_SEQ=1;KYTY_CP_SEQ_VERIFY=exit;KYTY_CP_SEQ_SPIN_US=0;KYTY_CP_SEQ_RESOLVER_SPIN_US=0;KYTY_CP_SEQ_SNAPSHOTS=4")
+	add_test(NAME gpu_command_lane_cp_seq_thread_park
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
+	set_tests_properties(gpu_command_lane_cp_seq_thread_park PROPERTIES
+		ENVIRONMENT "KYTY_CP_SEQ=1;KYTY_CP_SEQ_SPIN_US=0;KYTY_CP_SEQ_RESOLVER_SPIN_US=0;KYTY_CP_SEQ_SNAPSHOTS=4")
+	add_test(NAME gpu_command_lane_cp_seq_thread_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
+	set_tests_properties(gpu_command_lane_cp_seq_thread_verify PROPERTIES
+		ENVIRONMENT "KYTY_CP_SEQ=1;KYTY_CP_SEQ_VERIFY=exit")
+	add_test(NAME draw_prep_engine_parallel_cp_seq_thread_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_cp_seq_thread_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_CP_SEQ=1;KYTY_CP_SEQ_VERIFY=exit")
+	add_test(NAME draw_prep_engine_parallel_steal_cp_seq_thread
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_steal_cp_seq_thread PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_STEAL=1;KYTY_DRAW_PREP_WORKERS=1;KYTY_CP_SEQ=1")
+	add_test(NAME draw_prep_engine_inline_cp_seq_thread_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_inline_cp_seq_thread_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_PREP_VERIFY=exit;KYTY_CP_SEQ=1;KYTY_CP_SEQ_VERIFY=exit")
+	add_test(NAME draw_prep_engine_off_cp_seq_thread_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_off_cp_seq_thread_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=off;KYTY_CP_SEQ=1;KYTY_CP_SEQ_VERIFY=exit")
+	add_test(NAME shader_recompiler_compute_cp_seq_thread
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(shader_recompiler_compute_cp_seq_thread PROPERTIES
+		ENVIRONMENT "KYTY_CP_SEQ=1")
+	add_test(NAME shader_recompiler_compute_cp_seq_thread_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(shader_recompiler_compute_cp_seq_thread_verify PROPERTIES
+		ENVIRONMENT "KYTY_CP_SEQ=1;KYTY_CP_SEQ_VERIFY=exit;KYTY_DRAW_PREP_VERIFY=exit")
+	add_test(NAME shader_recompiler_compute_cp_seq_thread_recorder
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(shader_recompiler_compute_cp_seq_thread_recorder PROPERTIES
+		ENVIRONMENT "KYTY_CP_SEQ=1;KYTY_CP_SEQ_VERIFY=exit;KYTY_CP_RECORDER=1;KYTY_CP_RECORDER_VERIFY=exit")
+	add_test(NAME eop_timestamps_gpu_cp_seq_thread_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --eop-timestamps-only)
+	set_tests_properties(eop_timestamps_gpu_cp_seq_thread_verify PROPERTIES
+		ENVIRONMENT "KYTY_EOP_TIMESTAMPS=gpu;KYTY_CP_SEQ=1;KYTY_CP_SEQ_VERIFY=exit")
 	# KYTY_EOP_TIMESTAMPS: record time (default), GPU times, their verify mode, and GPU times
 	# delivered by deferred label writes (every label deferred).
 	add_test(NAME eop_timestamps

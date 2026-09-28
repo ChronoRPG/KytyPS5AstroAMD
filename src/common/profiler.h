@@ -995,6 +995,25 @@ enum class FrameEvent : uint32_t {
 	CpSeqVerifyChecks,
 	CpSeqVerifyMismatches,
 	CpSeqVerifyReadDivergences,
+	// KYTY_CP_SEQ=1 (cpSequencer.h): the sequencer's lockstep waits (ordering points), guest reads
+	// and command buffers it had the resolver read in order (GPU-touched pages), stops at pending
+	// CP writes, register snapshots, publishes that found the draw-prep window full, and waits of
+	// the front alone (REWIND); the resolver finding no op.
+	CpSeqBarriers,
+	CpSeqLockstepReads,
+	CpSeqLockstepBuffers,
+	CpSeqPendingWriteStops,
+	CpSeqSnapshots,
+	CpSeqWindowFull,
+	CpSeqFrontWaits,
+	CpSeqResolverStarved,
+	// Guest reads the sequencer made directly (never GPU-touched pages): with CpSeqLockstepReads
+	// the share the sticky bitmap lets through.
+	CpSeqDirectReads,
+	// Draw-prep log certificates checked at commit, and the log entries they walked (the cost of
+	// longer preparation-to-commit intervals: entries per check).
+	DrawPrepLogChecks,
+	DrawPrepLogEntries,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip
@@ -1085,6 +1104,14 @@ enum class FrameWait : uint32_t {
 	// KYTY_EOP_TIMESTAMPS=gpu: command-processor time reading completed timestamp queries and
 	// rewriting the guest slots (one call per publication).
 	EopTimestampPublish,
+	// KYTY_CP_SEQ=1: sequencer time waiting for the resolver (ordering points, pending CP writes,
+	// a full op ring, window or snapshot ring), and resolver time waiting for the sequencer's next
+	// op before it lets other queues run.
+	CpSeqSequencerWait,
+	CpSeqResolverStarved,
+	// Draw-prep commits (Engine::Commit: the prepared draw recorded from its slot), per draw; with
+	// KYTY_CP_SEQ=1 the resolver reads slots another core wrote (the snapshot cache-miss risk).
+	DrawPrepCommit,
 	Count,
 };
 
