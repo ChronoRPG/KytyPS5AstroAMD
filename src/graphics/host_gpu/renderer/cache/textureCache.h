@@ -427,9 +427,33 @@ private:
 	// reads VRAM instead of system memory over PCIe (KYTY_TEXTURE_STAGING_REBAR=0: none).
 	std::unique_ptr<StreamBuffer>  m_texture_staging;
 	// Registered images per ImagePageTable page, readable without m_lock
-	// (KYTY_TEXTURE_FAULT_FAST_PATH=0 always takes the lock).
+	// (KYTY_TEXTURE_FAULT_FAST_PATH=0 always takes the lock). RegisterImage counts a page before
+	// the image enters its owner list, UnregisterImage uncounts it after the image left it (all
+	// sequentially consistent), so an image FindImagesInRegion can find is always counted.
 	std::unique_ptr<std::atomic<uint32_t>[]> m_image_page_counts;
 	bool                                     m_fault_fast_path = true;
+	// No image is registered on the ImagePageTable pages [address, address + size) spans, from
+	// m_image_page_counts without m_lock: FindImagesInRegion would find nothing there. Each page's
+	// zero count means no image was findable on it at that load (see above); an image registered
+	// after a load (on that page) belongs after this query in any serialization of the two.
+	[[nodiscard]] bool NoImagesOnPages(uint64_t address, uint64_t size) const noexcept;
+	// KYTY_GPU_WRITE_IMAGE_SKIP (default on; =0 off): a GPU buffer write's image checks
+	// (InvalidateMemoryFromGPU, BufferCache::PreserveImagesForGpuWrite) skip m_lock and the page
+	// walk when NoImagesOnPages: the walk would find no image to act on. True: the caller skips.
+	// KYTY_GPU_WRITE_IMAGE_SKIP_VERIFY=1|exit takes the lock after such a decision and runs the
+	// walk (then returns false, so the caller does too): an image found while its pages are
+	// still uncounted is a mismatch (exit stops), one whose pages are counted by now was
+	// registered after the decision (a race). FrameEvents GpuWriteImageSkip*.
+	[[nodiscard]] bool SkipGpuWriteImageWalk(uint64_t address, uint64_t size);
+	bool m_gpu_write_skip        = true;
+	int  m_gpu_write_skip_verify = 0;
+	struct GpuWriteSkipTotals {
+		std::atomic<uint64_t> skips {0};
+		std::atomic<uint64_t> verify_checks {0};
+		std::atomic<uint64_t> verify_races {0};
+		std::atomic<uint64_t> verify_mismatches {0};
+	};
+	GpuWriteSkipTotals m_gpu_write_skip_totals;
 	enum class ResidencyMode : uint8_t { Off, On, Poison };
 	ResidencyMode                            m_residency            = ResidencyMode::On;
 	uint64_t                                 m_residency_violations = 0;

@@ -909,6 +909,12 @@ enum class FrameEvent : uint32_t {
 	FalseSharingUploadSplits,
 	FalseSharingVerifyChecks,
 	FalseSharingVerifyConflicts,
+	// KYTY_GPU_WRITE_IMAGE_SKIP (TextureCache::SkipGpuWriteImageWalk): GPU buffer writes whose
+	// image checks found no registered image without the texture-cache lock, and the verify mode.
+	GpuWriteImageSkips,
+	GpuWriteImageSkipVerifyChecks,
+	GpuWriteImageSkipVerifyRaces,
+	GpuWriteImageSkipVerifyMismatches,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

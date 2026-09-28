@@ -295,6 +295,13 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	    size_t {1} << (ImagePageTable::kAddressSpaceBits - ImagePageTable::kPageBits));
 	m_fault_fast_path = EnvNotZero("KYTY_TEXTURE_FAULT_FAST_PATH");
 	m_texel_sync_skip = EnvNotZero("KYTY_TEXEL_SYNC_SKIP");
+	m_gpu_write_skip  = EnvNotZero("KYTY_GPU_WRITE_IMAGE_SKIP");
+	if (m_gpu_write_skip) {
+		const auto* verify = std::getenv("KYTY_GPU_WRITE_IMAGE_SKIP_VERIFY");
+		if (verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0) {
+			m_gpu_write_skip_verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
+		}
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -811,9 +818,11 @@ void TextureCache::RegisterImage(ImageId id) {
 	                           Coherence::Source::ImageRegister);
 	NoteStructureChange(image);
 	ForEachPage(image.live.address, image.live.size, [this, id](uint64_t page) {
+		// Counted before the image enters the page's owner list, so a lock-free zero count means
+		// FindImagesInRegion finds nothing there (NoImagesOnPages); and before the image can
+		// watch pages (TrackImage follows registration).
+		m_image_page_counts[page].fetch_add(1, std::memory_order_seq_cst);
 		m_image_page_table[page].push_back(id);
-		// Before the image can watch pages (TrackImage follows registration).
-		m_image_page_counts[page].fetch_add(1);
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
@@ -3984,6 +3993,10 @@ void BufferCache::PreserveImagesForGpuWrite(BufferId id, uint64_t vaddr, uint64_
 	if (!ImageWritebackOnGpuWriteEnabled()) {
 		return;
 	}
+	// KYTY_GPU_WRITE_IMAGE_SKIP: no registered image whose contents could move into the buffer.
+	if (m_texture_cache.SkipGpuWriteImageWalk(vaddr, size)) {
+		return;
+	}
 	struct Candidate {
 		ImageId    id;
 		GuestRange range;
@@ -4127,6 +4140,58 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	return true;
 }
 
+bool TextureCache::NoImagesOnPages(uint64_t address, uint64_t size) const noexcept {
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+		return true; // FindImagesInRegion finds nothing there either
+	}
+	for (auto page = pages.first; page < pages.last_exclusive; ++page) {
+		if (m_image_page_counts[page].load(std::memory_order_seq_cst) != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool TextureCache::SkipGpuWriteImageWalk(uint64_t address, uint64_t size) {
+	if (!m_gpu_write_skip || !NoImagesOnPages(address, size)) {
+		return false;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuWriteImageSkips);
+	m_gpu_write_skip_totals.skips.fetch_add(1, std::memory_order_relaxed);
+	if (m_gpu_write_skip_verify == 0) {
+		return true;
+	}
+	std::scoped_lock lock {m_lock};
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuWriteImageSkipVerifyChecks);
+	m_gpu_write_skip_totals.verify_checks.fetch_add(1, std::memory_order_relaxed);
+	if (FindImagesInRegion(address, size, true).empty()) {
+		return false;
+	}
+	// Under m_lock a findable image's pages are counted: uncounted pages here are a broken
+	// ordering, counted ones an image registered after the lock-free decision.
+	if (!NoImagesOnPages(address, size)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::GpuWriteImageSkipVerifyRaces);
+		m_gpu_write_skip_totals.verify_races.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuWriteImageSkipVerifyMismatches);
+	m_gpu_write_skip_totals.verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::fprintf(stderr,
+		             "GpuWriteImageSkipVerify: an image over uncounted pages: addr=0x%016" PRIx64
+		             " size=0x%" PRIx64 "\n",
+		             address, size);
+	}
+	if (m_gpu_write_skip_verify == 2) {
+		EXIT("GpuWriteImageSkipVerify: an image over uncounted pages: addr=0x%016" PRIx64
+		     " size=0x%" PRIx64 "\n",
+		     address, size);
+	}
+	return false;
+}
+
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
@@ -4137,6 +4202,10 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		event.address = address;
 		event.size    = size;
 		HangTrace::RecordCp(event);
+	}
+	// KYTY_GPU_WRITE_IMAGE_SKIP: no registered image to take ownership from.
+	if (SkipGpuWriteImageWalk(address, size)) {
+		return;
 	}
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, true)) {

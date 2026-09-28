@@ -539,6 +539,40 @@ struct TextureCacheTestAccess {
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
+
+  // KYTY_GPU_WRITE_IMAGE_SKIP.
+  static bool NoImagesOnPages(const TextureCache &cache, uint64_t address, uint64_t size) {
+    return cache.NoImagesOnPages(address, size);
+  }
+  static bool GpuWriteSkip(const TextureCache &cache) { return cache.m_gpu_write_skip; }
+  static int GpuWriteSkipVerify(const TextureCache &cache) { return cache.m_gpu_write_skip_verify; }
+  static const TextureCache::GpuWriteSkipTotals &GpuWriteSkipTotals(const TextureCache &cache) {
+    return cache.m_gpu_write_skip_totals;
+  }
+  static void Register(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    cache.RegisterImage(id);
+  }
+  static void Unregister(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    cache.UnregisterImage(id);
+  }
+  // Under the lock every page's count equals its owner list's size.
+  static bool CountsMatchOwners(TextureCache &cache, uint64_t address, uint64_t size) {
+    std::lock_guard lock(cache.m_lock);
+    TextureCache::ImagePageTable::PageRange pages{};
+    if (!TextureCache::ImagePageTable::TryGetPageRange(address, size, pages)) {
+      return false;
+    }
+    for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+      const auto *owners = cache.m_image_page_table.Find(page);
+      const size_t listed = owners == nullptr ? 0 : owners->size();
+      if (cache.m_image_page_counts[page].load() != listed) {
+        return false;
+      }
+    }
+    return true;
+  }
 };
 
 struct RenderExecutorTestAccess {
@@ -6131,6 +6165,78 @@ public:
                 BufferCacheTestAccess::WrittenSyncSkipVerify(context.GetBufferCache()) != 0
                     ? "on"
                     : "off");
+  }
+
+  // KYTY_GPU_WRITE_IMAGE_SKIP (TextureCache::SkipGpuWriteImageWalk): a GPU buffer write's image
+  // checks skip the texture-cache lock and page walk when no image is registered on the write's
+  // 1 MiB pages, and never miss an image whose registration races the check.
+  void CheckGpuWriteImageSkip() {
+    constexpr const char *name = "GpuWriteImageSkip";
+    constexpr uint64_t base = 0x0000000264000000ull;
+    constexpr uint64_t page = 0x100000;
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &cache = context.GetTextureCache();
+    const bool skip_on = TextureCacheTestAccess::GpuWriteSkip(cache);
+    const int verify = TextureCacheTestAccess::GpuWriteSkipVerify(cache);
+    const auto &totals = TextureCacheTestAccess::GpuWriteSkipTotals(cache);
+    const auto none = [&](uint64_t address, uint64_t size) {
+      return TextureCacheTestAccess::NoImagesOnPages(cache, address, size);
+    };
+
+    // Nothing registered: the check skips.
+    Require(name, "empty pages", none(base + 0x1000, 0x2000),
+            "pages without images were reported to hold one");
+    const auto skips0 = totals.skips.load();
+    cache.InvalidateMemoryFromGPU(base + 0x1000, 0x2000);
+    Require(name, "skip without images", totals.skips.load() == skips0 + (skip_on ? 1u : 0u),
+            "a GPU write over pages without images took the lock (or skipped while off)");
+
+    // An ownership-only image on pages 1 and 2: counted there, and only there.
+    ImageInfo info{};
+    info.data = {base + page, 2 * page};
+    const auto id = TextureCacheTestAccess::InsertImage(cache, info);
+    Require(name, "registered image counted",
+            !none(base + page + 0x1000, 0x100) && !none(base + 0x800, page) &&
+                none(base + 3 * page, 0x100) && none(base, 0x1000),
+            "an image's pages were not counted, or other pages were");
+    const auto skips1 = totals.skips.load();
+    cache.InvalidateMemoryFromGPU(base + page + 0x1000, 0x100);
+    Require(name, "no skip over an image", totals.skips.load() == skips1,
+            "a GPU write over an image skipped the walk");
+
+    // A thread toggles the image's registration while this one checks and writes.
+    std::atomic<bool> stop{false};
+    std::thread toggler([&] {
+      for (int round = 0; round < 20000 && !stop.load(); round++) {
+        TextureCacheTestAccess::Unregister(cache, id);
+        TextureCacheTestAccess::Register(cache, id);
+      }
+    });
+    uint64_t skipped = 0;
+    for (int round = 0; round < 20000; round++) {
+      skipped += none(base + page + 0x2000, 0x100) ? 1u : 0u;
+      cache.InvalidateMemoryFromGPU(base + page + 0x2000, 0x100);
+      if ((round & 63) == 0) {
+        Require(name, "counts match owners",
+                TextureCacheTestAccess::CountsMatchOwners(cache, base, 4 * page),
+                "under the lock a page's count differed from its owner list");
+      }
+    }
+    stop.store(true);
+    toggler.join();
+    Require(name, "race outcome",
+            totals.verify_mismatches.load() == 0 &&
+                (verify == 0 || !skip_on || totals.verify_checks.load() != 0 || skipped == 0),
+            "a skip missed an image over uncounted pages (or the verify mode never checked)");
+    TextureCacheTestAccess::DeleteImage(cache, id);
+    Require(name, "retired image uncounted", none(base + page, 2 * page),
+            "a deleted image's pages stayed counted");
+    std::printf("[host]    %-32s ok (skip %s, verify %s, %llu racing skips, %llu races)\n", name,
+                skip_on ? "on" : "off", verify != 0 ? "on" : "off",
+                static_cast<unsigned long long>(skipped),
+                static_cast<unsigned long long>(totals.verify_races.load()));
   }
 
   // KYTY_UPLOAD_DEDUP (RenderExecutor::UploadShaderData): shader-data uploads equal to their
@@ -39904,6 +40010,11 @@ int main(int argc, char **argv) {
     vulkan.CheckShaderUploadDedup();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-write-image-skip-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckGpuWriteImageSkip();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--tracker-gap-detectors-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTrackerGapDetectors();
@@ -40153,6 +40264,7 @@ int main(int argc, char **argv) {
   vulkan.CheckWrittenSyncSkip();
   vulkan.CheckFalseSharingWrites();
   vulkan.CheckShaderUploadDedup();
+  vulkan.CheckGpuWriteImageSkip();
   vulkan.CheckTrackerGapDetectors();
   vulkan.CheckEagerReadback();
 #endif

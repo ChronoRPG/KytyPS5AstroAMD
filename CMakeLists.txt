@@ -828,6 +828,17 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shader-upload-dedup-only)
 	set_tests_properties(shader_upload_dedup_table PROPERTIES
 		ENVIRONMENT "KYTY_UPLOAD_DEDUP_TABLE=1")
+	# KYTY_GPU_WRITE_IMAGE_SKIP: default, verify mode (stops on a mismatch), off.
+	add_test(NAME gpu_write_image_skip
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-write-image-skip-only)
+	add_test(NAME gpu_write_image_skip_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-write-image-skip-only)
+	set_tests_properties(gpu_write_image_skip_verify PROPERTIES
+		ENVIRONMENT "KYTY_GPU_WRITE_IMAGE_SKIP_VERIFY=exit")
+	add_test(NAME gpu_write_image_skip_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-write-image-skip-only)
+	set_tests_properties(gpu_write_image_skip_off PROPERTIES
+		ENVIRONMENT "KYTY_GPU_WRITE_IMAGE_SKIP=0")
 	# Tracker-gap detectors: the page states they classify host writes by.
 	add_test(NAME tracker_gap_detectors
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tracker-gap-detectors-only)
