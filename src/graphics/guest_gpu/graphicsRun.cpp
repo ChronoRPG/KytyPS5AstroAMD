@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
+#include "graphics/host_gpu/renderer/eopTimestamps.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -2102,7 +2103,7 @@ static bool LabelCompletionMode() {
 }
 
 bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, bool interrupt,
-                                     uint32_t interrupt_context_id) {
+                                     uint32_t interrupt_context_id, uint32_t timestamp_slot) {
 	const auto address = reinterpret_cast<uint64_t>(dst);
 	auto&      gpu     = m_renderer.GetGpu();
 	const bool proxy   = m_defer_next_label;
@@ -2130,25 +2131,31 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 	}
 	auto*     renderer = &m_renderer;
 	const int event_id = m_interrupt_event_id;
+	// KYTY_EOP_TIMESTAMPS=gpu: a clock value is written with its query's GPU time.
+	auto* timestamps =
+	    timestamp_slot != EopTimestampRing::NoSlot ? scheduler.GuestTimestamps() : nullptr;
 	// Runs on the completion runner once `tick` has completed, after every priority operation
 	// registered before it (FIFO), including this tick's occlusion publications. The write itself
 	// is handed to the GPU thread: a label page may be protected by resource tracking, and only
 	// the GPU thread may take the resulting fault/readback. The interrupt follows the write.
 	scheduler.DeferPriorityOperation(
 	    [renderer, &gpu, address, value, size, tick, interrupt, event_id, interrupt_context_id,
-	     trace_queue] {
-		    const bool sent = gpu.TrySendCommand([renderer, &gpu, address, value, size, tick,
+	     trace_queue, timestamps, timestamp_slot] {
+		    // The tick has completed, so a timestamp query's result is final.
+		    const uint64_t written =
+		        timestamps != nullptr ? timestamps->TakeDeferred(timestamp_slot, value) : value;
+		    const bool sent = gpu.TrySendCommand([renderer, &gpu, address, written, size, tick,
 		                                          interrupt, event_id, interrupt_context_id,
 		                                          trace_queue] {
 			    {
 				    KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteDeferredLabel");
-				    std::memcpy(reinterpret_cast<void*>(address), &value, size);
+				    std::memcpy(reinterpret_cast<void*>(address), &written, size);
 			    }
 			    if (HangTrace::CpTraceEnabled()) {
 				    HangTrace::CpEvent event;
 				    event.event   = "label-deferred-write";
 				    event.address = address;
-				    event.value   = value;
+				    event.value   = written;
 				    event.size    = size;
 				    event.aux     = static_cast<int64_t>(tick);
 				    event.queue   = trace_queue;
@@ -2163,7 +2170,7 @@ bool CommandProcessor::TryDeferLabel(void* dst, uint64_t value, uint32_t size, b
 		    });
 		    if (!sent) {
 			    // Shutdown: the GPU thread no longer runs commands. Best-effort direct write.
-			    (void)LibKernel::Memory::TryWriteBacking(address, &value, size);
+			    (void)LibKernel::Memory::TryWriteBacking(address, &written, size);
 			    gpu.RemoveDeferredLabel(address, tick);
 			    if (interrupt) {
 				    renderer->TriggerInterrupt(event_id, interrupt_context_id);
@@ -2193,18 +2200,43 @@ static bool DroppedLabelsWritten() {
 
 bool CommandProcessor::WriteDroppedLabel(void* dst, uint64_t value, uint32_t size,
                                          bool interrupt, uint32_t interrupt_context_id,
-                                         Profiler::FrameEvent counter) {
+                                         Profiler::FrameEvent counter, bool timestamp) {
 	Profiler::CountFrameEvent(counter);
 	if (!DroppedLabelsWritten() || dst == nullptr || (size != 4 && size != 8)) {
 		return false;
 	}
-	if (TryDeferLabel(dst, value, size, interrupt, interrupt_context_id)) {
+	const auto timestamp_slot =
+	    timestamp && size == 8 ? RecordEopTimestamp() : EopTimestampRing::NoSlot;
+	if (TryDeferLabel(dst, value, size, interrupt, interrupt_context_id, timestamp_slot)) {
 		return interrupt;
 	}
 	KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel");
 	std::memcpy(dst, &value, size);
+	QueueEopTimestamp(timestamp_slot, dst, value);
 	TraceCpLabel("label-dropped", dst, value, size);
 	return false;
+}
+
+uint32_t CommandProcessor::RecordEopTimestamp() {
+	auto& scheduler  = GetScheduler();
+	auto* timestamps = scheduler.GuestTimestamps();
+	if (timestamps == nullptr) {
+		return EopTimestampRing::NoSlot;
+	}
+	// A fence position: publish what completed ticks measured first (never waits).
+	timestamps->Publish(scheduler.GetMasterSemaphore().KnownGpuTick());
+	// A query write touches no guest resource, so batched barriers may stay pending (and no
+	// rendering instance is split for it).
+	return timestamps->RecordQuery(CurrentBuffer().StateHandle());
+}
+
+void CommandProcessor::QueueEopTimestamp(uint32_t slot, const void* dst, uint64_t value) {
+	if (slot == EopTimestampRing::NoSlot) {
+		return;
+	}
+	auto& scheduler = GetScheduler();
+	scheduler.GuestTimestamps()->Queue(slot, scheduler.CurrentTick(),
+	                                   reinterpret_cast<uint64_t>(dst), value);
 }
 
 bool CommandProcessor::WriteReleaseMemDroppedData(void* dst, uint64_t value, uint32_t data_sel,
@@ -2220,7 +2252,7 @@ bool CommandProcessor::WriteReleaseMemDroppedData(void* dst, uint64_t value, uin
 		default: return false; // 5 (GDS) and others keep the old behaviour
 	}
 	return WriteDroppedLabel(dst, value, size, interrupt, interrupt_context_id,
-	                         Profiler::FrameEvent::ReleaseMemLabelsIntSel4);
+	                         Profiler::FrameEvent::ReleaseMemLabelsIntSel4, data_sel == 3);
 }
 
 // KYTY_GDS_EOP_MODE=defer snapshots the GDS range with a copy recorded at the packet's position
@@ -2362,6 +2394,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				// Plain data selections only (32-bit data, 64-bit data, reference clock).
 				uint32_t label_size  = 0;
 				uint64_t label_value = static_cast<uint64_t>(value);
+				bool     label_clock = false;
 				if constexpr (sizeof(T) == sizeof(uint32_t)) {
 					label_size = event_write_source == 0x02 ? 4u : 0u;
 				} else {
@@ -2371,14 +2404,15 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 						case 0x04:
 							label_size  = 8;
 							label_value = Sync::ReadReferenceClock();
+							label_clock = true;
 							break;
 						default: break;
 					}
 				}
 				if (label_size != 0 && dst_gpu_addr != nullptr &&
 				    WriteDroppedLabel(dst_gpu_addr, label_value, label_size, true,
-				                      interrupt_context_id,
-				                      Profiler::FrameEvent::EopLabelsIntSel1)) {
+				                      interrupt_context_id, Profiler::FrameEvent::EopLabelsIntSel1,
+				                      label_clock)) {
 					return; // the deferred label raises the interrupt after its write
 				}
 				Sync::TriggerEopEventAtEndOfPipe(command, m_interrupt_event_id,
@@ -2467,13 +2501,18 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					}
 				}
 			} else {
-				if (event_write_source == 0x04) {
+				const bool clock_write = event_write_source == 0x04;
+				if (clock_write) {
 					value = Sync::ReadReferenceClock();
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
+					// KYTY_EOP_TIMESTAMPS=gpu: a query at this point; the slot gets its GPU time
+					// once the tick completes (from the deferred write when deferred).
+					const auto timestamp_slot =
+					    clock_write ? RecordEopTimestamp() : EopTimestampRing::NoSlot;
 					if (TryDeferLabel(dst, value, sizeof(value), with_interrupt,
-					                  interrupt_context_id)) {
+					                  interrupt_context_id, timestamp_slot)) {
 						// The deferred write raises the interrupt itself, after the label.
 						if (with_writeback) {
 							Sync::WriteAtEndOfPipeWithWriteBack64(m_submit_id, command, dst,
@@ -2487,6 +2526,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 						KYTY_PROFILER_DETAIL_BLOCK("EndOfPipe::WriteLabel64");
 						std::memcpy(dst, &value, sizeof(value));
 					}
+					QueueEopTimestamp(timestamp_slot, dst, value);
 					TraceCpLabel("label-eop", dst, value, sizeof(value));
 
 					if (with_interrupt) {

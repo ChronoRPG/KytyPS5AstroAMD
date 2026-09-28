@@ -69,8 +69,20 @@
 //   compiles.csv       one row per new shader program permutation or pipeline: phase times, the
 //                      requesting thread, and for graphics pipelines which key fields differ from
 //                      the closest existing pipeline of the same programs (RecordCompile)
+//   timestamps.csv     one row per guest flip:
+//                      - guest clock writes rewritten with GPU times, skipped, kept at record time
+//                        and deferred (KYTY_EOP_TIMESTAMPS), with the mean and largest GPU - record
+//                        shift and the command processor's publishing time;
+//                      - the latest end - begin, in us, of each guest GPU timer ring
+//                        (KYTY_HANG_TRACE_TIMESTAMP_RINGS, default Astro Bot's; 0 = none);
+//                      - Astro Bot's dynamic-resolution controller state
+//                        (KYTY_HANG_TRACE_DRS_PROBE: the eboot.bin offset of its pointer, 0 = off):
+//                        resolution index, level, updates with room to upgrade, target fps,
+//                        scalable and total GPU ms (RecordEopTimestamps).
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -330,6 +342,38 @@ struct GpuOpCounts {
 	uint64_t draw_write_sinks = 0;
 };
 void RecordGpuOpCounts(const GpuOpCounts& counts);
+
+// Guest GPU timestamps (graphics/host_gpu/renderer/eopTimestamps.h), one timestamps.csv row per
+// guest flip, written in every KYTY_EOP_TIMESTAMPS mode (the rewrite counts are zero in record).
+struct EopTimestampFrame {
+	static constexpr uint32_t MaxRings = 8;
+	uint64_t rewritten   = 0; // slots rewritten with GPU times
+	uint64_t skipped     = 0; // not rewritten: the guest had written the slot again
+	uint64_t unavailable = 0; // no query slot, result or calibration: record time kept
+	uint64_t deferred    = 0; // GPU times delivered by deferred label writes
+	int64_t  shift_sum   = 0; // sum of GPU - record over rewritten and deferred, 10 ns ticks
+	uint64_t shift_max   = 0; // largest |GPU - record|, 10 ns ticks
+	uint64_t publish_ns  = 0; // command-processor time spent publishing
+	uint64_t publishes   = 0;
+	// Latest valid end - begin of each guest timer ring (KYTY_HANG_TRACE_TIMESTAMP_RINGS), in
+	// microseconds; -1 when no slot pair is valid.
+	uint32_t                      rings = 0;
+	std::array<int64_t, MaxRings> ring_delta_us {};
+	// Astro Bot's dynamic-resolution controller (KYTY_HANG_TRACE_DRS_PROBE), when readable.
+	bool    drs_valid       = false;
+	int32_t drs_index       = 0; // 0 1920x1080, 1-2 2432x1368, 3 3328x1872, 4 3840x2160
+	int32_t drs_level       = 0;
+	int32_t drs_room_frames = 0; // consecutive updates with room for the next level (31 upgrade)
+	int32_t drs_fps         = 0; // budget 1000 / fps ms
+	double  drs_scalable_ms = 0.0;
+	double  drs_total_ms    = 0.0;
+};
+void RecordEopTimestamps(const EopTimestampFrame& frame);
+// The load address of a registered guest module (RegisterGuestCode), by file name.
+[[nodiscard]] bool ModuleBase(std::string_view name, uint64_t& base);
+// Copies `size` bytes of guest memory whose host pages are all readable now (never faults on
+// guard, no-access or unmapped pages); false and nothing copied otherwise.
+[[nodiscard]] bool TryReadReadable(uint64_t address, void* data, size_t size);
 
 // Shader and pipeline compilation (graphics/host_gpu/renderer/pipeline/pipelineCache.cpp). One
 // event per new program permutation (translate = ShaderRecompiler::TranslateProgram, emit =

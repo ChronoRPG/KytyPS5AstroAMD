@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
+#include "graphics/host_gpu/renderer/eopTimestamps.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 
@@ -116,6 +117,12 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 		m_gpu_timing = std::make_unique<GpuTimestampRing>(graphics, GpuTimestampRing::GuestPairs);
 		if (!m_gpu_timing->Valid()) {
 			m_gpu_timing.reset();
+		}
+	}
+	if (role == Role::Guest && EopTimestamps::GpuEnabled()) {
+		m_eop_timestamps = std::make_unique<EopTimestampRing>(graphics);
+		if (!m_eop_timestamps->Valid()) {
+			m_eop_timestamps.reset();
 		}
 	}
 	m_gpu_ops = role == Role::Guest && GpuOpProfiler::Enabled();
@@ -486,6 +493,12 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 		// with this recording's tick and start time.
 		m_recorder->Begin(m_command.m_buffer, m_master.CurrentTick(),
 		                  m_gpu_timing ? GpuTiming::NowNs() : 0);
+		if (m_eop_timestamps) {
+			// KYTY_EOP_TIMESTAMPS=gpu has no recorder packets (its queries are recorded through
+			// StateHandle()): reset the slots whose results were read in a direct window, after
+			// the recorder has begun the buffer. Without it no slot would ever become free.
+			m_eop_timestamps->BeginCommand(m_command.StateHandle());
+		}
 		return m_command;
 	}
 	if (m_gpu_timing) {
@@ -493,6 +506,10 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 		// without waiting, then reset and stamp this buffer's pair before any rendering begins.
 		m_gpu_timing->Collect(m_master.KnownGpuTick());
 		m_gpu_timing->BeginCommand(m_command.m_buffer);
+	}
+	if (m_eop_timestamps) {
+		// Outside rendering: reset the guest timestamp slots whose results were read.
+		m_eop_timestamps->BeginCommand(m_command.m_buffer);
 	}
 	if (m_gpu_ops) {
 		GpuOpProfiler::OnBeginCommand(m_graphics, m_command.m_buffer, m_master.CurrentTick(),

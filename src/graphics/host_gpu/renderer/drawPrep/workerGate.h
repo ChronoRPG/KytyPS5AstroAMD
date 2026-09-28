@@ -24,6 +24,9 @@
 // No wakeup is lost: a sleeper announces itself (sleepers++, seq_cst) and then re-checks its
 // predicate, and a waker changes the signal word after its own seq_cst update of what the
 // predicate reads. Either the sleeper sees the new state, or the waker sees the sleeper.
+//
+// Work stealing (KYTY_DRAW_PREP_STEAL, AwaitHead below): a producer that must commit a head a
+// worker still holds prepares later unclaimed slots itself instead of idling.
 namespace Libs::Graphics::DrawPrep {
 
 class WorkerGate {
@@ -171,6 +174,69 @@ void RunPreparationWorker(WorkerGate& gate, WindowT& window, uint32_t index, uin
 		}
 		idle_start = WorkerNowNs();
 	}
+}
+
+// When the producer steals (KYTY_DRAW_PREP_STEAL, KYTY_DRAW_PREP_STEAL_AFTER_US). A stolen
+// preparation that outlasts the head delays the head's commit, and every commit after it, so the
+// producer steals only while the head is likely to take long and the workers are behind.
+struct StealPolicy {
+	uint32_t min_unclaimed = 0; // 0: never; else steal while at least this many slots are unclaimed
+	uint64_t after_ns      = 0; // spin this long on the held head before the first steal
+};
+
+struct AwaitStats {
+	uint32_t stolen  = 0; // slots the producer prepared
+	uint64_t spin_ns = 0; // time it spun, steals excluded
+};
+
+// Producer (Engine::CommitHead; the unit tests run the same code), when the head it must commit
+// next is claimed by another thread and not done yet. Returns once the head is done.
+// - It spins, calling `relax(spins, spin_start_ns)` between looks at the head.
+// - After policy.after_ns, while at least policy.min_unclaimed published slots are unclaimed, it
+//   claims the oldest of them with the workers' own TryClaim and hands it to `prepare`. That
+//   callback must prepare and complete the slot exactly as a worker does. Like a worker's claim, a
+//   claim that sees a backlog may wake a cold worker.
+// - The producer publishes nothing meanwhile, so the unclaimed backlog only shrinks. Once it is
+//   below the policy's minimum, the producer only spins.
+// - Commit order is unchanged: the caller commits the head alone. A stolen slot is committed later,
+//   when it is the head, like any worker-prepared one.
+// - A steal never takes the head: the head is claimed already. So it delays the head's commit by
+//   at most one preparation.
+template <typename WindowT, typename Prepare, typename Relax, typename OnColdWake>
+AwaitStats AwaitHead(WorkerGate& gate, WindowT& window, const StealPolicy& policy,
+                     Prepare&& prepare, Relax&& relax, OnColdWake&& on_cold_wake) {
+	AwaitStats stats;
+	bool       may_steal   = policy.min_unclaimed != 0;
+	uint32_t   until_check = 0; // the clock and the claim counter are read every 16th look
+	const auto start       = WorkerNowNs();
+	auto       spin_start  = start;
+	for (uint32_t spins = 0; !window.HeadDone(); spins++) {
+		if (may_steal && until_check-- == 0) {
+			until_check    = 15;
+			const auto now = WorkerNowNs();
+			if (now - start >= policy.after_ns) {
+				uint64_t seq  = 0;
+				auto*    slot = window.Unclaimed() >= policy.min_unclaimed ? window.TryClaim(seq)
+				                                                           : nullptr;
+				if (slot == nullptr) {
+					may_steal = false;
+				} else {
+					stats.spin_ns += now - spin_start;
+					if (gate.HasCold() && gate.MaybeWakeCold(window.Unclaimed())) {
+						on_cold_wake();
+					}
+					prepare(*slot, seq);
+					stats.stolen++;
+					until_check = 0; // look for the next one at once
+					spin_start  = WorkerNowNs();
+					continue;
+				}
+			}
+		}
+		relax(spins, spin_start);
+	}
+	stats.spin_ns += WorkerNowNs() - spin_start;
+	return stats;
 }
 
 } // namespace Libs::Graphics::DrawPrep

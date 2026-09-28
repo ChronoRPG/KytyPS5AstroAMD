@@ -1,20 +1,24 @@
 // Draw-prep S4-S6 unit tests: the coherence log, read-set coalescing and certificate checks,
-// and (S6) the preparation window ring.
+// and (S6) the preparation window ring, worker parking and the producer's work stealing.
+// --measure-worker-gate [reps]: the parking/stealing configuration sweep (not a test).
 #include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -591,9 +595,14 @@ void TestRecordScopeNests() {
 struct Item {
 	uint64_t input  = 0;
 	uint64_t output = 0;
-	uint32_t prepared_by = 0; // 0 = producer, k = worker k
+	uint32_t prepared_by = 0; // 0 = producer, k = worker k, StolenBy = producer while waiting
 	uint32_t preparations = 0;
+	// Pipeline workloads: the slot's preparation cost, and the producer's cost of committing it.
+	uint32_t prepare_ns = 0;
+	uint32_t commit_ns  = 0;
 };
+
+constexpr uint32_t StolenBy = 0xffffu;
 
 uint64_t Work(uint64_t value) {
 	// Deterministic, a little expensive, so workers and the producer race for slots.
@@ -718,7 +727,8 @@ void TestWindowConcurrent(uint32_t capacity, uint32_t workers, uint64_t items) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Worker parking (KYTY_DRAW_PREP_HOT): WorkerGate and the production worker loop
+// Worker parking (KYTY_DRAW_PREP_HOT) and work stealing (KYTY_DRAW_PREP_STEAL): WorkerGate, the
+// production worker loop and the producer's AwaitHead
 
 void TestWorkerGateBasics() {
 	DrawPrep::WorkerGate gate(6, 2, 8);
@@ -744,18 +754,195 @@ void TestWorkerGateBasics() {
 	Check(backlog_reads == 8, "the producer reads the backlog every WakeBacklog-th publish");
 }
 
-// Runs the pipeline the way Engine does: a producer publishes `items` slots (retiring the head
-// when the window is full, draining every `drain_every`), `workers` threads run the production
-// worker loop. `prepare_ns` of busy work per slot, `publish_gap_ns` of producer work per slot.
-struct PipelineResult {
-	uint64_t self_prepared   = 0; // slots the producer prepared itself
-	uint64_t commit_waits    = 0; // heads a worker still held when the producer needed them
-	uint64_t cold_wakes      = 0;
-	double   wall_ms         = 0;
-	double   worker_cpu_ms   = 0; // user + kernel time of all workers (Windows)
-	double   useful_ms       = 0; // busy work the workers did
-	bool     ok              = true;
-};
+// AwaitHead step by step: this thread is the producer and also plays the workers holding slots.
+void TestAwaitHead() {
+	DrawPrep::WorkerGate gate(2, 2, 8); // every worker hot: AwaitHead never wakes a cold one
+	int                  cold_wakes   = 0;
+	const auto           on_cold_wake = [&] { cold_wakes++; };
+	const auto           publish      = [](DrawPrep::Window<Item>& window, uint64_t count) {
+        for (uint64_t i = 0; i < count; i++) {
+            auto& item = window.Reserve();
+            item       = Item {};
+            item.input = window.Tail();
+            window.Publish();
+        }
+	};
+	// Retires everything in order; a head that is neither done nor claimable fails.
+	const auto retire_all = [](DrawPrep::Window<Item>& window) {
+		bool ok = true;
+		while (!window.Empty()) {
+			if (!window.HeadDone()) {
+				ok &= window.TryClaimHead();
+			}
+			window.Retire();
+		}
+		return ok;
+	};
+	const DrawPrep::StealPolicy never {};
+	const DrawPrep::StealPolicy always {1, 0};
+
+	{
+		DrawPrep::Window<Item> window(8);
+		publish(window, 5);
+		uint64_t head = 0;
+		Check(window.TryClaim(head) != nullptr && head == 0, "a worker holds the head");
+		std::vector<uint64_t> stolen;
+		int                   spins = 0;
+		const auto            stats = DrawPrep::AwaitHead(
+            gate, window, always,
+            [&](Item& item, uint64_t seq) {
+                Check(seq > window.Head() && item.input == seq,
+                      "a steal takes a later slot, never the head");
+                item.preparations++;
+                item.prepared_by = StolenBy;
+                stolen.push_back(seq);
+                window.Complete(seq);
+                if (stolen.size() == 2) {
+                    window.Complete(head); // the worker finishes the head meanwhile
+                }
+            },
+            [&](uint32_t, uint64_t) { spins++; }, on_cold_wake);
+		Check(stats.stolen == 2 && stolen == std::vector<uint64_t> {1, 2} && spins == 0,
+		      "the producer steals the oldest unclaimed slots until the head is done");
+		uint64_t seq  = 0;
+		auto*    next = window.TryClaim(seq);
+		Check(next != nullptr && seq == 3 && next->preparations == 0,
+		      "slots the producer did not steal stay claimable by workers");
+		window.Complete(seq);
+		Check(retire_all(window), "stolen slots retire in order like worker slots");
+	}
+	{
+		DrawPrep::Window<Item> window(8);
+		publish(window, 3);
+		uint64_t head = 0;
+		Check(window.TryClaim(head) != nullptr, "a worker holds the head");
+		int        prepared = 0;
+		int        spins    = 0;
+		const auto stats    = DrawPrep::AwaitHead(
+            gate, window, never, [&](Item&, uint64_t) { prepared++; },
+            [&](uint32_t, uint64_t) {
+                if (++spins == 100) {
+                    window.Complete(head);
+                }
+            },
+            on_cold_wake);
+		uint64_t seq = 0;
+		Check(stats.stolen == 0 && prepared == 0 && spins == 100 && window.HeadDone() &&
+		          window.TryClaim(seq) != nullptr && seq == 1,
+		      "without stealing the producer spins until the head is done and claims nothing");
+		window.Complete(seq);
+		Check(retire_all(window), "the window drains");
+	}
+	{
+		DrawPrep::Window<Item> window(4);
+		publish(window, 2);
+		uint64_t head   = 0;
+		uint64_t second = 0;
+		Check(window.TryClaim(head) != nullptr && window.TryClaim(second) != nullptr,
+		      "workers hold every slot");
+		int        prepared = 0;
+		int        spins    = 0;
+		const auto stats    = DrawPrep::AwaitHead(
+            gate, window, always, [&](Item&, uint64_t) { prepared++; },
+            [&](uint32_t, uint64_t) {
+                spins++;
+                window.Complete(head);
+            },
+            on_cold_wake);
+		Check(stats.stolen == 0 && prepared == 0 && spins == 1,
+		      "with nothing left to claim the producer only spins");
+		window.Complete(second);
+		Check(retire_all(window), "the window drains");
+	}
+	{
+		// The claim counter lags behind a head the producer prepared itself: claims skip it.
+		DrawPrep::Window<Item> window(4);
+		publish(window, 1);
+		Check(window.TryClaimHead(), "the producer prepares an unclaimed head itself");
+		window.Retire();
+		publish(window, 3);
+		uint64_t head = 0;
+		Check(window.TryClaim(head) != nullptr && head == 1,
+		      "a worker's claim skips the position the producer took");
+		std::vector<uint64_t> stolen;
+		const auto            stats = DrawPrep::AwaitHead(
+            gate, window, always,
+            [&](Item&, uint64_t seq) {
+                stolen.push_back(seq);
+                window.Complete(seq);
+            },
+            [&](uint32_t, uint64_t) { window.Complete(head); }, on_cold_wake);
+		Check(stats.stolen == 2 && stolen == std::vector<uint64_t> {2, 3},
+		      "steals follow the claim order");
+		Check(retire_all(window), "the window drains");
+	}
+	{
+		// A minimum backlog: the producer leaves the last unclaimed slot to the workers.
+		DrawPrep::Window<Item> window(8);
+		publish(window, 4);
+		uint64_t head = 0;
+		Check(window.TryClaim(head) != nullptr, "a worker holds the head");
+		std::vector<uint64_t> stolen;
+		const auto            stats = DrawPrep::AwaitHead(
+            gate, window, DrawPrep::StealPolicy {2, 0},
+            [&](Item&, uint64_t seq) {
+                stolen.push_back(seq);
+                window.Complete(seq);
+            },
+            [&](uint32_t, uint64_t) { window.Complete(head); }, on_cold_wake);
+		uint64_t seq = 0;
+		Check(stats.stolen == 2 && stolen == std::vector<uint64_t> {1, 2} &&
+		          window.TryClaim(seq) != nullptr && seq == 3,
+		      "the producer steals only while at least the minimum backlog waits");
+		window.Complete(seq);
+		Check(retire_all(window), "the window drains");
+	}
+	{
+		// A delay: a head done before it passes is never stolen from; a longer one is.
+		DrawPrep::Window<Item> window(8);
+		publish(window, 3);
+		uint64_t head = 0;
+		Check(window.TryClaim(head) != nullptr, "a worker holds the head");
+		int        prepared = 0;
+		const auto quick    = DrawPrep::AwaitHead(
+            gate, window, DrawPrep::StealPolicy {1, 60'000'000'000ull},
+            [&](Item&, uint64_t) { prepared++; },
+            [&](uint32_t spins, uint64_t) {
+                if (spins == 50) {
+                    window.Complete(head);
+                }
+            },
+            on_cold_wake);
+		Check(quick.stolen == 0 && prepared == 0, "no steal before the delay");
+		window.Retire();
+		uint64_t next = 0;
+		Check(window.TryClaim(next) != nullptr && next == 1, "a worker holds the next head");
+		const auto begin = std::chrono::steady_clock::now();
+		std::vector<uint64_t> stolen;
+		uint32_t              looks = 0;
+		const auto            slow  = DrawPrep::AwaitHead(
+            gate, window, DrawPrep::StealPolicy {1, 200'000},
+            [&](Item&, uint64_t seq) {
+                stolen.push_back(seq);
+                window.Complete(seq);
+                window.Complete(next); // the worker finishes after the steal
+            },
+            [&](uint32_t spins, uint64_t) {
+                looks = spins + 1;
+                DrawPrep::WorkerRelax();
+            },
+            on_cold_wake);
+		const auto waited = std::chrono::steady_clock::now() - begin;
+		Check(slow.stolen == 1 && stolen == std::vector<uint64_t> {2} && looks > 1 &&
+		          waited >= std::chrono::microseconds(200),
+		      "the producer steals once the delay has passed");
+		Check(retire_all(window), "the window drains");
+	}
+	Check(cold_wakes == 0, "an all-hot gate never wakes a cold worker");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pipelines: Engine's producer and workers on synthetic workloads
 
 void BusyNs(uint64_t ns) {
 	const auto end = std::chrono::steady_clock::now() + std::chrono::nanoseconds(ns);
@@ -763,75 +950,144 @@ void BusyNs(uint64_t ns) {
 	}
 }
 
-PipelineResult RunPipeline(uint32_t workers, uint32_t hot, uint64_t items, uint64_t prepare_ns,
-                           uint64_t publish_gap_ns, uint32_t drain_every, uint64_t hot_spin_ns,
-                           uint64_t cold_spin_ns, uint32_t wake_backlog, bool random_bursts) {
-	DrawPrep::Window<Item>   window(32);
-	DrawPrep::WorkerGate     gate(workers, hot, wake_backlog);
+// Engine's parallel-mode configuration (the KYTY_DRAW_PREP_* switches).
+// The defaults are Engine's.
+struct PipelineConfig {
+	uint32_t              workers      = 6;
+	uint32_t              hot          = 2;
+	uint32_t              wake_backlog = 2;
+	uint64_t              hot_spin_ns  = 200000; // KYTY_DRAW_PREP_SPIN_US default
+	uint64_t              cold_spin_ns = 50000;  // KYTY_DRAW_PREP_COLD_SPIN_US default
+	DrawPrep::StealPolicy steal {};              // KYTY_DRAW_PREP_STEAL default: never
+	uint32_t              window       = 32;
+	// A worker stalls `hiccup_ns` inside this share (per mille) of its preparations: preempted by
+	// a guest thread, or late to wake, while it holds the slot. The producer never stalls.
+	uint32_t hiccup_per_mille = 0;
+	uint32_t hiccup_ns        = 300000;
+};
+
+// One draw of a workload. Its slot costs `prepare_ns` on whichever thread prepares it and
+// `commit_ns` on the producer when it is committed. After publishing it the producer works
+// `after_ns` (parsing up to the next draw). A fence after it drains the window; the producer then
+// works `fence_ns` (packets without draws) and blocks `idle_us` (waiting for the next submission;
+// 0: not at all).
+struct DrawSpec {
+	uint32_t prepare_ns = 0;
+	uint32_t commit_ns  = 0;
+	uint32_t after_ns   = 0;
+	uint32_t fence_ns   = 0;
+	uint32_t idle_us    = 0;
+	bool     fence      = false;
+};
+
+struct PipelineResult {
+	uint64_t self_prepared = 0; // unclaimed heads the producer prepared itself
+	uint64_t commit_waits  = 0; // heads a worker still held when the producer needed them
+	uint64_t steals        = 0; // slots the producer prepared meanwhile (AwaitHead)
+	uint64_t cold_wakes    = 0;
+	double   wall_ms       = 0; // the producer's whole run: the command processor's critical path
+	double   spin_ms       = 0; // of which spinning on held heads
+	double   worker_cpu_ms = 0; // user + kernel time of all workers (Windows)
+	double   useful_ms     = 0; // preparation work the workers did
+	bool     ok            = true;
+};
+
+// Runs a workload the way Engine runs it:
+// - The producer publishes the draws, retires the head when the window is full, and drains the
+//   window at fences.
+// - It prepares an unclaimed head itself. It awaits a head a worker still holds with the
+//   production AwaitHead, stealing when config.steal is set.
+// - The workers run the production worker loop.
+// Every retired slot must be the next in order, carry the right output, and have been prepared
+// exactly once.
+PipelineResult RunPipeline(const PipelineConfig& config, const std::vector<DrawSpec>& draws) {
+	DrawPrep::Window<Item>   window(config.window);
+	DrawPrep::WorkerGate     gate(config.workers, config.hot, config.wake_backlog);
 	std::atomic<bool>        stop {false};
 	std::atomic<uint64_t>    useful_ns {0};
-	std::atomic<uint64_t>    cold_wakes {0};
+	std::atomic<uint64_t>    worker_cold_wakes {0};
 	std::vector<std::thread> threads;
-	for (uint32_t w = 0; w < workers; w++) {
+	for (uint32_t w = 0; w < config.workers; w++) {
 		threads.emplace_back([&, w] {
+			std::mt19937 stalls(1000u + w);
 			DrawPrep::RunPreparationWorker(
-			    gate, window, w, hot_spin_ns, cold_spin_ns, stop,
+			    gate, window, w, config.hot_spin_ns, config.cold_spin_ns, stop,
 			    [&](Item& item, uint64_t seq) {
-				    BusyNs(prepare_ns);
+				    const bool stall = config.hiccup_per_mille != 0 &&
+				                       stalls() % 1000u < config.hiccup_per_mille;
+				    BusyNs(item.prepare_ns + (stall ? config.hiccup_ns : 0u));
 				    item.output      = Work(item.input);
 				    item.prepared_by = w + 1u;
 				    item.preparations++;
-				    useful_ns.fetch_add(prepare_ns, std::memory_order_relaxed);
+				    useful_ns.fetch_add(item.prepare_ns, std::memory_order_relaxed);
 				    window.Complete(seq);
 			    },
-			    [&] { cold_wakes.fetch_add(1, std::memory_order_relaxed); });
+			    [&] { worker_cold_wakes.fetch_add(1, std::memory_order_relaxed); });
 		});
 	}
 	PipelineResult result;
-	std::mt19937   rng(12345);
-	uint64_t       next_input  = 0;
-	uint64_t       next_retire = 0;
-	const auto     retire_head = [&] {
-        auto& item = window.HeadPayload();
-        if (window.TryClaimHead()) {
-            BusyNs(prepare_ns);
-            item.output      = Work(item.input);
-            item.prepared_by = 0;
-            item.preparations++;
-            result.self_prepared++;
-        } else if (!window.HeadDone()) {
-            result.commit_waits++;
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-            while (!window.HeadDone() && std::chrono::steady_clock::now() < deadline) {
-                DrawPrep::WorkerRelax();
-            }
-            result.ok &= window.HeadDone();
-        }
-        result.ok &= item.input == next_retire && item.output == Work(item.input) &&
-                     item.preparations == 1;
-        next_retire++;
-        window.Retire();
+	uint64_t       next_retire  = 0;
+	uint64_t       spin_ns      = 0;
+	const auto     prepare_here = [](Item& item, uint32_t by) {
+        BusyNs(item.prepare_ns);
+        item.output      = Work(item.input);
+        item.prepared_by = by;
+        item.preparations++;
 	};
-	const auto start = std::chrono::steady_clock::now();
-	while (next_input < items) {
+	const auto retire_head = [&] {
+		auto& item = window.HeadPayload();
+		if (window.TryClaimHead()) {
+			prepare_here(item, 0);
+			result.self_prepared++;
+		} else if (!window.HeadDone()) {
+			result.commit_waits++;
+			const auto stats = DrawPrep::AwaitHead(
+			    gate, window, config.steal,
+			    [&](Item& other, uint64_t seq) {
+				    result.ok &= seq > window.Head();
+				    prepare_here(other, StolenBy);
+				    window.Complete(seq);
+			    },
+			    [&](uint32_t spins, uint64_t spin_start) {
+				    DrawPrep::WorkerRelax();
+				    if ((spins & 1023u) == 1023u &&
+				        DrawPrep::WorkerNowNs() - spin_start > 10'000'000'000ull) {
+					    std::fprintf(stderr, "FAILED: slot %llu was never completed\n",
+					                 static_cast<unsigned long long>(window.Head()));
+					    std::_Exit(3); // a hung protocol; going on would race the worker
+				    }
+			    },
+			    [] {});
+			result.steals += stats.stolen;
+			spin_ns += stats.spin_ns;
+		}
+		result.ok &= item.input == next_retire && item.output == Work(item.input) &&
+		             item.preparations == 1;
+		BusyNs(item.commit_ns);
+		next_retire++;
+		window.Retire();
+	};
+	const auto start      = std::chrono::steady_clock::now();
+	uint64_t   next_input = 0;
+	for (const auto& draw: draws) {
 		if (window.Full()) {
 			retire_head();
 		}
-		auto& item        = window.Reserve();
-		item.input        = next_input++;
-		item.output       = 0;
-		item.preparations = 0;
+		auto& item      = window.Reserve();
+		item            = Item {};
+		item.input      = next_input++;
+		item.prepare_ns = draw.prepare_ns;
+		item.commit_ns  = draw.commit_ns;
 		window.Publish();
 		(void)gate.OnPublish([&] { return window.Unclaimed(); });
-		BusyNs(random_bursts ? (rng() % 4 == 0 ? publish_gap_ns * 4 : publish_gap_ns / 4)
-		                     : publish_gap_ns);
-		if (next_input % drain_every == 0u) {
+		BusyNs(draw.after_ns);
+		if (draw.fence) {
 			while (!window.Empty()) {
 				retire_head();
 			}
-			if (random_bursts) {
-				// An idle gap, long enough for every worker to park.
-				std::this_thread::sleep_for(std::chrono::microseconds(rng() % 2000));
+			BusyNs(draw.fence_ns);
+			if (draw.idle_us != 0) {
+				std::this_thread::sleep_for(std::chrono::microseconds(draw.idle_us));
 			}
 		}
 	}
@@ -840,6 +1096,7 @@ PipelineResult RunPipeline(uint32_t workers, uint32_t hot, uint64_t items, uint6
 	}
 	result.wall_ms =
 	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+	result.spin_ms = static_cast<double>(spin_ns) / 1e6;
 	stop.store(true, std::memory_order_seq_cst);
 	gate.WakeAll();
 #if defined(_WIN32)
@@ -862,39 +1119,319 @@ PipelineResult RunPipeline(uint32_t workers, uint32_t hot, uint64_t items, uint6
 		thread.join();
 	}
 	result.useful_ms  = static_cast<double>(useful_ns.load()) / 1e6;
-	result.cold_wakes = gate.ColdWakes(); // by workers (cold_wakes) and by the producer
-	result.ok &= next_retire == items && cold_wakes.load() <= result.cold_wakes;
+	result.cold_wakes = gate.ColdWakes(); // by workers, by the producer and by its steals
+	result.ok &= next_retire == draws.size() && worker_cold_wakes.load() <= result.cold_wakes;
 	return result;
 }
 
-// Bursty stress with short spins: nothing hangs, every slot is prepared exactly once, in order,
-// and cold workers are woken when the backlog grows.
+// The earlier workload: a fixed preparation cost, `gap_ns` of producer work after every publish,
+// a drain every `drain_every` slots. With `random_bursts` the gap is 4x or a quarter of it, and
+// the producer blocks up to 2 ms after every drain, long enough for workers to park.
+std::vector<DrawSpec> UniformShape(uint64_t items, uint32_t prepare_ns, uint32_t gap_ns,
+                                   uint32_t drain_every, bool random_bursts) {
+	std::mt19937          rng(12345);
+	std::vector<DrawSpec> draws(items);
+	for (uint64_t i = 0; i < items; i++) {
+		auto& draw      = draws[i];
+		draw.prepare_ns = prepare_ns;
+		draw.after_ns   = !random_bursts ? gap_ns : rng() % 4 == 0 ? gap_ns * 4 : gap_ns / 4;
+		draw.fence      = (i + 1) % drain_every == 0;
+		draw.idle_us    = draw.fence && random_bursts ? static_cast<uint32_t>(rng() % 2000) : 0;
+	}
+	return draws;
+}
+
+// Bursty stress with short spins, with and without stealing: nothing hangs, every slot is
+// prepared exactly once, in order, and cold workers are woken when the backlog grows.
 void TestWorkerGateStress() {
 	for (uint32_t hot: {1u, 2u}) {
-		const auto r = RunPipeline(6, hot, 60000, 2000, 2000, 97, 20000, 0, 4, true);
-		Check(r.ok, "gated pipeline prepares every slot once, in order");
-		Check(r.cold_wakes > 0, "cold workers are woken by a backlog");
+		for (const bool steal: {false, true}) {
+			PipelineConfig config;
+			config.hot          = hot;
+			config.wake_backlog = 4;
+			config.hot_spin_ns  = 20000;
+			config.cold_spin_ns = 0;
+			config.steal        = steal ? DrawPrep::StealPolicy {1, 0} : DrawPrep::StealPolicy {};
+			const auto r = RunPipeline(config, UniformShape(60000, 2000, 2000, 97, true));
+			Check(r.ok, "gated pipeline prepares every slot once, in order");
+			Check(r.cold_wakes > 0, "cold workers are woken by a backlog");
+			Check(steal || r.steals == 0, "the producer never steals without KYTY_DRAW_PREP_STEAL");
+		}
 	}
 }
 
-// The Sky Garden shape (DEEP-TRACE-U52 3.4): about 11 us of Prepare per draw, one draw every
-// ~10 us, a drain every ~60 draws. Prints worker CPU against useful work for the old all-hot
-// behaviour and for the gate.
-void MeasureWorkerGate() {
-	struct Config {
-		const char* name;
-		uint32_t    hot;
+// KYTY_DRAW_PREP_STEAL under stress: random preparation costs and fences, windows of 4 to 32
+// slots, one to six workers and several steal policies, so that heads are often held while later
+// slots wait, and the producer's claims race the workers'. Every slot is prepared exactly once
+// (by a worker, by the producer as an unclaimed head, or stolen) and retired in order.
+void TestStealStress() {
+	struct Case {
+		uint32_t              window;
+		uint32_t              workers;
+		uint32_t              hot;
+		DrawPrep::StealPolicy steal;
 	};
-	for (const auto& config: {Config {"all hot (before)", 6u}, Config {"hot=2 (default)", 2u},
-	                          Config {"hot=1", 1u}}) {
-		const auto r = RunPipeline(6, config.hot, 20000, 11000, 10000, 60, 200000, 50000, 8, false);
-		Check(r.ok, "measured pipeline is correct");
-		std::printf("  gate %-17s: wall %.0f ms, worker CPU %.0f ms for %.0f ms of work, "
-		            "self-prepared %llu, commit waits %llu, cold wakes %llu\n",
-		            config.name, r.wall_ms, r.worker_cpu_ms, r.useful_ms,
-		            static_cast<unsigned long long>(r.self_prepared),
+	uint64_t steals = 0;
+	for (const auto& c: {Case {4, 1, 1, {1, 0}}, Case {4, 4, 1, {1, 0}}, Case {8, 2, 2, {2, 0}},
+	                     Case {32, 1, 1, {1, 0}}, Case {32, 1, 1, {3, 2000}},
+	                     Case {32, 6, 2, {1, 1000}}, Case {32, 6, 6, {1, 0}}}) {
+		PipelineConfig config;
+		config.window       = c.window;
+		config.workers      = c.workers;
+		config.hot          = c.hot;
+		config.wake_backlog = 2;
+		config.hot_spin_ns  = 5000;
+		config.cold_spin_ns = 0;
+		config.steal        = c.steal;
+		std::mt19937          rng(c.window * 131u + c.workers * 7u + c.hot);
+		std::vector<DrawSpec> draws(40000);
+		for (auto& draw: draws) {
+			draw.prepare_ns = rng() % 4 == 0 ? 3000 + rng() % 5000 : rng() % 1500;
+			draw.commit_ns  = rng() % 600;
+			draw.after_ns   = rng() % 300;
+			draw.fence      = rng() % 24 == 0;
+			draw.idle_us    = draw.fence && rng() % 32 == 0 ? rng() % 500 : 0;
+		}
+		const auto r = RunPipeline(config, draws);
+		Check(r.ok, "a stealing pipeline prepares every slot once and retires them in order");
+		steals += r.steals;
+		std::printf("  steal stress: window %u, %u workers (%u hot), steal %u after %llu ns: %llu "
+		            "steals, %llu held heads, %llu self-prepared\n",
+		            c.window, c.workers, c.hot, c.steal.min_unclaimed,
+		            static_cast<unsigned long long>(c.steal.after_ns),
+		            static_cast<unsigned long long>(r.steals),
 		            static_cast<unsigned long long>(r.commit_waits),
-		            static_cast<unsigned long long>(r.cold_wakes));
+		            static_cast<unsigned long long>(r.self_prepared));
+	}
+	Check(steals > 0, "the producer steals while workers hold heads");
+}
+
+// ---------------------------------------------------------------------------------------------
+// --measure-worker-gate [reps]: parking and stealing configurations on frame-shaped workloads
+
+// Frames of fence-delimited draw segments. Per frame, the number of segments in each
+// draws-per-fence bucket follows a scene's U54 Tracy counters (FrameEvent DrawPrepFenceDraws*,
+// per flip). The fences without draws are producer work between segments.
+struct FrameShape {
+	const char*           name;
+	std::array<double, 7> segments;     // per frame: 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64+ draws
+	uint32_t              long_segment; // mean draws of a 64+ segment
+	uint32_t              gap_ns;       // mean producer work between segments
+	uint32_t              parse_ns;     // producer work per draw before the next one
+	uint32_t              commit_ns;    // producer work per committed draw
+	uint32_t              prepare_min_ns;
+	uint32_t              prepare_max_ns;
+	uint32_t              short_prepare_ns; // draws of 1-3-draw segments (clears, copies)
+	uint32_t              burst_draws;      // the first draws after the fence of a 4+ segment...
+	uint32_t              burst_min_ns;     // ...cost this much to prepare
+	uint32_t              burst_max_ns;
+	uint32_t              frame_idle_us; // after each frame: waiting for the next submission
+};
+
+// Sky Garden start view (U54): 4,955 draws and about 2,460 fences without draws per flip, Prepare
+// 9.4 us on average, the command processor about 9 us per draw.
+const FrameShape kSkyGardenFrame {"sky-garden start", {48.0, 4.0, 4.6, 2.2, 1.2, 3.0, 10.0},
+                                  468, 50000, 1000, 7000, 4000, 15000, 2000, 0, 0, 0, 1000};
+// Heavy frames: the slide's segments (U54, per flip). Each segment of 4+ draws starts with a
+// burst of eight expensive draws (30-45 us); the others cost 8-16 us, about the slide's 15 us
+// average overall.
+const FrameShape kHeavyBurstFrame {"heavy burst (slide)", {49.3, 1.1, 6.5, 1.7, 1.6, 1.4, 2.3},
+                                   407, 48000, 1500, 8000, 8000, 16000, 2000, 8, 30000, 45000,
+                                   1500};
+
+std::vector<DrawSpec> MakeFrames(const FrameShape& shape, uint32_t frames, uint32_t seed) {
+	static constexpr std::array<std::array<uint32_t, 2>, 6> bounds {
+	    {{1, 1}, {2, 3}, {4, 7}, {8, 15}, {16, 31}, {32, 63}}};
+	std::mt19937 rng(seed);
+	const auto   uniform = [&](uint32_t low, uint32_t high) {
+        return high > low ? low + static_cast<uint32_t>(rng() % (high - low + 1u)) : low;
+	};
+	std::vector<DrawSpec> draws;
+	for (uint32_t frame = 0; frame < frames; frame++) {
+		std::vector<uint32_t> sizes;
+		for (size_t bucket = 0; bucket < shape.segments.size(); bucket++) {
+			const auto expected = shape.segments[bucket];
+			auto       count    = static_cast<uint32_t>(expected);
+			if (std::uniform_real_distribution<double>(0.0, 1.0)(rng) < expected - count) {
+				count++;
+			}
+			for (uint32_t i = 0; i < count; i++) {
+				sizes.push_back(bucket < bounds.size()
+				                    ? uniform(bounds[bucket][0], bounds[bucket][1])
+				                    : uniform(shape.long_segment / 2u, shape.long_segment * 3u / 2u));
+			}
+		}
+		std::shuffle(sizes.begin(), sizes.end(), rng);
+		for (const auto size: sizes) {
+			for (uint32_t i = 0; i < size; i++) {
+				DrawSpec draw;
+				draw.prepare_ns = size < 4                ? shape.short_prepare_ns
+				                  : i < shape.burst_draws ? uniform(shape.burst_min_ns, shape.burst_max_ns)
+				                                          : uniform(shape.prepare_min_ns, shape.prepare_max_ns);
+				draw.commit_ns  = shape.commit_ns;
+				draw.after_ns   = shape.parse_ns;
+				draws.push_back(draw);
+			}
+			draws.back().fence    = true;
+			draws.back().fence_ns = uniform(shape.gap_ns / 2u, shape.gap_ns * 3u / 2u);
+		}
+		draws.back().idle_us = shape.frame_idle_us;
+	}
+	return draws;
+}
+
+template <typename T, typename Get>
+double Median(const std::vector<T>& runs, Get&& get) {
+	std::vector<double> values;
+	for (const auto& run: runs) {
+		values.push_back(static_cast<double>(get(run)));
+	}
+	std::sort(values.begin(), values.end());
+	return values.empty() ? 0.0 : values[values.size() / 2];
+}
+
+// Sweeps KYTY_DRAW_PREP_HOT 2/3/4 x KYTY_DRAW_PREP_WAKE_BACKLOG 2/4/8 x steal policies (off; at
+// once while 1 or 2 slots are unclaimed; the same after a 5 us wait), with six workers and the
+// default spins, plus the U52 all-hot reference.
+// Workloads: the Sky Garden start, heavy bursts, and heavy bursts on workers that now and then
+// stall for 300 us (a preempted or late-waking worker holding its slot).
+// Runs are interleaved across configurations, and medians over `reps` runs are printed. The
+// producer's wall time is the command processor's critical path; worker CPU is what parking saves.
+// `only`: a comma-separated list of hot/backlog/steal/after_us configurations to run instead of
+// the sweep (e.g. "2/8/0/0,2/2/1/0"; the first one is the reference of the summary).
+void MeasureWorkerGate(uint32_t reps, const char* only) {
+	struct Workload {
+		const char*           name;
+		uint32_t              frames;
+		std::vector<DrawSpec> draws;
+		uint32_t              hiccup_per_mille;
+	};
+	std::vector<Workload> workloads;
+	workloads.push_back({kSkyGardenFrame.name, 4, MakeFrames(kSkyGardenFrame, 4, 1), 0});
+	workloads.push_back({kHeavyBurstFrame.name, 16, MakeFrames(kHeavyBurstFrame, 16, 2), 0});
+	workloads.push_back({"heavy burst, workers stall 300 us on 0.3% of slots", 16,
+	                     MakeFrames(kHeavyBurstFrame, 16, 3), 3});
+
+	struct GateConfig {
+		uint32_t              hot;
+		uint32_t              backlog;
+		DrawPrep::StealPolicy steal;
+		const char*           note;
+	};
+	std::vector<GateConfig> configs;
+	if (only != nullptr) {
+		for (const char* p = only; *p != '\0';) {
+			std::array<uint32_t, 4> fields {};
+			for (size_t i = 0; i < fields.size(); i++) {
+				char* end = nullptr;
+				fields[i] = static_cast<uint32_t>(std::strtoul(p, &end, 10));
+				const char expected = i + 1 < fields.size() ? '/' : ',';
+				if (end == p || (*end != expected && !(expected == ',' && *end == '\0'))) {
+					std::fprintf(stderr, "bad configuration list at '%s'\n", p);
+					g_failures++;
+					return;
+				}
+				p = *end == '\0' ? end : end + 1;
+			}
+			configs.push_back({fields[0], fields[1], {fields[2], uint64_t {fields[3]} * 1000u},
+			                   configs.empty() ? "reference" : ""});
+		}
+	} else {
+		configs.push_back({6, 8, {}, "all hot (U52)"});
+		const std::array<DrawPrep::StealPolicy, 5> policies {
+		    {{0, 0}, {1, 0}, {2, 0}, {1, 5000}, {2, 5000}}};
+		for (const auto& steal: policies) {
+			for (const uint32_t hot: {2u, 3u, 4u}) {
+				for (const uint32_t backlog: {2u, 4u, 8u}) {
+					configs.push_back({hot, backlog, steal,
+					                   steal.min_unclaimed == 0 && hot == 2 && backlog == 8
+					                       ? "U54 default"
+					                       : ""});
+				}
+			}
+		}
+	}
+	const auto steal_name = [](const DrawPrep::StealPolicy& steal) {
+		char text[32];
+		if (steal.min_unclaimed == 0) {
+			std::snprintf(text, sizeof(text), "off");
+		} else {
+			std::snprintf(text, sizeof(text), "%u@%lluus", steal.min_unclaimed,
+			              static_cast<unsigned long long>(steal.after_ns / 1000u));
+		}
+		return std::string(text);
+	};
+	std::vector<std::vector<double>> walls(configs.size());
+	size_t                           u54 = 0; // the summary's reference
+	for (size_t i = 0; i < configs.size(); i++) {
+		if (std::strcmp(configs[i].note, "U54 default") == 0) {
+			u54 = i;
+		}
+	}
+	for (const auto& workload: workloads) {
+		uint64_t prepare_ns = 0;
+		for (const auto& draw: workload.draws) {
+			prepare_ns += draw.prepare_ns;
+		}
+		std::vector<std::vector<PipelineResult>> results(configs.size());
+		for (uint32_t rep = 0; rep < reps; rep++) {
+			for (size_t i = 0; i < configs.size(); i++) {
+				PipelineConfig config;
+				config.hot              = configs[i].hot;
+				config.wake_backlog     = configs[i].backlog;
+				config.steal            = configs[i].steal;
+				config.hiccup_per_mille = workload.hiccup_per_mille;
+				results[i].push_back(RunPipeline(config, workload.draws));
+				Check(results[i].back().ok, "measured pipeline is correct");
+			}
+		}
+		std::printf("\n%s: %zu draws in %u frames, %.0f ms of Prepare, %u runs each (medians)\n",
+		            workload.name, workload.draws.size(), workload.frames,
+		            static_cast<double>(prepare_ns) / 1e6, reps);
+		std::printf("  hot backlog steal    | wall ms (min-max)      ms/frame | spin ms | steals | "
+		            "self | held | cold wakes | worker CPU ms\n");
+		for (size_t i = 0; i < configs.size(); i++) {
+			const auto& runs = results[i];
+			const auto  wall = Median(runs, [](const PipelineResult& r) { return r.wall_ms; });
+			double      low  = runs.front().wall_ms;
+			double      high = low;
+			for (const auto& r: runs) {
+				low  = std::min(low, r.wall_ms);
+				high = std::max(high, r.wall_ms);
+			}
+			walls[i].push_back(wall);
+			std::printf("  %3u %7u %-8s | %7.1f (%5.1f-%5.1f) %8.2f | %7.2f | %6.0f | %4.0f | %4.0f | "
+			            "%10.0f | %13.0f  %s\n",
+			            configs[i].hot, configs[i].backlog, steal_name(configs[i].steal).c_str(), wall,
+			            low, high, wall / workload.frames,
+			            Median(runs, [](const PipelineResult& r) { return r.spin_ms; }),
+			            Median(runs, [](const PipelineResult& r) { return r.steals; }),
+			            Median(runs, [](const PipelineResult& r) { return r.self_prepared; }),
+			            Median(runs, [](const PipelineResult& r) { return r.commit_waits; }),
+			            Median(runs, [](const PipelineResult& r) { return r.cold_wakes; }),
+			            Median(runs, [](const PipelineResult& r) { return r.worker_cpu_ms; }),
+			            configs[i].note);
+		}
+	}
+	// Each configuration's wall time against the reference, per workload and as a geometric mean.
+	std::printf("\nwall time against %s (%%), per workload and geometric mean:\n",
+	            configs[u54].note);
+	std::vector<std::pair<double, size_t>> order;
+	for (size_t i = 0; i < configs.size(); i++) {
+		double log_sum = 0;
+		for (size_t w = 0; w < workloads.size(); w++) {
+			log_sum += std::log(walls[i][w] / walls[u54][w]);
+		}
+		order.emplace_back(std::exp(log_sum / static_cast<double>(workloads.size())), i);
+	}
+	std::sort(order.begin(), order.end());
+	for (const auto& [mean, i]: order) {
+		std::printf("  hot %u backlog %u steal %-8s:", configs[i].hot, configs[i].backlog,
+		            steal_name(configs[i].steal).c_str());
+		for (size_t w = 0; w < workloads.size(); w++) {
+			std::printf(" %+6.2f", (walls[i][w] / walls[u54][w] - 1.0) * 100.0);
+		}
+		std::printf("  | mean %+6.2f  %s\n", (mean - 1.0) * 100.0, configs[i].note);
 	}
 }
 
@@ -1086,7 +1623,9 @@ void TestRegisterIndirectPairs() {
 
 int main(int argc, char** argv) {
 	if (argc > 1 && std::strcmp(argv[1], "--measure-worker-gate") == 0) {
-		MeasureWorkerGate();
+		const auto reps = argc > 2 ? std::strtoul(argv[2], nullptr, 10) : 5ul;
+		MeasureWorkerGate(static_cast<uint32_t>(std::clamp(reps, 1ul, 100ul)),
+		                  argc > 3 ? argv[3] : nullptr);
 		return g_failures == 0 ? 0 : 1;
 	}
 	TestLogEmptyIntervalIsClean();
@@ -1114,7 +1653,9 @@ int main(int argc, char** argv) {
 	TestWindowConcurrent(32, 6, 200000); // the default shape
 	TestWindowConcurrent(32, 1, 50000);
 	TestWorkerGateBasics();
+	TestAwaitHead();
 	TestWorkerGateStress();
+	TestStealStress();
 	if (g_failures != 0) {
 		std::fprintf(stderr, "DrawPrepTests: %d failure(s)\n", g_failures);
 		return 1;

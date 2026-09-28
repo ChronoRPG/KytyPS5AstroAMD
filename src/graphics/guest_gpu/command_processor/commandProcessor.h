@@ -187,17 +187,28 @@ private:
 	// a visibility-proxy dump armed it (KYTY_OCCLUSION_PROXY_MODE=defer-label), every label is
 	// deferred (KYTY_LABEL_MODE=completion), or an older deferred label to the same address is
 	// still pending (write order). Returns false when the label must be written now.
+	// timestamp_slot: the label is a clock value with a KYTY_EOP_TIMESTAMPS=gpu query
+	// (RecordEopTimestamp); a deferred write then writes the query's GPU time instead.
 	[[nodiscard]] bool TryDeferLabel(void* dst, uint64_t value, uint32_t size, bool interrupt,
-	                                 uint32_t interrupt_context_id);
+	                                 uint32_t interrupt_context_id,
+	                                 uint32_t timestamp_slot = UINT32_MAX);
+	// KYTY_EOP_TIMESTAMPS=gpu, at an end-of-pipe clock write (a fence: the draw-prep window is
+	// empty): publishes the completed timestamps, then records a query at this point. Returns its
+	// slot, or UINT32_MAX in record mode or without a free slot.
+	[[nodiscard]] uint32_t RecordEopTimestamp();
+	// The clock value `value` was just written to `dst` at record time: rewrite it with the
+	// query's GPU time once the current tick completes (no-op without a slot).
+	void QueueEopTimestamp(uint32_t slot, const void* dst, uint64_t value);
 	// KYTY_GDS_EOP_MODE=defer: snapshot a GDS range at this packet and write it to `dst` at the
 	// tick's completion instead of draining the GPU. Returns false for the synchronous path.
 	[[nodiscard]] bool TryDeferGdsRead(uint32_t* dst, uint32_t dw_offset, uint32_t dw_size,
 	                                   bool interrupt, uint32_t interrupt_context_id);
 	// Writes (or defers) the data of an end-of-pipe event Kyty used to drop (counted under
 	// `counter`). Returns true when a deferred write took over raising the interrupt.
+	// timestamp: `value` is the reference clock (KYTY_EOP_TIMESTAMPS).
 	[[nodiscard]] bool WriteDroppedLabel(void* dst, uint64_t value, uint32_t size, bool interrupt,
 	                                     uint32_t interrupt_context_id,
-	                                     Profiler::FrameEvent counter);
+	                                     Profiler::FrameEvent counter, bool timestamp = false);
 
 public:
 	// RELEASE_MEM with INT_SEL=4 and DATA_SEL != 0 (previously no data was written): writes the

@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_SYNC_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_SYNC_H_
 
+#include "graphics/host_gpu/renderer/referenceClock.h"
 #include "kernel/eventQueue.h"
 
 #include <cstdint>
@@ -13,8 +14,7 @@ class RenderContext;
 
 namespace Sync {
 
-[[nodiscard]] bool     ScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency,
-                                           uint64_t& value);
+// The reference clock now: the host TSC scaled to 100 MHz (ScaleReferenceClock).
 [[nodiscard]] uint64_t ReadReferenceClock();
 
 void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t context_id);

@@ -617,6 +617,14 @@ add_executable(image_cache_gc_policy_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(image_cache_gc_policy_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+add_executable(eop_timestamp_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/EopTimestampTests.cpp"
+)
+target_include_directories(eop_timestamp_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(LINUX)
+	target_link_libraries(eop_timestamp_tests Threads::Threads)
+endif()
+
 add_executable(draw_prep_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DrawPrepTests.cpp"
 )
@@ -707,6 +715,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_cache_gc_policy COMMAND $<TARGET_FILE:image_cache_gc_policy_tests>)
 	add_test(NAME ampr_counter_bank COMMAND $<TARGET_FILE:ampr_counter_bank_tests>)
 	add_test(NAME draw_prep COMMAND $<TARGET_FILE:draw_prep_tests>)
+	add_test(NAME eop_timestamp COMMAND $<TARGET_FILE:eop_timestamp_tests>)
 	add_test(NAME repeat_trace COMMAND $<TARGET_FILE:repeat_trace_tests>)
 	add_test(NAME binding_path COMMAND $<TARGET_FILE:binding_path_tests>)
 	add_test(NAME cp_recorder COMMAND $<TARGET_FILE:cp_recorder_tests>)
@@ -955,6 +964,32 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_copied PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE=0;KYTY_DRAW_PREP_LOCKFREE_HINT=0")
+	# KYTY_DRAW_PREP_STEAL (off by default): the command processor stealing whenever a slot waits,
+	# with six workers and with a single one (a held head with unclaimed slots behind it, where it
+	# steals most).
+	add_test(NAME draw_prep_engine_parallel_steal
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_steal PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_STEAL=1")
+	add_test(NAME draw_prep_engine_parallel_steal_one_worker
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_steal_one_worker PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_STEAL=1;KYTY_DRAW_PREP_WORKERS=1;KYTY_DRAW_PREP_HOT=1")
+	# KYTY_EOP_TIMESTAMPS: record time (default), GPU times, their verify mode, and GPU times
+	# delivered by deferred label writes (every label deferred).
+	add_test(NAME eop_timestamps
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --eop-timestamps-only)
+	add_test(NAME eop_timestamps_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --eop-timestamps-only)
+	set_tests_properties(eop_timestamps_gpu PROPERTIES ENVIRONMENT "KYTY_EOP_TIMESTAMPS=gpu")
+	add_test(NAME eop_timestamps_gpu_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --eop-timestamps-only)
+	set_tests_properties(eop_timestamps_gpu_verify PROPERTIES
+		ENVIRONMENT "KYTY_EOP_TIMESTAMPS=gpu-verify")
+	add_test(NAME eop_timestamps_gpu_deferred
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --eop-timestamps-only)
+	set_tests_properties(eop_timestamps_gpu_deferred PROPERTIES
+		ENVIRONMENT "KYTY_EOP_TIMESTAMPS=gpu;KYTY_LABEL_MODE=completion")
 	add_test(NAME draw_prep_code_cert_copied
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-code-cert-only)
 	set_tests_properties(draw_prep_code_cert_copied PROPERTIES
@@ -1036,6 +1071,9 @@ if(BUILD_TESTING)
 	add_cp_recorder_variants(compute_meta_clear_classification --compute-meta-clear-only)
 	add_cp_recorder_variants(buffer_cache_dirty_gc --buffer-cache-gc-only)
 	add_cp_recorder_variants(buffer_cache_eager_readback --readback-eager-only)
+	# KYTY_EOP_TIMESTAMPS=gpu with the recorder: its queries and slot resets are recorded in direct
+	# windows (CommandScheduler::BeginCommand, CommandProcessor::RecordEopTimestamp).
+	add_cp_recorder_variants(eop_timestamps_gpu --eop-timestamps-only KYTY_EOP_TIMESTAMPS=gpu)
 	# The recorder under VK_LAYER_KHRONOS_validation (KYTY_TEST_VULKAN_VALIDATION=1: core and
 	# thread-safety checks, i.e. command-pool, descriptor-pool, command-buffer and queue use from
 	# two threads at once, and descriptor sets updated while a recorded or pending buffer binds

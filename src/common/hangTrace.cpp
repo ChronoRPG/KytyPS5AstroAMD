@@ -435,8 +435,12 @@ struct Files {
 	std::FILE* compiles      = nullptr;
 	std::FILE* cp            = nullptr;
 	std::FILE* unclean       = nullptr;
+	std::FILE* timestamps    = nullptr;
 };
 Files g_files;
+
+std::mutex               g_timestamp_mutex;
+std::vector<std::string> g_pending_timestamp_rows;
 
 constexpr uint64_t       kCpRowLimit = 60'000'000; // ~6 GB at most; rows are flushed to disk
 std::mutex               g_cp_mutex;
@@ -707,6 +711,12 @@ void Publish() {
 		rows.swap(g_pending_lodreport_rows);
 	}
 	WriteRows(g_files.lodreports, rows);
+
+	{
+		std::scoped_lock lock(g_timestamp_mutex);
+		rows.swap(g_pending_timestamp_rows);
+	}
+	WriteRows(g_files.timestamps, rows);
 
 	if (g_files.cp != nullptr) {
 		{
@@ -1078,6 +1088,11 @@ void Initialize() {
 	                              "t_ms,destination,control,has_latest,sampled_counters,"
 	                              "total_samples,mean_finest_mip,pending_copies,drawn_counters,"
 	                              "counted_counters");
+	g_files.timestamps = OpenFile("timestamps.csv",
+	                              "t_ms,rewritten,skipped,unavailable,deferred,shift_avg_us,"
+	                              "shift_max_us,publish_us,publishes,ring0_us,ring1_us,ring2_us,"
+	                              "ring3_us,ring4_us,ring5_us,ring6_us,ring7_us,drs_index,drs_level,"
+	                              "drs_room_frames,drs_fps,drs_scalable_ms,drs_total_ms");
 	if (CpTraceEnabled()) {
 		g_files.cp = OpenFile("cp.csv", "t_us,row,host_tid,queue,seq,event,address,value,ref,mask,"
 		                                "aux,size");
@@ -1145,7 +1160,8 @@ void Shutdown() {
 	for (auto** file: {&g_files.summary, &g_files.apr, &g_files.imports, &g_files.imports_index,
 	                   &g_files.lod, &g_files.tex, &g_files.modules, &g_files.queues,
 	                   &g_files.readbacks, &g_files.images, &g_files.lodwatch,
-	                   &g_files.transfers, &g_files.compiles, &g_files.unclean}) {
+	                   &g_files.transfers, &g_files.compiles, &g_files.unclean,
+	                   &g_files.timestamps}) {
 		if (*file != nullptr) {
 			std::fclose(*file);
 			*file = nullptr;
@@ -1738,6 +1754,65 @@ void RecordGpuFrame(const GpuFrame& frame) {
 	g_totals.gpu_dispatch_latency_ns.fetch_add(frame.dispatch_latency_ns,
 	                                           std::memory_order_relaxed);
 	g_totals.gpu_dropped.fetch_add(frame.dropped, std::memory_order_relaxed);
+}
+
+void RecordEopTimestamps(const EopTimestampFrame& frame) {
+	if (!Enabled()) {
+		return;
+	}
+	const auto samples = frame.rewritten + frame.deferred;
+	// Reference-clock ticks are 10 ns.
+	const double shift_avg_us =
+	    samples != 0 ? static_cast<double>(frame.shift_sum) / static_cast<double>(samples) / 100.0
+	                 : 0.0;
+	std::string row = fmt::format("{},{},{},{},{},{:.1f},{:.1f},{:.1f},{}", NowMs(), frame.rewritten,
+	                              frame.skipped, frame.unavailable, frame.deferred, shift_avg_us,
+	                              static_cast<double>(frame.shift_max) / 100.0,
+	                              static_cast<double>(frame.publish_ns) / 1000.0, frame.publishes);
+	for (uint32_t i = 0; i < EopTimestampFrame::MaxRings; i++) {
+		row += i < frame.rings && frame.ring_delta_us[i] >= 0
+		           ? fmt::format(",{}", frame.ring_delta_us[i])
+		           : std::string(",");
+	}
+	if (frame.drs_valid) {
+		row += fmt::format(",{},{},{},{},{:.3f},{:.3f}", frame.drs_index, frame.drs_level,
+		                   frame.drs_room_frames, frame.drs_fps, frame.drs_scalable_ms,
+		                   frame.drs_total_ms);
+	} else {
+		row += ",,,,,,";
+	}
+	std::scoped_lock lock(g_timestamp_mutex);
+	g_pending_timestamp_rows.push_back(std::move(row));
+}
+
+bool ModuleBase(std::string_view name, uint64_t& base) {
+	const auto count = g_module_count.load(std::memory_order_acquire);
+	for (uint32_t i = 0; i < count; i++) {
+		if (g_modules[i].name == name) {
+			base = g_modules[i].base;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool TryReadReadable(uint64_t address, void* data, size_t size) {
+#ifdef _WIN32
+	if (size == 0 || UINT64_MAX - address < size) {
+		return false;
+	}
+	// A kernel copy: a page that is (or becomes) no-access, e.g. protected by resource tracking
+	// meanwhile, fails the call instead of faulting on this thread.
+	SIZE_T copied = 0;
+	return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), data,
+	                         size, &copied) != 0 &&
+	       copied == size;
+#else
+	(void)address;
+	(void)data;
+	(void)size;
+	return false;
+#endif
 }
 
 void CountMemory(MemoryCounter counter, uint64_t amount) {

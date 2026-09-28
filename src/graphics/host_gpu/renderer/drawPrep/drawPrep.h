@@ -35,10 +35,14 @@
 // up to a power of two), KYTY_DRAW_PREP_SPIN_US (default 200: how long an idle hot worker spins
 // before parking): parallel mode only.
 // KYTY_DRAW_PREP_HOT (default 2): workers that spin like that; the others park as soon as nothing
-// is claimable and are woken, one at a time, when KYTY_DRAW_PREP_WAKE_BACKLOG (default 8)
-// published slots wait unclaimed; a woken one spins KYTY_DRAW_PREP_COLD_SPIN_US (default 50)
+// is claimable and are woken, one at a time, when KYTY_DRAW_PREP_WAKE_BACKLOG (default 2; 8 until
+// U54) published slots wait unclaimed; a woken one spins KYTY_DRAW_PREP_COLD_SPIN_US (default 50)
 // before parking again (workerGate.h). KYTY_DRAW_PREP_HOT >= KYTY_DRAW_PREP_WORKERS keeps every
 // worker hot, the behaviour before the gate.
+// KYTY_DRAW_PREP_STEAL (default 0 = off): N >= 1 lets the command processor, while a worker holds
+// the head slot it must commit, prepare later unclaimed slots itself, exactly as a worker does,
+// as long as at least N slots wait unclaimed; KYTY_DRAW_PREP_STEAL_AFTER_US (default 0) first
+// spins that long on the held head (Engine::CommitHead, workerGate.h AwaitHead).
 // KYTY_DRAW_PREP_HISTOGRAM=1: the S0 draws-per-fence histogram also in off mode (the packet
 // classification runs, nothing else changes).
 namespace Libs::Graphics {
@@ -166,10 +170,12 @@ enum class DrawKind : uint8_t { Index, Auto };
 // processor keeps parsing. Drain commits every pending draw in guest order; the command processor
 // drains before every fence packet, before servicing commands from other threads, when a
 // draw's instance count may be GPU data, and at the end of every command-stream slice. A head
-// slot no worker has claimed yet is prepared by the command processor itself; a claimed one is
-// waited for (spinning; only after 2 ms, as a deadlock guard, does the wait service commands from
-// other threads). Workers never touch the caches, the scheduler or Vulkan, and never dereference
-// guest memory; a failed preparation or certificate runs the serial preparation at commit.
+// slot no worker has claimed yet is prepared by the command processor itself. For a claimed one,
+// the command processor can first prepare later unclaimed slots as a worker would
+// (KYTY_DRAW_PREP_STEAL, off by default). Then it waits, spinning; only after 2 ms, as a deadlock
+// guard, does the wait service commands from other threads. Draws are committed in order either way. Workers
+// never touch the caches, the scheduler or Vulkan, and never dereference guest memory; a failed
+// preparation or certificate runs the serial preparation at commit.
 class Engine {
 public:
 	// service_commands runs the GPU thread's pending cross-thread commands (used while waiting).

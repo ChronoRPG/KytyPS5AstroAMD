@@ -578,8 +578,9 @@ enum class FrameEvent : uint32_t {
 	DrawPrepFenceDraws32To63,
 	DrawPrepFenceDraws64Plus,
 	// Parallel mode: drains (window committed because of a fence or a full window), the summed
-	// window occupancy observed at each publish (mean = sum / Published), and head slots the
-	// command processor had to wait for while a worker was preparing them.
+	// window occupancy observed at each publish (mean = sum / Published), and head slots a worker
+	// was still preparing when the command processor needed them (with KYTY_DRAW_PREP_STEAL it
+	// prepares other slots meanwhile: DrawPrepSteals).
 	DrawPrepDrains,
 	DrawPrepWindowOccupancy,
 	DrawPrepCommitWaits,
@@ -944,6 +945,18 @@ enum class FrameEvent : uint32_t {
 	CpRecorderSameCoreSamples,
 	// Drains that found the recorder idle (everything executed): no marker, no wake.
 	CpRecorderIdleDrains,
+	// KYTY_DRAW_PREP_STEAL: slots the command processor prepared, as a worker would, while a worker
+	// held the head it had to commit (FrameWait DrawPrepSteal is their time).
+	DrawPrepSteals,
+	// KYTY_EOP_TIMESTAMPS=gpu: guest clock writes rewritten with GPU times, left alone because the
+	// guest had written the slot again, kept at record time (no query slot, result or calibration),
+	// and given GPU times through deferred label writes; gpu-verify checks and mismatches.
+	EopTimestampsRewritten,
+	EopTimestampsSkipped,
+	EopTimestampsUnavailable,
+	EopTimestampsDeferred,
+	EopTimestampsVerifyChecks,
+	EopTimestampsVerifyMismatches,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip
@@ -1005,7 +1018,8 @@ enum class FrameWait : uint32_t {
 	// Guest thread time in AgcSuspendPoint (GuestGpu::Done): the idle wait, or the bounded wait
 	// for the previous frame's submissions (KYTY_AGC_DONE_MODE).
 	AgcDoneWait,
-	// Draw-prep: command-processor time waiting for a worker's head slot (CommitWaitNs),
+	// Draw-prep: command-processor time spinning for a worker's head slot (CommitWaitNs; with
+	// KYTY_DRAW_PREP_STEAL only once no other slot was left to prepare, see DrawPrepSteal),
 	// preparation time on any thread, and certificate validation time at commit.
 	DrawPrepCommitWait,
 	DrawPrepPrepare,
@@ -1027,6 +1041,12 @@ enum class FrameWait : uint32_t {
 	CpRecorderDrain,
 	CpRecorderRingFull,
 	CpRecorderExecute,
+	// KYTY_DRAW_PREP_STEAL: command-processor time preparing stolen slots while a worker held the
+	// head (DrawPrepCommitWait is then only the idle spin after nothing was left to claim).
+	DrawPrepSteal,
+	// KYTY_EOP_TIMESTAMPS=gpu: command-processor time reading completed timestamp queries and
+	// rewriting the guest slots (one call per publication).
+	EopTimestampPublish,
 	Count,
 };
 
