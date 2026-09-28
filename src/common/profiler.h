@@ -988,6 +988,13 @@ enum class FrameEvent : uint32_t {
 	// thread compared at commit with the commit-time list, and the differences.
 	DrawPrepCertRangesVerifyChecks,
 	DrawPrepCertRangesVerifyMismatches,
+	// KYTY_CP_SEQ (cpOps.h): ops handed from the front to the back through the op ring;
+	// KYTY_CP_SEQ_VERIFY: ops compared with the reference front, ops or stream ends that
+	// differed, and front reads whose bytes differed from the serial read.
+	CpSeqOps,
+	CpSeqVerifyChecks,
+	CpSeqVerifyMismatches,
+	CpSeqVerifyReadDivergences,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

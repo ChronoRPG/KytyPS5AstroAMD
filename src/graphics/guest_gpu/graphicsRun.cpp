@@ -8,6 +8,8 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/command_processor/cpOps.h"
+#include "graphics/guest_gpu/command_processor/cpVerify.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
@@ -44,6 +46,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -508,7 +511,20 @@ CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 	return *processor;
 }
 
+CommandProcessor::CommandProcessor(RenderContext& renderer, int interrupt_event_id)
+    : m_renderer(renderer), m_interrupt_event_id(interrupt_event_id),
+      m_front_mode(CpSeq::ConfiguredMode() == CpSeq::Mode::Inline ? FrontMode::Inline
+                                                                  : FrontMode::Direct) {}
+
 CommandProcessor::~CommandProcessor() = default;
+
+void CommandProcessor::OpStreamDeleter::operator()(CpSeq::OpStream* stream) const noexcept {
+	delete stream;
+}
+
+void CommandProcessor::VerifierDeleter::operator()(CpSeq::Verifier* verifier) const noexcept {
+	delete verifier;
+}
 
 void CommandProcessor::DrawPrepDeleter::operator()(DrawPrep::Engine* engine) const noexcept {
 	delete engine;
@@ -760,7 +776,16 @@ void CommandProcessor::WriteConstRam(uint32_t offset, const uint32_t* src, uint3
 }
 
 void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num) {
-	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
+	CpSeq::DumpConstRamOp op;
+	op.dst    = reinterpret_cast<uint64_t>(dst);
+	op.offset = offset;
+	op.dw_num = dw_num;
+	// The front's constant RAM travels with the op (the direct path reads it in place).
+	(void)Submit(op, m_const_ram + offset / 4, dw_num * static_cast<uint32_t>(sizeof(uint32_t)));
+}
+
+void CommandProcessor::ExecDumpConstRam(const CpSeq::DumpConstRamOp& op, const uint32_t* src) {
+	memcpy(reinterpret_cast<uint32_t*>(op.dst), src, static_cast<size_t>(op.dw_num) * 4);
 }
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
@@ -785,10 +810,32 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	if ((wait_op & ~1u) != 0) {
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
+	CpSeq::WaitRegMemOp op;
+	op.addr    = reinterpret_cast<uint64_t>(addr);
+	op.ref     = static_cast<uint64_t>(ref);
+	op.mask    = static_cast<uint64_t>(mask);
+	op.func    = func;
+	op.poll    = poll;
+	op.wait_op = wait_op;
+	op.size    = static_cast<uint32_t>(sizeof(T));
+	if (Submit(op).suspended) {
+		SuspendPm4();
+	}
+}
 
-	(void)poll;
-	const auto value  = ReadGuestForCp<T>(reinterpret_cast<uint64_t>(addr));
-	const bool passed = TestWaitRegMemValue(value, ref, mask, func);
+CpSeq::Result CommandProcessor::ExecWaitRegMem(const CpSeq::WaitRegMemOp& op) {
+	return op.size == sizeof(uint64_t) ? ExecWaitRegMemSized<uint64_t>(op)
+	                                   : ExecWaitRegMemSized<uint32_t>(op);
+}
+
+template <typename T>
+CpSeq::Result CommandProcessor::ExecWaitRegMemSized(const CpSeq::WaitRegMemOp& op) {
+	const auto* addr  = reinterpret_cast<const T*>(op.addr);
+	const auto  ref   = static_cast<T>(op.ref);
+	const auto  mask  = static_cast<T>(op.mask);
+	const auto  func  = op.func;
+	const auto  value  = ReadGuestForCp<T>(reinterpret_cast<uint64_t>(addr));
+	const bool  passed = TestWaitRegMemValue(value, ref, mask, func);
 	if (HangTrace::CpTraceEnabled()) {
 		// One row per wait: the first failed evaluation, and the pass (aux = failed retries).
 		struct WaitTrace {
@@ -831,8 +878,9 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 				}
 			}
 		}
-		SuspendPm4();
+		return {true, 0};
 	}
+	return {};
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
@@ -842,6 +890,17 @@ template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, 
 
 void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
+	CpSeq::WriteDataOp op;
+	op.dst           = reinterpret_cast<uint64_t>(dst);
+	op.dw_num        = dw_num;
+	op.write_control = write_control;
+	(void)Submit(op, src, dw_num * static_cast<uint32_t>(sizeof(uint32_t)));
+}
+
+void CommandProcessor::ExecWriteData(const CpSeq::WriteDataOp& op, const uint32_t* src) {
+	auto*          dst           = reinterpret_cast<uint32_t*>(op.dst);
+	const uint32_t dw_num        = op.dw_num;
+	const uint32_t write_control = op.write_control;
 	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
 	const bool     write_one_address = ((write_control >> 16u) & 0x1u) != 0;
 
@@ -891,6 +950,15 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
+	CpSeq::ReferenceClockOp op;
+	op.dst       = dst_address;
+	op.num_bytes = num_bytes;
+	(void)Submit(op);
+}
+
+void CommandProcessor::ExecReferenceClock(const CpSeq::ReferenceClockOp& op) {
+	const auto dst_address = op.dst;
+	const auto num_bytes   = op.num_bytes;
 	if (dst_address == 0 || (num_bytes != sizeof(uint32_t) && num_bytes != sizeof(uint64_t)) ||
 	    (dst_address & (num_bytes - 1u)) != 0) {
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
@@ -912,6 +980,33 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
                                uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes,
                                uint8_t wait_for_previous, uint8_t write_confirm,
                                uint8_t block_engine) {
+	CpSeq::DmaDataOp op;
+	op.dst               = dst_address_or_offset;
+	op.src               = src_address_or_offset_or_immediate;
+	op.num_bytes         = num_bytes;
+	op.engine            = engine;
+	op.dst_sel           = dst_sel;
+	op.dst_cache_policy  = dst_cache_policy;
+	op.src_sel           = src_sel;
+	op.src_cache_policy  = src_cache_policy;
+	op.wait_for_previous = wait_for_previous;
+	op.write_confirm     = write_confirm;
+	op.block_engine      = block_engine;
+	(void)Submit(op);
+}
+
+void CommandProcessor::ExecDmaData(const CpSeq::DmaDataOp& op) {
+	const uint8_t  engine                             = op.engine;
+	const uint8_t  dst_sel                            = op.dst_sel;
+	const uint8_t  dst_cache_policy                   = op.dst_cache_policy;
+	const uint64_t dst_address_or_offset              = op.dst;
+	const uint8_t  src_sel                            = op.src_sel;
+	const uint8_t  src_cache_policy                   = op.src_cache_policy;
+	const uint64_t src_address_or_offset_or_immediate = op.src;
+	const uint32_t num_bytes                          = op.num_bytes;
+	const uint8_t  wait_for_previous                  = op.wait_for_previous;
+	const uint8_t  write_confirm                      = op.write_confirm;
+	const uint8_t  block_engine                       = op.block_engine;
 	EXIT_NOT_IMPLEMENTED(engine > 1);
 	if (num_bytes == 0) {
 		return;
@@ -1224,6 +1319,13 @@ bool GuestGpu::Process(Submission& submission) {
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
 		cp.SetFlip({});
+		if (!submission.constant_commands.empty()) {
+			// KYTY_CP_SEQ_VERIFY: the constant engine's stream changes the front state (constant
+			// RAM, CE counter) between slices of the draw engine's, which a reference front
+			// following one stream cannot mirror; neither stream is compared.
+			submission.command_execution.DisableSequencerVerify();
+			submission.constant_execution.DisableSequencerVerify();
+		}
 	}
 
 	cp.BufferInit();
@@ -1306,8 +1408,23 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	KYTY_PROFILER_BLOCK("CommandProcessor::Process");
 	EXIT_IF(g_current_execution != nullptr);
 	EXIT_IF(commands.size() > UINT32_MAX);
+	EXIT_IF(m_front_mode == FrontMode::Reference);
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
 		execution.m_buffer_stack.push_back({commands});
+		// A new stream (KYTY_CP_SEQ): ops refer to it by id and packet count.
+		execution.m_stream_id    = ++m_next_stream_id;
+		execution.m_packets      = 0;
+		execution.m_packets_hash = 0;
+		if (m_front_mode == FrontMode::Inline && CpSeq::VerifyMode() != 0) {
+			if (m_verifier == nullptr) {
+				m_verifier.reset(new CpSeq::Verifier(m_renderer, m_interrupt_event_id));
+			}
+			if (execution.m_verify) {
+				m_verifier->Attach(*this, execution.m_stream_id, commands);
+			} else {
+				m_verifier->Detach();
+			}
+		}
 	}
 	execution.m_suspended     = false;
 	execution.m_made_progress = false;
@@ -1333,8 +1450,12 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	ProcessPm4(execution);
 	// Draw-prep: every draw parsed in this slice is committed before the slice ends.
 	DrainPreparedDraws();
-	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
-	                                        : Pm4ProcessResult::Blocked;
+	const bool complete = execution.m_buffer_stack.empty();
+	if (complete && m_verifier != nullptr && m_verifier->Follows(execution.m_stream_id)) {
+		// KYTY_CP_SEQ_VERIFY: the reference front must end its stream here too.
+		m_verifier->Finish();
+	}
+	return complete ? Pm4ProcessResult::Complete : Pm4ProcessResult::Blocked;
 }
 
 // KYTY_CP_REPEAT_TRACE: the guest address of the packet whose handler is running (a draw packet
@@ -1350,7 +1471,7 @@ void CommandProcessor::NoteRepeatTraceDrawPacket() {
 
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
-	if (RepeatTrace::Enabled()) {
+	if (RepeatTrace::Enabled() && m_front_mode != FrontMode::Reference) {
 		RepeatTrace::OnIndirectBuffer(commands, chain);
 	}
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
@@ -1365,53 +1486,77 @@ void CommandProcessor::SuspendPm4() {
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	while (!execution.m_buffer_stack.empty()) {
-		if (g_gpu_state != nullptr) {
-			if (m_draw_prep != nullptr && m_draw_prep->Pending()) {
-				// Draw-prep: service commands (readbacks, unmaps) observe every parsed draw, so
-				// they only run with an empty window.
-				if (g_gpu_state->HasPendingCommands()) {
-					m_draw_prep->Drain();
-					g_gpu_state->ProcessCommands();
-				}
-			} else {
+		if (!ProcessPacket(execution)) {
+			return;
+		}
+	}
+}
+
+// KYTY_CP_SEQ: a completed (or skipped) packet of the stream is counted and, in verify mode,
+// hashed with its address: what the fronts parsed is compared through it.
+static void CountPacket(Pm4Execution& execution, const uint32_t* packet, uint32_t packet_dw,
+                        uint64_t& packets, uint64_t& packets_hash) {
+	(void)execution;
+	packets++;
+	if (CpSeq::PacketHashing()) {
+		packets_hash = XXH3_64bits_withSeed(packet, uint64_t {packet_dw} * sizeof(uint32_t),
+		                                    packets_hash ^ reinterpret_cast<uint64_t>(packet));
+	}
+}
+
+bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
+	// A reference front (KYTY_CP_SEQ_VERIFY) only parses: no services, sync epochs, draw-prep
+	// window or flush batching, and none of the parse's counters.
+	const bool reference = m_front_mode == FrontMode::Reference;
+	if (g_gpu_state != nullptr && !reference) {
+		if (m_draw_prep != nullptr && m_draw_prep->Pending()) {
+			// Draw-prep: service commands (readbacks, unmaps) observe every parsed draw, so
+			// they only run with an empty window.
+			if (g_gpu_state->HasPendingCommands()) {
+				m_draw_prep->Drain();
 				g_gpu_state->ProcessCommands();
 			}
+		} else {
+			g_gpu_state->ProcessCommands();
 		}
-		auto& cursor = execution.m_buffer_stack.back();
-		EXIT_IF(cursor.offset_dw > cursor.commands.size());
-		if (cursor.offset_dw == cursor.commands.size()) {
-			execution.m_buffer_stack.pop_back();
-			continue;
-		}
+	}
+	auto& cursor = execution.m_buffer_stack.back();
+	EXIT_IF(cursor.offset_dw > cursor.commands.size());
+	if (cursor.offset_dw == cursor.commands.size()) {
+		execution.m_buffer_stack.pop_back();
+		return true;
+	}
 
-		const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
-		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
-		const auto        remaining_dw  = total_dw - cursor.offset_dw;
-		const auto        packet_header = packet[0];
-		const auto        opcode        = (packet_header >> 8u) & 0xffu;
-		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
+	const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
+	const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
+	const auto        remaining_dw  = total_dw - cursor.offset_dw;
+	const auto        packet_header = packet[0];
+	const auto        opcode        = (packet_header >> 8u) & 0xffu;
+	EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 
-		if (packet_header == 0x80000000u) {
-			cursor.offset_dw++;
-			execution.m_made_progress = true;
-			continue;
-		}
+	if (packet_header == 0x80000000u) {
+		cursor.offset_dw++;
+		execution.m_made_progress = true;
+		CountPacket(execution, packet, 1, execution.m_packets, execution.m_packets_hash);
+		return true;
+	}
 
-		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
+	EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
 
-		if (GraphicsRunDebugDumpEnabled()) {
-			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
-			     " len=%" PRIu32 "\n",
-			     total_dw - remaining_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
-		}
+	if (GraphicsRunDebugDumpEnabled() && !reference) {
+		LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
+		     " len=%" PRIu32 "\n",
+		     total_dw - remaining_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
+	}
 
-		if ((packet_header & 1u) != 0) {
-			Profiler::CountFrameEvent(Profiler::FrameEvent::PredicatedPackets);
-		}
-		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
+	if ((packet_header & 1u) != 0 && !reference) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::PredicatedPackets);
+	}
+	if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
+		auto packet_dw = KYTY_PM4_LEN(packet_header);
+		EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
+		if (!reference) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::PredicatedPacketsSkipped);
-			auto packet_dw = KYTY_PM4_LEN(packet_header);
-			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
 			static std::atomic<uint32_t> skip_log_count {0};
 			if (skip_log_count.fetch_add(1) < 2048) {
 				LOGF("\t predicated skip: op=0x%02" PRIx32 ", r=0x%02" PRIx32 ", len=%" PRIu32
@@ -1431,29 +1576,32 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 					     dst, val, packet[1], packet[2]);
 				}
 			}
-			cursor.offset_dw += packet_dw;
-			execution.m_made_progress = true;
-			continue;
 		}
+		cursor.offset_dw += packet_dw;
+		execution.m_made_progress = true;
+		CountPacket(execution, packet, packet_dw, execution.m_packets, execution.m_packets_hash);
+		return true;
+	}
 
-		auto handler = g_cp_op_func[opcode];
+	auto handler = g_cp_op_func[opcode];
 
-		if (handler == nullptr) {
-			const auto offset = total_dw - remaining_dw;
-			LOGF("unknown PM4 packet: data=0x%016" PRIx64 ", num_dw=%" PRIu32
-			     ", offset=0x%05" PRIx32 ", current=0x%016" PRIx64 "\n",
-			     reinterpret_cast<uint64_t>(packet - offset), total_dw, offset,
-			     reinterpret_cast<uint64_t>(packet));
-			const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
-			const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
-			auto* const base       = packet - offset;
-			for (uint32_t i = dump_begin; i < dump_end; i++) {
-				LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "), base[i]);
-			}
-			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n",
-			     total_dw - remaining_dw, packet_header);
+	if (handler == nullptr) {
+		const auto offset = total_dw - remaining_dw;
+		LOGF("unknown PM4 packet: data=0x%016" PRIx64 ", num_dw=%" PRIu32
+		     ", offset=0x%05" PRIx32 ", current=0x%016" PRIx64 "\n",
+		     reinterpret_cast<uint64_t>(packet - offset), total_dw, offset,
+		     reinterpret_cast<uint64_t>(packet));
+		const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
+		const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
+		auto* const base       = packet - offset;
+		for (uint32_t i = dump_begin; i < dump_end; i++) {
+			LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "), base[i]);
 		}
+		EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n",
+		     total_dw - remaining_dw, packet_header);
+	}
 
+	if (!reference) {
 		// KYTY_SYNC_EPOCH (syncEpoch.h): every fence but a register load from memory is a point
 		// where guest CPU writes must become visible to the GPU work that follows it.
 		if (SyncEpoch::Enabled() &&
@@ -1484,33 +1632,40 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				engine->OnPacket(packet_class, fence_kind);
 			}
 		}
-		const auto packet_dw =
-		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
-		EXIT_IF(packet_dw > remaining_dw);
-		if (execution.m_suspended) {
-			return;
-		}
-		cursor.offset_dw += packet_dw;
-		execution.m_made_progress = true;
-		if (m_deferred_eop_flushes != 0 && ++m_packets_since_eop_request >= EopFlushPacketLimit()) {
-			// Bound how long a batched end-of-pipe interrupt can wait inside a long slice.
-			BufferFlush();
-		}
-		if (!execution.m_next_buffer.empty()) {
-			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
-			if (execution.m_chain) {
-				cursor = {execution.m_next_buffer};
-			} else {
-				execution.m_buffer_stack.push_back({execution.m_next_buffer});
-			}
-			execution.m_next_buffer = {};
-		}
-		if (execution.m_yield) {
-			execution.m_yield   = false;
-			execution.m_yielded = true;
-			return;
-		}
 	}
+	const auto packet_dw =
+	    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+	EXIT_IF(packet_dw > remaining_dw);
+	if (execution.m_suspended) {
+		// The packet runs again when the stream resumes. A reference front's lockstep packet may
+		// have chosen a buffer from its placeholder result before suspending (branches): drop it.
+		execution.m_next_buffer = {};
+		execution.m_chain       = false;
+		return false;
+	}
+	cursor.offset_dw += packet_dw;
+	execution.m_made_progress = true;
+	CountPacket(execution, packet, packet_dw, execution.m_packets, execution.m_packets_hash);
+	if (!reference && m_deferred_eop_flushes != 0 &&
+	    ++m_packets_since_eop_request >= EopFlushPacketLimit()) {
+		// Bound how long a batched end-of-pipe interrupt can wait inside a long slice.
+		BufferFlush();
+	}
+	if (!execution.m_next_buffer.empty()) {
+		// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
+		if (execution.m_chain) {
+			cursor = {execution.m_next_buffer};
+		} else {
+			execution.m_buffer_stack.push_back({execution.m_next_buffer});
+		}
+		execution.m_next_buffer = {};
+	}
+	if (execution.m_yield) {
+		execution.m_yield   = false;
+		execution.m_yielded = true;
+		return false;
+	}
+	return true;
 }
 
 void CommandProcessor::SetIndexType(uint32_t index_type_and_size) {
@@ -1539,19 +1694,44 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 		num_instances = 1;
 	}
 
+	if (m_front_mode != FrontMode::Direct) {
+		// Front state; the back applies it with the next indirect draw (m_front_num_instances).
+		m_front_num_instances   = num_instances;
+		m_front_instances_known = true;
+		return;
+	}
 	m_num_instances = num_instances;
 	m_pending_num_instances.clear();
 }
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
                                       const volatile void* address, uint32_t count_in_dwords) {
-	(void)count_in_dwords;
-	uint64_t value = 0;
+	if (op == 0x00) {
+		m_predicate_skip = false;
+		return;
+	}
+	CpSeq::PredicationOp payload;
+	payload.address         = reinterpret_cast<uint64_t>(address);
+	payload.condition       = condition;
+	payload.op              = op;
+	payload.wait_op         = wait_op;
+	payload.count_in_dwords = count_in_dwords;
+	const auto result       = Submit(payload);
+	if (result.suspended) {
+		SuspendPm4();
+		return;
+	}
+	m_predicate_skip = result.value != 0;
+}
+
+CpSeq::Result CommandProcessor::ExecPredication(const CpSeq::PredicationOp& payload) {
+	const auto  condition = payload.condition;
+	const auto  op        = payload.op;
+	const auto  wait_op   = payload.wait_op;
+	const auto* address   = reinterpret_cast<const volatile void*>(payload.address);
+	uint64_t    value     = 0;
 
 	switch (op) {
-		case 0x00:
-			m_predicate_skip = false;
-			return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionPredicates);
@@ -1574,12 +1754,8 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				const auto end   = results[db * 2u + 1u];
 				if ((begin & end & ready_bit) == 0) {
 					Profiler::CountFrameEvent(Profiler::FrameEvent::OcclusionPredicatesPending);
-					if (wait_op == 0) {
-						SuspendPm4();
-					} else {
-						m_predicate_skip = false;
-					}
-					return;
+					// Wait: the packet is retried. No wait: the predicate is cleared.
+					return {wait_op == 0, 0};
 				}
 				value += end - begin;
 			}
@@ -1602,9 +1778,10 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
 	}
+	bool skip = false;
 	switch (condition) {
-		case 0x00: m_predicate_skip = (value != 0); break;
-		case 0x01: m_predicate_skip = (value == 0); break;
+		case 0x00: skip = (value != 0); break;
+		case 0x01: skip = (value == 0); break;
 		default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
 	}
 	if (op == 0x01 && HangTrace::Enabled()) {
@@ -1613,7 +1790,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		event.address   = reinterpret_cast<uint64_t>(address);
 		event.value     = value;
 		event.condition = condition;
-		event.skip      = m_predicate_skip;
+		event.skip      = skip;
 		HangTrace::RecordOcclusion(event);
 	}
 	if (op == 0x03) {
@@ -1621,15 +1798,44 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		if (log_count.fetch_add(1) < 128) {
 			LOGF("\t bool predication: addr=0x%016" PRIx64 ", value=0x%016" PRIx64
 			     ", condition=%" PRIu32 ", skip=%u, wait_op=%" PRIu32 "\n",
-			     reinterpret_cast<uint64_t>(address), value, condition,
-			     m_predicate_skip ? 1u : 0u, wait_op);
+			     reinterpret_cast<uint64_t>(address), value, condition, skip ? 1u : 0u,
+			     wait_op);
 		}
 	}
+	return {false, skip ? 1u : 0u};
 }
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
-	args.index_type_and_size = m_index_type_and_size;
+	CpSeq::DrawIndexOp op;
+	op.index_addr                 = reinterpret_cast<uint64_t>(args.index_addr);
+	op.index_count                = args.index_count;
+	op.instance_count             = args.instance_count;
+	op.index_type_and_size        = m_index_type_and_size;
+	op.base_vertex                = args.base_vertex;
+	op.first_instance             = args.first_instance;
+	op.render_target_slice_offset = args.render_target_slice_offset;
+	op.offset_source              = static_cast<uint32_t>(args.offset_source);
 	if (args.instance_count == 0) {
+		if (m_front_mode != FrontMode::Direct && m_front_instances_known) {
+			op.instance_count = m_front_num_instances;
+		} else {
+			op.flags |= CpSeq::DrawFlagInheritInstances;
+		}
+	}
+	(void)Submit(op);
+}
+
+void CommandProcessor::ExecDrawIndex(const CpSeq::DrawIndexOp& op) {
+	DrawIndexArgs args;
+	args.index_count                = op.index_count;
+	args.index_addr                 = reinterpret_cast<const void*>(op.index_addr);
+	args.instance_count             = op.instance_count;
+	args.index_type_and_size        = op.index_type_and_size;
+	args.base_vertex                = op.base_vertex;
+	args.first_instance             = op.first_instance;
+	args.offset_source              = static_cast<DrawOffsetSource>(op.offset_source);
+	args.render_target_slice_offset = op.render_target_slice_offset;
+	if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
 		if (!m_pending_num_instances.empty()) {
 			// The inherited count may be GPU data an earlier (pending) draw writes.
 			DrainPreparedDraws();
@@ -1765,10 +1971,10 @@ bool CommandProcessor::TryDrawIndirectNative(DrawIndirectSource source) {
 	    (source.count_addr == 0 || !gpu_owned(source.count_addr, sizeof(uint32_t)))) {
 		return false;
 	}
-	if (source.indexed) {
-		source.index_base_addr     = m_index_base_addr;
-		source.index_buffer_size   = m_index_buffer_size;
-		source.index_type_and_size = m_index_type_and_size;
+	if (!source.indexed) {
+		source.index_base_addr     = 0;
+		source.index_buffer_size   = 0;
+		source.index_type_and_size = 0;
 	}
 
 	PendingNumInstances pending {.args_addr  = source.args_addr,
@@ -1808,18 +2014,83 @@ bool CommandProcessor::TryDrawIndirectNative(DrawIndirectSource source) {
 	return true;
 }
 
-void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
+CpSeq::DrawIndirectOp CommandProcessor::IndirectDrawOp(uint32_t data_offset,
+                                                      uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
+	CpSeq::DrawIndirectOp op;
+	op.args_base           = m_draw_indirect_args_base_addr;
+	op.index_base_addr     = m_index_base_addr;
+	op.index_buffer_size   = m_index_buffer_size;
+	op.index_type_and_size = m_index_type_and_size;
+	op.data_offset         = data_offset;
+	op.draw_initiator      = draw_initiator;
+	op.flags               = indexed ? CpSeq::IndirectFlagIndexed : 0u;
+	if (m_front_mode != FrontMode::Direct) {
+		if (m_front_instances_known) {
+			// The back's count still predates the last SET_NUM_INSTANCES: apply it first.
+			op.flags |= CpSeq::IndirectFlagSetInstances;
+			op.num_instances = m_front_num_instances;
+		}
+		// From here on the count is back state (read from the arguments, maybe GPU data).
+		m_front_instances_known = false;
+	}
+	return op;
+}
 
-	const auto args_addr   = m_draw_indirect_args_base_addr + data_offset;
+// An indirect draw record read on the CPU, drawn as the direct path's DrawIndexAuto/DrawIndex:
+// a zero instance count takes the back's instance state (NumInstances), which the draw's own
+// record has just set.
+static CpSeq::DrawAutoOp CpuIndirectAutoDraw(uint32_t vertex_count, uint32_t instance_count,
+                                             uint32_t first_vertex, uint32_t first_instance) {
+	CpSeq::DrawAutoOp draw;
+	draw.vertex_count   = vertex_count;
+	draw.instance_count = instance_count;
+	draw.first_vertex   = first_vertex;
+	draw.first_instance = first_instance;
+	draw.offset_source  = static_cast<uint32_t>(DrawOffsetSource::IndirectArgs);
+	draw.flags          = instance_count == 0 ? CpSeq::DrawFlagInheritInstances : 0u;
+	return draw;
+}
+
+static CpSeq::DrawIndexOp CpuIndirectIndexDraw(uint64_t index_addr, uint32_t index_count,
+                                               uint32_t instance_count, int32_t base_vertex,
+                                               uint32_t first_instance,
+                                               uint32_t index_type_and_size) {
+	CpSeq::DrawIndexOp draw;
+	draw.index_addr          = index_addr;
+	draw.index_count         = index_count;
+	draw.instance_count      = instance_count;
+	draw.index_type_and_size = index_type_and_size;
+	draw.base_vertex         = base_vertex;
+	draw.first_instance      = first_instance;
+	draw.offset_source       = static_cast<uint32_t>(DrawOffsetSource::IndirectArgs);
+	draw.flags               = instance_count == 0 ? CpSeq::DrawFlagInheritInstances : 0u;
+	return draw;
+}
+
+void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
+	const auto op = IndirectDrawOp(data_offset, draw_initiator, indexed);
+	(void)Submit(CpSeq::OpKind::DrawIndirect, &op, sizeof(op));
+}
+
+void CommandProcessor::ExecDrawIndirect(const CpSeq::DrawIndirectOp& op) {
+	if ((op.flags & CpSeq::IndirectFlagSetInstances) != 0) {
+		m_num_instances = op.num_instances;
+		m_pending_num_instances.clear();
+	}
+	const bool indexed     = (op.flags & CpSeq::IndirectFlagIndexed) != 0;
+	const auto args_addr   = op.args_base + op.data_offset;
 	const auto record_size = static_cast<uint32_t>(indexed ? sizeof(DrawIndexedIndirectArgs)
 	                                                       : sizeof(DrawIndirectArgs));
-	if (TryDrawIndirectNative({.args_addr  = args_addr,
-	                           .stride     = record_size,
-	                           .max_count  = 1,
-	                           .count_addr = 0,
-	                           .indexed    = indexed})) {
+	if (TryDrawIndirectNative({.args_addr           = args_addr,
+	                           .stride              = record_size,
+	                           .max_count           = 1,
+	                           .count_addr          = 0,
+	                           .indexed             = indexed,
+	                           .index_base_addr     = op.index_base_addr,
+	                           .index_buffer_size   = op.index_buffer_size,
+	                           .index_type_and_size = op.index_type_and_size})) {
 		return;
 	}
 
@@ -1827,23 +2098,21 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	if (!indexed) {
 		const auto args = ReadGuestForCp<DrawIndirectArgs>(args_addr);
 		m_num_instances = args.instance_count;
-		DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
-		               .instance_count = args.instance_count,
-		               .first_vertex   = args.start_vertex_location,
-		               .first_instance = args.start_instance_location,
-		               .offset_source  = DrawOffsetSource::IndirectArgs});
+		ExecDrawAuto(CpuIndirectAutoDraw(args.vertex_count_per_instance, args.instance_count,
+		                                 args.start_vertex_location,
+		                                 args.start_instance_location));
 		return;
 	}
 
 	const auto args       = ReadGuestForCp<DrawIndexedIndirectArgs>(args_addr);
-	const auto index_size = IndexElementSize(m_index_type_and_size);
+	const auto index_size = IndexElementSize(op.index_type_and_size);
 
-	auto* index_addr = reinterpret_cast<const void*>(
-	    m_index_base_addr + static_cast<uint64_t>(args.start_index_location) * index_size);
+	const auto index_addr =
+	    op.index_base_addr + static_cast<uint64_t>(args.start_index_location) * index_size;
 
 	const uint32_t index_count =
-	    (m_index_buffer_size != 0 ? std::min(args.index_count_per_instance, m_index_buffer_size)
-	                              : args.index_count_per_instance);
+	    (op.index_buffer_size != 0 ? std::min(args.index_count_per_instance, op.index_buffer_size)
+	                               : args.index_count_per_instance);
 	if (GraphicsRunDebugDumpEnabled() && index_count != args.index_count_per_instance) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -1854,20 +2123,31 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	}
 
 	m_num_instances = args.instance_count;
-	DrawIndex({.index_count    = index_count,
-	           .index_addr     = index_addr,
-	           .instance_count = args.instance_count,
-	           .base_vertex    = static_cast<int32_t>(args.base_vertex_location),
-	           .first_instance = args.start_instance_location,
-	           .offset_source  = DrawOffsetSource::IndirectArgs});
+	ExecDrawIndex(CpuIndirectIndexDraw(index_addr, index_count, args.instance_count,
+	                                   static_cast<int32_t>(args.base_vertex_location),
+	                                   args.start_instance_location, op.index_type_and_size));
 }
 
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, uint32_t draw_initiator,
                                          bool indexed) {
-	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
-	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
+	auto op               = IndirectDrawOp(data_offset, draw_initiator, indexed);
+	op.count_addr         = reinterpret_cast<uint64_t>(count_addr);
+	op.max_count_or_count = max_count_or_count;
+	op.stride             = stride_in_bytes;
+	(void)Submit(CpSeq::OpKind::DrawIndirectMulti, &op, sizeof(op));
+}
+
+void CommandProcessor::ExecDrawIndirectMulti(const CpSeq::DrawIndirectOp& op) {
+	if ((op.flags & CpSeq::IndirectFlagSetInstances) != 0) {
+		m_num_instances = op.num_instances;
+		m_pending_num_instances.clear();
+	}
+	const bool indexed            = (op.flags & CpSeq::IndirectFlagIndexed) != 0;
+	const auto max_count_or_count = op.max_count_or_count;
+	const auto stride_in_bytes    = op.stride;
+	const auto count_addr         = op.count_addr;
 
 	// Zero records draw nothing and leave the instance count unchanged on either path.
 	if (max_count_or_count == 0) {
@@ -1875,18 +2155,21 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	}
 
 	// The renderer rejects strides shorter than a record; the CPU path below reports them.
-	const auto args_base = m_draw_indirect_args_base_addr + data_offset;
-	if (TryDrawIndirectNative({.args_addr  = args_base,
-	                           .stride     = stride_in_bytes,
-	                           .max_count  = max_count_or_count,
-	                           .count_addr = reinterpret_cast<uint64_t>(count_addr),
-	                           .indexed    = indexed})) {
+	const auto args_base = op.args_base + op.data_offset;
+	if (TryDrawIndirectNative({.args_addr           = args_base,
+	                           .stride              = stride_in_bytes,
+	                           .max_count           = max_count_or_count,
+	                           .count_addr          = count_addr,
+	                           .indexed             = indexed,
+	                           .index_base_addr     = op.index_base_addr,
+	                           .index_buffer_size   = op.index_buffer_size,
+	                           .index_type_and_size = op.index_type_and_size})) {
 		return;
 	}
 
 	uint32_t draw_count = max_count_or_count;
-	if (count_addr != nullptr) {
-		draw_count = ReadGuestForCp<uint32_t>(reinterpret_cast<uint64_t>(count_addr));
+	if (count_addr != 0) {
+		draw_count = ReadGuestForCp<uint32_t>(count_addr);
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
 		}
@@ -1900,7 +2183,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	// Every drawn record sets the count, so pending native sources cannot decide any more.
 	m_pending_num_instances.clear();
 
-	const uint64_t index_size = indexed ? IndexElementSize(m_index_type_and_size) : 0;
+	const uint64_t index_size = indexed ? IndexElementSize(op.index_type_and_size) : 0;
 
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto args_addr = args_base + static_cast<uint64_t>(i) * stride_in_bytes;
@@ -1908,22 +2191,20 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		if (!indexed) {
 			const auto args = ReadGuestForCp<DrawIndirectArgs>(args_addr);
 			m_num_instances = args.instance_count;
-			DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
-			               .instance_count = args.instance_count,
-			               .first_vertex   = args.start_vertex_location,
-			               .first_instance = args.start_instance_location,
-			               .offset_source  = DrawOffsetSource::IndirectArgs});
+			ExecDrawAuto(CpuIndirectAutoDraw(args.vertex_count_per_instance, args.instance_count,
+			                                 args.start_vertex_location,
+			                                 args.start_instance_location));
 			continue;
 		}
 
 		const auto args = ReadGuestForCp<DrawIndexedIndirectArgs>(args_addr);
 
-		auto* index_addr = reinterpret_cast<const void*>(
-		    m_index_base_addr + static_cast<uint64_t>(args.start_index_location) * index_size);
+		const auto index_addr =
+		    op.index_base_addr + static_cast<uint64_t>(args.start_index_location) * index_size;
 
 		const uint32_t index_count =
-		    (m_index_buffer_size != 0
-		         ? std::min(args.index_count_per_instance, m_index_buffer_size)
+		    (op.index_buffer_size != 0
+		         ? std::min(args.index_count_per_instance, op.index_buffer_size)
 		         : args.index_count_per_instance);
 		if (GraphicsRunDebugDumpEnabled() && index_count != args.index_count_per_instance) {
 			static std::atomic<uint32_t> log_count {0};
@@ -1935,18 +2216,32 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 
 		m_num_instances = args.instance_count;
-		DrawIndex({.index_count    = index_count,
-		           .index_addr     = index_addr,
-		           .instance_count = args.instance_count,
-		           .base_vertex    = static_cast<int32_t>(args.base_vertex_location),
-		           .first_instance = args.start_instance_location,
-		           .offset_source  = DrawOffsetSource::IndirectArgs});
+		ExecDrawIndex(CpuIndirectIndexDraw(index_addr, index_count, args.instance_count,
+		                                   static_cast<int32_t>(args.base_vertex_location),
+		                                   args.start_instance_location, op.index_type_and_size));
 	}
 }
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
+	// The wave size is register state: the front sets it, the op's execution reads it.
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	CpSeq::DispatchDirectOp op;
+	op.x    = thread_group_x;
+	op.y    = thread_group_y;
+	op.z    = thread_group_z;
+	op.mode = mode;
+	(void)Submit(op);
+}
+
+void CommandProcessor::ExecDispatchDirect(const CpSeq::DispatchDirectOp& op) {
+	const auto thread_group_x = op.x;
+	const auto thread_group_y = op.y;
+	const auto thread_group_z = op.z;
+	const auto mode           = op.mode;
+	// The registers the command buffer reads (the front's, bound by BufferInit).
+	auto&       command = CurrentBuffer();
+	const auto& shaders = command.GetShaders();
 
 	uint32_t frame_num = 0;
 	// uint32_t local_x   = 1;
@@ -1958,8 +2253,10 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		if (GraphicsRunDebugDumpEnabled()) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {
-				const auto& cs = m_sh_ctx.GetCs().cs_regs;
-				const auto& oa = m_ucfg.GetGdsOaCounter(m_ucfg.GetGdsOaState().GetIndex());
+				const auto& user_config = command.GetUserConfig();
+				const auto& cs          = shaders.GetCs().cs_regs;
+				const auto& oa =
+				    user_config.GetGdsOaCounter(user_config.GetGdsOaState().GetIndex());
 				LOGF("QueuePoint DispatchDirect: frame=%u submit=%" PRIu64
 				     " groups=%ux%ux%u local=%ux%ux%u mode=0x%08" PRIx32 " wave=%u cs=0x%016" PRIx64
 				     " oa_index=%u oa_enabled=%s oa_addr=0x%04" PRIx32 " oa_space=0x%08" PRIx32
@@ -1967,21 +2264,20 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 				     frame_num, m_submit_id, thread_group_x, thread_group_y, thread_group_z,
 				     std::max(cs.num_thread_x, 1u), std::max(cs.num_thread_y, 1u),
 				     std::max(cs.num_thread_z, 1u), mode, static_cast<uint32_t>(cs.wave_size),
-				     cs.data_addr, m_ucfg.GetGdsOaState().GetIndex(),
+				     cs.data_addr, user_config.GetGdsOaState().GetIndex(),
 				     oa.IsCounterEnabled() ? "true" : "false", oa.GetAddressBytes(),
 				     oa.GetSpaceAvailable());
 			}
 		}
 
-		const auto& cs = m_sh_ctx.GetCs().cs_regs;
 		if (RepeatTrace::Enabled()) {
-			RepeatTrace::OnDispatch(static_cast<uint32_t>(m_interrupt_event_id), m_sh_ctx.GetCs(),
+			RepeatTrace::OnDispatch(static_cast<uint32_t>(m_interrupt_event_id), shaders.GetCs(),
 			                        thread_group_x, thread_group_y, thread_group_z, mode);
 		}
 		// local_x        = std::max(cs.num_thread_x, 1u);
 		// local_y        = std::max(cs.num_thread_y, 1u);
 		// local_z        = std::max(cs.num_thread_z, 1u);
-		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
+		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, command, thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
 		MaybeFlushIdleGpu();
 	}
@@ -2011,13 +2307,26 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
-	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
-		const auto args = ReadGuestForCp<vk::DispatchIndirectCommand>(args_addr);
-		DispatchDirect(args.x, args.y, args.z, mode);
+	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	CpSeq::DispatchIndirectOp op;
+	op.args_addr = args_addr;
+	op.mode      = mode;
+	(void)Submit(op);
+}
+
+void CommandProcessor::ExecDispatchIndirect(const CpSeq::DispatchIndirectOp& op) {
+	if ((op.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
+		const auto args = ReadGuestForCp<vk::DispatchIndirectCommand>(op.args_addr);
+		CpSeq::DispatchDirectOp direct;
+		direct.x    = args.x;
+		direct.y    = args.y;
+		direct.z    = args.z;
+		direct.mode = op.mode;
+		ExecDispatchDirect(direct);
 		return;
 	}
-	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
-	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
+	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), op.args_addr,
+	                                                op.mode);
 	MaybeFlushIdleGpu();
 }
 
@@ -2028,7 +2337,32 @@ void CommandProcessor::ReportLodStats(uint64_t destination, uint32_t size, uint3
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+	CpSeq::DrawAutoOp op;
+	op.vertex_count               = args.vertex_count;
+	op.instance_count             = args.instance_count;
+	op.first_vertex               = args.first_vertex;
+	op.first_instance             = args.first_instance;
+	op.offset_source              = static_cast<uint32_t>(args.offset_source);
+	op.render_target_slice_offset = args.render_target_slice_offset;
 	if (args.instance_count == 0) {
+		if (m_front_mode != FrontMode::Direct && m_front_instances_known) {
+			op.instance_count = m_front_num_instances;
+		} else {
+			op.flags |= CpSeq::DrawFlagInheritInstances;
+		}
+	}
+	(void)Submit(op);
+}
+
+void CommandProcessor::ExecDrawAuto(const CpSeq::DrawAutoOp& op) {
+	DrawAutoArgs args;
+	args.vertex_count               = op.vertex_count;
+	args.instance_count             = op.instance_count;
+	args.first_vertex               = op.first_vertex;
+	args.first_instance             = op.first_instance;
+	args.offset_source              = static_cast<DrawOffsetSource>(op.offset_source);
+	args.render_target_slice_offset = op.render_target_slice_offset;
+	if ((op.flags & CpSeq::DrawFlagInheritInstances) != 0) {
 		if (!m_pending_num_instances.empty()) {
 			DrainPreparedDraws();
 		}
@@ -2064,13 +2398,22 @@ static bool FlipWaitSuspends() {
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
-	const auto handle = static_cast<int>(video_out_handle);
-	const auto index  = static_cast<int>(display_buffer_index);
+	CpSeq::WaitFlipDoneOp op;
+	op.video_out_handle     = video_out_handle;
+	op.display_buffer_index = display_buffer_index;
+	if (Submit(op).suspended) {
+		SuspendPm4();
+	}
+}
+
+CpSeq::Result CommandProcessor::ExecWaitFlipDone(const CpSeq::WaitFlipDoneOp& op) {
+	const auto handle = static_cast<int>(op.video_out_handle);
+	const auto index  = static_cast<int>(op.display_buffer_index);
 	if (!FlipWaitSuspends()) {
 		BufferFlush();
 		Profiler::CountFrameEvent(Profiler::FrameEvent::FlipWaitBlocking);
 		m_renderer.GetVideoOut().WaitFlipDone(handle, index);
-		return;
+		return {};
 	}
 	if (!m_flip_wait_suspended) {
 		// First evaluation of this packet: submit everything recorded before it (as the
@@ -2082,10 +2425,10 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 			Profiler::CountFrameEvent(Profiler::FrameEvent::FlipWaitSuspends);
 		}
 		m_flip_wait_suspended = true;
-		SuspendPm4();
-		return;
+		return {true, 0};
 	}
 	m_flip_wait_suspended = false;
+	return {};
 }
 
 // KYTY_LABEL_MODE=completion writes every end-of-pipe label (RELEASE_MEM / EVENT_WRITE_EOP data
@@ -2619,6 +2962,27 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	EXIT("unknown event type\n");
 }
 
+static CpSeq::EndOfPipeOp EndOfPipePayload(uint32_t cache_policy, uint32_t event_write_dest,
+                                           uint32_t eop_event_type, uint32_t cache_action,
+                                           uint32_t event_index, uint32_t event_write_source,
+                                           void* dst_gpu_addr, uint64_t value,
+                                           uint32_t interrupt_selector,
+                                           uint32_t interrupt_context_id, uint32_t size) {
+	CpSeq::EndOfPipeOp op;
+	op.dst                  = reinterpret_cast<uint64_t>(dst_gpu_addr);
+	op.value                = value;
+	op.cache_policy         = cache_policy;
+	op.event_write_dest     = event_write_dest;
+	op.eop_event_type       = eop_event_type;
+	op.cache_action         = cache_action;
+	op.event_index          = event_index;
+	op.event_write_source   = event_write_source;
+	op.interrupt_selector   = interrupt_selector;
+	op.interrupt_context_id = interrupt_context_id;
+	op.size                 = size;
+	return op;
+}
+
 void CommandProcessor::WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_write_dest,
                                           uint32_t eop_event_type, uint32_t cache_action,
                                           uint32_t event_index, uint32_t event_write_source,
@@ -2626,9 +2990,9 @@ void CommandProcessor::WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_
                                           uint32_t interrupt_selector,
                                           uint32_t interrupt_context_id) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
-	WriteAtEndOfPipe(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
-	                 event_write_source, dst_gpu_addr, value, interrupt_selector,
-	                 interrupt_context_id);
+	(void)Submit(EndOfPipePayload(cache_policy, event_write_dest, eop_event_type, cache_action,
+	                              event_index, event_write_source, dst_gpu_addr, value,
+	                              interrupt_selector, interrupt_context_id, sizeof(uint32_t)));
 }
 
 void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_write_dest,
@@ -2638,9 +3002,23 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
                                           uint32_t interrupt_selector,
                                           uint32_t interrupt_context_id) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
-	WriteAtEndOfPipe(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
-	                 event_write_source, dst_gpu_addr, value, interrupt_selector,
-	                 interrupt_context_id);
+	(void)Submit(EndOfPipePayload(cache_policy, event_write_dest, eop_event_type, cache_action,
+	                              event_index, event_write_source, dst_gpu_addr, value,
+	                              interrupt_selector, interrupt_context_id, sizeof(uint64_t)));
+}
+
+void CommandProcessor::ExecEndOfPipe(const CpSeq::EndOfPipeOp& op) {
+	auto* dst = reinterpret_cast<void*>(op.dst);
+	if (op.size == sizeof(uint32_t)) {
+		WriteAtEndOfPipe(op.cache_policy, op.event_write_dest, op.eop_event_type, op.cache_action,
+		                 op.event_index, op.event_write_source, dst,
+		                 static_cast<uint32_t>(op.value), op.interrupt_selector,
+		                 op.interrupt_context_id);
+		return;
+	}
+	WriteAtEndOfPipe(op.cache_policy, op.event_write_dest, op.eop_event_type, op.cache_action,
+	                 op.event_index, op.event_write_source, dst, op.value, op.interrupt_selector,
+	                 op.interrupt_context_id);
 }
 
 void CommandProcessor::EmitGlobalBarrier() {
@@ -2681,6 +3059,17 @@ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id)
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
                                     uint64_t event_address) {
+	CpSeq::EventWriteOp op;
+	op.address     = event_address;
+	op.event_type  = event_type;
+	op.event_index = event_index;
+	(void)Submit(op);
+}
+
+void CommandProcessor::ExecEventWrite(const CpSeq::EventWriteOp& op) {
+	const auto event_type    = op.event_type;
+	const auto event_index   = op.event_index;
+	const auto event_address = op.address;
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::TriggerEvent()\n"
 		     "\t event_type  = 0x%08" PRIx32 "\n"
@@ -2805,64 +3194,110 @@ static void NoteLoopGuardHits(RenderContext& renderer) {
 	}
 }
 
-void CommandProcessor::Flip() {
-	NoteLoopGuardHits(m_renderer);
-	if (GraphicsRunDebugDumpEnabled()) {
-		LOGF("CommandProcessor::Flip()\n");
-	}
+// The flip markers: the front's flip info (FLIP packet / SetFlip) travels with the op.
+static CpSeq::FlipOp FlipPayload(const CommandProcessor::FlipInfo& flip, CpSeq::FlipVariant variant,
+                                 void* dst_gpu_addr, uint32_t value, uint32_t eop_event_type,
+                                 uint32_t cache_action) {
+	CpSeq::FlipOp op;
+	op.flip_arg       = flip.flip_arg;
+	op.dst            = reinterpret_cast<uint64_t>(dst_gpu_addr);
+	op.handle         = flip.handle;
+	op.index          = flip.index;
+	op.flip_mode      = flip.flip_mode;
+	op.variant        = static_cast<uint32_t>(variant);
+	op.value          = value;
+	op.eop_event_type = eop_event_type;
+	op.cache_action   = cache_action;
+	return op;
+}
 
-	auto& command = CurrentBuffer();
-	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
-	                                         m_flip.flip_arg);
-	Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, m_flip.handle, m_flip.index,
-	                               m_flip.flip_mode, m_flip.flip_arg, request);
-	GetScheduler().Flush();
+void CommandProcessor::Flip() {
+	(void)Submit(FlipPayload(m_flip, CpSeq::FlipVariant::Plain, nullptr, 0, 0, 0));
 }
 
 void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
-	NoteLoopGuardHits(m_renderer);
-	auto& command = CurrentBuffer();
-
-	if (GraphicsRunDebugDumpEnabled()) {
-		LOGF("CommandProcessor::Flip()\n"
-		     "\t dst_gpu_addr = 0x%016" PRIx64 "\n"
-		     "\t value        = 0x%08" PRIx32 "\n",
-		     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
-	}
-
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
-	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
-	                                         m_flip.flip_arg);
-	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
-	                                 value, m_flip.handle, m_flip.index, m_flip.flip_mode,
-	                                 m_flip.flip_arg, request);
-	GetScheduler().Flush();
+	(void)Submit(FlipPayload(m_flip, CpSeq::FlipVariant::Label, dst_gpu_addr, value, 0, 0));
 }
 
 void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action,
                                          void* dst_gpu_addr, uint32_t value) {
-	NoteLoopGuardHits(m_renderer);
-	auto& command = CurrentBuffer();
+	(void)Submit(FlipPayload(m_flip, CpSeq::FlipVariant::LabelInterrupt, dst_gpu_addr, value,
+	                         eop_event_type, cache_action));
+}
 
-	if (GraphicsRunDebugDumpEnabled()) {
-		LOGF("CommandProcessor::FlipWithInterrupt()\n"
-		     "\t eop_event_type      = 0x%08" PRIx32 "\n"
-		     "\t cache_action        = 0x%08" PRIx32 "\n"
-		     "\t dst_gpu_addr        = 0x%016" PRIx64 "\n"
-		     "\t value               = 0x%08" PRIx32 "\n",
-		     eop_event_type, cache_action, reinterpret_cast<uint64_t>(dst_gpu_addr), value);
-	}
+void CommandProcessor::ExecFlip(const CpSeq::FlipOp& op) {
+	const FlipInfo flip {.handle    = op.handle,
+	                     .index     = op.index,
+	                     .flip_mode = op.flip_mode,
+	                     .flip_arg  = op.flip_arg};
+	auto* const    dst_gpu_addr = reinterpret_cast<void*>(op.dst);
+	const auto     value        = op.value;
+	switch (static_cast<CpSeq::FlipVariant>(op.variant)) {
+		case CpSeq::FlipVariant::Plain: {
+			NoteLoopGuardHits(m_renderer);
+			if (GraphicsRunDebugDumpEnabled()) {
+				LOGF("CommandProcessor::Flip()\n");
+			}
 
-	if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
-		EXIT("unknown event type\n");
+			auto& command = CurrentBuffer();
+			auto  request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
+			                                          flip.flip_mode, flip.flip_arg);
+			Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, flip.handle, flip.index,
+			                               flip.flip_mode, flip.flip_arg, request);
+			GetScheduler().Flush();
+			return;
+		}
+		case CpSeq::FlipVariant::Label: {
+			NoteLoopGuardHits(m_renderer);
+			auto& command = CurrentBuffer();
+
+			if (GraphicsRunDebugDumpEnabled()) {
+				LOGF("CommandProcessor::Flip()\n"
+				     "\t dst_gpu_addr = 0x%016" PRIx64 "\n"
+				     "\t value        = 0x%08" PRIx32 "\n",
+				     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
+			}
+
+			std::memcpy(dst_gpu_addr, &value, sizeof(value));
+			auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
+			                                         flip.flip_mode, flip.flip_arg);
+			Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command,
+			                                 static_cast<uint32_t*>(dst_gpu_addr), value,
+			                                 flip.handle, flip.index, flip.flip_mode,
+			                                 flip.flip_arg, request);
+			GetScheduler().Flush();
+			return;
+		}
+		case CpSeq::FlipVariant::LabelInterrupt: {
+			const auto eop_event_type = op.eop_event_type;
+			const auto cache_action   = op.cache_action;
+			NoteLoopGuardHits(m_renderer);
+			auto& command = CurrentBuffer();
+
+			if (GraphicsRunDebugDumpEnabled()) {
+				LOGF("CommandProcessor::FlipWithInterrupt()\n"
+				     "\t eop_event_type      = 0x%08" PRIx32 "\n"
+				     "\t cache_action        = 0x%08" PRIx32 "\n"
+				     "\t dst_gpu_addr        = 0x%016" PRIx64 "\n"
+				     "\t value               = 0x%08" PRIx32 "\n",
+				     eop_event_type, cache_action, reinterpret_cast<uint64_t>(dst_gpu_addr),
+				     value);
+			}
+
+			if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
+				EXIT("unknown event type\n");
+			}
+			std::memcpy(dst_gpu_addr, &value, sizeof(value));
+			auto request = Sync::PrepareVideoOutFlip(command, flip.handle, flip.index,
+			                                         flip.flip_mode, flip.flip_arg);
+			Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(
+			    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, flip.handle,
+			    flip.index, flip.flip_mode, flip.flip_arg, request, m_interrupt_event_id);
+			GetScheduler().Flush();
+			return;
+		}
 	}
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
-	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
-	                                         m_flip.flip_arg);
-	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(
-	    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, m_flip.handle,
-	    m_flip.index, m_flip.flip_mode, m_flip.flip_arg, request, m_interrupt_event_id);
-	GetScheduler().Flush();
+	EXIT("unknown flip variant %u\n", op.variant);
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
@@ -2884,6 +3319,242 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 void CommandProcessor::SynchronizeGpu() {
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	GetScheduler().Finish();
+}
+
+// ---- P3: the front's op hand-off (cpOps.h) -----------------------------------------------------
+
+// KYTY_CP_SEQ_RING_KB (default 512): the op ring of inline mode. The largest record (a
+// WRITE_DATA of 16383 dwords) needs at least 256 KiB.
+static uint64_t OpRingBytes() {
+	static const uint64_t bytes = [] {
+		const auto* value  = std::getenv("KYTY_CP_SEQ_RING_KB");
+		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 512ul;
+		uint64_t    size   = 256u << 10u;
+		while (size < uint64_t {std::min(parsed, 1ul << 20u)} << 10u) {
+			size <<= 1u;
+		}
+		return size;
+	}();
+	return bytes;
+}
+
+CpSeq::Result CommandProcessor::Submit(CpSeq::OpKind kind, const void* payload,
+                                       uint32_t payload_size, const void* data,
+                                       uint32_t data_size) {
+	switch (m_front_mode) {
+		case FrontMode::Direct: return ExecuteOp(kind, payload, data);
+		case FrontMode::Inline: return SubmitInline(kind, payload, payload_size, data, data_size);
+		case FrontMode::Reference: {
+			EXIT_IF(m_capture == nullptr || g_current_execution == nullptr);
+			return m_capture->Capture(kind, payload, payload_size, data, data_size,
+			                          g_current_execution->m_packets,
+			                          g_current_execution->m_packets_hash);
+		}
+	}
+	EXIT("unknown front mode\n");
+	return {};
+}
+
+CpSeq::Result CommandProcessor::SubmitInline(CpSeq::OpKind kind, const void* payload,
+                                             uint32_t payload_size, const void* data,
+                                             uint32_t data_size) {
+	// An op's execution never emits another op (Exec* bodies call Exec*, not front methods).
+	EXIT_IF(m_executing);
+	if (m_ops == nullptr) {
+		m_ops.reset(new CpSeq::OpStream(OpRingBytes()));
+	}
+	const auto* execution = g_current_execution;
+	const bool  verify    = m_verifier != nullptr && execution != nullptr &&
+	                    m_verifier->Follows(execution->m_stream_id);
+	(void)m_ops->Emit(kind, payload, payload_size, data, data_size,
+	                  execution != nullptr ? execution->m_packets : 0,
+	                  execution != nullptr ? execution->m_packets_hash : 0, verify);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqOps);
+	// The resolver, at once on this thread: decode, compare with the reference front, execute.
+	CpSeq::OpView view;
+	EXIT_IF(!m_ops->Peek(view));
+	if (verify) {
+		m_verifier->Before(view);
+	}
+	m_executing       = true;
+	const auto result = ExecuteOp(view.Kind(), view.payload, view.data);
+	m_executing       = false;
+	if (verify) {
+		m_verifier->After(view, result);
+	}
+	m_ops->Pop();
+	return result;
+}
+
+CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payload,
+                                          const void* data) {
+	using CpSeq::OpKind;
+	switch (kind) {
+		case OpKind::DrawIndex: ExecDrawIndex(*static_cast<const CpSeq::DrawIndexOp*>(payload)); break;
+		case OpKind::DrawAuto: ExecDrawAuto(*static_cast<const CpSeq::DrawAutoOp*>(payload)); break;
+		case OpKind::DrawIndirect:
+			ExecDrawIndirect(*static_cast<const CpSeq::DrawIndirectOp*>(payload));
+			break;
+		case OpKind::DrawIndirectMulti:
+			ExecDrawIndirectMulti(*static_cast<const CpSeq::DrawIndirectOp*>(payload));
+			break;
+		case OpKind::DispatchDirect:
+			ExecDispatchDirect(*static_cast<const CpSeq::DispatchDirectOp*>(payload));
+			break;
+		case OpKind::DispatchIndirect:
+			ExecDispatchIndirect(*static_cast<const CpSeq::DispatchIndirectOp*>(payload));
+			break;
+		case OpKind::EndOfPipe: ExecEndOfPipe(*static_cast<const CpSeq::EndOfPipeOp*>(payload)); break;
+		case OpKind::ReleaseMem:
+			ExecReleaseMem(*static_cast<const CpSeq::ReleaseMemOp*>(payload));
+			break;
+		case OpKind::EventWrite:
+			ExecEventWrite(*static_cast<const CpSeq::EventWriteOp*>(payload));
+			break;
+		case OpKind::WriteData:
+			ExecWriteData(*static_cast<const CpSeq::WriteDataOp*>(payload),
+			              static_cast<const uint32_t*>(data));
+			break;
+		case OpKind::ReferenceClock:
+			ExecReferenceClock(*static_cast<const CpSeq::ReferenceClockOp*>(payload));
+			break;
+		case OpKind::DmaData: ExecDmaData(*static_cast<const CpSeq::DmaDataOp*>(payload)); break;
+		case OpKind::LodStats: ExecLodStats(*static_cast<const CpSeq::LodStatsOp*>(payload)); break;
+		case OpKind::Flip: ExecFlip(*static_cast<const CpSeq::FlipOp*>(payload)); break;
+		case OpKind::WaitRegMem:
+			return ExecWaitRegMem(*static_cast<const CpSeq::WaitRegMemOp*>(payload));
+		case OpKind::WaitFlipDone:
+			return ExecWaitFlipDone(*static_cast<const CpSeq::WaitFlipDoneOp*>(payload));
+		case OpKind::DumpConstRam:
+			ExecDumpConstRam(*static_cast<const CpSeq::DumpConstRamOp*>(payload),
+			                 static_cast<const uint32_t*>(data));
+			break;
+		case OpKind::Predication:
+			return ExecPredication(*static_cast<const CpSeq::PredicationOp*>(payload));
+		case OpKind::CondExec: return ExecCondExec(*static_cast<const CpSeq::CondExecOp*>(payload));
+		case OpKind::Branch: return ExecBranch(*static_cast<const CpSeq::BranchOp*>(payload));
+		case OpKind::ReadCheck: break; // compared by the verifier only
+		case OpKind::Count: EXIT("invalid op kind\n");
+	}
+	return {};
+}
+
+bool CommandProcessor::CondExec(uint64_t address) {
+	CpSeq::CondExecOp op;
+	op.address        = address;
+	const auto result = Submit(op);
+	if (result.suspended) {
+		// Reference front: the condition arrives with the resolver's answer.
+		SuspendPm4();
+		return false;
+	}
+	return result.value != 0;
+}
+
+CpSeq::Result CommandProcessor::ExecCondExec(const CpSeq::CondExecOp& op) {
+	return {false, *reinterpret_cast<const volatile uint32_t*>(op.address) != 0 ? 1u : 0u};
+}
+
+bool CommandProcessor::Branch(uint64_t compare_addr, uint64_t mask, uint64_t reference,
+                              uint32_t function) {
+	CpSeq::BranchOp op;
+	op.compare_addr   = compare_addr;
+	op.mask           = mask;
+	op.reference      = reference;
+	op.function       = function;
+	const auto result = Submit(op);
+	if (result.suspended) {
+		SuspendPm4();
+		return false;
+	}
+	return result.value != 0;
+}
+
+CpSeq::Result CommandProcessor::ExecBranch(const CpSeq::BranchOp& op) {
+	const bool taken =
+	    TestWaitRegMemValue(ReadGuestForCp<uint64_t>(op.compare_addr), op.reference, op.mask,
+	                        op.function);
+	return {false, taken ? 1u : 0u};
+}
+
+const uint32_t* CommandProcessor::ReadRegisterPairs(uint64_t address, uint32_t num_regs) {
+	m_register_pairs.resize(static_cast<size_t>(num_regs) * 2u);
+	const auto bytes = static_cast<uint64_t>(m_register_pairs.size()) * sizeof(uint32_t);
+	ReadGuestForCp(address, bytes, m_register_pairs.data());
+	// KYTY_CP_SEQ_VERIFY: the front's read is compared with the reference front's serial read.
+	const bool check =
+	    m_front_mode == FrontMode::Reference ||
+	    (m_front_mode == FrontMode::Inline && m_verifier != nullptr &&
+	     g_current_execution != nullptr && m_verifier->Follows(g_current_execution->m_stream_id));
+	if (check) {
+		CpSeq::ReadCheckOp op;
+		op.address = address;
+		op.size    = bytes;
+		op.hash    = XXH3_64bits(m_register_pairs.data(), bytes);
+		(void)Submit(op);
+	}
+	return m_register_pairs.data();
+}
+
+void CommandProcessor::ReleaseMem(const uint32_t* body) {
+	CpSeq::ReleaseMemOp op;
+	std::memcpy(op.body, body, 7 * sizeof(uint32_t));
+	(void)Submit(op);
+}
+
+void CommandProcessor::GetLodStats(const uint32_t* body) {
+	CpSeq::LodStatsOp op;
+	std::memcpy(op.body, body, sizeof(op.body));
+	(void)Submit(op);
+}
+
+void CommandProcessor::SetCeComplete(bool complete) {
+	m_ce_complete = complete;
+	if (m_verifier != nullptr) {
+		m_verifier->MirrorCeComplete(complete);
+	}
+}
+
+bool CommandProcessor::ReferenceStep(Pm4Execution& execution) {
+	EXIT_IF(m_front_mode != FrontMode::Reference);
+	struct Scope {
+		Scope(CommandProcessor& processor, Pm4Execution& execution)
+		    : previous_processor(g_current_processor), previous_execution(g_current_execution) {
+			g_current_processor = &processor;
+			g_current_execution = &execution;
+		}
+		~Scope() {
+			g_current_processor = previous_processor;
+			g_current_execution = previous_execution;
+		}
+		CommandProcessor* previous_processor;
+		Pm4Execution*     previous_execution;
+	} scope(*this, execution);
+	execution.m_suspended = false;
+	(void)ProcessPacket(execution);
+	return execution.m_suspended;
+}
+
+void CommandProcessor::CopyFrontState(const CommandProcessor& from) {
+	m_ctx                              = from.m_ctx;
+	m_saved_ctx                        = from.m_saved_ctx;
+	m_context_state_pushed             = from.m_context_state_pushed;
+	m_ucfg                             = from.m_ucfg;
+	m_sh_ctx                           = from.m_sh_ctx;
+	m_user_data_marker                 = from.m_user_data_marker;
+	m_index_type_and_size              = from.m_index_type_and_size;
+	m_index_buffer_size                = from.m_index_buffer_size;
+	m_index_base_addr                  = from.m_index_base_addr;
+	m_draw_indirect_args_base_addr     = from.m_draw_indirect_args_base_addr;
+	m_dispatch_indirect_args_base_addr = from.m_dispatch_indirect_args_base_addr;
+	m_front_num_instances              = from.m_front_num_instances;
+	m_front_instances_known            = from.m_front_instances_known;
+	m_de_count                         = from.m_de_count;
+	m_ce_count                         = from.m_ce_count;
+	m_ce_complete                      = from.m_ce_complete;
+	std::memcpy(m_const_ram, from.m_const_ram, sizeof(m_const_ram));
+	m_flip           = from.m_flip;
+	m_predicate_skip = from.m_predicate_skip;
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

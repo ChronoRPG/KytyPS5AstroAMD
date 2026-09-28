@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/command_processor/cpOps.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -42327,6 +42328,135 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
 }
 
+// P3 (cpOps.h): one PM4 stream whose packets become ops of the kinds the parse can check without
+// drawing: WRITE_DATA, SET_SH_REG_INDIRECT pairs (a ReadCheck op under verify), COND_EXEC with
+// both outcomes, WRITE_CONST_RAM + DUMP_CONST_RAM (constant RAM as inline data), a boolean
+// SET_PREDICATION with a tagged packet, a conditional INDIRECT_BUFFER in a called buffer, and a
+// WAIT_REG_MEM that suspends the stream and resumes it. The results are the same in every
+// KYTY_CP_SEQ mode. With KYTY_CP_SEQ_VERIFY every op is compared with the reference front and
+// none differs; in count mode (=1) a front-state change the reference cannot see (a predicate set
+// between two slices of a stream) must be detected.
+void CheckCpSeqOps(RenderContext &renderer) {
+  constexpr const char *name = "CpSeqOps";
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  processor.BufferInit();
+  auto &totals = CpSeq::GetVerifyTotals();
+  const bool verify = CpSeq::ConfiguredMode() == CpSeq::Mode::Inline && CpSeq::VerifyMode() != 0;
+  const auto checks_before = totals.checks.load();
+  const auto mismatches_before = totals.mismatches.load();
+  const auto divergences_before = totals.read_divergences.load();
+  const auto answers_before = totals.lockstep_answers.load();
+
+  const auto lo = [](const void *value) {
+    return static_cast<uint32_t>(reinterpret_cast<uint64_t>(value));
+  };
+  const auto hi = [](const void *value) {
+    return static_cast<uint32_t>(reinterpret_cast<uint64_t>(value) >> 32u);
+  };
+  alignas(16) std::array<uint32_t, 4> pairs{Pm4::SPI_SHADER_PGM_LO_PS, 0x05000104u,
+                                            Pm4::SPI_SHADER_PGM_HI_PS, 0u};
+  alignas(8) uint32_t cond_zero = 0;
+  alignas(8) uint32_t cond_one = 1;
+  alignas(8) uint32_t label = 0;
+  alignas(16) uint64_t predicate = 0;
+  alignas(8) uint64_t branch_value = 1;
+  uint32_t written = 0, skipped = 0, executed = 0, predicated = 0, branched = 0, suffix = 0;
+  alignas(16) std::array<uint32_t, 3> dump{};
+  const auto write = [&](std::vector<uint32_t> &out, uint32_t *dst, uint32_t value,
+                         bool tagged = false) {
+    out.insert(out.end(), {KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0) | (tagged ? 1u : 0u), 0u, lo(dst),
+                           hi(dst), value});
+  };
+  std::vector<uint32_t> then_commands;
+  write(then_commands, &branched, 55);
+  // A taken branch replaces the rest of its buffer: it sits alone in a called buffer.
+  const std::array<uint32_t, 14> branch{
+      KYTY_PM4(14, Pm4::IT_INDIRECT_BUFFER, 0), 1u | (3u << 8u), lo(&branch_value),
+      hi(&branch_value), UINT32_MAX, UINT32_MAX, 1u, 0u, lo(then_commands.data()),
+      hi(then_commands.data()), static_cast<uint32_t>(then_commands.size()), 0u, 0u, 0u};
+  std::vector<uint32_t> stream;
+  write(stream, &written, 11);
+  stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_SET_SH_REG_INDIRECT, Pm4::R_ZERO),
+                               lo(pairs.data()), hi(pairs.data()), 0x80000000u, 2u});
+  // COND_EXEC on a zero dword skips the next packet (5 dwords); on a non-zero one it runs it.
+  stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_COND_EXEC, 0), lo(&cond_zero), hi(&cond_zero),
+                               0u, 5u});
+  write(stream, &skipped, 22);
+  stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_COND_EXEC, 0), lo(&cond_one), hi(&cond_one),
+                               0u, 5u});
+  write(stream, &executed, 33);
+  stream.insert(stream.end(),
+                {KYTY_PM4(5, Pm4::IT_WRITE_CONST_RAM, 0), 0x40u, 0xa1u, 0xb2u, 0xc3u});
+  stream.insert(stream.end(), {KYTY_PM4(5, Pm4::IT_DUMP_CONST_RAM, 0), 0x40u, 3u, lo(dump.data()),
+                               hi(dump.data())});
+  // Boolean predication, condition 1 (skip when the value is 0): the tagged packet is skipped;
+  // op 0 clears it again.
+  stream.insert(stream.end(), {0xc0022000u, (3u << 16u) | (1u << 8u), lo(&predicate),
+                               hi(&predicate)});
+  write(stream, &predicated, 44, true);
+  stream.insert(stream.end(), {0xc0022000u, 0u, 0u, 0u});
+  stream.insert(stream.end(), {KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0), lo(branch.data()),
+                               hi(branch.data()),
+                               0x0f200000u | static_cast<uint32_t>(branch.size())});
+  stream.insert(stream.end(), {KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0), 0x10u | 3u, lo(&label),
+                               hi(&label), 1u, UINT32_MAX, 0u});
+  write(stream, &suffix, 66);
+
+  Pm4Execution execution;
+  Require(name, "wait suspends",
+          processor.Process(execution, stream) == Pm4ProcessResult::Blocked && suffix == 0 &&
+              processor.Process(execution, stream) == Pm4ProcessResult::Blocked &&
+              !execution.MadeProgress(),
+          "the stream did not stop at its unsatisfied wait");
+  label = 1;
+  Require(name, "wait resumes",
+          processor.Process(execution, stream) == Pm4ProcessResult::Complete && suffix == 66,
+          "the stream did not resume after its wait passed");
+  Require(name, "effects",
+          written == 11 && skipped == 0 && executed == 33 && predicated == 0 &&
+              branched == 55 && dump == std::array<uint32_t, 3>{0xa1u, 0xb2u, 0xc3u} &&
+              processor.GetShCtx().GetPs().ps_regs.data_addr == 0x500010400ull &&
+              !processor.ShouldSkipPredicatedPackets(),
+          "an op executed with different arguments than its packet's");
+  if (verify) {
+    Require(name, "verify",
+            totals.checks.load() > checks_before + 8 &&
+                totals.mismatches.load() == mismatches_before &&
+                totals.read_divergences.load() == divergences_before &&
+                totals.lockstep_answers.load() >= answers_before + 4,
+            "KYTY_CP_SEQ_VERIFY compared too few ops, or the reference front differed");
+  }
+  if (verify && CpSeq::VerifyMode() == 1) {
+    // Negative: the predicate changes between two slices of a stream, outside it. The front
+    // skips the tagged packet; the reference front, which took the front state at the stream's
+    // start, runs it: an op the front never emitted.
+    alignas(16) uint64_t zero = 0;
+    uint32_t tagged = 0;
+    label = 0;
+    std::vector<uint32_t> raced;
+    raced.insert(raced.end(), {KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0), 0x10u | 3u, lo(&label),
+                               hi(&label), 1u, UINT32_MAX, 0u});
+    write(raced, &tagged, 77, true);
+    Pm4Execution raced_execution;
+    const bool blocked = processor.Process(raced_execution, raced) == Pm4ProcessResult::Blocked;
+    processor.SetPredication(1, 3, 0, &zero, 0);
+    label = 1;
+    const bool complete =
+        processor.Process(raced_execution, raced) == Pm4ProcessResult::Complete;
+    processor.SetPredication(0, 0, 0, nullptr, 0);
+    Require(name, "verify detects",
+            blocked && complete && tagged == 0 &&
+                totals.mismatches.load() == mismatches_before + 1,
+            "KYTY_CP_SEQ_VERIFY missed a front-state difference");
+  }
+  processor.BufferWait();
+  std::printf("[host]    %-32s ok (%s)\n", name,
+              CpSeq::ConfiguredMode() == CpSeq::Mode::Inline
+                  ? (verify ? "inline, verified" : "inline")
+                  : "direct");
+}
+
 #include "ShaderCodegenTests.inc"
 #include "ShaderGiProbeTests.inc"
 #include "ShaderSrtVariantTests.inc"
@@ -42702,6 +42832,22 @@ int main(int argc, char **argv) {
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
     CheckPm4CeCompletion(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cp-seq-only") == 0) {
+    // KYTY_CP_SEQ (cpOps.h): the PM4 checks whose packets become ops (waits, predication,
+    // branches, rewind, constant engine, context state, events) and the scheduler lane.
+    VulkanHarness vulkan;
+    CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
+    CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
+    CheckPm4Predication(vulkan.RuntimeRenderer());
+    CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
+    CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
+    CheckPm4WaitResume(vulkan.RuntimeRenderer());
+    CheckPm4RewindResume(vulkan.RuntimeRenderer());
+    CheckPm4CeCompletion(vulkan.RuntimeRenderer());
+    CheckCpSeqOps(vulkan.RuntimeRenderer());
+    vulkan.CheckGpuCommandLane();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
@@ -43164,6 +43310,7 @@ int main(int argc, char **argv) {
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckPm4CeCompletion(vulkan.RuntimeRenderer());
+  CheckCpSeqOps(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
