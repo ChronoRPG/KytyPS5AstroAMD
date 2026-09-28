@@ -13727,6 +13727,18 @@ public:
     });
     LibKernel::Memory::InstallGpuResources(nullptr);
     context.ShutdownGpu();
+    if (DrawPrep::BindingParts() != 0) {
+      const auto &binding = DrawPrep::GetBindingTotals();
+      std::printf("[gpu]     %-32s binding plans %llu, used %llu, pipelines %llu, left %llu, busy "
+                  "%llu, refused %llu, verify checks %llu\n",
+                  name, static_cast<unsigned long long>(binding.plans.load()),
+                  static_cast<unsigned long long>(binding.used.load()),
+                  static_cast<unsigned long long>(binding.pipelines_used.load()),
+                  static_cast<unsigned long long>(binding.pipeline_abstains.load()),
+                  static_cast<unsigned long long>(binding.pipeline_busy.load()),
+                  static_cast<unsigned long long>(binding.pipeline_fallbacks.load()),
+                  static_cast<unsigned long long>(binding.verify_checks.load()));
+    }
     Require(name, "unmap direct backing",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "draw mapping release failed");
@@ -13737,20 +13749,7 @@ public:
     const char *mode_name = DrawPrep::GetMode() == DrawPrep::Mode::Parallel ? "parallel"
                             : DrawPrep::GetMode() == DrawPrep::Mode::Inline ? "inline"
                                                                             : "off";
-    if (DrawPrep::BindingParts() != 0) {
-      const auto &binding = DrawPrep::GetBindingTotals();
-      std::printf("[gpu]     %-32s ok (draw-prep %s; binding plans %llu, used %llu, pipelines "
-                  "%llu, left %llu, busy %llu, refused %llu, verify checks %llu)\n",
-                  name, mode_name, static_cast<unsigned long long>(binding.plans.load()),
-                  static_cast<unsigned long long>(binding.used.load()),
-                  static_cast<unsigned long long>(binding.pipelines_used.load()),
-                  static_cast<unsigned long long>(binding.pipeline_abstains.load()),
-                  static_cast<unsigned long long>(binding.pipeline_busy.load()),
-                  static_cast<unsigned long long>(binding.pipeline_fallbacks.load()),
-                  static_cast<unsigned long long>(binding.verify_checks.load()));
-    } else {
-      std::printf("[gpu]     %-32s ok (draw-prep %s)\n", name, mode_name);
-    }
+    std::printf("[gpu]     %-32s ok (draw-prep %s)\n", name, mode_name);
   }
 
   // KYTY_EOP_TIMESTAMPS: end-of-pipe clock writes (RELEASE_MEM, data select 3).
