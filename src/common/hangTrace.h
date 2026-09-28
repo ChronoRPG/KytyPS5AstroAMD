@@ -79,6 +79,12 @@
 //                        (KYTY_HANG_TRACE_DRS_PROBE: the eboot.bin offset of its pointer, 0 = off):
 //                        resolution index, level, updates with room to upgrade, target fps,
 //                        scalable and total GPU ms (RecordEopTimestamps).
+//   placement.csv      each second, per thread role (cp, recorder, guest, host): placement samples,
+//                      those on the CP's current physical core, the CP's core, and the samples per
+//                      logical processor 0-31 (lp_other: 32 and up). See common/cpuPlacement.h.
+//
+// summary.csv's last column, pending_ops_max, is the deepest normal-operation queue a draw or
+// dispatch left queued in that second (KYTY_PENDING_OPS_NOWAIT).
 
 #include <array>
 #include <atomic>
@@ -98,6 +104,16 @@ extern std::atomic<int8_t> g_enabled;
 // renderer threads start), empty otherwise.
 extern uint64_t g_cp_watch_begin;
 extern uint64_t g_cp_watch_end;
+// RecordTexture's count of resolved textures, one block per recording thread (written only by
+// that thread; summary.csv tex_resolved sums them). Never freed.
+struct alignas(64) TextureTally {
+	std::atomic<uint64_t> resolved {0};
+	TextureTally*         next = nullptr;
+};
+extern constinit thread_local TextureTally* t_texture_tally;
+[[nodiscard]] TextureTally& AcquireTextureTally() noexcept;
+// A resolved descriptor with the mip-statistics bit (tex_mipstats, texstats.csv).
+void RecordMipStatsTexture(const uint32_t* fields) noexcept;
 } // namespace Detail
 
 // Inlined: checked on hot renderer paths.
@@ -145,8 +161,22 @@ void ArmLodReportWatch(const void* destination, uint32_t size);
 [[nodiscard]] bool HandleLodWatchFault(uint64_t fault_vaddr, bool write, uint64_t pc,
                                        const uint64_t* gpr16, std::string_view thread_name);
 
-// Texture descriptor (8 dwords) resolved for a draw/dispatch.
-void RecordTexture(const uint32_t* fields);
+// Texture descriptor (8 dwords) resolved for a draw/dispatch. Inlined: every resolved texture,
+// ~50k per flip at the Sky Garden start view.
+inline void RecordTexture(const uint32_t* fields) {
+	if (!Enabled()) {
+		return;
+	}
+	auto* tally = Detail::t_texture_tally;
+	if (tally == nullptr) [[unlikely]] {
+		tally = &Detail::AcquireTextureTally();
+	}
+	tally->resolved.store(tally->resolved.load(std::memory_order_relaxed) + 1,
+	                      std::memory_order_relaxed);
+	if (((fields[5] >> 25u) & 1u) != 0) [[unlikely]] {
+		Detail::RecordMipStatsTexture(fields);
+	}
+}
 
 // GPU->CPU readbacks (BufferCache::ReadMemory), attributed to the path that requested them.
 // FaultReadSide / FaultReadDuplicate: a guest read fault served by a side copy (no drain of the
@@ -259,6 +289,14 @@ private:
 void NoteGpuWrite(uint64_t vaddr, uint64_t size);
 // Kind name of the last recorded GPU buffer write to the page holding vaddr ("unknown" if none).
 [[nodiscard]] const char* LastGpuWriteKind(uint64_t vaddr);
+// Tests: what NoteGpuWrite recorded for the page holding vaddr (readbacks.csv reports it).
+struct GpuPageWriter {
+	bool         found = false;
+	uint64_t     t_ms  = 0;
+	uint64_t     size  = 0;
+	GpuWriteKind kind  = GpuWriteKind::ShaderStorage;
+};
+[[nodiscard]] GpuPageWriter PageWriterForTest(uint64_t vaddr);
 
 // Texture-cache image deletion reasons (set around FreeImage calls) and native image churn.
 enum class ImageFreeReason : uint8_t {
@@ -369,6 +407,9 @@ struct EopTimestampFrame {
 	double  drs_total_ms    = 0.0;
 };
 void RecordEopTimestamps(const EopTimestampFrame& frame);
+// KYTY_PENDING_OPS_NOWAIT: the normal-operation queue depth when a draw/dispatch pop left it queued
+// (summary.csv pending_ops_max: the largest per second).
+void NotePendingOperations(uint64_t depth);
 // The load address of a registered guest module (RegisterGuestCode), by file name.
 [[nodiscard]] bool ModuleBase(std::string_view name, uint64_t& base);
 // Copies `size` bytes of guest memory whose host pages are all readable now (never faults on
@@ -404,6 +445,11 @@ struct CompileEvent {
 	// Programs: copy of a kept translation (reused, translate_ns 0) or of a new one being kept.
 	uint64_t         clone_ns = 0;
 	bool             reused   = false;
+	// Programs, persistent program cache (KYTY_PROGRAM_CACHE): key, lookups and decoding
+	// (compiles.csv load_us), and whether the permutation was reloaded instead of emitted
+	// (translate_ns and emit_ns 0; detail "+disk").
+	uint64_t         load_ns   = 0;
+	bool             from_disk = false;
 };
 void RecordCompile(const CompileEvent& event);
 // A draw or dispatch spent stall_ns in the compile paths (new programs and pipelines, including

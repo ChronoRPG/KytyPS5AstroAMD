@@ -45,6 +45,22 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+
+// The DccImageState* cause in the DCC CPU fallback's stderr line.
+const char* DccImageStateName(Profiler::FrameEvent cause) {
+	using Event = Profiler::FrameEvent;
+	switch (cause) {
+		case Event::DccImageStateUnregistered: return "unregistered";
+		case Event::DccImageStateStencil: return "stencil";
+		case Event::DccImageStateMismatch: return "mismatch";
+		case Event::DccImageStateNotGpuModified: return "not-gpu-modified";
+		case Event::DccImageStateBufferModified: return "buffer-modified";
+		case Event::DccImageStateCpuDirty: return "cpu-dirty";
+		case Event::DccImageStatePartial: return "partial";
+		case Event::DccImageStateGpuDirtyBytes: return "gpu-dirty-bytes";
+		default: return "other";
+	}
+}
 // Overlapping aliases (transient render targets sharing a heap) stay registered until unused
 // for this many presented guest frames; see AliasAgeByFrames.
 constexpr uint64_t AliasFramesBeforeRemoval = 4;
@@ -321,6 +337,26 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	     AliasBytesEnabled() ? "ownership follows written bytes, owned bytes reach the buffer before "
 	                           "buffer reads and frees"
 	                         : "off (whole-image ownership)");
+	m_gpu_write_skip  = EnvNotZero("KYTY_GPU_WRITE_IMAGE_SKIP");
+	if (m_gpu_write_skip) {
+		const auto* verify = std::getenv("KYTY_GPU_WRITE_IMAGE_SKIP_VERIFY");
+		if (verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0) {
+			m_gpu_write_skip_verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
+		}
+	}
+	m_lru_touch_skip = EnvNotZero("KYTY_IMAGE_LRU_SKIP");
+	if (const auto* verify = std::getenv("KYTY_IMAGE_LRU_SKIP_VERIFY");
+	    verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0) {
+		m_lru_touch_skip_verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
+	}
+	if (const auto* refresh = std::getenv("KYTY_DCC_GPU_REFRESH");
+	    refresh != nullptr && std::strcmp(refresh, "1") == 0) {
+		m_dcc_gpu_refresh = true;
+		const auto* verify = std::getenv("KYTY_DCC_GPU_REFRESH_VERIFY");
+		if (verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0) {
+			m_dcc_gpu_refresh_verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
+		}
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -842,12 +878,15 @@ void TextureCache::RegisterImage(ImageId id) {
 	                           Coherence::Source::ImageRegister);
 	NoteStructureChange(image);
 	ForEachPage(image.live.address, image.live.size, [this, id](uint64_t page) {
+		// Counted before the image enters the page's owner list, so a lock-free zero count means
+		// FindImagesInRegion finds nothing there (NoImagesOnPages); and before the image can
+		// watch pages (TrackImage follows registration).
+		m_image_page_counts[page].fetch_add(1, std::memory_order_seq_cst);
 		m_image_page_table[page].push_back(id);
-		// Before the image can watch pages (TrackImage follows registration).
-		m_image_page_counts[page].fetch_add(1);
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_tick   = m_lru_cache.TickOf(image.lru_id);
 	m_total_used_memory += image.AccountedSize();
 	m_registered_image_memory += image.AccountedSize();
 	// Registration precedes the first TrackImage, so the tracking mode never changes while
@@ -998,9 +1037,58 @@ void TextureCache::TouchImage(Image& image) {
 		HangTrace::RecordCp(event);
 	}
 	image.frame_accessed_last = m_frame.load(std::memory_order_relaxed);
-	if (image.registered) {
-		m_lru_cache.Touch(image.lru_id, m_gc_tick);
+	if (!image.registered) {
+		return;
 	}
+	const auto bump = [](std::atomic<uint64_t>& counter) {
+		counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+	};
+	// KYTY_IMAGE_LRU_SKIP: Touch returns at once for an item whose tick is not older than
+	// m_gc_tick, and image.lru_tick is that tick (textureCache.h).
+	bool skip = m_lru_touch_skip && image.lru_tick >= m_gc_tick;
+	if (m_lru_touch_skip_verify != 0) [[unlikely]] {
+		if (!LruMirrorHolds(image, skip)) {
+			skip = false; // today's path
+		}
+	}
+	if (skip) {
+		bump(m_lru_touch_totals.skips);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageLruTouchSkips);
+		return;
+	}
+	bump(m_lru_touch_totals.touches);
+	m_lru_cache.Touch(image.lru_id, m_gc_tick);
+	image.lru_tick = m_lru_cache.TickOf(image.lru_id);
+}
+
+bool TextureCache::LruMirrorHolds(Image& image, bool skip) {
+	const auto bump = [](std::atomic<uint64_t>& counter, uint64_t amount = 1) {
+		counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+	};
+	bump(m_lru_touch_totals.verify_checks);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::ImageLruVerifyChecks);
+	const bool linked = m_lru_cache.Linked(image.lru_id);
+	const auto item   = linked ? m_lru_cache.TickOf(image.lru_id) : 0;
+	if (linked && item == image.lru_tick) {
+		return true;
+	}
+	bump(m_lru_touch_totals.verify_mismatches);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::ImageLruVerifyMismatches);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::fprintf(stderr,
+		             "ImageLruVerify: image 0x%016" PRIx64 " size=0x%" PRIx64
+		             " mirror tick %" PRIu64 ", LRU item %zu %s tick %" PRIu64 ", GC tick %" PRIu64
+		             " (%s)\n",
+		             image.info.data.address, image.info.data.size, image.lru_tick, image.lru_id,
+		             linked ? "at" : "unlinked,", item, m_gc_tick,
+		             skip ? "the mirror skipped the touch" : "touched");
+	}
+	if (m_lru_touch_skip_verify == 2) {
+		EXIT("ImageLruVerify: an image's LRU mirror differs from its LRU item\n");
+	}
+	// Repair after the touch (TouchImage copies the item's tick back).
+	return false;
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
@@ -2545,11 +2633,36 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	if (ImageRangeOverlaps(range, desc.info.data)) {
 		return Event::DccFallbackMetadataAliased;
 	}
+	// KYTY_DCC_GPU_REFRESH (textureCache.h): a DCC image that is registered, matches the view and
+	// is fully resident is accepted while waiting for a refresh or not GPU-owned; it is refreshed
+	// right before the inspection, as the CPU fallback's ClearImage refreshes it.
+	const bool refresh_allowed = m_dcc_gpu_refresh && !cmask;
 	const auto eligible = [&]() -> std::optional<Event> {
 		const auto* image = m_slot_images.try_get(id);
-		if (image == nullptr || !image->registered || image->depth_id ||
-		    image->info.data != desc.info.data || image->info.extent != desc.info.extent ||
-		    !SafeToDownload(*image)) {
+		const bool  matches = image != nullptr && image->registered && !image->depth_id &&
+		                     image->info.data == desc.info.data &&
+		                     image->info.extent == desc.info.extent;
+		if (!matches ||
+		    (!SafeToDownload(*image) && !(refresh_allowed && image->FullyResident()))) {
+			// Which condition refused it (DccImageState* counters, MaterializeDccClear). The
+			// pending-refresh states come before "not GPU-modified", which they usually imply.
+			if (image == nullptr || !image->registered) {
+				m_image_state_reason = Event::DccImageStateUnregistered;
+			} else if (image->depth_id) {
+				m_image_state_reason = Event::DccImageStateStencil;
+			} else if (image->info.data != desc.info.data || image->info.extent != desc.info.extent) {
+				m_image_state_reason = Event::DccImageStateMismatch;
+			} else if (image->IsBufferModified()) {
+				m_image_state_reason = Event::DccImageStateBufferModified;
+			} else if (image->IsCpuDirty()) {
+				m_image_state_reason = Event::DccImageStateCpuDirty;
+			} else if (!image->IsGpuModified()) {
+				m_image_state_reason = Event::DccImageStateNotGpuModified;
+			} else if (!image->FullyResident()) {
+				m_image_state_reason = Event::DccImageStatePartial;
+			} else {
+				m_image_state_reason = Event::DccImageStateGpuDirtyBytes;
+			}
 			return Event::DccFallbackImageState;
 		}
 		if (image->backing.extent.width != desc.info.extent.width ||
@@ -2569,9 +2682,36 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		}
 		return std::nullopt;
 	};
+	bool refreshed = false;
 	{
 		std::scoped_lock lock {m_lock};
 		if (const auto reason = eligible()) return *reason;
+		if (refresh_allowed && !SafeToDownload(m_slot_images[id])) {
+			// Before the metadata buffer is acquired: the refresh may create or join the buffer
+			// under the image, which can share a caching page with the metadata.
+			refreshed = true;
+			InitializeImage(id);
+		}
+	}
+	// KYTY_DCC_GPU_REFRESH_VERIFY: today's decision for an image accepted through the refresh,
+	// from the metadata bytes the inspection will read (after a drain, as the CPU fallback).
+	std::vector<uint8_t> verify_bytes;
+	std::vector<uint8_t> verify_clears;
+	if (refreshed && m_dcc_gpu_refresh_verify != 0) {
+		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		verify_bytes.resize(slice_size * count);
+		verify_clears.resize(count);
+		if (!LibKernel::Memory::TryReadBacking(slice_range(0).address, verify_bytes.data(),
+		                                       verify_bytes.size())) {
+			EXIT("TextureCache: failed to read DCC metadata for verification\n");
+		}
+		for (uint32_t slice = 0; slice < count; ++slice) {
+			const auto* bytes = verify_bytes.data() + slice_size * slice;
+			vk::ClearColorValue color {};
+			verify_clears[slice] =
+			    DecodeDccClear(desc, bytes[0], color) &&
+			    std::all_of(bytes, bytes + slice_size, [&](uint8_t byte) { return byte == bytes[0]; });
+		}
 	}
 	// Use the canonical buffer and its normal GPU-write tracking. No CPU shadow of the
 	// clear value is trusted. Acquiring it may upload/submit, so hold no texture lock.
@@ -2585,6 +2725,11 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	std::scoped_lock lock {m_lock};
 	if (const auto reason = eligible()) return *reason;
 	auto& image = m_slot_images[id];
+	if (refresh_allowed && !SafeToDownload(image)) {
+		// Only when something dirtied the image again since the refresh above.
+		refreshed = true;
+		InitializeImage(id);
+	}
 	TrackImage(id);
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("DCC::GpuMaterialize");
@@ -2594,6 +2739,14 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		}
 	}
 	CommitGpuWrite(image);
+	if (refreshed) {
+		m_dcc_refresh_totals.refreshes += count;
+		Profiler::CountFrameEvent(Event::DccGpuRefreshes, count);
+		if (!verify_clears.empty()) {
+			RecordDccRefreshVerify(*buffer, offset + slice_size * first, slice_size,
+			                       std::move(verify_bytes), std::move(verify_clears), range);
+		}
+	}
 	if (!cmask) {
 		m_gpu_dcc_records += count;
 		Profiler::CountFrameEvent(Event::DccGpuRecords, count);
@@ -2626,6 +2779,78 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	                   static_cast<uint32_t>(view.format), static_cast<uint32_t>(desc.type), first,
 	                   count, m_scheduler.CurrentTick());
 	return Event::DccGpuRecords;
+}
+
+void TextureCache::RecordDccRefreshVerify(Buffer& metadata, uint64_t offset, uint64_t slice_size,
+                                          std::vector<uint8_t> before, std::vector<uint8_t> clears,
+                                          GuestRange range) {
+	// Caller holds m_lock, right after the inspection was recorded: copy the inspected slices
+	// out behind it and, once the recording completed, check what the helper did to them against
+	// the CPU fallback's decision. A cleared slice has its key consumed (every byte 0xFF); any
+	// other slice is untouched.
+	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	const auto bytes    = static_cast<uint64_t>(before.size());
+	const auto [mapped, download_offset] = download.Map(bytes, 64);
+	if (mapped == nullptr) {
+		EXIT("TextureCache: DCC refresh verification exceeds the download ring\n");
+	}
+	download.Commit();
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask       = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eMemoryWrite;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = metadata.Handle();
+	barrier.offset              = offset;
+	barrier.size                = bytes;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &barrier, 0,
+	                       nullptr);
+	const vk::BufferCopy copy {offset, download_offset, bytes};
+	native.copyBuffer(metadata.Handle(), download.Handle(), 1, &copy);
+	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	barrier.buffer        = download.Handle();
+	barrier.offset        = download_offset;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                       {}, 0, nullptr, 1, &barrier, 0, nullptr);
+	m_scheduler.DeferOperation([this, &download, mapped = mapped, download_offset = download_offset,
+	                            bytes, slice_size, before = std::move(before),
+	                            clears = std::move(clears), range] {
+		download.Invalidate(download_offset, bytes);
+		const auto* after = mapped;
+		uint32_t    wrong = 0;
+		for (size_t slice = 0; slice < clears.size(); ++slice) {
+			const auto* now  = after + slice_size * slice;
+			const auto* then = before.data() + slice_size * slice;
+			const bool  ok   = clears[slice] != 0
+			                       ? std::all_of(now, now + slice_size,
+			                                     [](uint8_t byte) { return byte == 0xffu; })
+			                       : std::memcmp(now, then, slice_size) == 0;
+			wrong += ok ? 0u : 1u;
+		}
+		m_dcc_refresh_totals.verify_checks++;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DccGpuRefreshVerifyChecks);
+		if (wrong == 0) {
+			return;
+		}
+		m_dcc_refresh_totals.verify_mismatches += wrong;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DccGpuRefreshVerifyMismatches, wrong);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::fprintf(stderr,
+			             "DccGpuRefreshVerify: %u slice(s) of metadata 0x%016" PRIx64
+			             " size=0x%" PRIx64 " differ from the CPU fallback's decision\n",
+			             wrong, range.address, range.size);
+		}
+		if (m_dcc_gpu_refresh_verify == 2) {
+			EXIT("DccGpuRefreshVerify: a refreshed image's inspection differs from the CPU "
+			     "fallback\n");
+		}
+	});
 }
 
 void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
@@ -2673,6 +2898,8 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	uint64_t diagnostic_readback = 0;
+	// Why this decision is not a provable no-op (instrumentation; the paths below refine it).
+	m_dcc_noop_refusal = Profiler::FrameEvent::TargetRecordDccGuest;
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
 		// The guest's DCC fast clear is a uniform fill of the metadata. When the whole range still
 		// holds a recorded fill (nothing wrote it since), every slice's code is that byte: no
@@ -2699,9 +2926,12 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 					decided.gpu_range_count = 1;
 					decided.provable        = true;
 					*noop                   = decided;
+				} else {
+					m_dcc_noop_refusal = Profiler::FrameEvent::TargetRecordDccPages;
 				}
 				return; // e.g. 0xFF: not a clear code, nothing to materialize
 			}
+			m_dcc_noop_refusal    = Profiler::FrameEvent::TargetRecordDccClear;
 			const auto slice_size = range.size / layers;
 			for (uint32_t slice = 0; slice < count; slice++) {
 				{
@@ -2722,10 +2952,30 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			const auto outcome = TryMaterializeGpuDccClear(id, desc, metadata_base_layer);
 			const bool native  = outcome == Profiler::FrameEvent::DccGpuRecords ||
 			                    outcome == Profiler::FrameEvent::DccGpuReuses;
+			m_dcc_noop_refusal = native ? Profiler::FrameEvent::TargetRecordDccNative
+			                            : Profiler::FrameEvent::TargetRecordDccFallback;
 			if (!native) {
 				++m_gpu_dcc_fallbacks;
 				Profiler::CountFrameEvent(Profiler::FrameEvent::DccCpuFallbacks);
 				Profiler::CountFrameEvent(outcome);
+				if (outcome == Profiler::FrameEvent::DccFallbackImageState) {
+					Profiler::CountFrameEvent(m_image_state_reason);
+					// The first few of every cause, also in release builds (LOGF may be off).
+					static std::array<std::atomic<uint32_t>,
+					                  static_cast<size_t>(Profiler::FrameEvent::Count)>
+					    cause_logged {};
+					if (cause_logged[static_cast<size_t>(m_image_state_reason)].fetch_add(
+					        1, std::memory_order_relaxed) < 4) {
+						std::fprintf(stderr,
+						             "DCC CPU fallback, image state cause %s: metadata=0x%016" PRIx64
+						             " bytes=%" PRIu64 " data=0x%016" PRIx64 " size=0x%" PRIx64
+						             " extent=%ux%u type=%u\n",
+						             DccImageStateName(m_image_state_reason), range.address,
+						             range.size, desc.info.data.address, desc.info.data.size,
+						             desc.info.extent.width, desc.info.extent.height,
+						             static_cast<uint32_t>(desc.type));
+					}
+				}
 				// The first few fallbacks of every reason, with what decided it.
 				static std::array<std::atomic<uint32_t>, static_cast<size_t>(
 				                                             Profiler::FrameEvent::Count)>
@@ -3002,7 +3252,11 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		m_buffer_cache.FillBuffer(metadata.address, metadata.size, UINT32_MAX, false);
 		Profiler::CountFrameEvent(Event::CmaskFastClears);
 	}
-	if (std::ranges::find(native, uint8_t {1}) == native.end()) {
+	// Why this decision is not a provable no-op, when it is not (instrumentation).
+	const bool any_native = std::ranges::find(native, uint8_t {1}) != native.end();
+	m_cmask_noop_refusal  = any_native ? Profiler::FrameEvent::TargetRecordCmaskNative
+	                                   : Profiler::FrameEvent::TargetRecordCmaskOther;
+	if (!any_native) {
 		if (provable) {
 			decided.provable = true;
 			*noop            = decided;
@@ -3153,6 +3407,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
+	// Instrumentation: why a record did not become valid before the metadata decisions.
+	auto lookup_refusal = Profiler::FrameEvent::TargetRecordNotFirstPage;
 	{
 		std::scoped_lock lock {m_lock};
 		ImageIds candidates;
@@ -3269,6 +3525,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 			record->exact_format    = exact_format;
 			record->has_partner     = HasAliasPartner(pages.first, result, image);
 			record->valid           = true;
+		} else if (first_page_answer) {
+			lookup_refusal = Profiler::FrameEvent::TargetRecordChanged;
 		}
 	}
 	const bool recording = record != nullptr && record->valid;
@@ -3276,6 +3534,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 	MaterializeCmaskClear(result, desc, metadata_base_layer, recording ? &record->cmask : nullptr);
 	if (recording) {
 		record->valid = record->dcc.provable && record->cmask.provable;
+		if (!record->valid) {
+			Profiler::CountFrameEvent(!record->dcc.provable ? m_dcc_noop_refusal
+			                                                : m_cmask_noop_refusal);
+		}
+	} else if (record != nullptr) {
+		Profiler::CountFrameEvent(lookup_refusal);
 	}
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
@@ -4432,6 +4696,10 @@ void BufferCache::PreserveImagesForGpuWrite(BufferId id, uint64_t vaddr, uint64_
 	if (!ImageWritebackOnGpuWriteEnabled()) {
 		return;
 	}
+	// KYTY_GPU_WRITE_IMAGE_SKIP: no registered image whose contents could move into the buffer.
+	if (m_texture_cache.SkipGpuWriteImageWalk(vaddr, size)) {
+		return;
+	}
 	struct Candidate {
 		ImageId    id;
 		GuestRange range;
@@ -4575,6 +4843,58 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	return true;
 }
 
+bool TextureCache::NoImagesOnPages(uint64_t address, uint64_t size) const noexcept {
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+		return true; // FindImagesInRegion finds nothing there either
+	}
+	for (auto page = pages.first; page < pages.last_exclusive; ++page) {
+		if (m_image_page_counts[page].load(std::memory_order_seq_cst) != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool TextureCache::SkipGpuWriteImageWalk(uint64_t address, uint64_t size) {
+	if (!m_gpu_write_skip || !NoImagesOnPages(address, size)) {
+		return false;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuWriteImageSkips);
+	m_gpu_write_skip_totals.skips.fetch_add(1, std::memory_order_relaxed);
+	if (m_gpu_write_skip_verify == 0) {
+		return true;
+	}
+	std::scoped_lock lock {m_lock};
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuWriteImageSkipVerifyChecks);
+	m_gpu_write_skip_totals.verify_checks.fetch_add(1, std::memory_order_relaxed);
+	if (FindImagesInRegion(address, size, true).empty()) {
+		return false;
+	}
+	// Under m_lock a findable image's pages are counted: uncounted pages here are a broken
+	// ordering, counted ones an image registered after the lock-free decision.
+	if (!NoImagesOnPages(address, size)) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::GpuWriteImageSkipVerifyRaces);
+		m_gpu_write_skip_totals.verify_races.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::GpuWriteImageSkipVerifyMismatches);
+	m_gpu_write_skip_totals.verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::fprintf(stderr,
+		             "GpuWriteImageSkipVerify: an image over uncounted pages: addr=0x%016" PRIx64
+		             " size=0x%" PRIx64 "\n",
+		             address, size);
+	}
+	if (m_gpu_write_skip_verify == 2) {
+		EXIT("GpuWriteImageSkipVerify: an image over uncounted pages: addr=0x%016" PRIx64
+		     " size=0x%" PRIx64 "\n",
+		     address, size);
+	}
+	return false;
+}
+
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
@@ -4585,6 +4905,10 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		event.address = address;
 		event.size    = size;
 		HangTrace::RecordCp(event);
+	}
+	// KYTY_GPU_WRITE_IMAGE_SKIP: no registered image to take ownership from.
+	if (SkipGpuWriteImageWalk(address, size)) {
+		return;
 	}
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, true)) {

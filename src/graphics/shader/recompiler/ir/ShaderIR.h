@@ -618,6 +618,9 @@ struct CompiledShaderInfo {
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
 	WriteRangeProgram             write_ranges;
+
+	// Every member (the persistent program cache's verify mode compares whole objects).
+	bool operator==(const CompiledShaderInfo& other) const = default;
 };
 
 struct UniformFillPlan {
@@ -781,7 +784,9 @@ bool        HasShaderMemoryWrites(const Program& program);
 // Deep copy of a translated program (ir/ProgramClone.cpp); false when `source` references an
 // instruction or block it does not own. The pipeline cache specializes such copies instead of
 // translating a program source again (KYTY_TRANSLATION_CACHE). Adding a member to Program,
-// ResourcePlan, Block or Inst requires updating CloneProgram (its layout checks enforce it).
+// ResourcePlan, Block or Inst requires updating CloneProgram (its layout checks enforce it), and
+// adding one to ResourcePlan, Inst, CompiledShaderInfo or a type they contain requires updating
+// ir/ProgramCodec.cpp (the persistent program cache's encoding; its layout checks enforce it).
 [[nodiscard]] bool CloneProgram(const Program& source, Program& target);
 
 void  ValidateProgram(const Program& program, bool require_ssa);

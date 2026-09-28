@@ -19,6 +19,10 @@ namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
 
+namespace DrawPrep {
+struct StagePlan;
+} // namespace DrawPrep
+
 struct TextureBinding {
 	ImageId                    image_id;
 	vk::ImageView              image_view = nullptr;
@@ -74,7 +78,30 @@ struct PreparedBindings {
 	// RebindBuffers: flattened_srt or shader_data_buffer was allocated for this binding (not a
 	// reused upload of the same recording), so no earlier descriptor set refers to it.
 	bool                                  fresh_upload = false;
+	// KYTY_DRAW_PREP_BINDINGS: the committed draw's plan for this stage (set by PrepareBindings,
+	// null for dispatches and draws without a plan), and whether shader_data is the plan's
+	// (user dwords and mip-statistics fields filled in, memory offsets zero).
+	DrawPrep::StagePlan*                  plan             = nullptr;
+	bool                                  plan_shader_data = false;
 };
+
+// NoteBufferOutOfBoundsMode's combination of a V# (OOB_SELECT, stride, swizzle, ADD_TID): the bit
+// index it logs once per run.
+[[nodiscard]] uint32_t BufferOutOfBoundsCombination(const ShaderBufferResource& descriptor);
+// The final sampler dwords of a program's sampler binding (depth-compare bits cleared unless the
+// shader compares, point filtering forced where the shader needs it): the SamplerCache key.
+[[nodiscard]] ShaderSamplerResource
+NativeSamplerDescriptor(const ShaderRecompiler::IR::CompiledShaderInfo& program, uint32_t index,
+                        const ShaderRecompiler::IR::DescriptorValue& value);
+// The user-data dwords of a stage's shader data (PrepareBindings), appended to `shader_data`.
+void AppendUserShaderData(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                          const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
+                          std::vector<uint32_t>&                          shader_data);
+// The GET_LOD_STATS field of every instrumented image (RebindBuffers), written into the
+// shader data; true when some image has a mip-statistics counter.
+bool WriteMipStatsFields(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                         const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
+                         std::vector<uint32_t>&                          shader_data);
 
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);

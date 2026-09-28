@@ -55,18 +55,26 @@ public:
 	ScopedBlock& operator=(const ScopedBlock&) = delete;
 	ScopedBlock(ScopedBlock&&)                 = delete;
 	ScopedBlock& operator=(ScopedBlock&&)      = delete;
+	// Always inlined: one flag test per scope (with zones off it is the whole cost).
+#if defined(__clang__) || defined(__GNUC__)
+	__attribute__((always_inline))
+#endif
 	~ScopedBlock() {
-		if (m_zone.has_value()) [[unlikely]] {
+		if (m_active) [[unlikely]] {
 			End();
 		}
 	}
 
-	void End();
+	void End() noexcept;
 
 private:
 	void Begin(const tracy::SourceLocationData* source_location);
 
-	std::optional<tracy::ScopedZone> m_zone;
+	// The zone, constructed in place by Begin while zones are on. Not a std::optional: its
+	// destructor would inline Tracy's zone-end code into every scope, so compilers kept this
+	// destructor out of line (a call per scope with zones off).
+	alignas(tracy::ScopedZone) unsigned char m_zone[sizeof(tracy::ScopedZone)];
+	bool m_active = false;
 };
 
 void EndBlock();
@@ -603,6 +611,12 @@ enum class FrameEvent : uint32_t {
 	// KYTY_TRANSLATION_CACHE_VERIFY found different from a fresh one.
 	TranslationReuses,
 	TranslationVerifyMismatches,
+	// Persistent program cache (KYTY_PROGRAM_CACHE): permutations reloaded from disk instead of
+	// translated and emitted, permutations emitted with the cache on (not stored), and
+	// KYTY_PROGRAM_CACHE_VERIFY comparisons that found a stored record different.
+	ProgramDiskHits,
+	ProgramDiskMisses,
+	ProgramDiskVerifyMismatches,
 	// Graphics pipeline libraries (KYTY_PIPELINE_LIBRARY): pipelines fast-linked from libraries,
 	// monolithic pipelines found in the driver cache instead, and libraries created.
 	PipelineLibraryLinks,
@@ -948,6 +962,37 @@ enum class FrameEvent : uint32_t {
 	// KYTY_DRAW_PREP_STEAL: slots the command processor prepared, as a worker would, while a worker
 	// held the head it had to commit (FrameWait DrawPrepSteal is their time).
 	DrawPrepSteals,
+	// KYTY_DRAW_PREP_BINDINGS (drawPrep/bindingPlan.h): binding plans computed by the preparing
+	// threads; plans the command processor used (DrawPrep::Validate accepted the slot's
+	// preparation) or dropped (a fallback, or a draw that returned before its programs); items a
+	// preparing thread left to the command processor: a V# or vertex range its clamp would change,
+	// a sampler not created yet, a pipeline not created yet (or a key the serial path refuses), the
+	// pipeline cache busy (its lock taken); plan items not used at commit because the guest virtual
+	// ranges changed or the pipeline's certificate failed (targets, topology, restart, generation);
+	// pipelines taken from plans; verify mode's comparisons and differences.
+	DrawPrepBindingPlans,
+	DrawPrepBindingPlansUsed,
+	DrawPrepBindingPlansDropped,
+	DrawPrepBindingAbstainRanges,
+	DrawPrepBindingAbstainSamplers,
+	DrawPrepBindingAbstainPipeline,
+	DrawPrepBindingAbstainPipelineBusy,
+	DrawPrepBindingFallbackVm,
+	DrawPrepBindingFallbackPipeline,
+	DrawPrepBindingPipelinesUsed,
+	DrawPrepBindingVerifyChecks,
+	DrawPrepBindingVerifyMismatches,
+	// KYTY_DESCRIPTOR_OFFSET_AUDIT=1 (P4b-D0, descriptors.cpp): descriptor sets written and push
+	// updates, how many repeat the previous one or any earlier one of the same command buffer
+	// with the per-draw buffer descriptors' offsets ignored (the reuse potential of dynamic
+	// offsets), and how many have more per-draw buffer descriptors than the dynamic limit.
+	DescriptorOffsetAuditSets,
+	DescriptorOffsetAuditSetRepeatsPrevious,
+	DescriptorOffsetAuditSetRepeatsAny,
+	DescriptorOffsetAuditPushes,
+	DescriptorOffsetAuditPushRepeatsPrevious,
+	DescriptorOffsetAuditPushRepeatsAny,
+	DescriptorOffsetAuditOverLimit,
 	// KYTY_EOP_TIMESTAMPS=gpu: guest clock writes rewritten with GPU times, left alone because the
 	// guest had written the slot again, kept at record time (no query slot, result or calibration),
 	// and given GPU times through deferred label writes; gpu-verify checks and mismatches.
@@ -984,10 +1029,104 @@ enum class FrameEvent : uint32_t {
 	WrittenSyncSkips,
 	WrittenSyncSkipVerifyChecks,
 	WrittenSyncSkipVerifyMismatches,
+	// KYTY_PENDING_OPS_NOWAIT: draw/dispatch pops that left completed operations queued because
+	// the priority runner had not finished their tick, and the queue depth summed over them.
+	PendingOpsDeferred,
+	PendingOpsDeferredDepth,
+	// KYTY_PRIORITY_WAIT_SPIN_US: WaitPriorityOperations spins, and spins that saw the wait end.
+	PriorityWaitSpins,
+	PriorityWaitSpinHits,
+	// Placement samples (cpuPlacement.h): the CP, and off its reserved core; guest threads, and on
+	// the physical core of the CP's latest sample; draw-prep workers and service threads, and on
+	// that core; the recorder off its reserved core (cp+recorder). Threads found with a hard affinity
+	// other than the process's, those confined to reserved cores, and those moved to the general
+	// processors (KYTY_CPU_RESERVE_REPIN), each thread counted once.
+	CpuPlacementCpSamples,
+	CpuPlacementCpOffCore,
+	CpuPlacementGuestSamples,
+	CpuPlacementGuestOnCpCore,
+	CpuPlacementHostSamples,
+	CpuPlacementHostOnCpCore,
+	CpuPlacementRecorderOffCore,
+	CpuPlacementHardAffinity,
+	CpuPlacementHardAffinityReserved,
+	CpuPlacementRepinned,
+	// KYTY_FALSE_SHARING_WRITES (BufferCache::TryFalseSharingWrite): write faults that released a
+	// GPU-owned page without draining the GPU, the GPU-owned bytes left to their publication,
+	// uploads that skipped such bytes, and the verify mode (CPU writes to them before publication).
+	FalseSharingWrites,
+	FalseSharingBytes,
+	FalseSharingUploadSplits,
+	FalseSharingVerifyChecks,
+	FalseSharingVerifyConflicts,
+	// KYTY_GPU_WRITE_IMAGE_SKIP (TextureCache::SkipGpuWriteImageWalk): GPU buffer writes whose
+	// image checks found no registered image without the texture-cache lock, and the verify mode.
+	GpuWriteImageSkips,
+	GpuWriteImageSkipVerifyChecks,
+	GpuWriteImageSkipVerifyRaces,
+	GpuWriteImageSkipVerifyMismatches,
+	// DccFallbackImageState by cause (TextureCache::TryMaterializeGpuMetadataClear refused the GPU
+	// inspection of a DCC slice's image), checked in this order: the image is not registered, has a
+	// stencil association, does not match the view's description, or is not safe to download
+	// because it is buffer-modified, CPU-dirty, not GPU-modified, partially resident, or has
+	// GPU-dirty buffer bytes. (Enumerated in declaration order below, which differs.)
+	DccImageStateUnregistered,
+	DccImageStateStencil,
+	DccImageStateMismatch,
+	DccImageStateNotGpuModified,
+	DccImageStateBufferModified,
+	DccImageStateCpuDirty,
+	DccImageStatePartial,
+	DccImageStateGpuDirtyBytes,
+	// ReadbackSideFallbackOther by cause (BufferCache::TryIssueSideReadback): no registered owner,
+	// unaligned window, read larger than the side-copy window, a pending backing publication, no
+	// GPU-dirty bytes in the window, no free side-copy slot.
+	ReadbackSideOtherOwner,
+	ReadbackSideOtherAlignment,
+	ReadbackSideOtherWindow,
+	ReadbackSideOtherPublication,
+	ReadbackSideOtherNoDirty,
+	ReadbackSideOtherSlot,
+	// KYTY_DCC_GPU_REFRESH (TextureCache::TryMaterializeGpuMetadataClear): DCC slices inspected on
+	// the GPU for an image refreshed first instead of the CPU fallback, and the verify mode.
+	DccGpuRefreshes,
+	DccGpuRefreshVerifyChecks,
+	DccGpuRefreshVerifyMismatches,
 	// KYTY_DRAW_PREP_CERT_RANGES_VERIFY (drawPrep.cpp): certificate ranges built by the preparing
 	// thread compared at commit with the commit-time list, and the differences.
 	DrawPrepCertRangesVerifyChecks,
 	DrawPrepCertRangesVerifyMismatches,
+	// KYTY_IMAGE_LRU_SKIP (TextureCache::TouchImage): LRU touches skipped because the image was
+	// touched in the current GC tick already, and the verify mode's mirror checks.
+	ImageLruTouchSkips,
+	ImageLruVerifyChecks,
+	ImageLruVerifyMismatches,
+	// KYTY_IMAGE_TRANSIT_SKIP (Image::Transit): transitions that return before GetBarriers
+	// because nothing would change, and the verify mode's checks of that decision.
+	ImageTransitSkips,
+	ImageTransitVerifyChecks,
+	ImageTransitVerifyMismatches,
+	// KYTY_DRAW_SEQUENCE_FAST target records (TextureCache::FindImage) that end invalid, so the
+	// next lookup of the target is a full FindImage, by the first reason (lookups of a null image,
+	// which cost nothing, are not counted):
+	//   NotFirstPage - the image did not come from the first-page lookup (overlap or new image);
+	//   Changed      - the first-page answer changed during the lookup (residency, alias sync),
+	//                  or the image is unregistered or a video-out surface;
+	//   Dcc*         - the DCC decision was not a provable no-op: a recorded-fill clear was applied
+	//                  (Clear), the native inspection (Native) or the readback (Fallback) decided
+	//                  GPU-owned bytes, guest bytes decided (Guest), or the metadata pages could not
+	//                  be captured (Pages);
+	//   Cmask*       - the CMASK decision: GPU-owned bytes without a recorded fill (Native), or any
+	//                  other non-provable decision (guest bytes, a clear, fills).
+	TargetRecordNotFirstPage,
+	TargetRecordChanged,
+	TargetRecordDccClear,
+	TargetRecordDccNative,
+	TargetRecordDccFallback,
+	TargetRecordDccGuest,
+	TargetRecordDccPages,
+	TargetRecordCmaskNative,
+	TargetRecordCmaskOther,
 	// KYTY_CP_SEQ (cpOps.h): ops handed from the front to the back through the op ring;
 	// KYTY_CP_SEQ_VERIFY: ops compared with the reference front, ops or stream ends that
 	// differed, and front reads whose bytes differed from the serial read.
@@ -1087,6 +1226,8 @@ enum class FrameWait : uint32_t {
 	ShaderEmit,
 	ShaderValidate,
 	ShaderModuleCreate,
+	// Persistent program cache: key, lookups and decoding of stored plans and permutations.
+	ShaderDiskLoad,
 	// vkCreateGraphicsPipelines alone (nested in GraphicsPipelineCreate), and a whole new compute
 	// pipeline (layouts and vkCreateComputePipelines).
 	GraphicsPipelineDriver,
@@ -1101,6 +1242,20 @@ enum class FrameWait : uint32_t {
 	// KYTY_DRAW_PREP_STEAL: command-processor time preparing stolen slots while a worker held the
 	// head (DrawPrepCommitWait is then only the idle spin after nothing was left to claim).
 	DrawPrepSteal,
+	// KYTY_DRAW_PREP_BINDINGS: binding-plan time on the preparing threads (inside the worker times
+	// below, or DrawPrepSteal on the command processor).
+	DrawPrepBindingPlan,
+	// Draw-prep worker load: the busy time of DrawPrep#k (preparation, repeat-trace hashes and
+	// binding plan of each slot it claimed; calls = slots). Workers past the eighth add to
+	// DrawPrepWorker8. Idle time is the flip interval minus this.
+	DrawPrepWorker1,
+	DrawPrepWorker2,
+	DrawPrepWorker3,
+	DrawPrepWorker4,
+	DrawPrepWorker5,
+	DrawPrepWorker6,
+	DrawPrepWorker7,
+	DrawPrepWorker8,
 	// KYTY_EOP_TIMESTAMPS=gpu: command-processor time reading completed timestamp queries and
 	// rewriting the guest slots (one call per publication).
 	EopTimestampPublish,
@@ -1144,7 +1299,9 @@ struct alignas(64) ThreadCounters {
 	std::atomic<bool>                                    in_use {false};
 	ThreadCounters*                                      next = nullptr; // registry, immutable
 };
-extern thread_local ThreadCounters* t_counters;
+// constinit: other translation units read it directly, without the thread-local initialization
+// guard an extern thread_local otherwise needs (which kept CurrentThreadCounters out of line).
+extern constinit thread_local ThreadCounters* t_counters;
 // Registers the calling thread's block (reusing a released one) and sets t_counters.
 [[nodiscard]] ThreadCounters& AcquireThreadCounters() noexcept;
 [[nodiscard]] inline ThreadCounters& CurrentThreadCounters() noexcept {

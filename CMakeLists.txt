@@ -394,6 +394,48 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${gpu_mesh_indirect_header}")
 
+# Persistent program cache (KYTY_PROGRAM_CACHE, pipeline/programDiskCache.h): the codegen version
+# (recompiler/CodegenFingerprint.h) hashes these files, the code that determines what translating
+# a program produces. src/codegen_version.cmake fails the build when one of them includes a
+# project header outside this set (unless the script exempts it).
+file(GLOB_RECURSE kyty_codegen_sources CONFIGURE_DEPENDS
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.inc"
+)
+list(APPEND kyty_codegen_sources
+	"${KYTY_SOURCE_DIR}/graphics/shader/shader.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderBindings.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderBindings.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderCompiler.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStaticKey.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_defs.h"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.h"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.h"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/programDiskCache.cpp"
+)
+list(SORT kyty_codegen_sources)
+string(REPLACE ";" "\n" kyty_codegen_source_lines "${kyty_codegen_sources}")
+file(CONFIGURE OUTPUT "${PROJECT_BINARY_DIR}/kytyCodegenSources.txt"
+	CONTENT "${kyty_codegen_source_lines}\n")
+set(kyty_codegen_header "${PROJECT_BINARY_DIR}/kytyCodegenVersion.h")
+add_custom_command(
+	OUTPUT "${kyty_codegen_header}"
+	COMMAND ${CMAKE_COMMAND}
+	        "-DSOURCE_ROOT=${KYTY_SOURCE_DIR}"
+	        "-DFILE_LIST=${PROJECT_BINARY_DIR}/kytyCodegenSources.txt"
+	        "-DOUTPUT_FILE=${kyty_codegen_header}"
+	        "-DCOMPILER=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_BUILD_TYPE} ${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELEASE}"
+	        -P "${KYTY_SOURCE_DIR}/codegen_version.cmake"
+	DEPENDS ${kyty_codegen_sources} "${PROJECT_BINARY_DIR}/kytyCodegenSources.txt"
+	        "${KYTY_SOURCE_DIR}/codegen_version.cmake"
+	COMMENT "Generate kytyCodegenVersion.h"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${kyty_codegen_header}")
+
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
@@ -493,6 +535,17 @@ target_link_libraries(profiler_counter_tests common)
 target_include_directories(profiler_counter_tests PRIVATE ${inc_headers})
 if(LINUX)
 	target_link_libraries(profiler_counter_tests Threads::Threads)
+endif()
+
+# KYTY_CPU_RESERVE (common/cpuPlacement.h): layout choice, live placement on this machine (Windows),
+# and --bench (off against cp in child processes).
+add_executable(cpu_placement_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CpuPlacementTests.cpp"
+)
+target_link_libraries(cpu_placement_tests common)
+target_include_directories(cpu_placement_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(cpu_placement_tests Threads::Threads)
 endif()
 
 add_executable(lod_stats_report_tests EXCLUDE_FROM_ALL
@@ -741,6 +794,8 @@ if(BUILD_TESTING)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME profiler_counters COMMAND $<TARGET_FILE:profiler_counter_tests>)
+	add_test(NAME cpu_placement COMMAND $<TARGET_FILE:cpu_placement_tests>)
+	add_test(NAME cpu_placement_recorder COMMAND $<TARGET_FILE:cpu_placement_tests> --mode cp+recorder)
 	add_test(NAME lod_stats_report COMMAND $<TARGET_FILE:lod_stats_report_tests>)
 	add_test(NAME game_patch_filter COMMAND $<TARGET_FILE:game_patch_filter_tests>)
 	add_test(NAME lod_stats_codegen
@@ -781,6 +836,18 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
+	# Draw-path pops that wait for the priority runner again, and the runner wait's spin.
+	add_test(NAME command_scheduler_ready_ops_wait
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
+	set_tests_properties(command_scheduler_ready_ops_wait PROPERTIES
+		ENVIRONMENT "KYTY_PENDING_OPS_NOWAIT=0")
+	# KYTY_GPU_OP_PROFILE_STAMPS: a per-op capture and a pass-stamp capture of the same work.
+	add_test(NAME gpu_op_profiler_stamps
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-op-profile-only)
+	add_test(NAME command_scheduler_priority_spin
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
+	set_tests_properties(command_scheduler_priority_spin PROPERTIES
+		ENVIRONMENT "KYTY_PRIORITY_WAIT_SPIN_US=500")
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane
@@ -893,6 +960,63 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --written-sync-skip-only)
 	set_tests_properties(written_sync_skip_off PROPERTIES
 		ENVIRONMENT "KYTY_WRITTEN_SYNC_SKIP=0")
+	# KYTY_FALSE_SHARING_WRITES: off (default), on, on with the verify mode.
+	add_test(NAME false_sharing_writes_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --false-sharing-writes-only)
+	add_test(NAME false_sharing_writes
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --false-sharing-writes-only)
+	set_tests_properties(false_sharing_writes PROPERTIES
+		ENVIRONMENT "KYTY_FALSE_SHARING_WRITES=1")
+	add_test(NAME false_sharing_writes_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --false-sharing-writes-only)
+	set_tests_properties(false_sharing_writes_verify PROPERTIES
+		ENVIRONMENT "KYTY_FALSE_SHARING_WRITES=1;KYTY_FALSE_SHARING_WRITES_VERIFY=1")
+	# KYTY_UPLOAD_DEDUP_TABLE: off (default, the site's last upload only) and on.
+	add_test(NAME shader_upload_dedup
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shader-upload-dedup-only)
+	add_test(NAME shader_upload_dedup_table
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shader-upload-dedup-only)
+	set_tests_properties(shader_upload_dedup_table PROPERTIES
+		ENVIRONMENT "KYTY_UPLOAD_DEDUP_TABLE=1")
+	# KYTY_GPU_WRITE_IMAGE_SKIP: default, verify mode (stops on a mismatch), off.
+	add_test(NAME gpu_write_image_skip
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-write-image-skip-only)
+	add_test(NAME gpu_write_image_skip_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-write-image-skip-only)
+	set_tests_properties(gpu_write_image_skip_verify PROPERTIES
+		ENVIRONMENT "KYTY_GPU_WRITE_IMAGE_SKIP_VERIFY=exit")
+	add_test(NAME gpu_write_image_skip_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-write-image-skip-only)
+	set_tests_properties(gpu_write_image_skip_off PROPERTIES
+		ENVIRONMENT "KYTY_GPU_WRITE_IMAGE_SKIP=0")
+	# KYTY_DCC_GPU_REFRESH: the refreshed native inspection (with its verify mode) against the
+	# CPU fallback, for a buffer-modified and a CPU-dirty image (the check sets the switches).
+	add_test(NAME dcc_gpu_refresh
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dcc-gpu-refresh-only)
+	# KYTY_IMAGE_LRU_SKIP: the same LRU order with the touch skip on and off, its verify mode on
+	# every decision, and the switch.
+	add_test(NAME image_lru_skip
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-lru-skip-only)
+	add_test(NAME image_lru_skip_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-lru-skip-only)
+	set_tests_properties(image_lru_skip_verify PROPERTIES
+		ENVIRONMENT "KYTY_IMAGE_LRU_SKIP_VERIFY=exit")
+	add_test(NAME image_lru_skip_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-lru-skip-only)
+	set_tests_properties(image_lru_skip_off PROPERTIES
+		ENVIRONMENT "KYTY_IMAGE_LRU_SKIP=0")
+	# KYTY_IMAGE_TRANSIT_SKIP: the no-op pre-check against GetBarriers, and Transit's skips (or
+	# verify checks).
+	add_test(NAME image_transit_skip
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-transit-skip-only)
+	add_test(NAME image_transit_skip_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-transit-skip-only)
+	set_tests_properties(image_transit_skip_verify PROPERTIES
+		ENVIRONMENT "KYTY_IMAGE_TRANSIT_SKIP_VERIFY=exit")
+	add_test(NAME image_transit_skip_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-transit-skip-only)
+	set_tests_properties(image_transit_skip_off PROPERTIES
+		ENVIRONMENT "KYTY_IMAGE_TRANSIT_SKIP=0")
 	# Tracker-gap detectors: the page states they classify host writes by.
 	add_test(NAME tracker_gap_detectors
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tracker-gap-detectors-only)
@@ -1006,6 +1130,42 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_copied PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE=0;KYTY_DRAW_PREP_LOCKFREE_HINT=0")
+	# KYTY_DRAW_PREP_BINDINGS (P4b): binding plans with every item compared (inline: plans computed
+	# on the command processor, counted exactly; parallel, and parallel with one stealing worker),
+	# plans used as they are, and the whole compute/renderer suite under the verify mode.
+	add_test(NAME draw_prep_engine_inline_bindings_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_inline_bindings_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit")
+	add_test(NAME draw_prep_engine_inline_bindings
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_inline_bindings PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=1")
+	add_test(NAME draw_prep_engine_parallel_bindings_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_bindings_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit")
+	add_test(NAME draw_prep_engine_parallel_bindings
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_bindings PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=1")
+	add_test(NAME draw_prep_engine_parallel_steal_bindings_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_steal_bindings_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_STEAL=1;KYTY_DRAW_PREP_WORKERS=1;KYTY_DRAW_PREP_HOT=1;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit")
+	add_test(NAME draw_prep_engine_inline_bindings_parts
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_inline_bindings_parts PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=buffers,userdata,samplers,textures;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit")
+	add_test(NAME shader_recompiler_compute_bindings_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(shader_recompiler_compute_bindings_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit")
+	# KYTY_DESCRIPTOR_OFFSET_AUDIT (P4b-D0, a measurement): the whole suite with the audit's digests.
+	add_test(NAME shader_recompiler_compute_offset_audit
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(shader_recompiler_compute_offset_audit PROPERTIES
+		ENVIRONMENT "KYTY_DESCRIPTOR_OFFSET_AUDIT=1;KYTY_DESCRIPTOR_SET_REUSE_AUDIT=1")
 	# KYTY_DRAW_PREP_STEAL (off by default): the command processor stealing whenever a slot waits,
 	# with six workers and with a single one (a held head with unclaimed slots behind it, where it
 	# steals most).
@@ -1190,6 +1350,40 @@ if(BUILD_TESTING)
 	# KYTY_SRT_VARIANT_READS: loop-variant scalar reads and runtime S_BUFFER_LOAD V#s through BDA.
 	add_test(NAME srt_variant_reads
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srt-variant-only)
+	# KYTY_PROGRAM_CACHE (pipeline/programDiskCache.h): source keys, codegen fingerprint and cache
+	# file (truncation, corruption, identity, verification); programs reloaded from the file
+	# render what translated ones render, with and without verify mode; and the renderer suites
+	# with the cache on and every reloaded program compared with a fresh translation (the files
+	# stay in the build directory, so later runs start warm).
+	add_test(NAME program_cache
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-only)
+	add_test(NAME program_cache_gpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-gpu-only)
+	add_test(NAME program_cache_gpu_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-gpu-only)
+	set_tests_properties(program_cache_gpu_verify PROPERTIES
+		ENVIRONMENT "KYTY_PROGRAM_CACHE_VERIFY=exit")
+	add_test(NAME program_cache_gpu_background
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-gpu-only)
+	set_tests_properties(program_cache_gpu_background PROPERTIES
+		ENVIRONMENT "KYTY_PROGRAM_CACHE_VERIFY=background")
+	# Verify catches a stored record that differs from a fresh translation, and heals it.
+	add_test(NAME program_cache_verify_tamper
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-tamper-only)
+	set_tests_properties(program_cache_verify_tamper PROPERTIES
+		ENVIRONMENT "KYTY_PROGRAM_CACHE_VERIFY=1")
+	add_test(NAME program_cache_verify_tamper_background
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --program-cache-tamper-only)
+	set_tests_properties(program_cache_verify_tamper_background PROPERTIES
+		ENVIRONMENT "KYTY_PROGRAM_CACHE_VERIFY=background")
+	add_test(NAME shader_recompiler_compute_program_cache
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(shader_recompiler_compute_program_cache PROPERTIES
+		ENVIRONMENT "KYTY_PROGRAM_CACHE=1;KYTY_PROGRAM_CACHE_PATH=program-cache-suite.bin;KYTY_PROGRAM_CACHE_VERIFY=exit")
+	add_test(NAME draw_prep_engine_program_cache
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_program_cache PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PROGRAM_CACHE=1;KYTY_PROGRAM_CACHE_PATH=program-cache-draw-prep.bin;KYTY_PROGRAM_CACHE_VERIFY=exit")
 
 	# KYTY_CP_RECORDER (renderer/commandRecorder.h): the recorder's own GPU checks (recorder
 	# thread, 1 MiB ring, verify log mode), and the renderer and compute suites with the recorder
@@ -1235,6 +1429,9 @@ if(BUILD_TESTING)
 	endfunction()
 	add_cp_recorder_variants(draw_prep_engine --draw-prep-engine-only
 		KYTY_DRAW_PREP=parallel KYTY_DRAW_PREP_VERIFY=exit)
+	add_cp_recorder_variants(draw_prep_engine_bindings --draw-prep-engine-only
+		KYTY_DRAW_PREP=parallel KYTY_DRAW_PREP_VERIFY=exit KYTY_DRAW_PREP_BINDINGS=1
+		KYTY_DRAW_PREP_BINDINGS_VERIFY=exit)
 	add_cp_recorder_variants(graphics_pipeline_rasterization --polygon-mode-only)
 	add_cp_recorder_variants(command_scheduler_timeline --scheduler-only)
 	add_cp_recorder_variants(gpu_command_lane --gpu-command-lane-only)
@@ -1244,9 +1441,12 @@ if(BUILD_TESTING)
 	add_cp_recorder_variants(compute_meta_clear_classification --compute-meta-clear-only)
 	add_cp_recorder_variants(buffer_cache_dirty_gc --buffer-cache-gc-only)
 	add_cp_recorder_variants(buffer_cache_eager_readback --readback-eager-only)
-	# KYTY_EOP_TIMESTAMPS=gpu with the recorder: its queries and slot resets are recorded in direct
-	# windows (CommandScheduler::BeginCommand, CommandProcessor::RecordEopTimestamp).
+	# KYTY_EOP_TIMESTAMPS=gpu with the recorder: its query writes and slot resets are recorder
+	# packets (WriteTimestamp2, ResetQueryPool); the clock writes drain nothing. gpu-verify checks
+	# the published values.
 	add_cp_recorder_variants(eop_timestamps_gpu --eop-timestamps-only KYTY_EOP_TIMESTAMPS=gpu)
+	add_cp_recorder_variants(eop_timestamps_gpu_verify --eop-timestamps-only
+		KYTY_EOP_TIMESTAMPS=gpu-verify)
 	# The recorder under VK_LAYER_KHRONOS_validation (KYTY_TEST_VULKAN_VALIDATION=1: core and
 	# thread-safety checks, i.e. command-pool, descriptor-pool, command-buffer and queue use from
 	# two threads at once, and descriptor sets updated while a recorded or pending buffer binds

@@ -49,6 +49,11 @@ public:
 		}
 	}
 
+	// The item's tick (Insert and Touch set it) and whether it is linked (Free unlinks it). Read by
+	// TextureCache's LRU mirror checks (KYTY_IMAGE_LRU_SKIP_VERIFY).
+	[[nodiscard]] Tick TickOf(size_t id) const { return m_items[id].tick; }
+	[[nodiscard]] bool Linked(size_t id) const { return id < m_items.size() && m_items[id].linked; }
+
 	void Free(size_t id) {
 		auto& item = m_items[id];
 		Detach(item);

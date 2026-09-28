@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/queueSubmission.h"
 
+#include "common/cpuPlacement.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -77,6 +78,7 @@ void QueueSubmissionBroker::Worker() {
 	KYTY_PROFILER_THREAD("Vulkan queue submission");
 	// It only blocks between submissions; the CP's work reaches the GPU through it.
 	Common::RaiseServiceThreadPriority();
+	uint32_t placement_count = 0; // placement samples (common/cpuPlacement.h), every 16th drain
 	for (;;) {
 		{
 			std::unique_lock lock(m_mutex);
@@ -90,6 +92,9 @@ void QueueSubmissionBroker::Worker() {
 		KYTY_PROFILER_DETAIL_BLOCK("SubmissionQueue::WorkerDrain");
 		Common::LockGuard queue_lock(m_graphics->queue_mutex);
 		DrainPendingLocked();
+		if ((++placement_count & 15u) == 0u) {
+			Common::SamplePlacement(Common::ThreadRole::Host);
+		}
 	}
 }
 

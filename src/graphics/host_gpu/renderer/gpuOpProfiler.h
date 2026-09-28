@@ -42,6 +42,13 @@
 //   KYTY_GPU_OP_PROFILE_MAX=<n>        stop after n captures (default 0 = unlimited)
 //   KYTY_GPU_OP_PROFILE_QUERIES=<n>    timestamp query capacity per capture (default 262144)
 //   KYTY_GPU_OP_PROFILE_DIR=<dir>      output directory when the hang trace is off
+//   KYTY_GPU_OP_PROFILE_STAMPS=ops|passes|alternate
+//                                      ops (default): a stamp after every op (serializes the
+//                                      GPU: a Sky Garden frame inflates about 5x). passes: stamps
+//                                      only around render passes, between guest dispatches and
+//                                      other work outside passes, and at command-buffer ends;
+//                                      draws and dispatch runs keep their overlap. alternate:
+//                                      every second capture uses passes.
 //   KYTY_GPU_OP_COUNTERS=1/0           force the cheap counters on/off. Unset, they follow
 //                                      KYTY_GPU_OP_PROFILE, KYTY_HANG_TRACE=1 or Profiler
 //                                      aggregate diagnostics. Counters: guest render-pass
@@ -90,8 +97,10 @@ namespace Detail {
 // Written once by InstallHooks() before any renderer thread records commands.
 extern bool g_active;
 // The calling thread's innermost and outermost site (see ScopedSite).
-extern thread_local Site* t_site;
-extern thread_local Site* t_scope;
+// constinit: ScopedSite (every KYTY_GPU_OP_SITE scope) reads them without the thread-local
+// initialization guard of an extern thread_local.
+extern constinit thread_local Site* t_site;
+extern constinit thread_local Site* t_scope;
 // Links a site into the published list the first time it is entered.
 void        LinkSite(Site& site) noexcept;
 // ScopedSite's work, for callers that set the calling thread's site themselves (e.g. a thread

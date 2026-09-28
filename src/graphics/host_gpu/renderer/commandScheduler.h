@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -65,8 +66,18 @@ public:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
+	// Runs every normal operation whose tick has completed, in order. Before each one it waits for
+	// the priority operations of that tick and earlier: a normal operation may free what they
+	// still use.
 	void                      PopPendingOperations();
+	// The same, for the draw and dispatch paths' opportunistic housekeeping. With
+	// KYTY_PENDING_OPS_NOWAIT (default on) it never waits for the priority runner. At the first
+	// completed operation whose tick still has priority operations pending, it stops and leaves
+	// that operation and those after it queued, in order, for a later pop. Every blocking caller
+	// (Finish, the fault manager, explicit waits) still uses PopPendingOperations.
+	void                      PopReadyOperations();
 	void                      DrainPriorityOperations();
+	// KYTY_PRIORITY_WAIT_SPIN_US (default 0): first spin that long for the priority runner.
 	void                      WaitPriorityOperations(uint64_t tick);
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(
@@ -165,6 +176,10 @@ private:
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+	// Pops normal operations (see PopPendingOperations/PopReadyOperations).
+	void PopOperations(bool wait_for_priority);
+	// m_operation_mutex held: no priority operation of `tick` or earlier is queued or running.
+	[[nodiscard]] bool PriorityDoneLocked(uint64_t tick) const noexcept;
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
@@ -181,6 +196,9 @@ private:
 	uint64_t                     m_priority_active_tick = 0;
 	// Threads in WaitPriorityOperations/DrainPriorityOperations (m_operation_mutex).
 	uint32_t                     m_priority_waiters     = 0;
+	// Bumped by the priority runner after each operation; WaitPriorityOperations' spin polls it
+	// instead of taking m_operation_mutex.
+	std::atomic<uint64_t>        m_priority_progress {0};
 	ProgressHook                 m_progress_hook         = nullptr;
 	void*                        m_progress_hook_context = nullptr;
 	OperationState               m_operation_state      = OperationState::Open;

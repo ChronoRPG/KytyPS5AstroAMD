@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
+#include "common/cpuPlacement.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/hangTrace.h"
@@ -1186,6 +1187,8 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	// The command processor is the frame-rate limit; keep it ahead of guest spin loops.
 	Common::RaiseCurrentThreadPriority();
+	// KYTY_CPU_RESERVE: its own physical core.
+	Common::PlaceCurrentThread(Common::ThreadRole::Cp);
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
@@ -1672,6 +1675,11 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 		return false;
 	}
 
+	// Placement samples (common/cpuPlacement.h), every 256th packet, on the thread that
+	// executes it: not the sequencer (the resolver samples per op) or a reference front.
+	if (!reference && !sequencer && (++m_placement_packets & 255u) == 0u) {
+		Common::SamplePlacement(Common::ThreadRole::Cp);
+	}
 	const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
 	// The packet's guest address (a lockstep copy of a command buffer is parsed elsewhere).
 	const uint64_t guest_packet =
@@ -2819,8 +2827,9 @@ uint32_t CommandProcessor::RecordEopTimestamp() {
 	// A fence position: publish what completed ticks measured first (never waits).
 	timestamps->Publish(scheduler.GetMasterSemaphore().KnownGpuTick());
 	// A query write touches no guest resource, so batched barriers may stay pending (and no
-	// rendering instance is split for it).
-	return timestamps->RecordQuery(CurrentBuffer().StateHandle());
+	// rendering instance is split for it). With KYTY_CP_RECORDER it is a recorder packet, in
+	// stream order, and drains nothing.
+	return timestamps->RecordQuery(CurrentBuffer().StateSink());
 }
 
 void CommandProcessor::QueueEopTimestamp(uint32_t slot, const void* dst, uint64_t value) {
@@ -4380,6 +4389,11 @@ Pm4ProcessResult CommandProcessor::ResolveSubmission(Pm4Execution& execution, ui
 			sequencer.NoteExecuted(sequence + 1u);
 			handoff = true;
 			return Pm4ProcessResult::Complete;
+		}
+		// Placement samples (common/cpuPlacement.h), every 256th op: this thread executes the
+		// graphics queue's packets, and ProcessPacket samples only where packets execute.
+		if ((++m_placement_packets & 255u) == 0u) {
+			Common::SamplePlacement(Common::ThreadRole::Cp);
 		}
 		// The back's per-packet work of the packets parsed since the previous op.
 		if ((header.flags & CpSeq::FlagAdvanceEpoch) != 0) {

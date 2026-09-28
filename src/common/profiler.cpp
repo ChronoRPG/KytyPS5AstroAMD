@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <tracy/Tracy.hpp>
@@ -355,6 +356,9 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.ProgramCompileDuplicates.Cumulative",
     "FrameEvent.TranslationReuses.Cumulative",
     "FrameEvent.TranslationVerifyMismatches.Cumulative",
+    "FrameEvent.ProgramDiskHits.Cumulative",
+    "FrameEvent.ProgramDiskMisses.Cumulative",
+    "FrameEvent.ProgramDiskVerifyMismatches.Cumulative",
     "FrameEvent.PipelineLibraryLinks.Cumulative",
     "FrameEvent.PipelineLibraryCacheHits.Cumulative",
     "FrameEvent.PipelineLibrariesCreated.Cumulative",
@@ -548,6 +552,25 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.CpRecorderSameCoreSamples.Cumulative",
     "FrameEvent.CpRecorderIdleDrains.Cumulative",
     "FrameEvent.DrawPrepSteals.Cumulative",
+    "FrameEvent.DrawPrepBindingPlans.Cumulative",
+    "FrameEvent.DrawPrepBindingPlansUsed.Cumulative",
+    "FrameEvent.DrawPrepBindingPlansDropped.Cumulative",
+    "FrameEvent.DrawPrepBindingAbstainRanges.Cumulative",
+    "FrameEvent.DrawPrepBindingAbstainSamplers.Cumulative",
+    "FrameEvent.DrawPrepBindingAbstainPipeline.Cumulative",
+    "FrameEvent.DrawPrepBindingAbstainPipelineBusy.Cumulative",
+    "FrameEvent.DrawPrepBindingFallbackVm.Cumulative",
+    "FrameEvent.DrawPrepBindingFallbackPipeline.Cumulative",
+    "FrameEvent.DrawPrepBindingPipelinesUsed.Cumulative",
+    "FrameEvent.DrawPrepBindingVerifyChecks.Cumulative",
+    "FrameEvent.DrawPrepBindingVerifyMismatches.Cumulative",
+    "FrameEvent.DescriptorOffsetAuditSets.Cumulative",
+    "FrameEvent.DescriptorOffsetAuditSetRepeatsPrevious.Cumulative",
+    "FrameEvent.DescriptorOffsetAuditSetRepeatsAny.Cumulative",
+    "FrameEvent.DescriptorOffsetAuditPushes.Cumulative",
+    "FrameEvent.DescriptorOffsetAuditPushRepeatsPrevious.Cumulative",
+    "FrameEvent.DescriptorOffsetAuditPushRepeatsAny.Cumulative",
+    "FrameEvent.DescriptorOffsetAuditOverLimit.Cumulative",
     "FrameEvent.EopTimestampsRewritten.Cumulative",
     "FrameEvent.EopTimestampsSkipped.Cumulative",
     "FrameEvent.EopTimestampsUnavailable.Cumulative",
@@ -569,8 +592,63 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.WrittenSyncSkips.Cumulative",
     "FrameEvent.WrittenSyncSkipVerifyChecks.Cumulative",
     "FrameEvent.WrittenSyncSkipVerifyMismatches.Cumulative",
+    "FrameEvent.PendingOpsDeferred.Cumulative",
+    "FrameEvent.PendingOpsDeferredDepth.Cumulative",
+    "FrameEvent.PriorityWaitSpins.Cumulative",
+    "FrameEvent.PriorityWaitSpinHits.Cumulative",
+    "FrameEvent.CpuPlacementCpSamples.Cumulative",
+    "FrameEvent.CpuPlacementCpOffCore.Cumulative",
+    "FrameEvent.CpuPlacementGuestSamples.Cumulative",
+    "FrameEvent.CpuPlacementGuestOnCpCore.Cumulative",
+    "FrameEvent.CpuPlacementHostSamples.Cumulative",
+    "FrameEvent.CpuPlacementHostOnCpCore.Cumulative",
+    "FrameEvent.CpuPlacementRecorderOffCore.Cumulative",
+    "FrameEvent.CpuPlacementHardAffinity.Cumulative",
+    "FrameEvent.CpuPlacementHardAffinityReserved.Cumulative",
+    "FrameEvent.CpuPlacementRepinned.Cumulative",
+    "FrameEvent.FalseSharingWrites.Cumulative",
+    "FrameEvent.FalseSharingBytes.Cumulative",
+    "FrameEvent.FalseSharingUploadSplits.Cumulative",
+    "FrameEvent.FalseSharingVerifyChecks.Cumulative",
+    "FrameEvent.FalseSharingVerifyConflicts.Cumulative",
+    "FrameEvent.GpuWriteImageSkips.Cumulative",
+    "FrameEvent.GpuWriteImageSkipVerifyChecks.Cumulative",
+    "FrameEvent.GpuWriteImageSkipVerifyRaces.Cumulative",
+    "FrameEvent.GpuWriteImageSkipVerifyMismatches.Cumulative",
+    "FrameEvent.DccImageStateUnregistered.Cumulative",
+    "FrameEvent.DccImageStateStencil.Cumulative",
+    "FrameEvent.DccImageStateMismatch.Cumulative",
+    "FrameEvent.DccImageStateNotGpuModified.Cumulative",
+    "FrameEvent.DccImageStateBufferModified.Cumulative",
+    "FrameEvent.DccImageStateCpuDirty.Cumulative",
+    "FrameEvent.DccImageStatePartial.Cumulative",
+    "FrameEvent.DccImageStateGpuDirtyBytes.Cumulative",
+    "FrameEvent.ReadbackSideOtherOwner.Cumulative",
+    "FrameEvent.ReadbackSideOtherAlignment.Cumulative",
+    "FrameEvent.ReadbackSideOtherWindow.Cumulative",
+    "FrameEvent.ReadbackSideOtherPublication.Cumulative",
+    "FrameEvent.ReadbackSideOtherNoDirty.Cumulative",
+    "FrameEvent.ReadbackSideOtherSlot.Cumulative",
+    "FrameEvent.DccGpuRefreshes.Cumulative",
+    "FrameEvent.DccGpuRefreshVerifyChecks.Cumulative",
+    "FrameEvent.DccGpuRefreshVerifyMismatches.Cumulative",
     "FrameEvent.DrawPrepCertRangesVerifyChecks.Cumulative",
     "FrameEvent.DrawPrepCertRangesVerifyMismatches.Cumulative",
+    "FrameEvent.ImageLruTouchSkips.Cumulative",
+    "FrameEvent.ImageLruVerifyChecks.Cumulative",
+    "FrameEvent.ImageLruVerifyMismatches.Cumulative",
+    "FrameEvent.ImageTransitSkips.Cumulative",
+    "FrameEvent.ImageTransitVerifyChecks.Cumulative",
+    "FrameEvent.ImageTransitVerifyMismatches.Cumulative",
+    "FrameEvent.TargetRecordNotFirstPage.Cumulative",
+    "FrameEvent.TargetRecordChanged.Cumulative",
+    "FrameEvent.TargetRecordDccClear.Cumulative",
+    "FrameEvent.TargetRecordDccNative.Cumulative",
+    "FrameEvent.TargetRecordDccFallback.Cumulative",
+    "FrameEvent.TargetRecordDccGuest.Cumulative",
+    "FrameEvent.TargetRecordDccPages.Cumulative",
+    "FrameEvent.TargetRecordCmaskNative.Cumulative",
+    "FrameEvent.TargetRecordCmaskOther.Cumulative",
     "FrameEvent.CpSeqOps.Cumulative",
     "FrameEvent.CpSeqVerifyChecks.Cumulative",
     "FrameEvent.CpSeqVerifyMismatches.Cumulative",
@@ -634,6 +712,7 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.ShaderEmit.Calls.Cumulative",
     "FrameWait.ShaderValidate.Calls.Cumulative",
     "FrameWait.ShaderModuleCreate.Calls.Cumulative",
+    "FrameWait.ShaderDiskLoad.Calls.Cumulative",
     "FrameWait.GraphicsPipelineDriver.Calls.Cumulative",
     "FrameWait.ComputePipelineCreate.Calls.Cumulative",
     "FrameWait.PipelineOptimize.Calls.Cumulative",
@@ -641,6 +720,15 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.CpRecorderRingFull.Calls.Cumulative",
     "FrameWait.CpRecorderExecute.Calls.Cumulative",
     "FrameWait.DrawPrepSteal.Calls.Cumulative",
+    "FrameWait.DrawPrepBindingPlan.Calls.Cumulative",
+    "FrameWait.DrawPrepWorker1.Calls.Cumulative",
+    "FrameWait.DrawPrepWorker2.Calls.Cumulative",
+    "FrameWait.DrawPrepWorker3.Calls.Cumulative",
+    "FrameWait.DrawPrepWorker4.Calls.Cumulative",
+    "FrameWait.DrawPrepWorker5.Calls.Cumulative",
+    "FrameWait.DrawPrepWorker6.Calls.Cumulative",
+    "FrameWait.DrawPrepWorker7.Calls.Cumulative",
+    "FrameWait.DrawPrepWorker8.Calls.Cumulative",
     "FrameWait.EopTimestampPublish.Calls.Cumulative",
     "FrameWait.CpSeqSequencerWait.Calls.Cumulative",
     "FrameWait.CpSeqResolverStarved.Calls.Cumulative",
@@ -686,6 +774,7 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.ShaderEmit.Nanoseconds.Cumulative",
     "FrameWait.ShaderValidate.Nanoseconds.Cumulative",
     "FrameWait.ShaderModuleCreate.Nanoseconds.Cumulative",
+    "FrameWait.ShaderDiskLoad.Nanoseconds.Cumulative",
     "FrameWait.GraphicsPipelineDriver.Nanoseconds.Cumulative",
     "FrameWait.ComputePipelineCreate.Nanoseconds.Cumulative",
     "FrameWait.PipelineOptimize.Nanoseconds.Cumulative",
@@ -693,6 +782,15 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.CpRecorderRingFull.Nanoseconds.Cumulative",
     "FrameWait.CpRecorderExecute.Nanoseconds.Cumulative",
     "FrameWait.DrawPrepSteal.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepBindingPlan.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepWorker1.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepWorker2.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepWorker3.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepWorker4.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepWorker5.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepWorker6.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepWorker7.Nanoseconds.Cumulative",
+    "FrameWait.DrawPrepWorker8.Nanoseconds.Cumulative",
     "FrameWait.EopTimestampPublish.Nanoseconds.Cumulative",
     "FrameWait.CpSeqSequencerWait.Nanoseconds.Cumulative",
     "FrameWait.CpSeqResolverStarved.Nanoseconds.Cumulative",
@@ -977,7 +1075,7 @@ std::atomic<int8_t>      g_detailed {-1};
 std::atomic<int8_t>      g_shared_counters {-1};
 std::atomic<bool>        g_zones {false};
 std::atomic<CounterSink> g_event_sink {CounterSink::Off};
-thread_local ThreadCounters* t_counters = nullptr;
+constinit thread_local ThreadCounters* t_counters = nullptr;
 
 namespace {
 
@@ -1103,13 +1201,15 @@ ThreadCounters& AcquireThreadCounters() noexcept {
 } // namespace Detail
 
 void ScopedBlock::Begin(const tracy::SourceLocationData* source_location) {
-	m_zone.emplace(source_location, TRACY_CALLSTACK, true);
+	new (m_zone) tracy::ScopedZone(source_location, TRACY_CALLSTACK, true);
+	m_active = true;
 	g_block_stack.push_back(this);
 }
 
-void ScopedBlock::End() {
-	if (m_zone.has_value()) {
-		m_zone.reset();
+void ScopedBlock::End() noexcept {
+	if (m_active) {
+		std::launder(reinterpret_cast<tracy::ScopedZone*>(m_zone))->~ScopedZone();
+		m_active = false;
 		RemoveBlock(this);
 	}
 }
@@ -1140,6 +1240,18 @@ void Detail::CountFrameEventShared(FrameEvent kind, uint64_t amount) noexcept {
 	}
 }
 
+#ifdef TRACY_ON_DEMAND
+namespace {
+// The on-demand connection a scope is counted against. The Thread sink can be on without a
+// started profiler (tests set it directly, and a shutdown can follow the flip that chose it), and
+// with TRACY_MANUAL_LIFETIME GetProfiler() then dereferences no profiler: 0 stands for "none", as
+// for a started profiler that has not been connected yet.
+uint64_t CurrentConnectionId() {
+	return tracy::ProfilerAvailable() ? tracy::GetProfiler().ConnectionId() : 0;
+}
+} // namespace
+#endif
+
 void ScopedFrameWait::Begin() {
 	const auto sink = Detail::g_event_sink.load(std::memory_order_relaxed);
 	if (sink == Detail::CounterSink::Shared &&
@@ -1147,7 +1259,7 @@ void ScopedFrameWait::Begin() {
 		return;
 	}
 #ifdef TRACY_ON_DEMAND
-	m_connection = tracy::GetProfiler().ConnectionId();
+	m_connection = CurrentConnectionId();
 #endif
 	m_sink     = sink;
 	m_start_ns = FrameWaitClockNs();
@@ -1159,7 +1271,7 @@ void ScopedFrameWait::Finish() {
 	}
 #ifdef TRACY_ON_DEMAND
 	// Scopes spanning an on-demand connection change are omitted.
-	if (m_connection != tracy::GetProfiler().ConnectionId()) {
+	if (m_connection != CurrentConnectionId()) {
 		return;
 	}
 #endif

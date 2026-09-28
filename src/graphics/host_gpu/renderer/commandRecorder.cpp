@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include "common/assert.h"
+#include "common/cpuPlacement.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -543,6 +544,9 @@ struct CommandRecorder::NativeExecutor {
 	                          vk::QueryResultFlags flags) {
 		command.copyQueryPoolResults(pool, first, count, destination, offset, stride, flags);
 	}
+	void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, uint32_t query) {
+		command.writeTimestamp2(stage, pool, query);
+	}
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -705,6 +709,9 @@ void CommandRecorder::Run(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("CP recorder");
 	// On the critical path of every drain and submission, like the CP itself.
 	Common::RaiseCurrentThreadPriority();
+	// KYTY_CPU_RESERVE=cp+recorder: its own physical core; cp: off the CP's core, with the other
+	// threads (common/cpuPlacement.h).
+	Common::PlaceCurrentThread(Common::ThreadRole::Recorder);
 #if defined(_WIN32)
 	if (const auto* ideal = std::getenv("KYTY_CP_RECORDER_IDEAL_CPU"); ideal != nullptr) {
 		const auto       cpu = static_cast<uint32_t>(std::strtoul(ideal, nullptr, 10));
@@ -836,6 +843,8 @@ void CommandRecorder::PublishConsumerCounters() {
 }
 
 void CommandRecorder::SamplePlacement() {
+	// The placement histogram (hang trace placement.csv) and CpuPlacementRecorderOffCore.
+	Common::SamplePlacement(Common::ThreadRole::Recorder);
 	const auto cp = m_cp_processor.load(std::memory_order_relaxed);
 	if (cp == UINT32_MAX) {
 		return;

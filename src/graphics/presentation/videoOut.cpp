@@ -3,6 +3,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/cpuPlacement.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/hangTrace.h"
@@ -800,8 +801,12 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 
-	int64_t total_wait = 0;
+	int64_t  total_wait      = 0;
+	uint32_t placement_count = 0; // placement samples (common/cpuPlacement.h), every 8th vblank
 	while (!token.stop_requested()) {
+		if ((++placement_count & 7u) == 0u) {
+			Common::SamplePlacement(Common::ThreadRole::Host);
+		}
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
 		if (total_wait > 0) {
 			const auto remaining_us =
