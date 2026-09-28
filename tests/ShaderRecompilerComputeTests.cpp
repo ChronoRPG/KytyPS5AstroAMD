@@ -25,6 +25,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -75,6 +76,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -87,6 +89,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -3413,6 +3416,295 @@ public:
             "a ready pop left an operation whose priority work had finished");
     std::printf("[host]    %-32s ok (nowait %d, spin %d)\n", "SchedulerReadyOperations",
                 nowait ? 1 : 0, spin ? 1 : 0);
+  }
+
+
+  // KYTY_GPU_OP_PROFILE_STAMPS=alternate (--gpu-op-profile-only sets it): two captured frames of the
+  // same work through the guest scheduler's command buffers: fills and barriers (emulator work), a
+  // run of guest dispatches, and a render pass. The first capture stamps every op. The second
+  // (pass stamps) stamps only the render-pass end, the boundaries between emulator work and the
+  // dispatch run ("segment" rows) and the command-buffer end; every other op has no delta.
+  void CheckGpuOpProfilerStamps(const std::filesystem::path &dir) {
+    constexpr const char *name = "GpuOpProfilerStamps";
+    EnsureRuntimeContext();
+    GpuOpProfiler::InstallHooks(m_runtime_context);
+    Require(name, "hooks", GpuOpProfiler::Active() && GpuOpProfiler::CaptureEnabled(),
+            "the GPU op profiler did not install its capture hooks");
+
+    // A fill target.
+    vk::BufferCreateInfo buffer_info{};
+    buffer_info.size = 4096;
+    buffer_info.usage = vk::BufferUsageFlagBits::eTransferDst;
+    buffer_info.sharingMode = vk::SharingMode::eExclusive;
+    vk::Buffer buffer = nullptr;
+    RequireVk(name, "buffer", m_device.createBuffer(&buffer_info, nullptr, &buffer),
+              "vkCreateBuffer");
+    vk::MemoryRequirements buffer_req{};
+    m_device.getBufferMemoryRequirements(buffer, &buffer_req);
+    u32 buffer_type = 0;
+    Require(name, "buffer memory",
+            FindMemoryType(buffer_req.memoryTypeBits, {}, &buffer_type),
+            "no memory type for the fill buffer");
+    vk::MemoryAllocateInfo buffer_alloc{};
+    buffer_alloc.allocationSize = buffer_req.size;
+    buffer_alloc.memoryTypeIndex = buffer_type;
+    vk::DeviceMemory buffer_memory = nullptr;
+    RequireVk(name, "buffer memory", m_device.allocateMemory(&buffer_alloc, nullptr, &buffer_memory),
+              "vkAllocateMemory");
+    RequireVk(name, "buffer bind", m_device.bindBufferMemory(buffer, buffer_memory, 0),
+              "vkBindBufferMemory");
+
+    // A colour target for a render pass that only clears.
+    vk::ImageCreateInfo image_info{};
+    image_info.imageType = vk::ImageType::e2D;
+    image_info.format = vk::Format::eR8G8B8A8Unorm;
+    image_info.extent = vk::Extent3D{64, 64, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = vk::SampleCountFlagBits::e1;
+    image_info.tiling = vk::ImageTiling::eOptimal;
+    image_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+    image_info.sharingMode = vk::SharingMode::eExclusive;
+    image_info.initialLayout = vk::ImageLayout::eUndefined;
+    vk::Image image = nullptr;
+    RequireVk(name, "image", m_device.createImage(&image_info, nullptr, &image), "vkCreateImage");
+    vk::MemoryRequirements image_req{};
+    m_device.getImageMemoryRequirements(image, &image_req);
+    u32 image_type = 0;
+    Require(name, "image memory",
+            FindMemoryType(image_req.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal,
+                           &image_type) ||
+                FindMemoryType(image_req.memoryTypeBits, {}, &image_type),
+            "no memory type for the colour target");
+    vk::MemoryAllocateInfo image_alloc{};
+    image_alloc.allocationSize = image_req.size;
+    image_alloc.memoryTypeIndex = image_type;
+    vk::DeviceMemory image_memory = nullptr;
+    RequireVk(name, "image memory", m_device.allocateMemory(&image_alloc, nullptr, &image_memory),
+              "vkAllocateMemory");
+    RequireVk(name, "image bind", m_device.bindImageMemory(image, image_memory, 0),
+              "vkBindImageMemory");
+    vk::ImageViewCreateInfo view_info{};
+    view_info.image = image;
+    view_info.viewType = vk::ImageViewType::e2D;
+    view_info.format = image_info.format;
+    view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+    vk::ImageView view = nullptr;
+    RequireVk(name, "view", m_device.createImageView(&view_info, nullptr, &view),
+              "vkCreateImageView");
+
+    // An empty compute shader (local size 1): OpCapability Shader, OpMemoryModel Logical GLSL450,
+    // OpEntryPoint GLCompute %1 "main", OpExecutionMode %1 LocalSize 1 1 1, void main() {}.
+    static constexpr std::array<u32, 35> kEmptyCompute{
+        0x07230203u, 0x00010000u, 0x00000000u, 5u, 0u, // header, bound 5
+        0x00020011u, 1u,                                // OpCapability Shader
+        0x0003000eu, 0u, 1u,                            // OpMemoryModel Logical GLSL450
+        0x0005000fu, 5u, 1u, 0x6e69616du, 0u,           // OpEntryPoint GLCompute %1 "main"
+        0x00060010u, 1u, 17u, 1u, 1u, 1u,               // OpExecutionMode %1 LocalSize 1 1 1
+        0x00020013u, 2u,                                // %2 = OpTypeVoid
+        0x00030021u, 3u, 2u,                            // %3 = OpTypeFunction %2
+        0x00050036u, 2u, 1u, 0u, 3u,                    // %1 = OpFunction %2 None %3
+        0x000200f8u, 4u,                                // %4 = OpLabel
+        0x000100fdu,                                    // OpReturn
+        0x00010038u};                                   // OpFunctionEnd
+    const std::vector<u32> code(kEmptyCompute.begin(), kEmptyCompute.end());
+    vk::ShaderModuleCreateInfo module_info{};
+    module_info.codeSize = code.size() * sizeof(u32);
+    module_info.pCode = code.data();
+    vk::ShaderModule module = nullptr;
+    RequireVk(name, "shader", m_device.createShaderModule(&module_info, nullptr, &module),
+              "vkCreateShaderModule");
+    vk::PipelineLayoutCreateInfo layout_info{};
+    vk::PipelineLayout layout = nullptr;
+    RequireVk(name, "layout", m_device.createPipelineLayout(&layout_info, nullptr, &layout),
+              "vkCreatePipelineLayout");
+    vk::ComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    pipeline_info.stage.module = module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = layout;
+    vk::Pipeline pipeline = nullptr;
+    RequireVk(name, "pipeline",
+              m_device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+              "vkCreateComputePipelines");
+
+    const auto record_work = [&](CommandScheduler &scheduler) {
+      const auto cb = scheduler.Current().Handle();
+      vk::ImageMemoryBarrier2 to_color{};
+      to_color.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+      to_color.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+      to_color.dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+      to_color.dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite;
+      to_color.oldLayout = vk::ImageLayout::eUndefined;
+      to_color.newLayout = vk::ImageLayout::eColorAttachmentOptimal;
+      to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      to_color.image = image;
+      to_color.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+      vk::MemoryBarrier2 all{};
+      all.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+      all.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+      all.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+      all.dstAccessMask =
+          vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+      vk::DependencyInfo memory_dependency{};
+      memory_dependency.memoryBarrierCount = 1;
+      memory_dependency.pMemoryBarriers = &all;
+      vk::DependencyInfo image_dependency = memory_dependency;
+      image_dependency.imageMemoryBarrierCount = 1;
+      image_dependency.pImageMemoryBarriers = &to_color;
+      {
+        KYTY_GPU_OP_SITE("buffer.fill");
+        cb.fillBuffer(buffer, 0, 4096, 0x12345678u);
+      }
+      {
+        KYTY_GPU_OP_SITE("batch.test");
+        cb.pipelineBarrier2(memory_dependency);
+      }
+      {
+        KYTY_GPU_OP_SITE("dispatch");
+        cb.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+        cb.dispatch(1, 1, 1);
+        cb.dispatch(1, 1, 1);
+        cb.dispatch(1, 1, 1);
+      }
+      {
+        KYTY_GPU_OP_SITE("batch.test");
+        cb.pipelineBarrier2(image_dependency);
+      }
+      {
+        KYTY_GPU_OP_SITE("draw.execute");
+        vk::RenderingAttachmentInfo color{};
+        color.imageView = view;
+        color.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+        color.loadOp = vk::AttachmentLoadOp::eClear;
+        color.storeOp = vk::AttachmentStoreOp::eStore;
+        vk::RenderingInfo rendering{};
+        rendering.renderArea = vk::Rect2D{{0, 0}, {64, 64}};
+        rendering.layerCount = 1;
+        rendering.colorAttachmentCount = 1;
+        rendering.pColorAttachments = &color;
+        cb.beginRendering(rendering);
+        cb.endRendering();
+      }
+      {
+        KYTY_GPU_OP_SITE("buffer.fill");
+        cb.fillBuffer(buffer, 0, 4096, 0u);
+      }
+    };
+
+    {
+      CommandScheduler scheduler(Renderer(), m_runtime_context, CommandScheduler::Role::Guest);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      for (int capture = 0; capture < 2; capture++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5)); // the capture period
+        GpuOpProfiler::OnGuestFlip();
+        scheduler.Flush(); // the next command buffer starts a capture
+        record_work(scheduler);
+        scheduler.Flush(); // a second captured command buffer of the same frame
+        record_work(scheduler);
+        GpuOpProfiler::OnGuestFlip();
+        scheduler.FlushAndWait(); // the next begin closes and collects the capture
+        scheduler.FlushAndWait();
+      }
+    } // shutdown flushes the writer
+
+    m_device.destroyPipeline(pipeline, nullptr);
+    m_device.destroyPipelineLayout(layout, nullptr);
+    m_device.destroyShaderModule(module, nullptr);
+    m_device.destroyImageView(view, nullptr);
+    m_device.destroyImage(image, nullptr);
+    m_device.freeMemory(image_memory, nullptr);
+    m_device.destroyBuffer(buffer, nullptr);
+    m_device.freeMemory(buffer_memory, nullptr);
+
+    // Rows of the two captures (oldest first).
+    std::vector<std::filesystem::path> files;
+    for (const auto &entry : std::filesystem::directory_iterator(dir)) {
+      const auto file = entry.path().filename().string();
+      if (file.rfind("gpuops-", 0) == 0 && file.size() > 11 &&
+          std::isdigit(static_cast<unsigned char>(file[7])) != 0) {
+        files.push_back(entry.path());
+      }
+    }
+    std::sort(files.begin(), files.end(), [](const auto &a, const auto &b) {
+      return std::stoull(a.filename().string().substr(7)) <
+             std::stoull(b.filename().string().substr(7));
+    });
+    Require(name, "captures", files.size() == 2,
+            "expected two gpuops-<flip>.csv captures in " + dir.string() + ", found " +
+                std::to_string(files.size()));
+    struct Row {
+      std::string kind, site, delta;
+    };
+    const auto read_rows = [&](const std::filesystem::path &path) {
+      std::ifstream in(path);
+      std::string line;
+      std::getline(in, line);
+      std::vector<std::string> header;
+      std::stringstream header_stream(line);
+      for (std::string cell; std::getline(header_stream, cell, ',');) {
+        header.push_back(cell);
+      }
+      const auto column = [&](const char *key) {
+        const auto it = std::find(header.begin(), header.end(), key);
+        Require(name, "columns", it != header.end(), std::string("missing column ") + key);
+        return static_cast<size_t>(it - header.begin());
+      };
+      const auto kind = column("kind"), site = column("site"), delta = column("delta_ns");
+      std::vector<Row> rows;
+      while (std::getline(in, line)) {
+        std::vector<std::string> cells;
+        std::stringstream stream(line);
+        for (std::string cell; std::getline(stream, cell, ',');) {
+          cells.push_back(cell);
+        }
+        cells.resize(std::max(cells.size(), header.size()));
+        if (cells[kind] != "cb_begin") {
+          rows.push_back({cells[kind], cells[site], cells[delta]});
+        }
+      }
+      return rows;
+    };
+    const auto per_op = read_rows(files[0]);
+    const auto passes = read_rows(files[1]);
+    Require(name, "per-op rows", !per_op.empty(), "the per-op capture recorded nothing");
+    for (const auto &row : per_op) {
+      Require(name, "per-op stamps", !row.delta.empty() && row.kind != "segment",
+              "a per-op capture row has no delta or is a segment row: " + row.kind);
+    }
+    uint32_t segments_compute = 0, segments_emulator = 0, pass_ends = 0, unstamped = 0,
+             dispatches = 0;
+    for (const auto &row : passes) {
+      if (row.kind == "segment") {
+        Require(name, "segment stamp", !row.delta.empty(), "a segment row has no delta");
+        segments_compute += row.site == "segment.compute" ? 1u : 0u;
+        segments_emulator += row.site == "segment.emulator" ? 1u : 0u;
+      } else if (row.kind == "end_rendering") {
+        Require(name, "pass stamp", !row.delta.empty(), "a render-pass end has no delta");
+        pass_ends++;
+      } else {
+        Require(name, "unstamped ops", row.delta.empty(),
+                "a pass-stamp capture timed an op of its own: " + row.kind + " " + row.site);
+        unstamped++;
+        dispatches += row.kind == "dispatch" ? 1u : 0u;
+      }
+    }
+    // Per command buffer: emulator work closed before the dispatch run, the run closed before the
+    // barrier, emulator work closed before the pass, the last fill closed at the buffer end.
+    Require(name, "pass stamps",
+            pass_ends == 2 && segments_compute == 2 && segments_emulator >= 6 &&
+                dispatches == 6 && unstamped >= 14,
+            "pass-stamp capture: " + std::to_string(pass_ends) + " pass ends, " +
+                std::to_string(segments_compute) + " compute and " +
+                std::to_string(segments_emulator) + " emulator segments, " +
+                std::to_string(unstamped) + " unstamped ops");
+    std::printf("[gpu]     %-32s ok (per-op %zu rows; pass stamps: %u pass ends, %u compute and "
+                "%u emulator segments, %u unstamped ops)\n",
+                name, per_op.size(), pass_ends, segments_compute, segments_emulator, unstamped);
   }
 
   void CheckGpuMappedRangeLifecycle() {
@@ -43282,6 +43574,28 @@ int main(int argc, char **argv) {
     vulkan.CheckCpRecorder();
     vulkan.CheckSchedulerTimeline();
     vulkan.CheckSchedulerReadyOperations();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-op-profile-only") == 0) {
+    // Captures every 1 ms at a flip, two at most, per-op then pass stamps, into a fresh directory
+    // (kept when KYTY_GPU_OP_PROFILE_DIR names one).
+    const auto *kept = std::getenv("KYTY_GPU_OP_PROFILE_DIR");
+    const auto dir =
+        kept != nullptr && kept[0] != '\0'
+            ? std::filesystem::path(kept)
+            : std::filesystem::temp_directory_path() /
+                  ("kyty-gpuops-test-" +
+                   std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(dir);
+    SetEnvironment("KYTY_GPU_OP_PROFILE", "0.001");
+    SetEnvironment("KYTY_GPU_OP_PROFILE_MAX", "2");
+    SetEnvironment("KYTY_GPU_OP_PROFILE_STAMPS", "alternate");
+    SetEnvironment("KYTY_GPU_OP_PROFILE_DIR", dir.string().c_str());
+    VulkanHarness vulkan;
+    vulkan.CheckGpuOpProfilerStamps(dir);
+    if (kept == nullptr || kept[0] == '\0') {
+      std::filesystem::remove_all(dir);
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cp-recorder-bench") == 0) {
