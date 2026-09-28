@@ -839,6 +839,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-write-image-skip-only)
 	set_tests_properties(gpu_write_image_skip_off PROPERTIES
 		ENVIRONMENT "KYTY_GPU_WRITE_IMAGE_SKIP=0")
+	# KYTY_DCC_GPU_REFRESH: the refreshed native inspection (with its verify mode) against the
+	# CPU fallback, for a buffer-modified and a CPU-dirty image (the check sets the switches).
+	add_test(NAME dcc_gpu_refresh
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dcc-gpu-refresh-only)
 	# Tracker-gap detectors: the page states they classify host writes by.
 	add_test(NAME tracker_gap_detectors
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tracker-gap-detectors-only)

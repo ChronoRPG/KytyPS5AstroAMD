@@ -449,6 +449,30 @@ private:
 	int  m_gpu_write_skip_verify = 0;
 	// Why TryMaterializeGpuMetadataClear last refused an image (DccImageState* FrameEvent).
 	Profiler::FrameEvent m_image_state_reason = Profiler::FrameEvent::DccImageStateUnregistered;
+	// KYTY_DCC_GPU_REFRESH (default off; =1 on, needs KYTY_DCC_GPU=1): the native DCC inspection
+	// (TryMaterializeGpuMetadataClear) also accepts a registered, matching, fully resident image
+	// that waits for a refresh (buffer-modified, CPU-dirty) or is not GPU-owned, which the CPU
+	// fallback handles today after draining the GPU for the metadata. The image is refreshed first
+	// (InitializeImage), exactly as that fallback's ClearImage refreshes it before a layer clear,
+	// then inspected and committed as a GPU write like any inspected image: the decision stays on
+	// the GPU behind the metadata's writer. FrameEvent DccGpuRefreshes (slices).
+	// KYTY_DCC_GPU_REFRESH_VERIFY=1|exit: for such an image, also take the CPU fallback's decision
+	// (after a drain), copy the inspected slices out behind the inspection and compare at
+	// completion: a slice the fallback clears must have its key consumed (all 0xFF), any other
+	// must be untouched. DccGpuRefreshVerify{Checks,Mismatches}; exit stops on a mismatch.
+	bool m_dcc_gpu_refresh        = false;
+	int  m_dcc_gpu_refresh_verify = 0;
+	// Atomic: the verify's deferred comparison runs on whichever thread pops pending operations.
+	struct DccRefreshTotals {
+		std::atomic<uint64_t> refreshes {0}; // slices inspected through the refresh
+		std::atomic<uint64_t> verify_checks {0};
+		std::atomic<uint64_t> verify_mismatches {0};
+	};
+	DccRefreshTotals m_dcc_refresh_totals;
+	// Caller holds m_lock, right after RecordSlice of the refreshed image.
+	void RecordDccRefreshVerify(Buffer& metadata, uint64_t offset, uint64_t slice_size,
+	                            std::vector<uint8_t> before, std::vector<uint8_t> clears,
+	                            GuestRange range);
 	struct GpuWriteSkipTotals {
 		std::atomic<uint64_t> skips {0};
 		std::atomic<uint64_t> verify_checks {0};

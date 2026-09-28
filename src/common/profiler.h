@@ -937,6 +937,11 @@ enum class FrameEvent : uint32_t {
 	ReadbackSideOtherPublication,
 	ReadbackSideOtherNoDirty,
 	ReadbackSideOtherSlot,
+	// KYTY_DCC_GPU_REFRESH (TextureCache::TryMaterializeGpuMetadataClear): DCC slices inspected on
+	// the GPU for an image refreshed first instead of the CPU fallback, and the verify mode.
+	DccGpuRefreshes,
+	DccGpuRefreshVerifyChecks,
+	DccGpuRefreshVerifyMismatches,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

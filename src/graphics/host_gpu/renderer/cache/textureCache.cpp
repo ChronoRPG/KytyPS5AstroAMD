@@ -45,6 +45,22 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+
+// The DccImageState* cause in the DCC CPU fallback's stderr line.
+const char* DccImageStateName(Profiler::FrameEvent cause) {
+	using Event = Profiler::FrameEvent;
+	switch (cause) {
+		case Event::DccImageStateUnregistered: return "unregistered";
+		case Event::DccImageStateStencil: return "stencil";
+		case Event::DccImageStateMismatch: return "mismatch";
+		case Event::DccImageStateNotGpuModified: return "not-gpu-modified";
+		case Event::DccImageStateBufferModified: return "buffer-modified";
+		case Event::DccImageStateCpuDirty: return "cpu-dirty";
+		case Event::DccImageStatePartial: return "partial";
+		case Event::DccImageStateGpuDirtyBytes: return "gpu-dirty-bytes";
+		default: return "other";
+	}
+}
 // Overlapping aliases (transient render targets sharing a heap) stay registered until unused
 // for this many presented guest frames; see AliasAgeByFrames.
 constexpr uint64_t AliasFramesBeforeRemoval = 4;
@@ -300,6 +316,14 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		const auto* verify = std::getenv("KYTY_GPU_WRITE_IMAGE_SKIP_VERIFY");
 		if (verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0) {
 			m_gpu_write_skip_verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
+		}
+	}
+	if (const auto* refresh = std::getenv("KYTY_DCC_GPU_REFRESH");
+	    refresh != nullptr && std::strcmp(refresh, "1") == 0) {
+		m_dcc_gpu_refresh = true;
+		const auto* verify = std::getenv("KYTY_DCC_GPU_REFRESH_VERIFY");
+		if (verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0) {
+			m_dcc_gpu_refresh_verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
 		}
 	}
 	if (m_graphics.CanReportMemoryUsage()) {
@@ -2480,11 +2504,17 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	if (ImageRangeOverlaps(range, desc.info.data)) {
 		return Event::DccFallbackMetadataAliased;
 	}
+	// KYTY_DCC_GPU_REFRESH (textureCache.h): a DCC image that is registered, matches the view and
+	// is fully resident is accepted while waiting for a refresh or not GPU-owned; it is refreshed
+	// right before the inspection, as the CPU fallback's ClearImage refreshes it.
+	const bool refresh_allowed = m_dcc_gpu_refresh && !cmask;
 	const auto eligible = [&]() -> std::optional<Event> {
 		const auto* image = m_slot_images.try_get(id);
-		if (image == nullptr || !image->registered || image->depth_id ||
-		    image->info.data != desc.info.data || image->info.extent != desc.info.extent ||
-		    !SafeToDownload(*image)) {
+		const bool  matches = image != nullptr && image->registered && !image->depth_id &&
+		                     image->info.data == desc.info.data &&
+		                     image->info.extent == desc.info.extent;
+		if (!matches ||
+		    (!SafeToDownload(*image) && !(refresh_allowed && image->FullyResident()))) {
 			// Which condition refused it (DccImageState* counters, MaterializeDccClear). The
 			// pending-refresh states come before "not GPU-modified", which they usually imply.
 			if (image == nullptr || !image->registered) {
@@ -2523,9 +2553,36 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		}
 		return std::nullopt;
 	};
+	bool refreshed = false;
 	{
 		std::scoped_lock lock {m_lock};
 		if (const auto reason = eligible()) return *reason;
+		if (refresh_allowed && !SafeToDownload(m_slot_images[id])) {
+			// Before the metadata buffer is acquired: the refresh may create or join the buffer
+			// under the image, which can share a caching page with the metadata.
+			refreshed = true;
+			InitializeImage(id);
+		}
+	}
+	// KYTY_DCC_GPU_REFRESH_VERIFY: today's decision for an image accepted through the refresh,
+	// from the metadata bytes the inspection will read (after a drain, as the CPU fallback).
+	std::vector<uint8_t> verify_bytes;
+	std::vector<uint8_t> verify_clears;
+	if (refreshed && m_dcc_gpu_refresh_verify != 0) {
+		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		verify_bytes.resize(slice_size * count);
+		verify_clears.resize(count);
+		if (!LibKernel::Memory::TryReadBacking(slice_range(0).address, verify_bytes.data(),
+		                                       verify_bytes.size())) {
+			EXIT("TextureCache: failed to read DCC metadata for verification\n");
+		}
+		for (uint32_t slice = 0; slice < count; ++slice) {
+			const auto* bytes = verify_bytes.data() + slice_size * slice;
+			vk::ClearColorValue color {};
+			verify_clears[slice] =
+			    DecodeDccClear(desc, bytes[0], color) &&
+			    std::all_of(bytes, bytes + slice_size, [&](uint8_t byte) { return byte == bytes[0]; });
+		}
 	}
 	// Use the canonical buffer and its normal GPU-write tracking. No CPU shadow of the
 	// clear value is trusted. Acquiring it may upload/submit, so hold no texture lock.
@@ -2539,6 +2596,11 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	std::scoped_lock lock {m_lock};
 	if (const auto reason = eligible()) return *reason;
 	auto& image = m_slot_images[id];
+	if (refresh_allowed && !SafeToDownload(image)) {
+		// Only when something dirtied the image again since the refresh above.
+		refreshed = true;
+		InitializeImage(id);
+	}
 	TrackImage(id);
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("DCC::GpuMaterialize");
@@ -2548,6 +2610,14 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 		}
 	}
 	CommitGpuWrite(image);
+	if (refreshed) {
+		m_dcc_refresh_totals.refreshes += count;
+		Profiler::CountFrameEvent(Event::DccGpuRefreshes, count);
+		if (!verify_clears.empty()) {
+			RecordDccRefreshVerify(*buffer, offset + slice_size * first, slice_size,
+			                       std::move(verify_bytes), std::move(verify_clears), range);
+		}
+	}
 	if (!cmask) {
 		m_gpu_dcc_records += count;
 		Profiler::CountFrameEvent(Event::DccGpuRecords, count);
@@ -2580,6 +2650,78 @@ Profiler::FrameEvent TextureCache::TryMaterializeGpuMetadataClear(
 	                   static_cast<uint32_t>(view.format), static_cast<uint32_t>(desc.type), first,
 	                   count, m_scheduler.CurrentTick());
 	return Event::DccGpuRecords;
+}
+
+void TextureCache::RecordDccRefreshVerify(Buffer& metadata, uint64_t offset, uint64_t slice_size,
+                                          std::vector<uint8_t> before, std::vector<uint8_t> clears,
+                                          GuestRange range) {
+	// Caller holds m_lock, right after the inspection was recorded: copy the inspected slices
+	// out behind it and, once the recording completed, check what the helper did to them against
+	// the CPU fallback's decision. A cleared slice has its key consumed (every byte 0xFF); any
+	// other slice is untouched.
+	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	const auto bytes    = static_cast<uint64_t>(before.size());
+	const auto [mapped, download_offset] = download.Map(bytes, 64);
+	if (mapped == nullptr) {
+		EXIT("TextureCache: DCC refresh verification exceeds the download ring\n");
+	}
+	download.Commit();
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask       = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eMemoryWrite;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = metadata.Handle();
+	barrier.offset              = offset;
+	barrier.size                = bytes;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &barrier, 0,
+	                       nullptr);
+	const vk::BufferCopy copy {offset, download_offset, bytes};
+	native.copyBuffer(metadata.Handle(), download.Handle(), 1, &copy);
+	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	barrier.buffer        = download.Handle();
+	barrier.offset        = download_offset;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                       {}, 0, nullptr, 1, &barrier, 0, nullptr);
+	m_scheduler.DeferOperation([this, &download, mapped = mapped, download_offset = download_offset,
+	                            bytes, slice_size, before = std::move(before),
+	                            clears = std::move(clears), range] {
+		download.Invalidate(download_offset, bytes);
+		const auto* after = mapped;
+		uint32_t    wrong = 0;
+		for (size_t slice = 0; slice < clears.size(); ++slice) {
+			const auto* now  = after + slice_size * slice;
+			const auto* then = before.data() + slice_size * slice;
+			const bool  ok   = clears[slice] != 0
+			                       ? std::all_of(now, now + slice_size,
+			                                     [](uint8_t byte) { return byte == 0xffu; })
+			                       : std::memcmp(now, then, slice_size) == 0;
+			wrong += ok ? 0u : 1u;
+		}
+		m_dcc_refresh_totals.verify_checks++;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DccGpuRefreshVerifyChecks);
+		if (wrong == 0) {
+			return;
+		}
+		m_dcc_refresh_totals.verify_mismatches += wrong;
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DccGpuRefreshVerifyMismatches, wrong);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::fprintf(stderr,
+			             "DccGpuRefreshVerify: %u slice(s) of metadata 0x%016" PRIx64
+			             " size=0x%" PRIx64 " differ from the CPU fallback's decision\n",
+			             wrong, range.address, range.size);
+		}
+		if (m_dcc_gpu_refresh_verify == 2) {
+			EXIT("DccGpuRefreshVerify: a refreshed image's inspection differs from the CPU "
+			     "fallback\n");
+		}
+	});
 }
 
 void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
@@ -2689,10 +2831,10 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 					if (cause_logged[static_cast<size_t>(m_image_state_reason)].fetch_add(
 					        1, std::memory_order_relaxed) < 4) {
 						std::fprintf(stderr,
-						             "DCC CPU fallback, image state cause %u: metadata=0x%016" PRIx64
+						             "DCC CPU fallback, image state cause %s: metadata=0x%016" PRIx64
 						             " bytes=%" PRIu64 " data=0x%016" PRIx64 " size=0x%" PRIx64
 						             " extent=%ux%u type=%u\n",
-						             static_cast<uint32_t>(m_image_state_reason), range.address,
+						             DccImageStateName(m_image_state_reason), range.address,
 						             range.size, desc.info.data.address, desc.info.data.size,
 						             desc.info.extent.width, desc.info.extent.height,
 						             static_cast<uint32_t>(desc.type));

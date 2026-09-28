@@ -545,6 +545,9 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.ReadbackSideOtherPublication.Cumulative",
     "FrameEvent.ReadbackSideOtherNoDirty.Cumulative",
     "FrameEvent.ReadbackSideOtherSlot.Cumulative",
+    "FrameEvent.DccGpuRefreshes.Cumulative",
+    "FrameEvent.DccGpuRefreshVerifyChecks.Cumulative",
+    "FrameEvent.DccGpuRefreshVerifyMismatches.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
