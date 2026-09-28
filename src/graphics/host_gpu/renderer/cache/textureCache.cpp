@@ -4397,6 +4397,28 @@ uint64_t TextureCache::MaterializeOwnedBytes(GuestRange range, ImageId only, Ima
 		    !image->OwnsBytesIn(range.address, range.size)) {
 			return;
 		}
+		// CPU invalidation releases write tracking for the image (or its dirty chunks),
+		// but its old GPU-owned range can remain until refresh/retirement. Those native
+		// contents are no longer a source of guest bytes. In particular, retiring an old
+		// render target must not tile its pixels over CPU tables that reused the memory.
+		// Match SafeToSyncIntoBuffer's CPU-dirty rejection. InitializeImage also excludes
+		// definitely CPU-dirty images from its own-byte preservation before a rebuild.
+		if (image->IsCpuDirty()) {
+			static const bool diagnose = [] {
+				const auto* value = std::getenv("KYTY_ALIAS_CPU_WRITE_DIAGNOSTICS");
+				return value != nullptr && std::strcmp(value, "1") == 0;
+			}();
+			static std::atomic<uint32_t> logged {0};
+			if (diagnose && logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+				std::fprintf(stderr,
+				             "AliasCpuWrite: rejected stale image addr=0x%016" PRIx64
+				             " size=0x%" PRIx64 " dirty_begin=0x%016" PRIx64
+				             " dirty_bytes=0x%" PRIx64 " reason=%s\n",
+				             image->info.data.address, image->info.data.size,
+				             image->DirtySpanBegin(), image->DirtySpanBytes(), reason);
+			}
+			return;
+		}
 		Owner owner {id, {}};
 		image->ForEachOwnedRange(range.address, range.size, [&](uint64_t begin, uint64_t end) {
 			owner.ranges.Add(begin, end - begin);
@@ -4409,7 +4431,8 @@ uint64_t TextureCache::MaterializeOwnedBytes(GuestRange range, ImageId only, Ima
 			// Bytes another image owns too (the destination of a copy from this one) stay there.
 			for (const auto id: FindImagesInRegion(range.address, range.size, false)) {
 				const auto* other = m_slot_images.try_get(id);
-				if (id == only || other == nullptr || !other->registered || other->depth_id) {
+				if (id == only || other == nullptr || !other->registered || other->depth_id ||
+				    other->IsCpuDirty()) {
 					continue;
 				}
 				other->ForEachOwnedRange(range.address, range.size,
