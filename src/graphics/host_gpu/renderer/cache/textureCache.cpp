@@ -344,6 +344,11 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 			m_gpu_write_skip_verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
 		}
 	}
+	m_lru_touch_skip = EnvNotZero("KYTY_IMAGE_LRU_SKIP");
+	if (const auto* verify = std::getenv("KYTY_IMAGE_LRU_SKIP_VERIFY");
+	    verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0) {
+		m_lru_touch_skip_verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
+	}
 	if (const auto* refresh = std::getenv("KYTY_DCC_GPU_REFRESH");
 	    refresh != nullptr && std::strcmp(refresh, "1") == 0) {
 		m_dcc_gpu_refresh = true;
@@ -881,6 +886,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_tick   = m_lru_cache.TickOf(image.lru_id);
 	m_total_used_memory += image.AccountedSize();
 	m_registered_image_memory += image.AccountedSize();
 	// Registration precedes the first TrackImage, so the tracking mode never changes while
@@ -1031,9 +1037,58 @@ void TextureCache::TouchImage(Image& image) {
 		HangTrace::RecordCp(event);
 	}
 	image.frame_accessed_last = m_frame.load(std::memory_order_relaxed);
-	if (image.registered) {
-		m_lru_cache.Touch(image.lru_id, m_gc_tick);
+	if (!image.registered) {
+		return;
 	}
+	const auto bump = [](std::atomic<uint64_t>& counter) {
+		counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+	};
+	// KYTY_IMAGE_LRU_SKIP: Touch returns at once for an item whose tick is not older than
+	// m_gc_tick, and image.lru_tick is that tick (textureCache.h).
+	bool skip = m_lru_touch_skip && image.lru_tick >= m_gc_tick;
+	if (m_lru_touch_skip_verify != 0) [[unlikely]] {
+		if (!LruMirrorHolds(image, skip)) {
+			skip = false; // today's path
+		}
+	}
+	if (skip) {
+		bump(m_lru_touch_totals.skips);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageLruTouchSkips);
+		return;
+	}
+	bump(m_lru_touch_totals.touches);
+	m_lru_cache.Touch(image.lru_id, m_gc_tick);
+	image.lru_tick = m_lru_cache.TickOf(image.lru_id);
+}
+
+bool TextureCache::LruMirrorHolds(Image& image, bool skip) {
+	const auto bump = [](std::atomic<uint64_t>& counter, uint64_t amount = 1) {
+		counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+	};
+	bump(m_lru_touch_totals.verify_checks);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::ImageLruVerifyChecks);
+	const bool linked = m_lru_cache.Linked(image.lru_id);
+	const auto item   = linked ? m_lru_cache.TickOf(image.lru_id) : 0;
+	if (linked && item == image.lru_tick) {
+		return true;
+	}
+	bump(m_lru_touch_totals.verify_mismatches);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::ImageLruVerifyMismatches);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::fprintf(stderr,
+		             "ImageLruVerify: image 0x%016" PRIx64 " size=0x%" PRIx64
+		             " mirror tick %" PRIu64 ", LRU item %zu %s tick %" PRIu64 ", GC tick %" PRIu64
+		             " (%s)\n",
+		             image.info.data.address, image.info.data.size, image.lru_tick, image.lru_id,
+		             linked ? "at" : "unlinked,", item, m_gc_tick,
+		             skip ? "the mirror skipped the touch" : "touched");
+	}
+	if (m_lru_touch_skip_verify == 2) {
+		EXIT("ImageLruVerify: an image's LRU mirror differs from its LRU item\n");
+	}
+	// Repair after the touch (TouchImage copies the item's tick back).
+	return false;
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
@@ -2843,6 +2898,8 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	uint64_t diagnostic_readback = 0;
+	// Why this decision is not a provable no-op (instrumentation; the paths below refine it).
+	m_dcc_noop_refusal = Profiler::FrameEvent::TargetRecordDccGuest;
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
 		// The guest's DCC fast clear is a uniform fill of the metadata. When the whole range still
 		// holds a recorded fill (nothing wrote it since), every slice's code is that byte: no
@@ -2869,9 +2926,12 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 					decided.gpu_range_count = 1;
 					decided.provable        = true;
 					*noop                   = decided;
+				} else {
+					m_dcc_noop_refusal = Profiler::FrameEvent::TargetRecordDccPages;
 				}
 				return; // e.g. 0xFF: not a clear code, nothing to materialize
 			}
+			m_dcc_noop_refusal    = Profiler::FrameEvent::TargetRecordDccClear;
 			const auto slice_size = range.size / layers;
 			for (uint32_t slice = 0; slice < count; slice++) {
 				{
@@ -2892,6 +2952,8 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			const auto outcome = TryMaterializeGpuDccClear(id, desc, metadata_base_layer);
 			const bool native  = outcome == Profiler::FrameEvent::DccGpuRecords ||
 			                    outcome == Profiler::FrameEvent::DccGpuReuses;
+			m_dcc_noop_refusal = native ? Profiler::FrameEvent::TargetRecordDccNative
+			                            : Profiler::FrameEvent::TargetRecordDccFallback;
 			if (!native) {
 				++m_gpu_dcc_fallbacks;
 				Profiler::CountFrameEvent(Profiler::FrameEvent::DccCpuFallbacks);
@@ -3190,7 +3252,11 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		m_buffer_cache.FillBuffer(metadata.address, metadata.size, UINT32_MAX, false);
 		Profiler::CountFrameEvent(Event::CmaskFastClears);
 	}
-	if (std::ranges::find(native, uint8_t {1}) == native.end()) {
+	// Why this decision is not a provable no-op, when it is not (instrumentation).
+	const bool any_native = std::ranges::find(native, uint8_t {1}) != native.end();
+	m_cmask_noop_refusal  = any_native ? Profiler::FrameEvent::TargetRecordCmaskNative
+	                                   : Profiler::FrameEvent::TargetRecordCmaskOther;
+	if (!any_native) {
 		if (provable) {
 			decided.provable = true;
 			*noop            = decided;
@@ -3341,6 +3407,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
+	// Instrumentation: why a record did not become valid before the metadata decisions.
+	auto lookup_refusal = Profiler::FrameEvent::TargetRecordNotFirstPage;
 	{
 		std::scoped_lock lock {m_lock};
 		ImageIds candidates;
@@ -3457,6 +3525,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 			record->exact_format    = exact_format;
 			record->has_partner     = HasAliasPartner(pages.first, result, image);
 			record->valid           = true;
+		} else if (first_page_answer) {
+			lookup_refusal = Profiler::FrameEvent::TargetRecordChanged;
 		}
 	}
 	const bool recording = record != nullptr && record->valid;
@@ -3464,6 +3534,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, RepeatLookup
 	MaterializeCmaskClear(result, desc, metadata_base_layer, recording ? &record->cmask : nullptr);
 	if (recording) {
 		record->valid = record->dcc.provable && record->cmask.provable;
+		if (!record->valid) {
+			Profiler::CountFrameEvent(!record->dcc.provable ? m_dcc_noop_refusal
+			                                                : m_cmask_noop_refusal);
+		}
+	} else if (record != nullptr) {
+		Profiler::CountFrameEvent(lookup_refusal);
 	}
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {

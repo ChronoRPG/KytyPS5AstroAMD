@@ -937,6 +937,30 @@ if(BUILD_TESTING)
 	# CPU fallback, for a buffer-modified and a CPU-dirty image (the check sets the switches).
 	add_test(NAME dcc_gpu_refresh
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dcc-gpu-refresh-only)
+	# KYTY_IMAGE_LRU_SKIP: the same LRU order with the touch skip on and off, its verify mode on
+	# every decision, and the switch.
+	add_test(NAME image_lru_skip
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-lru-skip-only)
+	add_test(NAME image_lru_skip_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-lru-skip-only)
+	set_tests_properties(image_lru_skip_verify PROPERTIES
+		ENVIRONMENT "KYTY_IMAGE_LRU_SKIP_VERIFY=exit")
+	add_test(NAME image_lru_skip_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-lru-skip-only)
+	set_tests_properties(image_lru_skip_off PROPERTIES
+		ENVIRONMENT "KYTY_IMAGE_LRU_SKIP=0")
+	# KYTY_IMAGE_TRANSIT_SKIP: the no-op pre-check against GetBarriers, and Transit's skips (or
+	# verify checks).
+	add_test(NAME image_transit_skip
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-transit-skip-only)
+	add_test(NAME image_transit_skip_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-transit-skip-only)
+	set_tests_properties(image_transit_skip_verify PROPERTIES
+		ENVIRONMENT "KYTY_IMAGE_TRANSIT_SKIP_VERIFY=exit")
+	add_test(NAME image_transit_skip_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-transit-skip-only)
+	set_tests_properties(image_transit_skip_off PROPERTIES
+		ENVIRONMENT "KYTY_IMAGE_TRANSIT_SKIP=0")
 	# Tracker-gap detectors: the page states they classify host writes by.
 	add_test(NAME tracker_gap_detectors
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tracker-gap-detectors-only)

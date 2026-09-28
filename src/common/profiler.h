@@ -1051,6 +1051,37 @@ enum class FrameEvent : uint32_t {
 	// thread compared at commit with the commit-time list, and the differences.
 	DrawPrepCertRangesVerifyChecks,
 	DrawPrepCertRangesVerifyMismatches,
+	// KYTY_IMAGE_LRU_SKIP (TextureCache::TouchImage): LRU touches skipped because the image was
+	// touched in the current GC tick already, and the verify mode's mirror checks.
+	ImageLruTouchSkips,
+	ImageLruVerifyChecks,
+	ImageLruVerifyMismatches,
+	// KYTY_IMAGE_TRANSIT_SKIP (Image::Transit): transitions that return before GetBarriers
+	// because nothing would change, and the verify mode's checks of that decision.
+	ImageTransitSkips,
+	ImageTransitVerifyChecks,
+	ImageTransitVerifyMismatches,
+	// KYTY_DRAW_SEQUENCE_FAST target records (TextureCache::FindImage) that end invalid, so the
+	// next lookup of the target is a full FindImage, by the first reason (lookups of a null image,
+	// which cost nothing, are not counted):
+	//   NotFirstPage - the image did not come from the first-page lookup (overlap or new image);
+	//   Changed      - the first-page answer changed during the lookup (residency, alias sync),
+	//                  or the image is unregistered or a video-out surface;
+	//   Dcc*         - the DCC decision was not a provable no-op: a recorded-fill clear was applied
+	//                  (Clear), the native inspection (Native) or the readback (Fallback) decided
+	//                  GPU-owned bytes, guest bytes decided (Guest), or the metadata pages could not
+	//                  be captured (Pages);
+	//   Cmask*       - the CMASK decision: GPU-owned bytes without a recorded fill (Native), or any
+	//                  other non-provable decision (guest bytes, a clear, fills).
+	TargetRecordNotFirstPage,
+	TargetRecordChanged,
+	TargetRecordDccClear,
+	TargetRecordDccNative,
+	TargetRecordDccFallback,
+	TargetRecordDccGuest,
+	TargetRecordDccPages,
+	TargetRecordCmaskNative,
+	TargetRecordCmaskOther,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

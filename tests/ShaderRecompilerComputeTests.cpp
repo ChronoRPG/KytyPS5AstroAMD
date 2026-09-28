@@ -340,16 +340,21 @@ struct TextureCacheTestAccess {
         live.push_back(id);
       }
     });
+    // Every Insert also sets the image's mirror of its item's tick (KYTY_IMAGE_LRU_SKIP), as
+    // RegisterImage does.
     for (const auto id : oldest) {
       const auto owner = cache.m_slot_images.try_get(id);
       if (owner != nullptr && owner->registered) {
         owner->tick_accessed_last = 0;
         owner->lru_id = cache.m_lru_cache.Insert(id, 0);
+        owner->lru_tick = 0;
       }
     }
     for (const auto id : live) {
       if (std::ranges::find(oldest, id) == oldest.end()) {
-        cache.m_slot_images[id].lru_id = cache.m_lru_cache.Insert(id, tick);
+        auto &image = cache.m_slot_images[id];
+        image.lru_id = cache.m_lru_cache.Insert(id, tick);
+        image.lru_tick = tick;
       }
     }
   }
@@ -574,6 +579,29 @@ struct TextureCacheTestAccess {
   static void Unregister(TextureCache &cache, ImageId id) {
     std::lock_guard lock(cache.m_lock);
     cache.UnregisterImage(id);
+  }
+  // KYTY_IMAGE_LRU_SKIP.
+  static bool &LruSkip(TextureCache &cache) { return cache.m_lru_touch_skip; }
+  static int &LruVerify(TextureCache &cache) { return cache.m_lru_touch_skip_verify; }
+  static const TextureCache::LruTouchTotals &LruTotals(const TextureCache &cache) {
+    return cache.m_lru_touch_totals;
+  }
+  static void AdvanceGcTick(TextureCache &cache) {
+    std::lock_guard lock(cache.m_lock);
+    cache.m_gc_tick++;
+  }
+  // The LRU order, oldest first, as (image data address, item tick) pairs.
+  static std::vector<std::pair<uint64_t, uint64_t>> LruOrder(TextureCache &cache) {
+    std::lock_guard lock(cache.m_lock);
+    std::vector<std::pair<uint64_t, uint64_t>> order;
+    cache.m_lru_cache.ForEachItemBelow(UINT64_MAX, [&](ImageId id) {
+      const auto &image = cache.m_slot_images[id];
+      order.emplace_back(image.info.data.address, cache.m_lru_cache.TickOf(image.lru_id));
+    });
+    return order;
+  }
+  static uint64_t &LruMirror(TextureCache &cache, ImageId id) {
+    return cache.m_slot_images[id].lru_tick;
   }
   // KYTY_DCC_GPU / KYTY_DCC_GPU_REFRESH.
   static bool DccHelperAvailable(const TextureCache &cache) {
@@ -7916,6 +7944,273 @@ public:
             "DCC refresh allocation release failed");
   }
 
+  // KYTY_IMAGE_LRU_SKIP (TextureCache::TouchImage): one script of image touches, GC ticks,
+  // re-registrations (a new LRU item) and image recreations (a reused LRU item) leaves the same
+  // LRU order and item ticks after every step with the skip on and off. The verify mode checks
+  // the image's mirror against its item on every decision; a corrupted mirror is caught and the
+  // image is still touched (the order stays the same).
+  void CheckImageLruSkip() {
+    constexpr const char *name = "ImageLruSkip";
+    constexpr uint64_t base = 0x0000000268000000ull;
+    constexpr uint64_t stride = 0x100000;
+    constexpr uint32_t images = 6;
+    constexpr uint32_t steps = 600;
+    EnsureRuntimeContext();
+    using Order = std::vector<std::pair<uint64_t, uint64_t>>;
+    struct Run {
+      std::vector<Order> orders;
+      uint64_t decisions = 0;
+      uint64_t corruptions = 0;
+      uint64_t skips = 0;
+      uint64_t touches = 0;
+      uint64_t verify_checks = 0;
+      uint64_t verify_mismatches = 0;
+      bool env_skip = false;
+      int env_verify = 0;
+    };
+    const auto run = [&](bool skip, bool corrupt) {
+      const auto context_owner = MakeRenderContext();
+      auto &cache = context_owner->GetTextureCache();
+      Run result;
+      result.env_skip = TextureCacheTestAccess::LruSkip(cache);
+      result.env_verify = TextureCacheTestAccess::LruVerify(cache);
+      TextureCacheTestAccess::LruSkip(cache) = skip;
+      if (corrupt) {
+        TextureCacheTestAccess::LruVerify(cache) = 1; // count the planted mismatches, no exit
+      }
+      std::vector<ImageId> ids(images);
+      const auto insert = [&](uint32_t index) {
+        ImageInfo info{};
+        info.data = {base + stride * index, stride / 2};
+        ids[index] = TextureCacheTestAccess::InsertImage(cache, info);
+      };
+      for (uint32_t index = 0; index < images; index++) {
+        insert(index);
+      }
+      uint32_t state = 0x2545f491u;
+      const auto next = [&] {
+        state = state * 1103515245u + 12345u;
+        return (state >> 16) & 0x7fffu;
+      };
+      for (uint32_t step = 0; step < steps; step++) {
+        const auto op = next() % 16;
+        const auto index = next() % images;
+        if (op < 10) {
+          // The draw path's touch (GetImage touches without the texture-cache lock).
+          (void)cache.GetImage(ids[index]);
+          result.decisions++;
+        } else if (op < 12) {
+          TextureCacheTestAccess::AdvanceGcTick(cache);
+        } else if (op == 12) {
+          TextureCacheTestAccess::Unregister(cache, ids[index]);
+          TextureCacheTestAccess::Register(cache, ids[index]);
+        } else if (op == 13) {
+          TextureCacheTestAccess::DeleteImage(cache, ids[index]);
+          insert(index);
+        } else if (op == 14 && corrupt) {
+          // A mirror claiming a touch its item never had.
+          TextureCacheTestAccess::LruMirror(cache, ids[index]) = UINT64_MAX;
+          result.corruptions++;
+        }
+        result.orders.push_back(TextureCacheTestAccess::LruOrder(cache));
+      }
+      const auto &totals = TextureCacheTestAccess::LruTotals(cache);
+      result.skips = totals.skips.load();
+      result.touches = totals.touches.load();
+      result.verify_checks = totals.verify_checks.load();
+      result.verify_mismatches = totals.verify_mismatches.load();
+      for (const auto id : ids) {
+        TextureCacheTestAccess::DeleteImage(cache, id);
+      }
+      return result;
+    };
+
+    const auto off = run(false, false);
+    const auto on = run(true, false);
+    const auto planted = run(true, true);
+    const char *skip_env = std::getenv("KYTY_IMAGE_LRU_SKIP");
+    const bool expect_env_skip = skip_env == nullptr || std::strcmp(skip_env, "0") != 0;
+    Require(name, "switch", on.env_skip == expect_env_skip,
+            "KYTY_IMAGE_LRU_SKIP did not set the skip");
+    Require(name, "decisions",
+            off.skips == 0 && off.touches == off.decisions &&
+                on.skips + on.touches == on.decisions && on.skips != 0 &&
+                on.decisions == off.decisions,
+            "the touches were not all decided, or the skip never (or, off, ever) skipped");
+    Require(name, "same order", on.orders == off.orders,
+            "the skip changed the LRU order or an item's tick");
+    Require(name, "verify",
+            on.verify_mismatches == 0 &&
+                (on.env_verify == 0 ? on.verify_checks == 0 : on.verify_checks == on.decisions),
+            "the verify mode missed a decision or found a mismatch without a planted one");
+    Require(name, "planted mismatches",
+            planted.orders == off.orders && planted.corruptions != 0 &&
+                planted.verify_mismatches != 0 &&
+                planted.verify_mismatches <= planted.corruptions &&
+                planted.verify_checks == planted.decisions,
+            "a corrupted mirror was not caught, or it changed the LRU order");
+    std::printf("[host]    %-32s ok (%llu touches: %llu skipped; env skip %s, verify %s; "
+                "%llu planted mirrors caught)\n",
+                name, static_cast<unsigned long long>(on.decisions),
+                static_cast<unsigned long long>(on.skips), on.env_skip ? "on" : "off",
+                on.env_verify != 0 ? "on" : "off",
+                static_cast<unsigned long long>(planted.verify_mismatches));
+  }
+
+  // KYTY_IMAGE_TRANSIT_SKIP (Image::Transit, Image::TransitIsNoOp): whenever the pre-check says a
+  // transition is a no-op, GetBarriers returns no barrier and changes no state, for every
+  // combination of states, per-subresource states, full and partial ranges, volumes and repeated
+  // writes; the common case (whole image, same read state) is taken; and Transit counts its skips
+  // (or, in the verify mode, its checks) without mismatches.
+  void CheckImageTransitSkip() {
+    constexpr const char *name = "ImageTransitSkip";
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+
+    ImageInfo array_info{};
+    array_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+    array_info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
+    array_info.type = Prospero::ImageType::kColor2D;
+    array_info.extent = {8, 8, 1};
+    array_info.resources = {2, 2};
+    array_info.pitch = 8;
+    array_info.bytes_per_block = 4;
+    array_info.samples = 1;
+    array_info.tile_mode = Prospero::TileMode::kLinear;
+    array_info.mip_layout[0] = {0, 512, 8, 8};
+    array_info.mip_layout[1] = {512, 128, 4, 4};
+    auto volume_info = array_info;
+    volume_info.type = Prospero::ImageType::kColor3D;
+    volume_info.extent = {8, 8, 4};
+    volume_info.resources = {2, 1};
+
+    const char *skip_env = std::getenv("KYTY_IMAGE_TRANSIT_SKIP");
+    const bool skip_on = skip_env == nullptr || std::strcmp(skip_env, "0") != 0;
+    const char *verify_env = std::getenv("KYTY_IMAGE_TRANSIT_SKIP_VERIFY");
+    const bool verify_on =
+        verify_env != nullptr && *verify_env != '\0' && std::strcmp(verify_env, "0") != 0;
+    uint64_t cases = 0;
+    uint64_t predicted = 0;
+    uint64_t skips = 0;
+    uint64_t checks = 0;
+    {
+      Libs::Graphics::Image array(m_runtime_context, scheduler, array_info);
+      Libs::Graphics::Image volume(m_runtime_context, scheduler, volume_info);
+      const auto same = [](const VulkanImageState &a, const VulkanImageState &b) {
+        return a.pl_stage == b.pl_stage && a.access_mask == b.access_mask && a.layout == b.layout;
+      };
+      const std::array layouts{vk::ImageLayout::eUndefined, vk::ImageLayout::eShaderReadOnlyOptimal,
+                               vk::ImageLayout::eGeneral, vk::ImageLayout::eColorAttachmentOptimal};
+      const std::array<vk::AccessFlags2, 6> accesses{
+          vk::AccessFlags2{},
+          vk::AccessFlagBits2::eShaderRead,
+          vk::AccessFlagBits2::eShaderWrite,
+          vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+          vk::AccessFlagBits2::eColorAttachmentWrite | vk::AccessFlagBits2::eShaderRead,
+          vk::AccessFlagBits2::eTransferRead};
+      const std::array<std::optional<ImageSubresourceRange>, 6> ranges{
+          std::nullopt,
+          ImageSubresourceRange{0, 2, 0, 2},  // every level and layer of the array
+          ImageSubresourceRange{1, 1, 0, 2},  // one level
+          ImageSubresourceRange{0, 2, 1, 1},  // one layer (a volume: every layer)
+          ImageSubresourceRange{0, 2, 0, 1},  // the volume's whole range
+          ImageSubresourceRange{0, 1, 0, 1}}; // one level of one layer
+      for (auto *image : {&array, &volume}) {
+        const auto subresources =
+            static_cast<size_t>(image->info.resources.levels) * image->info.resources.layers;
+        for (const auto layout : layouts) {
+          for (const auto access : accesses) {
+            for (const bool per_subresource : {false, true}) {
+              const VulkanImageState initial{vk::PipelineStageFlagBits2::eFragmentShader, access,
+                                             layout};
+              for (const auto destination_layout : layouts) {
+                for (const auto destination_access : accesses) {
+                  for (const auto &range : ranges) {
+                    image->backing.state = initial;
+                    image->backing.subresource_states.assign(per_subresource ? subresources : 0,
+                                                             initial);
+                    const bool noop =
+                        image->TransitIsNoOp(destination_layout, destination_access, range);
+                    const auto barriers =
+                        image->GetBarriers(destination_layout, destination_access,
+                                           vk::PipelineStageFlagBits2::eAllGraphics, range);
+                    cases++;
+                    predicted += noop ? 1u : 0u;
+                    if (noop) {
+                      Require(name, "sound",
+                              barriers.empty() && same(image->backing.state, initial) &&
+                                  image->backing.subresource_states.empty(),
+                              "a transition the pre-check calls a no-op needed a barrier or "
+                              "changed the image's state");
+                    }
+                    const bool whole = !range.has_value() ||
+                                       (range->base_level == 0 &&
+                                        range->level_count == image->info.resources.levels &&
+                                        (image->info.IsVolume() ||
+                                         (range->base_layer == 0 &&
+                                          range->layer_count == image->info.resources.layers)));
+                    if (!per_subresource && whole && layout == destination_layout &&
+                        access == destination_access &&
+                        !(access & (vk::AccessFlagBits2::eShaderWrite |
+                                    vk::AccessFlagBits2::eTransferWrite |
+                                    vk::AccessFlagBits2::eMemoryWrite))) {
+                      Require(name, "common case", noop,
+                              "the pre-check missed a whole-image transition to the same read "
+                              "state");
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      array.backing.state = {};
+      array.backing.subresource_states.clear();
+
+      // Transit itself: a barrier, a no-op (skipped, or checked by the verify mode), a write,
+      // and a repeated write (never skipped).
+      using Profiler::FrameEvent;
+      Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Thread);
+      const auto skips0 = Profiler::FrameEventTotal(FrameEvent::ImageTransitSkips);
+      const auto checks0 = Profiler::FrameEventTotal(FrameEvent::ImageTransitVerifyChecks);
+      const auto mismatches0 = Profiler::FrameEventTotal(FrameEvent::ImageTransitVerifyMismatches);
+      const auto full = std::optional<ImageSubresourceRange>(ImageSubresourceRange{0, 2, 0, 2});
+      const auto command = scheduler.Current().Handle();
+      array.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, full,
+                    command, true);
+      array.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, full,
+                    command, true);
+      array.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, std::nullopt,
+                    command, true);
+      array.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, std::nullopt,
+                    command, true);
+      skips = Profiler::FrameEventTotal(FrameEvent::ImageTransitSkips) - skips0;
+      checks = Profiler::FrameEventTotal(FrameEvent::ImageTransitVerifyChecks) - checks0;
+      const auto mismatches =
+          Profiler::FrameEventTotal(FrameEvent::ImageTransitVerifyMismatches) - mismatches0;
+      Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Off);
+      Require(name, "transit",
+              array.backing.state.layout == vk::ImageLayout::eGeneral &&
+                  array.backing.state.access_mask == vk::AccessFlagBits2::eShaderWrite &&
+                  mismatches == 0 &&
+                  skips == (skip_on && !verify_on ? 1u : 0u) &&
+                  checks == (skip_on && verify_on ? 1u : 0u),
+              "Transit did not skip exactly the no-op transition (or its verify mode did not "
+              "check it)");
+      scheduler.Finish();
+    }
+    std::printf("[host]    %-32s ok (%llu cases, %llu no-ops; skip %s, verify %s)\n", name,
+                static_cast<unsigned long long>(cases), static_cast<unsigned long long>(predicted),
+                skip_on ? "on" : "off", verify_on ? "on" : "off");
+  }
+
   // KYTY_GPU_WRITE_IMAGE_SKIP (TextureCache::SkipGpuWriteImageWalk): a GPU buffer write's image
   // checks skip the texture-cache lock and page walk when no image is registered on the write's
   // 1 MiB pages, and never miss an image whose registration races the check.
@@ -15080,6 +15375,11 @@ public:
         auto &executor = context.GetRenderExecutor();
         context.MapMemory(base, allocation_size);
         const auto totals = [&] { return RenderExecutorTestAccess::DrawSequenceTotals(executor); };
+        // Why a target record ends invalid (FrameEvent TargetRecord*, counted per thread).
+        Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Thread);
+        const auto cmask_refusals = [] {
+          return Profiler::FrameEventTotal(Profiler::FrameEvent::TargetRecordCmaskOther);
+        };
 
         // Targets.
         RenderColorInfo color{};
@@ -15099,9 +15399,11 @@ public:
                                              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
                                              clear);
         };
+        const auto r0 = cmask_refusals();
         Require(name, "guest CMASK bytes",
-                lookup() == color.image_id && !record.valid,
-                "a decision that read CMASK bytes in guest memory was recorded as repeatable");
+                lookup() == color.image_id && !record.valid && cmask_refusals() == r0 + one,
+                "a decision that read CMASK bytes in guest memory was recorded as repeatable "
+                "(or not counted as a CMASK refusal)");
 
         // GPU-owned CMASK bytes holding a recorded fill of 0xFFFFFFFF (every tile expanded).
         (void)buffer_cache.ObtainBuffer(cmask_address, cmask_size.size, true);
@@ -15118,11 +15420,14 @@ public:
         paint();
         buffer_cache.FillBuffer(cmask_address, cmask_size.size, 0, false);
         const auto t1 = totals();
+        const auto r1 = cmask_refusals();
         Require(name, "new fill",
                 lookup() == color.image_id && totals().target_repeats == t1.target_repeats &&
                     totals().target_misses == t1.target_misses + one &&
+                    cmask_refusals() == r1 + one &&
                     ReadCachedTexel(name, context, color.image_id) == cleared_texel,
-                "a lookup after a newly recorded fast clear repeated, or did not clear");
+                "a lookup after a newly recorded fast clear repeated, did not clear, or its "
+                "applied clear was not counted as a CMASK refusal");
         // The consumed clear left a recorded fill of 0xFFFFFFFF again.
         (void)lookup();
         paint();
@@ -15163,6 +15468,7 @@ public:
         Require(name, "repeat after the alias left",
                 lookup() == color.image_id && totals().target_repeats == t4.target_repeats + one,
                 "a lookup after the alias was freed did not repeat");
+        Profiler::Detail::g_event_sink.store(Profiler::Detail::CounterSink::Off);
 
         // Textures: one stage binding the same texture twice.
         ShaderTextureResource descriptor{{
@@ -43954,6 +44260,16 @@ int main(int argc, char **argv) {
     vulkan.CheckDccGpuRefresh();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-lru-skip-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImageLruSkip();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-transit-skip-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImageTransitSkip();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--tracker-gap-detectors-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTrackerGapDetectors();
@@ -44242,6 +44558,8 @@ int main(int argc, char **argv) {
   vulkan.CheckShaderUploadDedup();
   vulkan.CheckGpuWriteImageSkip();
   vulkan.CheckDccGpuRefresh();
+  vulkan.CheckImageLruSkip();
+  vulkan.CheckImageTransitSkip();
   vulkan.CheckTrackerGapDetectors();
   vulkan.CheckEagerReadback();
   vulkan.CheckMeshIndirectConversion();
