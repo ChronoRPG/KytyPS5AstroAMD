@@ -82,6 +82,55 @@ void TestBlockReuse() {
 	std::puts("ProfilerCounterTests: block reuse ok");
 }
 
+// ScopedFrameWait with the per-thread sink on and no Tracy profiler (this process never starts
+// one; TRACY_MANUAL_LIFETIME): the scope is counted in the thread's block without touching the
+// profiler, whose GetProfiler() would dereference none. The shared sink without a profiler counts
+// nothing and must not touch it either.
+void TestFrameWaitWithoutProfiler() {
+	Check(!tracy::ProfilerAvailable(), "the test process has a Tracy profiler");
+	using Profiler::FrameWait;
+	constexpr auto kind  = FrameWait::ReadMemory;
+	constexpr auto index = static_cast<size_t>(kind);
+	const auto     wait_calls = [] {
+		return Profiler::Detail::CurrentThreadCounters().wait_calls[index].load();
+	};
+	const auto wait_ns = [] {
+		return Profiler::Detail::CurrentThreadCounters().wait_ns[index].load();
+	};
+	SetSink(CounterSink::Thread);
+	const auto calls = wait_calls();
+	const auto ns    = wait_ns();
+	{
+		Profiler::ScopedFrameWait wait(kind);
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+	}
+	Check(wait_calls() == calls + 1, "a frame wait with the per-thread sink and no profiler was lost");
+	Check(wait_ns() - ns >= 1000000, "a frame wait with the per-thread sink lost its duration");
+	// Another thread, with its own block.
+	uint64_t other_calls = 0;
+	std::thread([&] {
+		const auto before = Profiler::Detail::CurrentThreadCounters().wait_calls[index].load();
+		{ Profiler::ScopedFrameWait wait(kind); }
+		other_calls = Profiler::Detail::CurrentThreadCounters().wait_calls[index].load() - before;
+	}).join();
+	Check(other_calls == 1, "a frame wait on another thread was lost");
+	// Externally measured totals take the same sink.
+	Profiler::AddFrameWait(kind, 2, 1000);
+	Check(wait_calls() == calls + 3, "AddFrameWait with the per-thread sink was lost");
+	// Shared sink, no profiler: not counted (and no profiler access).
+	SetSink(CounterSink::Shared);
+	{
+		Profiler::ScopedFrameWait wait(kind);
+	}
+	Check(wait_calls() == calls + 3, "a shared-sink frame wait without a profiler was counted");
+	SetSink(CounterSink::Off);
+	{
+		Profiler::ScopedFrameWait wait(kind);
+	}
+	Check(wait_calls() == calls + 3, "an Off sink counted a frame wait");
+	std::puts("ProfilerCounterTests: frame waits without a profiler ok");
+}
+
 // Timing: one "command processor" thread makes a flip's worth of counts (about 200k calls in the
 // Sky Garden start view, DEEP-TRACE-U52) while six "workers" count too, through
 //  - the per-thread path (a profiler connected),
@@ -167,6 +216,7 @@ void BenchmarkCounting() {
 int main(int argc, char** argv) {
 	TestTotalsAcrossThreads();
 	TestBlockReuse();
+	TestFrameWaitWithoutProfiler();
 	if (argc < 2 || std::strcmp(argv[1], "--no-benchmark") != 0) {
 		BenchmarkCounting();
 	}
