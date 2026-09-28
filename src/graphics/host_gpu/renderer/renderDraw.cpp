@@ -1102,27 +1102,28 @@ enum class CbColorMode : uint8_t {
 
 // These special modes run color-buffer metadata or decompression operations. The shader is a
 // vehicle for that operation, and its exported color must not be applied as a normal draw.
-// Kyty stores expanded Vulkan images rather than compressed guest surfaces, so no equivalent
-// hardware pass is emitted. Tracked DCC and CMASK fast-clear state is materialized on
-// attachment bind (TextureCache::MaterializeDccClear / MaterializeCmaskClear); FMask is not.
+// Kyty stores expanded Vulkan images rather than compressed guest surfaces. DCC and CMASK
+// clear state must be materialized here even when no ordinary draw ever binds the attachment;
+// a later sampled image or buffer reader need not carry its metadata. FMask is not implemented.
 static bool IsMetadataColorMode(uint8_t mode) {
 	return mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) ||
 	       mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
 	       mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
 }
 
-// KYTY_CB_METADATA_MATERIALIZE=1: a fast-clear-eliminate or DCC-decompress draw first resolves
-// each DCC render-target-tiled colour target it names (FindImage), which materializes a pending
-// uniform DCC fast clear into the image (TextureCache::MaterializeDccClear) and consumes the
+// KYTY_CB_METADATA_MATERIALIZE=0 restores the old diagnostic behavior of dropping the operation.
+// By default a fast-clear-eliminate or DCC-decompress draw first resolves each supported
+// render-target-tiled colour target it names (FindImage), which materializes a pending uniform
+// DCC or CMASK fast clear into the image and consumes the
 // clear key, exactly as a later attachment bind would. On hardware these draws exist to write the
 // cleared values into the surface memory for readers without DCC metadata (a T# without META,
 // buffer reads); dropping them left such readers with the surface's previous contents whenever
-// no draw bound the target in between. Off by default until a trace shows which targets the game
-// eliminates (cp.csv "cb-meta-op" rows, KYTY_HANG_TRACE_CP=1).
+// no draw bound the target in between. Astro Bot's water input uses exactly this CMASK route:
+// dropping the eliminate exposes stale scene texels at normal and top-down camera angles.
 static bool MetadataColorMaterializeEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_CB_METADATA_MATERIALIZE");
-		return value != nullptr && std::strcmp(value, "1") == 0;
+		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
 	return enabled;
 }

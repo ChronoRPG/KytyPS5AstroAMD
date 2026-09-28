@@ -16025,6 +16025,36 @@ public:
                     all_bytes(cmask_bytes(), 0xff),
                 "a CMASK fast clear in guest memory was not applied or not consumed");
 
+        // Sky Garden's water input: eliminate the clear, then sample without any intervening
+        // render-target bind and without metadata in the sampled description. Dropping mode 2
+        // leaves stale scene texels here, which become magnified foliage/white water in-game.
+        paint();
+        RenderExecutorTestAccess::ResetBindings(executor);
+        fill_cmask(cmask_words, 0);
+        auto eliminate_control = registers.GetColorControl();
+        eliminate_control.mode = 2;
+        registers.SetColorControl(eliminate_control);
+        RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                          {.vertex_count = 3, .instance_count = 1});
+        registers.SetColorControl({});
+        auto sampled = color.desc;
+        sampled.type = TextureCache::BindingType::Texture;
+        sampled.cmask = {};
+        sampled.info.metadata = {};
+        sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        const auto sampled_id = texture_cache.FindImage(sampled);
+        (void)texture_cache.FindTexture(sampled_id, sampled);
+        Require(name, "CMASK eliminate before metadata-free sample",
+                ReadCachedTexel(name, context, sampled_id) == cleared_texel &&
+                    ReadCachedTexel(name, context, sampled_id, {511, 255, 0}) == cleared_texel &&
+                    all_bytes(cmask_bytes(), 0xff),
+                "the eliminate was dropped: the sampled image still contains stale texels");
+        paint();
+        bind();
+        Require(name, "eliminated CMASK does not clear a later draw",
+                ReadCachedTexel(name, context, color.image_id) == painted,
+                "the already consumed eliminate cleared subsequent rendering");
+
         paint();
         registers.SetColorInfo(
             0, {.format = Prospero::ChannelLayout::k16_16_16_16,
@@ -16871,7 +16901,7 @@ public:
 
         // A fast clear the target is not bound after, then a fast-clear-eliminate draw, then a
         // read through a description without DCC metadata (a T# without META): the eliminate
-        // makes the clear visible (KYTY_CB_METADATA_MATERIALIZE=1); dropped, the reader keeps
+        // makes the clear visible by default; with KYTY_CB_METADATA_MATERIALIZE=0 the reader keeps
         // the previous contents.
         if (!fill_case.reuse_unorm) {
           paint();
@@ -16890,7 +16920,7 @@ public:
           sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
           const auto sampled_id = texture_cache.FindImage(sampled);
           const char *materialize = std::getenv("KYTY_CB_METADATA_MATERIALIZE");
-          const bool enabled = materialize != nullptr && std::strcmp(materialize, "1") == 0;
+          const bool enabled = materialize == nullptr || std::strcmp(materialize, "0") != 0;
           const auto expected =
               enabled ? std::vector<u32>(fill_case.texel.begin(), fill_case.texel.end())
                       : painted;
