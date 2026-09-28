@@ -856,6 +856,13 @@ public:
 			                                       flags);
 		}
 	}
+	void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, uint32_t query) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->writeTimestamp2(stage, pool, query);
+		} else {
+			m_owner->m_buffer.writeTimestamp2(stage, pool, query);
+		}
+	}
 
 private:
 	const CommandBuffer* m_owner;

@@ -487,6 +487,16 @@ void Replay(const Header& header, Exec& exec, ReplayState& state, MismatchHandle
 			                          p.flags);
 			break;
 		}
+		case Op::WriteTimestamp2: {
+			const auto& p         = reader.Get<WriteTimestampPacket>();
+			uint64_t    pool_bits = 0;
+			const auto  raw       = static_cast<VkQueryPool>(p.pool);
+			std::memcpy(&pool_bits, &raw, sizeof(pool_bits));
+			check(VerifyHash::Value(op, pool_bits, p.query, p.stage));
+			const auto stage = vk::PipelineStageFlags2(static_cast<VkPipelineStageFlags2>(p.stage));
+			exec.writeTimestamp2(stage, p.pool, p.query);
+			break;
+		}
 	}
 	if (site != nullptr) {
 		exec.LeaveSite();

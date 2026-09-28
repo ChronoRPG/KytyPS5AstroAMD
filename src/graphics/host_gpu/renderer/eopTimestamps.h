@@ -38,6 +38,7 @@
 // here, and stays at record time.
 namespace Libs::Graphics {
 
+class CommandSink;
 struct GraphicContext;
 
 namespace EopTimestamps {
@@ -74,11 +75,13 @@ public:
 	// then a no-op and the timestamps keep their record-time values.
 	[[nodiscard]] bool Valid() const noexcept { return m_pool != nullptr; }
 
-	// Directly after vkBeginCommandBuffer, outside rendering: resets the slots already read.
-	void BeginCommand(vk::CommandBuffer buffer);
+	// Directly after the command buffer begins, outside rendering: resets the slots already read.
+	// Through a CommandSink: with KYTY_CP_RECORDER the resets and timestamp writes are recorder
+	// packets, in stream order, and never drain the recorder.
+	void BeginCommand(const CommandSink& sink);
 	// At an end-of-pipe clock write: records a timestamp query at this point of the command
 	// buffer. Returns its slot, or NoSlot (no free slot: the record-time value stays).
-	[[nodiscard]] uint32_t RecordQuery(vk::CommandBuffer buffer);
+	[[nodiscard]] uint32_t RecordQuery(const CommandSink& sink);
 	// The slot's value goes to `address`, which now holds `record_value`, once `tick` completed.
 	void Queue(uint32_t slot, uint64_t tick, uint64_t address, uint64_t record_value);
 	// At a packet boundary with the draw-prep window empty: rewrites every queued timestamp whose

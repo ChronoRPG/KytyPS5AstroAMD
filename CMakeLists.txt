@@ -1121,9 +1121,12 @@ if(BUILD_TESTING)
 	add_cp_recorder_variants(compute_meta_clear_classification --compute-meta-clear-only)
 	add_cp_recorder_variants(buffer_cache_dirty_gc --buffer-cache-gc-only)
 	add_cp_recorder_variants(buffer_cache_eager_readback --readback-eager-only)
-	# KYTY_EOP_TIMESTAMPS=gpu with the recorder: its queries and slot resets are recorded in direct
-	# windows (CommandScheduler::BeginCommand, CommandProcessor::RecordEopTimestamp).
+	# KYTY_EOP_TIMESTAMPS=gpu with the recorder: its query writes and slot resets are recorder
+	# packets (WriteTimestamp2, ResetQueryPool); the clock writes drain nothing. gpu-verify checks
+	# the published values.
 	add_cp_recorder_variants(eop_timestamps_gpu --eop-timestamps-only KYTY_EOP_TIMESTAMPS=gpu)
+	add_cp_recorder_variants(eop_timestamps_gpu_verify --eop-timestamps-only
+		KYTY_EOP_TIMESTAMPS=gpu-verify)
 	# The recorder under VK_LAYER_KHRONOS_validation (KYTY_TEST_VULKAN_VALIDATION=1: core and
 	# thread-safety checks, i.e. command-pool, descriptor-pool, command-buffer and queue use from
 	# two threads at once, and descriptor sets updated while a recorded or pending buffer binds

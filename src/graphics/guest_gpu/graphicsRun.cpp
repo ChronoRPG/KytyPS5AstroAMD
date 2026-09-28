@@ -2233,8 +2233,9 @@ uint32_t CommandProcessor::RecordEopTimestamp() {
 	// A fence position: publish what completed ticks measured first (never waits).
 	timestamps->Publish(scheduler.GetMasterSemaphore().KnownGpuTick());
 	// A query write touches no guest resource, so batched barriers may stay pending (and no
-	// rendering instance is split for it).
-	return timestamps->RecordQuery(CurrentBuffer().StateHandle());
+	// rendering instance is split for it). With KYTY_CP_RECORDER it is a recorder packet, in
+	// stream order, and drains nothing.
+	return timestamps->RecordQuery(CurrentBuffer().StateSink());
 }
 
 void CommandProcessor::QueueEopTimestamp(uint32_t slot, const void* dst, uint64_t value) {

@@ -588,10 +588,10 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 		m_recorder->Begin(m_command.m_buffer, m_master.CurrentTick(),
 		                  m_gpu_timing ? GpuTiming::NowNs() : 0);
 		if (m_eop_timestamps) {
-			// KYTY_EOP_TIMESTAMPS=gpu has no recorder packets (its queries are recorded through
-			// StateHandle()): reset the slots whose results were read in a direct window, after
-			// the recorder has begun the buffer. Without it no slot would ever become free.
-			m_eop_timestamps->BeginCommand(m_command.StateHandle());
+			// KYTY_EOP_TIMESTAMPS=gpu: reset the slots whose results were read, as recorder
+			// packets after the recorder's Begin (no drain). Without it no slot would ever become
+			// free.
+			m_eop_timestamps->BeginCommand(m_command.StateSink());
 		}
 		return m_command;
 	}
@@ -603,7 +603,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	}
 	if (m_eop_timestamps) {
 		// Outside rendering: reset the guest timestamp slots whose results were read.
-		m_eop_timestamps->BeginCommand(m_command.m_buffer);
+		m_eop_timestamps->BeginCommand(m_command.StateSink());
 	}
 	if (m_gpu_ops) {
 		GpuOpProfiler::OnBeginCommand(m_graphics, m_command.m_buffer, m_master.CurrentTick(),

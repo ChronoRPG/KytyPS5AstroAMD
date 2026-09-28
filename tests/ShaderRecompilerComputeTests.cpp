@@ -13829,8 +13829,16 @@ public:
               "the GPU timestamp ring must exist exactly in GPU mode (it needs calibrated "
               "timestamps)");
       before = Sync::ReadReferenceClock();
+      // KYTY_CP_RECORDER: the query writes are recorder packets; they never drain it.
+      auto *recorder = scheduler.Recorder();
+      const auto drains = recorder != nullptr ? recorder->Drains() : 0;
       Require(name, "clock writes", process({&begin, &end}),
               "the clock-write stream did not complete");
+      Require(name, "no recorder drain",
+              recorder == nullptr || recorder->Drains() == drains,
+              "clock writes drained the CP recorder " +
+                  std::to_string(recorder != nullptr ? recorder->Drains() - drains : 0) +
+                  " times");
       begin_record = begin;
       end_record = end;
       scheduler.FlushAndWait();

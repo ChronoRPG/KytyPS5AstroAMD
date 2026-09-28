@@ -544,6 +544,9 @@ struct CommandRecorder::NativeExecutor {
 	                          vk::QueryResultFlags flags) {
 		command.copyQueryPoolResults(pool, first, count, destination, offset, stride, flags);
 	}
+	void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, uint32_t query) {
+		command.writeTimestamp2(stage, pool, query);
+	}
 };
 
 // ------------------------------------------------------------------------------------------------
