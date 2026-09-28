@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_BINDINGPLAN_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_BINDINGPLAN_H_
 
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
@@ -33,7 +34,7 @@
 // stays on the command processor.
 //
 // KYTY_DRAW_PREP_BINDINGS=0 (default) | 1 (every part) | a comma list of parts: pipeline, buffers,
-// userdata, samplers, textures, statics. Plans come from the preparing worker threads (and the
+// userdata, samplers, textures, statics (P4b-1); hwcheck, dynamic (P4b-1b); texturememo (P4b-2). Plans come from the preparing worker threads (and the
 // command processor's KYTY_DRAW_PREP_STEAL preparations); a head the command processor prepares
 // itself has none. KYTY_DRAW_PREP=inline computes them on the command processor (tests).
 // KYTY_DRAW_PREP_BINDINGS_VERIFY=1|exit: every plan item the command processor would use is also
@@ -43,6 +44,7 @@ namespace Libs::Graphics {
 struct DrawIndexArgs;
 struct GraphicContext;
 class SamplerCache;
+class TextureBindingMemo;
 
 namespace DrawPrep {
 
@@ -56,8 +58,11 @@ enum class BindingPart : uint32_t {
 	Samplers = 1u << 3u,
 	Textures = 1u << 4u, // texture memo hashes
 	Statics  = 1u << 5u, // program flags (shader writes, barrier sinking, scissor union), export map
+	HwCheck  = 1u << 6u, // P4b-1b: uc_check/hw_check verdict
+	Dynamic  = 1u << 7u, // P4b-1b: dynamic viewports and scissors
+	TextureMemo = 1u << 8u, // P4b-2: texture memo hints, runs of memo hits under one lock
 };
-inline constexpr uint32_t AllBindingParts = (1u << 6u) - 1u;
+inline constexpr uint32_t AllBindingParts = (1u << 9u) - 1u;
 
 // 0: off.
 [[nodiscard]] uint32_t BindingParts();
@@ -82,6 +87,10 @@ struct BindingTotals {
 	std::atomic<uint64_t> samplers_used {0};  // sampler handles taken from plans
 	std::atomic<uint64_t> vertex_ranges_used {0};
 	std::atomic<uint64_t> statics_used {0};
+	std::atomic<uint64_t> hw_checks_skipped {0}; // P4b-1b
+	std::atomic<uint64_t> viewports_used {0};    // P4b-1b
+	std::atomic<uint64_t> texture_run_hits {0};  // P4b-2: bindings resolved in runs
+	std::atomic<uint64_t> view_run_hits {0};     // P4b-2: views acquired in runs
 	// Pipelines left to the command processor by the preparing threads (not created yet, or a key
 	// the serial path refuses; the map lock busy), and plan pipelines whose certificate failed.
 	std::atomic<uint64_t> pipeline_abstains {0};
@@ -114,6 +123,9 @@ struct StagePlan {
 	// PrepareBindings: TextureBindingMemo::Hash of every image binding's key.
 	bool                  texture_hashes_valid = false;
 	std::vector<uint64_t> texture_hashes;
+	// P4b-2: the memo entry tag found for every image binding's key (0: none).
+	bool                  texture_tags_valid = false;
+	std::vector<uint64_t> texture_tags;
 
 	void Reset() {
 		ranges_valid         = false;
@@ -121,6 +133,7 @@ struct StagePlan {
 		mip_stats_active     = false;
 		samplers_valid       = false;
 		texture_hashes_valid = false;
+		texture_tags_valid   = false;
 	}
 };
 
@@ -138,6 +151,17 @@ struct VertexRangePlan {
 	std::array<uint64_t, MaxBuffers> sizes {};        // per vertex buffer; 0: a null binding
 	std::array<Merged, MaxBuffers>   merged {};       // sorted by base, overlapping ones merged
 	std::array<uint8_t, MaxBuffers>  merged_index {}; // per non-empty buffer: its merged range
+};
+
+// P4b-1b dynamic: SetGraphicsDynamicParams' viewports (an empty slot's width already made
+// positive, marked in empty_mask) and its scissors before the framebuffer clamp.
+struct DynamicViewportPlan {
+	static constexpr uint32_t MaxViewports = 16;
+	bool                                    valid      = false;
+	uint32_t                                count      = 0;
+	uint32_t                                empty_mask = 0;
+	std::array<vk::Viewport, MaxViewports>  viewports {};
+	std::array<ScissorRect, MaxViewports>   scissors {};
 };
 
 struct BindingPlan {
@@ -168,6 +192,9 @@ struct BindingPlan {
 	bool                   programs_barrier_safe = false;
 	bool                   written_valid         = false;
 	vk::Rect2D             written {};
+	// P4b-1b hwcheck: uc_check and hw_check would neither stop the emulator nor log (hw_checks_quiet).
+	bool                hw_checks_quiet = false;
+	DynamicViewportPlan viewports;
 
 	void Reset() {
 		valid         = false;
@@ -182,14 +209,17 @@ struct BindingPlan {
 		pipeline_generation = 0;
 		statics_valid       = false;
 		written_valid       = false;
+		hw_checks_quiet     = false;
+		viewports.valid     = false;
 	}
 };
 
 // What a preparing thread may use besides the slot: lookups only.
 struct BindingPlanContext {
-	PipelineCache*        pipelines = nullptr;
-	SamplerCache*         samplers  = nullptr;
-	const GraphicContext* graphics  = nullptr;
+	PipelineCache*            pipelines    = nullptr;
+	SamplerCache*             samplers     = nullptr;
+	const GraphicContext*     graphics     = nullptr;
+	const TextureBindingMemo* texture_memo = nullptr; // FindHint only
 };
 
 // The plan of a draw whose preparation succeeded (prepared.ok), on the preparing thread, from the
@@ -233,6 +263,10 @@ enum class RestartDecision : uint8_t { Disabled, Enabled, Scan, Unsupported };
 // below its acquired end); false when none does.
 [[nodiscard]] bool AssignVertexRanges(const ShaderVertexInputInfo& info, VertexRangePlan& ranges,
                                       uint32_t& unassigned);
+// SetGraphicsDynamicParams' viewports and unclamped scissors (P4b-1b); false where a scissor's
+// clip-rect rule is unsupported (the serial path reports it).
+[[nodiscard]] bool PlanDynamicViewports(const HW::Context& ctx, const vk::PhysicalDeviceLimits& limits,
+                                        bool indexed_viewports, DynamicViewportPlan& plan);
 // DrawIsBarrierSafe's conditions on a stage's program (the GDS buffer and the images are checked
 // at commit).
 [[nodiscard]] bool ProgramBarrierSafe(const ShaderRecompiler::IR::CompiledShaderInfo& program,

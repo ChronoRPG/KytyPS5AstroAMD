@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -96,9 +97,34 @@ public:
 
 	// ResolveTexture fast path. On success `binding` holds exactly what the full resolution
 	// would produce (image id and final description; view/layout/mip views are reset by the
-	// caller) and the FindImage touch was performed.
+	// caller) and the FindImage touch was performed. tag_hint: FindHint's tag for this key (0:
+	// none); an entry still holding that tag holds this key, so the key comparison is skipped.
+	// verify_hint: compare the keys anyway and report a difference (KYTY_DRAW_PREP_BINDINGS_VERIFY).
 	[[nodiscard]] bool TryResolve(TextureCache& cache, const Key& key, uint64_t hash,
-	                              TextureBinding& binding);
+	                              TextureBinding& binding, uint64_t tag_hint = 0,
+	                              bool verify_hint = false);
+
+	// KYTY_DRAW_PREP_BINDINGS texturememo (P4b-2). FindHint, on a draw-prep thread: the tag of the
+	// entry that holds `key` in its slot now, read without the command processor's cooperation
+	// (a sequence word guards the published key and tag; Record rewrites them). Tags are unique
+	// per recording and an entry's key never changes under a tag, so while the entry keeps the tag
+	// it holds the key.
+	[[nodiscard]] bool FindHint(const Key& key, uint64_t hash, uint64_t& tag) const;
+	// TryResolve for a run of bindings named by hints (tags[i], 0: none; hashes[i] their keys'
+	// hashes), under one texture-cache lock: in binding order, every binding whose entry still
+	// holds its tag and passes TryResolve's hit conditions without a revalidation gets TryResolve's
+	// hit (touches, description, counts), up to the first binding that does not, which is left to
+	// TryResolve. Nothing between the hits changes what the next check reads (touches and the
+	// callers' BindImage do not), so the order of effects is TryResolve's; other threads see the
+	// run as one critical section. apply false: count the hits only (verify mode). Returns them.
+	[[nodiscard]] uint32_t TryResolveRun(TextureCache& cache, std::span<const uint64_t> hashes,
+	                                     std::span<const uint64_t> tags,
+	                                     std::span<TextureBinding> bindings, bool apply = true);
+	// TryAcquireView for a run of bindings under one texture-cache lock, in binding order, up to
+	// the first binding TryAcquireView would not hit (left to it). apply false: count the hits
+	// only. Returns them.
+	[[nodiscard]] uint32_t TryAcquireViewRun(TextureCache& cache, std::span<TextureBinding> bindings,
+	                                         bool apply = true);
 	// After a full resolution: records `binding` when the answer is memoizable. `found` is what
 	// FindImage returned, `view_rebased` whether FindImage changed the view's base level/layer.
 	void Record(TextureCache& cache, const Key& key, uint64_t hash, TextureBinding& binding,
@@ -145,7 +171,21 @@ public:
 
 private:
 	struct Entry;
-	static constexpr uint32_t Slots = 4096;
+	static constexpr uint32_t Slots    = 4096;
+	static constexpr uint32_t KeyWords = 8;
+	using PackedKey                    = std::array<uint64_t, KeyWords>;
+
+	// Every field of a key, losslessly, in words FindHint compares.
+	[[nodiscard]] static PackedKey PackKey(const Key& key);
+	// TryResolve's hit conditions for an entry of a registered image (no revalidation): the image
+	// to touch, or null (a miss). Caller holds cache.m_lock.
+	[[nodiscard]] static Image* HitImage(TextureCache& cache, const Entry& entry);
+	// TryResolve's effects of a hit on `binding` (the image touch is the caller's).
+	void ApplyHit(Entry& entry, uint32_t slot, TextureBinding& binding);
+	// TryAcquireView's conditions without its lock (the entry and image checks). Caller holds
+	// cache.m_lock for the image part.
+	[[nodiscard]] const Entry* ViewEntry(const TextureBinding& binding) const;
+	[[nodiscard]] static bool ViewImageReady(const Entry& entry, const Image& image);
 
 	[[nodiscard]] static bool RefreshIsNoOp(const Image& image);
 	// Whether a registered image other than `found` has exactly its backing range, extent and
@@ -154,6 +194,8 @@ private:
 	                                     const Image& image);
 
 	std::unique_ptr<Entry[]> m_entries;
+	// m_entries for FindHint's readers: set once, after the entries exist (release).
+	std::atomic<const Entry*> m_published {nullptr};
 	uint64_t                 m_next_tag         = 1;
 	bool                     m_last_revalidated = false;
 	Totals                   m_totals;

@@ -13,8 +13,99 @@
 #include <atomic>
 #include <cmath>
 #include <fmt/format.h>
+#include <type_traits>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// P4b-1b (KYTY_DRAW_PREP_BINDINGS hwcheck, drawPrep/bindingPlan.h): each check below runs with
+// one of two policies. CheckRun is today's check: it stops the emulator or logs. CheckPredict,
+// on a draw-prep thread, only notes whether CheckRun would stop or log for the same registers
+// (`loud`). Log-once flags and counted logs live in g_check_log, shared by both: a flag only goes
+// from clear to set and a counter only grows, so a quiet prediction (a set flag, a counter past
+// its limit) stays true; a check that could still log or stop is left to CheckRun.
+struct CheckRun {
+	static constexpr bool Predict = false;
+};
+struct CheckPredict {
+	static constexpr bool Predict = true;
+	bool                  loud    = false;
+};
+
+struct CheckLogState {
+	std::atomic<bool>     rt_slices {false};
+	std::atomic<bool>     rt_mip_level {false};
+	std::atomic<bool>     rt_fmask {false};
+	std::atomic<bool>     rt_metadata {false};
+	std::atomic<bool>     rt_blend_bypass {false};
+	std::atomic<bool>     rt_round_mode {false};
+	std::atomic<bool>     rt_dest_alpha {false};
+	std::atomic<bool>     rt_msaa {false};
+	std::atomic<bool>     rt_extent {false};
+	std::atomic<bool>     rt_mip_count {false};
+	std::atomic<bool>     rt_pipe_aligned {false};
+	std::atomic<bool>     rt_metadata_addresses {false};
+	std::atomic<bool>     mc_window_offset {false};
+	std::atomic<bool>     bc_constants {false};
+	std::atomic<bool>     bc_mode {false};
+	std::atomic<bool>     bc_raster_op {false};
+	std::atomic<uint32_t> vp_msaa {0};
+	std::atomic<uint32_t> vp_transform {0};
+	std::atomic<uint32_t> vp_guard_band {0};
+	std::atomic<uint32_t> eqaa {0};
+	std::atomic<uint32_t> aa {0};
+	std::atomic<uint32_t> phases {0};
+	std::atomic<uint32_t> depth_clear {0};
+};
+CheckLogState g_check_log;
+
+// A condition CheckRun stops the emulator on (EXIT_NOT_IMPLEMENTED keeps its text and location).
+#define KYTY_CHECK_EXIT(policy, condition)                                                         \
+	do {                                                                                           \
+		if constexpr (std::remove_reference_t<decltype(policy)>::Predict) {                       \
+			(policy).loud = (policy).loud || static_cast<bool>(condition);                        \
+		} else {                                                                                   \
+			EXIT_NOT_IMPLEMENTED(condition);                                                       \
+		}                                                                                          \
+	} while (false)
+// A condition CheckRun stops the emulator on with a message.
+#define KYTY_CHECK_FAIL(policy, condition, ...)                                                    \
+	do {                                                                                           \
+		if (condition) {                                                                           \
+			if constexpr (std::remove_reference_t<decltype(policy)>::Predict) {                   \
+				(policy).loud = true;                                                              \
+			} else {                                                                               \
+				EXIT(__VA_ARGS__);                                                                 \
+			}                                                                                      \
+		}                                                                                          \
+	} while (false)
+// A message CheckRun logs the first time the condition holds.
+#define KYTY_CHECK_LOG_ONCE(policy, flag, condition, ...)                                          \
+	do {                                                                                           \
+		if (condition) {                                                                           \
+			if constexpr (std::remove_reference_t<decltype(policy)>::Predict) {                   \
+				(policy).loud = (policy).loud || !(flag).load(std::memory_order_relaxed);          \
+			} else if (!(flag).load(std::memory_order_relaxed)) {                                  \
+				LOGF(__VA_ARGS__);                                                                 \
+				(flag).store(true, std::memory_order_relaxed);                                     \
+			}                                                                                      \
+		}                                                                                          \
+	} while (false)
+// A message CheckRun logs the first `limit` times the condition holds.
+#define KYTY_CHECK_LOG_COUNTED(policy, counter, limit, condition, ...)                             \
+	do {                                                                                           \
+		if (condition) {                                                                           \
+			if constexpr (std::remove_reference_t<decltype(policy)>::Predict) {                   \
+				(policy).loud =                                                                    \
+				    (policy).loud || (counter).load(std::memory_order_relaxed) < (limit);          \
+			} else if ((counter).fetch_add(1, std::memory_order_relaxed) < (limit)) {              \
+				LOGF(__VA_ARGS__);                                                                 \
+			}                                                                                      \
+		}                                                                                          \
+	} while (false)
+
+} // namespace
 
 uint32_t render_target_mask_slot(uint32_t mask, uint32_t slot) {
 	return (mask >> (slot * 4u)) & 0x0fu;
@@ -24,9 +115,8 @@ static bool RenderTargetMaskHasMrt(uint32_t mask) {
 	return (mask & ~0x0fu) != 0;
 }
 
-static bool RenderTargetMaskHasBoundMrt(const CommandBuffer& buffer) {
-	const auto& hw   = buffer.GetRegisters();
-	const auto  mask = hw.GetRenderTargetMask();
+static bool RenderTargetMaskHasBoundMrt(const HW::Context& hw) {
+	const auto mask = hw.GetRenderTargetMask();
 
 	if (!RenderTargetMaskHasMrt(mask)) {
 		return false;
@@ -42,9 +132,8 @@ static bool RenderTargetMaskHasBoundMrt(const CommandBuffer& buffer) {
 	return bound_targets > 1;
 }
 
-uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
-	const auto& hw   = buffer.GetRegisters();
-	const auto  mask = hw.GetRenderTargetMask();
+static uint32_t RenderTargetFirstBoundSlot(const HW::Context& hw) {
+	const auto mask = hw.GetRenderTargetMask();
 	for (uint32_t i = 0; i < 8; i++) {
 		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0) {
 			return i;
@@ -52,6 +141,10 @@ uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
 	}
 
 	return 0;
+}
+
+uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
+	return RenderTargetFirstBoundSlot(buffer.GetRegisters());
 }
 
 bool graphics_debug_dump_enabled() {
@@ -80,12 +173,18 @@ void uc_print(const char* func, const HW::UserConfig& uc) {
 	     user_en.vgpr3 ? "true" : "false");
 }
 
-void uc_check(const HW::UserConfig& uc) {
+template <typename P>
+static void UcCheck(P& p, const HW::UserConfig& uc) {
 	const auto& user_en = uc.GetGeUserVgprEn();
 
-	EXIT_NOT_IMPLEMENTED(user_en.vgpr1 != false);
-	EXIT_NOT_IMPLEMENTED(user_en.vgpr2 != false);
-	EXIT_NOT_IMPLEMENTED(user_en.vgpr3 != false);
+	KYTY_CHECK_EXIT(p, user_en.vgpr1 != false);
+	KYTY_CHECK_EXIT(p, user_en.vgpr2 != false);
+	KYTY_CHECK_EXIT(p, user_en.vgpr3 != false);
+}
+
+void uc_check(const HW::UserConfig& uc) {
+	CheckRun run;
+	UcCheck(run, uc);
 }
 
 std::string rt_print(const char* func, const HW::RenderTarget& rt) {
@@ -184,138 +283,86 @@ static bool RenderIsColorDimension(uint32_t dimension) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-static void RtCheck(const HW::RenderTarget& rt) {
-	if (rt.base.addr != 0) {
-		//  EXIT_NOT_IMPLEMENTED(rt.base_addr == 0);
-
-		EXIT_NOT_IMPLEMENTED(rt.view.base_array_slice_index > rt.view.last_array_slice_index);
-		if (rt.view.base_array_slice_index != 0x00000000 ||
-		    rt.view.last_array_slice_index != 0x00000000) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: using color target array slice range %" PRIu32 "..%" PRIu32
-				     "\n",
-				     rt.view.base_array_slice_index, rt.view.last_array_slice_index);
-				logged = true;
-			}
-		}
-		if (rt.view.current_mip_level != 0x00000000) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: using PS5 color target mip level %" PRIu32 "\n",
-				     rt.view.current_mip_level);
-				logged = true;
-			}
-		}
-		if (rt.info.fmask_compression_enable) {
-			EXIT_NOT_IMPLEMENTED(rt.attrib.num_samples == 0 && rt.attrib.num_fragments == 0);
-			// Native MSAA stores expanded samples, independent of FMASK metadata compression.
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: using expanded native Vulkan MSAA samples, "
-				     "fmask=0x%016" PRIx64 "\n",
-				     rt.fmask.addr);
-				logged = true;
-			}
-		}
-
-		if (rt.info.cmask_fast_clear_enable || rt.info.dcc_compression_enable) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: ignoring PS5 color metadata fast_clear=%s dcc=%s "
-				     "cmask=0x%016" PRIx64 " dcc_addr=0x%016" PRIx64 "\n",
-				     rt.info.cmask_fast_clear_enable ? "true" : "false",
-				     rt.info.dcc_compression_enable ? "true" : "false", rt.cmask.addr,
-				     rt.dcc_addr.addr);
-				logged = true;
-			}
-		}
-		if (rt.info.blend_bypass) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: using PS5 blend bypass as disabled Vulkan "
-				     "blending\n");
-				logged = true;
-			}
-		}
-		// EXIT_NOT_IMPLEMENTED(rt.info.blend_clamp != false);
-		if (rt.info.round_mode) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: ignoring PS5 color round mode\n");
-				logged = true;
-			}
-		}
-		//		 EXIT_NOT_IMPLEMENTED(rt.format != 0x0000000a);
-		// EXIT_NOT_IMPLEMENTED(rt.channel_type != 0x00000006);
-		// EXIT_NOT_IMPLEMENTED(rt.channel_order != 0x00000001);
-		if (rt.attrib.force_dest_alpha_to_one) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: accepting PS5 force destination alpha-to-one\n");
-				logged = true;
-			}
-		}
-		if (rt.attrib.num_samples != 0x00000000 || rt.attrib.num_fragments != 0x00000000) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: using native PS5 MSAA color target, "
-				     "samples=0x%08" PRIx32 " fragments=0x%08" PRIx32 "\n",
-				     rt.attrib.num_samples, rt.attrib.num_fragments);
-				logged = true;
-			}
-		}
-
-		if (rt.attrib2.width == 0x00000000 || rt.attrib2.height == 0x00000000) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: accepting PS5 raw 1-pixel color target extent "
-				     "fields width_minus1=0x%08" PRIx32 " height_minus1=0x%08" PRIx32 "\n",
-				     rt.attrib2.width, rt.attrib2.height);
-				logged = true;
-			}
-		}
-		if (rt.attrib2.num_mip_levels != 0x00000000) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: using PS5 color target mip count field 0x%08" PRIx32 "\n",
-				     rt.attrib2.num_mip_levels);
-				logged = true;
-			}
-		}
-		if (!RenderIsColorTileMode(rt.attrib3.tile_mode)) {
-			EXIT("unknown PS5 render-target tile mode: 0x%08" PRIx32 "\n",
-			     static_cast<uint32_t>(rt.attrib3.tile_mode));
-		}
-		if (!RenderIsColorDimension(rt.attrib3.dimension)) {
-			EXIT("unknown PS5 render-target dimension: 0x%08" PRIx32 "\n", rt.attrib3.dimension);
-		}
-		if (!rt.attrib3.metadata_pipe_aligned) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: accepting unaligned PS5 metadata pipe flag\n");
-				logged = true;
-			}
-		}
-		EXIT_NOT_IMPLEMENTED(rt.attrib3.write_vrs_rate_hint_to_cmask);
-
-		// EXIT_NOT_IMPLEMENTED(rt.dcc_max_uncompressed_block_size != 0x00000002);
-		// EXIT_NOT_IMPLEMENTED(rt.dcc.max_compressed_block_size != 0x00000000);
-		// EXIT_NOT_IMPLEMENTED(rt.dcc.color_transform != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(rt.dcc.overwrite_combiner_disable != false);
-		// EXIT_NOT_IMPLEMENTED(rt.dcc.data_write_on_dcc_clear_to_reg != false);
-		EXIT_NOT_IMPLEMENTED(rt.dcc.dcc_clear_key_enable != false);
-		if (rt.cmask.addr != 0x0000000000000000 || rt.fmask.addr != 0x0000000000000000 ||
-		    rt.dcc_addr.addr != 0x0000000000000000) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: ignoring PS5 metadata addresses cmask=0x%016" PRIx64
-				     " fmask=0x%016" PRIx64 " dcc=0x%016" PRIx64 "\n",
-				     rt.cmask.addr, rt.fmask.addr, rt.dcc_addr.addr);
-				logged = true;
-			}
-		}
+template <typename P>
+static void RtCheck(P& p, const HW::RenderTarget& rt) {
+	if (rt.base.addr == 0) {
+		return;
 	}
+	auto& log = g_check_log;
+	//  EXIT_NOT_IMPLEMENTED(rt.base_addr == 0);
+
+	KYTY_CHECK_EXIT(p, rt.view.base_array_slice_index > rt.view.last_array_slice_index);
+	KYTY_CHECK_LOG_ONCE(p, log.rt_slices,
+	                    rt.view.base_array_slice_index != 0x00000000 ||
+	                        rt.view.last_array_slice_index != 0x00000000,
+	                    "RenderTarget: using color target array slice range %" PRIu32 "..%" PRIu32
+	                    "\n",
+	                    rt.view.base_array_slice_index, rt.view.last_array_slice_index);
+	KYTY_CHECK_LOG_ONCE(p, log.rt_mip_level, rt.view.current_mip_level != 0x00000000,
+	                    "RenderTarget: using PS5 color target mip level %" PRIu32 "\n",
+	                    rt.view.current_mip_level);
+	if (rt.info.fmask_compression_enable) {
+		KYTY_CHECK_EXIT(p, rt.attrib.num_samples == 0 && rt.attrib.num_fragments == 0);
+		// Native MSAA stores expanded samples, independent of FMASK metadata compression.
+		KYTY_CHECK_LOG_ONCE(p, log.rt_fmask, true,
+		                    "RenderTarget: using expanded native Vulkan MSAA samples, "
+		                    "fmask=0x%016" PRIx64 "\n",
+		                    rt.fmask.addr);
+	}
+
+	KYTY_CHECK_LOG_ONCE(p, log.rt_metadata,
+	                    rt.info.cmask_fast_clear_enable || rt.info.dcc_compression_enable,
+	                    "RenderTarget: temporary: ignoring PS5 color metadata fast_clear=%s dcc=%s "
+	                    "cmask=0x%016" PRIx64 " dcc_addr=0x%016" PRIx64 "\n",
+	                    rt.info.cmask_fast_clear_enable ? "true" : "false",
+	                    rt.info.dcc_compression_enable ? "true" : "false", rt.cmask.addr,
+	                    rt.dcc_addr.addr);
+	KYTY_CHECK_LOG_ONCE(p, log.rt_blend_bypass, rt.info.blend_bypass,
+	                    "RenderTarget: temporary: using PS5 blend bypass as disabled Vulkan "
+	                    "blending\n");
+	// EXIT_NOT_IMPLEMENTED(rt.info.blend_clamp != false);
+	KYTY_CHECK_LOG_ONCE(p, log.rt_round_mode, rt.info.round_mode,
+	                    "RenderTarget: temporary: ignoring PS5 color round mode\n");
+	//		 EXIT_NOT_IMPLEMENTED(rt.format != 0x0000000a);
+	// EXIT_NOT_IMPLEMENTED(rt.channel_type != 0x00000006);
+	// EXIT_NOT_IMPLEMENTED(rt.channel_order != 0x00000001);
+	KYTY_CHECK_LOG_ONCE(p, log.rt_dest_alpha, rt.attrib.force_dest_alpha_to_one,
+	                    "RenderTarget: temporary: accepting PS5 force destination alpha-to-one\n");
+	KYTY_CHECK_LOG_ONCE(p, log.rt_msaa,
+	                    rt.attrib.num_samples != 0x00000000 || rt.attrib.num_fragments != 0x00000000,
+	                    "RenderTarget: using native PS5 MSAA color target, "
+	                    "samples=0x%08" PRIx32 " fragments=0x%08" PRIx32 "\n",
+	                    rt.attrib.num_samples, rt.attrib.num_fragments);
+
+	KYTY_CHECK_LOG_ONCE(p, log.rt_extent,
+	                    rt.attrib2.width == 0x00000000 || rt.attrib2.height == 0x00000000,
+	                    "RenderTarget: temporary: accepting PS5 raw 1-pixel color target extent "
+	                    "fields width_minus1=0x%08" PRIx32 " height_minus1=0x%08" PRIx32 "\n",
+	                    rt.attrib2.width, rt.attrib2.height);
+	KYTY_CHECK_LOG_ONCE(p, log.rt_mip_count, rt.attrib2.num_mip_levels != 0x00000000,
+	                    "RenderTarget: using PS5 color target mip count field 0x%08" PRIx32 "\n",
+	                    rt.attrib2.num_mip_levels);
+	KYTY_CHECK_FAIL(p, !RenderIsColorTileMode(rt.attrib3.tile_mode),
+	                "unknown PS5 render-target tile mode: 0x%08" PRIx32 "\n",
+	                static_cast<uint32_t>(rt.attrib3.tile_mode));
+	KYTY_CHECK_FAIL(p, !RenderIsColorDimension(rt.attrib3.dimension),
+	                "unknown PS5 render-target dimension: 0x%08" PRIx32 "\n", rt.attrib3.dimension);
+	KYTY_CHECK_LOG_ONCE(p, log.rt_pipe_aligned, !rt.attrib3.metadata_pipe_aligned,
+	                    "RenderTarget: temporary: accepting unaligned PS5 metadata pipe flag\n");
+	KYTY_CHECK_EXIT(p, rt.attrib3.write_vrs_rate_hint_to_cmask);
+
+	// EXIT_NOT_IMPLEMENTED(rt.dcc_max_uncompressed_block_size != 0x00000002);
+	// EXIT_NOT_IMPLEMENTED(rt.dcc.max_compressed_block_size != 0x00000000);
+	// EXIT_NOT_IMPLEMENTED(rt.dcc.color_transform != 0x00000000);
+	KYTY_CHECK_EXIT(p, rt.dcc.overwrite_combiner_disable != false);
+	// EXIT_NOT_IMPLEMENTED(rt.dcc.data_write_on_dcc_clear_to_reg != false);
+	KYTY_CHECK_EXIT(p, rt.dcc.dcc_clear_key_enable != false);
+	KYTY_CHECK_LOG_ONCE(p, log.rt_metadata_addresses,
+	                    rt.cmask.addr != 0x0000000000000000 || rt.fmask.addr != 0x0000000000000000 ||
+	                        rt.dcc_addr.addr != 0x0000000000000000,
+	                    "RenderTarget: temporary: ignoring PS5 metadata addresses cmask=0x%016" PRIx64
+	                    " fmask=0x%016" PRIx64 " dcc=0x%016" PRIx64 "\n",
+	                    rt.cmask.addr, rt.fmask.addr, rt.dcc_addr.addr);
 }
 
 static void ZPrint(const char* func, const HW::DepthRenderTarget& z) {
@@ -391,13 +438,14 @@ static void ClipPrint(const char* func, const HW::ClipControl& c) {
 	     c.force_viewport_index_from_vs_enable ? "true" : "false");
 }
 
-static void ClipCheck(const HW::ClipControl& c) {
+template <typename P>
+static void ClipCheck(P& p, const HW::ClipControl& c) {
 	// dx_linear_attr_clip_enable preserves linear (noperspective) attributes at clip-generated
 	// vertices, which Vulkan provides as part of clipping and interpolation.
-	EXIT_NOT_IMPLEMENTED(c.user_clip_planes != 0 || c.user_clip_plane_mode != 0 ||
-	                     c.vertex_kill_any || c.user_clip_plane_negate_y ||
-	                     c.user_clip_plane_cull_only || c.cull_on_clipping_error_disable ||
-	                     c.force_viewport_index_from_vs_enable);
+	KYTY_CHECK_EXIT(p, c.user_clip_planes != 0 || c.user_clip_plane_mode != 0 ||
+	                       c.vertex_kill_any || c.user_clip_plane_negate_y ||
+	                       c.user_clip_plane_cull_only || c.cull_on_clipping_error_disable ||
+	                       c.force_viewport_index_from_vs_enable);
 }
 
 static void RcPrint(const char* func, const HW::RenderControl& c) {
@@ -416,13 +464,14 @@ static void RcPrint(const char* func, const HW::RenderControl& c) {
 	     c.copy_sample);
 }
 
-static void RcCheck(const HW::RenderControl& c) {
+template <typename P>
+static void RcCheck(P& p, const HW::RenderControl& c) {
 	// EXIT_NOT_IMPLEMENTED(c.depth_clear_enable != false);
 	// EXIT_NOT_IMPLEMENTED(c.stencil_clear_enable != false);
 	// EXIT_NOT_IMPLEMENTED(c.stencil_compress_disable != false);
 	// EXIT_NOT_IMPLEMENTED(c.depth_compress_disable != false);
-	EXIT_NOT_IMPLEMENTED(c.copy_centroid != false);
-	EXIT_NOT_IMPLEMENTED(c.copy_sample != 0);
+	KYTY_CHECK_EXIT(p, c.copy_centroid != false);
+	KYTY_CHECK_EXIT(p, c.copy_sample != 0);
 }
 
 static void McPrint(const char* func, const HW::ModeControl& c) {
@@ -447,20 +496,16 @@ static void McPrint(const char* func, const HW::ModeControl& c) {
 	     c.persp_corr_dis ? "true" : "false");
 }
 
-static void McCheck(const HW::ModeControl& c) {
+template <typename P>
+static void McCheck(P& p, const HW::ModeControl& c) {
 	// EXIT_NOT_IMPLEMENTED(c.cull_front != false);
 	// EXIT_NOT_IMPLEMENTED(c.cull_back != false);
 	// EXIT_NOT_IMPLEMENTED(c.face != false);
-	if (c.vtx_window_offset_enable) {
-		static bool logged = false;
-		if (!logged) {
-			LOGF("\t temporary: PA_SU_SC_MODE_CNTL.VTX_WINDOW_OFFSET_ENABLE is not fully "
-			     "implemented; continuing without vertex window "
-			     "offset adjustment\n");
-			logged = true;
-		}
-	}
-	EXIT_NOT_IMPLEMENTED(c.persp_corr_dis != false);
+	KYTY_CHECK_LOG_ONCE(p, g_check_log.mc_window_offset, c.vtx_window_offset_enable,
+	                    "\t temporary: PA_SU_SC_MODE_CNTL.VTX_WINDOW_OFFSET_ENABLE is not fully "
+	                    "implemented; continuing without vertex window "
+	                    "offset adjustment\n");
+	KYTY_CHECK_EXIT(p, c.persp_corr_dis != false);
 }
 
 static void BcPrint(const char* func, const HW::BlendControl& c, const HW::BlendColor& color,
@@ -486,32 +531,23 @@ static void BcPrint(const char* func, const HW::BlendControl& c, const HW::Blend
 	     color.red, color.green, color.blue, color.alpha, cc.mode, cc.op);
 }
 
-static void BcCheck(const HW::BlendColor& color, const HW::ColorControl& cc) {
-	if (color.red != 0.0f || color.green != 0.0f || color.blue != 0.0f || color.alpha != 0.0f) {
-		static bool logged = false;
-		if (!logged) {
-			LOGF("BlendControl: temporary: accepting nonzero blend constants (%f, %f, %f, %f)\n",
-			     color.red, color.green, color.blue, color.alpha);
-			logged = true;
-		}
-	}
-	if (cc.mode != 1 && cc.mode != 0 && cc.mode != 2 && cc.mode != 3 && cc.mode != 5 &&
-	    cc.mode != 6) {
-		static bool logged = false;
-		if (!logged) {
-			LOGF("BlendControl: temporary: accepting unsupported color-control mode %" PRIu8 "\n",
-			     cc.mode);
-			logged = true;
-		}
-	}
-	if (cc.op != 0xCC) {
-		static bool logged = false;
-		if (!logged) {
-			LOGF("BlendControl: temporary: accepting unsupported raster op 0x%02" PRIx8 "\n",
-			     cc.op);
-			logged = true;
-		}
-	}
+template <typename P>
+static void BcCheck(P& p, const HW::BlendColor& color, const HW::ColorControl& cc) {
+	auto& log = g_check_log;
+	KYTY_CHECK_LOG_ONCE(p, log.bc_constants,
+	                    color.red != 0.0f || color.green != 0.0f || color.blue != 0.0f ||
+	                        color.alpha != 0.0f,
+	                    "BlendControl: temporary: accepting nonzero blend constants (%f, %f, %f, %f)\n",
+	                    color.red, color.green, color.blue, color.alpha);
+	KYTY_CHECK_LOG_ONCE(p, log.bc_mode,
+	                    cc.mode != 1 && cc.mode != 0 && cc.mode != 2 && cc.mode != 3 &&
+	                        cc.mode != 5 && cc.mode != 6,
+	                    "BlendControl: temporary: accepting unsupported color-control mode %" PRIu8
+	                    "\n",
+	                    cc.mode);
+	KYTY_CHECK_LOG_ONCE(p, log.bc_raster_op, cc.op != 0xCC,
+	                    "BlendControl: temporary: accepting unsupported raster op 0x%02" PRIx8 "\n",
+	                    cc.op);
 }
 
 static void DPrint(const char* func, const HW::DepthControl& c, const HW::StencilControl& s,
@@ -566,20 +602,19 @@ static void EqaaPrint(const char* func, const HW::EqaaControl& c) {
 	     c.static_anchor_associations ? "true" : "false");
 }
 
-static void EqaaCheck(const HW::EqaaControl& c, const HW::AaConfig& cf) {
+template <typename P>
+static void EqaaCheck(P& p, const HW::EqaaControl& c, const HW::AaConfig& cf) {
 	// The EQAA controls only take effect while multisampling is on, so a single-sample
 	// target leaves them inert and has nothing to warn about.
 	if (cf.msaa_num_samples == 0) {
 		return;
 	}
-	if (c.max_anchor_samples != 0 || c.ps_iter_samples != 0 || c.mask_export_num_samples != 0 ||
-	    c.alpha_to_mask_num_samples != 0 || c.high_quality_intersections ||
-	    c.incoherent_eqaa_reads || c.interpolate_comp_z || c.static_anchor_associations) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 16) {
-			LOGF("\t warning: unsupported PS5 EQAA controls use native Vulkan MSAA defaults\n");
-		}
-	}
+	KYTY_CHECK_LOG_COUNTED(
+	    p, g_check_log.eqaa, 16u,
+	    c.max_anchor_samples != 0 || c.ps_iter_samples != 0 || c.mask_export_num_samples != 0 ||
+	        c.alpha_to_mask_num_samples != 0 || c.high_quality_intersections ||
+	        c.incoherent_eqaa_reads || c.interpolate_comp_z || c.static_anchor_associations,
+	    "\t warning: unsupported PS5 EQAA controls use native Vulkan MSAA defaults\n");
 }
 
 static void AaPrint(const char* func, const HW::AaSampleControl& c, const HW::AaConfig& cf) {
@@ -597,21 +632,20 @@ static void AaPrint(const char* func, const HW::AaSampleControl& c, const HW::Aa
 	     cf.msaa_exposed_samples);
 }
 
-static void AaCheck(const HW::AaSampleControl& c, const HW::AaConfig& cf) {
+template <typename P>
+static void AaCheck(P& p, const HW::AaSampleControl& c, const HW::AaConfig& cf) {
 	bool non_default_locations = (c.centroid_priority != 0);
 	for (uint32_t l: c.locations) {
 		non_default_locations |= (l != 0);
 	}
 
-	if (non_default_locations || cf.msaa_num_samples != 0 || cf.aa_mask_centroid_dtmn ||
-	    cf.max_sample_dist != 0 || cf.msaa_exposed_samples != 0) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 16) {
-			LOGF("\t warning: unsupported PS5 sample locations use native Vulkan locations: "
-			     "samples=%" PRIu8 ", exposed=%" PRIu8 ", max_dist=%" PRIu8 "\n",
-			     cf.msaa_num_samples, cf.msaa_exposed_samples, cf.max_sample_dist);
-		}
-	}
+	KYTY_CHECK_LOG_COUNTED(p, g_check_log.aa, 16u,
+	                       non_default_locations || cf.msaa_num_samples != 0 ||
+	                           cf.aa_mask_centroid_dtmn || cf.max_sample_dist != 0 ||
+	                           cf.msaa_exposed_samples != 0,
+	                       "\t warning: unsupported PS5 sample locations use native Vulkan locations: "
+	                       "samples=%" PRIu8 ", exposed=%" PRIu8 ", max_dist=%" PRIu8 "\n",
+	                       cf.msaa_num_samples, cf.msaa_exposed_samples, cf.max_sample_dist);
 }
 
 void LogDrawPhase(const char* draw_name, const char* phase) {
@@ -695,17 +729,14 @@ static void VpPrint(const char* func, const HW::ScreenViewport& vp,
 	     vp.viewports[0].viewport_scissor_window_offset_enable ? "true" : "false");
 }
 
-static void VpCheck(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc) {
-
-	if (smc.msaa_enable) {
-
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 16) {
-			LOGF("\t warning: unsupported PS5 MSAA raster controls use native Vulkan defaults\n");
-		}
-	}
+template <typename P>
+static void VpCheck(P& p, const HW::ScreenViewport& vp, const HW::ScanModeControl& smc) {
+	auto& log = g_check_log;
+	KYTY_CHECK_LOG_COUNTED(p, log.vp_msaa, 16u, smc.msaa_enable,
+	                       "\t warning: unsupported PS5 MSAA raster controls use native Vulkan "
+	                       "defaults\n");
 	// EXIT_NOT_IMPLEMENTED(smc.vport_scissor_enable);
-	EXIT_NOT_IMPLEMENTED(smc.line_stipple_enable);
+	KYTY_CHECK_EXIT(p, smc.line_stipple_enable);
 
 	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].xscale != 960.000000);
 	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].xoffset != 960.000000);
@@ -713,26 +744,19 @@ static void VpCheck(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc
 	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].yoffset != 540.000000);
 	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].zscale != 0.500000);
 	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].zoffset != 0.500000);
-	if (vp.transform_control != 1087) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-			LOGF("\t warning: non-default viewport transform control = 0x%08" PRIx32
-			     ", applying enabled scale/offset bits\n",
-			     vp.transform_control);
-		}
-	}
+	KYTY_CHECK_LOG_COUNTED(p, log.vp_transform, 16u, vp.transform_control != 1087,
+	                       "\t warning: non-default viewport transform control = 0x%08" PRIx32
+	                       ", applying enabled scale/offset bits\n",
+	                       vp.transform_control);
 	// EXIT_NOT_IMPLEMENTED(vp.hw_offset_x != 60);
 	// EXIT_NOT_IMPLEMENTED(vp.hw_offset_y != 32);
 	// EXIT_NOT_IMPLEMENTED(fabsf(vp.guard_band_horz_clip - 33.133327f) > 0.001f);
 	// EXIT_NOT_IMPLEMENTED(fabsf(vp.guard_band_vert_clip - 59.629623f) > 0.001f);
 
-	if (vp.guard_band_horz_discard != 1.0f || vp.guard_band_vert_discard != 1.0f) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 16) {
-			LOGF("\t warning: unsupported PS5 guard band discard = %f, %f, continuing\n",
-			     vp.guard_band_horz_discard, vp.guard_band_vert_discard);
-		}
-	}
+	KYTY_CHECK_LOG_COUNTED(p, log.vp_guard_band, 16u,
+	                       vp.guard_band_horz_discard != 1.0f || vp.guard_band_vert_discard != 1.0f,
+	                       "\t warning: unsupported PS5 guard band discard = %f, %f, continuing\n",
+	                       vp.guard_band_horz_discard, vp.guard_band_vert_discard);
 
 	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].viewport_scissor_left != 0);
 	// EXIT_NOT_IMPLEMENTED(vp.viewports[0].viewport_scissor_top != 0);
@@ -802,8 +826,8 @@ static bool ScissorClipRuleToIntersectionMask(uint16_t rule, uint8_t* mask) {
 	return false;
 }
 
-ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc,
-                               vk::Extent2D extent, uint32_t viewport_index) {
+bool calc_scissor_unclamped(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc,
+                            uint32_t viewport_index, ScissorRect& scissor) {
 	EXIT_IF(viewport_index >= std::size(vp.viewports));
 	ScissorRect final {vp.screen_scissor_left, vp.screen_scissor_top, vp.screen_scissor_right,
 	                   vp.screen_scissor_bottom};
@@ -825,6 +849,7 @@ ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeC
 		          viewport.viewport_scissor_window_offset_enable);
 	}
 
+	bool supported = true;
 	if (vp.clip_rect_rule == 0) {
 		final = {0, 0, 0, 0};
 	} else if (vp.clip_rect_rule != 0xffffu) {
@@ -839,20 +864,35 @@ ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeC
 				           vp.clip_rect_bottom[i]}, vp.clip_rect_window_offset_enable[i]);
 			}
 		} else {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
-				LOGF("unsupported clip-rect rule 0x%04" PRIx16 ", leaving scissor unchanged\n",
-				     vp.clip_rect_rule);
-			}
+			supported = false; // the scissor stays as it is (calc_final_scissor logs it)
+		}
+	}
+
+	scissor = final;
+	return supported;
+}
+
+ScissorRect clamp_scissor(const ScissorRect& scissor, vk::Extent2D extent) {
+	return ScissorRectClamp(scissor, extent.width, extent.height);
+}
+
+ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeControl& smc,
+                               vk::Extent2D extent, uint32_t viewport_index) {
+	ScissorRect final;
+	if (!calc_scissor_unclamped(vp, smc, viewport_index, final)) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("unsupported clip-rect rule 0x%04" PRIx16 ", leaving scissor unchanged\n",
+			     vp.clip_rect_rule);
 		}
 	}
 
 	return ScissorRectClamp(final, extent.width, extent.height);
 }
 
-void hw_check(const CommandBuffer& buffer) {
-	const auto& hw      = buffer.GetRegisters();
-	const auto  rt_slot = render_target_first_bound_slot(buffer);
+template <typename P>
+static void HwCheck(P& p, const HW::Context& hw) {
+	const auto  rt_slot = RenderTargetFirstBoundSlot(hw);
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
 	const auto& bclr    = hw.GetBlendColor();
 	const auto& vp      = hw.GetScreenViewport();
@@ -864,55 +904,65 @@ void hw_check(const CommandBuffer& buffer) {
 	const auto& smc     = hw.GetScanModeControl();
 	const auto& aa      = hw.GetAaSampleControl();
 	const auto& ac      = hw.GetAaConfig();
+	auto&       log     = g_check_log;
 
-	auto log_phase = [](const char* phase) {
-		if (graphics_debug_dump_enabled()) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
-				LOGF("HwCheckPhase: %s\n", phase);
-			}
-		}
+	const bool debug_dump = graphics_debug_dump_enabled();
+	auto       log_phase  = [&](const char* phase) {
+        KYTY_CHECK_LOG_COUNTED(p, log.phases, 512u, debug_dump, "HwCheckPhase: %s\n", phase);
 	};
 
 	log_phase("rt");
-	RtCheck(rt);
+	RtCheck(p, rt);
 	log_phase("vp");
-	VpCheck(vp, smc);
+	VpCheck(p, vp, smc);
 	log_phase("clip");
-	ClipCheck(c);
+	ClipCheck(p, c);
 	log_phase("rc");
-	RcCheck(rc);
+	RcCheck(p, rc);
 	log_phase("depth");
 	log_phase("mode");
-	McCheck(mc);
+	McCheck(p, mc);
 	log_phase("blend");
-	BcCheck(bclr, cc);
+	BcCheck(p, bclr, cc);
 	log_phase("eqaa");
-	EqaaCheck(eqaa, ac);
+	EqaaCheck(p, eqaa, ac);
 	log_phase("aa");
-	AaCheck(aa, ac);
+	AaCheck(p, aa, ac);
 	log_phase("done");
 
-	if (graphics_debug_dump_enabled() && RenderTargetMaskHasBoundMrt(buffer)) {
-		LOGF("MRT render target mask: 0x%08" PRIx32 "\n", hw.GetRenderTargetMask());
-		for (uint32_t i = 0; i < 8; i++) {
-			const auto& mrt = hw.GetRenderTarget(i);
-			LOGF("\t RT%u addr=0x%010" PRIx64 " mask=0x%x fmt=0x%08" PRIx32
-			     " width=%u height=%u tile=%u\n",
-			     i, mrt.base.addr, (hw.GetRenderTargetMask() >> (i * 4u)) & 0x0fu,
-			     static_cast<uint32_t>(mrt.info.format), mrt.attrib2.width + 1,
-			     mrt.attrib2.height + 1, static_cast<uint32_t>(mrt.attrib3.tile_mode));
+	if (debug_dump && RenderTargetMaskHasBoundMrt(hw)) {
+		if constexpr (P::Predict) {
+			p.loud = true;
+		} else {
+			LOGF("MRT render target mask: 0x%08" PRIx32 "\n", hw.GetRenderTargetMask());
+			for (uint32_t i = 0; i < 8; i++) {
+				const auto& mrt = hw.GetRenderTarget(i);
+				LOGF("\t RT%u addr=0x%010" PRIx64 " mask=0x%x fmt=0x%08" PRIx32
+				     " width=%u height=%u tile=%u\n",
+				     i, mrt.base.addr, (hw.GetRenderTargetMask() >> (i * 4u)) & 0x0fu,
+				     static_cast<uint32_t>(mrt.info.format), mrt.attrib2.width + 1,
+				     mrt.attrib2.height + 1, static_cast<uint32_t>(mrt.attrib3.tile_mode));
+			}
 		}
 	}
-	if (rc.depth_clear_enable && hw.GetDepthClearValue() != 0.0f &&
-	    hw.GetDepthClearValue() != 1.0f) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 16) {
-			LOGF("\t temporary: accepting non-default depth clear value %f\n",
-			     hw.GetDepthClearValue());
-		}
-	}
+	KYTY_CHECK_LOG_COUNTED(p, log.depth_clear, 16u,
+	                       rc.depth_clear_enable && hw.GetDepthClearValue() != 0.0f &&
+	                           hw.GetDepthClearValue() != 1.0f,
+	                       "\t temporary: accepting non-default depth clear value %f\n",
+	                       hw.GetDepthClearValue());
 	// EXIT_NOT_IMPLEMENTED(hw.GetStencilClearValue() != 0);
+}
+
+void hw_check(const CommandBuffer& buffer) {
+	CheckRun run;
+	HwCheck(run, buffer.GetRegisters());
+}
+
+bool hw_checks_quiet(const HW::Context& hw, const HW::UserConfig& uc) {
+	CheckPredict predict;
+	UcCheck(predict, uc);
+	HwCheck(predict, hw);
+	return !predict.loud;
 }
 
 void hw_print(const CommandBuffer& buffer) {

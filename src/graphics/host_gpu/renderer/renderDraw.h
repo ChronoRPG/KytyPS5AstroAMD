@@ -27,6 +27,10 @@ ResolveDrawOffsets(uint32_t index_offset, const ShaderVertexInputInfo& vs_input_
 // The union of a draw's scissors in framebuffer pixels, not clamped to the framebuffer (every
 // viewport slot when the vertex stage writes the viewport index); empty when it draws nothing.
 [[nodiscard]] vk::Rect2D DrawScissorUnion(const HW::Context& ctx, bool indexed_viewports);
+// DrawScissorUnion without calc_final_scissor's log (a draw-prep thread): false for a clip-rect
+// rule it does not support, which the command processor then reports.
+[[nodiscard]] bool DrawScissorUnionQuiet(const HW::Context& ctx, bool indexed_viewports,
+                                         vk::Rect2D& result);
 
 } // namespace Libs::Graphics
 

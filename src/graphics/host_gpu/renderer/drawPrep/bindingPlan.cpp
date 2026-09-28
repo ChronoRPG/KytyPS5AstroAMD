@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -162,21 +163,35 @@ bool PlanSamplers(SamplerCache& cache, const CompiledShaderInfo& program,
 	return true;
 }
 
-// ResolveTexture's memo hashes.
+// ResolveTexture's memo hashes; with `memo` (P4b-2) also the tags of the entries that hold the
+// keys now (TextureBindingMemo::FindHint), valid in `stage.texture_tags_valid`.
 bool PlanTextureHashes(const CompiledShaderInfo& program, const ResourceSnapshot& resources,
-                       StagePlan& stage) {
+                       const TextureBindingMemo* memo, StagePlan& stage) {
 	const auto count = program.info.images.size();
 	if (resources.images.size() < count) {
 		return false;
 	}
 	stage.texture_hashes.resize(count);
+	if (memo != nullptr) {
+		stage.texture_tags.assign(count, 0);
+	}
+	uint32_t hints = 0;
 	for (size_t i = 0; i < count; i++) {
 		ShaderTextureResource descriptor {};
 		if (!TryDecode(resources.images[i], descriptor)) {
 			return false;
 		}
-		stage.texture_hashes[i] = TextureBindingMemo::Hash(
-		    TextureBindingMemo::MakeKey(program.info.images[i], descriptor.fields));
+		const auto key          = TextureBindingMemo::MakeKey(program.info.images[i], descriptor.fields);
+		stage.texture_hashes[i] = TextureBindingMemo::Hash(key);
+		uint64_t tag            = 0;
+		if (memo != nullptr && memo->FindHint(key, stage.texture_hashes[i], tag)) {
+			stage.texture_tags[i] = tag;
+			hints++;
+		}
+	}
+	stage.texture_tags_valid = memo != nullptr;
+	if (hints != 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepBindingTextureHints, hints);
 	}
 	return true;
 }
@@ -337,11 +352,14 @@ void PlanStatics(const RegisterSnapshot& registers, const PreparedDraw& prepared
 	plan.written_valid = false;
 	if (TextureCache::AliasBytesEnabled()) {
 		const auto& outputs = vertex_program.info.outputs;
-		plan.written        = DrawScissorUnion(
-            registers.context, std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
-                return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
-            }));
-		plan.written_valid = true;
+		// Quiet: an unsupported clip-rect rule is left to the command processor, which logs it.
+		plan.written_valid = DrawScissorUnionQuiet(
+		    registers.context,
+		    std::any_of(outputs.begin(), outputs.end(),
+		                [](const auto& output) {
+			                return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+		                }),
+		    plan.written);
 	}
 	plan.statics_valid = true;
 }
@@ -414,9 +432,16 @@ uint32_t BindingParts() {
 					result |= static_cast<uint32_t>(BindingPart::Textures);
 				} else if (name == "statics") {
 					result |= static_cast<uint32_t>(BindingPart::Statics);
+				} else if (name == "hwcheck") {
+					result |= static_cast<uint32_t>(BindingPart::HwCheck);
+				} else if (name == "dynamic") {
+					result |= static_cast<uint32_t>(BindingPart::Dynamic);
+				} else if (name == "texturememo") {
+					result |= static_cast<uint32_t>(BindingPart::TextureMemo);
 				} else if (!name.empty()) {
 					EXIT("KYTY_DRAW_PREP_BINDINGS: unknown part '%.*s' (expected 0, 1 or a list of "
-					     "pipeline, buffers, userdata, samplers, textures, statics)\n",
+					     "pipeline, buffers, userdata, samplers, textures, statics, hwcheck, "
+					     "dynamic, texturememo)\n",
 					     static_cast<int>(name.size()), name.data());
 				}
 			}
@@ -506,8 +531,13 @@ void ComputeBindingPlan(const BindingPlanContext& context, const RegisterSnapsho
 		if (BindingPartEnabled(parts, BindingPart::Samplers)) {
 			stage.samplers_valid = PlanSamplers(*context.samplers, program, data, stage);
 		}
-		if (BindingPartEnabled(parts, BindingPart::Textures)) {
-			stage.texture_hashes_valid = PlanTextureHashes(program, data, stage);
+		// The memo part needs the hashes too (a run finds its entries by them).
+		const bool memo = BindingPartEnabled(parts, BindingPart::TextureMemo) &&
+		                  context.texture_memo != nullptr && TextureBindingMemo::Enabled();
+		if (BindingPartEnabled(parts, BindingPart::Textures) || memo) {
+			stage.texture_hashes_valid =
+			    PlanTextureHashes(program, data, memo ? context.texture_memo : nullptr, stage);
+			stage.texture_tags_valid = stage.texture_tags_valid && stage.texture_hashes_valid;
 		}
 	};
 	plan_stage(vertex_program, vertex_data, plan.vertex);
@@ -536,6 +566,19 @@ void ComputeBindingPlan(const BindingPlanContext& context, const RegisterSnapsho
 	}
 	if (BindingPartEnabled(parts, BindingPart::Pipeline)) {
 		PlanPipeline(context, registers, index_args, prepared, plan);
+	}
+	if (BindingPartEnabled(parts, BindingPart::HwCheck)) {
+		plan.hw_checks_quiet = hw_checks_quiet(registers.context, registers.user_config);
+	}
+	if (BindingPartEnabled(parts, BindingPart::Dynamic)) {
+		const auto& outputs = vertex_program.info.outputs;
+		(void)PlanDynamicViewports(
+		    registers.context, context.graphics->GetPhysicalDeviceProperties().limits,
+		    std::any_of(outputs.begin(), outputs.end(),
+		                [](const auto& output) {
+			                return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+		                }),
+		    plan.viewports);
 	}
 	plan.valid = true;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepBindingPlans);

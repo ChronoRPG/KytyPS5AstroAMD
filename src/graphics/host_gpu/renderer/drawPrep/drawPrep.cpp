@@ -660,7 +660,8 @@ void PlanBindings(Engine::Slot& slot, const BindingPlanContext& context) {
 
 BindingPlanContext MakeBindingPlanContext(RenderContext& renderer) {
 	(void)BindingParts(); // read (and logged) here, before any worker needs it
-	return {&renderer.GetPipelineCache(), &renderer.GetSamplerCache(), &renderer.GetGraphics()};
+	return {&renderer.GetPipelineCache(), &renderer.GetSamplerCache(), &renderer.GetGraphics(),
+	        &renderer.GetRenderExecutor().GetTextureMemo()};
 }
 
 // The DrawPrep#k thread's number k (0 on other threads): its busy time is FrameWait
