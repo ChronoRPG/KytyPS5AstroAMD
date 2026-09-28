@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -694,10 +695,70 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 	}
 }
 
+// Opt-in, bounded forensic output. All guest bytes use non-faulting backing reads;
+// this captures evidence only and never supplies replacement renderer data.
+static void DumpVertexFailure(uint64_t shader_addr, const ShaderMappedData& data,
+                              const HW::UserSgprInfo& user_sgpr, uint32_t user_sgpr_num,
+                              const ShaderVertexMetadata& metadata, uint64_t attrib,
+                              uint64_t buffer, bool speculative) {
+	static const char* prefix = std::getenv("KYTY_VERTEX_FAILURE_DUMP");
+	if (prefix == nullptr || *prefix == '\0') return;
+	static std::atomic<uint32_t> count {0};
+	const auto index = count.fetch_add(1, std::memory_order_relaxed);
+	if (index >= 8) return;
+	const auto path = std::string(prefix) + "-" + std::to_string(index) + ".txt";
+	auto* file = std::fopen(path.c_str(), "w");
+	if (file == nullptr) return;
+	std::fprintf(file, "shader=%016" PRIx64 " code_bytes=%u speculative=%u "
+	                  "sgpr_count=%u attrib_reg=%d buffer_reg=%d semantics=%u\n",
+	             shader_addr, data.code_size_bytes, static_cast<unsigned>(speculative),
+	             user_sgpr_num, metadata.vertex_attrib_reg, metadata.vertex_buffer_reg,
+	             metadata.input_semantics_count);
+	for (uint32_t i = 0; i < HW::UserSgprInfo::SGPRS_MAX; ++i) {
+		std::fprintf(file, "sgpr[%u]=%08x\n", i, user_sgpr.value[i]);
+	}
+	for (uint32_t i = 0; i < metadata.input_semantics_count; ++i) {
+		uint32_t word = 0;
+		static_assert(sizeof(ShaderSemantic) == sizeof(word));
+		std::memcpy(&word, &metadata.input_semantics[i], sizeof(word));
+		std::fprintf(file, "semantic[%u]=%08x\n", i, word);
+	}
+	const auto dump_words = [file](const char* label, uint64_t address) {
+		std::fprintf(file, "%s=%016" PRIx64 " (128 bytes before, 512 bytes from pointer)\n",
+		             label, address);
+		if (address < 128 || address > UINT64_MAX - 512) return;
+		for (int offset = -128; offset < 512; offset += 16) {
+			std::array<uint32_t, 4> words {};
+			const auto current = offset < 0 ? address - static_cast<uint64_t>(-offset)
+			                                : address + static_cast<uint64_t>(offset);
+			const bool read = LibKernel::Memory::TryReadBacking(current, words.data(), sizeof(words));
+			std::fprintf(file, "%016" PRIx64 " read=%u %08x %08x %08x %08x\n", current,
+			             static_cast<unsigned>(read), words[0], words[1], words[2], words[3]);
+		}
+	};
+	dump_words("attribute_table", attrib);
+	dump_words("buffer_table", buffer);
+	std::fclose(file);
+	const auto code_size = std::min<uint32_t>(data.code_size_bytes, 64u * 1024u);
+	std::vector<uint8_t> code(code_size);
+	if (code_size != 0 && LibKernel::Memory::TryReadBacking(shader_addr, code.data(), code_size)) {
+		const auto code_path = path + ".shader.bin";
+		if (auto* code_file = std::fopen(code_path.c_str(), "wb")) {
+			std::fwrite(code.data(), 1, code.size(), code_file);
+			std::fclose(code_file);
+		}
+	}
+	std::fprintf(stderr, "VertexFailureDump: %s\n", path.c_str());
+	std::fflush(stderr);
+}
+
 static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
                                        const ShaderSemantic*  input_semantics,
                                        uint32_t num_input_semantics, const uint32_t* attrib,
-                                       const uint32_t* buffer) {
+                                       const uint32_t* buffer, uint64_t shader_addr,
+                                       const ShaderMappedData& data,
+                                       const HW::UserSgprInfo& user_sgpr, uint32_t user_sgpr_num,
+                                       const ShaderVertexMetadata& metadata) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(attrib == nullptr || buffer == nullptr);
@@ -865,6 +926,54 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 			              DstSel(4, channels > 1u ? 5u : 0u, channels > 2u ? 6u : 0u,
 			                     channels > 3u ? 7u : 1u);
 		}
+		// Speculative table reads can observe data before its producing draw has committed.
+		// Such a descriptor must fall back to ordered preparation, not reach pipeline creation.
+		// Use the same component rules as TranslateEmbeddedFetch: constants need no
+		// memory format, and selectors beyond this semantic's width are not consumed.
+		const auto format_info = ShaderRecompiler::Format::GetFormatInfo(r.Format());
+		bool invalid_descriptor = size > 4;
+		for (uint32_t component = 0; component < std::min(size, 4u); component++) {
+			invalid_descriptor |= ShaderRecompiler::Format::ResolveFormattedSource(
+			    format_info, GetDstSel(r.DstSelXYZW(), component)).kind ==
+			    ShaderRecompiler::Format::FormattedSourceKind::Invalid;
+		}
+		if (invalid_descriptor) {
+			DumpVertexFailure(shader_addr, data, user_sgpr, user_sgpr_num, metadata,
+			                  reinterpret_cast<uint64_t>(attrib),
+			                  reinterpret_cast<uint64_t>(buffer), speculative);
+			static std::atomic<uint32_t> invalid_logs {0};
+			if (invalid_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+				std::fprintf(stderr, "VertexDescriptorInvalid: speculative=%u clean=%u batched=%u "
+				     "attrib_table=0x%016" PRIx64 " buffer_table=0x%016" PRIx64
+				     " semantic=%u attribute=0x%08x descriptor_index=%zu "
+				     "descriptor=%08x,%08x,%08x,%08x format=%u selectors=%u,%u,%u,%u\n",
+				     static_cast<unsigned>(speculative), static_cast<unsigned>(descriptor_clean),
+				     static_cast<unsigned>(sharps_batched), reinterpret_cast<uint64_t>(attrib),
+				     reinterpret_cast<uint64_t>(buffer), static_cast<unsigned>(in.semantic),
+				     attribute, index, r.fields[0], r.fields[1], r.fields[2], r.fields[3],
+				     static_cast<unsigned>(r.RawFormat()), static_cast<unsigned>(r.DstSelX()),
+				     static_cast<unsigned>(r.DstSelY()), static_cast<unsigned>(r.DstSelZ()),
+				     static_cast<unsigned>(r.DstSelW()));
+				uint32_t live_attribute = 0;
+				std::array<uint32_t, 4> live_descriptor {};
+				const bool live_attribute_read = LibKernel::Memory::TryReadBacking(
+				    reinterpret_cast<uint64_t>(attrib + in.semantic), &live_attribute,
+				    sizeof(live_attribute));
+				const bool live_descriptor_read = LibKernel::Memory::TryReadBacking(
+				    reinterpret_cast<uint64_t>(sharp), live_descriptor.data(),
+				    sizeof(live_descriptor));
+				std::fprintf(stderr, "VertexDescriptorBacking: attribute_read=%u attribute=%08x "
+				    "descriptor_read=%u descriptor=%08x,%08x,%08x,%08x\n",
+				    static_cast<unsigned>(live_attribute_read), live_attribute,
+				    static_cast<unsigned>(live_descriptor_read), live_descriptor[0],
+				    live_descriptor[1], live_descriptor[2], live_descriptor[3]);
+				std::fflush(stderr);
+			}
+			if (speculative) {
+				DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+				return;
+			}
+		}
 		if (offset != 0) {
 			r.UpdateAddress48(r.Base48() + offset);
 		}
@@ -974,7 +1083,9 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 			return false;
 		}
 		ShaderApplyAttribSemantics(info, metadata.input_semantics.data(),
-		                           metadata.input_semantics_count, attrib, buffer);
+		                           metadata.input_semantics_count, attrib, buffer, shader_addr,
+		                           data, user_sgpr, user_sgpr_num, metadata);
+		if (DrawPrep::SpeculativeFailed()) return false;
 		ShaderDetectBuffers(info);
 	}
 	return true;
