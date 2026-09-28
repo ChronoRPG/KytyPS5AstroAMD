@@ -478,9 +478,59 @@ private:
 	// reads VRAM instead of system memory over PCIe (KYTY_TEXTURE_STAGING_REBAR=0: none).
 	std::unique_ptr<StreamBuffer>  m_texture_staging;
 	// Registered images per ImagePageTable page, readable without m_lock
-	// (KYTY_TEXTURE_FAULT_FAST_PATH=0 always takes the lock).
+	// (KYTY_TEXTURE_FAULT_FAST_PATH=0 always takes the lock). RegisterImage counts a page before
+	// the image enters its owner list, UnregisterImage uncounts it after the image left it (all
+	// sequentially consistent), so an image FindImagesInRegion can find is always counted.
 	std::unique_ptr<std::atomic<uint32_t>[]> m_image_page_counts;
 	bool                                     m_fault_fast_path = true;
+	// No image is registered on the ImagePageTable pages [address, address + size) spans, from
+	// m_image_page_counts without m_lock: FindImagesInRegion would find nothing there. Each page's
+	// zero count means no image was findable on it at that load (see above); an image registered
+	// after a load (on that page) belongs after this query in any serialization of the two.
+	[[nodiscard]] bool NoImagesOnPages(uint64_t address, uint64_t size) const noexcept;
+	// KYTY_GPU_WRITE_IMAGE_SKIP (default on; =0 off): a GPU buffer write's image checks
+	// (InvalidateMemoryFromGPU, BufferCache::PreserveImagesForGpuWrite) skip m_lock and the page
+	// walk when NoImagesOnPages: the walk would find no image to act on. True: the caller skips.
+	// KYTY_GPU_WRITE_IMAGE_SKIP_VERIFY=1|exit takes the lock after such a decision and runs the
+	// walk (then returns false, so the caller does too): an image found while its pages are
+	// still uncounted is a mismatch (exit stops), one whose pages are counted by now was
+	// registered after the decision (a race). FrameEvents GpuWriteImageSkip*.
+	[[nodiscard]] bool SkipGpuWriteImageWalk(uint64_t address, uint64_t size);
+	bool m_gpu_write_skip        = true;
+	int  m_gpu_write_skip_verify = 0;
+	// Why TryMaterializeGpuMetadataClear last refused an image (DccImageState* FrameEvent).
+	Profiler::FrameEvent m_image_state_reason = Profiler::FrameEvent::DccImageStateUnregistered;
+	// KYTY_DCC_GPU_REFRESH (default off; =1 on, needs KYTY_DCC_GPU=1): the native DCC inspection
+	// (TryMaterializeGpuMetadataClear) also accepts a registered, matching, fully resident image
+	// that waits for a refresh (buffer-modified, CPU-dirty) or is not GPU-owned, which the CPU
+	// fallback handles today after draining the GPU for the metadata. The image is refreshed first
+	// (InitializeImage), exactly as that fallback's ClearImage refreshes it before a layer clear,
+	// then inspected and committed as a GPU write like any inspected image: the decision stays on
+	// the GPU behind the metadata's writer. FrameEvent DccGpuRefreshes (slices).
+	// KYTY_DCC_GPU_REFRESH_VERIFY=1|exit: for such an image, also take the CPU fallback's decision
+	// (after a drain), copy the inspected slices out behind the inspection and compare at
+	// completion: a slice the fallback clears must have its key consumed (all 0xFF), any other
+	// must be untouched. DccGpuRefreshVerify{Checks,Mismatches}; exit stops on a mismatch.
+	bool m_dcc_gpu_refresh        = false;
+	int  m_dcc_gpu_refresh_verify = 0;
+	// Atomic: the verify's deferred comparison runs on whichever thread pops pending operations.
+	struct DccRefreshTotals {
+		std::atomic<uint64_t> refreshes {0}; // slices inspected through the refresh
+		std::atomic<uint64_t> verify_checks {0};
+		std::atomic<uint64_t> verify_mismatches {0};
+	};
+	DccRefreshTotals m_dcc_refresh_totals;
+	// Caller holds m_lock, right after RecordSlice of the refreshed image.
+	void RecordDccRefreshVerify(Buffer& metadata, uint64_t offset, uint64_t slice_size,
+	                            std::vector<uint8_t> before, std::vector<uint8_t> clears,
+	                            GuestRange range);
+	struct GpuWriteSkipTotals {
+		std::atomic<uint64_t> skips {0};
+		std::atomic<uint64_t> verify_checks {0};
+		std::atomic<uint64_t> verify_races {0};
+		std::atomic<uint64_t> verify_mismatches {0};
+	};
+	GpuWriteSkipTotals m_gpu_write_skip_totals;
 	enum class ResidencyMode : uint8_t { Off, On, Poison };
 	ResidencyMode                            m_residency            = ResidencyMode::On;
 	uint64_t                                 m_residency_violations = 0;

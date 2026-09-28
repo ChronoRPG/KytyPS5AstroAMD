@@ -1006,6 +1006,47 @@ enum class FrameEvent : uint32_t {
 	CpuPlacementHardAffinity,
 	CpuPlacementHardAffinityReserved,
 	CpuPlacementRepinned,
+	// KYTY_FALSE_SHARING_WRITES (BufferCache::TryFalseSharingWrite): write faults that released a
+	// GPU-owned page without draining the GPU, the GPU-owned bytes left to their publication,
+	// uploads that skipped such bytes, and the verify mode (CPU writes to them before publication).
+	FalseSharingWrites,
+	FalseSharingBytes,
+	FalseSharingUploadSplits,
+	FalseSharingVerifyChecks,
+	FalseSharingVerifyConflicts,
+	// KYTY_GPU_WRITE_IMAGE_SKIP (TextureCache::SkipGpuWriteImageWalk): GPU buffer writes whose
+	// image checks found no registered image without the texture-cache lock, and the verify mode.
+	GpuWriteImageSkips,
+	GpuWriteImageSkipVerifyChecks,
+	GpuWriteImageSkipVerifyRaces,
+	GpuWriteImageSkipVerifyMismatches,
+	// DccFallbackImageState by cause (TextureCache::TryMaterializeGpuMetadataClear refused the GPU
+	// inspection of a DCC slice's image), checked in this order: the image is not registered, has a
+	// stencil association, does not match the view's description, or is not safe to download
+	// because it is buffer-modified, CPU-dirty, not GPU-modified, partially resident, or has
+	// GPU-dirty buffer bytes. (Enumerated in declaration order below, which differs.)
+	DccImageStateUnregistered,
+	DccImageStateStencil,
+	DccImageStateMismatch,
+	DccImageStateNotGpuModified,
+	DccImageStateBufferModified,
+	DccImageStateCpuDirty,
+	DccImageStatePartial,
+	DccImageStateGpuDirtyBytes,
+	// ReadbackSideFallbackOther by cause (BufferCache::TryIssueSideReadback): no registered owner,
+	// unaligned window, read larger than the side-copy window, a pending backing publication, no
+	// GPU-dirty bytes in the window, no free side-copy slot.
+	ReadbackSideOtherOwner,
+	ReadbackSideOtherAlignment,
+	ReadbackSideOtherWindow,
+	ReadbackSideOtherPublication,
+	ReadbackSideOtherNoDirty,
+	ReadbackSideOtherSlot,
+	// KYTY_DCC_GPU_REFRESH (TextureCache::TryMaterializeGpuMetadataClear): DCC slices inspected on
+	// the GPU for an image refreshed first instead of the CPU fallback, and the verify mode.
+	DccGpuRefreshes,
+	DccGpuRefreshVerifyChecks,
+	DccGpuRefreshVerifyMismatches,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

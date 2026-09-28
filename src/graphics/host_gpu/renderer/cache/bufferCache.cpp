@@ -262,6 +262,12 @@ bool WrittenSyncSkipEnabled() {
 	return ParseEnvU64("KYTY_WRITTEN_SYNC_SKIP", 1) != 0;
 }
 
+// KYTY_FALSE_SHARING_WRITES (default off; =1 on): write faults on GPU-owned pages at bytes the GPU
+// never wrote release the page without draining the GPU (BufferCache::TryFalseSharingWrite).
+bool FalseSharingWritesEnabled() {
+	return ParseEnvU64("KYTY_FALSE_SHARING_WRITES", 0) != 0;
+}
+
 // KYTY_BDA_SYNC_EPOCH_VERIFY=1|exit: every skipped BDA pass runs anyway and counts the pages the
 // skip would have missed that no guest write explains (BufferCache::VerifyBdaEpochSkip).
 int BdaEpochVerifyMode() {
@@ -545,7 +551,8 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                       const std::shared_ptr<EarlyReleasedDownload>& early) {
 	// An older side publication of these pages must reach the backing (and settle its pages)
 	// before this newer download is queued; otherwise it could overwrite newer bytes.
 	CompleteSideReadbacks(vaddr, size);
@@ -611,17 +618,127 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	for (const auto& copy: copies) {
 		publication_ranges.push_back({buffer_address + copy.srcOffset, copy.size});
 	}
+	if (early != nullptr) {
+		// The pages are released before this publication lands: remember its bytes (uploads skip
+		// them meanwhile) and, verifying, their guest contents now.
+		early->ranges = publication_ranges;
+		if (early->verify) {
+			for (const auto& range: early->ranges) {
+				const auto at = early->snapshot.size();
+				early->snapshot.resize(at + range.size);
+				(void)Libs::LibKernel::Memory::TryReadBacking(range.address, early->snapshot.data() + at,
+				                                              range.size);
+			}
+		}
+	}
 	const auto publication = BeginBackingPublication(publication_ranges, m_scheduler.CurrentTick());
 	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address, publication,
-	                                    copies = std::move(copies)] {
+	                                    early, copies = std::move(copies)] {
 		m_download_buffer.Invalidate(offset, total_size);
+		if (early != nullptr && early->verify) {
+			VerifyEarlyRelease(*early);
+		}
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
 		EndBackingPublication(publication);
+		if (early != nullptr) {
+			early->published.store(true, std::memory_order_release);
+		}
 	});
 	return true;
+}
+
+void BufferCache::VerifyEarlyRelease(const EarlyReleasedDownload& early) {
+	// Priority worker, right before the publication writes these bytes: they must still hold what
+	// they held when their pages were released, or a CPU write since is about to be overwritten.
+	m_false_sharing_totals.verify_checks.fetch_add(1, std::memory_order_relaxed);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::FalseSharingVerifyChecks);
+	std::vector<uint8_t> current;
+	uint64_t             at        = 0;
+	uint64_t             conflicts = 0;
+	for (const auto& range: early.ranges) {
+		current.resize(range.size);
+		(void)Libs::LibKernel::Memory::TryReadBacking(range.address, current.data(), range.size);
+		if (std::memcmp(current.data(), early.snapshot.data() + at, range.size) != 0) {
+			conflicts++;
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+				std::fprintf(stderr,
+				             "FalseSharingVerify: a CPU write to GPU-owned bytes of a released page "
+				             "is overwritten by their publication: addr=0x%016" PRIx64
+				             " size=0x%" PRIx64 "\n",
+				             range.address, range.size);
+			}
+		}
+		at += range.size;
+	}
+	if (conflicts == 0) {
+		return;
+	}
+	m_false_sharing_totals.verify_conflicts.fetch_add(conflicts, std::memory_order_relaxed);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::FalseSharingVerifyConflicts, conflicts);
+	if (m_false_sharing_verify == 2) {
+		EXIT("FalseSharingVerify: a CPU write to GPU-owned bytes of a released page\n");
+	}
+}
+
+void BufferCache::PruneEarlyReleased() {
+	std::erase_if(m_early_released, [](const auto& entry) {
+		return entry->published.load(std::memory_order_acquire);
+	});
+}
+
+bool BufferCache::OverlapsUnpublished(uint64_t address, uint64_t size) const {
+	const auto end = address + size;
+	for (const auto& entry: m_early_released) {
+		if (entry->published.load(std::memory_order_acquire)) {
+			continue;
+		}
+		for (const auto& range: entry->ranges) {
+			if (range.address < end && address < range.End()) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+template <typename Emit>
+void BufferCache::ForEachPublishedPart(uint64_t address, uint64_t size, Emit&& emit) const {
+	// Only called while early releases are pending (a handful of ranges at most).
+	const auto              end = address + size;
+	std::vector<GuestRange> excluded;
+	for (const auto& entry: m_early_released) {
+		if (entry->published.load(std::memory_order_acquire)) {
+			continue;
+		}
+		for (const auto& range: entry->ranges) {
+			if (range.address < end && address < range.End()) {
+				excluded.push_back(range);
+			}
+		}
+	}
+	if (excluded.empty()) {
+		emit(address, size);
+		return;
+	}
+	std::sort(excluded.begin(), excluded.end(),
+	          [](const GuestRange& a, const GuestRange& b) { return a.address < b.address; });
+	uint64_t cursor = address;
+	for (const auto& range: excluded) {
+		if (range.address > cursor) {
+			emit(cursor, std::min(range.address, end) - cursor);
+		}
+		cursor = std::max(cursor, range.End());
+		if (cursor >= end) {
+			return;
+		}
+	}
+	if (cursor < end) {
+		emit(cursor, end - cursor);
+	}
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -662,6 +779,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_written_sync_skip = WrittenSyncSkipEnabled();
 	if (m_written_sync_skip) {
 		m_written_sync_skip_verify = EnvVerifyMode("KYTY_WRITTEN_SYNC_SKIP_VERIFY");
+	}
+	m_false_sharing = FalseSharingWritesEnabled();
+	if (m_false_sharing) {
+		m_false_sharing_verify = EnvVerifyMode("KYTY_FALSE_SHARING_WRITES_VERIFY");
 	}
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
@@ -863,6 +984,20 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 				}
 				continue;
 			}
+			if (!m_early_released.empty() && OverlapsUnpublished(page, TRACKER_PAGE_SIZE)) {
+				// KYTY_FALSE_SHARING_WRITES: GPU-owned bytes of this page still wait for their
+				// publication, and the buffer holds them: upload only the other bytes of the
+				// snapshot, and return the page to normal tracking (no shadow of mixed contents).
+				ForEachPublishedPart(page, TRACKER_PAGE_SIZE, [&](uint64_t part, uint64_t bytes) {
+					copies.emplace_back(total_size + (part - page), buffer.Offset(part), bytes);
+				});
+				m_false_sharing_totals.upload_splits++;
+				Profiler::CountFrameEvent(Profiler::FrameEvent::FalseSharingUploadSplits);
+				demote.push_back(page);
+				total_size += TRACKER_PAGE_SIZE;
+				staged += TRACKER_PAGE_SIZE;
+				continue;
+			}
 			if (shadow == m_hot_shadows.end()) {
 				if (m_hot_shadows.size() < max_pages) {
 					shadow = m_hot_shadows.emplace(page, HotShadow {}).first;
@@ -1054,6 +1189,9 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return;
 	}
+	if (is_write && m_false_sharing && TryFalseSharingWrite(vaddr, size, trace)) {
+		return;
+	}
 	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
 	// Widen nearby CPU reads so they share one GPU drain.
@@ -1078,6 +1216,68 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
 	}
 }
 
+bool BufferCache::TryFalseSharingWrite(uint64_t vaddr, uint64_t size, ReadMemoryTrace& trace) {
+	// KYTY_FALSE_SHARING_WRITES (bufferCache.h). The written bytes must be none the GPU owns...
+	if (m_gpu_modified_ranges.Intersects(vaddr, size) || OverlapsUnpublished(vaddr, size)) {
+		return false;
+	}
+	// ...and no address-writing shader may still be writing bytes nobody tracks.
+	if (m_unbounded_write_tick != 0 && !m_scheduler.IsFree(m_unbounded_write_tick)) {
+		return false;
+	}
+	// Never create a buffer here: GPU-dirty bytes always live in a registered buffer, and one
+	// buffer owns every caching page it overlaps, hence the whole tracker page.
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner || IsBufferInvalid(*owner)) {
+		return false;
+	}
+	auto&      buffer     = m_slot_buffers[*owner];
+	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	if (!buffer.IsInBounds(page_begin, page_end - page_begin)) {
+		return false;
+	}
+	// An image over the pages would refresh from guest memory once invalidated by this fault.
+	{
+		std::scoped_lock lock {m_texture_cache.m_lock};
+		if (!m_texture_cache.FindImagesInRegion(page_begin, page_end - page_begin, true).empty()) {
+			return false;
+		}
+	}
+	// Pages the GPU owns without exact bytes (none to preserve) take the ordinary path, which
+	// then releases them without waiting.
+	if (!m_gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+		return false;
+	}
+	auto early    = std::make_shared<EarlyReleasedDownload>();
+	early->verify = m_false_sharing_verify != 0;
+	if (!DownloadBufferMemory(buffer, page_begin, page_end - page_begin, early)) {
+		return false;
+	}
+	// Release the pages now: the download above is recorded behind every GPU writer of their
+	// bytes, and its publication writes only those bytes. Uploads skip them until it lands.
+	m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
+	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	uint64_t bytes = 0;
+	for (const auto& range: early->ranges) {
+		bytes += range.size;
+	}
+	m_early_released.push_back(std::move(early));
+	// Submit the recording that copies them soon (within the eager-flush budget): the sooner it
+	// completes, the shorter the time guest reads of those bytes see their old contents.
+	if (m_eager_flush_budget != 0) {
+		m_eager_flush = true;
+	}
+	m_false_sharing_totals.writes++;
+	m_false_sharing_totals.bytes += bytes;
+	Profiler::CountFrameEvent(Profiler::FrameEvent::FalseSharingWrites);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::FalseSharingBytes, bytes);
+	trace.begin      = page_begin;
+	trace.size       = page_end - page_begin;
+	trace.downloaded = true;
+	return true;
+}
+
 BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
     uint64_t vaddr, uint64_t size, std::shared_ptr<SideReadback>& issued) {
 	EXIT_IF(!GuestGpu::IsGpuThread() || m_side == nullptr);
@@ -1087,14 +1287,19 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	if (m_unbounded_write_tick == current) {
 		return SideIssueResult::Unbounded;
 	}
+	// Why a read is refused as Other (ReadbackSideOther* counters).
+	const auto other = [](Profiler::FrameEvent cause) {
+		Profiler::CountFrameEvent(cause);
+		return SideIssueResult::Other;
+	};
 	// Never create a buffer here: GPU-dirty bytes always live in a registered buffer.
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner == nullptr || !*owner || IsBufferInvalid(*owner)) {
-		return SideIssueResult::Other;
+		return other(Profiler::FrameEvent::ReadbackSideOtherOwner);
 	}
 	auto& buffer = m_slot_buffers[*owner];
 	if (!buffer.IsInBounds(vaddr, size)) {
-		return SideIssueResult::Other;
+		return other(Profiler::FrameEvent::ReadbackSideOtherOwner);
 	}
 	const auto buffer_begin = buffer.CpuAddress();
 	const auto buffer_end   = buffer_begin + buffer.Size();
@@ -1104,7 +1309,7 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	const auto window_begin = std::max(aligned, buffer_begin);
 	const auto window_end   = std::min(aligned + side.window, buffer_end);
 	if (((page_begin | page_end | window_begin | window_end) % TRACKER_PAGE_SIZE) != 0) {
-		return SideIssueResult::Other;
+		return other(Profiler::FrameEvent::ReadbackSideOtherAlignment);
 	}
 
 	// Prefer the aligned window (neighbouring polled values share one copy); fall back to the
@@ -1118,6 +1323,8 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	std::optional<Candidate>       chosen;
 	uint64_t                       producer = 0;
 	auto                           reason   = SideIssueResult::Other;
+	// The cause of an Other result: no candidate fits the window unless one says otherwise.
+	auto other_cause = Profiler::FrameEvent::ReadbackSideOtherWindow;
 	for (size_t index = 0; index < candidates.size(); ++index) {
 		const auto& candidate = candidates[index];
 		if (index != 0 && candidate.begin == candidates[0].begin &&
@@ -1135,7 +1342,8 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 		// A queued drain/texture publication decides these bytes' final backing contents;
 		// publishing next to it could reorder the backing writes.
 		if (HasPendingBackingPublication(candidate.begin, candidate.end - candidate.begin)) {
-			reason = SideIssueResult::Other;
+			reason      = SideIssueResult::Other;
+			other_cause = Profiler::FrameEvent::ReadbackSideOtherPublication;
 			continue;
 		}
 		dirty.clear();
@@ -1146,7 +1354,8 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 			    newest = std::max(newest, m_write_ticks.MaxTick(start, end - start));
 		    });
 		if (dirty.empty()) {
-			reason = SideIssueResult::Other;
+			reason      = SideIssueResult::Other;
+			other_cause = Profiler::FrameEvent::ReadbackSideOtherNoDirty;
 			continue;
 		}
 		if (newest >= current) {
@@ -1156,6 +1365,9 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 		chosen   = candidate;
 		producer = newest;
 		break;
+	}
+	if (!chosen && reason == SideIssueResult::Other) {
+		Profiler::CountFrameEvent(other_cause);
 	}
 	if (!chosen) {
 		return reason;
@@ -1169,7 +1381,7 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 		}
 	}
 	if (slot_index == SideReadbackState::SlotCount) {
-		return SideIssueResult::Other;
+		return other(Profiler::FrameEvent::ReadbackSideOtherSlot);
 	}
 	auto&      slot         = side.slots[slot_index];
 	const auto staging_base = uint64_t {slot_index} * side.window;
@@ -1773,6 +1985,30 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
+	// KYTY_FALSE_SHARING_WRITES: bytes an early release left to their publication are the GPU's
+	// in the buffer; CPU-dirty page runs over them upload only the other bytes until it lands.
+	if (!m_early_released.empty()) {
+		PruneEarlyReleased();
+	}
+	const bool exclude_unpublished = !m_early_released.empty();
+	const auto append_copy = [&](std::vector<vk::BufferCopy>& list, uint64_t& list_size,
+	                             uint64_t address, uint64_t bytes) noexcept {
+		if (!exclude_unpublished) {
+			list.emplace_back(list_size, buffer.Offset(address), bytes);
+			list_size += bytes;
+			return;
+		}
+		uint64_t emitted = 0;
+		ForEachPublishedPart(address, bytes, [&](uint64_t part, uint64_t part_bytes) {
+			list.emplace_back(list_size, buffer.Offset(part), part_bytes);
+			list_size += part_bytes;
+			emitted += part_bytes;
+		});
+		if (emitted != bytes) {
+			m_false_sharing_totals.upload_splits++;
+			Profiler::CountFrameEvent(Profiler::FrameEvent::FalseSharingUploadSplits);
+		}
+	};
 	uint8_t* reserved = nullptr;
 	uint64_t reserved_offset = 0;
 	uint64_t reserved_size = 0;
@@ -1814,8 +2050,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			// epoch change before the lock was released, so it would be visible here.
 			stats->verify_mismatch_pages += bytes / TRACKER_PAGE_SIZE;
 		}
-		copies.emplace_back(total_size, buffer.Offset(address), bytes);
-		total_size += bytes;
+		append_copy(copies, total_size, address, bytes);
 	};
 	// KYTY_UPLOAD_DMA_HOST_COPY (uploadDma.h): a read upload large enough for the copy engine
 	// leaves its guest bytes to the DMA worker. The pages are already clean and write-protected
@@ -1855,8 +2090,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    [&](uint64_t address, uint64_t bytes) noexcept { collect(address, bytes, false); },
 		    upload,
 		    [&](uint64_t address, uint64_t bytes) noexcept {
-			    late_copies.emplace_back(late_size, buffer.Offset(address), bytes);
-			    late_size += bytes;
+			    append_copy(late_copies, late_size, address, bytes);
 		    },
 		    [&]() noexcept {
 			    if (late_copies.empty()) {
@@ -2898,7 +3132,11 @@ bool BufferCache::GpuDirtyMirrorMatches(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+	if (m_gpu_modified_ranges.Intersects(vaddr, size)) {
+		return true;
+	}
+	// KYTY_FALSE_SHARING_WRITES: released before their publication landed.
+	return !m_early_released.empty() && OverlapsUnpublished(vaddr, size);
 }
 
 std::optional<BufferContentRevision> BufferCache::GetContentRevision(uint64_t vaddr,

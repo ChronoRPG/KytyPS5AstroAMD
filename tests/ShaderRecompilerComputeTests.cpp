@@ -256,6 +256,12 @@ struct BufferCacheTestAccess {
   static BufferCache::WrittenSyncTotals WrittenSyncTotals(const BufferCache &cache) {
     return cache.m_written_sync_totals;
   }
+  // KYTY_FALSE_SHARING_WRITES.
+  static bool FalseSharing(const BufferCache &cache) { return cache.m_false_sharing; }
+  static int FalseSharingVerify(const BufferCache &cache) { return cache.m_false_sharing_verify; }
+  static const BufferCache::FalseSharingTotals &FalseSharingTotals(const BufferCache &cache) {
+    return cache.m_false_sharing_totals;
+  }
 };
 
 // Sets (or with nullptr removes) an environment switch read when a cache is constructed.
@@ -548,6 +554,50 @@ struct TextureCacheTestAccess {
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
+
+  // KYTY_GPU_WRITE_IMAGE_SKIP.
+  static bool NoImagesOnPages(const TextureCache &cache, uint64_t address, uint64_t size) {
+    return cache.NoImagesOnPages(address, size);
+  }
+  static bool GpuWriteSkip(const TextureCache &cache) { return cache.m_gpu_write_skip; }
+  static int GpuWriteSkipVerify(const TextureCache &cache) { return cache.m_gpu_write_skip_verify; }
+  static const TextureCache::GpuWriteSkipTotals &GpuWriteSkipTotals(const TextureCache &cache) {
+    return cache.m_gpu_write_skip_totals;
+  }
+  static void Register(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    cache.RegisterImage(id);
+  }
+  static void Unregister(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    cache.UnregisterImage(id);
+  }
+  // KYTY_DCC_GPU / KYTY_DCC_GPU_REFRESH.
+  static bool DccHelperAvailable(const TextureCache &cache) {
+    return cache.m_dcc_clear != nullptr && cache.m_dcc_clear->Available();
+  }
+  static bool DccGpuRefresh(const TextureCache &cache) { return cache.m_dcc_gpu_refresh; }
+  static const TextureCache::DccRefreshTotals &DccRefreshTotals(const TextureCache &cache) {
+    return cache.m_dcc_refresh_totals;
+  }
+  static uint64_t DccGpuRecords(const TextureCache &cache) { return cache.m_gpu_dcc_records; }
+  static uint64_t DccCpuFallbacks(const TextureCache &cache) { return cache.m_gpu_dcc_fallbacks; }
+  // Under the lock every page's count equals its owner list's size.
+  static bool CountsMatchOwners(TextureCache &cache, uint64_t address, uint64_t size) {
+    std::lock_guard lock(cache.m_lock);
+    TextureCache::ImagePageTable::PageRange pages{};
+    if (!TextureCache::ImagePageTable::TryGetPageRange(address, size, pages)) {
+      return false;
+    }
+    for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+      const auto *owners = cache.m_image_page_table.Find(page);
+      const size_t listed = owners == nullptr ? 0 : owners->size();
+      if (cache.m_image_page_counts[page].load() != listed) {
+        return false;
+      }
+    }
+    return true;
+  }
 };
 
 struct RenderExecutorTestAccess {
@@ -646,6 +696,12 @@ struct RenderExecutorTestAccess {
 
   static RenderExecutor::DrawSequenceTotals DrawSequenceTotals(const RenderExecutor &executor) {
     return executor.m_draw_sequence_totals;
+  }
+
+  // KYTY_UPLOAD_DEDUP / KYTY_UPLOAD_DEDUP_TABLE.
+  static vk::DescriptorBufferInfo UploadShaderData(RenderExecutor &executor,
+                                                   std::span<const uint32_t> data, uint32_t site) {
+    return executor.UploadShaderData(data, site);
   }
 
   static auto PrepareGraphicsBindings(RenderExecutor &executor,
@@ -2395,6 +2451,33 @@ public:
                vk::ShaderFloatControlsIndependence::eNone &&
            properties12.shaderDenormFlushToZeroFloat32 == VK_TRUE;
   }
+  // maxPushDescriptors of VK_KHR_push_descriptor, which the harness device enables. The product
+  // copies it into GraphicContext::max_push_descriptors (vulkanWindow.cpp); the harness runtime
+  // context leaves it 0, so the helpers that need push descriptors stay off unless a check
+  // enables them (PushDescriptorsScope).
+  [[nodiscard]] u32 MaxPushDescriptors() const {
+    vk::PhysicalDevicePushDescriptorPropertiesKHR push{};
+    vk::PhysicalDeviceProperties2 properties{};
+    properties.pNext = &push;
+    m_physical_device.getProperties2(&properties);
+    return push.maxPushDescriptors;
+  }
+  // Gives the runtime context the device's push-descriptor limit for one check's private
+  // RenderContext (constructed and shut down inside the scope), and restores 0 afterwards.
+  class PushDescriptorsScope {
+   public:
+    PushDescriptorsScope(GraphicContext &graphics, u32 limit)
+        : m_graphics(graphics), m_saved(graphics.max_push_descriptors) {
+      m_graphics.max_push_descriptors = limit;
+    }
+    ~PushDescriptorsScope() { m_graphics.max_push_descriptors = m_saved; }
+    PushDescriptorsScope(const PushDescriptorsScope &) = delete;
+    PushDescriptorsScope &operator=(const PushDescriptorsScope &) = delete;
+
+   private:
+    GraphicContext &m_graphics;
+    u32 m_saved;
+  };
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
     return m_runtime_context;
@@ -7376,6 +7459,486 @@ public:
     std::printf("[host]    %-32s ok (skip %s, verify %s)\n", name,
                 BufferCacheTestAccess::WrittenSyncSkip(context.GetBufferCache()) ? "on" : "off",
                 BufferCacheTestAccess::WrittenSyncSkipVerify(context.GetBufferCache()) != 0
+                    ? "on"
+                    : "off");
+  }
+
+  // KYTY_DCC_GPU_REFRESH (TextureCache::TryMaterializeGpuMetadataClear): a two-layer DCC render
+  // target whose metadata a shader wrote (layer 0 a clear code, layer 1 not), while its image
+  // waits for a refresh: its memory was written through a buffer by the GPU (buffer-modified),
+  // or only by the CPU (a new, CPU-dirty image). With the switch on the native inspection runs
+  // after a refresh (checked by its verify mode); with it off the CPU fallback drains for the
+  // metadata. Both must leave the same texels and metadata bytes.
+  void CheckDccGpuRefresh() {
+    constexpr const char *name = "DccGpuRefresh";
+    constexpr uintptr_t base = 0x0000000266000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t color_size = 0x20000; // 128x64, 2 layers, 8 bytes per texel
+    constexpr uint64_t metadata_address = base + 0x40000;
+    constexpr uint64_t metadata_size = 0x2000; // 0x1000 per layer
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "DCC refresh allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "DCC refresh mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+
+    struct Outcome {
+      std::vector<u32> layer0;
+      std::vector<u32> layer1;
+      std::vector<uint8_t> metadata;
+      bool helper = false;
+      uint64_t refreshes = 0;
+      uint64_t verify_checks = 0;
+      uint64_t verify_mismatches = 0;
+      uint64_t records = 0;
+      uint64_t fallbacks = 0;
+    };
+    const u32 push_limit = MaxPushDescriptors();
+    const auto run = [&](bool refresh, bool gpu_written_image) {
+      for (uint64_t index = 0; index < allocation_size; index++) {
+        memory[index] = static_cast<uint8_t>((index * 19 + index / 4096) & 0xffu);
+      }
+      // DccClearHelper needs four push descriptors, as in the product.
+      const PushDescriptorsScope push_descriptors(m_runtime_context, push_limit);
+      SetEnvironment("KYTY_DCC_GPU", "1");
+      SetEnvironment("KYTY_DCC_GPU_REFRESH", refresh ? "1" : "0");
+      SetEnvironment("KYTY_DCC_GPU_REFRESH_VERIFY", refresh ? "exit" : nullptr);
+      const auto context_owner = MakeRenderContext();
+      SetEnvironment("KYTY_DCC_GPU", nullptr);
+      SetEnvironment("KYTY_DCC_GPU_REFRESH", nullptr);
+      SetEnvironment("KYTY_DCC_GPU_REFRESH_VERIFY", nullptr);
+      auto &context = *context_owner;
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      auto &buffers = context.GetBufferCache();
+      // A shader write through a storage binding: GPU-owned bytes, no known fill.
+      const auto gpu_fill = [&](uint64_t address, uint64_t size, uint32_t value) {
+        OnGpuThread(context, [&] {
+          const auto [buffer, offset] = buffers.ObtainBuffer(address, size, true, false);
+          scheduler.Current().Handle().fillBuffer(buffer->Handle(), offset, size, value);
+        });
+      };
+      ImageDesc desc{};
+      desc.type = BindingType::RenderTarget;
+      desc.info.data = {base, color_size};
+      desc.info.pixel_format = vk::Format::eR16G16B16A16Sfloat;
+      desc.info.guest_format = Prospero::BufferFormat::k16_16_16_16Float;
+      desc.info.type = Prospero::ImageType::kColor2D;
+      desc.info.extent = {128, 64, 1};
+      desc.info.resources = {1, 2};
+      desc.info.bytes_per_block = 8;
+      desc.info.samples = 1;
+      desc.info.mip_layout[0] = {0, color_size, 128, 64};
+      desc.view_info.format = vk::Format::eR16G16B16A16Sfloat;
+      desc.view_info.type = vk::ImageViewType::e2DArray;
+      desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      desc.view_info.layer_count = 2;
+      desc.info.tile_mode = Prospero::TileMode::kRenderTarget;
+      desc.info.pitch = TileGetRenderTargetPitch(128, 8);
+      desc.info.mip_layout[0].pitch = desc.info.pitch;
+      desc.info.metadata.kind = ImageMetadataKind::Dcc;
+      desc.info.metadata.range = {metadata_address, metadata_size};
+      desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+      if (gpu_written_image) {
+        gpu_fill(base, color_size, 0x3c003c00u);
+      }
+      gpu_fill(metadata_address, 0x1000, 0x40404040u);
+      gpu_fill(metadata_address + 0x1000, 0x1000, 0x12121212u);
+      const auto id = OnGpuThread(context, [&] { return cache.FindImage(desc); });
+      Outcome outcome;
+      outcome.helper = TextureCacheTestAccess::DccHelperAvailable(cache);
+      outcome.layer0 = ReadCachedTexel(name, context, id, {5, 7, 0}, {1, 1, 1}, 0);
+      outcome.layer1 = ReadCachedTexel(name, context, id, {5, 7, 0}, {1, 1, 1}, 1);
+      buffers.ReadMemory(metadata_address, metadata_size, false);
+      outcome.metadata.resize(metadata_size);
+      Require(name, "metadata backing",
+              LibKernel::Memory::TryReadBacking(metadata_address, outcome.metadata.data(),
+                                               metadata_size),
+              "the metadata backing could not be read");
+      scheduler.Finish();
+      const auto &totals = TextureCacheTestAccess::DccRefreshTotals(cache);
+      outcome.refreshes = totals.refreshes.load();
+      outcome.verify_checks = totals.verify_checks.load();
+      outcome.verify_mismatches = totals.verify_mismatches.load();
+      outcome.records = TextureCacheTestAccess::DccGpuRecords(cache);
+      outcome.fallbacks = TextureCacheTestAccess::DccCpuFallbacks(cache);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      return outcome;
+    };
+
+    for (const bool gpu_written_image : {true, false}) {
+      const auto native = run(true, gpu_written_image);
+      const auto fallback = run(false, gpu_written_image);
+      const char *state = gpu_written_image ? "buffer-modified" : "CPU-dirty";
+      Require(name, "same texels",
+              native.layer0 == fallback.layer0 && native.layer1 == fallback.layer1 &&
+                  fallback.layer0 == std::vector<u32>{0, 0x3c000000u},
+              std::string("the refreshed native inspection left different texels (") + state +
+                  " image)");
+      Require(name, "same metadata",
+              native.metadata == fallback.metadata &&
+                  std::all_of(fallback.metadata.begin(), fallback.metadata.begin() + 0x1000,
+                              [](uint8_t byte) { return byte == 0xffu; }) &&
+                  std::all_of(fallback.metadata.begin() + 0x1000, fallback.metadata.end(),
+                              [](uint8_t byte) { return byte == 0x12u; }),
+              std::string("the refreshed native inspection left different metadata (") + state +
+                  " image)");
+      Require(name, "helper available", native.helper || push_limit < 4,
+              "DccClearHelper stayed off although the device has push descriptors");
+      Require(name, "paths taken",
+              fallback.fallbacks == 1 && fallback.refreshes == 0 &&
+                  (!native.helper || (native.refreshes == 2 && native.records == 2 &&
+                                      native.fallbacks == 0 && native.verify_checks == 1 &&
+                                      native.verify_mismatches == 0)),
+              std::string("the switch did not select the refreshed native inspection (") +
+                  state + " image)");
+      std::printf("[gpu]     %-32s ok (%s image, native inspection %s)\n", name, state,
+                  native.helper ? "ran" : "unavailable");
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "DCC refresh mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "DCC refresh allocation release failed");
+  }
+
+  // KYTY_GPU_WRITE_IMAGE_SKIP (TextureCache::SkipGpuWriteImageWalk): a GPU buffer write's image
+  // checks skip the texture-cache lock and page walk when no image is registered on the write's
+  // 1 MiB pages, and never miss an image whose registration races the check.
+  void CheckGpuWriteImageSkip() {
+    constexpr const char *name = "GpuWriteImageSkip";
+    constexpr uint64_t base = 0x0000000264000000ull;
+    constexpr uint64_t page = 0x100000;
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &cache = context.GetTextureCache();
+    const bool skip_on = TextureCacheTestAccess::GpuWriteSkip(cache);
+    const int verify = TextureCacheTestAccess::GpuWriteSkipVerify(cache);
+    const auto &totals = TextureCacheTestAccess::GpuWriteSkipTotals(cache);
+    const auto none = [&](uint64_t address, uint64_t size) {
+      return TextureCacheTestAccess::NoImagesOnPages(cache, address, size);
+    };
+
+    // Nothing registered: the check skips.
+    Require(name, "empty pages", none(base + 0x1000, 0x2000),
+            "pages without images were reported to hold one");
+    const auto skips0 = totals.skips.load();
+    cache.InvalidateMemoryFromGPU(base + 0x1000, 0x2000);
+    Require(name, "skip without images", totals.skips.load() == skips0 + (skip_on ? 1u : 0u),
+            "a GPU write over pages without images took the lock (or skipped while off)");
+
+    // An ownership-only image on pages 1 and 2: counted there, and only there.
+    ImageInfo info{};
+    info.data = {base + page, 2 * page};
+    const auto id = TextureCacheTestAccess::InsertImage(cache, info);
+    Require(name, "registered image counted",
+            !none(base + page + 0x1000, 0x100) && !none(base + 0x800, page) &&
+                none(base + 3 * page, 0x100) && none(base, 0x1000),
+            "an image's pages were not counted, or other pages were");
+    const auto skips1 = totals.skips.load();
+    cache.InvalidateMemoryFromGPU(base + page + 0x1000, 0x100);
+    Require(name, "no skip over an image", totals.skips.load() == skips1,
+            "a GPU write over an image skipped the walk");
+
+    // A thread toggles the image's registration while this one checks and writes.
+    std::atomic<bool> stop{false};
+    std::thread toggler([&] {
+      for (int round = 0; round < 20000 && !stop.load(); round++) {
+        TextureCacheTestAccess::Unregister(cache, id);
+        TextureCacheTestAccess::Register(cache, id);
+      }
+    });
+    uint64_t skipped = 0;
+    for (int round = 0; round < 20000; round++) {
+      skipped += none(base + page + 0x2000, 0x100) ? 1u : 0u;
+      cache.InvalidateMemoryFromGPU(base + page + 0x2000, 0x100);
+      if ((round & 63) == 0) {
+        Require(name, "counts match owners",
+                TextureCacheTestAccess::CountsMatchOwners(cache, base, 4 * page),
+                "under the lock a page's count differed from its owner list");
+      }
+    }
+    stop.store(true);
+    toggler.join();
+    Require(name, "race outcome",
+            totals.verify_mismatches.load() == 0 &&
+                (verify == 0 || !skip_on || totals.verify_checks.load() != 0 || skipped == 0),
+            "a skip missed an image over uncounted pages (or the verify mode never checked)");
+    TextureCacheTestAccess::DeleteImage(cache, id);
+    Require(name, "retired image uncounted", none(base + page, 2 * page),
+            "a deleted image's pages stayed counted");
+    std::printf("[host]    %-32s ok (skip %s, verify %s, %llu racing skips, %llu races)\n", name,
+                skip_on ? "on" : "off", verify != 0 ? "on" : "off",
+                static_cast<unsigned long long>(skipped),
+                static_cast<unsigned long long>(totals.verify_races.load()));
+  }
+
+  // KYTY_UPLOAD_DEDUP (RenderExecutor::UploadShaderData): shader-data uploads equal to their
+  // site's last upload in the same tick reuse its allocation; with KYTY_UPLOAD_DEDUP_TABLE=1 any
+  // equal upload of the tick does (hashed table). Every returned allocation holds the bytes.
+  void CheckShaderUploadDedup() {
+    constexpr const char *name = "ShaderUploadDedup";
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &executor = context.GetRenderExecutor();
+    auto &stream = context.GetBufferCache().GetUtilityBuffer(Libs::Graphics::MemoryUsage::Stream);
+    const char *table_env = std::getenv("KYTY_UPLOAD_DEDUP_TABLE");
+    const bool table = table_env != nullptr && std::strcmp(table_env, "1") == 0;
+
+    std::vector<uint32_t> a(40);
+    for (uint32_t index = 0; index < a.size(); index++) {
+      a[index] = 0x1000u + index * 7u;
+    }
+    auto b = a;
+    b[17] ^= 0xffffu;
+    const auto upload = [&](const std::vector<uint32_t> &data, uint32_t site) {
+      const auto info = RenderExecutorTestAccess::UploadShaderData(executor, data, site);
+      Require(name, "uploaded bytes",
+              info.buffer == stream.Handle() && info.range == data.size() * sizeof(uint32_t) &&
+                  std::memcmp(stream.Mapped().data() + info.offset, data.data(), info.range) == 0,
+              "a shader-data allocation does not hold its bytes");
+      return info.offset;
+    };
+    const auto a1 = upload(a, 0);
+    Require(name, "site repeat", upload(a, 0) == a1,
+            "an upload equal to its site's last one in the tick was not reused");
+    const auto b1 = upload(b, 0);
+    Require(name, "different bytes", b1 != a1, "different shader data shared an allocation");
+    const auto a2 = upload(a, 0);
+    const auto a_other_site = upload(a, 1);
+    Require(name, "table lookups",
+            table ? a2 == a1 && a_other_site == a1 : a2 != a1 && a_other_site != a1,
+            table ? "the content table did not find an equal upload of the tick"
+                  : "an upload equal to an older one of another site or position was reused");
+    Require(name, "other site repeat", upload(a, 1) == a_other_site,
+            "a site's repeated upload was not reused");
+    scheduler.Flush();
+    Require(name, "new tick", upload(a, 1) != a_other_site && upload(a, 0) != a2,
+            "an allocation of an earlier tick was reused");
+    scheduler.Finish();
+    std::printf("[host]    %-32s ok (table %s)\n", name, table ? "on" : "off");
+  }
+
+  // KYTY_FALSE_SHARING_WRITES (BufferCache::TryFalseSharingWrite): one tracker page holds the tail
+  // of a GPU-written binding and bytes the CPU writes (the GI G-buffer and the per-frame block
+  // after it). A CPU write there releases the page without draining the GPU when the switch is
+  // on; either way the buffer keeps the GPU's bytes, guest memory receives them, and the CPU's
+  // bytes reach the buffer. A CPU write to the GPU's bytes before their publication is the case
+  // the release gets wrong: the publication overwrites it (the verify mode counts it).
+  void CheckFalseSharingWrites() {
+    constexpr const char *name = "FalseSharingWrites";
+    constexpr uintptr_t base = 0x0000000208800000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t gpu_offset = 0x20000; // the GPU-written binding [0x20000, 0x21b20)
+    constexpr uint64_t gpu_size = 0x1b20;
+    constexpr uint64_t shared_page = 0x21000; // its last page, shared with CPU bytes
+    constexpr uint64_t cpu_offset = 0x21c00;  // CPU-written bytes on that page
+    constexpr uint64_t span = 0x2000;         // [0x20000, 0x22000): both pages
+    static_assert(gpu_offset + gpu_size > shared_page && gpu_offset + gpu_size < cpu_offset);
+
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "false-sharing direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "false-sharing fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    for (uint64_t index = 0; index < allocation_size; index++) {
+      memory[index] = static_cast<uint8_t>((index * 23 + index / 4096) & 0xffu);
+    }
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const bool on = BufferCacheTestAccess::FalseSharing(cache);
+      const int verify = BufferCacheTestAccess::FalseSharingVerify(cache);
+      const auto &totals = BufferCacheTestAccess::FalseSharingTotals(cache);
+      const auto current_tick = [&] {
+        return OnGpuThread(context, [&] { return scheduler.CurrentTick(); });
+      };
+      // The GPU writes the whole binding: a writable binding of it, then a fill.
+      const auto gpu_write = [&](uint32_t value) {
+        OnGpuThread(context, [&] {
+          const auto [buffer, offset] =
+              cache.ObtainBuffer(base + gpu_offset, gpu_size, true, false);
+          scheduler.Current().Handle().fillBuffer(buffer->Handle(), offset, gpu_size, value);
+        });
+      };
+      // As a guest thread writes: the write faults through the tracker (from this thread, so a
+      // drain is a GPU-thread command it waits for), then lands.
+      const auto cpu_write = [&](uint64_t offset, uint32_t value) {
+        Require(name, "write fault",
+                context.HandleFault(PageFaultAccess::Write, base + offset),
+                "a CPU write to a tracked page did not fault through the tracker");
+        std::memcpy(memory + offset, &value, sizeof(value));
+      };
+      // Everything recorded so far completes and publishes.
+      const auto settle = [&] {
+        OnGpuThread(context, [&] { scheduler.Finish(); });
+        scheduler.WaitPriorityOperations(current_tick() - 1);
+      };
+      const auto read_native = [&](const Libs::Graphics::Buffer &buffer, uint64_t offset,
+                                   uint64_t bytes) {
+        auto readback = CreateHostBuffer(name, bytes, vk::BufferUsageFlagBits::eTransferDst, {0});
+        OnGpuThread(context, [&] {
+          const vk::BufferCopy copy{offset, 0, bytes};
+          scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+          vk::BufferMemoryBarrier barrier{};
+          barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+          barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+          barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          barrier.buffer = readback.buffer;
+          barrier.size = readback.size;
+          scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                                       vk::PipelineStageFlagBits::eHost, {}, 0,
+                                                       nullptr, 1, &barrier, 0, nullptr);
+          scheduler.Finish();
+        });
+        auto words = ReadBuffer(name, readback, static_cast<uint32_t>(bytes / 4));
+        DestroyBuffer(&readback);
+        return words;
+      };
+      const auto filled = [&](const uint8_t *bytes, uint64_t size, uint32_t value) {
+        for (uint64_t index = 0; index < size; index += 4) {
+          uint32_t word = 0;
+          std::memcpy(&word, bytes + index, sizeof(word));
+          if (word != value) {
+            return false;
+          }
+        }
+        return true;
+      };
+
+      // Round 1: the CPU writes only its own bytes of the shared page.
+      constexpr uint32_t gpu_value = 0xa5a5a5a5u;
+      gpu_write(gpu_value);
+      const auto tick_before = current_tick();
+      constexpr uint32_t cpu_value = 0x600dbeefu;
+      cpu_write(cpu_offset, cpu_value);
+      const auto tick_after = current_tick();
+      if (on) {
+        Require(name, "released without a drain",
+                totals.writes == 1 && totals.bytes == gpu_offset + gpu_size - shared_page &&
+                    tick_after == tick_before,
+                "a write to CPU bytes of a GPU-owned page drained the GPU (or released wrongly)");
+        // The GPU's bytes wait for their publication: still old in guest memory, GPU-dirty to
+        // the cache, and left out of the page's upload.
+        Require(name, "publication pending",
+                !filled(memory + shared_page, gpu_offset + gpu_size - shared_page, gpu_value) &&
+                    OnGpuThread(context, [&] {
+                      return cache.HasGpuDirtyBytes(base + shared_page, 0x40);
+                    }),
+                "a released page's GPU bytes were published early, or not reported GPU-dirty");
+      } else {
+        Require(name, "drained",
+                totals.writes == 0 && tick_after != tick_before &&
+                    filled(memory + shared_page, gpu_offset + gpu_size - shared_page, gpu_value),
+                "the write fault did not drain the GPU with the switch off");
+      }
+      const auto bound = OnGpuThread(
+          context, [&] { return cache.ObtainBuffer(base + gpu_offset, span, false, false); });
+      Require(name, "upload skips the GPU's bytes", !on || totals.upload_splits == 1,
+              "the released page's upload did not leave out the unpublished bytes");
+      settle();
+      // (The binding's first page stays GPU-owned with the switch on: not read from here.)
+      Require(name, "published",
+              filled(memory + shared_page, gpu_offset + gpu_size - shared_page, gpu_value) &&
+                  OnGpuThread(context, [&] {
+                    return !cache.HasGpuDirtyBytes(base + shared_page, 0x40);
+                  }),
+              "the GPU's bytes did not reach guest memory");
+      const auto words = read_native(*bound.first, bound.second, span);
+      const auto *native = reinterpret_cast<const uint8_t *>(words.data());
+      Require(name, "buffer bytes",
+              filled(native, gpu_size, gpu_value) &&
+                  std::memcmp(native + gpu_size, memory + gpu_offset + gpu_size,
+                              span - gpu_size) == 0,
+              "the buffer lost the GPU's bytes or the CPU's write");
+      Require(name, "no conflict", totals.verify_conflicts.load() == 0 &&
+                                       totals.verify_checks.load() == (on && verify != 0 ? 1u : 0u),
+              "the verify mode saw a conflict where the CPU wrote only its own bytes");
+
+      // Round 2: the CPU also writes a byte the GPU owns before the publication lands.
+      constexpr uint32_t gpu_value2 = 0x5a5a5a5au;
+      gpu_write(gpu_value2);
+      cpu_write(cpu_offset + 0x40, cpu_value);
+      constexpr uint32_t intruder = 0x0badf00du;
+      constexpr uint64_t intruder_offset = shared_page + 0x100;
+      std::memcpy(memory + intruder_offset, &intruder, sizeof(intruder));
+      settle();
+      uint32_t landed = 0;
+      std::memcpy(&landed, memory + intruder_offset, sizeof(landed));
+      if (on) {
+        Require(name, "publication overwrites the CPU write",
+                totals.writes == 2 && landed == gpu_value2 &&
+                    totals.verify_conflicts.load() == (verify != 0 ? 1u : 0u),
+                "the released page's publication did not behave as documented");
+      } else {
+        Require(name, "the CPU write stands", landed == intruder,
+                "with the switch off, a CPU write after the drain was lost");
+      }
+      settle();
+      context.UnmapMemory(base, allocation_size);
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "false-sharing direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "false-sharing direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok (release %s, verify %s)\n", name,
+                BufferCacheTestAccess::FalseSharing(context.GetBufferCache()) ? "on" : "off",
+                BufferCacheTestAccess::FalseSharingVerify(context.GetBufferCache()) != 0
                     ? "on"
                     : "off");
   }
@@ -43033,6 +43596,26 @@ int main(int argc, char **argv) {
     vulkan.CheckWrittenSyncSkip();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--false-sharing-writes-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckFalseSharingWrites();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--shader-upload-dedup-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckShaderUploadDedup();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-write-image-skip-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckGpuWriteImageSkip();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--dcc-gpu-refresh-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDccGpuRefresh();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--tracker-gap-detectors-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTrackerGapDetectors();
@@ -43317,6 +43900,10 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaSyncEpoch();
   vulkan.CheckBindingEpochMemo();
   vulkan.CheckWrittenSyncSkip();
+  vulkan.CheckFalseSharingWrites();
+  vulkan.CheckShaderUploadDedup();
+  vulkan.CheckGpuWriteImageSkip();
+  vulkan.CheckDccGpuRefresh();
   vulkan.CheckTrackerGapDetectors();
   vulkan.CheckEagerReadback();
   vulkan.CheckMeshIndirectConversion();

@@ -583,6 +583,32 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.CpuPlacementHardAffinity.Cumulative",
     "FrameEvent.CpuPlacementHardAffinityReserved.Cumulative",
     "FrameEvent.CpuPlacementRepinned.Cumulative",
+    "FrameEvent.FalseSharingWrites.Cumulative",
+    "FrameEvent.FalseSharingBytes.Cumulative",
+    "FrameEvent.FalseSharingUploadSplits.Cumulative",
+    "FrameEvent.FalseSharingVerifyChecks.Cumulative",
+    "FrameEvent.FalseSharingVerifyConflicts.Cumulative",
+    "FrameEvent.GpuWriteImageSkips.Cumulative",
+    "FrameEvent.GpuWriteImageSkipVerifyChecks.Cumulative",
+    "FrameEvent.GpuWriteImageSkipVerifyRaces.Cumulative",
+    "FrameEvent.GpuWriteImageSkipVerifyMismatches.Cumulative",
+    "FrameEvent.DccImageStateUnregistered.Cumulative",
+    "FrameEvent.DccImageStateStencil.Cumulative",
+    "FrameEvent.DccImageStateMismatch.Cumulative",
+    "FrameEvent.DccImageStateNotGpuModified.Cumulative",
+    "FrameEvent.DccImageStateBufferModified.Cumulative",
+    "FrameEvent.DccImageStateCpuDirty.Cumulative",
+    "FrameEvent.DccImageStatePartial.Cumulative",
+    "FrameEvent.DccImageStateGpuDirtyBytes.Cumulative",
+    "FrameEvent.ReadbackSideOtherOwner.Cumulative",
+    "FrameEvent.ReadbackSideOtherAlignment.Cumulative",
+    "FrameEvent.ReadbackSideOtherWindow.Cumulative",
+    "FrameEvent.ReadbackSideOtherPublication.Cumulative",
+    "FrameEvent.ReadbackSideOtherNoDirty.Cumulative",
+    "FrameEvent.ReadbackSideOtherSlot.Cumulative",
+    "FrameEvent.DccGpuRefreshes.Cumulative",
+    "FrameEvent.DccGpuRefreshVerifyChecks.Cumulative",
+    "FrameEvent.DccGpuRefreshVerifyMismatches.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
@@ -1131,6 +1157,18 @@ void Detail::CountFrameEventShared(FrameEvent kind, uint64_t amount) noexcept {
 	}
 }
 
+#ifdef TRACY_ON_DEMAND
+namespace {
+// The on-demand connection a scope is counted against. The Thread sink can be on without a
+// started profiler (tests set it directly, and a shutdown can follow the flip that chose it), and
+// with TRACY_MANUAL_LIFETIME GetProfiler() then dereferences no profiler: 0 stands for "none", as
+// for a started profiler that has not been connected yet.
+uint64_t CurrentConnectionId() {
+	return tracy::ProfilerAvailable() ? tracy::GetProfiler().ConnectionId() : 0;
+}
+} // namespace
+#endif
+
 void ScopedFrameWait::Begin() {
 	const auto sink = Detail::g_event_sink.load(std::memory_order_relaxed);
 	if (sink == Detail::CounterSink::Shared &&
@@ -1138,7 +1176,7 @@ void ScopedFrameWait::Begin() {
 		return;
 	}
 #ifdef TRACY_ON_DEMAND
-	m_connection = tracy::GetProfiler().ConnectionId();
+	m_connection = CurrentConnectionId();
 #endif
 	m_sink     = sink;
 	m_start_ns = FrameWaitClockNs();
@@ -1150,7 +1188,7 @@ void ScopedFrameWait::Finish() {
 	}
 #ifdef TRACY_ON_DEMAND
 	// Scopes spanning an on-demand connection change are omitted.
-	if (m_connection != tracy::GetProfiler().ConnectionId()) {
+	if (m_connection != CurrentConnectionId()) {
 		return;
 	}
 #endif

@@ -934,6 +934,18 @@ static bool UploadDedupEnabled() {
 	return enabled;
 }
 
+// KYTY_UPLOAD_DEDUP_TABLE=1: every shader-data upload is also looked up in a hashed content table
+// after its site's last upload (the U54 behaviour). By default only the site's last upload is
+// checked: in the U54 captures the table matched about 14 of 9,200 lookups per flip at the Sky
+// Garden start and 0.6 of 900 in the desert, so hashing every upload cost more than it saved.
+static bool UploadDedupTableEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_UPLOAD_DEDUP_TABLE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 vk::DescriptorBufferInfo RenderExecutor::UploadShaderData(std::span<const uint32_t> data,
                                                           uint32_t site, bool* fresh) {
 	// These shader tables are read-only and ring allocations live until their GPU
@@ -958,6 +970,24 @@ vk::DescriptorBufferInfo RenderExecutor::UploadShaderData(std::span<const uint32
 		}
 		EXIT_IF(data.empty());
 		const auto tick = m_context.GetCommandScheduler().CurrentTick();
+		if (!UploadDedupTableEnabled()) {
+			auto& last = m_upload_site_last[site % m_upload_site_last.size()];
+			if (last.allocation.buffer != nullptr && last.tick == tick &&
+			    std::ranges::equal(data, last.words)) {
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadLastHits);
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadReuseHits);
+				Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadBytesAvoided,
+				                          data.size_bytes());
+				return last.allocation;
+			}
+			const auto allocation = NativeUpload(m_context, data);
+			last.words.assign(data.begin(), data.end());
+			last.allocation = allocation;
+			// The upload may have submitted (ring wrap): the allocation belongs to the tick after it.
+			last.tick = m_context.GetCommandScheduler().CurrentTick();
+			Profiler::CountFrameEvent(Profiler::FrameEvent::ShaderUploadReuseMisses);
+			return allocation;
+		}
 		auto&      last_slot = m_upload_last_slot[site % m_upload_last_slot.size()];
 		if (const auto& last = m_upload_dedup[last_slot];
 		    last.allocation.buffer != nullptr && last.tick == tick &&

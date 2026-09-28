@@ -1034,8 +1034,11 @@ private:
 		std::vector<uint32_t> words;
 	};
 	std::array<ShaderUploadEntry, 64> m_shader_uploads;
-	// KYTY_UPLOAD_DEDUP: same-tick content dedup of shader-data/flattened-SRT uploads, and the
-	// entry each upload site filled or matched last (checked before hashing).
+	// KYTY_UPLOAD_DEDUP: same-tick content dedup of shader-data/flattened-SRT uploads. By default
+	// each upload site keeps its last upload (m_upload_site_last); KYTY_UPLOAD_DEDUP_TABLE=1 also
+	// looks every upload up in a hashed content table, with the entry each site filled or matched
+	// last checked before hashing (the U54 behaviour).
+	std::array<ShaderUploadEntry, 32>  m_upload_site_last;
 	std::array<ShaderUploadEntry, 256> m_upload_dedup;
 	std::array<uint32_t, 32>           m_upload_last_slot {};
 	// KYTY_DESCRIPTOR_SET_REUSE: sets written earlier in the current command buffer.
