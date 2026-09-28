@@ -45,6 +45,8 @@ struct RenderExecutorTestAccess;
 
 namespace DrawPrep {
 struct PreparedDraw;
+struct BindingPlan;
+struct StagePlan;
 class Engine;
 } // namespace DrawPrep
 
@@ -919,7 +921,9 @@ public:
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode);
 
-	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	// plan: the committed draw's binding plan for this stage (KYTY_DRAW_PREP_BINDINGS), or null.
+	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared,
+	                     DrawPrep::StagePlan* plan = nullptr);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
@@ -933,6 +937,13 @@ public:
 		m_prepared_draw = nullptr;
 		return prepared;
 	}
+	// KYTY_DRAW_PREP_BINDINGS: the committed draw's binding plan while its preparation awaits
+	// validation (null: none), and its activation once DrawPrep::Validate accepted the
+	// preparation (RefreshShaders).
+	[[nodiscard]] const DrawPrep::BindingPlan* PendingBindingPlan() const noexcept {
+		return m_binding_plan;
+	}
+	void ActivateBindingPlan() noexcept { m_binding_plan_active = m_binding_plan != nullptr; }
 
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
@@ -949,8 +960,10 @@ private:
 
 	// Resolves into `binding` (image, description) in place; its view and mip views are left
 	// for RebindImages. Writing in place avoids copying the ~0.5 KB description twice.
+	// hash_hint: TextureBindingMemo::Hash of the binding's key, computed by a draw-prep worker.
 	void ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-	                    const ShaderRecompiler::IR::DescriptorValue& value, TextureBinding& binding);
+	                    const ShaderRecompiler::IR::DescriptorValue& value, TextureBinding& binding,
+	                    const uint64_t* hash_hint = nullptr);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 	// ResolveTexture's full resolution (no memo lookup); `memo` records the answer.
@@ -1146,6 +1159,11 @@ private:
 	// Draw-prep (drawPrep.h): the preparation of the draw the engine is committing, taken by
 	// RefreshShaders in place of GetGraphicsPrograms when its certificate holds. Null otherwise.
 	DrawPrep::PreparedDraw* m_prepared_draw = nullptr;
+	// KYTY_DRAW_PREP_BINDINGS: the binding plan of the draw the engine is committing (null: none),
+	// and whether it applies: set by RefreshShaders once DrawPrep::Validate accepted the same
+	// slot's preparation (the plan was derived from it), cleared by the engine after the draw.
+	DrawPrep::BindingPlan* m_binding_plan        = nullptr;
+	bool                   m_binding_plan_active = false;
 	// KYTY_NATIVE_INDIRECT_MESH (meshIndirect.h): created by the first native indirect mesh draw.
 	std::unique_ptr<MeshIndirect::Converter> m_mesh_indirect;
 

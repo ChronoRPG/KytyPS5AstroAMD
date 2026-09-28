@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
@@ -25,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <thread>
 
 #if defined(_M_X64) || defined(__x86_64__)
@@ -618,6 +620,10 @@ struct Engine::Slot {
 	DrawAutoArgs     auto_args {};
 	RegisterSnapshot registers;
 	PreparedDraw     prepared;
+	// KYTY_DRAW_PREP_BINDINGS (bindingPlan.h): computed with `prepared` by the preparing thread,
+	// published with it by Complete; used at commit only if Validate accepts `prepared`. Reset
+	// after every commit.
+	BindingPlan      plan;
 	bool             eligible        = false; // DrawReachesPrograms, decided at submission
 	bool             worker_prepared = false;
 	// KYTY_CP_REPEAT_TRACE (repeatTrace.h): the draw's input hashes, filled by the preparing thread,
@@ -636,6 +642,30 @@ void HashForRepeatTrace(Engine::Slot& slot) {
 	RepeatTrace::HashDraw(slot.registers, slot.kind == DrawKind::Index ? &slot.index_args : nullptr,
 	                      slot.kind == DrawKind::Auto ? &slot.auto_args : nullptr, slot.eligible,
 	                      slot.prepared, slot.repeat);
+}
+
+// After Prepare, on the preparing thread (KYTY_DRAW_PREP_BINDINGS): the slot's binding plan.
+void PlanBindings(Engine::Slot& slot, const BindingPlanContext& context) {
+	if (BindingParts() == 0) [[likely]] {
+		return;
+	}
+	ComputeBindingPlan(context, slot.registers,
+	                   slot.kind == DrawKind::Index ? &slot.index_args : nullptr, slot.prepared,
+	                   slot.plan);
+}
+
+BindingPlanContext MakeBindingPlanContext(RenderContext& renderer) {
+	(void)BindingParts(); // read (and logged) here, before any worker needs it
+	return {&renderer.GetPipelineCache(), &renderer.GetSamplerCache(), &renderer.GetGraphics()};
+}
+
+// The DrawPrep#k thread's number k (0 on other threads): its busy time is FrameWait
+// DrawPrepWorker<k> (threads past the eighth share DrawPrepWorker8).
+thread_local uint32_t t_worker_number = 0;
+
+Profiler::FrameWait WorkerBusyWait(uint32_t number) {
+	return static_cast<Profiler::FrameWait>(
+	    static_cast<uint32_t>(Profiler::FrameWait::DrawPrepWorker1) + std::min(number, 8u) - 1u);
 }
 
 uint32_t EnvUnsigned(const char* name, uint32_t fallback, uint32_t low, uint32_t high) {
@@ -716,8 +746,13 @@ struct Engine::Workers {
 	// (Engine::CommitHead), so the two cannot differ: the conservative clean hint (exact=false),
 	// then the release store of Done that publishes the preparation to the commit.
 	void PrepareClaimed(Slot& slot, uint64_t seq) {
+		std::optional<Profiler::ScopedFrameWait> busy;
+		if (t_worker_number != 0) {
+			busy.emplace(WorkerBusyWait(t_worker_number));
+		}
 		Prepare(pipeline_cache, slot.registers, slot.eligible, false, slot.prepared);
 		HashForRepeatTrace(slot);
+		PlanBindings(slot, plan_context);
 		slot.worker_prepared = true;
 		window.Complete(seq);
 	}
@@ -728,6 +763,7 @@ struct Engine::Workers {
 		Profiler::SetThreadName(name);
 		t_worker_thread = true;
 		uint32_t placement_count = 0; // placement samples (common/cpuPlacement.h), every 64th slot
+		t_worker_number = index + 1u;
 		RunPreparationWorker(
 		    gate, window, index, spin_ns, cold_spin_ns, stop,
 		    [this, &placement_count](Slot& slot, uint64_t seq) {
@@ -740,6 +776,7 @@ struct Engine::Workers {
 	}
 
 	PipelineCache&           pipeline_cache;
+	BindingPlanContext       plan_context; // set by the engine before the first Submit
 	Window<Slot>             window;
 	uint64_t                 spin_ns      = 0;
 	uint64_t                 cold_spin_ns = 0;
@@ -780,6 +817,7 @@ Engine::Engine(RenderContext& renderer, std::function<void()> service_commands,
 		m_workers = std::make_unique<Workers>(m_renderer.GetPipelineCache(), window, workers,
 		                                      uint64_t {spin_us} * 1000u, hot, wake_backlog,
 		                                      uint64_t {cold_spin_us} * 1000u, steal);
+		m_workers->plan_context = MakeBindingPlanContext(m_renderer);
 		LOGF("DrawPrep: parallel mode, window=%u workers=%u spin=%uus hot=%u wake_backlog=%u "
 		     "cold_spin=%uus steal=%u steal_after=%uus cert=%s verify=%d\n",
 		     m_workers->window.Capacity(), workers, spin_us, m_workers->gate.HotCount(),
@@ -838,6 +876,7 @@ bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
 		FillSlot(slot, submit_id, index_args, auto_args, context, user_config, shaders);
 		Prepare(m_renderer.GetPipelineCache(), slot.registers, slot.eligible, true, slot.prepared);
 		HashForRepeatTrace(slot);
+		PlanBindings(slot, MakeBindingPlanContext(m_renderer)); // tests: plans on this thread
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
 		Commit(slot);
 		return true;
@@ -925,11 +964,21 @@ void Engine::Commit(Slot& slot) {
 	                                               slot.registers.user_config,
 	                                               slot.registers.shaders);
 	executor.m_prepared_draw = &slot.prepared;
+	// KYTY_DRAW_PREP_BINDINGS: the slot's plan, which RefreshShaders activates once Validate
+	// accepted the preparation it was computed from.
+	executor.m_binding_plan        = slot.plan.valid ? &slot.plan : nullptr;
+	executor.m_binding_plan_active = false;
 	if (slot.kind == DrawKind::Index) {
 		executor.DrawIndex(slot.submit_id, scheduler.Current(), slot.index_args);
 	} else {
 		executor.DrawAuto(slot.submit_id, scheduler.Current(), slot.auto_args);
 	}
+	if (slot.plan.valid) {
+		CountCommittedPlan(executor.m_binding_plan_active);
+		slot.plan.Reset();
+	}
+	executor.m_binding_plan        = nullptr;
+	executor.m_binding_plan_active = false;
 	const bool taken = executor.m_prepared_draw == nullptr;
 	if (executor.m_prepared_draw != nullptr) {
 		// The draw returned before preparing its programs (nothing to draw, a metadata

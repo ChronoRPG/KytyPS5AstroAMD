@@ -1116,6 +1116,42 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(draw_prep_engine_parallel_copied PROPERTIES
 		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_BACKING_INPLACE=0;KYTY_DRAW_PREP_LOCKFREE_HINT=0")
+	# KYTY_DRAW_PREP_BINDINGS (P4b): binding plans with every item compared (inline: plans computed
+	# on the command processor, counted exactly; parallel, and parallel with one stealing worker),
+	# plans used as they are, and the whole compute/renderer suite under the verify mode.
+	add_test(NAME draw_prep_engine_inline_bindings_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_inline_bindings_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit")
+	add_test(NAME draw_prep_engine_inline_bindings
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_inline_bindings PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=1")
+	add_test(NAME draw_prep_engine_parallel_bindings_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_bindings_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit")
+	add_test(NAME draw_prep_engine_parallel_bindings
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_bindings PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=1")
+	add_test(NAME draw_prep_engine_parallel_steal_bindings_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_parallel_steal_bindings_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=parallel;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_STEAL=1;KYTY_DRAW_PREP_WORKERS=1;KYTY_DRAW_PREP_HOT=1;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit")
+	add_test(NAME draw_prep_engine_inline_bindings_parts
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(draw_prep_engine_inline_bindings_parts PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP=inline;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=buffers,userdata,samplers,textures;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit")
+	add_test(NAME shader_recompiler_compute_bindings_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(shader_recompiler_compute_bindings_verify PROPERTIES
+		ENVIRONMENT "KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_BINDINGS_VERIFY=exit")
+	# KYTY_DESCRIPTOR_OFFSET_AUDIT (P4b-D0, a measurement): the whole suite with the audit's digests.
+	add_test(NAME shader_recompiler_compute_offset_audit
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	set_tests_properties(shader_recompiler_compute_offset_audit PROPERTIES
+		ENVIRONMENT "KYTY_DESCRIPTOR_OFFSET_AUDIT=1;KYTY_DESCRIPTOR_SET_REUSE_AUDIT=1")
 	# KYTY_DRAW_PREP_STEAL (off by default): the command processor stealing whenever a slot waits,
 	# with six workers and with a single one (a held head with unclaimed slots behind it, where it
 	# steals most).
@@ -1271,6 +1307,9 @@ if(BUILD_TESTING)
 	endfunction()
 	add_cp_recorder_variants(draw_prep_engine --draw-prep-engine-only
 		KYTY_DRAW_PREP=parallel KYTY_DRAW_PREP_VERIFY=exit)
+	add_cp_recorder_variants(draw_prep_engine_bindings --draw-prep-engine-only
+		KYTY_DRAW_PREP=parallel KYTY_DRAW_PREP_VERIFY=exit KYTY_DRAW_PREP_BINDINGS=1
+		KYTY_DRAW_PREP_BINDINGS_VERIFY=exit)
 	add_cp_recorder_variants(graphics_pipeline_rasterization --polygon-mode-only)
 	add_cp_recorder_variants(command_scheduler_timeline --scheduler-only)
 	add_cp_recorder_variants(gpu_command_lane --gpu-command-lane-only)

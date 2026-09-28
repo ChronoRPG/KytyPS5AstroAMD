@@ -543,6 +543,12 @@ public:
 		return ClampRangeSizeUnlocked(virtual_addr, size, ClampRangeMemoEnabled());
 	}
 
+	// The generation every change advances before it starts (acquire): an unchanged value later
+	// means every ClampRangeSize answer made after this read still holds.
+	[[nodiscard]] uint64_t Generation() const noexcept {
+		return m_generation.load(std::memory_order_acquire);
+	}
+
 	uint64_t CountPageTableEntries(bool gpu) {
 		Common::LockGuard lock(m_mutex);
 
@@ -1369,6 +1375,14 @@ bool IsGpuCleanForRead(uint64_t vaddr, uint64_t size) {
 bool SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
 	       GetGpuResources().SynchronizeGpuBackingForRead(vaddr, size);
+}
+
+uint64_t ClampRangeSizeQuiet(uint64_t vaddr, uint64_t size) {
+	return g_virtual_ranges != nullptr ? g_virtual_ranges->ClampRangeSize(vaddr, size) : 0;
+}
+
+uint64_t VirtualRangesGeneration() noexcept {
+	return g_virtual_ranges != nullptr ? g_virtual_ranges->Generation() : 0;
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {

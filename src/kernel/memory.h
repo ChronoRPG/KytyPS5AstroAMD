@@ -144,6 +144,11 @@ bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
 bool                   SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// ClampRangeSize's answer without its log or exit (0: not committed, or no ranges yet). Any thread.
+[[nodiscard]] uint64_t ClampRangeSizeQuiet(uint64_t vaddr, uint64_t size);
+// The guest virtual ranges' change generation (advanced before every change starts; 0 before
+// they exist). Unchanged since a read made before a ClampRangeSize call: the call's answer holds.
+[[nodiscard]] uint64_t VirtualRangesGeneration() noexcept;
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;

@@ -18,13 +18,20 @@ struct GraphicContext;
 
 class SamplerCache {
 public:
-	explicit SamplerCache(GraphicContext& graphics): m_graphics(graphics) {
+	explicit SamplerCache(GraphicContext& graphics)
+	    : m_graphics(graphics), m_instance(NextInstance()) {
 		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	}
 	~SamplerCache();
 	KYTY_CLASS_NO_COPY(SamplerCache);
 
 	vk::Sampler GetSampler(const ShaderSamplerResource& r);
+	// The sampler GetSampler returns for these dwords when it was created already, null otherwise
+	// (lookup only: nothing is created). Samplers are never evicted, so a handle found stays the
+	// answer for the cache's lifetime. Any thread (DrawPrep binding plans).
+	[[nodiscard]] vk::Sampler FindSampler(const ShaderSamplerResource& r);
+	// Unique per cache object for the process lifetime (per-thread lookup memos key on it).
+	[[nodiscard]] uint64_t InstanceId() const noexcept { return m_instance; }
 
 private:
 	using SamplerKey = std::array<uint32_t, 4>;
@@ -41,7 +48,10 @@ private:
 		}
 	};
 
+	static uint64_t NextInstance() noexcept;
+
 	GraphicContext&                                             m_graphics;
+	const uint64_t                                              m_instance;
 	Common::Mutex                                               m_mutex;
 	std::unordered_map<SamplerKey, vk::Sampler, SamplerKeyHash> m_samplers;
 };
