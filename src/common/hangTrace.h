@@ -79,6 +79,12 @@
 //                        (KYTY_HANG_TRACE_DRS_PROBE: the eboot.bin offset of its pointer, 0 = off):
 //                        resolution index, level, updates with room to upgrade, target fps,
 //                        scalable and total GPU ms (RecordEopTimestamps).
+//   placement.csv      each second, per thread role (cp, recorder, guest, host): placement samples,
+//                      those on the CP's current physical core, the CP's core, and the samples per
+//                      logical processor 0-31 (lp_other: 32 and up). See common/cpuPlacement.h.
+//
+// summary.csv's last column, pending_ops_max, is the deepest normal-operation queue a draw or
+// dispatch left queued in that second (KYTY_PENDING_OPS_NOWAIT).
 
 #include <array>
 #include <atomic>
@@ -369,6 +375,9 @@ struct EopTimestampFrame {
 	double  drs_total_ms    = 0.0;
 };
 void RecordEopTimestamps(const EopTimestampFrame& frame);
+// KYTY_PENDING_OPS_NOWAIT: the normal-operation queue depth when a draw/dispatch pop left it queued
+// (summary.csv pending_ops_max: the largest per second).
+void NotePendingOperations(uint64_t depth);
 // The load address of a registered guest module (RegisterGuestCode), by file name.
 [[nodiscard]] bool ModuleBase(std::string_view name, uint64_t& base);
 // Copies `size` bytes of guest memory whose host pages are all readable now (never faults on

@@ -270,6 +270,11 @@ struct LogExecutor {
 		                       s ^ (static_cast<uint64_t>(static_cast<VkQueryResultFlags>(fl))
 		                            << 40u)));
 	}
+	void writeTimestamp2(vk::PipelineStageFlags2 st, vk::QueryPool p, uint32_t q) {
+		Push(Op::WriteTimestamp2,
+		     VerifyHash::Value(Op::WriteTimestamp2, Bits(p), q,
+		                       static_cast<uint64_t>(static_cast<VkPipelineStageFlags2>(st))));
+	}
 };
 
 // Discards everything (benchmark consumer).
@@ -759,6 +764,19 @@ public:
 				                                          8u ^ (static_cast<uint64_t>(
 				                                                    static_cast<VkQueryResultFlags>(flags))
 				                                                << 40u))});
+				break;
+			}
+			case Op::WriteTimestamp2: {
+				const auto     p = H<vk::QueryPool>();
+				const uint32_t q = U32() % 100;
+				const auto     stage = (U32() & 1u) != 0 ? vk::PipelineStageFlagBits2::eAllCommands
+				                                        : vk::PipelineStageFlagBits2::eTopOfPipe;
+				e.writeTimestamp2(stage, p, q);
+				expected.push_back(
+				    {op, VerifyHash::Value(op, LogExecutor::Bits(p), q,
+				                           static_cast<uint64_t>(
+				                               static_cast<VkPipelineStageFlags2>(
+				                                   vk::PipelineStageFlags2(stage))))});
 				break;
 			}
 			default: break;

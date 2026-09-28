@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
+#include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 
@@ -204,15 +205,15 @@ void EopTimestampRing::Recalibrate(uint64_t now_ns, bool force) {
 	m_calibrated_ns = now_ns;
 }
 
-void EopTimestampRing::BeginCommand(vk::CommandBuffer buffer) {
+void EopTimestampRing::BeginCommand(const CommandSink& sink) {
 	if (!Valid()) {
 		return;
 	}
 	(void)m_ring.ResetConsumed(
-	    [&](uint32_t first, uint32_t count) { buffer.resetQueryPool(m_pool, first, count); });
+	    [&](uint32_t first, uint32_t count) { sink.resetQueryPool(m_pool, first, count); });
 }
 
-uint32_t EopTimestampRing::RecordQuery(vk::CommandBuffer buffer) {
+uint32_t EopTimestampRing::RecordQuery(const CommandSink& sink) {
 	if (!Valid()) {
 		return NoSlot;
 	}
@@ -224,7 +225,7 @@ uint32_t EopTimestampRing::RecordQuery(vk::CommandBuffer buffer) {
 	}
 	// When everything recorded before it has completed: the end-of-pipe semantics. Allowed inside
 	// a rendering instance; it touches no guest resource, so pending batched barriers may follow.
-	buffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, m_pool, slot);
+	sink.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, m_pool, slot);
 	return slot;
 }
 

@@ -89,6 +89,7 @@ enum class Op : uint16_t {
 	BeginQuery,
 	EndQuery,
 	CopyQueryPoolResults,
+	WriteTimestamp2,
 	Count,
 };
 
@@ -334,6 +335,11 @@ struct CopyQueryPoolResultsPacket {
 	uint32_t             first       = 0;
 	uint32_t             count       = 0;
 	vk::QueryResultFlags flags {};
+};
+struct WriteTimestampPacket {
+	vk::QueryPool pool  = nullptr;
+	uint64_t      stage = 0; // VkPipelineStageFlags2
+	uint32_t      query = 0;
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -681,6 +687,7 @@ public:
 	void copyQueryPoolResults(vk::QueryPool pool, uint32_t first, uint32_t count,
 	                          vk::Buffer destination, vk::DeviceSize offset, vk::DeviceSize stride,
 	                          vk::QueryResultFlags flags);
+	void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, uint32_t query);
 
 private:
 	class Writer;

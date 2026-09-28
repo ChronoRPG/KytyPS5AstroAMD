@@ -1,5 +1,7 @@
 #include "common/hangTrace.h"
 
+#include "common/cpuPlacement.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -294,6 +296,7 @@ struct Totals {
 	std::atomic<uint64_t> apr_shrink_reads {0};
 	std::atomic<uint64_t> apr_shrinks_since_flip {0}; // not reset by the summary
 	std::atomic<uint64_t> apr_shrink_max_per_flip {0};
+	std::atomic<uint64_t> pending_ops_max {0};
 	std::atomic<uint64_t> lod_packets {0};
 	std::atomic<uint64_t> lod_prior_nonzero {0};
 	std::atomic<uint64_t> tex_total {0};
@@ -436,6 +439,7 @@ struct Files {
 	std::FILE* cp            = nullptr;
 	std::FILE* unclean       = nullptr;
 	std::FILE* timestamps    = nullptr;
+	std::FILE* placement     = nullptr;
 };
 Files g_files;
 
@@ -718,6 +722,33 @@ void Publish() {
 	}
 	WriteRows(g_files.timestamps, rows);
 
+	if (g_files.placement != nullptr) {
+		Common::PlacementHistogram histogram;
+		Common::TakePlacementHistogram(histogram);
+		static constexpr std::array<const char*, 4> kRoles {"cp", "recorder", "guest", "host"};
+		static_assert(kRoles.size() == static_cast<size_t>(Common::ThreadRole::Count));
+		for (size_t role = 0; role < histogram.samples.size(); role++) {
+			uint64_t total = 0;
+			uint64_t other = 0;
+			for (uint32_t cpu = 0; cpu < Common::PlacementHistogram::Processors; cpu++) {
+				total += histogram.samples[role][cpu];
+				other += cpu >= 32 ? histogram.samples[role][cpu] : 0u;
+			}
+			if (total == 0) {
+				continue;
+			}
+			std::string row = fmt::format(
+			    "{},{},{},{},{}", t_ms, kRoles[role], total, histogram.on_cp_core[role],
+			    histogram.cp_core == UINT32_MAX ? int64_t {-1} : int64_t {histogram.cp_core});
+			for (uint32_t cpu = 0; cpu < 32; cpu++) {
+				row += fmt::format(",{}", histogram.samples[role][cpu]);
+			}
+			row += fmt::format(",{}", other);
+			std::fputs(row.c_str(), g_files.placement);
+			std::fputc('\n', g_files.placement);
+		}
+	}
+
 	if (g_files.cp != nullptr) {
 		{
 			std::scoped_lock lock(g_cp_mutex);
@@ -934,6 +965,7 @@ void Publish() {
 		line += fmt::format(",{},{},{},{}", take(g_totals.apr_grow_reads),
 		                    take(g_totals.apr_shrink_reads),
 		                    take(g_totals.apr_shrink_max_per_flip), stream_bytes >> 20u);
+		line += fmt::format(",{}", take(g_totals.pending_ops_max));
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
@@ -941,7 +973,7 @@ void Publish() {
 	for (auto* file: {g_files.summary, g_files.apr, g_files.imports, g_files.imports_index,
 	                  g_files.lod, g_files.tex, g_files.modules, g_files.queues, g_files.readbacks,
 	                  g_files.images, g_files.lodwatch, g_files.transfers, g_files.compiles,
-	                  g_files.unclean}) {
+	                  g_files.unclean, g_files.timestamps, g_files.placement}) {
 		if (file != nullptr) {
 			std::fflush(file);
 		}
@@ -1065,6 +1097,8 @@ void Initialize() {
 	// reads between two flips, and the texture-streamer footprint (MiB): streamed-texture
 	// residency changes.
 	summary_header += ",apr_grow_reads,apr_shrink_reads,apr_shrink_max_per_flip,apr_stream_mib";
+	// KYTY_PENDING_OPS_NOWAIT: the deepest normal-operation queue a draw or dispatch left queued.
+	summary_header += ",pending_ops_max";
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.compiles = OpenFile("compiles.csv",
 	                            "t_ms,kind,stage,guest_hash,id,id2,origin,translate_us,emit_us,"
@@ -1093,6 +1127,14 @@ void Initialize() {
 	                              "shift_max_us,publish_us,publishes,ring0_us,ring1_us,ring2_us,"
 	                              "ring3_us,ring4_us,ring5_us,ring6_us,ring7_us,drs_index,drs_level,"
 	                              "drs_room_frames,drs_fps,drs_scalable_ms,drs_total_ms");
+	{
+		std::string header = "t_ms,role,samples,on_cp_core,cp_core";
+		for (uint32_t cpu = 0; cpu < 32; cpu++) {
+			header += ",lp" + std::to_string(cpu);
+		}
+		header += ",lp_other";
+		g_files.placement = OpenFile("placement.csv", header.c_str());
+	}
 	if (CpTraceEnabled()) {
 		g_files.cp = OpenFile("cp.csv", "t_us,row,host_tid,queue,seq,event,address,value,ref,mask,"
 		                                "aux,size");
@@ -1161,7 +1203,7 @@ void Shutdown() {
 	                   &g_files.lod, &g_files.tex, &g_files.modules, &g_files.queues,
 	                   &g_files.readbacks, &g_files.images, &g_files.lodwatch,
 	                   &g_files.transfers, &g_files.compiles, &g_files.unclean,
-	                   &g_files.timestamps}) {
+	                   &g_files.timestamps, &g_files.placement}) {
 		if (*file != nullptr) {
 			std::fclose(*file);
 			*file = nullptr;
@@ -1783,6 +1825,13 @@ void RecordEopTimestamps(const EopTimestampFrame& frame) {
 	}
 	std::scoped_lock lock(g_timestamp_mutex);
 	g_pending_timestamp_rows.push_back(std::move(row));
+}
+
+void NotePendingOperations(uint64_t depth) {
+	if (!Enabled()) {
+		return;
+	}
+	UpdateMax(g_totals.pending_ops_max, depth);
 }
 
 bool ModuleBase(std::string_view name, uint64_t& base) {

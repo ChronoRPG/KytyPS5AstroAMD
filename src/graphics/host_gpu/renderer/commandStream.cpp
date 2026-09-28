@@ -223,6 +223,7 @@ const char* OpName(Op op) noexcept {
 	    "BeginQuery",
 	    "EndQuery",
 	    "CopyQueryPoolResults",
+	    "WriteTimestamp2",
 	};
 	static_assert(std::size(names) == static_cast<size_t>(Op::Count));
 	const auto index = static_cast<size_t>(op);
@@ -1277,6 +1278,15 @@ void Encoder::copyQueryPoolResults(vk::QueryPool pool, uint32_t first, uint32_t 
 	                HandleBits(destination), offset,
 	                stride ^ (static_cast<uint64_t>(static_cast<VkQueryResultFlags>(flags)) << 40u))
 	          : 0);
+}
+
+void Encoder::writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool pool, uint32_t query) {
+	const auto stage_bits = static_cast<uint64_t>(static_cast<VkPipelineStageFlags2>(stage));
+	auto       w          = Open(Op::WriteTimestamp2, Sz<WriteTimestampPacket>(), false);
+	w.Put(WriteTimestampPacket {pool, stage_bits, query});
+	Close(w, m_options.verify
+	             ? VerifyHash::Value(Op::WriteTimestamp2, HandleBits(pool), query, stage_bits)
+	             : 0);
 }
 
 } // namespace Libs::Graphics::CommandStream

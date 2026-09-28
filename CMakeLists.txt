@@ -495,6 +495,17 @@ if(LINUX)
 	target_link_libraries(profiler_counter_tests Threads::Threads)
 endif()
 
+# KYTY_CPU_RESERVE (common/cpuPlacement.h): layout choice, live placement on this machine (Windows),
+# and --bench (off against cp in child processes).
+add_executable(cpu_placement_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CpuPlacementTests.cpp"
+)
+target_link_libraries(cpu_placement_tests common)
+target_include_directories(cpu_placement_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(cpu_placement_tests Threads::Threads)
+endif()
+
 add_executable(lod_stats_report_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LodStatsReportTests.cpp"
 )
@@ -727,6 +738,8 @@ if(BUILD_TESTING)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME profiler_counters COMMAND $<TARGET_FILE:profiler_counter_tests>)
+	add_test(NAME cpu_placement COMMAND $<TARGET_FILE:cpu_placement_tests>)
+	add_test(NAME cpu_placement_recorder COMMAND $<TARGET_FILE:cpu_placement_tests> --mode cp+recorder)
 	add_test(NAME lod_stats_report COMMAND $<TARGET_FILE:lod_stats_report_tests>)
 	add_test(NAME game_patch_filter COMMAND $<TARGET_FILE:game_patch_filter_tests>)
 	add_test(NAME lod_stats_codegen
@@ -767,6 +780,15 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
+	# Draw-path pops that wait for the priority runner again, and the runner wait's spin.
+	add_test(NAME command_scheduler_ready_ops_wait
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
+	set_tests_properties(command_scheduler_ready_ops_wait PROPERTIES
+		ENVIRONMENT "KYTY_PENDING_OPS_NOWAIT=0")
+	add_test(NAME command_scheduler_priority_spin
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
+	set_tests_properties(command_scheduler_priority_spin PROPERTIES
+		ENVIRONMENT "KYTY_PRIORITY_WAIT_SPIN_US=500")
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane
@@ -1099,9 +1121,12 @@ if(BUILD_TESTING)
 	add_cp_recorder_variants(compute_meta_clear_classification --compute-meta-clear-only)
 	add_cp_recorder_variants(buffer_cache_dirty_gc --buffer-cache-gc-only)
 	add_cp_recorder_variants(buffer_cache_eager_readback --readback-eager-only)
-	# KYTY_EOP_TIMESTAMPS=gpu with the recorder: its queries and slot resets are recorded in direct
-	# windows (CommandScheduler::BeginCommand, CommandProcessor::RecordEopTimestamp).
+	# KYTY_EOP_TIMESTAMPS=gpu with the recorder: its query writes and slot resets are recorder
+	# packets (WriteTimestamp2, ResetQueryPool); the clock writes drain nothing. gpu-verify checks
+	# the published values.
 	add_cp_recorder_variants(eop_timestamps_gpu --eop-timestamps-only KYTY_EOP_TIMESTAMPS=gpu)
+	add_cp_recorder_variants(eop_timestamps_gpu_verify --eop-timestamps-only
+		KYTY_EOP_TIMESTAMPS=gpu-verify)
 	# The recorder under VK_LAYER_KHRONOS_validation (KYTY_TEST_VULKAN_VALIDATION=1: core and
 	# thread-safety checks, i.e. command-pool, descriptor-pool, command-buffer and queue use from
 	# two threads at once, and descriptor sets updated while a recorded or pending buffer binds

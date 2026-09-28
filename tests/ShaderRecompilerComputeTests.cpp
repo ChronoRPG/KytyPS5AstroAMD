@@ -3211,6 +3211,127 @@ public:
     std::printf("[host]    %-32s ok\n", "SchedulerTimeline");
   }
 
+  // KYTY_PENDING_OPS_NOWAIT (default on): a draw/dispatch pop (PopReadyOperations) never waits
+  // for the priority runner. It leaves a completed normal operation queued while its tick's
+  // priority operation still runs, with every operation after it, in order; a blocking pop
+  // (Finish) then waits and runs them all. =0 checks only the blocking half. With
+  // KYTY_PRIORITY_WAIT_SPIN_US set, the runner wait spins first (PriorityWaitSpins).
+  // Counters are read through the per-thread sink, switched on only around calls that submit
+  // nothing (a scoped frame wait needs a running profiler).
+  void CheckSchedulerReadyOperations() {
+    EnsureRuntimeContext();
+    const auto *nowait_env = std::getenv("KYTY_PENDING_OPS_NOWAIT");
+    const bool nowait = nowait_env == nullptr || std::strcmp(nowait_env, "0") != 0;
+    const auto *spin_env = std::getenv("KYTY_PRIORITY_WAIT_SPIN_US");
+    const bool spin =
+        spin_env != nullptr && std::strtoull(spin_env, nullptr, 10) != 0;
+    const auto previous_sink = Profiler::Detail::g_event_sink.load();
+    const auto counted = [previous_sink](bool on) {
+      Profiler::Detail::g_event_sink.store(
+          on ? Profiler::Detail::CounterSink::Thread : previous_sink);
+    };
+    const auto total = [](Profiler::FrameEvent kind) {
+      return Profiler::FrameEventTotal(kind);
+    };
+
+    CommandScheduler scheduler(Renderer(), m_runtime_context,
+                               CommandScheduler::Role::Guest);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    std::mutex order_mutex;
+    std::vector<int> order;
+    const auto record = [&order_mutex, &order](int value) {
+      std::lock_guard lock(order_mutex);
+      order.push_back(value);
+    };
+    const auto recorded = [&order_mutex, &order] {
+      std::lock_guard lock(order_mutex);
+      return order;
+    };
+
+    // Tick 1: a priority operation that holds the runner, and a normal operation. Tick 2: a
+    // normal operation only. Both ticks complete on the GPU.
+    std::binary_semaphore priority_entered{0};
+    std::binary_semaphore release_priority{0};
+    const auto first_tick = scheduler.CurrentTick();
+    scheduler.DeferPriorityOperation([&] {
+      priority_entered.release();
+      release_priority.acquire();
+      record(1);
+    });
+    scheduler.DeferOperation([&] { record(2); });
+    scheduler.Flush();
+    scheduler.Wait(first_tick);
+    priority_entered.acquire();
+    const auto second_tick = scheduler.CurrentTick();
+    scheduler.DeferOperation([&] { record(3); });
+    scheduler.Flush();
+    scheduler.Wait(second_tick);
+    Require("SchedulerReadyOperations", "ticks complete",
+            scheduler.IsFree(first_tick) && scheduler.IsFree(second_tick) &&
+                recorded().empty(),
+            "the test's ticks did not complete, or an operation ran early");
+
+    if (nowait) {
+      counted(true);
+      const auto deferred = total(Profiler::FrameEvent::PendingOpsDeferred);
+      const auto depth = total(Profiler::FrameEvent::PendingOpsDeferredDepth);
+      const auto start = std::chrono::steady_clock::now();
+      scheduler.PopReadyOperations();
+      const auto elapsed = std::chrono::steady_clock::now() - start;
+      const auto deferred_after = total(Profiler::FrameEvent::PendingOpsDeferred);
+      const auto depth_after = total(Profiler::FrameEvent::PendingOpsDeferredDepth);
+      counted(false);
+      Require("SchedulerReadyOperations", "deferred pop",
+              recorded().empty() && elapsed < std::chrono::seconds(1),
+              "a draw-path pop ran or waited for an operation whose tick still had "
+              "priority work running");
+      Require("SchedulerReadyOperations", "deferred counters",
+              deferred_after == deferred + 1 && depth_after >= depth + 2,
+              "the deferred pop was not counted with its queue depth");
+    }
+
+    // The runner wait (spinning first with KYTY_PRIORITY_WAIT_SPIN_US), then a blocking pop that
+    // runs both normal operations after the priority one, in order.
+    std::jthread releaser([&release_priority] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      release_priority.release();
+    });
+    counted(true);
+    const auto spins = total(Profiler::FrameEvent::PriorityWaitSpins);
+    scheduler.WaitPriorityOperations(first_tick);
+    const auto spins_after = total(Profiler::FrameEvent::PriorityWaitSpins);
+    counted(false);
+    releaser.join();
+    Require("SchedulerReadyOperations", "runner wait",
+            recorded() == std::vector<int>{1},
+            "the runner wait returned before the priority operation finished, or a normal "
+            "operation ran");
+    Require("SchedulerReadyOperations", "priority wait spin",
+            spin ? spins_after > spins : spins_after == spins,
+            "KYTY_PRIORITY_WAIT_SPIN_US spun when off or did not spin when on");
+    scheduler.Finish();
+    Require("SchedulerReadyOperations", "blocking drain",
+            recorded() == std::vector<int>{1, 2, 3},
+            "Finish did not run the deferred operations after the priority one, in order");
+
+    // With the runner idle, a ready pop runs a completed tick's operations at once.
+    const auto third_tick = scheduler.CurrentTick();
+    scheduler.DeferPriorityOperation([&] { record(4); });
+    scheduler.DeferOperation([&] { record(5); });
+    scheduler.Flush();
+    scheduler.Wait(third_tick);
+    scheduler.DrainPriorityOperations();
+    scheduler.PopReadyOperations();
+    Require("SchedulerReadyOperations", "ready pop",
+            recorded() == std::vector<int>{1, 2, 3, 4, 5},
+            "a ready pop left an operation whose priority work had finished");
+    std::printf("[host]    %-32s ok (nowait %d, spin %d)\n", "SchedulerReadyOperations",
+                nowait ? 1 : 0, spin ? 1 : 0);
+  }
+
   void CheckGpuMappedRangeLifecycle() {
     EnsureRuntimeContext();
     const auto context_owner = MakeRenderContext();
@@ -13708,8 +13829,16 @@ public:
               "the GPU timestamp ring must exist exactly in GPU mode (it needs calibrated "
               "timestamps)");
       before = Sync::ReadReferenceClock();
+      // KYTY_CP_RECORDER: the query writes are recorder packets; they never drain it.
+      auto *recorder = scheduler.Recorder();
+      const auto drains = recorder != nullptr ? recorder->Drains() : 0;
       Require(name, "clock writes", process({&begin, &end}),
               "the clock-write stream did not complete");
+      Require(name, "no recorder drain",
+              recorder == nullptr || recorder->Drains() == drains,
+              "clock writes drained the CP recorder " +
+                  std::to_string(recorder != nullptr ? recorder->Drains() - drains : 0) +
+                  " times");
       begin_record = begin;
       end_record = end;
       scheduler.FlushAndWait();
@@ -42547,6 +42676,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
+    vulkan.CheckSchedulerReadyOperations();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cp-recorder-only") == 0) {
@@ -42564,6 +42694,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckCpRecorder();
     vulkan.CheckSchedulerTimeline();
+    vulkan.CheckSchedulerReadyOperations();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cp-recorder-bench") == 0) {
@@ -43148,6 +43279,7 @@ int main(int argc, char **argv) {
   CheckIndirectImageKeySwitch();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
+  vulkan.CheckSchedulerReadyOperations();
   vulkan.CheckHostImageAllocation();
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGraphicsPushConstantBank();

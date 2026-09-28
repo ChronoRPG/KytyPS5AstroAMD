@@ -1,6 +1,7 @@
 #include "common/threads.h"
 
 #include "common/assert.h"
+#include "common/cpuPlacement.h"
 
 #include <algorithm>
 #include <atomic>
@@ -228,6 +229,8 @@ static std::atomic<int> g_thread_counter = 0;
 void InitializeThreads() {
 	g_main_thread     = std::this_thread::get_id();
 	g_main_thread_int = Thread::GetThreadIdUnique();
+	// KYTY_CPU_RESERVE: the process default CPU sets, before most threads start.
+	InitCpuPlacement();
 }
 
 #ifdef KYTY_WIN_CS

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/cpuPlacement.h"
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
@@ -1761,6 +1762,12 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 
 int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
 	// PRINT_NAME();
+
+	// Placement samples of guest threads (common/cpuPlacement.h), every 64th lock.
+	static thread_local uint32_t placement_locks = 0;
+	if ((++placement_locks & 63u) == 0u) {
+		Common::SamplePlacement(Common::ThreadRole::Guest);
+	}
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3643,6 +3650,11 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 }
 
 void KYTY_SYSV_ABI PthreadYield() {
+	// Placement samples of spinning guest threads (the fence poller), every 4096th yield.
+	static thread_local uint32_t placement_yields = 0;
+	if ((++placement_yields & 4095u) == 0u) {
+		Common::SamplePlacement(Common::ThreadRole::Guest);
+	}
 	SchedulerBackoffOnce();
 }
 

@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 
 #include "common/assert.h"
+#include "common/cpuPlacement.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -650,9 +651,15 @@ struct Engine::Workers {
 		std::snprintf(name, sizeof(name), "DrawPrep#%u", index + 1u);
 		Profiler::SetThreadName(name);
 		t_worker_thread = true;
+		uint32_t placement_count = 0; // placement samples (common/cpuPlacement.h), every 64th slot
 		RunPreparationWorker(
 		    gate, window, index, spin_ns, cold_spin_ns, stop,
-		    [this](Slot& slot, uint64_t seq) { PrepareClaimed(slot, seq); },
+		    [this, &placement_count](Slot& slot, uint64_t seq) {
+			    PrepareClaimed(slot, seq);
+			    if ((++placement_count & 63u) == 0u) {
+				    Common::SamplePlacement(Common::ThreadRole::Host);
+			    }
+		    },
 		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); });
 	}
 

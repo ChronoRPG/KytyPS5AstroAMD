@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
+#include "common/cpuPlacement.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/hangTrace.h"
@@ -1024,6 +1025,8 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	// The command processor is the frame-rate limit; keep it ahead of guest spin loops.
 	Common::RaiseCurrentThreadPriority();
+	// KYTY_CPU_RESERVE: its own physical core.
+	Common::PlaceCurrentThread(Common::ThreadRole::Cp);
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
@@ -1384,6 +1387,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
+		// Placement samples (common/cpuPlacement.h), every 256th packet.
+		if ((++m_placement_packets & 255u) == 0u) {
+			Common::SamplePlacement(Common::ThreadRole::Cp);
+		}
 		const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
 		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
@@ -2226,8 +2233,9 @@ uint32_t CommandProcessor::RecordEopTimestamp() {
 	// A fence position: publish what completed ticks measured first (never waits).
 	timestamps->Publish(scheduler.GetMasterSemaphore().KnownGpuTick());
 	// A query write touches no guest resource, so batched barriers may stay pending (and no
-	// rendering instance is split for it).
-	return timestamps->RecordQuery(CurrentBuffer().StateHandle());
+	// rendering instance is split for it). With KYTY_CP_RECORDER it is a recorder packet, in
+	// stream order, and drains nothing.
+	return timestamps->RecordQuery(CurrentBuffer().StateSink());
 }
 
 void CommandProcessor::QueueEopTimestamp(uint32_t slot, const void* dst, uint64_t value) {
