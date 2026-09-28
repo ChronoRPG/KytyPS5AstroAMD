@@ -942,6 +942,11 @@ enum class FrameEvent : uint32_t {
 	DccGpuRefreshes,
 	DccGpuRefreshVerifyChecks,
 	DccGpuRefreshVerifyMismatches,
+	// KYTY_IMAGE_LRU_SKIP (TextureCache::TouchImage): LRU touches skipped because the image was
+	// touched in the current GC tick already, and the verify mode's mirror checks.
+	ImageLruTouchSkips,
+	ImageLruVerifyChecks,
+	ImageLruVerifyMismatches,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

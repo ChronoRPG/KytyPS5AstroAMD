@@ -480,6 +480,26 @@ private:
 		std::atomic<uint64_t> verify_mismatches {0};
 	};
 	GpuWriteSkipTotals m_gpu_write_skip_totals;
+	// KYTY_IMAGE_LRU_SKIP (default on; =0 off): TouchImage skips the LRU call when the image's
+	// mirror of its item's tick (Image::lru_tick) is not older than m_gc_tick: the image was
+	// touched in this GC tick already, and LeastRecentlyUsedCache::Touch would return at once.
+	// The LRU order and every GC decision stay the same; only the item's cache line is not read.
+	// KYTY_IMAGE_LRU_SKIP_VERIFY=1|exit checks the mirror against the item on every decision of
+	// TouchImage for a registered image (linked, equal ticks); a mismatch takes today's path (the
+	// touch) and is counted and logged (exit stops). FrameEvents ImageLruTouchSkips,
+	// ImageLruVerify{Checks,Mismatches}.
+	[[nodiscard]] bool LruMirrorHolds(Image& image, bool skip);
+	bool m_lru_touch_skip        = true;
+	int  m_lru_touch_skip_verify = 0;
+	// Written by the thread that touches images (the GPU thread; GetImage touches without m_lock)
+	// with a relaxed load and store, read by tests.
+	struct LruTouchTotals {
+		std::atomic<uint64_t> skips {0};
+		std::atomic<uint64_t> touches {0};
+		std::atomic<uint64_t> verify_checks {0};
+		std::atomic<uint64_t> verify_mismatches {0};
+	};
+	LruTouchTotals m_lru_touch_totals;
 	enum class ResidencyMode : uint8_t { Off, On, Poison };
 	ResidencyMode                            m_residency            = ResidencyMode::On;
 	uint64_t                                 m_residency_violations = 0;

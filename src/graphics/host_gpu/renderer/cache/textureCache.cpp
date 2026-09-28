@@ -318,6 +318,11 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 			m_gpu_write_skip_verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
 		}
 	}
+	m_lru_touch_skip = EnvNotZero("KYTY_IMAGE_LRU_SKIP");
+	if (const auto* verify = std::getenv("KYTY_IMAGE_LRU_SKIP_VERIFY");
+	    verify != nullptr && *verify != '\0' && std::strcmp(verify, "0") != 0) {
+		m_lru_touch_skip_verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
+	}
 	if (const auto* refresh = std::getenv("KYTY_DCC_GPU_REFRESH");
 	    refresh != nullptr && std::strcmp(refresh, "1") == 0) {
 		m_dcc_gpu_refresh = true;
@@ -850,6 +855,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_tick   = m_lru_cache.TickOf(image.lru_id);
 	m_total_used_memory += image.AccountedSize();
 	m_registered_image_memory += image.AccountedSize();
 	// Registration precedes the first TrackImage, so the tracking mode never changes while
@@ -989,9 +995,58 @@ void TextureCache::TouchImage(Image& image) {
 		HangTrace::RecordCp(event);
 	}
 	image.frame_accessed_last = m_frame.load(std::memory_order_relaxed);
-	if (image.registered) {
-		m_lru_cache.Touch(image.lru_id, m_gc_tick);
+	if (!image.registered) {
+		return;
 	}
+	const auto bump = [](std::atomic<uint64_t>& counter) {
+		counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+	};
+	// KYTY_IMAGE_LRU_SKIP: Touch returns at once for an item whose tick is not older than
+	// m_gc_tick, and image.lru_tick is that tick (textureCache.h).
+	bool skip = m_lru_touch_skip && image.lru_tick >= m_gc_tick;
+	if (m_lru_touch_skip_verify != 0) [[unlikely]] {
+		if (!LruMirrorHolds(image, skip)) {
+			skip = false; // today's path
+		}
+	}
+	if (skip) {
+		bump(m_lru_touch_totals.skips);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageLruTouchSkips);
+		return;
+	}
+	bump(m_lru_touch_totals.touches);
+	m_lru_cache.Touch(image.lru_id, m_gc_tick);
+	image.lru_tick = m_lru_cache.TickOf(image.lru_id);
+}
+
+bool TextureCache::LruMirrorHolds(Image& image, bool skip) {
+	const auto bump = [](std::atomic<uint64_t>& counter, uint64_t amount = 1) {
+		counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+	};
+	bump(m_lru_touch_totals.verify_checks);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::ImageLruVerifyChecks);
+	const bool linked = m_lru_cache.Linked(image.lru_id);
+	const auto item   = linked ? m_lru_cache.TickOf(image.lru_id) : 0;
+	if (linked && item == image.lru_tick) {
+		return true;
+	}
+	bump(m_lru_touch_totals.verify_mismatches);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::ImageLruVerifyMismatches);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::fprintf(stderr,
+		             "ImageLruVerify: image 0x%016" PRIx64 " size=0x%" PRIx64
+		             " mirror tick %" PRIu64 ", LRU item %zu %s tick %" PRIu64 ", GC tick %" PRIu64
+		             " (%s)\n",
+		             image.info.data.address, image.info.data.size, image.lru_tick, image.lru_id,
+		             linked ? "at" : "unlinked,", item, m_gc_tick,
+		             skip ? "the mirror skipped the touch" : "touched");
+	}
+	if (m_lru_touch_skip_verify == 2) {
+		EXIT("ImageLruVerify: an image's LRU mirror differs from its LRU item\n");
+	}
+	// Repair after the touch (TouchImage copies the item's tick back).
+	return false;
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {

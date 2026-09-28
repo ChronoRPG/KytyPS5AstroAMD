@@ -331,16 +331,21 @@ struct TextureCacheTestAccess {
         live.push_back(id);
       }
     });
+    // Every Insert also sets the image's mirror of its item's tick (KYTY_IMAGE_LRU_SKIP), as
+    // RegisterImage does.
     for (const auto id : oldest) {
       const auto owner = cache.m_slot_images.try_get(id);
       if (owner != nullptr && owner->registered) {
         owner->tick_accessed_last = 0;
         owner->lru_id = cache.m_lru_cache.Insert(id, 0);
+        owner->lru_tick = 0;
       }
     }
     for (const auto id : live) {
       if (std::ranges::find(oldest, id) == oldest.end()) {
-        cache.m_slot_images[id].lru_id = cache.m_lru_cache.Insert(id, tick);
+        auto &image = cache.m_slot_images[id];
+        image.lru_id = cache.m_lru_cache.Insert(id, tick);
+        image.lru_tick = tick;
       }
     }
   }
@@ -556,6 +561,29 @@ struct TextureCacheTestAccess {
   static void Unregister(TextureCache &cache, ImageId id) {
     std::lock_guard lock(cache.m_lock);
     cache.UnregisterImage(id);
+  }
+  // KYTY_IMAGE_LRU_SKIP.
+  static bool &LruSkip(TextureCache &cache) { return cache.m_lru_touch_skip; }
+  static int &LruVerify(TextureCache &cache) { return cache.m_lru_touch_skip_verify; }
+  static const TextureCache::LruTouchTotals &LruTotals(const TextureCache &cache) {
+    return cache.m_lru_touch_totals;
+  }
+  static void AdvanceGcTick(TextureCache &cache) {
+    std::lock_guard lock(cache.m_lock);
+    cache.m_gc_tick++;
+  }
+  // The LRU order, oldest first, as (image data address, item tick) pairs.
+  static std::vector<std::pair<uint64_t, uint64_t>> LruOrder(TextureCache &cache) {
+    std::lock_guard lock(cache.m_lock);
+    std::vector<std::pair<uint64_t, uint64_t>> order;
+    cache.m_lru_cache.ForEachItemBelow(UINT64_MAX, [&](ImageId id) {
+      const auto &image = cache.m_slot_images[id];
+      order.emplace_back(image.info.data.address, cache.m_lru_cache.TickOf(image.lru_id));
+    });
+    return order;
+  }
+  static uint64_t &LruMirror(TextureCache &cache, ImageId id) {
+    return cache.m_slot_images[id].lru_tick;
   }
   // KYTY_DCC_GPU / KYTY_DCC_GPU_REFRESH.
   static bool DccHelperAvailable(const TextureCache &cache) {
@@ -6363,6 +6391,119 @@ public:
     Require(name, "release direct backing",
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
             "DCC refresh allocation release failed");
+  }
+
+  // KYTY_IMAGE_LRU_SKIP (TextureCache::TouchImage): one script of image touches, GC ticks,
+  // re-registrations (a new LRU item) and image recreations (a reused LRU item) leaves the same
+  // LRU order and item ticks after every step with the skip on and off. The verify mode checks
+  // the image's mirror against its item on every decision; a corrupted mirror is caught and the
+  // image is still touched (the order stays the same).
+  void CheckImageLruSkip() {
+    constexpr const char *name = "ImageLruSkip";
+    constexpr uint64_t base = 0x0000000268000000ull;
+    constexpr uint64_t stride = 0x100000;
+    constexpr uint32_t images = 6;
+    constexpr uint32_t steps = 600;
+    EnsureRuntimeContext();
+    using Order = std::vector<std::pair<uint64_t, uint64_t>>;
+    struct Run {
+      std::vector<Order> orders;
+      uint64_t decisions = 0;
+      uint64_t corruptions = 0;
+      uint64_t skips = 0;
+      uint64_t touches = 0;
+      uint64_t verify_checks = 0;
+      uint64_t verify_mismatches = 0;
+      bool env_skip = false;
+      int env_verify = 0;
+    };
+    const auto run = [&](bool skip, bool corrupt) {
+      const auto context_owner = MakeRenderContext();
+      auto &cache = context_owner->GetTextureCache();
+      Run result;
+      result.env_skip = TextureCacheTestAccess::LruSkip(cache);
+      result.env_verify = TextureCacheTestAccess::LruVerify(cache);
+      TextureCacheTestAccess::LruSkip(cache) = skip;
+      if (corrupt) {
+        TextureCacheTestAccess::LruVerify(cache) = 1; // count the planted mismatches, no exit
+      }
+      std::vector<ImageId> ids(images);
+      const auto insert = [&](uint32_t index) {
+        ImageInfo info{};
+        info.data = {base + stride * index, stride / 2};
+        ids[index] = TextureCacheTestAccess::InsertImage(cache, info);
+      };
+      for (uint32_t index = 0; index < images; index++) {
+        insert(index);
+      }
+      uint32_t state = 0x2545f491u;
+      const auto next = [&] {
+        state = state * 1103515245u + 12345u;
+        return (state >> 16) & 0x7fffu;
+      };
+      for (uint32_t step = 0; step < steps; step++) {
+        const auto op = next() % 16;
+        const auto index = next() % images;
+        if (op < 10) {
+          // The draw path's touch (GetImage touches without the texture-cache lock).
+          (void)cache.GetImage(ids[index]);
+          result.decisions++;
+        } else if (op < 12) {
+          TextureCacheTestAccess::AdvanceGcTick(cache);
+        } else if (op == 12) {
+          TextureCacheTestAccess::Unregister(cache, ids[index]);
+          TextureCacheTestAccess::Register(cache, ids[index]);
+        } else if (op == 13) {
+          TextureCacheTestAccess::DeleteImage(cache, ids[index]);
+          insert(index);
+        } else if (op == 14 && corrupt) {
+          // A mirror claiming a touch its item never had.
+          TextureCacheTestAccess::LruMirror(cache, ids[index]) = UINT64_MAX;
+          result.corruptions++;
+        }
+        result.orders.push_back(TextureCacheTestAccess::LruOrder(cache));
+      }
+      const auto &totals = TextureCacheTestAccess::LruTotals(cache);
+      result.skips = totals.skips.load();
+      result.touches = totals.touches.load();
+      result.verify_checks = totals.verify_checks.load();
+      result.verify_mismatches = totals.verify_mismatches.load();
+      for (const auto id : ids) {
+        TextureCacheTestAccess::DeleteImage(cache, id);
+      }
+      return result;
+    };
+
+    const auto off = run(false, false);
+    const auto on = run(true, false);
+    const auto planted = run(true, true);
+    const char *skip_env = std::getenv("KYTY_IMAGE_LRU_SKIP");
+    const bool expect_env_skip = skip_env == nullptr || std::strcmp(skip_env, "0") != 0;
+    Require(name, "switch", on.env_skip == expect_env_skip,
+            "KYTY_IMAGE_LRU_SKIP did not set the skip");
+    Require(name, "decisions",
+            off.skips == 0 && off.touches == off.decisions &&
+                on.skips + on.touches == on.decisions && on.skips != 0 &&
+                on.decisions == off.decisions,
+            "the touches were not all decided, or the skip never (or, off, ever) skipped");
+    Require(name, "same order", on.orders == off.orders,
+            "the skip changed the LRU order or an item's tick");
+    Require(name, "verify",
+            on.verify_mismatches == 0 &&
+                (on.env_verify == 0 ? on.verify_checks == 0 : on.verify_checks == on.decisions),
+            "the verify mode missed a decision or found a mismatch without a planted one");
+    Require(name, "planted mismatches",
+            planted.orders == off.orders && planted.corruptions != 0 &&
+                planted.verify_mismatches != 0 &&
+                planted.verify_mismatches <= planted.corruptions &&
+                planted.verify_checks == planted.decisions,
+            "a corrupted mirror was not caught, or it changed the LRU order");
+    std::printf("[host]    %-32s ok (%llu touches: %llu skipped; env skip %s, verify %s; "
+                "%llu planted mirrors caught)\n",
+                name, static_cast<unsigned long long>(on.decisions),
+                static_cast<unsigned long long>(on.skips), on.env_skip ? "on" : "off",
+                on.env_verify != 0 ? "on" : "off",
+                static_cast<unsigned long long>(planted.verify_mismatches));
   }
 
   // KYTY_GPU_WRITE_IMAGE_SKIP (TextureCache::SkipGpuWriteImageWalk): a GPU buffer write's image
@@ -40218,6 +40359,11 @@ int main(int argc, char **argv) {
     vulkan.CheckDccGpuRefresh();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-lru-skip-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImageLruSkip();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--tracker-gap-detectors-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTrackerGapDetectors();
@@ -40469,6 +40615,7 @@ int main(int argc, char **argv) {
   vulkan.CheckShaderUploadDedup();
   vulkan.CheckGpuWriteImageSkip();
   vulkan.CheckDccGpuRefresh();
+  vulkan.CheckImageLruSkip();
   vulkan.CheckTrackerGapDetectors();
   vulkan.CheckEagerReadback();
 #endif

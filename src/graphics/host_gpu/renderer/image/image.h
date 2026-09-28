@@ -335,6 +335,9 @@ public:
 	uint64_t         tick_accessed_last  = 0;
 	uint64_t         frame_accessed_last = 0; // presented guest frames, see TextureCache::AdvanceFrame
 	size_t           lru_id              = 0;
+	// While registered: the tick of TextureCache's LRU item lru_id (KYTY_IMAGE_LRU_SKIP). Set from
+	// the item after every Insert (RegisterImage) and Touch (TouchImage), its only writers.
+	uint64_t         lru_tick            = 0;
 	// Last GPU writer among overlapping aliases; cleared when another alias takes the bytes.
 	bool             alias_owner         = false;
 	ChunkState       chunks;
