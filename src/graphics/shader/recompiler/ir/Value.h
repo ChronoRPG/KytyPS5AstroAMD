@@ -19,6 +19,8 @@ struct Program;
 
 // ir/ProgramClone.cpp: deep copy of a translated program (copies every private member).
 [[nodiscard]] bool CloneProgram(const Program& source, Program& target);
+// ir/ProgramCodec.cpp: byte encoding of resource plans (reads and writes every private member).
+struct ProgramCodecAccess;
 
 class Value {
 public:
@@ -58,6 +60,8 @@ public:
 	bool operator==(const Value& other) const;
 
 private:
+	friend struct ProgramCodecAccess;
+
 	Type type = Type::Void;
 	union {
 		Inst*     inst;
@@ -162,8 +166,9 @@ public:
 	}
 
 private:
-	// Copies every member below; update it (and its layout check) when adding one.
+	// Copy and encode every member below; update both (and their layout checks) when adding one.
 	friend bool CloneProgram(const Program& source, Program& target);
+	friend struct ProgramCodecAccess;
 
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);

@@ -36,6 +36,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
+#include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -45,12 +46,14 @@
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/CodegenFingerprint.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/ir/ProgramCodec.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/rectListShader.h"
@@ -1944,6 +1947,91 @@ private:
   bool m_cloned = false;
 };
 
+// Persistent program cache (KYTY_PROGRAM_CACHE, ir/ProgramCodec.h): a stored resource plan,
+// specialization and compiled metadata come back exactly (encode, decode and encode again give
+// the same bytes; the decoded plan materializes the same resources), and translating and emitting
+// the same program twice gives the same encodings and SPIR-V (what KYTY_PROGRAM_CACHE_VERIFY
+// compares). Runs for every compute and fragment case.
+class ProgramCacheRoundTrip {
+public:
+  // Before CompileProgram consumes the original translation.
+  ProgramCacheRoundTrip(const char *name, std::span<const u32> code,
+                        const ShaderRecompiler::CompileOptions &options,
+                        const ShaderRecompiler::IR::ResourcePlan &plan)
+      : m_name(name) {
+    using namespace ShaderRecompiler::IR;
+    Require(name, "program cache plan encoding", EncodeResourcePlan(plan, m_plan),
+            "the resource plan could not be encoded");
+    m_second = ShaderRecompiler::TranslateProgram(code, options);
+    const auto second_plan = ExtractResourcePlan(m_second.program);
+    std::vector<uint8_t> second_bytes;
+    Require(name, "program cache determinism",
+            EncodeResourcePlan(second_plan, second_bytes) && second_bytes == m_plan,
+            "translating the program again gave another resource plan encoding");
+  }
+
+  void Verify(const ShaderRecompiler::CompileOptions &options,
+              const ShaderRecompiler::IR::SrtRuntime &runtime,
+              const ShaderRecompiler::IR::ResourceSnapshot &resources,
+              const ShaderRecompiler::IR::ResourceSpecialization &specialization,
+              const ShaderRecompiler::CompileResult &original) {
+    using namespace ShaderRecompiler::IR;
+    ResourcePlan decoded;
+    Require(m_name, "program cache plan decoding", DecodeResourcePlan(m_plan, decoded),
+            "the encoded resource plan did not decode");
+    std::vector<uint8_t> again;
+    Require(m_name, "program cache plan round trip",
+            EncodeResourcePlan(decoded, again) && again == m_plan,
+            "encoding the decoded plan gave other bytes");
+    ResourceSnapshot reloaded_resources;
+    ResourceSpecialization reloaded_specialization;
+    Require(m_name, "program cache plan materialization",
+            MaterializeResources(decoded, runtime, reloaded_resources,
+                                 reloaded_specialization) &&
+                reloaded_resources.buffers == resources.buffers &&
+                reloaded_resources.images == resources.images &&
+                reloaded_resources.samplers == resources.samplers &&
+                reloaded_resources.flattened_srt == resources.flattened_srt &&
+                reloaded_resources.user_data == resources.user_data &&
+                reloaded_resources.uniform_fill == resources.uniform_fill &&
+                reloaded_specialization == specialization,
+            "the decoded plan materialized other resources or another specialization");
+    std::vector<uint8_t> specialization_bytes;
+    EncodeSpecialization(specialization, specialization_bytes);
+    ResourceSpecialization specialization_back;
+    Require(m_name, "program cache specialization round trip",
+            DecodeSpecialization(specialization_bytes, specialization_back) &&
+                specialization_back == specialization,
+            "the specialization did not come back");
+    auto second = ShaderRecompiler::CompileProgram(std::move(m_second), options, specialization);
+    Require(m_name, "program cache determinism",
+            second.spirv == original.spirv && second.spirv_plain == original.spirv_plain,
+            "emitting the program again gave other SPIR-V");
+    const auto info = std::move(second.program).TakeCompiledInfo();
+    Require(m_name, "program cache determinism",
+            info.info == original.program.info && info.bindings == original.program.bindings &&
+                info.write_ranges == original.program.write_ranges &&
+                info.scratch_dwords == original.program.scratch_dwords,
+            "emitting the program again gave other metadata");
+    std::vector<uint8_t> info_bytes;
+    EncodeCompiledShaderInfo(info, info_bytes);
+    CompiledShaderInfo info_back;
+    std::vector<uint8_t> info_again;
+    const bool decoded_info = DecodeCompiledShaderInfo(info_bytes, info_back);
+    if (decoded_info) {
+      EncodeCompiledShaderInfo(info_back, info_again);
+    }
+    Require(m_name, "program cache metadata round trip",
+            decoded_info && info_back == info && info_again == info_bytes,
+            "the compiled metadata did not come back");
+  }
+
+private:
+  const char *m_name;
+  std::vector<uint8_t> m_plan;
+  ShaderRecompiler::TranslateResult m_second;
+};
+
 CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
@@ -1977,6 +2065,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   TranslationCopyCheck copy_check(translated);
   auto resource_plan =
       ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  ProgramCacheRoundTrip cache_check(test.name, test.code, options, resource_plan);
   ShaderRecompiler::IR::ResourceSnapshot resources;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
   const ShaderRecompiler::IR::SrtRuntime runtime{
@@ -1992,6 +2081,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
   copy_check.Verify(test.name, options, specialization, result);
+  cache_check.Verify(options, runtime, resources, specialization, result);
   for (const auto &[text, expected] : test.decoded_counts) {
     const auto actual = CountText(result.decoded_dump, text);
     Require(test.name, "decoded RDNA2", actual == expected,
@@ -2300,6 +2390,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test, bool plain_variant 
   TranslationCopyCheck copy_check(translated);
   auto resource_plan =
       ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  ProgramCacheRoundTrip cache_check(test.name, test.fragment_code, options, resource_plan);
   ShaderRecompiler::IR::ResourceSnapshot resources;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
   const ShaderRecompiler::IR::SrtRuntime runtime{
@@ -2313,6 +2404,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test, bool plain_variant 
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
   copy_check.Verify(test.name, options, specialization, result);
+  cache_check.Verify(options, runtime, resources, specialization, result);
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
@@ -43620,6 +43712,7 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 #include "ShaderCodegenTests.inc"
 #include "ShaderGiProbeTests.inc"
 #include "ShaderSrtVariantTests.inc"
+#include "ShaderProgramCacheTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
@@ -43635,6 +43728,10 @@ int main(int argc, char **argv) {
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--corpus-spirv-stats") == 0) {
     EnsureConfigInitialized();
     return CorpusSpirvStats(argv[2], argc == 4 ? argv[3] : nullptr);
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--corpus-program-cache") == 0) {
+    EnsureConfigInitialized();
+    return ProgramCacheTests::CorpusProgramCache(argv[2]);
   }
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
@@ -44268,6 +44365,20 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--image-transit-skip-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckImageTransitSkip();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--program-cache-only") == 0) {
+    ProgramCacheTests::RunCpu();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--program-cache-gpu-only") == 0) {
+    VulkanHarness vulkan;
+    ProgramCacheTests::RunGpu(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--program-cache-tamper-only") == 0) {
+    VulkanHarness vulkan;
+    ProgramCacheTests::CheckVerifyCatchesDifferences(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--tracker-gap-detectors-only") == 0) {
