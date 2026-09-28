@@ -238,6 +238,18 @@ struct BufferCacheTestAccess {
   static BufferCache::BindingMemoTotals BindingMemoTotals(const BufferCache &cache) {
     return cache.m_binding_memo_totals;
   }
+  // KYTY_BINDING_MEMO_CROSS_EPOCH.
+  static bool BindingMemoCross(const BufferCache &cache) {
+    return cache.m_binding_memo != nullptr && cache.m_binding_memo_cross;
+  }
+  // KYTY_WRITTEN_SYNC_SKIP.
+  static bool WrittenSyncSkip(const BufferCache &cache) { return cache.m_written_sync_skip; }
+  static int WrittenSyncSkipVerify(const BufferCache &cache) {
+    return cache.m_written_sync_skip_verify;
+  }
+  static BufferCache::WrittenSyncTotals WrittenSyncTotals(const BufferCache &cache) {
+    return cache.m_written_sync_totals;
+  }
 };
 
 // Sets (or with nullptr removes) an environment switch read when a cache is constructed.
@@ -5266,7 +5278,16 @@ public:
                   small_size <= BufferCache::CACHING_PAGESIZE);
 
     EnsureRuntimeContext();
+    // Every obtain() below is its own GPU-thread command, hence its own sync epoch. The binding
+    // memo would answer the repeated clean bindings across those epochs
+    // (KYTY_BINDING_MEMO_CROSS_EPOCH, CheckBindingEpochMemo) before the range memo and the relaxed
+    // queries this check is about; the cache reads the switch when it is constructed.
+    const char *cross_env = std::getenv("KYTY_BINDING_MEMO_CROSS_EPOCH");
+    const bool cross_was_set = cross_env != nullptr;
+    const std::string cross_saved = cross_was_set ? cross_env : "";
+    SetEnvironment("KYTY_BINDING_MEMO_CROSS_EPOCH", "0");
     const auto context_owner = MakeRenderContext();
+    SetEnvironment("KYTY_BINDING_MEMO_CROSS_EPOCH", cross_was_set ? cross_saved.c_str() : nullptr);
     auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
@@ -5879,6 +5900,66 @@ public:
       Require(name, "joined bytes",
               std::memcmp(words.data(), memory + large_offset, large_size) == 0,
               "the joined buffer lost the uploaded write");
+
+      // KYTY_BINDING_MEMO_CROSS_EPOCH: a cache-buffer memo of an earlier epoch is reused while no
+      // page of its range is CPU-dirty. A write fault still ends it, and a hot page (CPU-dirty and
+      // writable, so written without a fault) makes the next epoch synchronize the range again.
+      constexpr uint64_t cross_offset = 0x80000;
+      constexpr uint64_t cross_size = 0x8000;
+      constexpr uint64_t cross_hot = cross_offset + 0x2000;
+      static_assert(cross_size > BufferCache::CACHING_PAGESIZE);
+      const bool cross_on = BufferCacheTestAccess::BindingMemoCross(cache);
+      auto &tracker = BufferCacheTestAccess::Tracker(cache);
+      Binding crossed{};
+      OnGpuThread(context, [&] {
+        (void)bind(cross_offset, cross_size); // creates and uploads the buffer
+        const auto first = bind(cross_offset, cross_size);
+        SyncEpoch::Advance();
+        const Totals before_cross = totals();
+        const auto reused = bind(cross_offset, cross_size);
+        Require(name, "cross-epoch reuse",
+                reused == first && first.first != &stream &&
+                    (cross_on ? totals().cross_hits == before_cross.cross_hits + 1 &&
+                                    totals().cached_hits == before_cross.cached_hits + 1
+                              : totals().cross_hits == before_cross.cross_hits),
+                "a clean cache-buffer binding of an earlier epoch was not reused (or was, with "
+                "the switch off)");
+
+        // A write fault moves the signature: the next epoch's binding uploads the range.
+        cpu_write(cross_offset + 0x100, 0x13572468u);
+        SyncEpoch::Advance();
+        const Totals before_fault = totals();
+        const auto after_fault = bind(cross_offset, cross_size);
+        Require(name, "cross-epoch write fault",
+                after_fault == first && totals().cross_hits == before_fault.cross_hits &&
+                    totals().cached_hits == before_fault.cached_hits,
+                "a binding after a write fault was reused across epochs");
+
+        // A hot page: a write fault in three consecutive frames promotes it, and its upload
+        // leaves it CPU-dirty and writable. The last binding is recorded with it.
+        for (uint32_t frame = 0; frame < 3; frame++) {
+          cpu_write(cross_hot, 0x2000u + frame);
+          (void)bind(cross_offset, cross_size);
+          cache.AdvanceFrame();
+        }
+        Require(name, "cross-epoch hot promotion", tracker.IsRegionHot(base + cross_hot, 4096),
+                "three faulting frames did not promote the page");
+        // Written while hot (no fault, no transition): the next epoch must not reuse the memo.
+        SyncEpoch::Advance();
+        const uint32_t hot_value = 0x600dcafeu;
+        std::memcpy(memory + cross_hot + 0x40, &hot_value, sizeof(hot_value));
+        const Totals before_hot = totals();
+        crossed = bind(cross_offset, cross_size);
+        Require(name, "cross-epoch hot page",
+                crossed == first && totals().cross_hits == before_hot.cross_hits &&
+                    totals().cached_hits == before_hot.cached_hits &&
+                    (!cross_on || totals().cross_rejects == before_hot.cross_rejects + 1),
+                "a binding over a hot page was reused across epochs");
+      });
+      const auto cross_words = read_native(*crossed.first, crossed.second, cross_size);
+      Require(name, "cross-epoch bytes",
+              std::memcmp(cross_words.data(), memory + cross_offset, cross_size) == 0,
+              "a cache buffer bound across epochs lost a write (the hot page's included)");
       Require(name, "verify agrees", totals().verify_mismatches == 0,
               "the verify mode found a hit the normal path disagrees with");
       Require(name, "memo state", memo_on == (totals().records != 0),
@@ -5894,10 +5975,150 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
                                                                allocation_size) == 0,
             "binding-memo direct-memory allocation release failed");
-    std::printf("[host]    %-32s ok (memo %s, verify %s)\n", name,
+    std::printf("[host]    %-32s ok (memo %s, verify %s, cross-epoch %s)\n", name,
                 BufferCacheTestAccess::BindingMemoEnabled(context.GetBufferCache()) ? "on" : "off",
                 BufferCacheTestAccess::BindingMemoVerify(context.GetBufferCache()) != 0 ? "on"
-                                                                                          : "off");
+                                                                                          : "off",
+                BufferCacheTestAccess::BindingMemoCross(context.GetBufferCache()) ? "on" : "off");
+  }
+
+  // KYTY_WRITTEN_SYNC_SKIP (BufferCache::SynchronizeBuffer): a writable binding of a range the
+  // GPU already owns entirely is not synchronized again; one with pages a CPU write took back
+  // uploads them.
+  void CheckWrittenSyncSkip() {
+    constexpr const char *name = "WrittenSyncSkip";
+    constexpr uintptr_t base = 0x0000000208400000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t range_offset = 0x20000;
+    constexpr uint64_t range_size = 0x10000;
+    constexpr uint64_t part_offset = range_offset + 0x4000; // inside the range
+    constexpr uint64_t part_size = 0x2000;
+    constexpr uint64_t write_offset = range_offset + 0x9000; // a CPU write takes this page back
+
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "written-sync direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "written-sync fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    for (uint64_t index = 0; index < allocation_size; index++) {
+      memory[index] = static_cast<uint8_t>((index * 29 + index / 4096) & 0xffu);
+    }
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const bool skip_on = BufferCacheTestAccess::WrittenSyncSkip(cache);
+      const int verify = BufferCacheTestAccess::WrittenSyncSkipVerify(cache);
+      const auto totals = [&] { return BufferCacheTestAccess::WrittenSyncTotals(cache); };
+      auto &tracker = BufferCacheTestAccess::Tracker(cache);
+      const auto owned = [&](uint64_t offset, uint64_t size) {
+        return tracker.IsRangeGpuOwned(base + offset, size);
+      };
+      const auto write_binding = [&](uint64_t offset, uint64_t size) {
+        return cache.ObtainBuffer(base + offset, size, true, false);
+      };
+      // Skips (and, in verify mode, checks) counted since the start.
+      const auto skipped = [&](uint64_t expected) {
+        const auto now = totals();
+        return now.skips == (skip_on ? expected : 0u) &&
+               now.verify_checks == (skip_on && verify != 0 ? expected : 0u) &&
+               now.verify_mismatches == 0;
+      };
+      using Binding = std::pair<Libs::Graphics::Buffer *, uint64_t>;
+      Binding bound{};
+      std::vector<uint8_t> expected;
+      OnGpuThread(context, [&] {
+        // The first writable binding uploads the new region's CPU-dirty pages and owns them.
+        const auto first = write_binding(range_offset, range_size);
+        Require(name, "first binding synchronizes",
+                owned(range_offset, range_size) && skipped(0),
+                "the first writable binding did not take the range, or was skipped");
+        // Again, and a part of it: entirely GPU-owned, nothing to synchronize.
+        const auto again = write_binding(range_offset, range_size);
+        const auto part = write_binding(part_offset, part_size);
+        Require(name, "owned ranges skip",
+                again == first && part.first == first.first &&
+                    part.second == first.second + (part_offset - range_offset) &&
+                    owned(range_offset, range_size) && skipped(2),
+                "a writable binding of an owned range was synchronized (or skipped while off)");
+        // A written sub-range of a wider binding (ObtainWrittenBuffer): the same.
+        const GuestRange written[] = {{base + part_offset, part_size}};
+        const auto sub = cache.ObtainWrittenBuffer(base + range_offset, range_size, written);
+        Require(name, "owned written range skips", sub == first && skipped(3),
+                "an owned written range of a wider binding was synchronized");
+
+        // A CPU write takes its window back (downloaded, then CPU-dirty): the next writable
+        // binding is synchronized and uploads the written page.
+        Require(name, "write fault",
+                context.HandleFault(PageFaultAccess::Write, base + write_offset),
+                "a CPU write to a GPU-owned page did not fault through the tracker");
+        const uint32_t value = 0x5eed1234u;
+        std::memcpy(memory + write_offset, &value, sizeof(value));
+        Require(name, "write takes the range back", !owned(range_offset, range_size),
+                "a CPU write left its range GPU-owned");
+        expected.assign(memory + range_offset, memory + range_offset + range_size);
+        bound = write_binding(range_offset, range_size);
+        Require(name, "taken-back range synchronizes",
+                bound == first && owned(range_offset, range_size) && skipped(3),
+                "a writable binding over a CPU-written page was skipped");
+      });
+      auto readback = CreateHostBuffer(name, range_size, vk::BufferUsageFlagBits::eTransferDst, {0});
+      OnGpuThread(context, [&] {
+        const vk::BufferCopy copy{bound.second, 0, range_size};
+        scheduler.Current().Handle().copyBuffer(bound.first->Handle(), readback.buffer, 1, &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                                     vk::PipelineStageFlagBits::eHost, {}, 0,
+                                                     nullptr, 1, &barrier, 0, nullptr);
+        scheduler.Finish();
+      });
+      const auto words = ReadBuffer(name, readback, static_cast<uint32_t>(range_size / 4));
+      DestroyBuffer(&readback);
+      Require(name, "uploaded bytes",
+              std::memcmp(words.data(), expected.data(), range_size) == 0,
+              "the synchronized buffer lost the CPU write");
+      scheduler.Finish();
+      context.UnmapMemory(base, allocation_size);
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "written-sync direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "written-sync direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok (skip %s, verify %s)\n", name,
+                BufferCacheTestAccess::WrittenSyncSkip(context.GetBufferCache()) ? "on" : "off",
+                BufferCacheTestAccess::WrittenSyncSkipVerify(context.GetBufferCache()) != 0
+                    ? "on"
+                    : "off");
   }
 
   // Tracker-gap detectors (RenderContext::NoteHostBackingWrite, NoteGuestProtection): the page
@@ -39409,6 +39630,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBindingEpochMemo();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--written-sync-skip-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckWrittenSyncSkip();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--tracker-gap-detectors-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckTrackerGapDetectors();
@@ -39655,6 +39881,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBufferRangeMemo();
   vulkan.CheckBdaSyncEpoch();
   vulkan.CheckBindingEpochMemo();
+  vulkan.CheckWrittenSyncSkip();
   vulkan.CheckTrackerGapDetectors();
   vulkan.CheckEagerReadback();
 #endif

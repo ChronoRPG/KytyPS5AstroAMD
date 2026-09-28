@@ -53,6 +53,14 @@ public:
 	[[nodiscard]] bool IsRegionGpuModifiedRelaxed(uint64_t vaddr, uint64_t size) const;
 	// Verify mode: under each region lock, whether the mirror equals the GPU-dirty bits.
 	[[nodiscard]] bool GpuMirrorMatches(uint64_t vaddr, uint64_t size);
+	// Under each region lock: every page of the range is GPU-dirty and none is readback-pending
+	// (false when a region of it does not exist). On the GPU thread the answer stays true until
+	// that thread changes it: only it sets GPU-dirty bits and readback marks, other threads clear
+	// GPU-dirty bits only of marked pages (readback completion), and a CPU access to a GPU-dirty
+	// page waits for the GPU thread. A written upload of such a range (ForEachUploadRange or
+	// ForEachWrittenUploadRange with is_written) then collects nothing and changes no bit, serial
+	// or protection (KYTY_WRITTEN_SYNC_SKIP, BufferCache::SynchronizeBuffer).
+	[[nodiscard]] bool IsRangeGpuOwned(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);

@@ -885,6 +885,22 @@ enum class FrameEvent : uint32_t {
 	// KYTY_HOST_WRITE_TRACKING (RenderContext::PrepareHostBackingWrite): emulator writes of guest
 	// bytes that gave their clean tracked pages the transition of a guest write fault.
 	HostBackingWritesTracked,
+	// KYTY_BINDING_MEMO_CROSS_EPOCH (BufferCache::ObtainReadBinding): cache-buffer memos from an
+	// earlier sync epoch reused (included in BindingEpochMemoCachedHits) or refused (CPU-dirty pages
+	// or a racing transition), and why the other lookups missed: no memo of that range in the slot,
+	// a tracker transition in the range's regions, a changed buffer structure or stream tick, or an
+	// earlier epoch that could not be crossed (stream memos, or the switch off).
+	BindingEpochMemoCrossHits,
+	BindingEpochMemoCrossRejects,
+	BindingEpochMemoMissSlot,
+	BindingEpochMemoMissSignature,
+	BindingEpochMemoMissGuard,
+	BindingEpochMemoMissEpoch,
+	// KYTY_WRITTEN_SYNC_SKIP (BufferCache::SynchronizeBuffer): written synchronizations of entirely
+	// GPU-owned ranges skipped, and their verify mode.
+	WrittenSyncSkips,
+	WrittenSyncSkipVerifyChecks,
+	WrittenSyncSkipVerifyMismatches,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip

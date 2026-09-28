@@ -23,6 +23,12 @@ public:
 		if (it != m_entries.begin() && std::prev(it)->second.end > address) {
 			it = std::prev(it);
 		}
+		// One entry with this tick already covers the range (a binding written again in the same
+		// recording): splitting it and coalescing the pieces back would restore exactly it.
+		if (it != m_entries.end() && it->first <= address && it->second.end >= end &&
+		    it->second.tick == tick) {
+			return;
+		}
 		while (it != m_entries.end() && it->first < end) {
 			const auto begin      = it->first;
 			const auto entry      = it->second;

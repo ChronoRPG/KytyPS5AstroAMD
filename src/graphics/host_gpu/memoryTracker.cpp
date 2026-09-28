@@ -291,6 +291,31 @@ bool MemoryTracker::IsRegionGpuModifiedRelaxed(uint64_t vaddr, uint64_t size) co
 	return false;
 }
 
+bool MemoryTracker::IsRangeGpuOwned(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	ValidateRange(vaddr, size);
+	uint64_t remaining = size;
+	uint64_t index     = vaddr / TRACKER_REGION_SIZE;
+	uint64_t offset    = vaddr % TRACKER_REGION_SIZE;
+	while (remaining != 0) {
+		const auto bytes   = std::min(TRACKER_REGION_SIZE - offset, remaining);
+		auto*      manager = m_regions[index].load(std::memory_order_acquire);
+		if (manager == nullptr) {
+			return false; // a missing region is entirely CPU dirty once created
+		}
+		{
+			std::scoped_lock lock(manager->lock);
+			if (!manager->IsGpuOwned(offset, bytes)) {
+				return false;
+			}
+		}
+		remaining -= bytes;
+		offset = 0;
+		index++;
+	}
+	return true;
+}
+
 bool MemoryTracker::GpuMirrorMatches(uint64_t vaddr, uint64_t size) {
 	bool matches = true;
 	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {

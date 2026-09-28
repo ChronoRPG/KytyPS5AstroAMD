@@ -444,6 +444,17 @@ public:
 		return m_hot.AnyInRange(start, end);
 	}
 
+	// Caller holds `lock`: every page of [m_cpu_addr + offset, + size) is GPU-dirty (so none is
+	// CPU-dirty or hot) and none is marked readback-pending. A written upload of such pages
+	// (CollectUpload, then ChangeState<Gpu, true>) collects nothing and changes no bit, serial or
+	// protection.
+	[[nodiscard]] bool IsGpuOwned(uint64_t offset, uint64_t size) const {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		const bool all_gpu_dirty = !RegionBits::AnyInRange(
+		    start, end, [this](size_t word) { return ~m_gpu_dirty.Word(word); });
+		return all_gpu_dirty && !m_readback_pending.AnyInRange(start, end);
+	}
+
 	// Side readbacks (BufferCache::ReadMemory). Pending marks the GPU-dirty pages of a range whose
 	// exact dirty bytes were handed to one side-copy publication. Any later GPU transition of a
 	// page clears its mark, so completion unprotects only pages that no newer writer re-owned.

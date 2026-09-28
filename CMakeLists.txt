@@ -795,6 +795,21 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-epoch-memo-only)
 	set_tests_properties(binding_epoch_memo_no_sync_epoch PROPERTIES
 		ENVIRONMENT "KYTY_SYNC_EPOCH=0")
+	add_test(NAME binding_epoch_memo_cross_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-epoch-memo-only)
+	set_tests_properties(binding_epoch_memo_cross_off PROPERTIES
+		ENVIRONMENT "KYTY_BINDING_MEMO_CROSS_EPOCH=0")
+	# KYTY_WRITTEN_SYNC_SKIP: default, verify mode, off.
+	add_test(NAME written_sync_skip
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --written-sync-skip-only)
+	add_test(NAME written_sync_skip_verify
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --written-sync-skip-only)
+	set_tests_properties(written_sync_skip_verify PROPERTIES
+		ENVIRONMENT "KYTY_WRITTEN_SYNC_SKIP_VERIFY=exit")
+	add_test(NAME written_sync_skip_off
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --written-sync-skip-only)
+	set_tests_properties(written_sync_skip_off PROPERTIES
+		ENVIRONMENT "KYTY_WRITTEN_SYNC_SKIP=0")
 	# Tracker-gap detectors: the page states they classify host writes by.
 	add_test(NAME tracker_gap_detectors
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tracker-gap-detectors-only)
