@@ -6,3 +6,26 @@ _Build/vscode-clang/
 _Build/
 cmake-build-debug/
 _PipelineCache/
+
+# Local configuration, handoffs, runtime data and diagnostics
+/.claude/
+/.codex/
+/.vscode/
+/CLAUDE_HANDOFF.md
+/docs/claude-handoff/
+/Profiling/
+Kyty.ini
+imgui.ini
+_SaveData/
+_Shaders/
+_Buffers/
+_TempData/
+_DownloadData/
+_Textures/
+*.tracy
+*.rdc
+*.etl
+*.dmp
+*.pdb
+*.nsys-rep
+*.ngfx-gputrace

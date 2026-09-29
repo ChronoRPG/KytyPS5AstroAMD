@@ -1,4 +1,13 @@
-# KytyPS5
+# KytyPS5 — Demon's Souls research branch
+
+This branch preserves seven shader/test commits beyond U59 for Demon's Souls.
+It is separate from the selected last known good main. Publication did not
+rebuild or measure it; no new compatibility or performance claim is made.
+
+The [U59 feature guide](https://github.com/Jetsku/KytyPS5-experimental/blob/main/docs/CHANGES-U59.md)
+and [complete change catalog](https://github.com/Jetsku/KytyPS5-experimental/blob/main/docs/CHANGE-CATALOG.md)
+describe the branch differences. The badges below refer to upstream.
+
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
