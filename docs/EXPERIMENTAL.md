@@ -1,8 +1,9 @@
 # Building and launching U59
 
-`main` uses the U59 source checkpoint plus publication-only documents and scripts.
-The `u59` tag is the exact sanitized source checkpoint. No U60 renderer changes are
-included. The private research branches are independent; RT is not merged into main.
+`main` uses the U59 source checkpoint plus the Demon's Souls shader, renderer
+fallback and page-hint changes described in [the integration notes](DEMONS-INTEGRATION.md).
+The `u59` tag and the existing Windows release tags still identify the original
+sanitized U59 checkpoint. No U60 renderer changes are included. RT remains separate.
 
 Follow the Windows requirements in [README](../README.md#build-requirements-windows):
 Git, Visual Studio C++ tools, clang-cl, Ninja, CMake, Qt 6 for MSVC and glslangValidator.
@@ -19,7 +20,7 @@ Build `launcher` and install to `_Build/windows/install` using the README comman
 ./tools/Launch-U59.ps1 -PrintSettings
 ```
 
-`tools/u59-preset.json` contains the portable no-diagnostics renderer environment.
+`tools/u59-preset.json` contains the portable no-diagnostics U59 renderer environment.
 The five optional features are enabled: CP recorder, program cache, draw-prep binding
 plans, DCC GPU refresh and CP sequencer. Shader metadata backing reads are off and
 label mode is `record`, matching the selected U59 configuration. Failure diagnostics

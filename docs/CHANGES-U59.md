@@ -411,13 +411,13 @@ older renderer, not U59 with all fixes automatically merged. See [RT-STATUS.md](
 Hardware traversal is promising in synthetic tests, but no Astro Bot hardware-RT
 replacement or FPS benefit has been demonstrated.
 
-### Demon's Souls: `claude/u59-demons`
+### Demon's Souls integration
 
-Seven commits beyond U59 implement shader-phi simplification, constant-mask folding,
-wave-wide EXEC/VCC branches, typed-buffer conversion/packing and supporting tests.
-The exact entries and mechanisms are in the catalog. This preserves that work
-without changing the selected U59 main. No new performance or compatibility result
-is claimed for publication.
+The original `claude/u59-demons` shader and test commits were merged into `main`
+with their history intact. Four renderer fallback commits and two page-hint commits
+were then applied separately. The always-on draw diagnostics were excluded.
+[Integration notes](DEMONS-INTEGRATION.md) record the validation and its limits.
+The U59 release tags still point to the pre-merge build; no new FPS result is claimed.
 
 ## 9. Reproducing the review
 
