@@ -1160,7 +1160,24 @@ static int LockFreeHintVerifyMode() {
 	return mode;
 }
 
+// KYTY_DRAW_PREP_GPU_DIRTY_HINT=0: a non-GPU preparing thread no longer refuses a read because
+// its tracker PAGE is GPU-dirty. The hint is only an efficiency filter (see above): the commit
+// re-validates every recorded range with the exact byte-range predicate, so a preparation that
+// read bytes the GPU had really written still falls back. Demon's Souls reads 16-byte records
+// from a few pages that compute shaders write elsewhere, and the page-level hint refused ~98% of
+// those reads (draw-prep fallbacks 2/3 of all draws, "unclean").
+static bool GpuDirtyHintEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DRAW_PREP_GPU_DIRTY_HINT");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 static bool GpuDirtyHint(Graphics::BufferCache& buffers, uint64_t vaddr, uint64_t size) {
+	if (!GpuDirtyHintEnabled()) {
+		return false;
+	}
 	if (!LockFreeHintEnabled()) {
 		return buffers.IsRegionGpuModified(vaddr, size);
 	}
