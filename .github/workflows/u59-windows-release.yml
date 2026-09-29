@@ -92,7 +92,9 @@ jobs:
           Copy-Item -LiteralPath 'tools/Launch-U59.ps1' -Destination $release
           Copy-Item -LiteralPath 'tools/Launch-U59.cmd' -Destination $release
           Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination $release
-          Copy-Item -LiteralPath 'tools/Kyty-U59-defaults.ini' -Destination (Join-Path $release 'Kyty.ini')
+          if (Test-Path -LiteralPath (Join-Path $release 'Kyty.ini')) {
+            throw 'The release must use the shared Kyty settings location; remove the local Kyty.ini.'
+          }
           Copy-Item -LiteralPath 'docs/EXPERIMENTAL.md' -Destination (Join-Path $release 'U59-README.md')
           Copy-Item -LiteralPath 'LICENSE' -Destination $release
           $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-U59-Windows-x64.zip'

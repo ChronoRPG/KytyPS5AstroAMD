@@ -17,6 +17,19 @@ if (-not $RuntimeDirectory) {
 $runtime = (Resolve-Path -LiteralPath $RuntimeDirectory).Path
 $launcher = Join-Path $runtime 'launcher.exe'
 if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) { throw "Launcher not found: $launcher" }
+
+# The first U59 ZIP bundled a local Kyty.ini, which takes priority over QSettings' shared
+# C:/ProgramData/Kyty/Kyty.ini. Preserve it before launching from an extracted release.
+if ([System.IO.Path]::GetFullPath($runtime) -eq [System.IO.Path]::GetFullPath($PSScriptRoot)) {
+    $localSettings = Join-Path $runtime 'Kyty.ini'
+    if (Test-Path -LiteralPath $localSettings -PathType Leaf) {
+        $backup = Join-Path $runtime ("Kyty.ini.release-local-{0}-{1}.bak" -f `
+            (Get-Date -Format 'yyyyMMdd-HHmmss'), [guid]::NewGuid().ToString('N').Substring(0, 8))
+        Move-Item -LiteralPath $localSettings -Destination $backup -ErrorAction Stop
+        Write-Output "Backed up release-local settings to $backup"
+    }
+}
+
 $start = New-Object System.Diagnostics.ProcessStartInfo
 $start.FileName = $launcher
 $start.WorkingDirectory = $runtime

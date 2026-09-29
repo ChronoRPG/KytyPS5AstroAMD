@@ -27,8 +27,8 @@ are off for clean timing; they are distinct from the renderer settings.
 
 Set game paths and runtime options in the launcher. For the recorded U59 baseline,
 use 1920x1080, 60 Hz, Mailbox; disable Tracy, RenderDoc, Vulkan/shader validation and
-shader logging. The script does not rewrite your INI or remove external capture
-layers. It isolates its child from inherited KYTY/TRACY environment settings and
+shader logging. The script does not rewrite the shared INI or remove external
+capture layers. It isolates its child from inherited KYTY/TRACY environment settings and
 does not impose machine-specific CPU affinity. Use a separate runtime for experiments
 and preserve saves/caches. The clean baseline used compatibility patches selecting
 non-tiled deferred lighting and disabling GI probes/lighting shaders; these game
@@ -36,11 +36,13 @@ patch files are not distributed here.
 
 The Windows release archive is built from the U59 main branch and includes a portable
 launcher. After extracting it, open `Launch-U59.cmd`, or run `./Launch-U59.ps1`
-in PowerShell. Add your own
-game directory in the launcher. The packaged `Kyty.ini` sets 1920x1080, 60 Hz,
-Mailbox, Performance shader optimization, and tracing and validation off by
-default. It contains no game paths, saves, caches or patches. The script leaves
-existing installation settings alone. Retained source and
+in PowerShell. The archive contains no `Kyty.ini`, so the launcher uses its normal
+shared settings file at `C:\ProgramData\Kyty\Kyty.ini`. Existing game directories and
+per-game settings remain available. If the first U59 archive left a `Kyty.ini` beside
+the launcher, this script backs it up before opening the launcher. It does not
+modify the shared settings file. Users without shared settings should configure
+resolution, validation and other options in the launcher. No game files, saves,
+caches or patches are distributed. Retained source and
 dependency pins were compared with U59; documentation preparation does not constitute
 a fresh full test run. Historical test/results and their limitations are described
 in [CHANGES-U59.md](CHANGES-U59.md). Check both normal and top-down water before

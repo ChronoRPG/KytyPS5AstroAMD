@@ -13,7 +13,7 @@ excluded. Source publication is not a new stability certification or a 60 FPS re
 This fork retains sanitized development history and upstream attribution.
 The badges and general project description below refer to upstream. A Windows U59
 build is available under Releases. Its archive includes the U59 launcher preset
-and default settings with tracing and validation disabled.
+and uses the shared Kyty settings file in ProgramData.
 
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
