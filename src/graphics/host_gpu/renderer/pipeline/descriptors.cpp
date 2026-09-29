@@ -695,8 +695,28 @@ static TextureCache::ImageDesc BuildTextureDescription(
 		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
 		                        physical_levels, tile, volume, size);
 	}
-	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
-	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
+	if (size.size == 0 || size.align == 0 ||
+	    (address & (static_cast<uint64_t>(size.align) - 1u)) != 0) {
+		if (storage) {
+			EXIT("Not implemented (storage texture with size=0x%x align=0x%x addr=0x%016" PRIx64
+			     ")\n",
+			     size.size, size.align, address);
+		}
+		// A sampled texture whose descriptor has no valid footprint (zero size, or a base address
+		// the tile layout cannot align to): bind a null texture like a null descriptor.
+		static std::atomic_uint32_t reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("Warning: texture with invalid footprint bound as null: addr=0x%016" PRIx64
+			            " size=0x%x align=0x%x %ux%u format=%u type=%u tile=%u "
+			            "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			            address, size.size, size.align, width, height,
+			            static_cast<uint32_t>(format), static_cast<uint32_t>(type),
+			            static_cast<uint32_t>(tile), descriptor.fields[0], descriptor.fields[1],
+			            descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
+			            descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+		}
+		return NullTextureDesc(resource, TextureCache::BindingType::Texture);
+	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}
