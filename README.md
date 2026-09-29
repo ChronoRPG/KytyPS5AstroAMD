@@ -1,4 +1,19 @@
-# KytyPS5
+# KytyPS5 experimental — U59
+
+The main branch publishes the selected **last known good U59** build, including
+the water fast-clear and stale-image corrections. U60 renderer experiments are
+excluded. Source publication is not a new stability certification or a 60 FPS result.
+
+- [All feature changes and performance evidence](docs/CHANGES-U59.md)
+- [Every fork commit and changed file](docs/CHANGE-CATALOG.md)
+- [U59 build and launch guide](docs/EXPERIMENTAL.md)
+- [RT research status](docs/RT-STATUS.md), on `codex/rt-experimental`
+- Demon's Souls additions remain separate on `claude/u59-demons`.
+
+This fork retains sanitized development history and upstream attribution.
+The badges and general project description below refer to upstream. Fork builds
+can be requested manually through Actions; no binary release accompanies publication.
+
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
