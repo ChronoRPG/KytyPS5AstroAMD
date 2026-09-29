@@ -1160,16 +1160,17 @@ static int LockFreeHintVerifyMode() {
 	return mode;
 }
 
-// KYTY_DRAW_PREP_GPU_DIRTY_HINT=0: a non-GPU preparing thread no longer refuses a read because
-// its tracker PAGE is GPU-dirty. The hint is only an efficiency filter (see above): the commit
-// re-validates every recorded range with the exact byte-range predicate, so a preparation that
-// read bytes the GPU had really written still falls back. Demon's Souls reads 16-byte records
-// from a few pages that compute shaders write elsewhere, and the page-level hint refused ~98% of
-// those reads (draw-prep fallbacks 2/3 of all draws, "unclean").
+// KYTY_DRAW_PREP_GPU_DIRTY_HINT=1 restores the page-level refusal (default off): a non-GPU preparing
+// thread refused a read because its tracker PAGE is GPU-dirty. The hint is only an efficiency
+// filter (see above): the commit re-validates every recorded range with the exact byte-range
+// predicate, so a preparation that read bytes the GPU had really written still falls back.
+// Demon's Souls reads 16-byte records from a few pages that compute shaders write elsewhere and the
+// hint refused ~98% of those reads (2/3 of all draws fell back, 104 -> 84 ms per frame without it);
+// Astro Bot's Sky Garden start view went from 27.6 to 30.2 fps with a steadier 2-vblank pacing.
 static bool GpuDirtyHintEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_DRAW_PREP_GPU_DIRTY_HINT");
-		return value == nullptr || std::strcmp(value, "0") != 0;
+		return value != nullptr && std::strcmp(value, "1") == 0;
 	}();
 	return enabled;
 }
