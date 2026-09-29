@@ -13,7 +13,7 @@ jobs:
     if: github.repository == 'Jetsku/KytyPS5-experimental'
     runs-on: windows-2022
     steps:
-      - name: Check out U59 source
+      - name: Check out experimental source
         uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -57,9 +57,6 @@ jobs:
           arch: win64_msvc2022_64
           cache: true
 
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-
       - name: Configure Release
         shell: cmd
         run: |
@@ -72,8 +69,6 @@ jobs:
             -DKYTY_RELEASE_TAG=%GITHUB_REF_NAME% ^
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
 
       - name: Build and install
@@ -82,31 +77,32 @@ jobs:
           cmake --build _Build/windows --target launcher kyty_emulator --parallel
           cmake --install _Build/windows --prefix _Build/windows/install
 
-      - name: Package portable U59 runtime
+      - name: Package portable experimental runtime
         shell: pwsh
         run: |
           $runtime = Join-Path $env:GITHUB_WORKSPACE '_Build/windows/install'
-          $release = Join-Path $env:RUNNER_TEMP 'KytyPS5-U59-Windows-x64'
+          $release = Join-Path $env:RUNNER_TEMP 'KytyPS5-U59-Demons-Windows-x64'
           New-Item -ItemType Directory -Path $release | Out-Null
           Copy-Item -Path (Join-Path $runtime '*') -Destination $release -Recurse
           Copy-Item -LiteralPath 'tools/Launch-U59.ps1' -Destination $release
           Copy-Item -LiteralPath 'tools/Launch-U59.cmd' -Destination $release
           Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination $release
+          Copy-Item -LiteralPath 'docs/DEMONS-INTEGRATION.md' -Destination (Join-Path $release 'DEMONS-INTEGRATION.md')
           if (Test-Path -LiteralPath (Join-Path $release 'Kyty.ini')) {
             throw 'The release must use the shared Kyty settings location; remove the local Kyty.ini.'
           }
           Copy-Item -LiteralPath 'docs/EXPERIMENTAL.md' -Destination (Join-Path $release 'U59-README.md')
           Copy-Item -LiteralPath 'LICENSE' -Destination $release
-          $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-U59-Windows-x64.zip'
+          $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-U59-Demons-Windows-x64.zip'
           Compress-Archive -Path (Join-Path $release '*') -DestinationPath $archive
           "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-      - name: Publish U59 build
+      - name: Publish experimental build
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create $env:GITHUB_REF_NAME 'KytyPS5-U59-Windows-x64.zip' `
+          gh release create $env:GITHUB_REF_NAME 'KytyPS5-U59-Demons-Windows-x64.zip' `
             --repo $env:GITHUB_REPOSITORY `
-            --title 'U59 Windows x64' `
-            --notes 'U59 renderer with water fast-clear and stale-image fixes. Includes the portable no-diagnostics launcher preset. RT and U60 work are excluded.'
+            --title "U59 + Demon's Souls changes (Windows x64)" `
+            --notes "Experimental U59 plus the merged Demon's Souls shader, renderer fallback and page-hint changes. Open launcher.exe directly: the bundled u59-preset.json applies the no-diagnostics renderer settings. The existing shared Kyty.ini supplies game paths and display settings. No FPS gain is claimed; this release is for visual and performance testing. RT and U60 work are excluded."

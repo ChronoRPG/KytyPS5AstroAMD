@@ -35,9 +35,11 @@ and preserve saves/caches. The clean baseline used compatibility patches selecti
 non-tiled deferred lighting and disabling GI probes/lighting shaders; these game
 patch files are not distributed here.
 
-The Windows release archive is built from the U59 main branch and includes a portable
-launcher. After extracting it, open `Launch-U59.cmd`, or run `./Launch-U59.ps1`
-in PowerShell. The archive contains no `Kyty.ini`, so the launcher uses its normal
+The Windows release archive is built from this experimental `main` and includes a portable
+launcher. After extracting it, open `launcher.exe` directly. When `u59-preset.json`
+is beside the executable, the launcher applies the same no-diagnostics environment
+as `Launch-U59.cmd`; that script remains available for older archives. The archive
+contains no `Kyty.ini`, so the launcher uses its normal
 shared settings file at `C:\ProgramData\Kyty\Kyty.ini`. Existing game directories and
 per-game settings remain available. If the first U59 archive left a `Kyty.ini` beside
 the launcher, this script backs it up before opening the launcher. It does not
