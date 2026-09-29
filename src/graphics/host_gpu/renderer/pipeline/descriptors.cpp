@@ -826,7 +826,14 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 	TextureBindingMemo::Forget(binding);
 	auto& desc = binding.desc;
 
-	if (descriptor.IsNull()) {
+	// The recompiler's specialization treats a sampled texture whose format the host cannot
+	// represent as a null image (ResourceMaterialization.cpp); bind a null texture for it here.
+	const bool unsupported_sampled_format =
+	    !storage && !resource.depth_compare &&
+	    !Prospero::IsFmaskTextureFormat(descriptor.Format()) &&
+	    Prospero::SampledTextureNumericClass(descriptor.Format()) ==
+	        Prospero::TextureNumericClass::Unsupported;
+	if (descriptor.IsNull() || unsupported_sampled_format) {
 		desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 		                                         : TextureCache::BindingType::Texture);
 		binding.image_id = texture_cache.FindImage(desc);

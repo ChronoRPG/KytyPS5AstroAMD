@@ -626,6 +626,22 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			if (raw_sint_storage) {
 				image.numeric_class = Prospero::TextureNumericClass::Uint;
 			}
+		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported &&
+		           !base.depth_compare && !image.fmask) {
+			// A sampled texture in a format the host cannot represent: the specialization treats
+			// it as a null image (the renderer binds a null texture for it, ResolveTextureFull)
+			// instead of dropping every draw that samples it.
+			(void)SpecializationFail(fmt::format(
+			    "sampled image descriptor {} uses unsupported format {} (T# {:08x} {:08x} {:08x} "
+			    "{:08x} {:08x} {:08x} {:08x} {:08x}); bound as a null texture",
+			    i, static_cast<uint32_t>(format), descriptor.dwords[0], descriptor.dwords[1],
+			    descriptor.dwords[2], descriptor.dwords[3], descriptor.dwords[4],
+			    descriptor.dwords[5], descriptor.dwords[6], descriptor.dwords[7]));
+			image.numeric_class     = Prospero::TextureNumericClass::Float;
+			image.dimension         = Decoder::ImageDimension::Dim2D;
+			image.cube              = false;
+			image.conversion_format = Prospero::BufferFormat::kInvalid;
+			continue;
 		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
 		           (base.depth_compare &&
 		            image.numeric_class != Prospero::TextureNumericClass::Float)) {
