@@ -1907,6 +1907,11 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::RefreshShaders");
 		RefreshShaders(buffer, draw, state);
 	}
+	// A stage whose shader the recompiler skipped (an unresolvable runtime descriptor,
+	// KYTY_SRT_VARIANT_READS) leaves its program empty: drop the draw.
+	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
+		return false;
+	}
 	KYTY_PROFILER_DETAIL_BLOCK("Draw::ResolveTargets");
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {

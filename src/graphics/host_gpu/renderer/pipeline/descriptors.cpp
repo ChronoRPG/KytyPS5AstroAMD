@@ -1471,7 +1471,18 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			uint64_t serial_base = 0;
 			if (serial_address != 0 && requested_size != 0) {
 				serial_base = serial_address;
-				serial_size = Libs::LibKernel::Memory::ClampRangeSize(serial_address, requested_size);
+				serial_size = Libs::LibKernel::Memory::ClampRangeSizeQuiet(serial_address, requested_size);
+				if (serial_size == 0) {
+					// An unmapped V# (typically left over from a skipped shader's output): bind
+					// no buffer instead of ending the emulator.
+					static std::atomic_bool unmapped_warned = false;
+					if (!unmapped_warned.exchange(true, std::memory_order_relaxed)) {
+						std::printf("Warning: buffer descriptor %u points at unmapped memory "
+						            "(addr=0x%016" PRIx64 " size=0x%" PRIx64 "); bound as empty\n",
+						            static_cast<uint32_t>(i), serial_address, requested_size);
+					}
+					serial_base = 0;
+				}
 			}
 			if (verify) {
 				DrawPrep::CountBindingVerifyCheck();

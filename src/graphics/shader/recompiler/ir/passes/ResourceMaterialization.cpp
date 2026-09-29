@@ -15,7 +15,9 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
+#include <mutex>
 #include <numeric>
+#include <string>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -25,6 +27,16 @@ constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectImageProbes = 65536u;
 
 bool SpecializationFail(std::string_view message) {
+	// A draw whose descriptors cannot be specialized fails again on every frame; each distinct
+	// reason is reported once (the console write costs more than the failed materialization).
+	static std::mutex                      mutex;
+	static std::unordered_set<std::string> reported;
+	{
+		const std::lock_guard lock(mutex);
+		if (reported.size() >= 64 || !reported.emplace(message).second) {
+			return false;
+		}
+	}
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
 	return false;
@@ -618,8 +630,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		           (base.depth_compare &&
 		            image.numeric_class != Prospero::TextureNumericClass::Float)) {
 			return SpecializationFail(
-			    fmt::format("sampled image descriptor {} uses unsupported format {}", i,
-			                static_cast<uint32_t>(format)));
+			    fmt::format("sampled image descriptor {} uses unsupported format {} "
+			                "(T# {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x})",
+			                i, static_cast<uint32_t>(format), descriptor.dwords[0],
+			                descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3],
+			                descriptor.dwords[4], descriptor.dwords[5], descriptor.dwords[6],
+			                descriptor.dwords[7]));
 		}
 	}
 	for (uint32_t root_index = 0; root_index < specialization.images.size(); root_index++) {

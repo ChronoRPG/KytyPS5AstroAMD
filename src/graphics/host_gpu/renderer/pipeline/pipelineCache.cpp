@@ -1629,7 +1629,12 @@ struct PipelineCache::ProgramCache {
 		}
 		// An unsuccessful optional uniform-fill/active-source probe is harmless if the
 		// complete refresh succeeded. Only a failed refresh requests a retry.
-		EXIT_IF(!NativeDccEnabled() || read_attempt.count == 0);
+		if (!NativeDccEnabled() || read_attempt.count == 0) {
+			// A failure no read can fix (an unsupported descriptor format, a specialization the
+			// recompiler rejects): the stage gets no program and its draws/dispatches are dropped
+			// instead of ending the emulator. The reason was already logged by the materializer.
+			return false;
+		}
 		read_attempt.materialization_failed = true;
 		return false;
 	}
