@@ -323,7 +323,7 @@ private:
 				const auto& b = *descriptor.indirect_image;
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
-				    a.table_offset != b.table_offset ||
+				    a.table_offset != b.table_offset || a.selector_immediate != b.selector_immediate ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
@@ -944,9 +944,10 @@ private:
 			const auto* memory = material_read != nullptr
 			                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
 			if (table_offset != 0u || memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
-			    memory->offset != 0u || !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
+			    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
 				return false;
 			}
+			indirect.selector_immediate = memory->offset;
 			Value selector;
 			if (!MatchMaterialOffset(material_read->Arg(1), selector, indirect.selector_stride,
 			                         indirect.selector_offset)) {

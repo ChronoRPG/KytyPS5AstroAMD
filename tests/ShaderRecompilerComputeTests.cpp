@@ -28549,6 +28549,135 @@ TestCase ScalarAndn2B64SccUsesMaskShadow() {
            O::S_CBRANCH_SCC0, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase WaveBranchSkipsOnlyWhenNoLaneMatches(const char *name,
+                                              std::vector<u32> prologue,
+                                              u32 branch_opcode,
+                                              std::vector<ShaderOpcode> opcodes,
+                                              u32 wave_size) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code = {EncodeVopc(0xc2, InlineU32(5), 0)};
+  code.insert(code.end(), prologue.begin(), prologue.end());
+  const auto branch = code.size();
+  code.push_back(0);
+  AppendVop3(&code, 0x360, 4, Vgpr(0), InlineU32(5));
+  code.push_back(EncodeSop1(0x04, 126, 2));
+  code.push_back(EncodeVop1(0x01, 1, 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  code[branch] =
+      EncodeSopp(branch_opcode, static_cast<u32>(code.size() - branch - 1u));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = name;
+  test.code = code;
+  test.initial = std::vector<u32>(wave_size, 0);
+  test.expected = std::vector<u32>(wave_size, 5);
+  test.opcodes = {O::V_CMP_EQ_U32};
+  test.opcodes.insert(test.opcodes.end(), opcodes.begin(), opcodes.end());
+  test.opcodes.insert(test.opcodes.end(),
+                      {O::V_READLANE_B32, O::S_MOV_B64, O::V_MOV_B32,
+                       O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM});
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase BranchExeczTestsTheWholeWave() {
+  using O = ShaderOpcode;
+  return WaveBranchSkipsOnlyWhenNoLaneMatches(
+      "BranchExeczTestsTheWholeWave", {EncodeSop1(0x24, 2, 106)}, 0x08,
+      {O::S_AND_SAVEEXEC_B64, O::S_CBRANCH_EXECZ}, 64);
+}
+
+TestCase BranchExeczTestsTheWholeWave32() {
+  using O = ShaderOpcode;
+  return WaveBranchSkipsOnlyWhenNoLaneMatches(
+      "BranchExeczTestsTheWholeWave32", {EncodeSop1(0x24, 2, 106)}, 0x08,
+      {O::S_AND_SAVEEXEC_B64, O::S_CBRANCH_EXECZ}, 32);
+}
+
+TestCase BranchVcczTestsTheWholeWave() {
+  using O = ShaderOpcode;
+  return WaveBranchSkipsOnlyWhenNoLaneMatches(
+      "BranchVcczTestsTheWholeWave", {EncodeSop1(0x04, 2, 126)}, 0x06,
+      {O::S_MOV_B64, O::S_CBRANCH_VCCZ}, 64);
+}
+
+TestCase BranchVcczTestsTheWholeWave32() {
+  using O = ShaderOpcode;
+  return WaveBranchSkipsOnlyWhenNoLaneMatches(
+      "BranchVcczTestsTheWholeWave32", {EncodeSop1(0x04, 2, 126)}, 0x06,
+      {O::S_MOV_B64, O::S_CBRANCH_VCCZ}, 32);
+}
+
+TestCase MaskSccBranchesTheWholeWave(const char *name,
+                                     std::vector<u32> prologue,
+                                     std::vector<ShaderOpcode> opcodes,
+                                     u32 wave_size) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code = {EncodeVopc(0xc2, InlineU32(5), 0)};
+  code.insert(code.end(), prologue.begin(), prologue.end());
+  const auto branch = code.size();
+  code.push_back(0);
+  AppendVMovU32(&code, 1, 1);
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  code[branch] = EncodeSopp(0x04, static_cast<u32>(code.size() - branch - 1u));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = name;
+  test.code = code;
+  test.initial = std::vector<u32>(wave_size, 0);
+  test.expected = std::vector<u32>(wave_size, 1);
+  test.opcodes = {O::V_CMP_EQ_U32};
+  test.opcodes.insert(test.opcodes.end(), opcodes.begin(), opcodes.end());
+  test.opcodes.insert(test.opcodes.end(),
+                      {O::S_CBRANCH_SCC0, O::V_MOV_B32, O::V_LSHLREV_B32,
+                       O::BUFFER_STORE_DWORD, O::S_ENDPGM});
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase MaskSccVccBranchesTheWholeWave() {
+  using O = ShaderOpcode;
+  return MaskSccBranchesTheWholeWave("MaskSccVccBranchesTheWholeWave",
+                                     {EncodeSop2(0x0f, 106, 106, 126)},
+                                     {O::S_AND_B64}, 64);
+}
+
+TestCase MaskSccVccBranchesTheWholeWave32() {
+  using O = ShaderOpcode;
+  return MaskSccBranchesTheWholeWave("MaskSccVccBranchesTheWholeWave32",
+                                     {EncodeSop2(0x0f, 106, 106, 126)},
+                                     {O::S_AND_B64}, 32);
+}
+
+TestCase MaskSccSgprBranchesTheWholeWave() {
+  using O = ShaderOpcode;
+  return MaskSccBranchesTheWholeWave("MaskSccSgprBranchesTheWholeWave",
+                                     {EncodeSop2(0x0f, 2, 106, 126)},
+                                     {O::S_AND_B64}, 64);
+}
+
+TestCase MaskSccSaveexecBranchesTheWholeWave() {
+  using O = ShaderOpcode;
+  return MaskSccBranchesTheWholeWave(
+      "MaskSccSaveexecBranchesTheWholeWave",
+      {EncodeSop1(0x24, 2, 106), EncodeSop1(0x04, 126, 2)},
+      {O::S_AND_SAVEEXEC_B64, O::S_MOV_B64}, 64);
+}
+
 TestCase ScalarMaskHighWriteInvalidatesProvenance() {
   using O = ShaderOpcode;
 
@@ -33673,6 +33802,123 @@ TestCase BufferStoreFormatXyzwDropsPartialRecord() {
       0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
   test.has_user_data = true;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreFormatXyzwPacksUnorm10() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x3f800000u);
+  AppendVMovLiteral(&code, 1, 0x3f000000u);
+  AppendVMovLiteral(&code, 2, 0xbf800000u);
+  AppendVMovLiteral(&code, 3, 0x3f800000u);
+  AppendVMovU32(&code, 20, 4);
+  code.push_back(EncodeMubuf0(0x07u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzwPacksUnorm10";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0x22222222u};
+  test.expected = {0x11111111u, 0xc00803ffu};
+  test.storage_buffer_range_dwords = 2;
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 8, false, BufferFormat(Prospero::BufferFormat::k10_10_10_2UNorm));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreFormatXPacksUnorm10Word() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x3f800000u);
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeMubuf0(0x04u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXPacksUnorm10Word";
+  test.code = std::move(code);
+  test.initial = {0xffffffffu};
+  test.expected = {0x000003ffu};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 4, false, BufferFormat(Prospero::BufferFormat::k10_10_10_2UNorm));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreFormatXyPacksSnorm16() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x3f000000u);
+  AppendVMovLiteral(&code, 1, 0xc0000000u);
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeMubuf0(0x05u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyPacksSnorm16";
+  test.code = std::move(code);
+  test.initial = {0x11111111u};
+  test.expected = {0x80014000u};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 4, false, BufferFormat(Prospero::BufferFormat::k16_16SNorm));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XY, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreFormatXPacksHalf() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x3f800000u);
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeMubuf0(0x04u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXPacksHalf";
+  test.code = std::move(code);
+  test.initial = {0x11223344u};
+  test.expected = {0x11223c00u};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 4, false, BufferFormat(Prospero::BufferFormat::k16Float));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreFormatXyzPacksFloat11() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x3f800000u);
+  AppendVMovLiteral(&code, 1, 0x3f000000u);
+  AppendVMovLiteral(&code, 2, 0x40000000u);
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeMubuf0(0x06u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzPacksFloat11";
+  test.code = std::move(code);
+  test.initial = {0x11111111u};
+  test.expected = {0x801c03c0u};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 4, false, BufferFormat(Prospero::BufferFormat::k11_11_10Float));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZ, O::S_ENDPGM};
   return test;
 }
 
@@ -39222,6 +39468,14 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarConditionalMoveB64);
   AddCase(ScalarConditionalMoveB64PreservesMasks);
   AddCase(ScalarAndn2B64SccUsesMaskShadow);
+  AddCase(BranchExeczTestsTheWholeWave);
+  AddCase(BranchExeczTestsTheWholeWave32);
+  AddCase(BranchVcczTestsTheWholeWave);
+  AddCase(BranchVcczTestsTheWholeWave32);
+  AddCase(MaskSccVccBranchesTheWholeWave);
+  AddCase(MaskSccVccBranchesTheWholeWave32);
+  AddCase(MaskSccSgprBranchesTheWholeWave);
+  AddCase(MaskSccSaveexecBranchesTheWholeWave);
   AddCase(ScalarMaskHighWriteInvalidatesProvenance);
   AddCase(ScalarSelectB64PreservesMaskProvenance);
   AddCase(ScalarWqmB64SelectsSccDomain);
@@ -39374,6 +39628,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
+  AddCase(BufferStoreFormatXyzwPacksUnorm10);
+  AddCase(BufferStoreFormatXPacksUnorm10Word);
+  AddCase(BufferStoreFormatXyPacksSnorm16);
+  AddCase(BufferStoreFormatXPacksHalf);
+  AddCase(BufferStoreFormatXyzPacksFloat11);
   AddCase(BufferLoadFormatXChecksOnlyTransferredComponent);
   AddCase(BufferStoreFormatXChecksOnlyTransferredComponent);
   AddCase(BufferLoadFormatXyChecksOnlyTransferredComponents);
@@ -45094,6 +45353,31 @@ int main(int argc, char **argv) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
     CheckDynamicRenderingState();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--shader-cases-only") == 0) {
+    VulkanHarness vulkan;
+    const auto tests = MakeCases();
+    const auto graphics_tests = MakeGraphicsCases();
+    CheckOpcodeCoverage(tests, graphics_tests);
+    for (const auto &test : tests) {
+      RunCase(&vulkan, test);
+    }
+    for (const auto &test : graphics_tests) {
+      RunGraphicsCase(&vulkan, test);
+    }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wave-branch-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BranchExeczTestsTheWholeWave());
+    RunCase(&vulkan, BranchExeczTestsTheWholeWave32());
+    RunCase(&vulkan, BranchVcczTestsTheWholeWave());
+    RunCase(&vulkan, BranchVcczTestsTheWholeWave32());
+    RunCase(&vulkan, MaskSccVccBranchesTheWholeWave());
+    RunCase(&vulkan, MaskSccVccBranchesTheWholeWave32());
+    RunCase(&vulkan, MaskSccSgprBranchesTheWholeWave());
+    RunCase(&vulkan, MaskSccSaveexecBranchesTheWholeWave());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {
