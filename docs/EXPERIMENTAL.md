@@ -34,13 +34,20 @@ and preserve saves/caches. The clean baseline used compatibility patches selecti
 non-tiled deferred lighting and disabling GI probes/lighting shaders; these game
 patch files are not distributed here.
 
-There is no rebuilt binary attached to this publication. Retained source and
+The Windows release archive is built from the U59 main branch and includes a portable
+launcher. After extracting it, open `Launch-U59.cmd`, or run `./Launch-U59.ps1`
+in PowerShell. Add your own
+game directory in the launcher. The packaged `Kyty.ini` sets 1920x1080, 60 Hz,
+Mailbox, Performance shader optimization, and tracing and validation off by
+default. It contains no game paths, saves, caches or patches. The script leaves
+existing installation settings alone. Retained source and
 dependency pins were compared with U59; documentation preparation does not constitute
 a fresh full test run. Historical test/results and their limitations are described
 in [CHANGES-U59.md](CHANGES-U59.md). Check both normal and top-down water before
 accepting a rendering change. Use a clean timing run separately from diagnostics.
 
-GitHub builds are manual-only. Original licenses/credits remain intact. Personal
+The U59 Windows release is produced by a tagged GitHub Actions build. Original
+licenses and credits remain intact. Personal
 handoffs, local editor configuration, captures, saves and caches are excluded;
 sanitizing historical files changes affected commit hashes while preserving commits
 and merge relationships. U60 remains available only in the original local development

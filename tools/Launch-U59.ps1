@@ -1,10 +1,19 @@
 param(
-    [string]$RuntimeDirectory = (Join-Path $PSScriptRoot '../_Build/windows/install'),
+    [string]$RuntimeDirectory,
     [switch]$PrintSettings
 )
 $ErrorActionPreference = 'Stop'
 $settings = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'u59-preset.json') -Raw | ConvertFrom-Json
+
 if ($PrintSettings) { $settings | ConvertTo-Json; return }
+if (-not $RuntimeDirectory) {
+    # The download places this script beside launcher.exe; the source checkout keeps it in tools/.
+    $RuntimeDirectory = if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'launcher.exe')) {
+        $PSScriptRoot
+    } else {
+        Join-Path $PSScriptRoot '../_Build/windows/install'
+    }
+}
 $runtime = (Resolve-Path -LiteralPath $RuntimeDirectory).Path
 $launcher = Join-Path $runtime 'launcher.exe'
 if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) { throw "Launcher not found: $launcher" }
@@ -20,4 +29,4 @@ foreach ($setting in $settings.PSObject.Properties) {
     $start.EnvironmentVariables[$setting.Name] = [string]$setting.Value
 }
 $process = [System.Diagnostics.Process]::Start($start)
-Write-Output "Started launcher PID $($process.Id). Configure tracing and validation in the launcher before starting a game."
+Write-Output "Started U59 launcher PID $($process.Id) with the no-diagnostics preset."
