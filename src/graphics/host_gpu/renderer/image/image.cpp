@@ -47,6 +47,9 @@ constexpr vk::AccessFlags2 TransitWriteAccess = vk::AccessFlagBits2::eTransferWr
                                                 vk::AccessFlagBits2::eShaderWrite |
                                                 vk::AccessFlagBits2::eMemoryWrite;
 
+// Image::RecordedTransitions.
+std::atomic<uint64_t> g_recorded_transitions {0};
+
 // KYTY_COPY_VIA_BUFFER_BATCH=0: Image::CopyImageWithBuffer copies one region per barrier pair.
 bool CopyViaBufferBatchEnabled() {
 	static const bool enabled = [] {
@@ -146,6 +149,10 @@ void Image::NoteContentWrite() noexcept {
 
 uint64_t Image::NextContentSerial() noexcept {
 	return g_content_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+uint64_t Image::RecordedTransitions() noexcept {
+	return g_recorded_transitions.load(std::memory_order_relaxed);
 }
 
 void Image::NotePossibleWrite() noexcept {
@@ -339,6 +346,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	if (barriers.empty()) {
 		return;
 	}
+	g_recorded_transitions.fetch_add(1, std::memory_order_relaxed);
 	// Barrier batcher (render.h): merged with pending requests, recorded now or (deferrable) at
 	// the next flush point, ending an active rendering instance only when recorded.
 	if (m_scheduler.Active() && m_scheduler.Current().BatchImageBarriers(barriers, command_buffer,

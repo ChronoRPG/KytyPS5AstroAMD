@@ -73,6 +73,9 @@ public:
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
 	             bool deferrable = false);
+	// Transit calls that produced barriers (all images; KYTY_DRAW_RUN=verify reads the difference
+	// around a draw's attachment acquisition and binding commit).
+	[[nodiscard]] static uint64_t RecordedTransitions() noexcept;
 	// GetBarriers would return no barrier and change no state: the image has one state (no
 	// per-subresource states), `range` covers every level and layer (a volume's range counts as
 	// one layer, as in GetBarriers), and that state already has the layout and the access, which

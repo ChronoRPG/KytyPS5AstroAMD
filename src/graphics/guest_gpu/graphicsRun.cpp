@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/gpuTouchedPages.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
@@ -295,6 +296,10 @@ void GuestGpu::ProcessCommands() {
 		// Service commands (mapping changes, readbacks, deferred label writes) change guest
 		// memory outside the command stream (syncEpoch.h).
 		SyncEpoch::Advance();
+		// KYTY_DRAW_RUN: other command-processor work (drawPrep/drawRun.h).
+		if (DrawRun::Enabled()) {
+			DrawRun::NoteForeignActivity();
+		}
 	}
 }
 
@@ -1347,6 +1352,10 @@ void GuestGpu::ThreadRun(void* data) {
 			EXIT_IF(g_current_processor != nullptr);
 			command();
 			SyncEpoch::Advance();
+			// KYTY_DRAW_RUN: a service command is other command-processor work.
+			if (DrawRun::Enabled()) {
+				DrawRun::NoteForeignActivity();
+			}
 			spin_deadline = 0;
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
@@ -1424,6 +1433,9 @@ bool GuestGpu::Process(Submission& submission) {
 	SyncEpoch::Advance();
 	if (first_slice) {
 		SyncEpoch::AdvanceSubmission();
+	}
+	if (DrawRun::Enabled()) {
+		DrawRun::NoteForeignActivity();
 	}
 
 	if (first_slice && submission.reset_processor) {
@@ -1541,6 +1553,9 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 	const bool first_slice = !submission.started;
 	// A new submission, or a slice after other queues ran (syncEpoch.h).
 	SyncEpoch::Advance();
+	if (DrawRun::Enabled()) {
+		DrawRun::NoteForeignActivity();
+	}
 	if (first_slice) {
 		SyncEpoch::AdvanceSubmission();
 		submission.started = true;
@@ -3728,6 +3743,12 @@ CpSeq::Result CommandProcessor::SubmitInline(CpSeq::OpKind kind, const void* pay
 CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payload,
                                           const void* data) {
 	using CpSeq::OpKind;
+	// KYTY_DRAW_RUN (drawPrep/drawRun.h): every operation but a direct draw (whose commit keeps its
+	// own run bookkeeping) and pure control flow is other command-processor work, which ends a run.
+	if (DrawRun::Enabled() && kind != OpKind::DrawIndex && kind != OpKind::DrawAuto &&
+	    kind != OpKind::ReadCheck && kind != OpKind::CondExec && kind != OpKind::Branch) {
+		DrawRun::NoteForeignActivity();
+	}
 	switch (kind) {
 		case OpKind::DrawIndex: ExecDrawIndex(*static_cast<const CpSeq::DrawIndexOp*>(payload)); break;
 		case OpKind::DrawAuto: ExecDrawAuto(*static_cast<const CpSeq::DrawAutoOp*>(payload)); break;

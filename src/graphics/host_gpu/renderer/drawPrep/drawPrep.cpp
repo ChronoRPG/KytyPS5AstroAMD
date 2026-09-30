@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
@@ -654,12 +655,19 @@ struct Engine::Slot {
 	// and the guest address of its draw packet.
 	RepeatTrace::DrawRecord repeat;
 	uint64_t                repeat_packet = 0;
+	// KYTY_DRAW_RUN (drawRun.h): the structure key of the preparation, by the preparing thread.
+	uint64_t run_key = 0;
 };
 
 namespace {
 
-// After Prepare, on the preparing thread: the repeat trace's hashes of this draw's inputs.
+// After Prepare, on the preparing thread: the repeat trace's hashes of this draw's inputs, and the
+// run key (KYTY_DRAW_RUN).
 void HashForRepeatTrace(Engine::Slot& slot) {
+	slot.run_key = DrawRun::Enabled() ? DrawRun::StructureKey(slot.registers.context,
+	                                                          slot.registers.user_config,
+	                                                          slot.prepared)
+	                                  : 0;
 	if (!RepeatTrace::Enabled()) [[likely]] {
 		return;
 	}
@@ -1206,11 +1214,16 @@ void Engine::Commit(Slot& slot) {
 	// accepted the preparation it was computed from.
 	executor.m_binding_plan        = slot.plan.valid ? &slot.plan : nullptr;
 	executor.m_binding_plan_active = false;
+	// KYTY_DRAW_RUN (drawRun.h): the draw is an engine commit with this structure key.
+	executor.m_run_key          = slot.run_key;
+	executor.m_in_engine_commit = true;
 	if (slot.kind == DrawKind::Index) {
 		executor.DrawIndex(slot.submit_id, scheduler.Current(), slot.index_args);
 	} else {
 		executor.DrawAuto(slot.submit_id, scheduler.Current(), slot.auto_args);
 	}
+	executor.m_in_engine_commit = false;
+	executor.m_run_key          = 0;
 	if (slot.plan.valid) {
 		CountCommittedPlan(executor.m_binding_plan_active);
 		slot.plan.Reset();
@@ -1237,6 +1250,7 @@ void Engine::Commit(Slot& slot) {
 	}
 	CommitStats::EndDraw();
 	PrintDrawPrepSummary();
+	DrawRun::PrintSummary();
 }
 
 void Engine::NoteFence() {

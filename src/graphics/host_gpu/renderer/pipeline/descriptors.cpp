@@ -1361,7 +1361,8 @@ bool RenderExecutor::RepeatStageTextures(const ShaderRecompiler::IR::CompiledSha
 }
 
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
-                                     PreparedBindings& prepared, DrawPrep::StagePlan* plan) {
+                                     PreparedBindings& prepared, DrawPrep::StagePlan* plan,
+                                     bool keep_images) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
@@ -1374,10 +1375,14 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shader_data_buffer = {};
 	prepared.buffer_sources.clear();
 	prepared.buffers.clear();
-	prepared.samplers.clear();
+	if (!keep_images) {
+		prepared.samplers.clear();
+	}
 	prepared.shader_data.clear();
 	const bool verify = plan != nullptr && DrawPrep::BindingsVerifyMode() != 0;
-	if (!RepeatStageTextures(program, snapshot, prepared)) {
+	// KYTY_DRAW_RUN continuation: the texture and sampler bindings are the previous draw's (the
+	// same program, T# and S# words; RenderExecutor::DrawRunCandidate).
+	if (!keep_images && !RepeatStageTextures(program, snapshot, prepared)) {
 		// KYTY_DRAW_PREP_BINDINGS textures: the memo hashes the preparing worker computed.
 		const auto count  = static_cast<uint32_t>(program.info.images.size());
 		const bool hashes = plan != nullptr && plan->texture_hashes_valid &&
@@ -1454,9 +1459,11 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	// resolved here as before.
 	const bool plan_samplers = plan != nullptr && plan->samplers_valid &&
 	                           plan->samplers.size() == program.info.samplers.size();
-	prepared.samplers.reserve(program.info.samplers.size());
+	if (!keep_images) {
+		prepared.samplers.reserve(program.info.samplers.size());
+	}
 	uint32_t planned_samplers = 0;
-	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+	for (uint32_t i = 0; !keep_images && i < program.info.samplers.size(); i++) {
 		auto sampler = plan_samplers ? plan->samplers[i] : vk::Sampler {};
 		planned_samplers += sampler != nullptr ? 1u : 0u;
 		if (sampler == nullptr || verify) {
@@ -1929,7 +1936,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-                                             std::span<RenderColorInfo> colors) {
+                                             std::span<RenderColorInfo> colors, bool keep_images) {
 	bool uses_dma = false;
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
@@ -1939,11 +1946,19 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		m_context.PrepareBda();
 	}
 	CommitStats::Mark(CommitStats::Phase::FindBuffers);
+	// KYTY_DRAW_RUN continuation: the views and targets are the previous draw's (checked against the
+	// image state after the buffer work, RenderExecutor::DrawRunImagesUnchanged).
 	for (auto* stage: stages) {
+		if (keep_images) {
+			break;
+		}
 		RebindImages(*stage);
 	}
 	auto& cache = m_context.GetTextureCache();
 	for (auto& target: colors) {
+		if (keep_images) {
+			break;
+		}
 		EXIT_IF(!target.image_id);
 		const auto old_image = cache.m_slot_images.try_get(target.image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
@@ -2143,7 +2158,8 @@ private:
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
-                                    std::span<PreparedBindings* const> prepared_bindings) {
+                                    std::span<PreparedBindings* const> prepared_bindings,
+                                    bool                               keep_images) {
 	KYTY_PROFILER_FUNCTION();
 	// Run after resource discovery so an unbounded address writer cannot retain a
 	// metadata-inspection memo created during preparation of this same command.
@@ -2230,7 +2246,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		// KYTY_DRAW_RUN continuation: every image is in the state the previous draw's transitions
+		// left it in (RenderExecutor::DrawRunImagesUnchanged), which the bindings' layouts record.
+		for (uint32_t i = 0; !keep_images && i < program.info.images.size(); i++) {
 			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];
 			const auto&                 view = binding.desc.view_info;
