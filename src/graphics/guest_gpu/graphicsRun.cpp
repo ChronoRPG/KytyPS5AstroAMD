@@ -18,6 +18,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/coherenceLog.h"
 #include "graphics/host_gpu/gpuTouchedPages.h"
+#include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
@@ -1428,6 +1429,9 @@ bool GuestGpu::Process(Submission& submission) {
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();
 	}
+	if (first_slice && submission.reset_processor && submission.type != SubmissionType::Compute) {
+		CommitStats::OnFrameBoundary();
+	}
 	if (first_slice && RepeatTrace::Enabled()) {
 		// KYTY_CP_REPEAT_TRACE: a guest frame starts with the processor reset after
 		// sceAgcSuspendPoint; every submission's content is hashed.
@@ -1544,6 +1548,11 @@ bool GuestGpu::ProcessSequenced(Submission& submission) {
 		// The frame fence's ordering point: the sequencer reads a fenced submission's command
 		// bytes only from here on.
 		m_sequencer->NoteStarted(submission.sequence);
+		// KYTY_CP_COMMIT_STATS: a guest frame starts with the processor reset after
+		// sceAgcSuspendPoint.
+		if (submission.reset_processor && submission.type != SubmissionType::Compute) {
+			CommitStats::OnFrameBoundary();
+		}
 	}
 	cp.BufferInit();
 	if (submission.handoff) {

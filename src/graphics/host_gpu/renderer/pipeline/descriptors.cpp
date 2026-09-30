@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
+#include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/lodStats.h"
@@ -1937,6 +1938,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	if (uses_dma) {
 		m_context.PrepareBda();
 	}
+	CommitStats::Mark(CommitStats::Phase::FindBuffers);
 	for (auto* stage: stages) {
 		RebindImages(*stage);
 	}
@@ -1955,13 +1957,17 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			BindRenderTarget(target.image_id);
 		}
 	}
+	CommitStats::Mark(CommitStats::Phase::RebindImages);
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
 	// The uploads of every stage share one barrier pair (KYTY_UPLOAD_BATCH).
-	const BufferCache::UploadBatch upload_batch(m_context.GetBufferCache());
-	for (auto* stage: stages) {
-		RebindBuffers(*stage);
+	{
+		const BufferCache::UploadBatch upload_batch(m_context.GetBufferCache());
+		for (auto* stage: stages) {
+			RebindBuffers(*stage);
+		}
 	}
+	CommitStats::Mark(CommitStats::Phase::RebindBuffers);
 }
 
 // KYTY_PUSH_SHADOW_FRESH_SKIP=1 (default off): a push-descriptor update whose stages include a shader
