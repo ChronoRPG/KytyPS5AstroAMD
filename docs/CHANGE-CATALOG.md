@@ -10531,7 +10531,7 @@ Changed files: `src/graphics/host_gpu/renderer/cache/textureCache.cpp`.
 
 Commit: [`f266ddf6`](https://github.com/Jetsku/KytyPS5-experimental/commit/f266ddf60a9fea82f21a9afd4ecc078499405627) · **Shader translation and ISA behavior**
 
-Implements the named instruction/semantic correction or simplifies equivalent generated work. Accuracy changes need not be faster, and no per-instruction gameplay gain is claimed. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named instruction/semantic correction or simplifies equivalent generated work. Accuracy changes need not be faster, and no per-instruction gameplay gain is claimed. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -10564,7 +10564,7 @@ Changed files: `src/graphics/shader/recompiler/frontend/decode/ShaderDecoder.h`,
 
 Commit: [`ebb3f71e`](https://github.com/Jetsku/KytyPS5-experimental/commit/ebb3f71e3a77dea0cff0f7d232f2dfe4d1229bb2) · **Shader translation and ISA behavior**
 
-Implements the named instruction/semantic correction or simplifies equivalent generated work. Accuracy changes need not be faster, and no per-instruction gameplay gain is claimed. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named instruction/semantic correction or simplifies equivalent generated work. Accuracy changes need not be faster, and no per-instruction gameplay gain is claimed. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -10609,7 +10609,7 @@ Changed files: `src/graphics/shader/recompiler/ShaderRecompiler.cpp`, `src/graph
 
 Commit: [`868ec21e`](https://github.com/Jetsku/KytyPS5-experimental/commit/868ec21e9d695ab8d082da3e37d8d5bafcfa2744) · **Memory coherence and cached proofs**
 
-Reduces repeated range/page work or corrects which copy owns the bytes. Cached answers are valid only until the relevant writes/epochs change; coherence fixes prevent stale-data reuse. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Reduces repeated range/page work or corrects which copy owns the bytes. Cached answers are valid only until the relevant writes/epochs change; coherence fixes prevent stale-data reuse. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -10699,7 +10699,7 @@ Changed files: `CMakeLists.txt`, `src/common/profiler.cpp`, `src/common/profiler
 
 Commit: [`a2cc8b76`](https://github.com/Jetsku/KytyPS5-experimental/commit/a2cc8b76a235585091af3dc6c1f373ef76f8f029) · **Diagnostics and attribution**
 
-Makes the named event, cost or failure observable. It does not itself establish lower frame time; collection can add overhead. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Makes the named event, cost or failure observable. It does not itself establish lower frame time; collection can add overhead. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -10727,7 +10727,7 @@ Integrates the named parent work and any conflict resolution. Read its parent co
 
 Commit: [`4002d7be`](https://github.com/Jetsku/KytyPS5-experimental/commit/4002d7be26e2baa825e430c7c6d18679f51de557) · **RT decode, traversal and integration**
 
-Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -10764,7 +10764,7 @@ Changed files: `CMakeLists.txt`, `src/graphics/host_gpu/rt/psrBvh.cpp`, `src/gra
 
 Commit: [`a04b2556`](https://github.com/Jetsku/KytyPS5-experimental/commit/a04b255660f17aaa0eaca92b7271c9a4818dc929) · **RT decode, traversal and integration**
 
-Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -10809,7 +10809,7 @@ Changed files: `src/graphics/host_gpu/rt/psrBvh.cpp`, `src/graphics/host_gpu/rt/
 
 Commit: [`79f39727`](https://github.com/Jetsku/KytyPS5-experimental/commit/79f397271683891d0d2061fbd68320f424c9d96a) · **RT decode, traversal and integration**
 
-Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -10845,7 +10845,7 @@ Changed files: `src/common/profiler.cpp`, `src/common/profiler.h`, `src/graphics
 
 Commit: [`3352f37a`](https://github.com/Jetsku/KytyPS5-experimental/commit/3352f37adeb71d3a8f06a9391c0da97575edb8e6) · **RT decode, traversal and integration**
 
-Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -10874,7 +10874,7 @@ Integrates the named parent work and any conflict resolution. Read its parent co
 
 Commit: [`18f4fbb6`](https://github.com/Jetsku/KytyPS5-experimental/commit/18f4fbb612206f791431274373a116fa3e81af7f) · **RT decode, traversal and integration**
 
-Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -10911,7 +10911,7 @@ Changed files: `CMakeLists.txt`, `src/graphics/host_gpu/renderer/renderCompute.c
 
 Commit: [`89492447`](https://github.com/Jetsku/KytyPS5-experimental/commit/894924477f454fabe6b88af8f225f6e4439a1f2c) · **RT decode, traversal and integration**
 
-Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -10960,7 +10960,7 @@ Changed files: `src/graphics/shader/recompiler/BvhReference.h`, `src/graphics/sh
 
 Commit: [`4d7eb58b`](https://github.com/Jetsku/KytyPS5-experimental/commit/4d7eb58b319a25de041a5ee61f83a505c4264507) · **RT decode, traversal and integration**
 
-Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -11001,7 +11001,7 @@ Integrates the named parent work and any conflict resolution. Read its parent co
 
 Commit: [`661fbf19`](https://github.com/Jetsku/KytyPS5-experimental/commit/661fbf1906229913ba97cd2309b0d4731b93e4e8) · **RT decode, traversal and integration**
 
-Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -11102,7 +11102,7 @@ Integrates the named parent work and any conflict resolution. Read its parent co
 
 Commit: [`7f7f300f`](https://github.com/Jetsku/KytyPS5-experimental/commit/7f7f300fbfe6862229d9ad21c82d973c2dc2fe0f) · **RT decode, traversal and integration**
 
-Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -11172,7 +11172,7 @@ Integrates the named parent work and any conflict resolution. Read its parent co
 
 Commit: [`31f805c0`](https://github.com/Jetsku/KytyPS5-experimental/commit/31f805c0a7f49367f320381f65db5b4d6aa18bf3) · **RT decode, traversal and integration**
 
-Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -11190,7 +11190,7 @@ Changed files: `src/graphics/host_gpu/renderer/rtBvhDump.cpp`, `src/graphics/hos
 
 Commit: [`36cb325b`](https://github.com/Jetsku/KytyPS5-experimental/commit/36cb325b99a6f9aa2ce7928967b7b85d384ee2b6) · **Shader translation and ISA behavior**
 
-Implements the named instruction/semantic correction or simplifies equivalent generated work. Accuracy changes need not be faster, and no per-instruction gameplay gain is claimed. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named instruction/semantic correction or simplifies equivalent generated work. Accuracy changes need not be faster, and no per-instruction gameplay gain is claimed. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -11240,7 +11240,7 @@ Integrates the named parent work and any conflict resolution. Read its parent co
 
 Commit: [`1f4cec88`](https://github.com/Jetsku/KytyPS5-experimental/commit/1f4cec881a4d4e6b5b1c6650715e58a795442864) · **Shader translation and ISA behavior**
 
-Implements the named instruction/semantic correction or simplifies equivalent generated work. Accuracy changes need not be faster, and no per-instruction gameplay gain is claimed. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named instruction/semantic correction or simplifies equivalent generated work. Accuracy changes need not be faster, and no per-instruction gameplay gain is claimed. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -11304,7 +11304,7 @@ Changed files: `src/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp`, `tes
 
 Commit: [`9bf0cc2d`](https://github.com/Jetsku/KytyPS5-experimental/commit/9bf0cc2d930caacd59cfc6d78b1fd982d032d881) · **Support/correctness change**
 
-The subject and linked diff identify the exact change. No isolated performance measurement is available; do not count it as an additional FPS gain. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+The subject and linked diff identify the exact change. No isolated performance measurement is available; do not count it as an additional FPS gain. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -11351,7 +11351,7 @@ Changed files: `src/common/profiler.cpp`, `src/common/profiler.h`, `src/graphics
 
 Commit: [`1cc0411e`](https://github.com/Jetsku/KytyPS5-experimental/commit/1cc0411e341325b589df47f267aaeb80684ee860) · **Shader translation and ISA behavior**
 
-Implements the named instruction/semantic correction or simplifies equivalent generated work. Accuracy changes need not be faster, and no per-instruction gameplay gain is claimed. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named instruction/semantic correction or simplifies equivalent generated work. Accuracy changes need not be faster, and no per-instruction gameplay gain is claimed. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -11380,7 +11380,7 @@ Changed files: `src/graphics/shader/recompiler/frontend/decode/ScalarAluOps.cpp`
 
 Commit: [`e5dd1a4b`](https://github.com/Jetsku/KytyPS5-experimental/commit/e5dd1a4b782ee363d14504f1c74eea77bfbc1ddc) · **Shader translation and ISA behavior**
 
-Implements the named instruction/semantic correction or simplifies equivalent generated work. Accuracy changes need not be faster, and no per-instruction gameplay gain is claimed. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named instruction/semantic correction or simplifies equivalent generated work. Accuracy changes need not be faster, and no per-instruction gameplay gain is claimed. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -11427,7 +11427,7 @@ Changed files: `src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp`, `src
 
 Commit: [`a6efeceb`](https://github.com/Jetsku/KytyPS5-experimental/commit/a6efecebdc75a6ab765e80ccfcbe3f1b2da4c5a3) · **RT decode, traversal and integration**
 
-Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits apply; no game hardware-RT speedup is established.
 
 Changed files: `src/graphics/host_gpu/rt/psrBvh.cpp`, `src/graphics/host_gpu/rt/psrBvh.h`, `tests/RtHardwareTests.cpp`.
 
@@ -11435,7 +11435,7 @@ Changed files: `src/graphics/host_gpu/rt/psrBvh.cpp`, `src/graphics/host_gpu/rt/
 
 Commit: [`45065df8`](https://github.com/Jetsku/KytyPS5-experimental/commit/45065df85c5bc68d5317363791a609e4218c3f8a) · **Memory coherence and cached proofs**
 
-Reduces repeated range/page work or corrects which copy owns the bytes. Cached answers are valid only until the relevant writes/epochs change; coherence fixes prevent stale-data reuse. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Reduces repeated range/page work or corrects which copy owns the bytes. Cached answers are valid only until the relevant writes/epochs change; coherence fixes prevent stale-data reuse. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -11470,7 +11470,7 @@ Changed files: `src/common/profiler.cpp`, `src/common/profiler.h`, `src/graphics
 
 Commit: [`b0bc3f85`](https://github.com/Jetsku/KytyPS5-experimental/commit/b0bc3f8542e97fe9ec590b7ec9709af0bc5c9aad) · **Shader translation and ISA behavior**
 
-Implements the named instruction/semantic correction or simplifies equivalent generated work. Accuracy changes need not be faster, and no per-instruction gameplay gain is claimed. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named instruction/semantic correction or simplifies equivalent generated work. Accuracy changes need not be faster, and no per-instruction gameplay gain is claimed. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 
@@ -11504,7 +11504,7 @@ Changed files: `src/common/profiler.cpp`, `src/common/profiler.h`, `src/graphics
 
 Commit: [`bf29c2e7`](https://github.com/Jetsku/KytyPS5-experimental/commit/bf29c2e78164a82853bfb6b6f77191992508b76c) · **Memory coherence and cached proofs**
 
-Reduces repeated range/page work or corrects which copy owns the bytes. Cached answers are valid only until the relevant writes/epochs change; coherence fixes prevent stale-data reuse. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Reduces repeated range/page work or corrects which copy owns the bytes. Cached answers are valid only until the relevant writes/epochs change; coherence fixes prevent stale-data reuse. RT-specific limits apply; no game hardware-RT speedup is established.
 
 Changed files: `CMakeLists.txt`, `docs/rt-offline-validation.md`, `tests/ShaderRecompilerComputeTests.cpp`.
 
@@ -11512,7 +11512,7 @@ Changed files: `CMakeLists.txt`, `docs/rt-offline-validation.md`, `tests/ShaderR
 
 Commit: [`bc64dba0`](https://github.com/Jetsku/KytyPS5-experimental/commit/bc64dba09885eae62a7350d9dce54902b5205e57) · **Workflow and compatibility controls**
 
-Supports controlled launches, navigation or documentation. This does not optimize rendering; private operational documents are excluded from the publication. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Supports controlled launches, navigation or documentation. This does not optimize rendering; private operational documents are excluded from the publication. RT-specific limits apply; no game hardware-RT speedup is established.
 
 Changed files: `CMakeLists.txt`, `docs/host-input-testing.md`, `src/common/hostInputTrace.h`, `src/graphics/presentation/window/hostInput.cpp`, `src/graphics/presentation/window/hostInputPulse.h`, `src/libs/controller.cpp`, `tests/HostInputPulseTests.cpp`.
 
@@ -11520,7 +11520,7 @@ Changed files: `CMakeLists.txt`, `docs/host-input-testing.md`, `src/common/hostI
 
 Commit: [`69745bd6`](https://github.com/Jetsku/KytyPS5-experimental/commit/69745bd687756875fcb845fd50aa725d77ec87e6) · **RT decode, traversal and integration**
 
-Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits apply; no game hardware-RT speedup is established.
 
 Changed files: `src/graphics/host_gpu/renderer/rtBvhDump.cpp`, `src/graphics/host_gpu/renderer/rtBvhDump.h`, `src/graphics/host_gpu/rt/bvhDump.cpp`, `src/graphics/host_gpu/rt/bvhDump.h`, `src/graphics/host_gpu/rt/psrBvh.cpp`, `src/graphics/host_gpu/rt/psrBvh.h`, `tests/RtHardwareTests.cpp`.
 
@@ -11528,7 +11528,7 @@ Changed files: `src/graphics/host_gpu/renderer/rtBvhDump.cpp`, `src/graphics/hos
 
 Commit: [`8652c44a`](https://github.com/Jetsku/KytyPS5-experimental/commit/8652c44ada55574fa0eae938cd3c2f3e2a4c02d3) · **RT decode, traversal and integration**
 
-Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits and synthetic evidence are documented in RT-STATUS.md; no game hardware-RT speedup is established.
+Implements the named hierarchy, traversal or native-device step. Native traversal can reduce ALU work, but snapshot validity, exact ray behavior and game integration remain prerequisites; this is research code, not an established game acceleration. RT-specific limits apply; no game hardware-RT speedup is established.
 
 <details><summary>Original commit rationale (historical claims; not a fresh benchmark)</summary>
 

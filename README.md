@@ -7,7 +7,6 @@ build; merging source changes does not certify a new release or a 60 FPS result.
 - [U59 feature changes and performance evidence](docs/CHANGES-U59.md)
 - [Fork commit and file catalog through U59](docs/CHANGE-CATALOG.md)
 - [U59 build and launch guide](docs/EXPERIMENTAL.md)
-- [RT research status](docs/RT-STATUS.md), on `codex/rt-experimental`
 
 This fork retains sanitized development history and upstream attribution.
 The badges and general project description below refer to upstream. The

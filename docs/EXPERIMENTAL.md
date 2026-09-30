@@ -1,8 +1,7 @@
 # Building and launching U59
 
 `main` uses the U59 source checkpoint plus the Demon's Souls shader, renderer
-fallback and page-hint changes. Detailed integration notes are available in
-the source repository's `docs/DEMONS-INTEGRATION.md`.
+fallback and page-hint changes.
 The `u59` tag and the existing Windows release tags still identify the original
 sanitized U59 checkpoint. No U60 renderer changes are included. RT remains separate.
 

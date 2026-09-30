@@ -407,7 +407,7 @@ was performed just to publish this source.
 
 This preserves the committed software/hardware RT research plus a clearly marked
 snapshot of the existing native-scene/device-integration work. It is based on an
-older renderer, not U59 with all fixes automatically merged. See [RT-STATUS.md](RT-STATUS.md).
+older renderer, not U59 with all fixes automatically merged.
 Hardware traversal is promising in synthetic tests, but no Astro Bot hardware-RT
 replacement or FPS benefit has been demonstrated.
 
@@ -416,7 +416,6 @@ replacement or FPS benefit has been demonstrated.
 The original `claude/u59-demons` shader and test commits were merged into `main`
 with their history intact. Four renderer fallback commits and two page-hint commits
 were then applied separately. The always-on draw diagnostics were excluded.
-[Integration notes](DEMONS-INTEGRATION.md) record the validation and its limits.
 The U59 release tags still point to the pre-merge build; no new FPS result is claimed.
 
 ## 9. Reproducing the review
