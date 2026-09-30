@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   windows:
-    if: github.repository == 'Jetsku/KytyPS5-experimental'
+    if: github.repository == 'Jetsku/KytyPS5-experimental' || github.repository == 'Jetsku/KytyPS5'
     runs-on: windows-2022
     steps:
       - name: Check out experimental source
@@ -84,8 +84,6 @@ jobs:
           $release = Join-Path $env:RUNNER_TEMP 'KytyPS5-U59-Demons-Windows-x64'
           New-Item -ItemType Directory -Path $release | Out-Null
           Copy-Item -Path (Join-Path $runtime '*') -Destination $release -Recurse
-          Copy-Item -LiteralPath 'tools/Launch-U59.ps1' -Destination $release
-          Copy-Item -LiteralPath 'tools/Launch-U59.cmd' -Destination $release
           Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination $release
           Copy-Item -LiteralPath 'docs/DEMONS-INTEGRATION.md' -Destination (Join-Path $release 'DEMONS-INTEGRATION.md')
           if (Test-Path -LiteralPath (Join-Path $release 'Kyty.ini')) {

@@ -12,13 +12,9 @@ Configure Release in an x64 Visual Studio developer shell using the documented Q
 add `-DKYTY_EMULATOR_IPO=ON` to match the optimized experimental configuration.
 Build `launcher` and install to `_Build/windows/install` using the README commands.
 
-```powershell
-./tools/Launch-U59.ps1
-# Or use a separate installed runtime:
-./tools/Launch-U59.ps1 -RuntimeDirectory 'D:/Kyty-runtime'
-# Inspect the environment without launching:
-./tools/Launch-U59.ps1 -PrintSettings
-```
+For a source build, copy `tools/u59-preset.json` beside the installed
+`launcher.exe`, then open `launcher.exe` directly. Release archives already
+include this preset. No launch script is required.
 
 `tools/u59-preset.json` contains the portable no-diagnostics U59 renderer environment.
 The five optional features are enabled: CP recorder, program cache, draw-prep binding
@@ -28,8 +24,8 @@ are off for clean timing; they are distinct from the renderer settings.
 
 Set game paths and runtime options in the launcher. For the recorded U59 baseline,
 use 1920x1080, 60 Hz, Mailbox; disable Tracy, RenderDoc, Vulkan/shader validation and
-shader logging. The script does not rewrite the shared INI or remove external
-capture layers. It isolates its child from inherited KYTY/TRACY environment settings and
+shader logging. The launcher does not rewrite the shared INI or remove external
+capture layers. The bundled preset isolates its child from inherited KYTY/TRACY environment settings and
 does not impose machine-specific CPU affinity. Use a separate runtime for experiments
 and preserve saves/caches. The clean baseline used compatibility patches selecting
 non-tiled deferred lighting and disabling GI probes/lighting shaders; these game
@@ -37,13 +33,13 @@ patch files are not distributed here.
 
 The Windows release archive is built from this experimental `main` and includes a portable
 launcher. After extracting it, open `launcher.exe` directly. When `u59-preset.json`
-is beside the executable, the launcher applies the same no-diagnostics environment
-as `Launch-U59.cmd`; that script remains available for older archives. The archive
+is beside the executable, the launcher applies the no-diagnostics environment
+automatically. The archive
 contains no `Kyty.ini`, so the launcher uses its normal
 shared settings file at `C:\ProgramData\Kyty\Kyty.ini`. Existing game directories and
-per-game settings remain available. If the first U59 archive left a `Kyty.ini` beside
-the launcher, this script backs it up before opening the launcher. It does not
-modify the shared settings file. Users without shared settings should configure
+per-game settings remain available. If an older U59 archive left a `Kyty.ini` beside
+the launcher, move that file aside before launching to use the shared settings.
+Users without shared settings should configure
 resolution, validation and other options in the launcher. No game files, saves,
 caches or patches are distributed. Retained source and
 dependency pins were compared with U59; documentation preparation does not constitute
