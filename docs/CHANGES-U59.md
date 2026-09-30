@@ -17,7 +17,7 @@ inventories in [CHANGE-CATALOG.md](CHANGE-CATALOG.md) distinguish the two direct
 
 The catalog covers every fork commit through U59, including merges, tests,
 diagnostics and the early A–S19 checkpoint. This guide explains the mechanisms
-by subsystem. The separate RT and Demon's Souls branches have their own entries.
+by subsystem.
 
 ### Reading performance claims
 
@@ -350,8 +350,7 @@ lanes so they cannot corrupt counters used by particles/GI work.
 
 **Expected:** fewer shader instructions and less host translation work where exact
 transformations apply. Accuracy corrections can add work. There is no measured
-per-opcode Sky Garden FPS attribution. The new Demon's Souls instruction and phi-web
-changes are kept on its separate branch, not silently added to U59.
+per-opcode Sky Garden FPS attribution.
 
 ## 6. Diagnostics, compatibility helpers and regression coverage
 
@@ -364,7 +363,7 @@ measure work and can alter scheduling; their FPS is not clean benchmark FPS.
 
 The RenderDoc lifecycle correction coordinates capture with recorder/submission
 completion. Capture tools still need their own stability checks. Game-patch filtering
-allows controlled compatibility/RT experiments without rewriting patch files.
+allows controlled compatibility experiments without rewriting patch files.
 Opt-in host input and minimum key-press duration support repeatable navigation;
 they do not modify rendering. AMPR counter-bank/address/wait emulation improves
 guest compatibility and makes hangs easier to diagnose.
@@ -401,24 +400,7 @@ U59 is the selected last known good build, not a certification of all games or a
 validation layers have hidden failures before. No new game benchmark or rebuild
 was performed just to publish this source.
 
-## 8. Separate branches
-
-### RT: `codex/rt-experimental`
-
-This preserves the committed software/hardware RT research plus a clearly marked
-snapshot of the existing native-scene/device-integration work. It is based on an
-older renderer, not U59 with all fixes automatically merged.
-Hardware traversal is promising in synthetic tests, but no Astro Bot hardware-RT
-replacement or FPS benefit has been demonstrated.
-
-### Demon's Souls integration
-
-The original `claude/u59-demons` shader and test commits were merged into `main`
-with their history intact. Four renderer fallback commits and two page-hint commits
-were then applied separately. The always-on draw diagnostics were excluded.
-The U59 release tags still point to the pre-merge build; no new FPS result is claimed.
-
-## 9. Reproducing the review
+## 8. Reproducing the review
 
 Use the published commit links in the catalog to inspect each change and its tests.
 The source base and comparison upstream hashes above identify the original public

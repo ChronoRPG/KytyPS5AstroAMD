@@ -1,9 +1,7 @@
 # Building and launching U59
 
-`main` uses the U59 source checkpoint plus the Demon's Souls shader, renderer
-fallback and page-hint changes.
 The `u59` tag and the existing Windows release tags still identify the original
-sanitized U59 checkpoint. No U60 renderer changes are included. RT remains separate.
+sanitized U59 checkpoint. No U60 renderer changes are included.
 
 Follow the Windows requirements in [README](../README.md#build-requirements-windows):
 Git, Visual Studio C++ tools, clang-cl, Ninja, CMake, Qt 6 for MSVC and glslangValidator.
