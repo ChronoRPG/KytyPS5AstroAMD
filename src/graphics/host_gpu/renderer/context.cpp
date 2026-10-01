@@ -606,6 +606,9 @@ void CommandBuffer::Begin() {
 		state.layout    = nullptr;
 		state.bound_set = nullptr;
 	}
+	for (auto& epoch: m_descriptor_epochs) {
+		epoch++;
+	}
 	// Push constants are undefined at the start of a command buffer.
 	m_push_constants.valid = false;
 	// Commands of other submissions can precede this buffer on the queue: no epoch, no elision.
@@ -657,6 +660,7 @@ void CommandBuffer::InvalidateDescriptors(vk::PipelineBindPoint point) {
 	auto& state     = m_descriptor_states[BindingPointIndex(point)];
 	state.layout    = nullptr;
 	state.bound_set = nullptr;
+	m_descriptor_epochs[BindingPointIndex(point)]++;
 }
 
 void CommandBuffer::BindDescriptorSet(vk::PipelineBindPoint point, vk::PipelineLayout layout,
@@ -671,6 +675,7 @@ void CommandBuffer::BindDescriptorSet(vk::PipelineBindPoint point, vk::PipelineL
 		return;
 	}
 	StateSink().bindDescriptorSets(point, layout, 0, 1, &set, 0, nullptr);
+	m_descriptor_epochs[BindingPointIndex(point)]++;
 	state.layout    = DescriptorSetReuseEnabled() ? layout : nullptr;
 	state.bound_set = DescriptorSetReuseEnabled() ? set : nullptr;
 	state.writes.clear();
@@ -763,6 +768,7 @@ int32_t CommandBuffer::PushDescriptors(vk::PipelineBindPoint point, vk::Pipeline
 		return result;
 	}
 	StateSink().pushDescriptorSetKHR(point, layout, set, count, writes);
+	m_descriptor_epochs[BindingPointIndex(point)]++;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushes);
 	state.layout    = nullptr;
 	state.bound_set = nullptr;

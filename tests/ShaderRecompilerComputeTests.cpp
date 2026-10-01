@@ -16305,6 +16305,8 @@ public:
     AppendEnd(&pixel_code);
 
     EnsureRuntimeContext();
+    // Push descriptors as in the product (KYTY_DRAW_RUN_PUSH updates them incrementally).
+    const PushDescriptorsScope push_descriptors(m_runtime_context, MaxPushDescriptors());
     int64_t direct_offset = -1;
     Require(name, "direct allocation",
             Libs::LibKernel::Memory::KernelAllocateDirectMemory(
@@ -16367,6 +16369,7 @@ public:
     uint64_t late = 0;
     uint64_t mismatches = 0;
     uint64_t reused = 0;
+    uint64_t partial = 0;
     context.GetGpu().SendCommandSync([&] {
       GraphicsInitJmpTables();
       CommandProcessor processor(context, 0);
@@ -16486,6 +16489,7 @@ public:
       const auto late_before = totals.late_fallbacks.load();
       const auto mismatches_before = totals.verify_mismatches.load();
       const auto reused_before = totals.acquire_reused.load();
+      const auto partial_before = totals.partial_pushes.load();
       clear();
       stream(0);
       rewrite(1);
@@ -16494,6 +16498,7 @@ public:
       late = totals.late_fallbacks.load() - late_before;
       mismatches = totals.verify_mismatches.load() - mismatches_before;
       reused = totals.acquire_reused.load() - reused_before;
+      partial = totals.partial_pushes.load() - partial_before;
       Require(name, "serial and command-processor run draws", read() == serial,
               "the command processor's draws differ from the serial draws (continued " +
                   std::to_string(continued) + ", late fallbacks " + std::to_string(late) + ")");
@@ -16512,14 +16517,21 @@ public:
         const uint64_t want_reused = !DrawRun::AcquireReuseEnabled() || !alternate_samplers
                                          ? 0
                                          : 2 * (draws_per_stream - 1);
+        // KYTY_DRAW_RUN_PUSH: every continuation but the late fallback pushes only its per-draw
+        // descriptors (verify mode: would have).
+        const uint64_t want_partial =
+            DrawRun::PushPartialEnabled() ? want_continued - want_late : 0;
         Require(name, "continuations",
-                continued == want_continued && late == want_late && reused == want_reused,
+                continued == want_continued && late == want_late && reused == want_reused &&
+                    partial == want_partial,
                 "continued " + std::to_string(continued) + ", late fallbacks " +
                     std::to_string(late) + ", acquisitions reused " + std::to_string(reused) +
-                    "; expected " + std::to_string(want_continued) + ", " +
-                    std::to_string(want_late) + " and " + std::to_string(want_reused));
+                    ", partial pushes " + std::to_string(partial) + "; expected " +
+                    std::to_string(want_continued) + ", " + std::to_string(want_late) + ", " +
+                    std::to_string(want_reused) + " and " + std::to_string(want_partial));
       } else {
-        Require(name, "no run without the switch", continued == 0 && late == 0 && reused == 0,
+        Require(name, "no run without the switch",
+                continued == 0 && late == 0 && reused == 0 && partial == 0,
                 "the run bookkeeping ran without KYTY_DRAW_RUN");
       }
       RenderExecutorTestAccess::ResetBindings(executor);
@@ -16535,13 +16547,13 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
             "draw-run allocation release failed");
     std::printf("[gpu]     %-32s ok (mode %s, continued %llu, late fallbacks %llu, acquisitions "
-                "reused %llu, verify checks %llu)\n",
+                "reused %llu, partial pushes %llu, verify checks %llu)\n",
                 name,
                 DrawRun::GetMode() == DrawRun::Mode::Off
                     ? "off"
                     : (DrawRun::GetMode() == DrawRun::Mode::Verify ? "verify" : "on"),
                 static_cast<unsigned long long>(continued), static_cast<unsigned long long>(late),
-                static_cast<unsigned long long>(reused),
+                static_cast<unsigned long long>(reused), static_cast<unsigned long long>(partial),
                 static_cast<unsigned long long>(DrawRun::GetTotals().verify_checks.load()));
   }
 

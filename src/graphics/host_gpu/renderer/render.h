@@ -310,6 +310,14 @@ public:
 	                        uint32_t count, const vk::WriteDescriptorSet* writes,
 	                        bool known_miss = false);
 	void InvalidateDescriptors(vk::PipelineBindPoint point);
+	// Advances whenever a descriptor command is recorded for the bind point (a push or a set bind),
+	// its state is forgotten, or the command buffer begins. Unchanged since a push: the descriptors
+	// it pushed are still in effect (descriptor commands go through this class only, see
+	// BindDescriptorSet), so a later push with the same layout may update them incrementally
+	// (KYTY_DRAW_RUN_PUSH).
+	[[nodiscard]] uint64_t DescriptorEpoch(vk::PipelineBindPoint point) const {
+		return m_descriptor_epochs[point == vk::PipelineBindPoint::eCompute ? 1u : 0u];
+	}
 	// Binds `set` as set 0 unless it is still the set bound there with this layout
 	// (KYTY_DESCRIPTOR_SET_REUSE). Bound sets are disturbed only by another bind or a push
 	// descriptor update of set 0 at that bind point, both of which go through this class.
@@ -416,6 +424,7 @@ private:
 		std::vector<vk::DescriptorImageInfo> images;
 	};
 	std::array<DescriptorState, 2> m_descriptor_states;
+	std::array<uint64_t, 2>        m_descriptor_epochs {};
 	struct PushConstantShadow {
 		bool                     valid  = false;
 		vk::PipelineLayout       layout = nullptr;
@@ -1235,9 +1244,14 @@ private:
 		std::vector<RenderDepthInfo> depth;
 		vk::Rect2D                   written {};
 		bool                         bounded = false;
+		// KYTY_DRAW_RUN_PUSH: the graphics descriptor epoch after the draw's push, and its layout.
+		uint64_t           push_epoch  = 0;
+		vk::PipelineLayout push_layout = nullptr;
+		bool               push_valid  = false; // pushed (not a descriptor set)
 		// Verify mode: what the normal path must reproduce for a continuation.
-		std::vector<TextureBinding> textures;
-		std::vector<vk::Sampler>    samplers;
+		std::vector<TextureBinding>          textures;
+		std::vector<vk::Sampler>             samplers;
+		std::vector<vk::DescriptorImageInfo> pushed_images; // image and sampler descriptors
 	};
 	// DrawIndex/DrawAuto under the render mutex: the previous run's validity is taken for this draw,
 	// and a draw the draw-prep engine does not commit counts as other command-processor work.
@@ -1273,7 +1287,12 @@ private:
 	// written: the scissor union the attachments were acquired for (null: unbounded claims).
 	void DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRenderState& state,
 	                       uint32_t render_target_slice_offset, const RenderState& rendering,
-	                       std::span<PreparedBindings* const> stages, const vk::Rect2D* written);
+	                       std::span<PreparedBindings* const> stages, const vk::Rect2D* written,
+	                       const PipelineCache::Pipeline& pipeline);
+	// KYTY_DRAW_RUN_PUSH: whether a continuation's CommitBindings may push only its per-draw
+	// descriptors (the previous draw's image and sampler descriptors still in effect).
+	[[nodiscard]] bool DrawRunPartialPush(const CommandBuffer&           buffer,
+	                                      const PipelineCache::Pipeline& pipeline) const;
 	void DrawRunVerify(const DrawRenderState& state, const RenderState& rendering,
 	                   vk::ImageAspectFlags feedback_aspects,
 	                   std::span<PreparedBindings* const> stages);

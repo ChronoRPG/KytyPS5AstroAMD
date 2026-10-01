@@ -91,9 +91,22 @@ namespace Detail {
 // changed no attachment state.
 namespace Detail {
 [[nodiscard]] bool ReadAcquire();
+[[nodiscard]] bool ReadPush();
 } // namespace Detail
 [[nodiscard]] inline bool AcquireReuseEnabled() {
 	static const bool enabled = Detail::ReadAcquire();
+	return enabled;
+}
+
+// KYTY_DRAW_RUN_PUSH=1 (default 0; with KYTY_DRAW_RUN=1 or verify): a continuation pushes only its
+// per-draw descriptors (buffers, shader data, flattened SRT, BDA, GDS, mip statistics); its image
+// and sampler descriptors are the previous draw's, still in effect: the same pipeline layout, and
+// no descriptor command recorded at the graphics bind point since that draw's push
+// (CommandBuffer::DescriptorEpoch; push descriptors may be updated incrementally until the set is
+// disturbed). Verify mode checks that the image and sampler descriptors the normal path pushes for
+// a would-be continuation are the previous draw's.
+[[nodiscard]] inline bool PushPartialEnabled() {
+	static const bool enabled = Detail::ReadPush();
 	return enabled;
 }
 
@@ -129,6 +142,7 @@ struct Totals {
 	std::atomic<uint64_t> dynamic_emitted {0}; // continuation whose dynamic state was recorded again
 	std::atomic<uint64_t> alias_excluded {0};  // eligible, but a texture lies over an attachment
 	std::atomic<uint64_t> acquire_reused {0};  // KYTY_DRAW_RUN_ACQUIRE (verify: would have)
+	std::atomic<uint64_t> partial_pushes {0};  // KYTY_DRAW_RUN_PUSH (verify: would have)
 	std::atomic<uint64_t> verify_checks {0};
 	std::atomic<uint64_t> verify_mismatches {0};
 	std::atomic<uint64_t> misses[static_cast<uint32_t>(Miss::Count)] {};

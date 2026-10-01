@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/lodStats.h"
@@ -2209,6 +2210,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_descriptor_buffers.reserve(descriptor_count);
 	m_descriptor_images.reserve(descriptor_count);
 	m_descriptor_writes.reserve(write_count);
+	// KYTY_DRAW_RUN_PUSH: a continuation pushes only its per-draw descriptors; its image and sampler
+	// descriptors are the previous draw's, still in effect (RenderExecutor::DrawRunPartialPush).
+	const bool partial = keep_images && pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
+	                     DrawRunPartialPush(buffer, pipeline);
+	if (partial) {
+		DrawRun::GetTotals().partial_pushes.fetch_add(1, std::memory_order_relaxed);
+	}
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = *prepared->runtime->program;
@@ -2301,6 +2309,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 
 		m_image_occurrences.assign(descriptors.images.size(), 0);
 		for (const auto& binding: program.bindings.descriptors) {
+			if (partial && (binding.kind == BindingKind::Samplers ||
+			                ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) !=
+			                    ShaderRecompiler::IR::ImageResourceClass::None)) {
+				continue;
+			}
 			vk::WriteDescriptorSet write {};
 			write.dstBinding     = ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind);
 			write.descriptorType = NativeDescriptorType(binding.kind);
@@ -2371,7 +2384,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			m_descriptor_writes.push_back(write);
 		}
-		for (uint32_t i = 0; i < descriptors.images.size(); i++) {
+		for (uint32_t i = 0; !partial && i < descriptors.images.size(); i++) {
 			const auto expected =
 			    descriptors.images[i].mip_views.empty()
 			        ? 1u

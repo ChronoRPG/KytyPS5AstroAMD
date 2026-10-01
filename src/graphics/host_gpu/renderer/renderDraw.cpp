@@ -2375,23 +2375,35 @@ bool RenderExecutor::DrawRunAcquireCandidate(const CommandBuffer&               
 	return DrawRunImagesUnchanged(true, true);
 }
 
+bool RenderExecutor::DrawRunPartialPush(const CommandBuffer&           buffer,
+                                        const PipelineCache::Pipeline& pipeline) const {
+	return DrawRun::PushPartialEnabled() && pipeline.uses_push_descriptors && m_run.push_valid &&
+	       m_run.push_layout == pipeline.pipeline_layout &&
+	       buffer.DescriptorEpoch(vk::PipelineBindPoint::eGraphics) == m_run.push_epoch;
+}
+
 // After an eligible draw was recorded: what a continuation of it may reuse, and its certificate.
 void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRenderState& state,
                                        uint32_t render_target_slice_offset,
                                        const RenderState& rendering,
                                        std::span<PreparedBindings* const> stages,
-                                       const vk::Rect2D*                  written) {
+                                       const vk::Rect2D*                  written,
+                                       const PipelineCache::Pipeline&     pipeline) {
 	auto& run            = m_run;
 	run.key              = m_run_key;
 	run.activity         = DrawRun::ActivityEpoch();
 	run.command          = buffer.Identity();
 	run.tick             = m_context.GetCommandScheduler().CurrentTick();
 	run.rendering_serial = buffer.ActiveRenderingSerial();
+	// The draw's push (whole or partial) is the last descriptor command at the bind point.
+	run.push_epoch = buffer.DescriptorEpoch(vk::PipelineBindPoint::eGraphics);
 	if (m_run_active) {
 		// A continuation changed none of the recorded images, targets or bindings.
 		run.valid = true;
 		return;
 	}
+	run.push_valid  = pipeline.uses_push_descriptors;
+	run.push_layout = pipeline.pipeline_layout;
 	run.slice_offset   = render_target_slice_offset;
 	run.vertex_program = state.vertex_info[0].stage.program;
 	run.pixel_program  = state.ps_active ? state.ps_input_info.stage.program : nullptr;
@@ -2430,6 +2442,7 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 		run.written = written != nullptr ? *written : vk::Rect2D {};
 	}
 	if (verify) {
+		run.pushed_images.assign(m_descriptor_images.begin(), m_descriptor_images.end());
 		run.textures.clear();
 		run.samplers.clear();
 		for (const auto* stage: stages) {
@@ -3305,9 +3318,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x300u);
 	}
+	// KYTY_DRAW_RUN_PUSH verify: a would-be continuation that would push only its per-draw
+	// descriptors must push the previous draw's image and sampler descriptors on the normal path.
+	const bool run_verify_push = run_verify_images && DrawRunPartialPush(buffer, pipeline);
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::CommitBindings");
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages, m_run_active);
+	}
+	if (run_verify_push) {
+		DrawRun::GetTotals().partial_pushes.fetch_add(1, std::memory_order_relaxed);
+		DrawRun::CountVerifyCheck();
+		if (m_descriptor_images != m_run.pushed_images) {
+			DrawRun::ReportMismatch("pushed image or sampler descriptors",
+			                        m_descriptor_images.size());
+		}
 	}
 	if (run_verify_images && Image::RecordedTransitions() != run_transitions) {
 		DrawRun::CountVerifyCheck();
@@ -3546,7 +3570,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (eligible) {
 			DrawRun::GetTotals().eligible.fetch_add(1, std::memory_order_relaxed);
 			DrawRunRecordDraw(buffer, state, m_run_slice_offset, rendering, stages,
-			                  bounded ? &written : nullptr);
+			                  bounded ? &written : nullptr, pipeline);
 		}
 	}
 	if (CommitStats::Enabled()) [[unlikely]] {
