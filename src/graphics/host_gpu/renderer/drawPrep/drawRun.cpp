@@ -19,32 +19,21 @@ namespace Libs::Graphics::DrawRun {
 
 namespace Detail {
 
-Mode ReadMode() {
-	const auto* value = std::getenv("KYTY_DRAW_RUN");
+// KYTY_DRAW_RUN: unset, empty, "0", "off": 0; "verify": 2; "exit": 3; anything else: 1.
+static int64_t ParseMode(const char* value) {
 	if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0 ||
 	    std::strcmp(value, "off") == 0) {
-		return Mode::Off;
+		return 0;
 	}
-	if (std::strcmp(value, "verify") == 0 || std::strcmp(value, "exit") == 0) {
-		return Mode::Verify;
+	if (std::strcmp(value, "exit") == 0) {
+		return 3;
 	}
-	return Mode::On;
+	return std::strcmp(value, "verify") == 0 ? 2 : 1;
 }
 
-bool ReadExit() {
-	const auto* value = std::getenv("KYTY_DRAW_RUN");
-	return value != nullptr && std::strcmp(value, "exit") == 0;
-}
-
-bool ReadAcquire() {
-	const auto* value = std::getenv("KYTY_DRAW_RUN_ACQUIRE");
-	return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-}
-
-bool ReadPush() {
-	const auto* value = std::getenv("KYTY_DRAW_RUN_PUSH");
-	return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-}
+Live::Switch g_mode("KYTY_DRAW_RUN", ParseMode);
+Live::Switch g_acquire("KYTY_DRAW_RUN_ACQUIRE", Live::ParseDefaultOff);
+Live::Switch g_push("KYTY_DRAW_RUN_PUSH", Live::ParseDefaultOff);
 
 } // namespace Detail
 

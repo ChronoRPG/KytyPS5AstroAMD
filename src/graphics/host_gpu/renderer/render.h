@@ -1244,6 +1244,10 @@ private:
 		std::vector<RenderDepthInfo> depth;
 		vk::Rect2D                   written {};
 		bool                         bounded = false;
+		// The record stored colors/depth/written (acquisition reuse) and the verify copies (the
+		// flags are live switches: a later draw must not read what an earlier record left).
+		bool acquire_valid = false;
+		bool verify_valid  = false;
 		// KYTY_DRAW_RUN_PUSH: the graphics descriptor epoch after the draw's push, and its layout.
 		uint64_t           push_epoch  = 0;
 		vk::PipelineLayout push_layout = nullptr;

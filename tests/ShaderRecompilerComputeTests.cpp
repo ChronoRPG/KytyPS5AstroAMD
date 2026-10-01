@@ -48264,6 +48264,18 @@ int main(int argc, char **argv) {
     vulkan.CheckDrawRun(true);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--draw-run-live") == 0) {
+    // KYTY_DRAW_RUN* as live switches (ab-testing.md): on through a staged change, then off again.
+    VulkanHarness vulkan;
+    Live::Testing::StageText("KYTY_DRAW_RUN=1\nKYTY_DRAW_RUN_ACQUIRE=1\nKYTY_DRAW_RUN_PUSH=1\n");
+    Live::OnCpFlip();
+    vulkan.CheckDrawRun();
+    vulkan.CheckDrawRun(true);
+    Live::Testing::StageText("KYTY_DRAW_RUN=\nKYTY_DRAW_RUN_ACQUIRE=\nKYTY_DRAW_RUN_PUSH=\n");
+    Live::OnCpFlip();
+    vulkan.CheckDrawRun();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--eop-timestamps-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckEopTimestamps();

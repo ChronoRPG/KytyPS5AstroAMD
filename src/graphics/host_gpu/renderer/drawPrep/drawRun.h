@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_DRAWRUN_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_DRAWRUN_H_
 
+#include "common/liveSwitch.h"
+
 #include <atomic>
 #include <cstdint>
 
@@ -62,22 +64,28 @@ namespace DrawRun {
 
 enum class Mode : uint8_t { Off, On, Verify };
 
+// The three flags are live switches (common/liveSwitch.h; KytyTiming\ab-testing.md): read per use,
+// they may change at a guest flip. Live-safe: the structure key is computed by the preparing thread
+// only while the flag is on (0 otherwise, which never continues), every record is reset by the next
+// draw, and the parts a record holds only under one value (acquisition targets, verify copies) are
+// marked valid only by the record that stored them.
 namespace Detail {
-[[nodiscard]] Mode ReadMode();
-[[nodiscard]] bool ReadExit();
+// KYTY_DRAW_RUN: 0 off, 1 on, 2 verify, 3 verify stopping at the first difference ("exit").
+extern Live::Switch g_mode;
+extern Live::Switch g_acquire; // KYTY_DRAW_RUN_ACQUIRE
+extern Live::Switch g_push;    // KYTY_DRAW_RUN_PUSH
 } // namespace Detail
 
 [[nodiscard]] inline Mode GetMode() {
-	static const Mode mode = Detail::ReadMode();
-	return mode;
+	const auto mode = Detail::g_mode.Get();
+	return mode == 0 ? Mode::Off : (mode == 1 ? Mode::On : Mode::Verify);
 }
 [[nodiscard]] inline bool Enabled() {
-	return GetMode() != Mode::Off;
+	return Detail::g_mode.Get() != 0;
 }
 // verify mode stops at the first difference.
 [[nodiscard]] inline bool VerifyExit() {
-	static const bool exit = Detail::ReadExit();
-	return exit;
+	return Detail::g_mode.Get() == 3;
 }
 
 // KYTY_DRAW_RUN_ACQUIRE=1 (default 0; with KYTY_DRAW_RUN=1 or verify): a committed draw that does
@@ -89,13 +97,8 @@ namespace Detail {
 // textures, samplers, bindings and dynamic state take the normal path. Verify mode runs the
 // acquisition and checks it returned the recorded rendering state, recorded no transition and
 // changed no attachment state.
-namespace Detail {
-[[nodiscard]] bool ReadAcquire();
-[[nodiscard]] bool ReadPush();
-} // namespace Detail
 [[nodiscard]] inline bool AcquireReuseEnabled() {
-	static const bool enabled = Detail::ReadAcquire();
-	return enabled;
+	return Detail::g_acquire.On();
 }
 
 // KYTY_DRAW_RUN_PUSH=1 (default 0; with KYTY_DRAW_RUN=1 or verify): a continuation pushes only its
@@ -106,8 +109,7 @@ namespace Detail {
 // disturbed). Verify mode checks that the image and sampler descriptors the normal path pushes for
 // a would-be continuation are the previous draw's.
 [[nodiscard]] inline bool PushPartialEnabled() {
-	static const bool enabled = Detail::ReadPush();
-	return enabled;
+	return Detail::g_push.On();
 }
 
 // Command-processor work other than committed draws (GPU thread). Relaxed: written and read by the

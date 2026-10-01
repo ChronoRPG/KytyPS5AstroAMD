@@ -2332,7 +2332,7 @@ bool RenderExecutor::DrawRunAcquireCandidate(const CommandBuffer&               
                                              std::span<PreparedBindings* const> stages,
                                              const vk::Rect2D*                  written) const {
 	const auto& run = m_run;
-	if (!m_run_prev_valid || !m_in_engine_commit || run.depth.size() != 1 ||
+	if (!m_run_prev_valid || !m_in_engine_commit || !run.acquire_valid || run.depth.size() != 1 ||
 	    run.colors.size() != run.color_count || state.color_count != run.color_count ||
 	    DrawRun::ActivityEpoch() != run.activity || buffer.Identity() != run.command ||
 	    m_context.GetCommandScheduler().CurrentTick() != run.tick ||
@@ -2435,7 +2435,9 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 		}
 	}
 	const bool verify = DrawRun::GetMode() == DrawRun::Mode::Verify;
-	if (verify || DrawRun::AcquireReuseEnabled()) {
+	run.acquire_valid = verify || DrawRun::AcquireReuseEnabled();
+	run.verify_valid  = verify;
+	if (run.acquire_valid) {
 		run.colors.assign(state.color_info, state.color_info + state.color_count);
 		run.depth.assign(1, state.depth_info);
 		run.bounded = written != nullptr;
@@ -2459,6 +2461,9 @@ void RenderExecutor::DrawRunVerify(const DrawRenderState& state, const RenderSta
                                    vk::ImageAspectFlags               feedback_aspects,
                                    std::span<PreparedBindings* const> stages) {
 	const auto& run = m_run;
+	if (!run.verify_valid) {
+		return; // recorded before verify mode was switched on
+	}
 	DrawRun::CountVerifyCheck();
 	if (state.color_count != run.color_count || state.color_slots_written != run.color_slots ||
 	    run.depth.size() != 1) {
@@ -3320,7 +3325,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	// KYTY_DRAW_RUN_PUSH verify: a would-be continuation that would push only its per-draw
 	// descriptors must push the previous draw's image and sampler descriptors on the normal path.
-	const bool run_verify_push = run_verify_images && DrawRunPartialPush(buffer, pipeline);
+	const bool run_verify_push =
+	    run_verify_images && m_run.verify_valid && DrawRunPartialPush(buffer, pipeline);
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::CommitBindings");
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages, m_run_active);
