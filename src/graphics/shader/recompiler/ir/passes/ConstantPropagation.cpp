@@ -27,6 +27,9 @@ public:
 	static constexpr size_t MaxProduct = 4096;
 	static constexpr int    MaxDepth   = 24;
 
+	// KYTY_MOVREL_KNOWN_ZEROS: equality compares also fold by known zero bits (KnownZeros).
+	bool known_zeros = false;
+
 	Set Of(Value value, int depth = 0) {
 		value = value.Resolve();
 		if (value.IsImmediate()) {
@@ -75,7 +78,99 @@ public:
 		return any_true;
 	}
 
+	// KYTY_MOVREL_KNOWN_ZEROS: bits that are zero in every value a U32 can take, for values whose
+	// set is unknown or too large. A loop counter times 4 (V_MOVRELS with M0 = i << 2) still has
+	// two low zero bits. Under-approximated: a value reached again through a phi cycle, or deeper
+	// than MaxDepth, counts as having none.
+	uint32_t KnownZeros(Value value, int depth = 0) {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			return value.GetType() == Type::U32 ? ~value.U32() : 0u;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->GetType() != Type::U32 || depth > MaxDepth) {
+			return 0u;
+		}
+		if (const auto it = m_zeros.find(inst); it != m_zeros.end()) {
+			return it->second;
+		}
+		if (!m_zeros_active.insert(inst).second) {
+			return 0u; // A cycle through phis: nothing is known along it.
+		}
+		const auto zeros = ComputeZeros(*inst, depth + 1);
+		m_zeros_active.erase(inst);
+		m_zeros.emplace(inst, zeros);
+		return zeros;
+	}
+
 private:
+	static constexpr uint32_t LowMask(uint32_t bits) {
+		return bits >= 32u ? UINT32_MAX : (uint32_t {1} << bits) - 1u;
+	}
+
+	uint32_t ComputeZeros(const Inst& inst, int depth) {
+		const auto zeros = [&](size_t index) { return KnownZeros(inst.Arg(index), depth); };
+		// Low bits known zero.
+		const auto trailing = [&](size_t index) {
+			return static_cast<uint32_t>(std::countr_one(zeros(index)));
+		};
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::BitwiseAnd32: return zeros(0) | zeros(1);
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitwiseXor32: return zeros(0) & zeros(1);
+			case ValueOpcode::ShiftLeftLogical32:
+			case ValueOpcode::ShiftRightLogical32: {
+				const auto shift = inst.Arg(1).Resolve();
+				if (!shift.IsImmediate() || shift.GetType() != Type::U32) {
+					return 0u;
+				}
+				const auto amount = shift.U32() & 31u;
+				const auto source = zeros(0);
+				return inst.GetOpcode() == ValueOpcode::ShiftLeftLogical32
+				           ? (source << amount) | LowMask(amount)
+				           : (source >> amount) | ~(UINT32_MAX >> amount);
+			}
+			// Modulo 2^32 a product has at least the sum of its factors' low zero bits, and a sum or
+			// difference at least the fewer of its operands'.
+			case ValueOpcode::IMul32: return LowMask(std::min(32u, trailing(0) + trailing(1)));
+			case ValueOpcode::IAdd32:
+			case ValueOpcode::ISub32: return LowMask(std::min(trailing(0), trailing(1)));
+			case ValueOpcode::BitFieldUExtract: {
+				const auto offset = inst.Arg(1).Resolve();
+				const auto count  = inst.Arg(2).Resolve();
+				if (!offset.IsImmediate() || !count.IsImmediate() || offset.GetType() != Type::U32 ||
+				    count.GetType() != Type::U32 || offset.U32() > 32u ||
+				    count.U32() > 32u - offset.U32()) {
+					return 0u;
+				}
+				const auto field  = LowMask(count.U32());
+				const auto source = offset.U32() == 32u ? UINT32_MAX : zeros(0) >> offset.U32();
+				return ~field | (source & field);
+			}
+			// Zero extensions.
+			case ValueOpcode::ConvertU32U16: return 0xffff0000u;
+			case ValueOpcode::ConvertU32U8: return 0xffffff00u;
+			// One lane's value of the source (a waterfall loop's key): the source's bits hold for it.
+			case ValueOpcode::ReadFirstLane:
+			case ValueOpcode::ReadLane: return zeros(0);
+			// One of the operands.
+			case ValueOpcode::UMin32:
+			case ValueOpcode::UMax32: return zeros(0) & zeros(1);
+			case ValueOpcode::SelectU32: return zeros(1) & zeros(2);
+			case ValueOpcode::Phi: {
+				uint32_t result = UINT32_MAX;
+				for (size_t index = 0; index < inst.NumArgs() && result != 0u; index++) {
+					if (inst.Arg(index).Resolve().TryInstruction() == &inst) {
+						continue;
+					}
+					result &= zeros(index);
+				}
+				return result;
+			}
+			default: return 0u;
+		}
+	}
+
 	static Set Normalize(std::vector<uint32_t> values) {
 		std::sort(values.begin(), values.end());
 		values.erase(std::unique(values.begin(), values.end()), values.end());
@@ -212,8 +307,10 @@ private:
 		}
 	}
 
-	std::unordered_map<const Inst*, Set> m_memo;
-	std::unordered_set<const Inst*>      m_active;
+	std::unordered_map<const Inst*, Set>      m_memo;
+	std::unordered_set<const Inst*>           m_active;
+	std::unordered_map<const Inst*, uint32_t> m_zeros;
+	std::unordered_set<const Inst*>           m_zeros_active;
 };
 
 Value Arg(const Inst& inst, size_t index) {
@@ -408,6 +505,25 @@ void FoldU32CompareBySets(Inst& inst, ValueSetAnalysis* sets, Predicate predicat
 	}
 	if (const auto result = sets->Compare(Arg(inst, 0), Arg(inst, 1), predicate)) {
 		Replace(inst, Value(*result));
+	}
+}
+
+// KYTY_MOVREL_KNOWN_ZEROS: x == C (x != C) folds to false (true) when C sets a bit that x never
+// has. Tried after the value sets, which fold more when x's set is known.
+void FoldEqualityByKnownZeros(Inst& inst, ValueSetAnalysis* sets, ValueOpcode opcode) {
+	if (sets == nullptr || !sets->known_zeros || inst.GetOpcode() != opcode) {
+		return; // Disabled, or already folded (the instruction became an identity).
+	}
+	auto value    = Arg(inst, 0);
+	auto constant = Arg(inst, 1);
+	if (IsImmediate(value, Type::U32)) {
+		std::swap(value, constant);
+	}
+	if (!IsImmediate(constant, Type::U32) || IsImmediate(value, Type::U32)) {
+		return;
+	}
+	if ((constant.U32() & sets->KnownZeros(value)) != 0u) {
+		Replace(inst, Value(opcode == ValueOpcode::INotEqual32));
 	}
 }
 
@@ -783,9 +899,11 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			return;
 		case ValueOpcode::IEqual32:
 			FoldU32CompareBySets(inst, sets, [](uint32_t a, uint32_t b) { return a == b; });
+			FoldEqualityByKnownZeros(inst, sets, ValueOpcode::IEqual32);
 			return;
 		case ValueOpcode::INotEqual32:
 			FoldU32CompareBySets(inst, sets, [](uint32_t a, uint32_t b) { return a != b; });
+			FoldEqualityByKnownZeros(inst, sets, ValueOpcode::INotEqual32);
 			return;
 		case ValueOpcode::ULessThan32:
 			FoldU32CompareBySets(inst, sets, [](uint32_t a, uint32_t b) { return a < b; });
@@ -900,6 +1018,7 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 void ConstantPropagationPass(const BlockList& blocks) {
 	std::unordered_set<Inst*> lowered_ancillary;
 	ValueSetAnalysis          value_sets;
+	value_sets.known_zeros = GetCodegenOptions().movrel_known_zeros;
 	auto* sets = GetCodegenOptions().movrel_range ? &value_sets : nullptr;
 	for (auto* block: blocks) {
 		for (auto inst = block->begin(); inst != block->end(); ++inst) {

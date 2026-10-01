@@ -70,7 +70,9 @@ struct SpirvRequirements {
 	// A pixel shader's DS_APPEND/DS_CONSUME elect a non-helper lane (KYTY_PS_APPEND_LIVE_ELECTION).
 	bool helper_invocation            = false;
 	bool buffer_int64_atomics         = false;
+	bool shared_int64_atomics         = false;
 	bool coherent_buffers             = false;
+	bool float64                      = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
@@ -107,6 +109,7 @@ struct EmitterState {
 	bool                                             mip_stats_records            = true;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
+	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
 	uint32_t                   sampler_variable                      = 0;
@@ -143,6 +146,13 @@ struct EmitterState {
 	// Pixel inputs whose V_INTERP_P2 reads were all resolved to hardware I/J pairs of one
 	// perspective mode (KYTY_INTERP_MODES): variable -> sampling location its decoration selects.
 	std::unordered_map<uint32_t, IR::InterpolationMode> input_interpolation;
+	// KYTY_MOVREL_SWITCH: long select(index == constant, ...) chains (V_MOVRELS reads) become one
+	// OpSwitch at their outermost select; their inner selects emit nothing (EmitIndexedSelect),
+	// found on first use.
+	bool                                indexed_selects_found = false;
+	std::unordered_set<const IR::Inst*> indexed_select_heads;
+	std::unordered_set<const IR::Inst*> indexed_select_members;
+	std::unordered_set<const IR::Inst*> indexed_select_compares;
 };
 
 uint32_t TypeVoid(EmitterState& state);
@@ -155,6 +165,7 @@ uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
 uint32_t TypeF32(EmitterState& state);
+uint32_t TypeF64(EmitterState& state);
 uint32_t TypeU32Vector(EmitterState& state, uint32_t components);
 
 uint32_t TypeU32Composite(EmitterState& state, uint32_t components);
@@ -185,6 +196,10 @@ template <spv::Op opcode, IR::Type type, typename... Args>
 uint32_t EmitNative(EmitterState& state, Args... args) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(opcode, TypeId(state, type), result, args...);
+	if constexpr (type == IR::Type::F64 &&
+	              (opcode == spv::OpFMul || opcode == spv::OpFDiv || opcode == spv::OpExtInst)) {
+		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	}
 	return result;
 }
 
@@ -392,6 +407,7 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
+void EnsureLdsStorage(EmitterState& state);
 
 struct MemoryResourceAccess {
 	IR::ResourceKind      kind             = IR::ResourceKind::None;

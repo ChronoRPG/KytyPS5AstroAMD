@@ -38,6 +38,26 @@ struct CodegenOptions {
 	// KYTY_MOVREL_RANGE=0: keep V_MOVRELS/V_MOVRELD select chains over every VGPR above the base
 	// instead of folding the compares that the M0 value set proves false.
 	bool movrel_range = true;
+	// KYTY_MOVREL_KNOWN_ZEROS=1 (default off): with movrel_range, a V_MOVRELS/V_MOVRELD compare of M0
+	// against a register offset that sets a bit M0 never has also folds when M0's value set is
+	// unknown. Known zero bits pass through shifts by constants, masks, sums, products, bit-field
+	// extracts, selects, phis and lane reads: M0 = loop counter << 2 (Astro Bot's foliage vertex
+	// shaders) leaves every fourth register of each chain. Exact.
+	bool movrel_known_zeros = false;
+	// KYTY_MOVREL_SWITCH=1 (default off): a V_MOVRELS select chain of 16 or more links is emitted as
+	// an OpSwitch on M0 / 16 whose cases hold the select chains of their 16 index values. M0 is
+	// uniform, so the host runs one short chain instead of a select per register. Exact.
+	bool movrel_switch = false;
+	// KYTY_UNIFORM_LANE_READS=1 (default off): the shuffle result of V_READFIRSTLANE/V_READLANE
+	// (every lane already holds the same value) passes through OpGroupNonUniformBroadcastFirst,
+	// which returns it unchanged but lets the host compiler treat it and everything derived from
+	// it (a waterfall loop's key, addresses, loop exits) as uniform. Exact.
+	bool uniform_lane_reads = false;
+	// KYTY_SHORT_F32_HELPERS=1 (default off): NaN tests are one OpIsNan instead of exponent and
+	// mantissa tests (float-to-int conversions, the legacy min/max/med3, float atomics). Exact.
+	// (Bryan's companion change, dropping the sin/cos |x| >= 2^23 select, is not exact on the RTX
+	// 3090 and is not applied.)
+	bool short_f32_helpers = false;
 	// KYTY_FAST_FMINMAX=0: emulate f32 min/max/min3/max3/med3 with two bit classifications per
 	// min/max instead of one compare-and-select plus a single two-zeros test.
 	bool fast_float_min_max = true;

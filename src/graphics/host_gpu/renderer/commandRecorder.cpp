@@ -435,6 +435,11 @@ struct CommandRecorder::NativeExecutor {
 		command.bindDescriptorSets(point, layout, first_set, set_count, sets, dynamic_count,
 		                           dynamic_offsets);
 	}
+	// KYTY_RECORDER_DESCRIPTOR_SETS: the CP allocated the set and binds it in a later packet.
+	void updateDescriptorSets(vk::DescriptorSet /*set*/, uint32_t count,
+	                          const vk::WriteDescriptorSet* writes) {
+		owner.m_graphics.device.updateDescriptorSets(count, writes, 0, nullptr);
+	}
 	void pushDescriptorSetKHR(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
 	                          uint32_t count, const vk::WriteDescriptorSet* writes) {
 		command.pushDescriptorSetKHR(point, layout, set, count, writes);

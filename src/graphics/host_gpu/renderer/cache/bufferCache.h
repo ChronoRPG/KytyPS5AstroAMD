@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/writeTickMap.h"
 
 #include <atomic>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -199,6 +200,9 @@ public:
 	// Map/unmap callers may run outside the GPU thread, under the mapped-range lock.
 	void               InvalidateBdaSynchronization() noexcept;
 	void               RunGarbageCollector();
+	// KYTY_VRAM_STATS report lines (vramStats.h): guest buffers by age, the largest buffers of
+	// every kind, the guest address span they cover, the GC thresholds (GPU thread).
+	void               ReportVram();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -397,9 +401,11 @@ private:
 		BindingMemoKind kind = BindingMemoKind::Empty;
 	};
 	static constexpr size_t BindingMemoSlots = 2048;
+	// KYTY_CP_COMMIT=bindslots: 32,768 slots, indexed by the hash's top 15 bits (11 above).
+	static constexpr size_t BindingMemoSlotsLarge = 32768;
 	[[nodiscard]] BindingMemo& BindingMemoSlot(uint64_t vaddr, uint64_t size) noexcept {
 		const auto hash = (vaddr >> 4u) * 0x9e3779b97f4a7c15ull ^ size * 0xc2b2ae3d27d4eb4full;
-		return m_binding_memo[static_cast<size_t>(hash >> 53u) & (BindingMemoSlots - 1)];
+		return m_binding_memo[static_cast<size_t>(hash >> m_binding_memo_shift)];
 	}
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainReadBinding(uint64_t vaddr, uint64_t size,
 	                                                             BufferId id);
@@ -538,6 +544,14 @@ private:
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;
+	// KYTY_BDA_PAGETABLE_SPARSE (GraphicContext::sparse_residency_buffer_enabled): the BDA page
+	// table is a sparse residency buffer. Its blocks get zeroed memory, bound before any entry in
+	// them is written (EnsureBdaTableResident, before ChangeRegister's write); an unbound block
+	// reads as zero, as the dense table's unwritten entries do. Declared before the table so that
+	// the memory is freed after the buffer is destroyed. Null for the dense table.
+	struct SparsePageTable;
+	std::unique_ptr<SparsePageTable>                  m_bda_sparse;
+	void EnsureBdaTableResident(uint64_t first_page, uint64_t page_count);
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
@@ -614,6 +628,7 @@ private:
 	bool                                              m_relaxed_queries = false;
 	// KYTY_BINDING_EPOCH_MEMO (nullptr when disabled; GPU thread) and its outcomes (tests read them).
 	std::unique_ptr<BindingMemo[]>                    m_binding_memo;
+	uint32_t                                          m_binding_memo_shift = 53; // 64 - log2(slots)
 	int                                               m_binding_memo_verify = 0;
 	bool                                              m_binding_memo_cross  = false;
 	struct BindingMemoTotals {
@@ -689,9 +704,15 @@ private:
 	uint64_t m_bda_synced_epoch      = 0;
 	uint64_t m_bda_synced_structure  = 0;
 	uint64_t m_bda_synced_fault      = 0;
+	// KYTY_BDA_SYNC_PER_SUBMISSION (default off): the guest submission (SyncEpoch::
+	// CurrentSubmission) taken before the last completed pass; later passes of that submission
+	// are skipped while the structure epoch holds.
+	bool     m_bda_submission_skip   = false;
+	uint64_t m_bda_synced_submission = 0;
 	struct BdaEpochTotals {
 		uint64_t passes                = 0;
 		uint64_t skips                 = 0;
+		uint64_t submission_skips      = 0;
 		uint64_t verify_checks         = 0;
 		uint64_t verify_mismatch_pages = 0;
 	};
@@ -703,6 +724,21 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
+	// KYTY_VRAM_IDLE_BUFFER_FRAMES=N (default 0: off; see TextureCache's KYTY_VRAM_IDLE_FRAMES):
+	// once every 32 frames, cache buffers unused for more than N presented frames without GPU-dirty
+	// bytes are untracked and deleted, as the collector below deletes them, whatever the memory
+	// usage. A later use recreates the buffer and uploads the guest bytes. Caution: a buffer only
+	// shaders' BDA pointers read is never touched (no binding), so it looks unused while it is not.
+	// KYTY_VRAM_PRESSURE_BUFFER_FRAMES=K: the same with K frames replaces the submission-age
+	// collection above the trigger. m_frame_ticks: the GC tick each recent frame began at.
+	void                                              RetireUnusedBuffers(uint64_t frame, uint64_t min_age);
+	uint64_t                                          m_idle_frames      = 0;
+	uint64_t                                          m_idle_next_frame  = 0;
+	uint64_t                                          m_idle_freed       = 0;
+	uint64_t                                          m_idle_freed_bytes = 0;
+	uint64_t                                          m_pressure_frames  = 0;
+	uint64_t                                          m_pressure_frame   = 0;
+	std::deque<std::pair<uint64_t, uint64_t>>         m_frame_ticks;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;

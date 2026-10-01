@@ -64,6 +64,8 @@ public:
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
 	void               RunGarbageCollector();
+	// KYTY_VRAM_STATS (vramStats.h): one GPU memory report (GPU thread).
+	void               ReportVram();
 
 	// Detectors for guest-memory changes resource tracking does not see. They only count
 	// (FrameEvent.HostBackingWrite*, GuestProtect*) and log the first occurrences to stderr.

@@ -216,6 +216,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	SpirvRequirements requirements {};
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
+			requirements.float64 |= inst.GetType() == IR::Type::F64;
 			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
 			    inst.GetType() == IR::Type::U64) {
 				requirements.buffer_int64_atomics = true;
@@ -266,6 +267,12 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				const auto kind = program.memory_info[index].kind;
 				if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
 					Fail(program, "shared operation has invalid resource kind");
+				}
+				if (inst.GetOpcode() == IR::ValueOpcode::SharedAtomicOr64) {
+					if (kind != IR::ResourceKind::Lds || program.stage != ShaderType::Compute) {
+						Fail(program, "64-bit shared atomics require compute LDS");
+					}
+					requirements.shared_int64_atomics = true;
 				}
 				if (program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh &&
 				    kind == IR::ResourceKind::Lds) {

@@ -702,8 +702,18 @@ void CommandBuffer::PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlag
 
 int32_t CommandBuffer::PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout,
                                        uint32_t set, uint32_t count,
-                                       const vk::WriteDescriptorSet* writes) {
+                                       const vk::WriteDescriptorSet* writes, bool known_miss) {
 	auto& state = m_descriptor_states[BindingPointIndex(point)];
+	if (known_miss) {
+		// The comparison below could only miss. No copy is kept for the next update either: one
+		// equal to this (its upload deduplicated to the same range) is then recorded again, which
+		// is only redundant; the Sky Garden start avoids no push at all (DescriptorPushesAvoided).
+		StateSink().pushDescriptorSetKHR(point, layout, set, count, writes);
+		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushes);
+		state.layout    = nullptr;
+		state.bound_set = nullptr;
+		return PushMissFresh;
+	}
 	bool supported = Common::RendererBatchEnabled() && set == 0;
 	size_t buffer_count = 0, image_count = 0;
 	for (uint32_t i = 0; supported && i < count; ++i) {

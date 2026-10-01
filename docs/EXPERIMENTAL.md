@@ -1,53 +1,66 @@
-# Building and launching U59
+# U59 integration release (Windows x64)
 
-The `u59` tag and the existing Windows release tags still identify the original
-sanitized U59 checkpoint. No U60 renderer changes are included.
+This release builds on the U59 renderer and the Demon's Souls changes of the previous U59 release.
 
-Follow the Windows requirements in [README](../README.md#build-requirements-windows):
-Git, Visual Studio C++ tools, clang-cl, Ninja, CMake, Qt 6 for MSVC and glslangValidator.
-Clone recursively, or initialize dependencies with `git submodule update --init --recursive`.
-Configure Release in an x64 Visual Studio developer shell using the documented Qt path;
-add `-DKYTY_EMULATOR_IPO=ON` to match the optimized experimental configuration.
-Build `launcher` and install to `_Build/windows/install` using the README commands.
+## What is new
 
-For a source build, copy `tools/u59-preset.json` beside the installed
-`launcher.exe`, then open `launcher.exe` directly. Release archives already
-include this preset. No launch script is required.
+- Command-processor work, behind flags that the bundled `u59-preset.json` turns on:
+  - a fix for draw-preparation workers that stopped waking (`KYTY_DRAW_PREP_COLD_TOKEN`);
+  - cheaper per-draw commits (`KYTY_CP_COMMIT=all`);
+  - descriptor sets written on the recorder thread, push-descriptor and metadata-clear memos, and fewer GPU progress
+    queries (`KYTY_RECORDER_DESCRIPTOR_SETS`, `KYTY_PUSH_SHADOW_FRESH_SKIP`, `KYTY_META_CLEAR_MEMO`,
+    `KYTY_PENDING_REFRESH_US`).
+- Lower VRAM use, also behind preset flags:
+  - sparse residency for partially resident textures and for the BDA page table;
+  - idle limits for the native image pool and the tiler scratch pool;
+  - images unused for 600 frames are freed.
+- `kyty_emulator.exe` is built with profile-guided optimization (PGO). The profile was recorded in Astro Bot
+  (`tools/pgo/`).
+- Upstream KytyPS5 changes up to the merge: controller, audio and compatibility fixes, and the layered VideoOut
+  presenter.
 
-`tools/u59-preset.json` contains the portable no-diagnostics U59 renderer environment.
-The five optional features are enabled: CP recorder, program cache, draw-prep binding
-plans, DCC GPU refresh and CP sequencer. Shader metadata backing reads are off and
-label mode is `record`, matching the selected U59 configuration. Failure diagnostics
-are off for clean timing; they are distinct from the renderer settings.
+## Measured
 
-Set game paths and runtime options in the launcher. For the recorded U59 baseline,
-use 1920x1080, 60 Hz, Mailbox; disable Tracy, RenderDoc, Vulkan/shader validation and
-shader logging. The launcher does not rewrite the shared INI or remove external
-capture layers. The bundled preset isolates its child from inherited KYTY/TRACY environment settings and
-does not impose machine-specific CPU affinity. Use a separate runtime for experiments
-and preserve saves/caches. The clean baseline used compatibility patches selecting
-non-tiled deferred lighting and disabling GI probes/lighting shaders; these game
-patch files are not distributed here.
+Astro Bot (PPSA21567), Sky Garden start view; RTX 3090, Ryzen 9 7950X3D; 1920x1080 output at a 120 Hz vblank.
+These are separate timed runs on one PC, with the U59 renderer settings plus the bundle flags that the preset adds.
 
-The Windows release archive is built from this experimental `main` and includes a portable
-launcher. After extracting it, open `launcher.exe` directly. When `u59-preset.json`
-is beside the executable, the launcher applies the no-diagnostics environment
-automatically. The archive
-contains no `Kyty.ini`, so the launcher uses its normal
-shared settings file at `C:\ProgramData\Kyty\Kyty.ini`. Existing game directories and
-per-game settings remain available. If an older U59 archive left a `Kyty.ini` beside
-the launcher, move that file aside before launching to use the shared settings.
-Users without shared settings should configure
-resolution, validation and other options in the launcher. No game files, saves,
-caches or patches are distributed. Retained source and
-dependency pins were compared with U59; documentation preparation does not constitute
-a fresh full test run. Historical test/results and their limitations are described
-in [CHANGES-U59.md](CHANGES-U59.md). Check both normal and top-down water before
-accepting a rendering change. Use a clean timing run separately from diagnostics.
+| | Before (earlier U59 test build) | This build |
+|---|---:|---:|
+| Frame rate | 28.2 fps | about 36 fps |
+| Dedicated VRAM | 12.7 GB | 9.7 GB |
 
-The U59 Windows release is produced by a tagged GitHub Actions build. Original
-licenses and credits remain intact. Personal
-handoffs, local editor configuration, captures, saves and caches are excluded;
-sanitizing historical files changes affected commit hashes while preserving commits
-and merge relationships. U60 remains available only in the original local development
-history, not on the published main lineage.
+- The VRAM figure is the mean over the timed minute. A spike to about 13 GB can occur for a moment while the galaxy
+  map streams.
+- Demon's Souls boots to its menu with the preset. Its frame rate with this build was not measured.
+
+## Launching
+
+Extract the archive and open `launcher.exe` directly. When `u59-preset.json` is beside the executable, the launcher
+applies its environment and clears inherited KYTY/TRACY variables. The archive contains no `Kyty.ini`: the launcher uses
+the shared settings file `C:\ProgramData\Kyty\Kyty.ini`, so existing game directories and per-game settings stay
+available. If an older archive left a `Kyty.ini` beside the launcher, move it aside. No game files, saves, caches or
+patches are distributed.
+
+## Caveats
+
+- The first launch of each game compiles its shaders again. Program caches from older builds are not reused, so the
+  first load is slow and the game stutters until the cache fills.
+- The PGO profile comes from Astro Bot only. Other games run with code laid out for Astro Bot.
+- The upstream controller and audio changes were not tested by hand.
+- The preset also sets `KYTY_SRT_VARIANT_READS=1` (needed by Demon's Souls) and `KYTY_CPU_RESERVE=cp`. The Astro Bot
+  measurements above were taken without these two.
+
+## Building from source
+
+Follow the Windows requirements in [README](../README.md#build-requirements-windows) and clone recursively. Configure
+Release with Ninja in an x64 Visual Studio developer shell, as in `.github/workflows/u59-windows-release.yml`:
+
+- Use clang-cl, lld-link and llvm-lib from LLVM 22.1.3: the profile needs the compiler version that recorded it.
+- Add `-DKYTY_EMULATOR_IPO=ON` and `-DKYTY_PGO_USE=<checkout>/tools/pgo/u59-int-up-sg-1.profdata`. Without
+  `KYTY_PGO_USE` the build works, but without the profile's speedup.
+- Build `launcher` and `kyty_emulator`, install to `_Build/windows/install`, and copy `tools/u59-preset.json` beside
+  `launcher.exe`.
+
+The Windows release is produced by a tagged GitHub Actions build. Original licenses and credits remain intact.
+Personal handoffs, local editor configuration, captures, saves and caches are excluded. Historical results and their
+limitations are described in [CHANGES-U59.md](CHANGES-U59.md).

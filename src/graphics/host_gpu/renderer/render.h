@@ -302,8 +302,13 @@ public:
 	static constexpr int32_t PushAvoided   = -1;
 	static constexpr int32_t PushMissState = -2;
 	static constexpr int32_t PushMissShape = -3;
+	// `known_miss`: the caller knows the update differs from every earlier one of this command
+	// buffer (a descriptor refers to an upload made for this command, KYTY_PUSH_SHADOW_FRESH_SKIP):
+	// recorded without the comparison and without keeping a copy for the next one.
+	static constexpr int32_t PushMissFresh = -4;
 	int32_t PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
-	                        uint32_t count, const vk::WriteDescriptorSet* writes);
+	                        uint32_t count, const vk::WriteDescriptorSet* writes,
+	                        bool known_miss = false);
 	void InvalidateDescriptors(vk::PipelineBindPoint point);
 	// Binds `set` as set 0 unless it is still the set bound there with this layout
 	// (KYTY_DESCRIPTOR_SET_REUSE). Bound sets are disturbed only by another bind or a push
@@ -564,6 +569,16 @@ public:
 			m_owner->m_encoder->pushDescriptorSetKHR(point, layout, set, count, writes);
 		} else {
 			m_owner->m_buffer.pushDescriptorSetKHR(point, layout, set, count, writes);
+		}
+	}
+	// vkUpdateDescriptorSets of `set` (every write's dstSet): a device call, made at once natively,
+	// or by the recorder thread before the packets encoded after this one (a later bind of the set).
+	void updateDescriptorSets(vk::Device device, vk::DescriptorSet set, uint32_t count,
+	                          const vk::WriteDescriptorSet* writes) const {
+		if (m_owner->Encoding()) {
+			m_owner->m_encoder->updateDescriptorSets(set, count, writes);
+		} else {
+			device.updateDescriptorSets(count, writes, 0, nullptr);
 		}
 	}
 	void pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t offset,
@@ -1126,7 +1141,8 @@ private:
 	// SamplerMemoWays entries, most recently used first (NativeSampler).
 	struct SamplerMemoEntry {
 		std::array<uint32_t, 4> fields {};
-		vk::Sampler             sampler = nullptr;
+		bool                    integer_border = false;
+		vk::Sampler             sampler        = nullptr;
 	};
 	static constexpr uint32_t SamplerMemoWays = 4;
 	std::array<SamplerMemoEntry, 64 * SamplerMemoWays> m_sampler_memo {};

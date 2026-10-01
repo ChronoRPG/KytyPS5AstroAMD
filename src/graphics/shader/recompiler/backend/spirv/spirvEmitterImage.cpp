@@ -1354,7 +1354,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return;
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);
-	if (atomic_opcode != spv::OpNop) {
+	if (image_info.access == IR::ImageAccess::Atomic) {
 		const auto dimension = image.dimension;
 		const auto exec_arg = inst.NumArgs() - 1;
 		ctx.Define(inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, exec_arg), [&]() {
@@ -1374,6 +1374,15 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					                               return op == IR::ValueOpcode::ImageAtomicInc32
 					                                          ? AtomicIncrement(state, old, limit)
 					                                          : AtomicDecrement(state, old, limit);
+				                               });
+			           }
+			           if (op == IR::ValueOpcode::ImageAtomicFMin32 ||
+			               op == IR::ValueOpcode::ImageAtomicFMax32) {
+				           return AtomicUpdate(state, pointer, IR::ResourceKind::Image,
+				                               [&](uint32_t old) {
+					                               return EmitFloatAtomicReplacement(
+					                                   state, old, ctx.Arg(inst, 2),
+					                                   op == IR::ValueOpcode::ImageAtomicFMax32);
 				                               });
 			           }
 			           const auto old = state.builder.AllocateId();

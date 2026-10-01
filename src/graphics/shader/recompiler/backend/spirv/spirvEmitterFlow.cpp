@@ -504,6 +504,11 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (exp.kind == IR::ExportTargetKind::Null || exp.en == 0u) {
 		return;
 	}
+	// Skip dormant color exports after their valid mask; MRT1 is reserved for logical alpha.
+	if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+	    exp.index != 0 && state.input_info.pixel->alpha_blend_source_remap) {
+		return;
+	}
 	EmitIfCondition(state, exec, [&]() {
 		const auto data = ctx.Arg(inst, 0);
 		if (exp.kind == IR::ExportTargetKind::Primitive) {
@@ -544,6 +549,18 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const bool uint_output = MrtOutputMode(state, exp) == 7u;
 		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output);
+		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+		    exp.index == 0 && !uint_output && state.input_info.pixel->alpha_blend_source_remap) {
+			// Broadcast logical alpha before swizzling the primary output.
+			const auto blend_output =
+			    OutputVariableForExport(state, {.kind = IR::ExportTargetKind::Mrt, .index = 1});
+			if (blend_output != 0) {
+				const auto alpha = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpVectorShuffle, vector_type, alpha, value, value,
+				                          3u, 3u, 3u, 3u);
+				state.builder.AddFunction(spv::OpStore, blend_output, alpha);
+			}
+		}
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
 		    exp.index < state.input_info.pixel->target_export_mapping.size()) {
 			const auto mapping = state.input_info.pixel->target_export_mapping[exp.index];
@@ -751,6 +768,24 @@ uint32_t EmitAnyLane(ValueEmitContext& ctx, IR::Value predicate) {
 	return any;
 }
 
+// KYTY_UNIFORM_LANE_READS (from BryanKAdams/KytyPS5 d514872): after a shuffle by a uniform lane
+// every invocation holds the same value, so OpGroupNonUniformBroadcastFirst of it returns it
+// unchanged. It tells the host compiler that the value is uniform: AMD compiles the shuffle alone
+// to ds_bpermute and treats the result, and everything derived from a waterfall loop's key
+// (addresses, scalar loads, loop exits), as per-lane vector work.
+static uint32_t MarkLaneReadUniform(ValueEmitContext& ctx, const IR::Inst& inst,
+                                    uint32_t shuffled) {
+	if (!GetCodegenOptions().uniform_lane_reads) {
+		return shuffled;
+	}
+	auto&      state  = ctx.state;
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBroadcastFirst,
+	                          TypeId(state, inst.Arg(0).GetType()), result,
+	                          ConstantU32(state, spv::ScopeSubgroup), shuffled);
+	return result;
+}
+
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state  = ctx.state;
 	const auto ballot = ctx.Ballot(inst.Arg(1));
@@ -768,11 +803,12 @@ uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto lane = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelect, TypeU32(state), lane, active, first,
 	                          ConstantU32(state, 0));
-	return ctx.Shuffle(inst, 0, lane);
+	return MarkLaneReadUniform(ctx, inst, ctx.Shuffle(inst, 0, lane));
 }
 
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+	// V_READLANE's lane is an SGPR, M0 or a constant, so the shuffle's lane is uniform too.
+	return MarkLaneReadUniform(ctx, inst, ctx.Shuffle(inst, 0, ctx.Arg(inst, 1)));
 }
 
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {

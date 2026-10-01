@@ -638,6 +638,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::EliminateDeadCode(ir.blocks);
 	}
 	LowerTessellationMemory(ir, options);
+	// KYTY_DUMP_STDOUT=1 with the early dump: the decoded ISA and the IR that resource tracking is
+	// about to see go to stdout, so a shader the tracker rejects can still be inspected offline.
+	if (options.dump_ir && options.early_dump && std::getenv("KYTY_DUMP_STDOUT") != nullptr) {
+		std::fputs(decoded_dump.c_str(), stdout);
+		std::fputs(MakeIrDump(CFG::GraphToString(cfg), ir).c_str(), stdout);
+		std::fflush(stdout);
+	}
 	const bool variant_reads = GetCodegenOptions().srt_variant_reads;
 	IR::BuildSrtPlan(ir, variant_reads);
 	IR::EliminateDeadCode(ir.blocks);

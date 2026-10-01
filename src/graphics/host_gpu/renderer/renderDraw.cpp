@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
@@ -1084,9 +1085,12 @@ void RenderExecutor::NoteDepthFeedback(const CommandBuffer& buffer) {
 }
 
 static bool DrawHasActivePixelShader(const CommandBuffer& buffer) {
-	const auto& ctx              = buffer.GetRegisters();
-	const auto& sh_regs          = ctx.GetShaderRegisters();
-	const bool  has_color_output = (ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask) != 0;
+	const auto& ctx     = buffer.GetRegisters();
+	const auto& sh_regs = ctx.GetShaderRegisters();
+	// KYTY_SKIP_INACTIVE_PS also requires a nonzero export format (DrawColorOutputFilter).
+	const bool has_color_output = SkipInactivePixelShadersEnabled()
+	                                  ? DrawColorOutputFilter(ctx) != 0
+	                                  : (ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask) != 0;
 	return buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	       (has_color_output || PixelShaderHasDepthOrCoverageSideEffects(sh_regs));
 }
@@ -1521,6 +1525,94 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&                
 	return prepared;
 }
 
+// KYTY_CP_COMMIT=draws: AcquireVertexBuffers into the draw's value-initialised bindings, without
+// its dead work: the collected range plan (about 1 KiB value-initialised) exists only when the
+// draw has no binding plan (or verifies it), the acquired ranges are not value-initialised (only
+// the merged ones are written and read), and no second PreparedVertexBuffers is built and copied.
+// Every value it computes and every call it makes, in order, are AcquireVertexBuffers'.
+static void AcquireVertexBuffersInto(CommandBuffer&                   buffer,
+                                     const ShaderVertexInputInfo&     vs_input_info,
+                                     const DrawPrep::VertexRangePlan* planned,
+                                     PreparedVertexBuffers&           prepared) {
+	KYTY_PROFILER_DETAIL_FUNCTION();
+	EXIT_IF(vs_input_info.buffers_num < 0 ||
+	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
+	EXIT_IF(prepared.count != 0); // the draw's bindings, value-initialised
+
+	const bool verify = planned != nullptr && DrawPrep::BindingsVerifyMode() != 0;
+	const DrawPrep::VertexRangePlan*          ranges = planned;
+	std::optional<DrawPrep::VertexRangePlan> collected_storage;
+	if (planned == nullptr || verify) {
+		auto&    collected = collected_storage.emplace();
+		uint32_t invalid   = 0;
+		if (!DrawPrep::CollectVertexRanges(vs_input_info, collected, invalid)) {
+			EXIT("invalid vertex buffer range: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			     vs_input_info.buffers[invalid].addr, collected.sizes[invalid]);
+		}
+		for (uint32_t i = 0; i < collected.merged_count; i++) {
+			auto& range = collected.merged[i];
+			// PPSA20298
+			const auto size = Libs::LibKernel::Memory::ClampRangeSize(
+			    range.base_address, range.requested_end - range.base_address);
+			range.acquired_end = range.base_address + size;
+		}
+		uint32_t unassigned = 0;
+		if (!DrawPrep::AssignVertexRanges(vs_input_info, collected, unassigned)) {
+			EXIT("vertex buffer address is outside the acquired range: addr=0x%016" PRIx64 "\n",
+			     vs_input_info.buffers[unassigned].addr);
+		}
+		if (verify) {
+			DrawPrep::CountBindingVerifyCheck();
+			if (!SameVertexRanges(*planned, collected)) {
+				DrawPrep::ReportBindingMismatch("vertex ranges", collected.merged_count);
+			}
+		}
+		ranges = &collected;
+	}
+
+	auto& cache = buffer.GetContext().GetBufferCache();
+	struct Acquired {
+		Buffer*  buffer;
+		uint64_t offset;
+	};
+	std::array<Acquired, ShaderVertexInputInfo::RES_MAX> acquired; // [0, merged_count) written
+	for (uint32_t i = 0; i < ranges->merged_count; i++) {
+		const auto& range           = ranges->merged[i];
+		const auto  size            = range.acquired_end - range.base_address;
+		const auto [handle, offset] = cache.ObtainBuffer(range.base_address, size, false);
+		acquired[i]                 = {handle, offset};
+		SetVulkanObjectNameF(
+		    buffer.GetContext().GetGraphics().device, handle->Handle(),
+		    "Kyty.VertexBufferRange[guest=0x{:016x} size=0x{:x}]", range.base_address, size);
+	}
+
+	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
+	prepared.count         = static_cast<uint32_t>(vs_input_info.buffers_num);
+	vk::Buffer null_buffer = nullptr;
+	for (int i = 0; i < vs_input_info.buffers_num; i++) {
+		const auto& vertex = vs_input_info.buffers[i];
+		const auto  size   = ranges->sizes[i];
+		if (size == 0) {
+			if (null_buffer == nullptr) {
+				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();
+			}
+			prepared.buffers[i] = null_buffer;
+			prepared.offsets[i] = 0;
+			continue;
+		}
+
+		const auto  index = ranges->merged_index[i];
+		const auto& range = ranges->merged[index];
+		prepared.buffers[i] = acquired[index].buffer->Handle();
+		prepared.offsets[i] = acquired[index].offset + vertex.addr - range.base_address;
+		prepared.sizes[i]   = std::min(size, range.acquired_end - vertex.addr);
+		SetVulkanObjectNameF(
+		    buffer.GetContext().GetGraphics().device, prepared.buffers[i],
+		    "Kyty.VertexBuffer[slot={} guest=0x{:016x} size=0x{:x} stride={} records={}]", i,
+		    vertex.addr, size, vertex.stride, vertex.num_records);
+	}
+}
+
 static void SetDrawDebugPhase(CommandBuffer& buffer, uint64_t submit_id, const DrawCallInfo& draw,
                               const DrawEmitInfo& emit, uint32_t phase) {
 	buffer.SetDebugInfo(static_cast<uint32_t>(draw.debug_op), submit_id, phase, draw.index_count, 0,
@@ -1846,9 +1938,11 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 		std::copy(prepared->target_export_mapping.begin(), prepared->target_export_mapping.end(),
 		          target_export_mapping.begin());
 	} else {
+		const auto output_filter = DrawColorOutputFilter(ctx);
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 			const auto& rt = ctx.GetRenderTarget(slot);
-			if (rt.base.addr != 0 && render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0) {
+			if (rt.base.addr != 0 && render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
+			    (output_filter & (1u << slot)) != 0) {
 				target_export_mapping[slot] =
 				    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
 				                                 rt.info.channel_order)
@@ -1910,6 +2004,13 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	// A stage whose shader the recompiler skipped (an unresolvable runtime descriptor,
 	// KYTY_SRT_VARIANT_READS) leaves its program empty: drop the draw.
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
+		// Counted and reported (the first few, then every 2048th) so a dropped draw is never silent.
+		static std::atomic_uint64_t dropped {0};
+		const auto                  count = dropped.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (count <= 4u || (count & 2047u) == 0u) {
+			std::printf("Warning: draw #%" PRIu64 " dropped, %s program missing (%s)\n", count,
+			            !state.programs.vertex[0] ? "vertex" : "pixel", draw.Name());
+		}
 		return false;
 	}
 	KYTY_PROFILER_DETAIL_BLOCK("Draw::ResolveTargets");
@@ -1920,6 +2021,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 				mrt_mask |= 1u << output.index;
 			}
 		}
+	}
+	if (SkipInactivePixelShadersEnabled()) {
+		mrt_mask &= DrawColorOutputFilter(buffer.GetRegisters());
 	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
@@ -2355,8 +2459,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepBindingFallbackVm);
 			}
 		}
-		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0], vertex_ranges);
-		index_binding   = PrepareIndexBuffer(buffer, index_source);
+		if (CpCommit::Enabled(CpCommit::Part::Draws)) {
+			AcquireVertexBuffersInto(buffer, state.vertex_info[0], vertex_ranges, vertex_bindings);
+		} else {
+			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0], vertex_ranges);
+		}
+		index_binding = PrepareIndexBuffer(buffer, index_source);
 	}
 	PreparedIndirectBuffers indirect_buffers;
 	MeshIndirect::Converter::Slot mesh_slot;

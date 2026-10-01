@@ -57,24 +57,51 @@ jobs:
           arch: win64_msvc2022_64
           cache: true
 
+      # The PGO profile in tools/pgo was merged with LLVM 22.1.3's llvm-profdata (the clang-cl of
+      # Visual Studio 18, llvm-project e9846648f); the compiler that reads it must be the same release.
+      - name: Install LLVM 22.1.3
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'LLVM-22.1.3-win64.exe'
+          Invoke-WebRequest -Uri 'https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.3/LLVM-22.1.3-win64.exe' `
+            -OutFile $installer
+          $process = Start-Process -FilePath $installer -ArgumentList '/S', '/D=C:\LLVM-22.1.3' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "LLVM installer exited with $($process.ExitCode)" }
+          $version = & 'C:\LLVM-22.1.3\bin\clang-cl.exe' --version | Select-Object -First 1
+          Write-Host $version
+          if ($version -notmatch 'clang version 22\.1\.3\b') { throw "Unexpected clang-cl: $version" }
+          foreach ($tool in 'lld-link.exe', 'llvm-lib.exe') {
+            if (-not (Test-Path -LiteralPath "C:\LLVM-22.1.3\bin\$tool")) { throw "$tool missing" }
+          }
+
       - name: Configure Release
         shell: cmd
         run: |
+          set LLVM=C:/LLVM-22.1.3/bin
+          set PGO_PROFILE=%GITHUB_WORKSPACE:\=/%/tools/pgo/u59-int-up-sg-1.profdata
           cmake -S . -B _Build/windows ^
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DKYTY_EMULATOR_IPO=ON ^
+            -DKYTY_PGO_USE=%PGO_PROFILE% ^
             -DKYTY_BUILD_ORIGIN=Fork ^
             -DKYTY_BUILD_REPOSITORY=%GITHUB_REPOSITORY% ^
             -DKYTY_RELEASE_TAG=%GITHUB_REF_NAME% ^
-            -DCMAKE_C_COMPILER=clang-cl ^
-            -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_C_COMPILER=%LLVM%/clang-cl.exe ^
+            -DCMAKE_CXX_COMPILER=%LLVM%/clang-cl.exe ^
+            -DCMAKE_LINKER=%LLVM%/lld-link.exe ^
+            -DCMAKE_AR=%LLVM%/llvm-lib.exe ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
 
       - name: Build and install
         shell: cmd
         run: |
-          cmake --build _Build/windows --target launcher kyty_emulator --parallel
+          cmake --build _Build/windows --target launcher kyty_emulator --parallel > pgo-build.log 2>&1
+          set BUILD_EXIT=%ERRORLEVEL%
+          type pgo-build.log
+          if %BUILD_EXIT% neq 0 exit /b %BUILD_EXIT%
+          rem Functions whose profile does not match this compile are optimized without it (not an error).
+          findstr /c:"profile data may be out of date" pgo-build.log || echo No PGO profile mismatch warnings.
           cmake --install _Build/windows --prefix _Build/windows/install
 
       - name: Package portable experimental runtime
@@ -101,5 +128,5 @@ jobs:
         run: |
           gh release create $env:GITHUB_REF_NAME 'KytyPS5-U59-Demons-Windows-x64.zip' `
             --repo $env:GITHUB_REPOSITORY `
-            --title "U59 + Demon's Souls changes (Windows x64)" `
-            --notes "Experimental U59 plus the merged Demon's Souls shader, renderer fallback and page-hint changes. Open launcher.exe directly: the bundled u59-preset.json applies the no-diagnostics renderer settings. The existing shared Kyty.ini supplies game paths and display settings. No FPS gain is claimed; this release is for visual and performance testing. RT and U60 work are excluded."
+            --title "U59 integration: CP + VRAM work, PGO, upstream sync (Windows x64)" `
+            --notes "U59 with the Demon's Souls changes, plus: command-processor and VRAM changes, which the bundled u59-preset.json turns on; a PGO-built kyty_emulator (profile recorded in Astro Bot); and upstream KytyPS5 changes (controller, audio, compatibility, layered VideoOut presenter). Measured on one PC (RTX 3090, Ryzen 9 7950X3D, 120 Hz vblank), Astro Bot Sky Garden start view: 28.2 fps before, about 36 fps with this build; dedicated VRAM 12.7 GB before, 9.7 GB with this build. Open launcher.exe directly; the existing shared Kyty.ini supplies game paths and display settings. The first launch compiles shaders again. Controller and audio changes were not tested by hand. See U59-README.md."

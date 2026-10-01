@@ -1062,6 +1062,11 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+bool TryReadBackingDirect(uint64_t vaddr, void* data, uint64_t size) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryReadBackingDirect(vaddr, data, size);
+}
+
 const void* GuestBackingAlias(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space != nullptr ? g_guest_address_space->BackingAlias(vaddr, size)
 	                                        : nullptr;

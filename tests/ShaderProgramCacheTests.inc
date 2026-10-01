@@ -172,6 +172,13 @@ void CheckFingerprint() {
             std::string("the fingerprint does not depend on CodegenOptions::") + field);
   };
   options_differ("movrel_range", [](CodegenOptions &o) { o.movrel_range = !o.movrel_range; });
+  options_differ("movrel_known_zeros",
+                 [](CodegenOptions &o) { o.movrel_known_zeros = !o.movrel_known_zeros; });
+  options_differ("movrel_switch", [](CodegenOptions &o) { o.movrel_switch = !o.movrel_switch; });
+  options_differ("uniform_lane_reads",
+                 [](CodegenOptions &o) { o.uniform_lane_reads = !o.uniform_lane_reads; });
+  options_differ("short_f32_helpers",
+                 [](CodegenOptions &o) { o.short_f32_helpers = !o.short_f32_helpers; });
   options_differ("fast_float_min_max",
                  [](CodegenOptions &o) { o.fast_float_min_max = !o.fast_float_min_max; });
   options_differ("fast_pkrtz", [](CodegenOptions &o) { o.fast_pkrtz = !o.fast_pkrtz; });
