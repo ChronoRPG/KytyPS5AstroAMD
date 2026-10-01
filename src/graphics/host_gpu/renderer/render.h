@@ -1206,6 +1206,8 @@ private:
 		vk::AccessFlags2        access;
 		vk::ImageLayout         layout         = vk::ImageLayout::eUndefined;
 		uint64_t                serial         = 0;
+		uint64_t                address        = 0; // guest range (info.data)
+		uint64_t                size           = 0;
 		uint32_t                resident_first = 0;
 		bool                    registered     = false;
 		bool                    single_state   = false; // no per-subresource states
@@ -1227,17 +1229,38 @@ private:
 		RenderState       rendering;
 		// The textures of the recorded stages, then the attachments, as the draw left them.
 		std::vector<DrawRunImage> images;
-		// Verify mode: what the normal path must reproduce for a continuation (depth: one entry).
+		// KYTY_DRAW_RUN_ACQUIRE and verify mode: the resolved targets (depth: one entry) and the
+		// scissor union (KYTY_ALIAS_BYTES claims) the attachments were acquired for.
 		std::vector<RenderColorInfo> colors;
 		std::vector<RenderDepthInfo> depth;
-		std::vector<TextureBinding>  textures;
-		std::vector<vk::Sampler>     samplers;
+		vk::Rect2D                   written {};
+		bool                         bounded = false;
+		// Verify mode: what the normal path must reproduce for a continuation.
+		std::vector<TextureBinding> textures;
+		std::vector<vk::Sampler>    samplers;
 	};
 	// DrawIndex/DrawAuto under the render mutex: the previous run's validity is taken for this draw,
 	// and a draw the draw-prep engine does not commit counts as other command-processor work.
 	void                       BeginDrawRun();
 	[[nodiscard]] DrawRunImage MakeDrawRunImage(ImageId id, bool texture) const;
-	[[nodiscard]] bool         DrawRunImagesUnchanged(bool compare_serials) const;
+	// attachments_only: the textures of the record are not checked (KYTY_DRAW_RUN_ACQUIRE).
+	// DrawRunImagesChange: 0 when unchanged, else the first difference (verify-mode detail).
+	[[nodiscard]] uint32_t DrawRunImagesChange(bool compare_serials,
+	                                           bool attachments_only = false) const;
+	[[nodiscard]] bool     DrawRunImagesUnchanged(bool compare_serials,
+	                                              bool attachments_only = false) const {
+		return DrawRunImagesChange(compare_serials, attachments_only) == 0;
+	}
+	// Whether a guest range lies over one of the marked attachments.
+	[[nodiscard]] static bool DrawRunOverAttachment(std::span<const DrawRunImage> marks,
+	                                                uint64_t address, uint64_t size);
+	// KYTY_DRAW_RUN_ACQUIRE: a draw that does not continue the run but resolved the recorded targets
+	// for the same scissor union, in the same rendering instance right after the recorded draw, with
+	// no texture over an attachment's memory, keeps the recorded attachment acquisition.
+	[[nodiscard]] bool DrawRunAcquireCandidate(const CommandBuffer&               buffer,
+	                                           const DrawRenderState&             state,
+	                                           std::span<PreparedBindings* const> stages,
+	                                           const vk::Rect2D*                  written) const;
 	// A continuation's kept textures and attachments are marked bound for the draw as their
 	// resolution marks them (BindImage, BindRenderTarget), before the draw's buffer work.
 	void                       DrawRunMarkBindings();
@@ -1247,9 +1270,10 @@ private:
 	                                    uint32_t render_target_slice_offset);
 	void               DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                  uint32_t render_target_slice_offset, DrawRenderState& state);
+	// written: the scissor union the attachments were acquired for (null: unbounded claims).
 	void DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRenderState& state,
 	                       uint32_t render_target_slice_offset, const RenderState& rendering,
-	                       std::span<PreparedBindings* const> stages);
+	                       std::span<PreparedBindings* const> stages, const vk::Rect2D* written);
 	void DrawRunVerify(const DrawRenderState& state, const RenderState& rendering,
 	                   vk::ImageAspectFlags feedback_aspects,
 	                   std::span<PreparedBindings* const> stages);

@@ -2164,10 +2164,27 @@ RenderExecutor::DrawRunImage RenderExecutor::MakeDrawRunImage(ImageId id, bool t
 	mark.access         = image->backing.state.access_mask;
 	mark.layout         = image->backing.state.layout;
 	mark.serial         = image->ContentSerial();
+	mark.address        = image->info.data.address;
+	mark.size           = image->info.data.size;
 	mark.resident_first = image->resident_first;
 	mark.registered     = image->registered;
 	mark.single_state   = image->backing.subresource_states.empty();
 	return mark;
+}
+
+// Whether a guest range lies over one of the record's attachments (either may be a null image).
+bool RenderExecutor::DrawRunOverAttachment(std::span<const DrawRunImage> marks, uint64_t address,
+                                           uint64_t size) {
+	if (size == 0) {
+		return false;
+	}
+	for (const auto& mark: marks) {
+		if (!mark.texture && mark.size != 0 && address < mark.address + mark.size &&
+		    mark.address < address + size) {
+			return true;
+		}
+	}
+	return false;
 }
 
 // A sampled image whose view the normal path would take as it is: FindTexture's rediscovery checks
@@ -2190,31 +2207,55 @@ static bool DrawRunTextureReady(const Image& image) {
 // previous draw left it in, with nothing the normal path's resolution would refresh (CPU-dirty or
 // buffer-modified contents, a released tracking range, a rebind request) (GPU thread; images change
 // only on it or, for CPU dirtiness, under the texture-cache lock on a faulting thread).
-bool RenderExecutor::DrawRunImagesUnchanged(bool compare_serials) const {
+// 0 when unchanged; otherwise which mark differs and how (verify-mode detail):
+// (mark index + 1) << 8 | 0x80 for a texture | the field (1 slot freed, 2 native image,
+// 3 registration, 4 rebind request, 5 residency, 6 layout, 7 access, 8 stage, 9 per-subresource
+// states, 10 content serial, 11 unregistered, 12 CPU-dirty, 13 buffer-modified, 14 texture refresh).
+uint32_t RenderExecutor::DrawRunImagesChange(bool compare_serials, bool attachments_only) const {
 	auto&            cache = m_context.GetTextureCache();
 	std::scoped_lock lock {cache.m_lock};
 	const auto&      images = cache.m_slot_images;
-	for (const auto& mark: m_run.images) {
+	for (uint32_t index = 0; index < m_run.images.size(); index++) {
+		const auto& mark = m_run.images[index];
+		if (attachments_only && mark.texture) {
+			continue;
+		}
 		const auto* image = images.try_get(mark.id);
-		if (image == nullptr || image->backing.image != mark.image ||
-		    image->registered != mark.registered || image->binding.needs_rebind ||
-		    image->resident_first != mark.resident_first ||
-		    image->backing.state.layout != mark.layout ||
-		    image->backing.state.access_mask != mark.access ||
-		    image->backing.state.pl_stage != mark.stage ||
-		    image->backing.subresource_states.empty() != mark.single_state ||
-		    (compare_serials && image->ContentSerial() != mark.serial)) {
-			return false;
+		uint32_t    field = 0;
+		if (image == nullptr) {
+			field = 1;
+		} else if (image->backing.image != mark.image) {
+			field = 2;
+		} else if (image->registered != mark.registered) {
+			field = 3;
+		} else if (image->binding.needs_rebind) {
+			field = 4;
+		} else if (image->resident_first != mark.resident_first) {
+			field = 5;
+		} else if (image->backing.state.layout != mark.layout) {
+			field = 6;
+		} else if (image->backing.state.access_mask != mark.access) {
+			field = 7;
+		} else if (image->backing.state.pl_stage != mark.stage) {
+			field = 8;
+		} else if (image->backing.subresource_states.empty() != mark.single_state) {
+			field = 9;
+		} else if (compare_serials && image->ContentSerial() != mark.serial) {
+			field = 10;
+		} else if (!image->info.data.Empty() && !image->registered) {
+			field = 11;
+		} else if (!image->info.data.Empty() && image->IsCpuDirty()) {
+			field = 12;
+		} else if (!image->info.data.Empty() && image->IsBufferModified()) {
+			field = 13;
+		} else if (mark.texture && !DrawRunTextureReady(*image)) {
+			field = 14;
 		}
-		if (!image->info.data.Empty() &&
-		    (!image->registered || image->IsCpuDirty() || image->IsBufferModified())) {
-			return false;
-		}
-		if (mark.texture && !DrawRunTextureReady(*image)) {
-			return false;
+		if (field != 0) {
+			return ((index + 1u) << 8u) | (mark.texture ? 0x80u : 0u) | field;
 		}
 	}
-	return true;
+	return 0;
 }
 
 void RenderExecutor::DrawRunMarkBindings() {
@@ -2286,11 +2327,60 @@ bool RenderExecutor::DrawRunCandidate(const CommandBuffer& buffer, const DrawRen
 	return true;
 }
 
+bool RenderExecutor::DrawRunAcquireCandidate(const CommandBuffer&               buffer,
+                                             const DrawRenderState&             state,
+                                             std::span<PreparedBindings* const> stages,
+                                             const vk::Rect2D*                  written) const {
+	const auto& run = m_run;
+	if (!m_run_prev_valid || !m_in_engine_commit || run.depth.size() != 1 ||
+	    run.colors.size() != run.color_count || state.color_count != run.color_count ||
+	    DrawRun::ActivityEpoch() != run.activity || buffer.Identity() != run.command ||
+	    m_context.GetCommandScheduler().CurrentTick() != run.tick ||
+	    buffer.ActiveRenderingSerial() == 0 ||
+	    buffer.ActiveRenderingSerial() != run.rendering_serial ||
+	    (written != nullptr) != run.bounded || (written != nullptr && *written != run.written)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		if (!SameRenderColorInfo(state.color_info[i], run.colors[i])) {
+			return false;
+		}
+	}
+	if (!SameRenderDepthInfo(state.depth_info, run.depth[0])) {
+		return false;
+	}
+	// No texture of the draw is an attachment or lies over one (AcquireRenderTargets would detect a
+	// feedback loop or choose other layouts; an alias is synchronized from the attachment).
+	{
+		auto&            cache = m_context.GetTextureCache();
+		std::scoped_lock lock {cache.m_lock};
+		for (const auto* stage: stages) {
+			for (const auto& binding: stage->images) {
+				const auto* image = cache.m_slot_images.try_get(binding.image_id);
+				if (image == nullptr) {
+					return false;
+				}
+				for (const auto& mark: run.images) {
+					if (!mark.texture && mark.id == binding.image_id) {
+						return false;
+					}
+				}
+				if (DrawRunOverAttachment(run.images, image->info.data.address,
+				                          image->info.data.size)) {
+					return false;
+				}
+			}
+		}
+	}
+	return DrawRunImagesUnchanged(true, true);
+}
+
 // After an eligible draw was recorded: what a continuation of it may reuse, and its certificate.
 void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRenderState& state,
                                        uint32_t render_target_slice_offset,
                                        const RenderState& rendering,
-                                       std::span<PreparedBindings* const> stages) {
+                                       std::span<PreparedBindings* const> stages,
+                                       const vk::Rect2D*                  written) {
 	auto& run            = m_run;
 	run.key              = m_run_key;
 	run.activity         = DrawRun::ActivityEpoch();
@@ -2324,9 +2414,22 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 			run.images.push_back(MakeDrawRunImage(state.depth_info.image_id, false));
 		}
 	}
-	if (DrawRun::GetMode() == DrawRun::Mode::Verify) {
+	// A texture over an attachment's memory (an alias of it) is synchronized from the attachment by
+	// each draw's texture resolution (SyncAliasFromOwner), which a continuation skips: no run.
+	for (const auto& mark: run.images) {
+		if (mark.texture && DrawRunOverAttachment(run.images, mark.address, mark.size)) {
+			DrawRun::GetTotals().alias_excluded.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+	}
+	const bool verify = DrawRun::GetMode() == DrawRun::Mode::Verify;
+	if (verify || DrawRun::AcquireReuseEnabled()) {
 		run.colors.assign(state.color_info, state.color_info + state.color_count);
 		run.depth.assign(1, state.depth_info);
+		run.bounded = written != nullptr;
+		run.written = written != nullptr ? *written : vk::Rect2D {};
+	}
+	if (verify) {
 		run.textures.clear();
 		run.samplers.clear();
 		for (const auto* stage: stages) {
@@ -3100,6 +3203,27 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// KYTY_DRAW_RUN=verify: the continuation's skipped acquisition and transitions must be no-ops.
 	const bool run_verify_images   = m_run_verify && DrawRunImagesUnchanged(false);
 	const auto run_transitions     = m_run_verify ? Image::RecordedTransitions() : uint64_t {0};
+	// Where this draw can write its colour targets (KYTY_ALIAS_BYTES ownership claims); a
+	// continuation's are the recorded draw's.
+	vk::Rect2D written = m_run_active ? m_run.written : vk::Rect2D {};
+	const bool bounded = TextureCache::AliasBytesEnabled();
+	if (bounded && !m_run_active) {
+		if (plan_statics && plan->written_valid && !plan_verify) {
+			written = plan->written;
+		} else {
+			const auto& outputs = vertex_stages.back().stage.program->info.outputs;
+			written             = DrawScissorUnion(
+	            buffer.GetRegisters(), std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
+	                return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+	            }));
+			if (plan_statics && plan->written_valid) {
+				DrawPrep::CountBindingVerifyCheck();
+				if (written != plan->written) {
+					DrawPrep::ReportBindingMismatch("scissor union");
+				}
+			}
+		}
+	}
 	if (m_run_active) {
 		// KYTY_DRAW_RUN continuation: the attachments were acquired, claimed and transitioned by the
 		// previous draw of the run, for the same targets, scissors and textures (no feedback), and
@@ -3107,32 +3231,45 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		rendering              = m_run.rendering;
 		m_depth_feedback.valid = false;
 	} else {
-		// Where this draw can write its colour targets (KYTY_ALIAS_BYTES ownership claims).
-		vk::Rect2D written {};
-		const bool bounded = TextureCache::AliasBytesEnabled();
-		if (bounded) {
-			if (plan_statics && plan->written_valid && !plan_verify) {
-				written = plan->written;
-			} else {
-				const auto& outputs = vertex_stages.back().stage.program->info.outputs;
-				written             = DrawScissorUnion(
-		            buffer.GetRegisters(), std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
-		                return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
-		            }));
-				if (plan_statics && plan->written_valid) {
-					DrawPrep::CountBindingVerifyCheck();
-					if (written != plan->written) {
-						DrawPrep::ReportBindingMismatch("scissor union");
-					}
+		// KYTY_DRAW_RUN_ACQUIRE: the same targets and scissor union right after the recorded draw, in
+		// its rendering instance, with the attachments as it left them: its acquisition, whose
+		// transitions, claims, refreshes and depth-feedback bookkeeping would all be repeats.
+		// (Verify mode checks a would-be continuation's acquisition as the continuation's.)
+		const bool acquire_reuse =
+		    DrawRun::Enabled() && DrawRun::AcquireReuseEnabled() && !m_run_verify &&
+		    DrawRunAcquireCandidate(buffer, state, stages, bounded ? &written : nullptr);
+		if (acquire_reuse) {
+			DrawRun::GetTotals().acquire_reused.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (acquire_reuse && DrawRun::GetMode() == DrawRun::Mode::On) {
+			rendering              = m_run.rendering;
+			m_depth_feedback.valid = false;
+		} else {
+			const auto acquire_transitions =
+			    acquire_reuse ? Image::RecordedTransitions() : uint64_t {0};
+			rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
+			                                 state.depth_info, feedback_aspects, stages,
+			                                 bounded ? &written : nullptr);
+			if (acquire_reuse) {
+				// Verify mode: the acquisition a reuse skips must have been a repeat.
+				DrawRun::CountVerifyCheck();
+				if (!(rendering == m_run.rendering) || feedback_aspects) {
+					DrawRun::ReportMismatch("reused acquisition's rendering state");
+				}
+				if (Image::RecordedTransitions() != acquire_transitions) {
+					DrawRun::ReportMismatch("reused acquisition's transitions",
+					                        DrawRunImagesChange(false, true));
+				}
+				if (const auto change = DrawRunImagesChange(false, true); change != 0) {
+					DrawRun::ReportMismatch("reused acquisition's attachment state", change);
 				}
 			}
-		}
-		rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
-		                                 state.depth_info, feedback_aspects, stages,
-		                                 bounded ? &written : nullptr);
-		if (run_verify_images && !DrawRunImagesUnchanged(false)) {
-			DrawRun::CountVerifyCheck();
-			DrawRun::ReportMismatch("attachment state after acquisition");
+			if (run_verify_images) {
+				if (const auto change = DrawRunImagesChange(false); change != 0) {
+					DrawRun::CountVerifyCheck();
+					DrawRun::ReportMismatch("attachment state after acquisition", change);
+				}
+			}
 		}
 	}
 	CommitStats::Mark(CommitStats::Phase::AcquireTargets);
@@ -3174,7 +3311,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	if (run_verify_images && Image::RecordedTransitions() != run_transitions) {
 		DrawRun::CountVerifyCheck();
-		DrawRun::ReportMismatch("image transition", Image::RecordedTransitions() - run_transitions);
+		// Detail: which recorded image's state the transition changed (0: another image's).
+		DrawRun::ReportMismatch("image transition", DrawRunImagesChange(false));
 	}
 	CommitStats::Mark(CommitStats::Phase::CommitBindings);
 	if (!mesh_active) CommitIndexBuffer(vk_buffer, index_binding);
@@ -3407,7 +3545,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		if (eligible) {
 			DrawRun::GetTotals().eligible.fetch_add(1, std::memory_order_relaxed);
-			DrawRunRecordDraw(buffer, state, m_run_slice_offset, rendering, stages);
+			DrawRunRecordDraw(buffer, state, m_run_slice_offset, rendering, stages,
+			                  bounded ? &written : nullptr);
 		}
 	}
 	if (CommitStats::Enabled()) [[unlikely]] {

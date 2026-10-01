@@ -80,6 +80,23 @@ namespace Detail {
 	return exit;
 }
 
+// KYTY_DRAW_RUN_ACQUIRE=1 (default 0; with KYTY_DRAW_RUN=1 or verify): a committed draw that does
+// not continue the run keeps the attachment acquisition of the previous committed draw when that
+// draw recorded through the run's eligible shape, nothing else ran on the command processor since,
+// the command buffer, tick and rendering instance are the same, the draw resolved the same colour
+// and depth targets (every field) for the same scissor union, no texture of the draw lies over an
+// attachment's memory, and every attachment is unchanged since (as for a continuation). Its
+// textures, samplers, bindings and dynamic state take the normal path. Verify mode runs the
+// acquisition and checks it returned the recorded rendering state, recorded no transition and
+// changed no attachment state.
+namespace Detail {
+[[nodiscard]] bool ReadAcquire();
+} // namespace Detail
+[[nodiscard]] inline bool AcquireReuseEnabled() {
+	static const bool enabled = Detail::ReadAcquire();
+	return enabled;
+}
+
 // Command-processor work other than committed draws (GPU thread). Relaxed: written and read by the
 // GPU thread; other threads only bump it.
 void NoteForeignActivity() noexcept;
@@ -110,6 +127,8 @@ struct Totals {
 	std::atomic<uint64_t> late_fallbacks {0};  // images changed during the buffer work
 	std::atomic<uint64_t> pipeline_lookups {0};// continuation whose pipeline was looked up again
 	std::atomic<uint64_t> dynamic_emitted {0}; // continuation whose dynamic state was recorded again
+	std::atomic<uint64_t> alias_excluded {0};  // eligible, but a texture lies over an attachment
+	std::atomic<uint64_t> acquire_reused {0};  // KYTY_DRAW_RUN_ACQUIRE (verify: would have)
 	std::atomic<uint64_t> verify_checks {0};
 	std::atomic<uint64_t> verify_mismatches {0};
 	std::atomic<uint64_t> misses[static_cast<uint32_t>(Miss::Count)] {};

@@ -16255,8 +16255,11 @@ public:
   // against the same draws made serially (never a run). Between the two streams of each phase the
   // guest rewrites the texture (a CPU write the kept bindings do not see, the rendering instance
   // continues): the second stream's first draw must fall back late and sample the new texels.
-  void CheckDrawRun() {
-    constexpr const char *name = "DrawRun";
+  // alternate_samplers: consecutive draws alternate between two S# words that sample alike (border
+  // colour type under clamp-to-edge), so no draw continues a run and every draw after a stream's
+  // first keeps its predecessor's attachment acquisition (KYTY_DRAW_RUN_ACQUIRE).
+  void CheckDrawRun(bool alternate_samplers = false) {
+    const char *name = alternate_samplers ? "DrawRunAcquire" : "DrawRun";
     constexpr uintptr_t base = 0x000000020b000000ull;
     constexpr uint64_t allocation_size = 0x400000;
     constexpr uint64_t allocation_alignment = 0x10000;
@@ -16343,9 +16346,15 @@ public:
           DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
           0, 0x00700000u, 0, 0}};
     }
-    // Clamp to edge, bilinear, no mip filter.
+    // Clamp to edge, bilinear, no mip filter; the alternative has an opaque-black border colour,
+    // which clamp-to-edge never samples.
     const ShaderSamplerResource s_sharp{
         {2u | (2u << 3u) | (2u << 6u), 0, (1u << 20u) | (1u << 22u), 0}};
+    const ShaderSamplerResource s_sharp_alternate{
+        {2u | (2u << 3u) | (2u << 6u), 0, (1u << 20u) | (1u << 22u), 1u << 30u}};
+    const auto sampler_for = [&](u32 k) -> const ShaderSamplerResource & {
+      return alternate_samplers && (k & 1u) != 0 ? s_sharp_alternate : s_sharp;
+    };
     const std::array<u32, 3> draw{0xc0012d00u, 3u, 0x2u};
     // Draw k's red: (k + 1) / 8, exact in every sum.
     const auto constant = [](u32 k) { return std::bit_cast<u32>(0.125f * static_cast<float>(k + 1u)); };
@@ -16357,6 +16366,7 @@ public:
     uint64_t continued = 0;
     uint64_t late = 0;
     uint64_t mismatches = 0;
+    uint64_t reused = 0;
     context.GetGpu().SendCommandSync([&] {
       GraphicsInitJmpTables();
       CommandProcessor processor(context, 0);
@@ -16429,7 +16439,7 @@ public:
           shaders.SetPsUserSgpr(i, t_sharps[0].fields[i], HW::UserSgprType::Unknown);
         }
         for (u32 i = 0; i < 4; i++) {
-          shaders.SetPsUserSgpr(8 + i, s_sharp.fields[i], HW::UserSgprType::Unknown);
+          shaders.SetPsUserSgpr(8 + i, sampler_for(k).fields[i], HW::UserSgprType::Unknown);
         }
         shaders.SetPsUserSgpr(12, constant(k), HW::UserSgprType::Unknown);
         RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
@@ -16463,7 +16473,7 @@ public:
           words.push_back(KYTY_PM4(15, Pm4::IT_SET_SH_REG, Pm4::R_ZERO));
           words.push_back(Pm4::SPI_SHADER_USER_DATA_PS_0);
           words.insert(words.end(), std::begin(t_sharps[1].fields), std::end(t_sharps[1].fields));
-          words.insert(words.end(), std::begin(s_sharp.fields), std::end(s_sharp.fields));
+          words.insert(words.end(), std::begin(sampler_for(k).fields), std::end(sampler_for(k).fields));
           words.push_back(constant(k));
           words.insert(words.end(), draw.begin(), draw.end());
         }
@@ -16475,6 +16485,7 @@ public:
       const auto continued_before = totals.continued.load();
       const auto late_before = totals.late_fallbacks.load();
       const auto mismatches_before = totals.verify_mismatches.load();
+      const auto reused_before = totals.acquire_reused.load();
       clear();
       stream(0);
       rewrite(1);
@@ -16482,6 +16493,7 @@ public:
       continued = totals.continued.load() - continued_before;
       late = totals.late_fallbacks.load() - late_before;
       mismatches = totals.verify_mismatches.load() - mismatches_before;
+      reused = totals.acquire_reused.load() - reused_before;
       Require(name, "serial and command-processor run draws", read() == serial,
               "the command processor's draws differ from the serial draws (continued " +
                   std::to_string(continued) + ", late fallbacks " + std::to_string(late) + ")");
@@ -16491,14 +16503,23 @@ public:
       const bool certified = code_cert == nullptr || std::strcmp(code_cert, "0") != 0;
       if (DrawRun::Enabled() && DrawPrep::GetMode() != DrawPrep::Mode::Off && certified) {
         // Every draw after a stream's first continues (the second stream's first one continues
-        // the first stream's run, then falls back late: its texture was rewritten).
+        // the first stream's run, then falls back late: its texture was rewritten). With
+        // alternating samplers no draw continues, and every draw after a stream's first keeps its
+        // predecessor's acquisition; the second stream's first one cannot: the upload of its
+        // rewritten texture ended the rendering instance.
+        const uint64_t want_continued = alternate_samplers ? 0 : 2 * draws_per_stream - 1;
+        const uint64_t want_late = alternate_samplers ? 0 : 1;
+        const uint64_t want_reused = !DrawRun::AcquireReuseEnabled() || !alternate_samplers
+                                         ? 0
+                                         : 2 * (draws_per_stream - 1);
         Require(name, "continuations",
-                continued == 2 * draws_per_stream - 1 && late == 1,
+                continued == want_continued && late == want_late && reused == want_reused,
                 "continued " + std::to_string(continued) + ", late fallbacks " +
-                    std::to_string(late) + "; expected " +
-                    std::to_string(2 * draws_per_stream - 1) + " and 1");
+                    std::to_string(late) + ", acquisitions reused " + std::to_string(reused) +
+                    "; expected " + std::to_string(want_continued) + ", " +
+                    std::to_string(want_late) + " and " + std::to_string(want_reused));
       } else {
-        Require(name, "no run without the switch", continued == 0 && late == 0,
+        Require(name, "no run without the switch", continued == 0 && late == 0 && reused == 0,
                 "the run bookkeeping ran without KYTY_DRAW_RUN");
       }
       RenderExecutorTestAccess::ResetBindings(executor);
@@ -16513,13 +16534,14 @@ public:
     Require(name, "release direct backing",
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
             "draw-run allocation release failed");
-    std::printf("[gpu]     %-32s ok (mode %s, continued %llu, late fallbacks %llu, verify "
-                "checks %llu)\n",
+    std::printf("[gpu]     %-32s ok (mode %s, continued %llu, late fallbacks %llu, acquisitions "
+                "reused %llu, verify checks %llu)\n",
                 name,
                 DrawRun::GetMode() == DrawRun::Mode::Off
                     ? "off"
                     : (DrawRun::GetMode() == DrawRun::Mode::Verify ? "verify" : "on"),
                 static_cast<unsigned long long>(continued), static_cast<unsigned long long>(late),
+                static_cast<unsigned long long>(reused),
                 static_cast<unsigned long long>(DrawRun::GetTotals().verify_checks.load()));
   }
 
@@ -48227,6 +48249,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--draw-run-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDrawRun();
+    vulkan.CheckDrawRun(true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--eop-timestamps-only") == 0) {
@@ -48497,6 +48520,7 @@ int main(int argc, char **argv) {
   vulkan.CheckDrawPrepEngineDraw();
   vulkan.CheckDrawPrepEngineTextures();
   vulkan.CheckDrawRun();
+  vulkan.CheckDrawRun(true);
   vulkan.CheckTextureMemoRevalidation();
   vulkan.CheckRenderExecutorColorDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
