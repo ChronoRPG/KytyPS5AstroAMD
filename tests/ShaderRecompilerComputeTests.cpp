@@ -5714,23 +5714,33 @@ public:
 
       // Switch at the same boundary as the A/B harness, checking unaligned partial
       // pages, equal bytes, changed bytes and an overlapping memmove fallback.
+      const auto cpu_copy = [&](uint64_t destination, uint64_t source, uint64_t bytes) {
+        OnGpuThread(context, [&] { cache.CopyBuffer(destination, source, bytes, false, false); });
+      };
       for (const bool on : {false, true, false}) {
         Live::Testing::StageText(on ? "KYTY_CPU_COPY_PAGE_SKIP=1\n" : "KYTY_CPU_COPY_PAGE_SKIP=0\n");
         Live::OnCpFlip();
         constexpr uint64_t partial_size = 2 * 4096 + 29;
         const auto source = large_copy_source_offset + 17;
         const auto destination = large_copy_destination_offset + 23;
-        cache.CopyBuffer(base + destination, base + source, partial_size, false, false);
-        cache.CopyBuffer(base + destination, base + source, partial_size, false, false);
+        cpu_copy(base + destination, base + source, partial_size);
+        OnGpuThread(context, [&] {
+          Require(name, "page-copy clean equal proof",
+                  Libs::LibKernel::Memory::CompareGpuCleanBacking(
+                      base + destination, memory + source, partial_size) ==
+                      Libs::LibKernel::Memory::BackingCompare::Equal,
+                  "mapped equal bytes did not establish a clean backing proof");
+        });
+        cpu_copy(base + destination, base + source, partial_size);
         memory[source + 4099] ^= 0x5a;
-        cache.CopyBuffer(base + destination, base + source, partial_size, false, false);
+        cpu_copy(base + destination, base + source, partial_size);
         Require(name, "live page-copy partial pages",
                 std::memcmp(memory + destination, memory + source, partial_size) == 0,
                 "page-copy switch lost changed or partial-page bytes");
         if (on) {
           std::vector<uint8_t> expected(memory + source, memory + source + partial_size + 31);
           std::memmove(expected.data() + 31, expected.data(), partial_size);
-          cache.CopyBuffer(base + source + 31, base + source, partial_size, false, false);
+          cpu_copy(base + source + 31, base + source, partial_size);
           Require(name, "page-copy overlap",
                   std::memcmp(memory + source, expected.data(), expected.size()) == 0,
                   "page-copy overlap corrupted source bytes");
