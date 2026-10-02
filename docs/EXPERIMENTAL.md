@@ -57,7 +57,7 @@ Three timed runs of each build on one PC, alternating, each with its bundled pre
 | Build | Frame rate: mean (range) | Dedicated VRAM |
 |---|---|---|
 | Previous release (`u59-windows-20261002-int2`) | 34.4 fps (33.3-36.2) | 9.6 GB |
-| This release | 35.7 fps (34.9-37.3) | 9.4 GB |
+| This release (a local build of the same source) | 35.7 fps (34.9-37.3) | 9.4 GB |
 
 - The frame-rate difference is within the spread between runs.
 - The VRAM figure is the mean over the timed minute. A spike to about 13 GB can occur for a moment while the galaxy
