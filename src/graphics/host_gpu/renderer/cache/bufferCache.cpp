@@ -3646,9 +3646,16 @@ void BufferCache::RunGarbageCollector() {
 	auto trigger  = m_trigger_gc_memory;
 	auto critical = m_critical_gc_memory;
 	if (VramBudget::GcEnabled() && m_graphics.CanReportMemoryUsage()) {
-		const auto budget = m_graphics.GetTotalMemoryBudget();
-		trigger           = VramBudget::BufferTrigger(budget);
-		critical          = VramBudget::BufferCritical(budget);
+		// The budget once per frame (this runs on the command-processor thread after every
+		// completed submission).
+		if (frame != m_budget_frame) {
+			m_budget_frame    = frame;
+			const auto budget = m_graphics.GetTotalMemoryBudget();
+			m_budget_trigger  = VramBudget::BufferTrigger(budget);
+			m_budget_critical = VramBudget::BufferCritical(budget);
+		}
+		trigger  = m_budget_trigger;
+		critical = m_budget_critical;
 	}
 	if (m_total_used_memory < trigger) {
 		return;

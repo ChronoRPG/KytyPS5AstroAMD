@@ -5533,13 +5533,18 @@ bool TextureCache::RunBudgetGarbageCollector(uint64_t frame) {
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return false; // no driver budget: the stock collection
 	}
+	// Once per frame (this runs on the command-processor thread after every completed submission;
+	// images are retired at most once per frame anyway).
+	if (frame == m_budget_frame) {
+		return true;
+	}
+	m_budget_frame    = frame;
 	const auto budget = m_graphics.GetTotalMemoryBudget();
 	m_budget_last     = budget;
 	const auto plan   = VramBudget::PlanImages(budget, m_total_used_memory, m_pressure_frames);
-	if (!plan.retire || frame == m_budget_frame) {
+	if (!plan.retire) {
 		return true;
 	}
-	m_budget_frame     = frame;
 	const auto before  = m_idle_freed;
 	m_budget_freed_bytes += RetireUnusedImages(frame, plan.age_frames, 256, plan.bytes);
 	m_budget_freed += m_idle_freed - before;

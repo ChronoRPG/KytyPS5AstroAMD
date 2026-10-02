@@ -15,8 +15,9 @@
 // ones, so on cards below ~16 GB both run all the time, re-create and re-upload what every frame
 // uses, and the startup budget misses the budget other programs leave later.
 //
-// With the switch on, at every collection the planning budget B (GraphicContext::
-// GetTotalMemoryBudget: the driver's VK_EXT_memory_budget budget minus a reserve) is read again and:
+// With the switch on, once per frame the planning budget B (GraphicContext::GetTotalMemoryBudget: the
+// driver's VK_EXT_memory_budget budget minus a reserve) is read again (the collectors run on the
+// command-processor thread after every completed submission, so not per collection) and:
 //   - images: above ImageTrigger(B) the collector frees, once per frame and oldest first, clean
 //     images not used for AgeFrames() frames (a quarter of that, at least 4, above Critical(B)),
 //     until usage is back at the trigger; never a GPU-modified, bound or target image, never a

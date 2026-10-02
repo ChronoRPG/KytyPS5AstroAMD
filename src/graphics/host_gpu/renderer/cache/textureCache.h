@@ -473,9 +473,9 @@ private:
 	uint64_t           m_pressure_frame       = 0;
 	uint64_t           m_pressure_freed_bytes = 0;
 	// KYTY_VRAM_GC_BUDGET (graphics/host_gpu/vramBudget.h): frame-aged collection against the
-	// budget at each collection. Returns true when it handled this collection.
+	// budget once per frame. Returns true when it handled this collection.
 	bool               RunBudgetGarbageCollector(uint64_t frame);
-	uint64_t           m_budget_frame       = 0;
+	uint64_t           m_budget_frame       = UINT64_MAX;
 	uint64_t           m_budget_freed_bytes = 0;
 	uint64_t           m_budget_freed       = 0;
 	uint64_t           m_budget_last        = 0; // planning budget at the last collection
