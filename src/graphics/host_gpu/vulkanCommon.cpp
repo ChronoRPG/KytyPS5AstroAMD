@@ -2,8 +2,18 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/spirvLocalArrays.h"
+
+#include <spirv-tools/libspirv.hpp>
 
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <set>
+#include <string>
+#include <vector>
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
@@ -123,7 +133,78 @@ void RequireVulkanSuccess(vk::Result result, const char* operation) {
 	}
 }
 
+namespace {
+
+// KYTY_FUNCTION_ARRAY_SHRINK=1 (default 0: off): shader modules get their per-invocation
+// (Function storage) arrays shrunk to the indices they can reach (spirvLocalArrays.h). The driver
+// reserves local memory for the largest per-thread footprint of any pipeline times every thread the
+// GPU keeps resident and never returns it; the recompiler's 8192-dword LDS emulation in vertex and
+// pixel shaders made that 3.9 GiB on an RTX 3090 (Astro Bot's galaxy map), where the pixel shaders
+// only reach 96 dwords. A rewritten module that fails spirv-val is not used (logged once).
+bool FunctionArrayShrinkEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_FUNCTION_ARRAY_SHRINK");
+		const bool  on    = value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+		if (on) {
+			std::printf("Kyty Function-storage arrays: shrunk to their proven index bound "
+			            "(KYTY_FUNCTION_ARRAY_SHRINK)\n");
+			std::fflush(stdout);
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+std::vector<uint32_t> ShrinkFunctionArrays(std::span<const uint32_t> code) {
+	std::vector<uint32_t> shrunk;
+	const auto            result = SpirvLocalArrays::Shrink(code, shrunk);
+	if (!result.changed) {
+		return {};
+	}
+	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+	std::string          messages;
+	tools.SetMessageConsumer([&messages](spv_message_level_t, const char*, const spv_position_t&,
+	                                     const char* message) {
+		if (messages.size() < 512) {
+			messages += message;
+			messages += "; ";
+		}
+	});
+	const bool valid = tools.Validate(shrunk);
+	static std::mutex                   log_mutex;
+	static std::set<std::string>        logged;
+	std::string                         arrays;
+	for (const auto& array: result.arrays) {
+		char part[160];
+		std::snprintf(part, sizeof(part), "%s%s %u -> %u", arrays.empty() ? "" : ", ",
+		              array.name.empty() ? "array" : array.name.c_str(), array.old_length, array.new_length);
+		arrays += part;
+	}
+	{
+		std::scoped_lock lock(log_mutex);
+		if (logged.insert(arrays + (valid ? "" : " invalid")).second) {
+			std::printf("Kyty Function-storage arrays (KYTY_FUNCTION_ARRAY_SHRINK): %s elements, %llu -> %llu "
+			            "bytes per invocation%s%s\n",
+			            arrays.c_str(), static_cast<unsigned long long>(result.bytes_before),
+			            static_cast<unsigned long long>(result.bytes_after),
+			            valid ? "" : "; the rewritten module failed validation, the original is used: ",
+			            valid ? "" : messages.c_str());
+			std::fflush(stdout);
+		}
+	}
+	return valid ? shrunk : std::vector<uint32_t> {};
+}
+
+} // namespace
+
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
+	std::vector<uint32_t> shrunk;
+	if (FunctionArrayShrinkEnabled()) {
+		shrunk = ShrinkFunctionArrays(code);
+		if (!shrunk.empty()) {
+			code = shrunk;
+		}
+	}
 	vk::ShaderModuleCreateInfo create_info {};
 	create_info.codeSize    = code.size_bytes();
 	create_info.pCode       = code.data();
