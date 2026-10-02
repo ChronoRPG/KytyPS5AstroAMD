@@ -1725,19 +1725,30 @@ void CheckDppInactiveSource(VulkanHarness *vulkan) {
 
 // KYTY_LANE_REDUCTIONS: a v_max_u32 DPP row_shr scan (1, 2, 4, 8) read by v_readlane at each
 // row's last lane (wave32: 15, 31) or, after V_PERMLANEX16, at each row pair's last lane (wave64:
-// 31, 63) on full waves of distinct data. The native subgroup reduction and the emulated scan
+// 31, 63) on full waves of distinct data, with every lane enabled by s_mov exec, -1 or as EXEC =
+// m | ~m (s_orn2_saveexec of a copy of EXEC). The native subgroup reduction and the emulated scan
 // must both give each row's (pair's) maximum.
 void CheckLaneReductions(VulkanHarness *vulkan) {
   constexpr const char *name = "CodegenLaneReductions";
-  for (const u32 wave : {32u, 64u}) {
+  for (const u32 variant : {0u, 1u, 2u, 3u}) {
+    const u32 wave = (variant & 1u) != 0u ? 64u : 32u;
+    const bool complement = (variant & 2u) != 0u;
     TestCase test;
     test.name = name;
     auto &code = test.code;
     code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0)); // v_lshlrev_b32 v3, 2, v0
     AppendBufferLoadDword(&code, 1, 3);                  // v1 = data[lane]
     code.push_back(EncodeSopp(0x0c, 0));                 // s_waitcnt 0
-    code.push_back(wave == 64u ? EncodeSop1(0x04, 126, 193)  // s_mov_b64 exec, -1
-                               : EncodeSMovB32(126, 193));   // s_mov_b32 exec_lo, -1
+    if (!complement) {
+      code.push_back(wave == 64u ? EncodeSop1(0x04, 126, 193)  // s_mov_b64 exec, -1
+                                 : EncodeSMovB32(126, 193));   // s_mov_b32 exec_lo, -1
+    } else if (wave == 64u) {
+      code.push_back(EncodeSop1(0x04, 10, 126)); // s_mov_b64 s[10:11], exec
+      code.push_back(EncodeSop1(0x28, 12, 10));  // s_orn2_saveexec_b64 s[12:13], s[10:11]
+    } else {
+      code.push_back(EncodeSMovB32(10, 126));    // s_mov_b32 s10, exec_lo
+      code.push_back(EncodeSop1(0x40, 12, 10));  // s_orn2_saveexec_b32 s12, s10
+    }
     for (const u32 shift : {1u, 2u, 4u, 8u}) {
       code.push_back(EncodeVop2(0x14, 1, 250, 1));       // v_max_u32 v1, v1 row_shr:n, v1
       code.push_back(EncodeVop2Dpp(1, 0x110u + shift));
@@ -1784,7 +1795,19 @@ void CheckLaneReductions(VulkanHarness *vulkan) {
       ScopedCodegenOptions scope(options);
       scan_words = RunCollect(vulkan, test, wave + 2u, &scan_spirv);
     }
-    const auto stage = wave == 64u ? "wave64 row pairs" : "wave32 rows";
+    const auto stage = wave == 64u ? (complement ? "wave64 row pairs, EXEC = m | ~m"
+                                                 : "wave64 row pairs")
+                                   : (complement ? "wave32 rows, EXEC = m | ~m" : "wave32 rows");
+    if (CountSpirv(native_spirv, "OpGroupNonUniformUMax") != 2u) {
+      // The IR the match saw, for the failure below.
+      CodegenOptions options = GetCodegenOptions();
+      options.lane_reductions = true;
+      ScopedCodegenOptions scope(options);
+      std::fprintf(stderr, "%s (%s): IR\n%s\n", name, stage,
+                   ShaderRecompiler::IR::ProgramToString(
+                       CompileCase(test, vulkan->SubgroupSize()).program)
+                       .c_str());
+    }
     Require(name, stage,
             CountSpirv(native_spirv, "OpGroupNonUniformUMax") == 2u &&
                 CountSpirv(scan_spirv, "OpGroupNonUniformUMax") == 0u,
@@ -1792,7 +1815,7 @@ void CheckLaneReductions(VulkanHarness *vulkan) {
     RequireEqualWords(name, stage, expected, native_words);
     RequireEqualWords(name, stage, expected, scan_words);
   }
-  std::printf("[codegen] %-32s ok (wave32 rows, wave64 row pairs)\n", name);
+  std::printf("[codegen] %-32s ok (wave32 rows, wave64 row pairs; both EXEC forms)\n", name);
 }
 
 // KYTY_DISPATCHER_CAP: a guest loop that never ends in an irreducible CFG (the dispatcher

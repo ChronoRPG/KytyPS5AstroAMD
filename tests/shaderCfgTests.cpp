@@ -9509,17 +9509,29 @@ void TestCapturedBufferAtomicsX2() {
 // other row's last lane, of each row pair's last lane (wave64: lanes 31 and 63). A partly filled
 // host subgroup lacks lanes the scan and v_readlane would read, so each read becomes a native
 // subgroup reduction (KYTY_LANE_REDUCTIONS); the same code with a different last shift, or with
-// KYTY_LANE_REDUCTIONS=0, stays a scan.
+// KYTY_LANE_REDUCTIONS=0, stays a scan. Every lane is enabled either by s_mov exec, -1 or as the
+// complement form EXEC = m | ~m (s_orn2_saveexec of a copy of EXEC), which reaches the emitter as
+// a mask test or, after upstream's wave32 lane-mask projection, as p || !p.
 void TestWaveRowReduction() {
   const auto native_reductions = [](uint32_t last_control, bool row_pairs,
-                                    bool lane_reductions = true) {
-    std::vector<uint32_t> shader = {
-        row_pairs ? EncodeSop1(0x04, 126, 193) : EncodeSMovB32(126, 193), // s_mov_b64 exec, -1
+                                    bool lane_reductions = true, bool complement = false) {
+    std::vector<uint32_t> shader;
+    if (!complement) {
+      shader.push_back(row_pairs ? EncodeSop1(0x04, 126, 193)  // s_mov_b64 exec, -1
+                                 : EncodeSMovB32(126, 193));   // s_mov_b32 exec_lo, -1
+    } else if (row_pairs) {
+      shader.push_back(EncodeSop1(0x04, 10, 126)); // s_mov_b64 s[10:11], exec
+      shader.push_back(EncodeSop1(0x28, 12, 10));  // s_orn2_saveexec_b64 s[12:13], s[10:11]
+    } else {
+      shader.push_back(EncodeSMovB32(10, 126));    // s_mov_b32 s10, exec_lo
+      shader.push_back(EncodeSop1(0x40, 12, 10));  // s_orn2_saveexec_b32 s12, s10
+    }
+    shader.insert(shader.end(), {
         EncodeVop2(0x14, 1, 250, 0), EncodeVop2Dpp(0, 0x111), // v_max_u32 v1, v0 row_shr:1, v0
         EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x112), // v_max_u32 v1, v1 row_shr:2, v1
         EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x114),
         EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, last_control),
-    };
+    });
     const uint32_t lanes[2] = {row_pairs ? 31u : 15u, row_pairs ? 63u : 31u};
     if (row_pairs) {
       shader.insert(shader.end(), {
@@ -9560,6 +9572,9 @@ void TestWaveRowReduction() {
         "a scan with the wrong last shift was taken for a lane reduction");
   Check(native_reductions(0x118, false, false) == 0 && native_reductions(0x118, true, false) == 0,
         "KYTY_LANE_REDUCTIONS=0 still emitted native lane reductions");
+  Check(native_reductions(0x118, false, true, true) == 2 &&
+            native_reductions(0x118, true, true, true) == 2,
+        "a DPP row scan under EXEC = m | ~m did not become two lane reductions");
 }
 
 void TestNewShaderRecompilerBranchConditionForms() {

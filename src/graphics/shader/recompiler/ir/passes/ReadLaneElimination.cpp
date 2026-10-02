@@ -243,28 +243,27 @@ std::optional<LaneReduction> MatchLaneReduction(const Inst& read_lane, uint32_t 
 		result.lanes      = 16u;
 		return result;
 	}
-	// The row pair: select(every lane, op(scan, select(every lane, V_PERMLANEX16(scan, lane 15
-	// of the other row), old)), scan), read at lane 32h+31.
+	// The row pair: op(scan, V_PERMLANEX16(scan, lane 15 of the other row)), read at lane 32h+31.
+	// The translator writes each VGPR result as select(every lane, new, old); EliminateExecSelects
+	// (KYTY_EXEC_SELECTS) removes those whose old value no lane observes, so either form appears.
 	if (lane % 32u != 31u) {
 		return std::nullopt;
 	}
-	const auto* merged = value.TryInstruction();
-	if (merged == nullptr || merged->GetOpcode() != ValueOpcode::SelectU32 ||
-	    !IsEveryLane(merged->Arg(0))) {
-		return std::nullopt;
-	}
-	const auto  scan      = merged->Arg(2).Resolve();
-	const auto* operation = merged->Arg(1).Resolve().TryInstruction();
+	const auto written = [](Value written_value) {
+		written_value     = written_value.Resolve();
+		const auto* merge = written_value.TryInstruction();
+		return merge != nullptr && merge->GetOpcode() == ValueOpcode::SelectU32 &&
+		               IsEveryLane(merge->Arg(0))
+		           ? merge->Arg(1).Resolve()
+		           : written_value;
+	};
+	const auto* operation = written(value).TryInstruction();
 	if (operation == nullptr || !IsReduction(operation->GetOpcode())) {
 		return std::nullopt;
 	}
 	for (size_t index = 0; index < 2; index++) {
-		const auto* other = operation->Arg(index).Resolve().TryInstruction();
-		if (other == nullptr || other->GetOpcode() != ValueOpcode::SelectU32 ||
-		    !IsEveryLane(other->Arg(0)) || operation->Arg(1 - index).Resolve() != scan) {
-			continue;
-		}
-		const auto* permlane = other->Arg(1).Resolve().TryInstruction();
+		const auto scan     = operation->Arg(1 - index).Resolve();
+		const auto* permlane = written(operation->Arg(index)).TryInstruction();
 		if (permlane == nullptr || permlane->GetOpcode() != ValueOpcode::Permlane16U32 ||
 		    !permlane->Flags<PermlaneFlags>().x16 || permlane->Arg(0).Resolve() != scan ||
 		    permlane->Arg(1).Resolve() != Value(0xffffffffu) ||

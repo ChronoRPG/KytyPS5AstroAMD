@@ -858,6 +858,11 @@ static uint32_t EmitLaneReduction(ValueEmitContext& ctx, const IR::LaneReduction
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (GetCodegenOptions().lane_reductions) {
 		if (const auto reduction = IR::MatchLaneReduction(inst, ctx.state.program.wave_size)) {
+			// One reduction per wave: the second half of a wave64 that one invocation runs
+			// (lane_count 2) takes the first half's result, which covers the same lanes.
+			if (ctx.half == 1) {
+				return ctx.other_half->Def(IR::Value(const_cast<IR::Inst*>(&inst)));
+			}
 			return EmitLaneReduction(ctx, *reduction);
 		}
 	}
