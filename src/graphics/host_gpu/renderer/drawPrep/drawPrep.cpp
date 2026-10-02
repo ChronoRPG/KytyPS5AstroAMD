@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
+#include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/repeatTrace.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
@@ -1194,6 +1195,7 @@ void PrintDrawPrepSummary() {
 
 void Engine::Commit(Slot& slot) {
 	Profiler::ScopedFrameWait commit_time(Profiler::FrameWait::DrawPrepCommit);
+	CommitStats::BeginDraw();
 	auto&      scheduler = m_renderer.GetCommandScheduler();
 	auto&      executor  = m_renderer.GetRenderExecutor();
 	const auto previous  = scheduler.BindRegisters(slot.registers.context,
@@ -1233,6 +1235,7 @@ void Engine::Commit(Slot& slot) {
 	if (m_after_commit) {
 		m_after_commit();
 	}
+	CommitStats::EndDraw();
 	PrintDrawPrepSummary();
 }
 

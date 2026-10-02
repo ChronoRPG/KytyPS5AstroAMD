@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
+#include "graphics/host_gpu/renderer/drawPrep/commitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/meshIndirect.h"
@@ -2001,6 +2002,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::RefreshShaders");
 		RefreshShaders(buffer, draw, state);
 	}
+	CommitStats::Mark(CommitStats::Phase::Programs);
 	// A stage whose shader the recompiler skipped (an unresolvable runtime descriptor,
 	// KYTY_SRT_VARIANT_READS) leaves its program empty: drop the draw.
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
@@ -2073,6 +2075,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		return false;
 	}
 
+	CommitStats::Mark(CommitStats::Phase::Targets);
 	return true;
 }
 
@@ -2305,6 +2308,209 @@ static void CountBindingRepeats(std::span<const ShaderStageRuntime* const> stage
 	}
 }
 
+// KYTY_CP_COMMIT_STATS (commitStats.h): what a recorded draw bound, as hashes.
+namespace {
+
+class ShapeWords {
+public:
+	void Add(uint64_t word) { m_words.push_back(word); }
+	void AddFloat(float value) { m_words.push_back(std::bit_cast<uint32_t>(value)); }
+	template <typename Handle>
+	void AddHandle(Handle handle) {
+		m_words.push_back(static_cast<uint64_t>(
+		    reinterpret_cast<uintptr_t>(static_cast<typename Handle::CType>(handle))));
+	}
+	void AddBufferInfo(const vk::DescriptorBufferInfo& info) {
+		AddHandle(info.buffer);
+		Add(info.offset);
+		Add(info.range);
+	}
+	void AddValue(const ShaderRecompiler::IR::DescriptorValue& value, bool mask_address) {
+		Add(value.dword_count);
+		for (uint32_t i = 0; i < value.dword_count && i < value.dwords.size(); i++) {
+			auto word = value.dwords[i];
+			if (mask_address && i == 0) {
+				word = 0;
+			} else if (mask_address && i == 1) {
+				word &= 0xffff0000u;
+			}
+			Add(word);
+		}
+	}
+	[[nodiscard]] uint64_t Finish() {
+		const auto hash = CommitStats::Hash(m_words.data(), m_words.size() * sizeof(uint64_t));
+		m_words.clear();
+		return hash;
+	}
+
+private:
+	std::vector<uint64_t> m_words;
+};
+
+} // namespace
+
+static CommitStats::DrawShape MakeCommitShape(
+    const CommandBuffer& buffer, std::span<PreparedBindings* const> stages,
+    const PipelineCache::Pipeline& pipeline, const RenderState& rendering,
+    const GraphicsDynamicStateShadow& dynamic, const PreparedVertexBuffers& vertex,
+    const PreparedIndexBuffer& index, const DrawCallInfo& draw, const DrawEmitInfo& emit,
+    const DrawIndexBufferSource& index_source, vk::PipelineStageFlags shader_write_stages) {
+	static thread_local ShapeWords words;
+	CommitStats::DrawShape shape;
+	shape.rendering_serial = buffer.ActiveRenderingSerial();
+	shape.command = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+	    static_cast<VkCommandBuffer>(buffer.Identity())));
+	shape.pipeline = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+	    static_cast<VkPipeline>(pipeline.pipeline)));
+	shape.shader_writes = static_cast<bool>(shader_write_stages);
+	// Structure: programs, texture views and layouts, samplers, attachments.
+	for (const auto* stage: stages) {
+		words.Add(reinterpret_cast<uintptr_t>(stage->runtime->program));
+		for (const auto& image: stage->images) {
+			words.AddHandle(image.image_view);
+			words.Add(static_cast<uint64_t>(image.layout));
+			for (const auto view: image.mip_views) {
+				words.AddHandle(view);
+			}
+		}
+		for (const auto sampler: stage->samplers) {
+			words.AddHandle(sampler);
+		}
+	}
+	for (uint32_t i = 0; i < rendering.num_color_attachments; i++) {
+		words.AddHandle(rendering.color_attachments[i].image_view);
+		words.Add(static_cast<uint64_t>(rendering.color_attachments[i].image_layout));
+	}
+	words.AddHandle(rendering.depth_stencil_attachment.image_view);
+	words.Add(static_cast<uint64_t>(rendering.depth_stencil_attachment.image_layout));
+	shape.structure = words.Finish();
+	// Dynamic state.
+	words.Add(dynamic.viewport_count);
+	for (uint32_t i = 0; i < dynamic.viewport_count && i < dynamic.viewports.size(); i++) {
+		const auto& v = dynamic.viewports[i];
+		words.AddFloat(v.x);
+		words.AddFloat(v.y);
+		words.AddFloat(v.width);
+		words.AddFloat(v.height);
+		words.AddFloat(v.minDepth);
+		words.AddFloat(v.maxDepth);
+		const auto& s = dynamic.scissors[i];
+		words.Add(static_cast<uint32_t>(s.offset.x));
+		words.Add(static_cast<uint32_t>(s.offset.y));
+		words.Add(s.extent.width);
+		words.Add(s.extent.height);
+	}
+	words.AddFloat(dynamic.line_width);
+	for (const auto value: dynamic.blend_constants) {
+		words.AddFloat(value);
+	}
+	words.Add(dynamic.depth_test_enable);
+	words.Add(dynamic.depth_write_enable);
+	words.Add(static_cast<uint64_t>(dynamic.depth_compare_op));
+	words.Add(dynamic.depth_bias_enable);
+	for (const auto value: dynamic.depth_bias) {
+		words.AddFloat(value);
+	}
+	words.Add(dynamic.stencil_test_enable);
+	for (const auto* op: {&dynamic.stencil_front, &dynamic.stencil_back}) {
+		words.Add(static_cast<uint64_t>(op->failOp));
+		words.Add(static_cast<uint64_t>(op->passOp));
+		words.Add(static_cast<uint64_t>(op->depthFailOp));
+		words.Add(static_cast<uint64_t>(op->compareOp));
+		words.Add(op->compareMask);
+		words.Add(op->writeMask);
+		words.Add(op->reference);
+	}
+	words.Add(dynamic.color_write_count);
+	for (uint32_t i = 0; i < dynamic.color_write_count && i < dynamic.color_write.size(); i++) {
+		words.Add(dynamic.color_write[i]);
+	}
+	words.Add(static_cast<uint32_t>(dynamic.feedback));
+	words.Add(static_cast<uint32_t>(dynamic.cull_mode));
+	words.Add(static_cast<uint64_t>(dynamic.front_face));
+	words.Add(dynamic.depth_bounds_test_enable);
+	words.AddFloat(dynamic.depth_bounds[0]);
+	words.AddFloat(dynamic.depth_bounds[1]);
+	shape.dynamic = words.Finish();
+	// Per-draw data.
+	for (const auto* stage: stages) {
+		for (const auto& info: stage->buffers) {
+			words.AddBufferInfo(info);
+		}
+	}
+	shape.buffers = words.Finish();
+	for (const auto* stage: stages) {
+		for (const auto dword: stage->shader_data) {
+			words.Add(dword);
+		}
+	}
+	shape.push = words.Finish();
+	for (const auto* stage: stages) {
+		words.AddBufferInfo(stage->flattened_srt);
+		words.AddBufferInfo(stage->shader_data_buffer);
+	}
+	shape.tables = words.Finish();
+	words.AddHandle(index.buffer);
+	words.Add(index.offset);
+	words.Add(static_cast<uint64_t>(index.type));
+	shape.index = words.Finish();
+	for (uint32_t i = 0; i < vertex.count; i++) {
+		words.AddHandle(vertex.buffers[i]);
+		words.Add(vertex.offsets[i]);
+		words.Add(vertex.sizes[i]);
+	}
+	shape.vertex = words.Finish();
+	// Cross-frame keys: the complete binding inputs, and the structure alone.
+	for (const auto* stage: stages) {
+		const auto& resources = *stage->runtime->resources;
+		words.Add(reinterpret_cast<uintptr_t>(stage->runtime->program));
+		for (const auto& value: resources.buffers) {
+			words.AddValue(value, false);
+		}
+		for (const auto& value: resources.images) {
+			words.AddValue(value, false);
+		}
+		for (const auto& value: resources.samplers) {
+			words.AddValue(value, false);
+		}
+		for (const auto dword: resources.flattened_srt) {
+			words.Add(dword);
+		}
+		for (const auto dword: resources.user_data) {
+			words.Add(dword);
+		}
+	}
+	words.Add(draw.index_count);
+	words.Add(draw.instance_count);
+	words.Add(static_cast<uint32_t>(emit.vertex_offset));
+	words.Add(emit.first_vertex);
+	words.Add(emit.first_instance);
+	words.Add(index_source.address);
+	shape.bind_input = words.Finish();
+	words.Add(shape.pipeline);
+	for (uint32_t i = 0; i < rendering.num_color_attachments; i++) {
+		words.AddHandle(rendering.color_attachments[i].image_view);
+	}
+	words.AddHandle(rendering.depth_stencil_attachment.image_view);
+	for (const auto* stage: stages) {
+		const auto& resources = *stage->runtime->resources;
+		words.Add(reinterpret_cast<uintptr_t>(stage->runtime->program));
+		for (const auto& value: resources.buffers) {
+			words.AddValue(value, true);
+		}
+		for (const auto& value: resources.images) {
+			words.AddValue(value, false);
+		}
+		for (const auto& value: resources.samplers) {
+			words.AddValue(value, false);
+		}
+	}
+	words.Add(draw.index_count);
+	words.Add(draw.instance_count);
+	shape.struct_input = words.Finish();
+	return shape;
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -2437,6 +2643,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			descriptor_stages[stage_count++] = &*bindings.pixel;
 		}
 	}
+	CommitStats::Mark(CommitStats::Phase::PrepareBindings);
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::PrepareGraphicsBindings");
@@ -2478,6 +2685,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (indirect != nullptr) {
 		indirect_buffers = ObtainIndirectBuffers(buffer, *indirect);
 	}
+	CommitStats::Mark(CommitStats::Phase::VertexIndex);
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
@@ -2536,6 +2744,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	const auto& pipeline = *pipeline_object;
+	CommitStats::Mark(CommitStats::Phase::Pipeline);
 	if (mesh_indirect) {
 		// The conversion of the argument record into this draw's dispatches and draw dwords:
 		// outside rendering (it ends the active instance, before the targets are acquired for the
@@ -2569,6 +2778,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages, bounded ? &written : nullptr);
+	CommitStats::Mark(CommitStats::Phase::AcquireTargets);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -2605,6 +2815,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::CommitBindings");
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	}
+	CommitStats::Mark(CommitStats::Phase::CommitBindings);
 	if (!mesh_active) CommitIndexBuffer(vk_buffer, index_binding);
 
 	{
@@ -2779,6 +2990,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x700u);
 	}
+	if (CommitStats::Enabled()) [[unlikely]] {
+		CommitStats::Mark(CommitStats::Phase::Emit);
+		CommitStats::NoteRecorded(MakeCommitShape(buffer, stages, pipeline, rendering,
+		                                          m_dynamic_state, vertex_bindings, index_binding,
+		                                          draw, emit, index_source, shader_write_stages));
+		// The hashing above is the diagnostic's own cost: not counted in any phase.
+		CommitStats::Skip();
+	}
 }
 
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
@@ -2865,6 +3084,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	// The member state is reused; the render mutex held above makes it exclusive to this draw.
 	auto& state = *m_draw_state;
 	state.Reset();
+	CommitStats::Mark(CommitStats::Phase::Setup);
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
@@ -2964,6 +3184,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	// The member state is reused; the render mutex held above makes it exclusive to this draw.
 	auto& state = *m_draw_state;
 	state.Reset();
+	CommitStats::Mark(CommitStats::Phase::Setup);
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
