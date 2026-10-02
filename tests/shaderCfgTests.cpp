@@ -13341,6 +13341,42 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
   CompilePixelRuntime(vcc_params, vcc_input);
 }
 
+void TestRegisteredShaderCodeIdentity() {
+  uint32_t shader[] = {EncodeSopp(0x00), EncodeSopp(0x01)};
+  HW::ComputeShaderInfo regs{};
+  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+  regs.cs_regs.num_thread_x = 64;
+  regs.cs_regs.num_thread_y = regs.cs_regs.num_thread_z = 1;
+  ShaderMappedData mapped{};
+  mapped.code_size_bytes = sizeof(shader);
+  const auto prepare = [&] {
+    ShaderComputeInputInfo input{};
+    return PrepareProgram(regs, HW::ShaderRegisters{}, input).hash;
+  };
+  const auto before = ShaderMapGeneration();
+  ShaderMapUserData(regs.cs_regs.data_addr, mapped);
+  Check(ShaderMapGeneration() > before, "shader registration did not invalidate generation memo");
+  const auto first = prepare();
+  Check(first == XXH3_64bits(shader, sizeof(shader)), "registered identity differs from exact code hash");
+  Check(prepare() == first, "memo hit changed registered identity");
+  shader[0] = EncodeSopp(0x00, 1);
+  ShaderMapUserData(regs.cs_regs.data_addr, mapped);
+  const auto second = prepare();
+  Check(second != first && second == XXH3_64bits(shader, sizeof(shader)),
+        "same-address re-registration retained stale code identity");
+  const auto remapped = ShaderMapGeneration();
+  ShaderUnmapCode(regs.cs_regs.data_addr + sizeof(uint32_t), sizeof(uint32_t));
+  const auto* flag = std::getenv("KYTY_REGISTERED_SHADER_CODE");
+  const bool enabled = flag != nullptr && std::strcmp(flag, "0") != 0;
+  Check(enabled ? ShaderMapGeneration() > remapped : ShaderMapGeneration() == remapped,
+        "partial code unmap did not respect registration flag");
+  const auto removed = ShaderMapGeneration();
+  ShaderUnmapCode(regs.cs_regs.data_addr, sizeof(shader));
+  Check(ShaderMapGeneration() == removed, "code identity survived overlapping unmap");
+  ShaderMapUserData(regs.cs_regs.data_addr, mapped);
+  Check(prepare() == second, "re-registration after unmap did not restore identity");
+}
+
 void TestComputeLdsAllocationIdentity() {
   const uint32_t shader[] = {
       EncodeDs0(0x0d, 4288u), // ds_write_b32 v0, v1 offset:4288
@@ -14202,6 +14238,10 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--registered-shader-code-only") == 0) {
+    TestRegisteredShaderCodeIdentity();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--isa-accuracy-only") == 0) {
     TestRdna2IsaAccuracyDecode();
     TestRdna2LdsWaitcntBarrierAndFloatControls();
