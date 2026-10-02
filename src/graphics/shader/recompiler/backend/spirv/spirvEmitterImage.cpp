@@ -1400,7 +1400,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				                                     ConstantU32(state, spv::MemorySemanticsMaskNone),
 				                                     ctx.Arg(inst, 2));
 			           }
-			           EmitDeviceAtomicMemoryBarrier(state);
+			           // This pointer names storage-image memory, not a storage buffer.
+			           state.builder.AddFunction(
+			               spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
+			               ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
+			                                     spv::MemorySemanticsImageMemoryMask));
 			           return old;
 		           }));
 		return;
