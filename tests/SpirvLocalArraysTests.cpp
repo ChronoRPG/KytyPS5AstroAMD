@@ -166,6 +166,39 @@ void TestWholeArrayUse() {
 	Expect(!result.changed, "whole-array use leaves the module alone");
 }
 
+void TestNoFunctionArrays() {
+	// No Function-storage array (only a scalar Function variable): the declarations pre-scan returns
+	// before any analysis, the module is unchanged and has no Function-array bytes.
+	const auto module = Assemble(R"(
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %out_var
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %out_var Location 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+     %uint_4 = OpConstant %uint 4
+      %arr4 = OpTypeArray %uint %uint_4
+%ptr_out_uint = OpTypePointer Output %uint
+%ptr_fn_uint = OpTypePointer Function %uint
+    %out_var = OpVariable %ptr_out_uint Output
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+     %scalar = OpVariable %ptr_fn_uint Function
+               OpStore %scalar %uint_4
+      %value = OpLoad %uint %scalar
+               OpStore %out_var %value
+               OpReturn
+               OpFunctionEnd
+)");
+	Expect(Validate(module), "no-array module validates");
+	std::vector<uint32_t> out;
+	const Result          result = Shrink(module, out);
+	Expect(!result.changed && out.empty(), "no Function array: unchanged");
+	Expect(result.bytes_before == 0 && result.unbounded_arrays == 0, "no Function array: no bytes counted");
+}
+
 void TestNotSpirv() {
 	const std::vector<uint32_t> garbage {1, 2, 3, 4, 5, 6};
 	std::vector<uint32_t>       out;
@@ -215,6 +248,7 @@ int main(int argc, char** argv) {
 	TestBoundedLds();
 	TestUnboundedIndex();
 	TestWholeArrayUse();
+	TestNoFunctionArrays();
 	TestNotSpirv();
 	if (g_failures != 0) {
 		std::printf("%d failure(s)\n", g_failures);

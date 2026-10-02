@@ -373,6 +373,34 @@ std::pair<uint32_t, uint32_t> IdOperands(uint16_t op, uint32_t count) {
 	}
 }
 
+// Whether any Function-storage pointer type points to an array type. Types are declared before the
+// first function, so this reads only the declarations: most modules have no such type and need no
+// analysis.
+bool HasFunctionArrayPointer(std::span<const uint32_t> module) {
+	if (module.size() < 5 || module[0] != Magic) {
+		return false;
+	}
+	std::unordered_set<uint32_t> arrays;
+	for (size_t offset = 5; offset < module.size();) {
+		const auto count = module[offset] >> 16u;
+		const auto op    = module[offset] & 0xffffu;
+		if (count == 0 || offset + count > module.size()) {
+			return true; // malformed: let the full parse decide
+		}
+		if (op == spv::OpFunction) {
+			return false;
+		}
+		if (op == spv::OpTypeArray && count >= 4) {
+			arrays.insert(module[offset + 1]);
+		} else if (op == spv::OpTypePointer && count >= 4 && module[offset + 2] == spv::StorageClassFunction &&
+		           arrays.contains(module[offset + 3])) {
+			return true;
+		}
+		offset += count;
+	}
+	return false;
+}
+
 } // namespace
 
 void SetMaxSubgroupSize(uint32_t size) noexcept {
@@ -384,6 +412,9 @@ void SetMaxSubgroupSize(uint32_t size) noexcept {
 Result Shrink(std::span<const uint32_t> module, std::vector<uint32_t>& out) {
 	Result result;
 	out.clear();
+	if (!HasFunctionArrayPointer(module)) {
+		return result;
+	}
 	Analysis analysis(module);
 	if (!analysis.Parse()) {
 		return result;
