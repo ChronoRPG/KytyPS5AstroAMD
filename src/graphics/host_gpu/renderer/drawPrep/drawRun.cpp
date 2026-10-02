@@ -31,7 +31,10 @@ static int64_t ParseMode(const char* value) {
 	return std::strcmp(value, "verify") == 0 ? 2 : 1;
 }
 
-Live::Switch g_mode("KYTY_DRAW_RUN", ParseMode);
+// Activity is not maintained while off. Invalidate certificates across every mode switch so a
+// record preceding an off period cannot certify operations performed during that period.
+Live::Switch g_mode("KYTY_DRAW_RUN", ParseMode,
+                    [](int64_t, int64_t) { NoteForeignActivity(); });
 Live::Switch g_acquire("KYTY_DRAW_RUN_ACQUIRE", Live::ParseDefaultOff);
 Live::Switch g_push("KYTY_DRAW_RUN_PUSH", Live::ParseDefaultOff);
 

@@ -48294,15 +48294,33 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--draw-run-live") == 0) {
     // KYTY_DRAW_RUN* as live switches (ab-testing.md): on through a staged change, then off again.
     VulkanHarness vulkan;
+    const auto off_certificate = DrawRun::ActivityEpoch();
     Live::Testing::StageText("KYTY_DRAW_RUN=1\nKYTY_DRAW_RUN_ACQUIRE=1\nKYTY_DRAW_RUN_PUSH=1\n");
     Live::OnCpFlip();
+    Require("DrawRunLive", "off-to-on invalidates certificates",
+            DrawRun::ActivityEpoch() != off_certificate,
+            "a certificate survived operations whose activity was not tracked while off");
     vulkan.CheckDrawRun();
     vulkan.CheckDrawRun(true);
     vulkan.CheckDrawRun(false, true);
     vulkan.CheckDrawRun(true, true);
+    const auto on_certificate = DrawRun::ActivityEpoch();
     Live::Testing::StageText("KYTY_DRAW_RUN=\nKYTY_DRAW_RUN_ACQUIRE=\nKYTY_DRAW_RUN_PUSH=\n");
     Live::OnCpFlip();
+    Require("DrawRunLive", "on-to-off invalidates certificates",
+            DrawRun::ActivityEpoch() != on_certificate,
+            "a pre-switch certificate remained valid");
     vulkan.CheckDrawRun();
+    const auto stale_certificate = DrawRun::ActivityEpoch();
+    Live::Testing::StageText("KYTY_DRAW_RUN=verify\nKYTY_DRAW_RUN_ACQUIRE=1\nKYTY_DRAW_RUN_PUSH=1\n");
+    Live::OnCpFlip();
+    Require("DrawRunLive", "off-to-verify invalidates certificates",
+            DrawRun::ActivityEpoch() != stale_certificate,
+            "verify accepted a certificate from the off period");
+    vulkan.CheckDrawRun();
+    vulkan.CheckDrawRun(true);
+    vulkan.CheckDrawRun(false, true);
+    vulkan.CheckDrawRun(true, true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--eop-timestamps-only") == 0) {
