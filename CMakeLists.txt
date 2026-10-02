@@ -209,6 +209,15 @@ if(KYTY_MARCH)
 	message(STATUS "Host code for -march=${KYTY_MARCH}")
 endif()
 
+# zstd enables ASM. The first configure detects clang-cl's ASM as MSVC-like, but CMake does not save that
+# (CMakeASMCompiler.cmake.in). On every later CMake run in the same directory the Ninja generator then
+# takes the compiler for a GNU one and writes all paths with forward slashes: a full rebuild, and new
+# anonymous-namespace names (they hash the source path, see PGO below). Keep the first run's answer.
+if(KYTY_CLANG_CL)
+	set(CMAKE_ASM_SIMULATE_ID MSVC)
+	set(CMAKE_ASM_COMPILER_FRONTEND_VARIANT MSVC)
+endif()
+
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 
 # Profile-guided optimization (clang and clang-cl). Use a separate build directory for each step:
