@@ -790,6 +790,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		}
 	}
 
+	if (result == vk::Result::eErrorDeviceLost) {
+		DumpDeviceLossDiagnostics(graphics, tick);
+	}
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,

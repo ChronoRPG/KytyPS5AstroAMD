@@ -795,6 +795,22 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
+	if (m_graphics.diagnostic_checkpoints_enabled && m_buffer) {
+		const auto* marker = RecordDiagnosticCheckpoint({.op        = op,
+		                                                 .submit_id = submit_id,
+		                                                 .arg0      = arg0,
+		                                                 .arg1      = arg1,
+		                                                 .arg2      = arg2,
+		                                                 .arg3      = arg3,
+		                                                 .arg4      = arg4,
+		                                                 .tick = m_context.GetCommandScheduler().CurrentTick(),
+		                                                 .vs = m_shaders != nullptr ? m_shaders->GetVs().es_regs.data_addr : 0,
+		                                                 .ps = m_shaders != nullptr ? m_shaders->GetPs().ps_regs.data_addr : 0,
+		                                                 .cs = m_shaders != nullptr ? m_shaders->GetCs().cs_regs.data_addr : 0});
+		if (marker != nullptr) {
+			Handle().setCheckpointNV(marker);
+		}
+	}
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {

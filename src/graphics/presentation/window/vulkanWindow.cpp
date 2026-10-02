@@ -873,6 +873,36 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		index_type_uint8.pNext          = const_cast<void*>(create_info.pNext);
 		create_info.pNext               = &index_type_uint8;
 	}
+	vk::DeviceDiagnosticsConfigCreateInfoNV diagnostics_config {};
+	vk::PhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_features {};
+	if (HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+		vk::PhysicalDeviceDiagnosticsConfigFeaturesNV supported_diagnostics {};
+		vk::PhysicalDeviceFeatures2                   diagnostics_query {};
+		diagnostics_query.pNext = &supported_diagnostics;
+		physical_device.getFeatures2(&diagnostics_query);
+		if (supported_diagnostics.diagnosticsConfig) {
+			diagnostics_config.flags =
+			    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderDebugInfo |
+			    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableResourceTracking |
+			    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderErrorReporting;
+			diagnostics_config.pNext = const_cast<void*>(create_info.pNext);
+			diagnostics_features.diagnosticsConfig = VK_TRUE;
+			diagnostics_features.pNext = &diagnostics_config;
+			create_info.pNext = &diagnostics_features;
+		}
+	}
+	vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};
+		vk::PhysicalDeviceFeatures2        fault_query {};
+		fault_query.pNext = &supported_fault;
+		physical_device.getFeatures2(&fault_query);
+		if (supported_fault.deviceFault) {
+			device_fault.deviceFault      = VK_TRUE;
+			device_fault.deviceFaultVendorBinary = supported_fault.deviceFaultVendorBinary;
+			device_fault.pNext            = const_cast<void*>(create_info.pNext);
+			create_info.pNext             = &device_fault;
+			graphics.device_fault_enabled = true;
+		}
+	}
 	vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8 {};
 	if (graphics.maintenance8_enabled) {
 		maintenance8.maintenance8 = VK_TRUE;
@@ -1325,6 +1355,18 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
+		}
+		if (DeviceFaultDiagnosticsEnabled()) {
+		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+			graphic_ctx.diagnostic_checkpoints_enabled = true;
+		}
+		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		}
+		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+		}
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
