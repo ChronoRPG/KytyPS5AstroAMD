@@ -11,7 +11,9 @@ permissions:
 jobs:
   windows:
     if: github.repository == 'Jetsku/KytyPS5-experimental' || github.repository == 'Jetsku/KytyPS5'
-    runs-on: windows-2022
+    # Visual Studio 2026 18.10 (MSVC 14.51), as on the PC that records the PGO profile: standard-library
+    # functions only match their profile data when they are compiled from the same headers.
+    runs-on: windows-2025-vs2026
     steps:
       - name: Check out experimental source
         uses: actions/checkout@v4
