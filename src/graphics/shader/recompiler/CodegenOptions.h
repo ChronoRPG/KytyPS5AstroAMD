@@ -150,6 +150,12 @@ struct CodegenOptions {
 	// row or row pair. A partly filled host subgroup lacks lanes the scan would read; the reduction
 	// counts them as the operation's identity, as the guest shader's own masking makes them.
 	bool lane_reductions = true;
+	// KYTY_DISPATCHER_CAP=<n> (default 4096; 0: no cap): a program whose CFG cannot be structured runs
+	// as a dispatcher loop over its blocks (IR::Program::dispatcher_fallback), and an invocation
+	// leaves that loop after n block transitions. A guest loop that never ends (for example a trip
+	// count read from memory an unemulated pass left unwritten) then gives that invocation wrong
+	// results instead of hanging the GPU until a device reset. Structured programs are unaffected.
+	uint32_t dispatcher_cap = 4096;
 };
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.

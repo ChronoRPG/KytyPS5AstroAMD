@@ -9058,6 +9058,25 @@ void TestNewShaderRecompilerCfgIrreducibleDispatcher() {
   Check(SpirvContainsOpcode(result.spirv, 251),
         "dispatcher SPIR-V lacks OpSwitch");
   CheckSpirvBinaryValidates(result.spirv);
+
+  // KYTY_DISPATCHER_CAP (default 4096): the loop counts its block transitions (an iteration Phi,
+  // a compare and an or in the header, an add in the continue block) and leaves at the cap;
+  // KYTY_DISPATCHER_CAP=0 emits it without them.
+  const auto saved = ShaderRecompiler::GetCodegenOptions();
+  auto codegen = saved;
+  codegen.dispatcher_cap = 0;
+  ShaderRecompiler::SetCodegenOptions(codegen);
+  const auto uncapped = RecompileForTest(shader, options);
+  ShaderRecompiler::SetCodegenOptions(saved);
+  CheckSpirvBinaryValidates(uncapped.spirv);
+  constexpr uint32_t OpIAdd = 128, OpLogicalOr = 166, OpUGreaterThanEqual = 174, OpPhi = 245;
+  const auto added = [&](uint32_t opcode) {
+    return SpirvInstructionOpcodeCount(result.spirv, opcode) -
+           SpirvInstructionOpcodeCount(uncapped.spirv, opcode);
+  };
+  Check(saved.dispatcher_cap == 4096u && added(OpUGreaterThanEqual) == 1u &&
+            added(OpLogicalOr) == 1u && added(OpPhi) == 1u && added(OpIAdd) == 1u,
+        "the dispatcher loop does not count its transitions against KYTY_DISPATCHER_CAP");
 }
 
 void TestNewShaderRecompilerDispatcherSpillsU32x3() {

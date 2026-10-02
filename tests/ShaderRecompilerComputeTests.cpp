@@ -47626,6 +47626,11 @@ int main(int argc, char **argv) {
     GiProbeTests::CheckLoopGuardEndsEndlessLoop(&vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--dispatcher-cap-only") == 0) {
+    VulkanHarness vulkan;
+    CodegenTests::CheckDispatcherCap(&vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--wave-reductions-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorDppInactiveSourcePreservesDestination());

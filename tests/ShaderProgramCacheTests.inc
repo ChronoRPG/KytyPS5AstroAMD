@@ -219,6 +219,7 @@ void CheckFingerprint() {
   options_differ("dpp_skip_inactive",
                  [](CodegenOptions &o) { o.dpp_skip_inactive = !o.dpp_skip_inactive; });
   options_differ("lane_reductions", [](CodegenOptions &o) { o.lane_reductions = !o.lane_reductions; });
+  options_differ("dispatcher_cap", [](CodegenOptions &o) { o.dispatcher_cap++; });
 
   // Host state the emitter reads.
   namespace Spirv = ShaderRecompiler::Spirv;
@@ -280,7 +281,8 @@ void CheckFingerprint() {
         "KYTY_LOOP_GUARD", "KYTY_LOOP_GUARD_SHADERS", "KYTY_SRT_VARIANT_READS",
         "KYTY_NATIVE_INDIRECT_MESH", "KYTY_LDS_WAITCNT_BARRIER", "KYTY_LOD_STATS_MODE",
         "KYTY_SRT_COMPILED_RECIPES", "KYTY_SRT_DECODED_ROOTS", "KYTY_SRT_ARITHMETIC_TAPES",
-        "KYTY_REALTIME_CLOCK", "KYTY_DPP_SKIP_INACTIVE", "KYTY_LANE_REDUCTIONS"}) {
+        "KYTY_REALTIME_CLOCK", "KYTY_DPP_SKIP_INACTIVE", "KYTY_LANE_REDUCTIONS",
+        "KYTY_DISPATCHER_CAP"}) {
     Require(name, "codegen switch list", listed(required),
             std::string("the codegen switch list misses ") + required);
   }

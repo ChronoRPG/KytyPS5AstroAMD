@@ -938,6 +938,9 @@ if(BUILD_TESTING)
 	# S_MEMREALTIME reads the host GPU clock (KYTY_REALTIME_CLOCK): codegen and a timed GPU wait.
 	add_test(NAME s_memrealtime_clock
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --s-memrealtime-only)
+	# KYTY_DISPATCHER_CAP: an endless loop in a dispatcher-fallback shader ends on the GPU.
+	add_test(NAME dispatcher_cap
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatcher-cap-only)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)

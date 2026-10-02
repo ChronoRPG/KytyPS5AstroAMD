@@ -655,9 +655,32 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                          dispatcher.continue_label);
-	const auto done = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), done, pc,
+	// KYTY_DISPATCHER_CAP (from Senaxx's wolverine branch): a guest loop whose trip count comes from
+	// bad data (memory an unemulated pass left unwritten) hung the GPU until the driver reset it.
+	// The invocation leaves the dispatcher after a bounded number of block transitions instead:
+	// its results are wrong, the device survives. 0 emits the loop without the bound.
+	const auto cap            = GetCodegenOptions().dispatcher_cap;
+	uint32_t   iteration      = 0;
+	uint32_t   next_iteration = 0;
+	if (cap != 0) {
+		iteration      = state.builder.AllocateId();
+		next_iteration = state.builder.AllocateId();
+	}
+	const auto finished = state.builder.AllocateId();
+	if (cap != 0) {
+		state.builder.AddFunction(spv::OpPhi, TypeU32(state), iteration, ConstantU32(state, 0u),
+		                          initial_parent, next_iteration, dispatcher.continue_label);
+	}
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), finished, pc,
 	                          ConstantU32(ctx.state, UINT32_MAX));
+	auto done = finished;
+	if (cap != 0) {
+		const auto exhausted = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), exhausted, iteration,
+		                          ConstantU32(state, cap));
+		done = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), done, finished, exhausted);
+	}
 	state.builder.AddFunction(spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
 	                          spv::LoopControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, done, dispatcher.merge_label,
@@ -690,6 +713,10 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	state.builder.AddFunction(next_pc_words);
 	state.builder.AddFunction(spv::OpBranch, dispatcher.continue_label);
 	EmitLabel(state, dispatcher.continue_label);
+	if (cap != 0) {
+		state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next_iteration, iteration,
+		                          ConstantU32(state, 1u));
+	}
 	state.builder.AddFunction(spv::OpBranch, dispatcher.header_label);
 	EmitLabel(state, dispatcher.merge_label);
 	EmitReturn(ctx);

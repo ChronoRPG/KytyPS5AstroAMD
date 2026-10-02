@@ -79,6 +79,28 @@ void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
 	     static_cast<uint64_t>(predecessors), static_cast<uint64_t>(successors),
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
 	     static_cast<uint64_t>(cfg.back_edges.size()), cfg.unsupported_reason.c_str());
+	// The dispatcher is rare: the console names each guest shader that takes it (the first 64, then
+	// every 64th), so a title's log shows whether KYTY_DISPATCHER_CAP can apply to it.
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> seen;
+	size_t                              count = 0;
+	{
+		std::scoped_lock lock(mutex);
+		if (!seen.insert(options.shader_hash).second) {
+			return;
+		}
+		count = seen.size();
+	}
+	if (count <= 64u || count % 64u == 0u) {
+		const auto cap = GetCodegenOptions().dispatcher_cap;
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader: CFG dispatcher #{}: {} 0x{:016x} ({}; {})\n", count, StageName(options.stage),
+		    options.shader_hash, CFG::FailureKindToString(cfg.failure_kind),
+		    cap != 0 ? fmt::format("an invocation leaves it after {} block transitions, "
+		                           "KYTY_DISPATCHER_CAP",
+		                           cap)
+		             : std::string("no transition cap, KYTY_DISPATCHER_CAP=0")));
+	}
 }
 
 enum class EmbeddedFetchValueType {

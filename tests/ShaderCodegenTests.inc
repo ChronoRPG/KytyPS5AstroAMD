@@ -1795,6 +1795,53 @@ void CheckLaneReductions(VulkanHarness *vulkan) {
   std::printf("[codegen] %-32s ok (wave32 rows, wave64 row pairs)\n", name);
 }
 
+// KYTY_DISPATCHER_CAP: a guest loop that never ends in an irreducible CFG (the dispatcher
+// fallback; entry -> B or A, A -> C, C -> A or B, B -> C, never S_ENDPGM) after a store of 7.
+// With the cap the invocation leaves the dispatcher loop and the dispatch completes; codegen with
+// and without the cap. Without a cap this dispatch would never end, so the GPU part needs one.
+void CheckDispatcherCap(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenDispatcherCap";
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = name;
+  auto &code = test.code;
+  AppendVMovU32(&code, 2, 7);
+  AppendStoreVgpr(&code, 2, 0);
+  code.push_back(EncodeSopp(0x05, 2));       // entry -> B, fallthrough A
+  code.push_back(EncodeSopp(0x02, 0));       // A -> C
+  code.push_back(EncodeSopp(0x05, 0xfffeu)); // C -> A, fallthrough B
+  code.push_back(EncodeSopp(0x02, 0xfffeu)); // B -> C
+  AppendEnd(&code);
+  test.initial = {0u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_CBRANCH_SCC1, O::S_BRANCH,
+                  O::S_ENDPGM};
+  const auto compile = [&](uint32_t cap) {
+    CodegenOptions options = GetCodegenOptions();
+    options.dispatcher_cap = cap;
+    ScopedCodegenOptions scope(options);
+    return CompileCase(test, vulkan->SubgroupSize());
+  };
+  const auto capped = compile(4096u);
+  const auto uncapped = compile(0u);
+  Require(name, "dispatcher", capped.program.dispatcher_fallback,
+          "the irreducible loop did not take the dispatcher fallback");
+  Require(name, "cap",
+          CountSpirv(capped.spirv, "OpUGreaterThanEqual") ==
+                  CountSpirv(uncapped.spirv, "OpUGreaterThanEqual") + 1u &&
+              CountSpirv(capped.spirv, "OpLogicalOr") ==
+                  CountSpirv(uncapped.spirv, "OpLogicalOr") + 1u,
+          "the dispatcher loop does not leave at KYTY_DISPATCHER_CAP");
+  if (GetCodegenOptions().dispatcher_cap == 0u) {
+    std::printf("[codegen] %-32s ok (codegen only: KYTY_DISPATCHER_CAP=0)\n", name);
+    return;
+  }
+  const auto words = RunCollect(vulkan, test, 1);
+  Require(name, "endless loop ends", words[0] == 7u,
+          "the dispatch with an endless dispatcher loop did not complete with its store");
+  std::printf("[codegen] %-32s ok (an endless dispatcher loop ended after %u transitions)\n",
+              name, GetCodegenOptions().dispatcher_cap);
+}
+
 // The Scope operand of every OpReadClockKHR (Device 1, Subgroup 3), from the 32-bit constants.
 std::vector<u32> ReadClockScopes(const std::vector<u32> &spirv) {
   constexpr u32 OpConstant = 43;
