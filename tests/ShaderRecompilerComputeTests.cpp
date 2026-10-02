@@ -5712,6 +5712,33 @@ public:
                           large_copy_source.data(), large_copy_size) == 0,
               "chunked host copy lost bytes across its scratch boundary");
 
+      // Switch at the same boundary as the A/B harness, checking unaligned partial
+      // pages, equal bytes, changed bytes and an overlapping memmove fallback.
+      for (const bool on : {false, true, false}) {
+        Live::Testing::StageText(on ? "KYTY_CPU_COPY_PAGE_SKIP=1\n" : "KYTY_CPU_COPY_PAGE_SKIP=0\n");
+        Live::OnCpFlip();
+        constexpr uint64_t partial_size = 2 * 4096 + 29;
+        const auto source = large_copy_source_offset + 17;
+        const auto destination = large_copy_destination_offset + 23;
+        cache.CopyBuffer(base + destination, base + source, partial_size, false, false);
+        cache.CopyBuffer(base + destination, base + source, partial_size, false, false);
+        memory[source + 4099] ^= 0x5a;
+        cache.CopyBuffer(base + destination, base + source, partial_size, false, false);
+        Require(name, "live page-copy partial pages",
+                std::memcmp(memory + destination, memory + source, partial_size) == 0,
+                "page-copy switch lost changed or partial-page bytes");
+        if (on) {
+          std::vector<uint8_t> expected(memory + source, memory + source + partial_size + 31);
+          std::memmove(expected.data() + 31, expected.data(), partial_size);
+          cache.CopyBuffer(base + source + 31, base + source, partial_size, false, false);
+          Require(name, "page-copy overlap",
+                  std::memcmp(memory + source, expected.data(), expected.size()) == 0,
+                  "page-copy overlap corrupted source bytes");
+        }
+      }
+      Live::Testing::StageText("KYTY_CPU_COPY_PAGE_SKIP=\n");
+      Live::OnCpFlip();
+
       constexpr uint64_t index_offset = 0x180000;
       constexpr uint64_t index_page = BufferCache::CACHING_PAGESIZE;
       constexpr uint64_t index_span = 3 * index_page;
