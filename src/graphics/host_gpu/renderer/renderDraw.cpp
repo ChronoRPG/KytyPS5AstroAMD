@@ -2437,6 +2437,22 @@ void RenderExecutor::DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRe
 	run.images.clear();
 	{
 		std::scoped_lock lock {m_context.GetTextureCache().m_lock};
+		if (state.depth_info.image_id && DepthFeedbackKeepEnabled() &&
+		    !state.depth_info.AttachmentWriteAspects()) {
+			const auto* depth = m_context.GetTextureCache().m_slot_images.try_get(state.depth_info.image_id);
+			const auto attachment_access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+			                               vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+			// NoteDepthFeedback just established an unwritten-instance proof. The next acquisition
+			// can now adopt attachment_access | ShaderRead even for an unsampled attachment
+			// (AcquireRenderTargets). It must run normally to publish that union and its deferred
+			// ordering; this first draw cannot seed either a continuation or acquisition reuse.
+			if (depth != nullptr && depth->backing.state.access_mask == attachment_access &&
+			    depth->feedback_instance == run.rendering_serial &&
+			    depth->feedback_serial == depth->ContentSerial()) {
+				DrawRun::GetTotals().depth_promotions_excluded.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
+		}
 		for (const auto* stage: stages) {
 			for (const auto& binding: stage->images) {
 				run.images.push_back(MakeDrawRunImage(binding.image_id, true));

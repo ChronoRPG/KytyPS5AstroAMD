@@ -16258,8 +16258,9 @@ public:
   // alternate_samplers: consecutive draws alternate between two S# words that sample alike (border
   // colour type under clamp-to-edge), so no draw continues a run and every draw after a stream's
   // first keeps its predecessor's attachment acquisition (KYTY_DRAW_RUN_ACQUIRE).
-  void CheckDrawRun(bool alternate_samplers = false) {
-    const char *name = alternate_samplers ? "DrawRunAcquire" : "DrawRun";
+  void CheckDrawRun(bool alternate_samplers = false, bool read_only_depth = false) {
+    const char *name = read_only_depth ? (alternate_samplers ? "DrawRunDepthAcquire" : "DrawRunDepth")
+                                        : (alternate_samplers ? "DrawRunAcquire" : "DrawRun");
     constexpr uintptr_t base = 0x000000020b000000ull;
     constexpr uint64_t allocation_size = 0x400000;
     constexpr uint64_t allocation_alignment = 0x10000;
@@ -16410,6 +16411,22 @@ public:
       shaders.SetEsShaderBase(vertex_address);
       shaders.SetPsShaderBase(pixel_address);
       shaders.SetPsShaderResource2({.user_sgpr = 13});
+      if (read_only_depth) {
+        // An unsampled, read-only D32 attachment: its first draw establishes the feedback proof;
+        // the next acquisition broadens attachment access to include shader reads even unsampled.
+        HW::DepthRenderTarget depth_target{};
+        depth_target.z_info = HW::DepthZInfo::Decode(0x22900983u);
+        depth_target.stencil_info = HW::DepthStencilInfo::Decode(0x00100980u);
+        depth_target.z_read_base_addr = base + 0x30000;
+        depth_target.z_write_base_addr = base + 0x30000;
+        depth_target.htile_data_base_addr = base + 0x50000;
+        depth_target.size = {extent - 1, extent - 1, true};
+        registers.SetDepthRenderTarget(depth_target);
+        HW::DepthControl depth_control{};
+        depth_control.z_enable = true;
+        depth_control.zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways);
+        registers.SetDepthControl(depth_control);
+      }
 
       RenderColorInfo color{};
       RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color, 0);
@@ -16490,6 +16507,7 @@ public:
       const auto mismatches_before = totals.verify_mismatches.load();
       const auto reused_before = totals.acquire_reused.load();
       const auto partial_before = totals.partial_pushes.load();
+      const auto depth_excluded_before = totals.depth_promotions_excluded.load();
       clear();
       stream(0);
       rewrite(1);
@@ -16507,6 +16525,11 @@ public:
       const auto *code_cert = std::getenv("KYTY_DRAW_PREP_CODE_CERT");
       const bool certified = code_cert == nullptr || std::strcmp(code_cert, "0") != 0;
       if (DrawRun::Enabled() && DrawPrep::GetMode() != DrawPrep::Mode::Off && certified) {
+        if (read_only_depth && DepthFeedbackKeepEnabled()) {
+          Require(name, "depth access promotion is not reusable",
+                  totals.depth_promotions_excluded.load() > depth_excluded_before,
+                  "the first read-only depth draw seeded a run before the access promotion");
+        }
         // Every draw after a stream's first continues (the second stream's first one continues
         // the first stream's run, then falls back late: its texture was rewritten). With
         // alternating samplers no draw continues, and every draw after a stream's first keeps its
@@ -16522,6 +16545,8 @@ public:
         const uint64_t want_partial =
             DrawRun::PushPartialEnabled() ? want_continued - want_late : 0;
         Require(name, "continuations",
+                read_only_depth ? (alternate_samplers ? (DrawRun::AcquireReuseEnabled() ? reused > 0 : reused == 0)
+                                                     : continued > 0) :
                 continued == want_continued && late == want_late && reused == want_reused &&
                     partial == want_partial,
                 "continued " + std::to_string(continued) + ", late fallbacks " +
@@ -48262,6 +48287,8 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckDrawRun();
     vulkan.CheckDrawRun(true);
+    vulkan.CheckDrawRun(false, true);
+    vulkan.CheckDrawRun(true, true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-run-live") == 0) {
@@ -48271,6 +48298,8 @@ int main(int argc, char **argv) {
     Live::OnCpFlip();
     vulkan.CheckDrawRun();
     vulkan.CheckDrawRun(true);
+    vulkan.CheckDrawRun(false, true);
+    vulkan.CheckDrawRun(true, true);
     Live::Testing::StageText("KYTY_DRAW_RUN=\nKYTY_DRAW_RUN_ACQUIRE=\nKYTY_DRAW_RUN_PUSH=\n");
     Live::OnCpFlip();
     vulkan.CheckDrawRun();

@@ -150,7 +150,7 @@ void PrintSummary() {
 		return;
 	}
 	static uint64_t                                          last_ns = 0;
-	static std::array<uint64_t, 12>                          last {};
+	static std::array<uint64_t, 13>                          last {};
 	static std::array<uint64_t, static_cast<size_t>(Miss::Count)> last_misses {};
 	const auto                                               now = NowNs();
 	if (last_ns == 0) {
@@ -160,7 +160,7 @@ void PrintSummary() {
 	if (now - last_ns < 10'000'000'000ull) {
 		return;
 	}
-	const std::array<uint64_t, 12> values {
+	const std::array<uint64_t, 13> values {
 	    g_totals.draws.load(std::memory_order_relaxed),
 	    g_totals.eligible.load(std::memory_order_relaxed),
 	    g_totals.key_matches.load(std::memory_order_relaxed),
@@ -172,8 +172,9 @@ void PrintSummary() {
 	    g_totals.alias_excluded.load(std::memory_order_relaxed),
 	    g_totals.acquire_reused.load(std::memory_order_relaxed),
 	    g_totals.dynamic_emitted.load(std::memory_order_relaxed),
-	    g_totals.partial_pushes.load(std::memory_order_relaxed)};
-	std::array<uint64_t, 12> delta {};
+	    g_totals.partial_pushes.load(std::memory_order_relaxed),
+	    g_totals.depth_promotions_excluded.load(std::memory_order_relaxed)};
+	std::array<uint64_t, 13> delta {};
 	for (size_t i = 0; i < values.size(); i++) {
 		delta[i] = values[i] - last[i];
 	}
@@ -191,13 +192,13 @@ void PrintSummary() {
 	            " key matches, %" PRIu64 " continued (%.1f%%), %" PRIu64
 	            " late fallbacks; misses:%s; verify %" PRIu64 " checks, %" PRIu64
 	            " mismatches; %" PRIu64 " alias-excluded, %" PRIu64 " acquisitions reused, %" PRIu64
-	            " dynamic re-emitted, %" PRIu64 " partial pushes\n",
+	            " dynamic re-emitted, %" PRIu64 " partial pushes, %" PRIu64 " depth-promotions excluded\n",
 	            static_cast<double>(now - last_ns) * 1e-9,
 	            GetMode() == Mode::Verify ? "verify" : "on", delta[0], delta[1], delta[2], delta[3],
 	            delta[0] != 0 ? 100.0 * static_cast<double>(delta[3]) / static_cast<double>(delta[0])
 	                          : 0.0,
 	            delta[4], misses.empty() ? " none" : misses.c_str(), delta[6], delta[7], delta[8],
-	            delta[9], delta[10], delta[11]);
+	            delta[9], delta[10], delta[11], delta[12]);
 	std::fflush(stdout);
 	last    = values;
 	last_ns = now;

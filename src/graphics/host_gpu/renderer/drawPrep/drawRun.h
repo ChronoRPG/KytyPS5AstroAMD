@@ -142,6 +142,7 @@ struct Totals {
 	std::atomic<uint64_t> late_fallbacks {0};  // images changed during the buffer work
 	std::atomic<uint64_t> pipeline_lookups {0};// continuation whose pipeline was looked up again
 	std::atomic<uint64_t> dynamic_emitted {0}; // continuation whose dynamic state was recorded again
+	std::atomic<uint64_t> depth_promotions_excluded {0}; // next depth acquisition broadens its access
 	std::atomic<uint64_t> alias_excluded {0};  // eligible, but a texture lies over an attachment
 	std::atomic<uint64_t> acquire_reused {0};  // KYTY_DRAW_RUN_ACQUIRE (verify: would have)
 	std::atomic<uint64_t> partial_pushes {0};  // KYTY_DRAW_RUN_PUSH (verify: would have)
