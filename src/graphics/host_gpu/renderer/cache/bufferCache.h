@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/writeTickMap.h"
 
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <map>
 #include <memory>
@@ -733,10 +734,10 @@ private:
 	uint64_t m_bda_synced_epoch      = 0;
 	uint64_t m_bda_synced_structure  = 0;
 	uint64_t m_bda_synced_fault      = 0;
-	// KYTY_BDA_SYNC_PER_SUBMISSION (default off): the guest submission (SyncEpoch::
-	// CurrentSubmission) taken before the last completed pass; later passes of that submission
-	// are skipped while the structure epoch holds.
-	bool     m_bda_submission_skip   = false;
+	// KYTY_BDA_SYNC_PER_SUBMISSION (default off, live switch in bufferCache.cpp): the guest
+	// submission (SyncEpoch::CurrentSubmission) taken before the last completed pass; later passes
+	// of that submission are skipped while the structure epoch holds. Every pass records it, so the
+	// switch can turn on at any flip.
 	uint64_t m_bda_synced_submission = 0;
 	struct BdaEpochTotals {
 		uint64_t passes                = 0;
@@ -744,8 +745,21 @@ private:
 		uint64_t submission_skips      = 0;
 		uint64_t verify_checks         = 0;
 		uint64_t verify_mismatch_pages = 0;
+		// KYTY_BDA_SYNC_PER_SUBMISSION=verify: passes the gate would have skipped, and their uploads.
+		uint64_t submission_verify_passes  = 0;
+		uint64_t submission_deferred_bytes = 0;
 	};
 	BdaEpochTotals m_bda_epoch_totals;
+	// Bytes every BDA pass uploaded (only counted where a pass keeps its statistics: always for the
+	// dirty-log and hot passes, for full scans with KYTY_BDA_HOT_SYNC, aggregates, or while
+	// m_bda_count_uploads is set).
+	uint64_t m_bda_pass_upload_bytes = 0;
+	bool     m_bda_count_uploads     = false;
+	// The 10 s console line of the submission gate (ReportBdaSubmissionGate).
+	void                                  ReportBdaSubmissionGate();
+	uint32_t                              m_bda_gate_report_calls = 0;
+	std::chrono::steady_clock::time_point m_bda_gate_report_time {};
+	BdaEpochTotals                        m_bda_gate_reported {};
 	StreamBuffer                                      m_staging_buffer;
 	// After the staging ring: destroyed first, waiting for its copies that read the ring.
 	std::unique_ptr<UploadDma>                        m_upload_dma;
