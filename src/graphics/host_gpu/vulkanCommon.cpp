@@ -3,9 +3,11 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/spirvLocalArrays.h"
+#include "graphics/host_gpu/vramStats.h"
 
 #include <spirv-tools/libspirv.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -155,9 +157,14 @@ bool FunctionArrayShrinkEnabled() {
 	return enabled;
 }
 
-std::vector<uint32_t> ShrinkFunctionArrays(std::span<const uint32_t> code) {
+// Returns the rewritten module, or nothing (unchanged or invalid). `declared` / `created`: the
+// module's Function-storage bytes per invocation before and as given to the driver.
+std::vector<uint32_t> ShrinkFunctionArrays(std::span<const uint32_t> code, uint64_t& declared,
+                                           uint64_t& created) {
 	std::vector<uint32_t> shrunk;
 	const auto            result = SpirvLocalArrays::Shrink(code, shrunk);
+	declared                     = result.bytes_before;
+	created                      = result.bytes_before;
 	if (!result.changed) {
 		return {};
 	}
@@ -192,6 +199,9 @@ std::vector<uint32_t> ShrinkFunctionArrays(std::span<const uint32_t> code) {
 			std::fflush(stdout);
 		}
 	}
+	if (valid) {
+		created = result.bytes_after;
+	}
 	return valid ? shrunk : std::vector<uint32_t> {};
 }
 
@@ -199,11 +209,21 @@ std::vector<uint32_t> ShrinkFunctionArrays(std::span<const uint32_t> code) {
 
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	std::vector<uint32_t> shrunk;
+	uint64_t              declared = 0;
+	uint64_t              created  = 0;
 	if (FunctionArrayShrinkEnabled()) {
-		shrunk = ShrinkFunctionArrays(code);
+		shrunk = ShrinkFunctionArrays(code, declared, created);
 		if (!shrunk.empty()) {
 			code = shrunk;
 		}
+	} else if (VramStats::Enabled()) {
+		// The analysis only measures here (the module is not changed).
+		std::vector<uint32_t> unused;
+		declared = SpirvLocalArrays::Shrink(code, unused).bytes_before;
+		created  = declared;
+	}
+	if (VramStats::Enabled()) {
+		VramStats::NoteFunctionStorage(declared, created);
 	}
 	vk::ShaderModuleCreateInfo create_info {};
 	create_info.codeSize    = code.size_bytes();

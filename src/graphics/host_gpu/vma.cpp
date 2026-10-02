@@ -589,6 +589,14 @@ void GraphicContext::ReportVramStats() {
 	                ToMiB(pool_bytes), pool_count, ToMiB(RetiredImageByteLimit(*this)),
 	                RetiredImageCountLimit(), NativeImagePoolEnabled() ? "on" : "off",
 	                ToMiB(GetDeviceMemoryUsage()), ToMiB(GetTotalMemoryBudget()));
+	// The driver's local memory (outside VMA) follows the largest per-invocation footprint.
+	const auto function_storage = VramStats::FunctionStorageMax();
+	VramStats::Line("Function-storage arrays: largest per invocation %llu bytes declared, %llu bytes given to "
+	                "the driver (%llu modules with such arrays; KYTY_FUNCTION_ARRAY_SHRINK %s)",
+	                static_cast<unsigned long long>(function_storage.declared),
+	                static_cast<unsigned long long>(function_storage.created),
+	                static_cast<unsigned long long>(function_storage.modules),
+	                function_storage.created < function_storage.declared ? "shrank them" : "off or no effect");
 }
 
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {
