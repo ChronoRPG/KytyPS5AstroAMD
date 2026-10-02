@@ -227,6 +227,11 @@ add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty
 # 2. llvm-profdata merge -o <x.profdata> <dumps>, with the llvm-profdata next to the compiler.
 # 3. KYTY_PGO_USE=<x.profdata> builds the optimized emulator. Use a new file name for a new
 #    profile: a compiler cache (sccache) does not see the profile's contents.
+# The profile finds functions by name, and clang-cl names a function in an anonymous namespace after
+# a hash of its source file's path as written on the compile command line (?A0x<hash>). A profile
+# fully matches only a build from the same path, spelled the same way. So both steps configure from
+# KYTY_PGO_SOURCE_DIR, a directory junction to the checkout (mklink /J C:\kyty-src <checkout>;
+# cmake -S C:\kyty-src): CMake and clang-cl keep the junction's path. The release workflow does the same.
 # Only Kyty's own targets (declared below: common, emulator, tests, launcher) get the flags.
 # Third-party code that a training run does not exercise (the SPIR-V optimizer, ...) keeps its
 # normal optimization instead of being treated as cold. The flags are compile options, not
@@ -240,6 +245,12 @@ if(KYTY_PGO_GENERATE OR KYTY_PGO_USE)
 	if(KYTY_PGO_GENERATE AND KYTY_PGO_USE)
 		message(FATAL_ERROR "KYTY_PGO_GENERATE and KYTY_PGO_USE are separate builds")
 	endif()
+endif()
+set(KYTY_PGO_SOURCE_DIR "C:/kyty-src" CACHE PATH "Source path that PGO profiles are recorded and used from (clang-cl)")
+if((KYTY_PGO_GENERATE OR KYTY_PGO_USE) AND KYTY_CLANG_CL AND NOT CMAKE_SOURCE_DIR STREQUAL KYTY_PGO_SOURCE_DIR)
+	message(WARNING "PGO: configured from ${CMAKE_SOURCE_DIR}, not from KYTY_PGO_SOURCE_DIR "
+	                "(${KYTY_PGO_SOURCE_DIR}): functions in anonymous namespaces get other names than in "
+	                "the profile and lose it. Configure with -S ${KYTY_PGO_SOURCE_DIR}, a junction to this checkout.")
 endif()
 if(KYTY_PGO_GENERATE)
 	add_compile_options(-fprofile-instr-generate)
