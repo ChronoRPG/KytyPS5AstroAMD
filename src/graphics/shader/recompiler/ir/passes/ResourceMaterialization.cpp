@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "common/liveSwitch.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -23,6 +24,8 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
+
+Live::Switch g_buffer_refresh_fusion("KYTY_BUFFER_REFRESH_FUSION", Live::ParseDefaultOff);
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectImageProbes = 65536u;
@@ -536,37 +539,44 @@ private:
 template <typename Images>
 bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan);
 
+static bool SpecializeBuffer(const BufferResource& buffer, DescriptorValue& descriptor_value,
+                             ResourceSpecialization& specialization, uint32_t i) {
+	ShaderBufferResource descriptor;
+	if (!DecodeBufferDescriptor(descriptor_value, descriptor)) {
+		return SpecializationFail(fmt::format("buffer descriptor {} has invalid width", i));
+	}
+	if (descriptor.Type() != 0) {
+		descriptor_value.dwords.fill(0);
+		descriptor = {};
+	}
+	auto       packed_stride = descriptor.PackedStride();
+	const auto stride        = packed_stride & 0x3fffu;
+	const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
+	if (stride == 0u) {
+		packed_stride &= ~((1u << 14u) | (3u << 16u));
+	} else if (!swizzle) {
+		packed_stride &= ~(3u << 16u);
+	}
+	specialization.buffers.push_back({
+	    .packed_stride     = packed_stride,
+	    .descriptor_format = buffer.formatted
+	                             ? descriptor.Format()
+	                             : Prospero::BufferFormat::kInvalid,
+	    .descriptor_swizzle =
+	        buffer.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7),
+	    .zero_stride_oob = descriptor.OutOfBounds() == 0u && stride == 0u,
+	});
+	return true;
+}
+
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
-                                        ResourceSpecialization& specialization) {
-	specialization.buffers.clear();
-	specialization.buffers.reserve(program.info.buffers.size());
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		auto&                descriptor_value = snapshot.buffers[i];
-		ShaderBufferResource descriptor;
-		if (!DecodeBufferDescriptor(descriptor_value, descriptor)) {
-			return SpecializationFail(fmt::format("buffer descriptor {} has invalid width", i));
+                                        ResourceSpecialization& specialization, bool buffers_ready) {
+	if (!buffers_ready) {
+		specialization.buffers.clear();
+		specialization.buffers.reserve(program.info.buffers.size());
+		for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+			if (!SpecializeBuffer(program.info.buffers[i], snapshot.buffers[i], specialization, i)) return false;
 		}
-		if (descriptor.Type() != 0) {
-			descriptor_value.dwords.fill(0);
-			descriptor = {};
-		}
-		auto       packed_stride = descriptor.PackedStride();
-		const auto stride        = packed_stride & 0x3fffu;
-		const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
-		if (stride == 0u) {
-			packed_stride &= ~((1u << 14u) | (3u << 16u));
-		} else if (!swizzle) {
-			packed_stride &= ~(3u << 16u);
-		}
-		specialization.buffers.push_back({
-		    .packed_stride     = packed_stride,
-		    .descriptor_format = program.info.buffers[i].formatted
-		                             ? descriptor.Format()
-		                             : Prospero::BufferFormat::kInvalid,
-		    .descriptor_swizzle =
-		        program.info.buffers[i].formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7),
-		    .zero_stride_oob = descriptor.OutOfBounds() == 0u && stride == 0u,
-		});
 	}
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
@@ -1129,6 +1139,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	}
 	const bool capture_reads = masked_image &&
 	    std::ranges::any_of(program.info.buffers, &BufferResource::written);
+	const bool fuse_buffers = g_buffer_refresh_fusion.On() && !capture_reads;
 	auto& reads = scratch.specialization_reads;
 	ReadCapture capture {runtime, reads};
 	SrtRuntime observed = runtime;
@@ -1181,10 +1192,15 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Resources::Buffers");
 		snapshot.buffers.resize(program.info.buffers.size());
+		if (fuse_buffers) {
+			specialization.buffers.clear();
+			specialization.buffers.reserve(program.info.buffers.size());
+		}
 		for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
 			if (!evaluate(program.info.buffers[i].source, snapshot.buffers[i])) {
 				return false;
 			}
+			if (fuse_buffers && !SpecializeBuffer(program.info.buffers[i], snapshot.buffers[i], specialization, i)) return false;
 		}
 		if (capture_reads) {
 			for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
@@ -1263,7 +1279,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 		}
 		if (capture_reads && !WrittenBuffersDisjoint(program, snapshot, reads)) return false;
 		snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-		return BuildResourceSpecialization(program, snapshot, specialization);
+		return BuildResourceSpecialization(program, snapshot, specialization, fuse_buffers);
 	}
 }
 
