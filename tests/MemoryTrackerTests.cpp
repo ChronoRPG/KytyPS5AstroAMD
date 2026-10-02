@@ -1948,6 +1948,10 @@ void TestDirtyQueryAndGpuMirror() {
   Check(!tracker.QueryDirtyRelaxed(boundary - page_size, page_size * 2, relaxed_missing) &&
             !second_exists(),
         "a relaxed query decided (or created) a range with a missing region");
+  bool cpu_missing = false;
+  Check(!tracker.QueryCpuDirtyRelaxed(boundary - page_size, page_size * 2, cpu_missing) &&
+            !second_exists(),
+        "a CPU-only query decided (or created) a range with a missing region");
   const auto across = tracker.QueryDirty(boundary - page_size, page_size * 2);
   Check(across.gpu && !second_exists() &&
             tracker.IsRegionGpuModifiedRelaxed(boundary - page_size, page_size * 2),
@@ -1982,6 +1986,9 @@ void TestDirtyQueryAndGpuMirror() {
       MemoryTracker::DirtyState relaxed;
       Check(tracker.QueryDirtyRelaxed(address, size, relaxed) && relaxed.gpu == gpu &&
                 relaxed.cpu == tracker.IsRegionCpuModified(address, size),
+            what);
+      bool cpu_dirty = false;
+      Check(tracker.QueryCpuDirtyRelaxed(address, size, cpu_dirty) && cpu_dirty == relaxed.cpu,
             what);
     }
   };

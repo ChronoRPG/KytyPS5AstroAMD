@@ -234,6 +234,11 @@ struct BufferCacheTestAccess {
   }
   // KYTY_TRACKER_RELAXED_QUERIES.
   static bool RelaxedQueriesEnabled(const BufferCache &cache) { return cache.m_relaxed_queries; }
+  static bool QueryUploadSnapshot(const MemoryTracker &tracker, uint64_t address,
+                                  uint64_t size, MemoryTracker::DirtyState &state,
+                                  bool &cpu_only) {
+    return BufferCache::QueryUploadSnapshot(tracker, address, size, state, cpu_only);
+  }
   static BufferCache::RelaxedTotals RelaxedTotals(const BufferCache &cache) {
     return cache.m_relaxed_totals;
   }
@@ -256,6 +261,11 @@ struct BufferCacheTestAccess {
     return cache.m_binding_memo != nullptr;
   }
   static int BindingMemoVerify(const BufferCache &cache) { return cache.m_binding_memo_verify; }
+  static bool BindingHotContains(BufferCache &cache, uint64_t address, uint64_t size) {
+    const auto &entry = cache.BindingHotMemoSlot(address, size);
+    return cache.m_binding_hot_enabled && entry.vaddr == address && entry.size == size &&
+           entry.kind != BufferCache::BindingMemoKind::Empty;
+  }
   static BufferCache::BindingMemoTotals BindingMemoTotals(const BufferCache &cache) {
     return cache.m_binding_memo_totals;
   }
@@ -8084,8 +8094,12 @@ public:
   // copy keeps the bytes from before it (verify mode: the normal path's fresh copy, counted as a
   // race); the next epoch copies them. A GPU write, a write fault, a buffer join or a new tick in
   // between makes the next binding take the normal path.
-  void CheckBindingEpochMemo() {
+  void CheckBindingEpochMemo(bool live_hot = false) {
     constexpr const char *name = "BindingEpochMemo";
+    if (live_hot) {
+      Live::Testing::StageText("KYTY_CP_BINDING_HOT_MEMO=0\n");
+      Live::OnCpFlip();
+    }
     constexpr uintptr_t base = 0x0000000207400000ull;
     constexpr uint64_t allocation_size = 0x100000;
     constexpr uint64_t allocation_alignment = 0x10000;
@@ -8181,11 +8195,33 @@ public:
         const auto first = bind(small_offset, small_size);
         const Totals recorded = totals();
         const auto again = bind(small_offset, small_size);
-        Require(name, "stream copy reuse",
+          Require(name, "stream copy reuse",
                 copied(first) && copied(again) &&
                     (!memo_on || totals().stream_hits == recorded.stream_hits + 1) &&
                     (!reuse || again == first),
-                "a repeated stream-copy binding in one epoch was not reused, or lost its bytes");
+                  "a repeated stream-copy binding in one epoch was not reused, or lost its bytes");
+          if (live_hot && memo_on) {
+            Live::Testing::StageText("KYTY_CP_BINDING_HOT_MEMO=1\n");
+            Live::OnCpFlip();
+            (void)bind(small_offset, small_size); // fill from the certified main-table hit
+            const auto hits = totals().hot_hits;
+            const auto hot = bind(small_offset, small_size);
+            Require(name, "hot tier live enable",
+                    BufferCacheTestAccess::BindingHotContains(cache, base + small_offset, small_size) &&
+                        totals().hot_hits == hits + 1 && copied(hot) && (!reuse || hot == first),
+                    "enabling the hot tier did not produce a certified hit with the right bytes");
+            const auto before_switch = totals().hot_hits;
+            Live::Testing::StageText("KYTY_CP_BINDING_HOT_MEMO=0\n");
+            Live::OnCpFlip();
+            Live::Testing::StageText("KYTY_CP_BINDING_HOT_MEMO=1\n");
+            Live::OnCpFlip(); // no binding lookup during the off period
+            (void)bind(small_offset, small_size);
+            Require(name, "hot tier resets without off-period lookups",
+                    totals().hot_hits == before_switch,
+                    "an off/on transition retained a hot entry when no lookup observed off");
+            Live::Testing::StageText("KYTY_CP_BINDING_HOT_MEMO=0\n");
+            Live::OnCpFlip();
+          }
 
         // A guest write within the epoch (the page is CPU-dirty, so no fault) races the draws.
         memory[small_offset + 5] ^= 0xffu;
@@ -8203,9 +8239,17 @@ public:
         const auto next_epoch = bind(small_offset, small_size);
         Require(name, "next epoch copies", copied(next_epoch) && next_epoch != first,
                 "the first binding of the next epoch did not copy the current bytes");
-        (void)bind(small_offset, small_size);
+          (void)bind(small_offset, small_size);
 
-        // A new tick (the ring may reuse older allocations) copies again.
+          // A new tick (the ring may reuse older allocations) copies again.
+          if (live_hot && memo_on) {
+            Live::Testing::StageText("KYTY_CP_BINDING_HOT_MEMO=1\n");
+            Live::OnCpFlip();
+            const auto restored = bind(small_offset, small_size);
+            Require(name, "hot tier after off-period mutation",
+                    copied(restored) && (!reuse || restored == next_epoch),
+                    "re-enabling the hot tier resurrected the old epoch's bytes");
+          }
         scheduler.Flush();
         const Totals before_tick = totals();
         const auto next_tick = bind(small_offset, small_size);
@@ -8334,6 +8378,10 @@ public:
                 BufferCacheTestAccess::BindingMemoVerify(context.GetBufferCache()) != 0 ? "on"
                                                                                           : "off",
                 BufferCacheTestAccess::BindingMemoCross(context.GetBufferCache()) ? "on" : "off");
+    if (live_hot) {
+      Live::Testing::StageText("KYTY_CP_BINDING_HOT_MEMO=\n");
+      Live::OnCpFlip();
+    }
   }
 
   // KYTY_WRITTEN_SYNC_SKIP (BufferCache::SynchronizeBuffer): a writable binding of a range the
@@ -46102,6 +46150,54 @@ void CheckStandard64RenderTargetTileRoundTrip() {
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void CheckCpCpuQueryLive() {
+  constexpr const char *name = "CpCpuQueryLive";
+  constexpr uintptr_t base = 0x0000000200200000ull;
+  constexpr uint64_t size = 0x10000;
+  const auto address = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+      base, size, Common::VirtualMemory::Mode::ReadWrite, "cp_cpu_query_live", true);
+  Require(name, "allocation", address == base, "fixed guest allocation failed");
+  PageManager page_manager;
+  MemoryTracker tracker(page_manager);
+  tracker.ForEachUploadRange(base, size, true, [](uint64_t, uint64_t) noexcept {},
+                            []() noexcept {});
+  const auto check = [&](bool cpu_dirty, bool gpu_dirty) {
+    for (const bool on : {false, true, false, true}) {
+      Live::Testing::StageText(on ? "KYTY_CP_CPU_ONLY_QUERY=1\n"
+                                  : "KYTY_CP_CPU_ONLY_QUERY=0\n");
+      Live::OnCpFlip();
+      MemoryTracker::DirtyState state;
+      bool cpu_only = !on;
+      Require(name, "snapshot",
+              BufferCacheTestAccess::QueryUploadSnapshot(tracker, base, size, state, cpu_only) &&
+                  cpu_only == on && state.cpu == cpu_dirty && state.gpu == (!on && gpu_dirty),
+              "live switch did not choose the requested query or changed its CPU decision");
+      Require(name, "missing region",
+              !BufferCacheTestAccess::QueryUploadSnapshot(
+                  tracker, base + TRACKER_REGION_SIZE, size, state, cpu_only) &&
+                  tracker.RangeSignature(base + TRACKER_REGION_SIZE, size) == 0,
+              "a query created or accepted a missing region");
+    }
+  };
+  check(false, true);
+  tracker.UnmarkRegionAsGpuModified(base, size);
+  check(false, false);
+  tracker.MarkRegionAsCpuModified(base, size);
+  check(true, false);
+  Live::Testing::StageText("KYTY_CP_CPU_ONLY_QUERY=\n");
+  Live::OnCpFlip();
+  MemoryTracker::DirtyState state;
+  bool cpu_only = true;
+  Require(name, "default off",
+          BufferCacheTestAccess::QueryUploadSnapshot(tracker, base, size, state, cpu_only) &&
+              !cpu_only && state.cpu,
+          "unsetting the live flag did not restore the full query");
+  tracker.UntrackMemory(base, size);
+  Require(name, "free", Libs::LibKernel::Memory::FreeGuestMemory(base, size),
+          "guest free failed");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckStorageTextureGpuOwnedRebindState() {
   constexpr uintptr_t base = 0x0000000200200000ull;
   constexpr uint64_t size = 0x10000;
@@ -49105,6 +49201,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBindingEpochMemo();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--binding-memo-hot-live-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBindingEpochMemo(true);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--written-sync-skip-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckWrittenSyncSkip();
@@ -49274,6 +49375,12 @@ int main(int argc, char **argv) {
     vulkan.CheckRecorderDescriptorSetsLive();
     return 0;
   }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--cp-cpu-query-live-only") == 0) {
+    CheckCpCpuQueryLive();
+    return 0;
+  }
+#endif
   if (argc == 2 && std::strcmp(argv[1], "--push-shadow-only") == 0) {
     // The shadow compares only with KYTY_RENDERER_BATCH (the timing runs' setting), unless the
     // environment chose otherwise.
