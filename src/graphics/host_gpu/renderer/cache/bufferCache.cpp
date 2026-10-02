@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/hangTrace.h"
 #include "common/logging/log.h"
+#include "common/liveSwitch.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -38,6 +39,8 @@
 namespace Libs::Graphics {
 
 namespace {
+
+Live::Switch g_cpu_copy_page_skip("KYTY_CPU_COPY_PAGE_SKIP", Live::ParseDefaultOff);
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
@@ -3286,8 +3289,25 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	    (!TextureCache::AliasBytesEnabled() ||
 	     (!m_texture_cache.IsRegionGpuModified(src_vaddr, size) &&
 	      !m_texture_cache.IsRegionGpuModified(dst_vaddr, size)))) {
-		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
-		            size);
+		if (!g_cpu_copy_page_skip.On()) {
+			std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr), size);
+		} else if ((dst_vaddr >= src_vaddr ? dst_vaddr - src_vaddr : src_vaddr - dst_vaddr) < size) {
+			// Page-by-page copying would corrupt later source bytes of an overlapping copy.
+			std::memmove(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr), size);
+		} else {
+			for (uint64_t at = 0; at < size;) {
+				const auto bytes = std::min(TRACKER_PAGE_SIZE - (dst_vaddr + at) % TRACKER_PAGE_SIZE, size - at);
+				auto* to = reinterpret_cast<void*>(dst_vaddr + at);
+				const auto* from = reinterpret_cast<const void*>(src_vaddr + at);
+				// Only a successful clean-backing comparison can suppress a write. Dirty GPU
+				// ownership is checked above; an unmapped/failed proof takes the original copy.
+				if (LibKernel::Memory::CompareGpuCleanBacking(dst_vaddr + at, from, bytes) !=
+				    LibKernel::Memory::BackingCompare::Equal) {
+					std::memcpy(to, from, bytes);
+				}
+				at += bytes;
+			}
+		}
 		return;
 	}
 

@@ -1028,6 +1028,14 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
 	add_test(NAME compute_meta_clear_classification
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
+	add_test(NAME cpu_copy_page_skip_ranges
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
+	add_test(NAME cpu_copy_page_skip_alias_bytes
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alias-bytes-only)
+	add_test(NAME cpu_copy_page_skip_dirty_gc
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	set_tests_properties(cpu_copy_page_skip_ranges cpu_copy_page_skip_alias_bytes cpu_copy_page_skip_dirty_gc
+		PROPERTIES ENVIRONMENT "KYTY_CPU_COPY_PAGE_SKIP=1")
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	add_test(NAME draw_prep_code_cert
