@@ -2211,7 +2211,8 @@ static bool DrawRunTextureReady(const Image& image) {
 // (mark index + 1) << 8 | 0x80 for a texture | the field (1 slot freed, 2 native image,
 // 3 registration, 4 rebind request, 5 residency, 6 layout, 7 access, 8 stage, 9 per-subresource
 // states, 10 content serial, 11 unregistered, 12 CPU-dirty, 13 buffer-modified, 14 texture refresh).
-uint32_t RenderExecutor::DrawRunImagesChange(bool compare_serials, bool attachments_only) const {
+uint32_t RenderExecutor::DrawRunImagesChange(bool compare_serials, bool attachments_only,
+                                           bool log_change) const {
 	auto&            cache = m_context.GetTextureCache();
 	std::scoped_lock lock {cache.m_lock};
 	const auto&      images = cache.m_slot_images;
@@ -2252,6 +2253,28 @@ uint32_t RenderExecutor::DrawRunImagesChange(bool compare_serials, bool attachme
 			field = 14;
 		}
 		if (field != 0) {
+			static uint32_t logged = 0;
+			if (log_change && logged++ < DrawRun::MismatchLogLimit()) {
+				static const char* names[] = {"none", "slot freed", "native image", "registration",
+				    "rebind", "residency", "layout", "access", "stage", "subresource state",
+				    "content serial", "unregistered", "CPU dirty", "buffer modified", "texture refresh"};
+				std::printf("DrawRunVerifyImage: mark=%u role=%s field=%s guest=0x%llx size=0x%llx "
+				            "layout=%u->%u access=0x%llx->0x%llx stage=0x%llx->0x%llx "
+				            "serial=%llu->%llu subresources=%zu feedback=%llu/%llu attachment=%llu\n",
+				            index, mark.texture ? "texture" : "attachment", names[field],
+				            (unsigned long long)mark.address, (unsigned long long)mark.size,
+				            (unsigned)mark.layout, image ? (unsigned)image->backing.state.layout : 0u,
+				            (unsigned long long)(VkAccessFlags2)mark.access,
+				            image ? (unsigned long long)(VkAccessFlags2)image->backing.state.access_mask : 0ull,
+				            (unsigned long long)(VkPipelineStageFlags2)mark.stage,
+				            image ? (unsigned long long)(VkPipelineStageFlags2)image->backing.state.pl_stage : 0ull,
+				            (unsigned long long)mark.serial, image ? (unsigned long long)image->ContentSerial() : 0ull,
+				            image ? image->backing.subresource_states.size() : 0u,
+				            image ? (unsigned long long)image->feedback_instance : 0ull,
+				            image ? (unsigned long long)image->feedback_serial : 0ull,
+				            image ? (unsigned long long)image->feedback_attached : 0ull);
+				std::fflush(stdout);
+			}
 			return ((index + 1u) << 8u) | (mark.texture ? 0x80u : 0u) | field;
 		}
 	}
@@ -2490,7 +2513,8 @@ void RenderExecutor::DrawRunVerify(const DrawRenderState& state, const RenderSta
 			if (binding.image_id != old.image_id || binding.image_view != old.image_view ||
 			    binding.layout != old.layout || binding.desc.type != old.desc.type ||
 			    binding.mip_views != old.mip_views) {
-				DrawRun::ReportMismatch("texture binding", texture - 1);
+				DrawRun::ReportMismatch(binding.image_view != old.image_view || binding.mip_views != old.mip_views
+				                            ? "texture views" : "texture binding", texture - 1);
 			}
 		}
 		for (const auto handle: stage->samplers) {
@@ -3276,14 +3300,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				}
 				if (Image::RecordedTransitions() != acquire_transitions) {
 					DrawRun::ReportMismatch("reused acquisition's transitions",
-					                        DrawRunImagesChange(false, true));
+					                        DrawRunImagesChange(false, true, true));
 				}
-				if (const auto change = DrawRunImagesChange(false, true); change != 0) {
+				if (const auto change = DrawRunImagesChange(false, true, true); change != 0) {
 					DrawRun::ReportMismatch("reused acquisition's attachment state", change);
 				}
 			}
 			if (run_verify_images) {
-				if (const auto change = DrawRunImagesChange(false); change != 0) {
+				if (const auto change = DrawRunImagesChange(false, false, true); change != 0) {
 					DrawRun::CountVerifyCheck();
 					DrawRun::ReportMismatch("attachment state after acquisition", change);
 				}
@@ -3342,7 +3366,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (run_verify_images && Image::RecordedTransitions() != run_transitions) {
 		DrawRun::CountVerifyCheck();
 		// Detail: which recorded image's state the transition changed (0: another image's).
-		DrawRun::ReportMismatch("image transition", DrawRunImagesChange(false));
+		DrawRun::ReportMismatch("image transition", DrawRunImagesChange(false, false, true));
 	}
 	CommitStats::Mark(CommitStats::Phase::CommitBindings);
 	if (!mesh_active) CommitIndexBuffer(vk_buffer, index_binding);

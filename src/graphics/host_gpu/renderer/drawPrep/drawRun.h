@@ -154,6 +154,7 @@ struct Totals {
 void CountMiss(Miss miss) noexcept;
 // Verify mode: one comparison, and a difference (counted, logged; exit mode stops).
 void CountVerifyCheck() noexcept;
+[[nodiscard]] uint32_t MismatchLogLimit();
 void ReportMismatch(const char* what, uint64_t detail = 0);
 // GPU thread: the 10-second console line.
 void PrintSummary();

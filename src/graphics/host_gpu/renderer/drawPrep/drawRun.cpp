@@ -117,13 +117,27 @@ void CountVerifyCheck() noexcept {
 	g_totals.verify_checks.fetch_add(1, std::memory_order_relaxed);
 }
 
+uint32_t MismatchLogLimit() {
+	static const uint32_t limit = [] {
+		const auto* value = std::getenv("KYTY_DRAW_RUN_LOG_LIMIT");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 64u;
+	}();
+	return limit;
+}
+
 void ReportMismatch(const char* what, uint64_t detail) {
 	g_totals.verify_mismatches.fetch_add(1, std::memory_order_relaxed);
 	static std::atomic<uint32_t> logged {0};
-	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
-		std::printf("DrawRunVerify: a continuation would have reused a different %s (detail %" PRIu64
+	if (logged.fetch_add(1, std::memory_order_relaxed) < MismatchLogLimit()) {
+		const char* part = std::strstr(what, "acquisition") ? "acquisition" :
+		                   std::strstr(what, "transition") ? "transitions" :
+		                   std::strstr(what, "dynamic") ? "dynamic state" :
+		                   std::strstr(what, "view") ? "views" :
+		                   std::strstr(what, "sampler") ? "samplers" :
+		                   std::strstr(what, "texture") ? "textures" : "targets";
+		std::printf("DrawRunVerify: part=%s: a continuation would have reused a different %s (detail %" PRIu64
 		            " = 0x%" PRIx64 ")\n",
-		            what, detail, detail);
+		            part, what, detail, detail);
 		std::fflush(stdout);
 	}
 	if (VerifyExit()) {
