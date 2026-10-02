@@ -64,7 +64,7 @@ namespace DrawRun {
 
 enum class Mode : uint8_t { Off, On, Verify };
 
-// The three flags are live switches (common/liveSwitch.h; KytyTiming\ab-testing.md): read per use,
+// The three flags are live switches (common/liveSwitch.h): read per use,
 // they may change at a guest flip. Live-safe: the structure key is computed by the preparing thread
 // only while the flag is on (0 otherwise, which never continues), every record is reset by the next
 // draw, and the parts a record holds only under one value (acquisition targets, verify copies) are
