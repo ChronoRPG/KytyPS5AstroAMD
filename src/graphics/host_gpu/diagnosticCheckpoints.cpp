@@ -147,9 +147,20 @@ void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick, bool que
 	std::vector<vk::CheckpointDataNV> data;
 	if (queue_locked) {
 		data = graphics.queue.getCheckpointDataNV();
-	} else {
-		Common::LockGuard lock(graphics.queue_mutex);
+	} else if (graphics.queue_mutex.TryLock()) {
 		data = graphics.queue.getCheckpointDataNV();
+		graphics.queue_mutex.Unlock();
+	} else {
+		// Fatal reporting must not wait behind another stalled driver submission.
+		std::printf("  Queue busy: NV checkpoint query skipped; latest CPU breadcrumb follows (not GPU completion).\n");
+		DiagnosticCheckpoint latest;
+		{
+			const std::lock_guard lock(g_checkpoint_mutex);
+			latest = g_checkpoints[g_checkpoint_sequence % CHECKPOINT_RING_SIZE];
+		}
+		if (latest.sequence != 0) Print("latest CPU record", latest);
+		std::fflush(stdout);
+		return;
 	}
 	std::printf("--- Diagnostic checkpoints (%zu) ---\n", data.size());
 	for (const auto& entry: data) {

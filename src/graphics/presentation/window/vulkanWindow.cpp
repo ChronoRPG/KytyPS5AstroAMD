@@ -931,6 +931,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		return nullptr;
 	}
 
+	if (DeviceFaultDiagnosticsEnabled()) {
+		std::printf("Device-fault diagnostics: EXT fault=%u vendor binary=%u NV checkpoints=%u NV tracking/debug=%u\n",
+		            static_cast<unsigned>(device_fault.deviceFault),
+		            static_cast<unsigned>(device_fault.deviceFaultVendorBinary),
+		            graphics.diagnostic_checkpoints_enabled ? 1u : 0u,
+		            static_cast<unsigned>(diagnostics_features.diagnosticsConfig));
+		std::fflush(stdout);
+	}
 	return device;
 }
 
