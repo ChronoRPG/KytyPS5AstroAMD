@@ -46706,8 +46706,8 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
 
   // Removed GCN shader resource/checksum/queue registers. Numeric offsets keep
   // this check independent of the deleted legacy names.
-  constexpr std::array<uint32_t, 19> legacy_shader_slots{
-      0x000u, 0x001u, 0x002u, 0x003u, 0x030u, 0x0b0u, 0x0bcu, 0x130u,
+  constexpr std::array<uint32_t, 17> legacy_shader_slots{
+      0x000u, 0x001u, 0x030u, 0x0b0u, 0x0bcu, 0x130u,
       0x14au, 0x14bu, 0x20eu, 0x20fu, 0x210u, 0x211u, 0x216u, 0x217u,
       0x219u, 0x21au, 0x27du,
   };
@@ -46750,7 +46750,7 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
 void CheckPm4PrivateAgcShaderRegisters(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
-  std::array<uint32_t, 24> registers{
+  std::array<uint32_t, 32> registers{
       Pm4::SPI_SHADER_PGM_RSRC4_GS, 0x0badc0deu,
       Pm4::SPI_SHADER_PGM_CHKSUM_HS, 0x12345678u,
       Pm4::SPI_SHADER_PGM_RSRC4_HS, 0x87654321u,
@@ -46763,6 +46763,10 @@ void CheckPm4PrivateAgcShaderRegisters(RenderContext &renderer) {
       Pm4::SPI_SHADER_PGM_HI_PS, 0u,
       Pm4::SPI_SHADER_PGM_RSRC1_PS, 0x022c018du,
       Pm4::SPI_SHADER_PGM_RSRC2_PS, 0x0000003cu,
+      Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS, 0x12345678u,
+      Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS, 0x42u,
+      4u, 0x76543210u,
+      5u, 0x43u,
   };
   const auto address = reinterpret_cast<uint64_t>(registers.data());
   std::array<uint32_t, 5> command{
@@ -46774,7 +46778,12 @@ void CheckPm4PrivateAgcShaderRegisters(RenderContext &renderer) {
   const bool handlers_present =
       g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_GS] != nullptr &&
       g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_CHKSUM_HS] != nullptr &&
-      g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_HS] != nullptr;
+      g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_HS] != nullptr &&
+      g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS] != nullptr &&
+      g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS] != nullptr &&
+      g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS] != nullptr &&
+      g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS] != nullptr &&
+      g_hw_sh_indirect_func[4] != nullptr && g_hw_sh_indirect_func[5] != nullptr;
   Require("Pm4PrivateAgcShaderRegisters", "private shader register stream",
           handlers_present &&
               processor.Process(execution, command) == Pm4ProcessResult::Complete,
@@ -46788,7 +46797,9 @@ void CheckPm4PrivateAgcShaderRegisters(RenderContext &renderer) {
               vs.gs_regs.rsrc2.es_vgpr_component_count == 3u &&
               vs.gs_regs.rsrc2.user_sgpr == 4u &&
               ps.data_addr == 0x500010400ull && ps.rsrc1.vgprs == 13u &&
-              ps.rsrc2.user_sgpr == 30u,
+              ps.rsrc2.user_sgpr == 30u &&
+              ps.user_data_addr == 0x4212345678ull &&
+              ps.auxiliary_table_addr == 0x4376543210ull,
           "GS-front metadata changed native GS state or prevented later PS writes");
   std::printf("[host]    %-32s ok\n", "Pm4PrivateAgcShaderRegisters");
 }
