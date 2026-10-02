@@ -1697,6 +1697,104 @@ int CorpusPipelineTimes(VulkanHarness *vulkan, const char *directory) {
   return 0;
 }
 
+// KYTY_DPP_SKIP_INACTIVE: a DPP source lane EXEC disables leaves the receiving lane unchanged
+// (default); with the switch off the lane reads zero from it, the behaviour before.
+void CheckDppInactiveSource(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenDppInactiveSource";
+  const auto test = VectorDppInactiveSourcePreservesDestination();
+  std::vector<u32> skip_words;
+  std::vector<u32> zero_words;
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.dpp_skip_inactive = true;
+    ScopedCodegenOptions scope(options);
+    skip_words = RunCollect(vulkan, test, test.expected.size());
+  }
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.dpp_skip_inactive = false;
+    ScopedCodegenOptions scope(options);
+    zero_words = RunCollect(vulkan, test, test.expected.size());
+  }
+  RequireEqualWords(name, "inactive source kept", test.expected, skip_words);
+  auto legacy = test.expected;
+  legacy[4] = 100u; // lane 4 read zero from the disabled lane 3
+  RequireEqualWords(name, "KYTY_DPP_SKIP_INACTIVE=0", legacy, zero_words);
+  std::printf("[codegen] %-32s ok\n", name);
+}
+
+// KYTY_LANE_REDUCTIONS: a v_max_u32 DPP row_shr scan (1, 2, 4, 8) read by v_readlane at each
+// row's last lane (wave32: 15, 31) or, after V_PERMLANEX16, at each row pair's last lane (wave64:
+// 31, 63) on full waves of distinct data. The native subgroup reduction and the emulated scan
+// must both give each row's (pair's) maximum.
+void CheckLaneReductions(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenLaneReductions";
+  for (const u32 wave : {32u, 64u}) {
+    TestCase test;
+    test.name = name;
+    auto &code = test.code;
+    code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0)); // v_lshlrev_b32 v3, 2, v0
+    AppendBufferLoadDword(&code, 1, 3);                  // v1 = data[lane]
+    code.push_back(EncodeSopp(0x0c, 0));                 // s_waitcnt 0
+    code.push_back(wave == 64u ? EncodeSop1(0x04, 126, 193)  // s_mov_b64 exec, -1
+                               : EncodeSMovB32(126, 193));   // s_mov_b32 exec_lo, -1
+    for (const u32 shift : {1u, 2u, 4u, 8u}) {
+      code.push_back(EncodeVop2(0x14, 1, 250, 1));       // v_max_u32 v1, v1 row_shr:n, v1
+      code.push_back(EncodeVop2Dpp(1, 0x110u + shift));
+    }
+    if (wave == 64u) {
+      AppendVop3(&code, 0x378, 2, Vgpr(1), 193, 193);   // v_permlanex16_b32 v2, v1, -1, -1
+      code.push_back(EncodeVop2(0x14, 1, Vgpr(1), 2));   // v_max_u32 v1, v1, v2
+    }
+    const u32 first = wave == 64u ? 31u : 15u;
+    const u32 second = wave == 64u ? 63u : 31u;
+    AppendVop3(&code, 0x360, 20, Vgpr(1), InlineU32(first));  // v_readlane_b32 s20, v1, first
+    AppendVop3(&code, 0x360, 21, Vgpr(1), InlineU32(second)); // v_readlane_b32 s21, v1, second
+    AppendStoreSgpr(&code, 20, wave);
+    AppendStoreSgpr(&code, 21, wave + 1u);
+    AppendEnd(&code);
+    test.initial.resize(wave + 2u);
+    for (u32 lane = 0; lane < wave; lane++) {
+      test.initial[lane] = (lane * 2654435761u) ^ 0x5a5a5a5au;
+    }
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = 1;
+    test.compute_info.threads_num[2] = 1;
+    test.compute_info.thread_ids_num = 1;
+    test.compute_info.wave_size = wave;
+    test.has_compute_info = true;
+    const u32 span = wave == 64u ? 32u : 16u;
+    std::vector<u32> expected = test.initial;
+    expected[wave] = *std::max_element(test.initial.begin(), test.initial.begin() + span);
+    expected[wave + 1u] = *std::max_element(test.initial.begin() + (wave - span),
+                                            test.initial.begin() + wave);
+    std::vector<u32> native_spirv;
+    std::vector<u32> scan_spirv;
+    std::vector<u32> native_words;
+    std::vector<u32> scan_words;
+    {
+      CodegenOptions options = GetCodegenOptions();
+      options.lane_reductions = true;
+      ScopedCodegenOptions scope(options);
+      native_words = RunCollect(vulkan, test, wave + 2u, &native_spirv);
+    }
+    {
+      CodegenOptions options = GetCodegenOptions();
+      options.lane_reductions = false;
+      ScopedCodegenOptions scope(options);
+      scan_words = RunCollect(vulkan, test, wave + 2u, &scan_spirv);
+    }
+    const auto stage = wave == 64u ? "wave64 row pairs" : "wave32 rows";
+    Require(name, stage,
+            CountSpirv(native_spirv, "OpGroupNonUniformUMax") == 2u &&
+                CountSpirv(scan_spirv, "OpGroupNonUniformUMax") == 0u,
+            "the row scan reads did not become two native reductions, or did with the switch off");
+    RequireEqualWords(name, stage, expected, native_words);
+    RequireEqualWords(name, stage, expected, scan_words);
+  }
+  std::printf("[codegen] %-32s ok (wave32 rows, wave64 row pairs)\n", name);
+}
+
 // The Scope operand of every OpReadClockKHR (Device 1, Subgroup 3), from the 32-bit constants.
 std::vector<u32> ReadClockScopes(const std::vector<u32> &spirv) {
   constexpr u32 OpConstant = 43;

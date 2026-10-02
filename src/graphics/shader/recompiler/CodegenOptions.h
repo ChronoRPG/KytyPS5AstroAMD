@@ -139,6 +139,17 @@ struct CodegenOptions {
 	// S_MEMREALTIME never times out, and only a GPU reset ends it. The emitter reads the clock the
 	// device layer enabled (Spirv::HostShaderClock); a device without one keeps the placeholder.
 	bool realtime_clock = true;
+	// KYTY_DPP_SKIP_INACTIVE=0: a DPP source lane that EXEC disables reads zero (the behaviour
+	// before), so the receiving lane gets op(0, x). On the guest such a source is invalid like a
+	// vacated one, and without bound_ctrl the receiving lane keeps its value (PS5 ISA, DPP options);
+	// so does a lane the host subgroup lacks. A work-list loop whose DPP row scan then yields a
+	// wrong minimum never ends (a GPU hang). Not for DPP8 or fetch-inactive. Exact.
+	bool dpp_skip_inactive = true;
+	// KYTY_LANE_REDUCTIONS=0: a V_READLANE of the last lane of a DPP row scan with every lane enabled
+	// (IR::MatchLaneReduction) stays an emulated scan instead of a native subgroup reduction over the
+	// row or row pair. A partly filled host subgroup lacks lanes the scan would read; the reduction
+	// counts them as the operation's identity, as the guest shader's own masking makes them.
+	bool lane_reductions = true;
 };
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.

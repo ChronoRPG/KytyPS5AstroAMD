@@ -9484,6 +9484,65 @@ void TestCapturedBufferAtomicsX2() {
   }
 }
 
+// A wave reduction as compilers write it for RDNA (from Senaxx's wolverine branch): with every
+// lane enabled, v_max_u32 over a DPP row_shr scan (1, 2, 4, 8) of each row of 16 lanes, then
+// v_readlane of each row's last lane (wave32: lanes 15 and 31), or, after V_PERMLANEX16 adds the
+// other row's last lane, of each row pair's last lane (wave64: lanes 31 and 63). A partly filled
+// host subgroup lacks lanes the scan and v_readlane would read, so each read becomes a native
+// subgroup reduction (KYTY_LANE_REDUCTIONS); the same code with a different last shift, or with
+// KYTY_LANE_REDUCTIONS=0, stays a scan.
+void TestWaveRowReduction() {
+  const auto native_reductions = [](uint32_t last_control, bool row_pairs,
+                                    bool lane_reductions = true) {
+    std::vector<uint32_t> shader = {
+        row_pairs ? EncodeSop1(0x04, 126, 193) : EncodeSMovB32(126, 193), // s_mov_b64 exec, -1
+        EncodeVop2(0x14, 1, 250, 0), EncodeVop2Dpp(0, 0x111), // v_max_u32 v1, v0 row_shr:1, v0
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x112), // v_max_u32 v1, v1 row_shr:2, v1
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x114),
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, last_control),
+    };
+    const uint32_t lanes[2] = {row_pairs ? 31u : 15u, row_pairs ? 63u : 31u};
+    if (row_pairs) {
+      shader.insert(shader.end(), {
+          EncodeVop3Word0(0x378, 2), EncodeVop3Word1(256 + 1, 193, 193), // v_permlanex16_b32 v2, v1, -1, -1
+          EncodeVop2(0x14, 1, 256 + 1, 2),                              // v_max_u32 v1, v1, v2
+      });
+    }
+    shader.insert(shader.end(), {
+        EncodeVop3Word0(0x360, 2), EncodeVop3Word1(256 + 1, 128 + lanes[0], 0), // v_readlane_b32 s2
+        EncodeVop3Word0(0x360, 3), EncodeVop3Word1(256 + 1, 128 + lanes[1], 0), // v_readlane_b32 s3
+        EncodeSop2(0x09, 4, 2, 3),                    // s_max_u32 s4, s2, s3
+        EncodeVop1(0x01, 2, 4),                       // v_mov_b32 v2, s4
+        EncodeExp0(0x00, 0xf), EncodeExp1(2, 2, 2, 2), // exp mrt0
+        0xbf810000u,
+    });
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.wave_size = row_pairs ? 64 : 32;
+    const auto saved = ShaderRecompiler::GetCodegenOptions();
+    auto codegen = saved;
+    codegen.lane_reductions = lane_reductions;
+    ShaderRecompiler::SetCodegenOptions(codegen);
+    const auto result = RecompileForTest(shader, options);
+    ShaderRecompiler::SetCodegenOptions(saved);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    size_t found = 0;
+    for (auto at = source.find("OpGroupNonUniformUMax"); at != std::string::npos;
+         at = source.find("OpGroupNonUniformUMax", at + 1)) {
+      found++;
+    }
+    return found;
+  };
+  Check(native_reductions(0x118, false) == 2,
+        "a DPP row scan read at lanes 15 and 31 did not become two row reductions");
+  Check(native_reductions(0x118, true) == 2,
+        "a DPP row scan with V_PERMLANEX16 read at lanes 31 and 63 did not become two reductions");
+  Check(native_reductions(0x117, false) == 0 && native_reductions(0x117, true) == 0,
+        "a scan with the wrong last shift was taken for a lane reduction");
+  Check(native_reductions(0x118, false, false) == 0 && native_reductions(0x118, true, false) == 0,
+        "KYTY_LANE_REDUCTIONS=0 still emitted native lane reductions");
+}
+
 void TestNewShaderRecompilerBranchConditionForms() {
   struct Case {
     uint32_t opcode;
@@ -14080,6 +14139,11 @@ int main(int argc, char **argv) {
     std::printf("shader_cfg --mesh-indirect-only: ok\n");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--wave-reduction-only") == 0) {
+    TestWaveRowReduction();
+    std::printf("shader_cfg --wave-reduction-only: ok\n");
+    return 0;
+  }
   TestRayTracingDispatchDetection();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
@@ -14176,6 +14240,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
+  TestWaveRowReduction();
   TestDisabledSystemDebugBranch();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();

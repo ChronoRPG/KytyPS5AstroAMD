@@ -1197,6 +1197,12 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_NATIVE_INDIRECT_MESH=0")
 	add_test(NAME mesh_indirect_codegen
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --mesh-indirect-only)
+	# DPP row scans read by V_READLANE become native subgroup reductions (KYTY_LANE_REDUCTIONS);
+	# the GPU checks of the reductions and of DPP inactive sources are --wave-reductions-only.
+	add_test(NAME wave_row_reduction_codegen
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --wave-reduction-only)
+	add_test(NAME wave_reductions
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-reductions-only)
 	# The set-associative sampler memo; KYTY_SET_REUSE_FRESH: default, off, verify.
 	add_test(NAME sampler_memo
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampler-memo-only)

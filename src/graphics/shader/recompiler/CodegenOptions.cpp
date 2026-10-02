@@ -62,6 +62,8 @@ CodegenOptions FromEnvironment() {
 	}
 	options.srt_variant_reads = EnvFlag("KYTY_SRT_VARIANT_READS", options.srt_variant_reads);
 	options.realtime_clock    = EnvFlag("KYTY_REALTIME_CLOCK", options.realtime_clock);
+	options.dpp_skip_inactive = EnvFlag("KYTY_DPP_SKIP_INACTIVE", options.dpp_skip_inactive);
+	options.lane_reductions   = EnvFlag("KYTY_LANE_REDUCTIONS", options.lane_reductions);
 	// KYTY_NATIVE_INDIRECT_MESH=1|on|verify|exit (renderer/meshIndirect.h: GPU-converted indirect
 	// mesh draws); unset, 0 and "empty" keep the pushed-dword-only mesh draw parameters.
 	if (const auto* mode = std::getenv("KYTY_NATIVE_INDIRECT_MESH"); mode != nullptr) {

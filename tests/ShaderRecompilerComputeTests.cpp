@@ -33016,6 +33016,37 @@ TestCase VectorDppBoundsControlZeroPreservesDestination() {
   return test;
 }
 
+// A DPP row_shr:1 without bound_ctrl whose source lane EXEC disables: the receiving lane keeps
+// its value (PS5 ISA, DPP options), as one whose source is outside the row does
+// (KYTY_DPP_SKIP_INACTIVE; with it off, lane 4 read zero from lane 3 and wrote 0 + 100).
+TestCase VectorDppInactiveSourcePreservesDestination() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 2, 0xaaaaaaaau);
+  AppendVMovU32(&code, 1, 100);
+  AppendSMovLiteral(&code, 126, 0xf7u); // s_mov_b32 exec_lo: lanes 0-2 and 4-7
+  code.push_back(EncodeVop2(0x25, 2, 250, 1));
+  code.push_back(EncodeVop2Dpp(0, 0x111));
+  AppendSMovLiteral(&code, 126, 0xffu); // s_mov_b32 exec_lo: lanes 0-7
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDppInactiveSourcePreservesDestination";
+  test.code = code;
+  test.expected = {0xaaaaaaaau, 100, 101, 0xaaaaaaaau, 0xaaaaaaaau, 104, 105, 106};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 8;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase Vop3FmacF32NegatedSourceAccumulates() {
   using O = ShaderOpcode;
 
@@ -42191,6 +42222,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorDpp8Vop2);
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
+  AddCase(VectorDppInactiveSourcePreservesDestination);
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
@@ -47594,6 +47626,13 @@ int main(int argc, char **argv) {
     GiProbeTests::CheckLoopGuardEndsEndlessLoop(&vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--wave-reductions-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorDppInactiveSourcePreservesDestination());
+    CodegenTests::CheckDppInactiveSource(&vulkan);
+    CodegenTests::CheckLaneReductions(&vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ScalarMemRealtimeCaptured());
@@ -47615,6 +47654,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorDpp8Vop2());
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
     RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
+    RunCase(&vulkan, VectorDppInactiveSourcePreservesDestination());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-o-f32-only") == 0) {
