@@ -233,6 +233,11 @@ struct BufferCacheTestAccess {
   }
   // KYTY_TRACKER_RELAXED_QUERIES.
   static bool RelaxedQueriesEnabled(const BufferCache &cache) { return cache.m_relaxed_queries; }
+  static bool QueryUploadSnapshot(const MemoryTracker &tracker, uint64_t address,
+                                  uint64_t size, MemoryTracker::DirtyState &state,
+                                  bool &cpu_only) {
+    return BufferCache::QueryUploadSnapshot(tracker, address, size, state, cpu_only);
+  }
   static BufferCache::RelaxedTotals RelaxedTotals(const BufferCache &cache) {
     return cache.m_relaxed_totals;
   }
@@ -44916,6 +44921,54 @@ void CheckStandard64RenderTargetTileRoundTrip() {
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void CheckCpCpuQueryLive() {
+  constexpr const char *name = "CpCpuQueryLive";
+  constexpr uintptr_t base = 0x0000000200200000ull;
+  constexpr uint64_t size = 0x10000;
+  const auto address = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+      base, size, Common::VirtualMemory::Mode::ReadWrite, "cp_cpu_query_live", true);
+  Require(name, "allocation", address == base, "fixed guest allocation failed");
+  PageManager page_manager;
+  MemoryTracker tracker(page_manager);
+  tracker.ForEachUploadRange(base, size, true, [](uint64_t, uint64_t) noexcept {},
+                            []() noexcept {});
+  const auto check = [&](bool cpu_dirty, bool gpu_dirty) {
+    for (const bool on : {false, true, false, true}) {
+      Live::Testing::StageText(on ? "KYTY_CP_CPU_ONLY_QUERY=1\n"
+                                  : "KYTY_CP_CPU_ONLY_QUERY=0\n");
+      Live::OnCpFlip();
+      MemoryTracker::DirtyState state;
+      bool cpu_only = !on;
+      Require(name, "snapshot",
+              BufferCacheTestAccess::QueryUploadSnapshot(tracker, base, size, state, cpu_only) &&
+                  cpu_only == on && state.cpu == cpu_dirty && state.gpu == (!on && gpu_dirty),
+              "live switch did not choose the requested query or changed its CPU decision");
+      Require(name, "missing region",
+              !BufferCacheTestAccess::QueryUploadSnapshot(
+                  tracker, base + TRACKER_REGION_SIZE, size, state, cpu_only) &&
+                  tracker.RangeSignature(base + TRACKER_REGION_SIZE, size) == 0,
+              "a query created or accepted a missing region");
+    }
+  };
+  check(false, true);
+  tracker.UnmarkRegionAsGpuModified(base, size);
+  check(false, false);
+  tracker.MarkRegionAsCpuModified(base, size);
+  check(true, false);
+  Live::Testing::StageText("KYTY_CP_CPU_ONLY_QUERY=\n");
+  Live::OnCpFlip();
+  MemoryTracker::DirtyState state;
+  bool cpu_only = true;
+  Require(name, "default off",
+          BufferCacheTestAccess::QueryUploadSnapshot(tracker, base, size, state, cpu_only) &&
+              !cpu_only && state.cpu,
+          "unsetting the live flag did not restore the full query");
+  tracker.UntrackMemory(base, size);
+  Require(name, "free", Libs::LibKernel::Memory::FreeGuestMemory(base, size),
+          "guest free failed");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckStorageTextureGpuOwnedRebindState() {
   constexpr uintptr_t base = 0x0000000200200000ull;
   constexpr uint64_t size = 0x10000;
@@ -47980,6 +48033,12 @@ int main(int argc, char **argv) {
     vulkan.CheckRecorderDescriptorSetsLive();
     return 0;
   }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--cp-cpu-query-live-only") == 0) {
+    CheckCpCpuQueryLive();
+    return 0;
+  }
+#endif
   if (argc == 2 && std::strcmp(argv[1], "--push-shadow-only") == 0) {
     // The shadow compares only with KYTY_RENDERER_BATCH (the timing runs' setting), unless the
     // environment chose otherwise.

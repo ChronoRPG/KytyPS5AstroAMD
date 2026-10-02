@@ -346,9 +346,14 @@ private:
 	[[nodiscard]] bool RelaxedDirtySnapshot(uint64_t vaddr, uint64_t size,
 	                                        MemoryTracker::DirtyState& state);
 	[[nodiscard]] bool RelaxedNothingToUpload(uint64_t vaddr, uint64_t size);
+	// KYTY_CP_CPU_ONLY_QUERY (default off, live): omit the GPU mirror when only CPU dirtiness
+	// decides an upload. No cached state; the same mirrors and missing-region fallback apply.
+	static bool QueryUploadSnapshot(const MemoryTracker& tracker, uint64_t vaddr, uint64_t size,
+	                                MemoryTracker::DirtyState& state, bool& cpu_only);
 	bool VerifyRelaxedSnapshot(uint64_t vaddr, uint64_t size,
 	                           const MemoryTracker::DirtyState& relaxed,
-	                           const MemoryTracker::DirtyState& locked, uint64_t signature);
+	                           const MemoryTracker::DirtyState& locked, uint64_t signature,
+	                           bool cpu_only = false);
 	// KYTY_BINDING_EPOCH_MEMO (default on; =0 off; off with KYTY_SYNC_EPOCH=0). The result of a read
 	// binding (ObtainBuffer: not written, not a texel read; GPU thread) of [vaddr, vaddr + size) is
 	// reused by later read bindings of exactly that range while

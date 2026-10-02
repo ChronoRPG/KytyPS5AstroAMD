@@ -4,6 +4,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/hangTrace.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
@@ -41,6 +42,8 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+
+Live::Switch g_cpu_only_query("KYTY_CP_CPU_ONLY_QUERY", Live::ParseDefaultOff);
 
 bool IncrementalBdaSyncEnabled() {
 	const auto* value = std::getenv("KYTY_BDA_INCREMENTAL_SYNC");
@@ -2667,6 +2670,16 @@ bool BufferCache::RelaxedDirtySnapshot(uint64_t vaddr, uint64_t size,
 	return true;
 }
 
+bool BufferCache::QueryUploadSnapshot(const MemoryTracker& tracker, uint64_t vaddr, uint64_t size,
+                                      MemoryTracker::DirtyState& state, bool& cpu_only) {
+	cpu_only = g_cpu_only_query.On();
+	if (!cpu_only) {
+		return tracker.QueryDirtyRelaxed(vaddr, size, state);
+	}
+	state = {};
+	return tracker.QueryCpuDirtyRelaxed(vaddr, size, state.cpu);
+}
+
 bool BufferCache::RelaxedNothingToUpload(uint64_t vaddr, uint64_t size) {
 	if (!m_relaxed_queries || !GuestGpu::IsGpuThread()) {
 		return false;
@@ -2674,12 +2687,13 @@ bool BufferCache::RelaxedNothingToUpload(uint64_t vaddr, uint64_t size) {
 	const bool                verify    = RelaxedVerifyMode() != 0;
 	const auto                signature = verify ? m_memory_tracker.RangeSignature(vaddr, size) : 0;
 	MemoryTracker::DirtyState state;
-	if (!m_memory_tracker.QueryDirtyRelaxed(vaddr, size, state) || state.cpu) {
+	bool                     cpu_only = false;
+	if (!QueryUploadSnapshot(m_memory_tracker, vaddr, size, state, cpu_only) || state.cpu) {
 		return false;
 	}
 	if (verify) {
 		const auto locked = m_memory_tracker.QueryDirty(vaddr, size);
-		if (!VerifyRelaxedSnapshot(vaddr, size, state, locked, signature) || locked.cpu) {
+		if (!VerifyRelaxedSnapshot(vaddr, size, state, locked, signature, cpu_only) || locked.cpu) {
 			// A page turned CPU-dirty in between: synchronize it now, as the locked path would.
 			return false;
 		}
@@ -2692,14 +2706,15 @@ bool BufferCache::RelaxedNothingToUpload(uint64_t vaddr, uint64_t size) {
 bool BufferCache::VerifyRelaxedSnapshot(uint64_t vaddr, uint64_t size,
                                         const MemoryTracker::DirtyState& relaxed,
                                         const MemoryTracker::DirtyState& locked,
-                                        uint64_t                         signature) {
+                                        uint64_t                         signature, bool cpu_only) {
 	Profiler::CountFrameEvent(Profiler::FrameEvent::TrackerRelaxedVerifyChecks);
-	if (relaxed.cpu == locked.cpu && relaxed.gpu == locked.gpu) {
+	if (relaxed.cpu == locked.cpu && (cpu_only || relaxed.gpu == locked.gpu)) {
 		return true;
 	}
 	// Other threads only make pages CPU-dirty and publish GPU-dirty ones, and every such change
 	// advances the range's mutation serials first.
-	const bool forbidden = (relaxed.cpu && !locked.cpu) || (!relaxed.gpu && locked.gpu);
+	const bool forbidden = (relaxed.cpu && !locked.cpu) ||
+	                       (!cpu_only && !relaxed.gpu && locked.gpu);
 	const bool quiet =
 	    signature != 0 && m_memory_tracker.RangeSignature(vaddr, size) == signature;
 	if (!forbidden && !quiet) {
@@ -2759,8 +2774,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 			// locked query also waits for a transition that advanced the serial but has not
 			// changed its bits yet.
 			MemoryTracker::DirtyState relaxed;
+			bool                     cpu_only = false;
 			cross = !stream && m_binding_memo_cross &&
-			        m_memory_tracker.QueryDirtyRelaxed(vaddr, size, relaxed) && !relaxed.cpu &&
+			        QueryUploadSnapshot(m_memory_tracker, vaddr, size, relaxed, cpu_only) && !relaxed.cpu &&
 			        !m_memory_tracker.IsRegionCpuModified(vaddr, size) &&
 			        m_memory_tracker.RangeSignature(vaddr, size) == before;
 			if (!cross) {
