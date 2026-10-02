@@ -1260,6 +1260,7 @@ private:
 	// DrawIndex/DrawAuto under the render mutex: the previous run's validity is taken for this draw,
 	// and a draw the draw-prep engine does not commit counts as other command-processor work.
 	void                       BeginDrawRun();
+	[[nodiscard]] bool DrawRunCommandUnchanged(const CommandBuffer& buffer) const;
 	[[nodiscard]] DrawRunImage MakeDrawRunImage(ImageId id, bool texture) const;
 	// attachments_only: the textures of the record are not checked (KYTY_DRAW_RUN_ACQUIRE).
 	// DrawRunImagesChange: 0 when unchanged, else the first difference (verify-mode detail).

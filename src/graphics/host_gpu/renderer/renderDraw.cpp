@@ -2151,6 +2151,13 @@ void RenderExecutor::BeginDrawRun() {
 	}
 }
 
+bool RenderExecutor::DrawRunCommandUnchanged(const CommandBuffer& buffer) const {
+	return buffer.Identity() == m_run.command &&
+	       m_context.GetCommandScheduler().CurrentTick() == m_run.tick &&
+	       buffer.ActiveRenderingSerial() != 0 &&
+	       buffer.ActiveRenderingSerial() == m_run.rendering_serial;
+}
+
 RenderExecutor::DrawRunImage RenderExecutor::MakeDrawRunImage(ImageId id, bool texture) const {
 	DrawRunImage mark;
 	mark.id           = id;
@@ -2260,7 +2267,7 @@ uint32_t RenderExecutor::DrawRunImagesChange(bool compare_serials, bool attachme
 				    "content serial", "unregistered", "CPU dirty", "buffer modified", "texture refresh"};
 				std::printf("DrawRunVerifyImage: mark=%u role=%s field=%s guest=0x%llx size=0x%llx "
 				            "layout=%u->%u access=0x%llx->0x%llx stage=0x%llx->0x%llx "
-				            "serial=%llu->%llu subresources=%zu feedback=%llu/%llu attachment=%llu\n",
+				            "serial=%llu->%llu subresources=%zu feedback=%llu/%llu attachment=%llu run=%llu active=%llu\n",
 				            index, mark.texture ? "texture" : "attachment", names[field],
 				            (unsigned long long)mark.address, (unsigned long long)mark.size,
 				            (unsigned)mark.layout, image ? (unsigned)image->backing.state.layout : 0u,
@@ -2272,7 +2279,9 @@ uint32_t RenderExecutor::DrawRunImagesChange(bool compare_serials, bool attachme
 				            image ? image->backing.subresource_states.size() : 0u,
 				            image ? (unsigned long long)image->feedback_instance : 0ull,
 				            image ? (unsigned long long)image->feedback_serial : 0ull,
-				            image ? (unsigned long long)image->feedback_attached : 0ull);
+				            image ? (unsigned long long)image->feedback_attached : 0ull,
+				            (unsigned long long)m_run.rendering_serial,
+				            (unsigned long long)m_context.GetCommandScheduler().Current().ActiveRenderingSerial());
 				std::fflush(stdout);
 			}
 			return ((index + 1u) << 8u) | (mark.texture ? 0x80u : 0u) | field;
@@ -3123,34 +3132,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count},
 		                        m_run_active);
 	}
-	// KYTY_DRAW_RUN continuation: the buffer work above can download images for texel reads, submit
-	// the recording or change image state otherwise. Unless every kept image is as the previous
-	// draw left it, the structure is resolved now, in the normal order relative to the buffer
-	// bindings, which are made again after it (their reservations follow the image identities).
-	if (m_run_active && (buffer.Identity() != m_run.command ||
-	                     m_context.GetCommandScheduler().CurrentTick() != m_run.tick ||
-	                     !DrawRunImagesUnchanged(true))) {
-		DrawRun::GetTotals().late_fallbacks.fetch_add(1, std::memory_order_relaxed);
-		DrawRun::CountMiss(DrawRun::Miss::Images);
-		m_run_active = false;
-		DrawRunTargets(buffer, draw, m_run_slice_offset, state);
-		// No plan: its shader data was taken by the first preparation above.
-		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
-			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i], nullptr);
-		}
-		if (state.ps_active) {
-			PrepareBindings(state.ps_input_info.stage, *bindings.pixel, nullptr);
-		}
-		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
-	}
-	// KYTY_DRAW_RUN=verify: whether the kept images would have passed the check above (the normal
-	// path's own texture resolution ran before it here). A draw that would have fallen back is
-	// not compared.
-	if (m_run_verify && !DrawRunImagesUnchanged(true)) {
-		DrawRun::GetTotals().late_fallbacks.fetch_add(1, std::memory_order_relaxed);
-		DrawRun::CountMiss(DrawRun::Miss::Images);
-		m_run_verify = false;
-	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -3191,6 +3172,38 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
+	// All per-draw buffer work is now complete, including vertex/index/indirect acquisition. It
+	// can end rendering without changing a command buffer, tick or image state (buffer uploads /
+	// barriers). The rendering instance is part of the certificate, not just image identity.
+	// Unless every kept image is as the previous draw left it, the structure is resolved now, in the normal order relative to the buffer
+	// bindings, which are made again after it (their reservations follow the image identities).
+	if (m_run_active && (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true))) {
+		DrawRun::GetTotals().late_fallbacks.fetch_add(1, std::memory_order_relaxed);
+		DrawRun::CountMiss(DrawRun::Miss::Images);
+		m_run_active = false;
+		DrawRunTargets(buffer, draw, m_run_slice_offset, state);
+		// No plan: its shader data was taken by the first preparation above.
+		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i], nullptr);
+		}
+		if (state.ps_active) {
+			PrepareBindings(state.ps_input_info.stage, *bindings.pixel, nullptr);
+		}
+		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+		// The repeated binding work may merge/retire cache buffers or restart the command buffer.
+		// Reacquire the per-draw vertex/index reservations after it, just as on the normal path.
+		AcquireVertexBuffersInto(buffer, state.vertex_info[0], nullptr, vertex_bindings);
+		index_binding = PrepareIndexBuffer(buffer, index_source);
+	}
+	// KYTY_DRAW_RUN=verify: whether the kept images would have passed the check above (the normal
+	// path's own texture resolution ran before it here). A draw that would have fallen back is
+	// not compared.
+	if (m_run_verify && (!DrawRunCommandUnchanged(buffer) || !DrawRunImagesUnchanged(true))) {
+		DrawRun::GetTotals().late_fallbacks.fetch_add(1, std::memory_order_relaxed);
+		DrawRun::CountMiss(DrawRun::Miss::Images);
+		m_run_verify = false;
+	}
+
 	// KYTY_LOD_STATS_PLAIN_VARIANT: without a mip-statistics counter on any image the pixel
 	// program's feedback records nothing; its feedback-free variant then gives the same results
 	// without forcing the depth/stencil tests after a shader that can discard.

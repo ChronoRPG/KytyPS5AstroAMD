@@ -659,6 +659,18 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  static void SnapshotRunCommand(RenderExecutor &executor, const CommandBuffer &command, ImageId id) {
+    executor.m_run.command = command.Identity();
+    executor.m_run.tick = executor.m_context.GetCommandScheduler().CurrentTick();
+    executor.m_run.rendering_serial = command.ActiveRenderingSerial();
+    executor.m_run.images.assign(1, executor.MakeDrawRunImage(id, false));
+  }
+  static bool RunCommandUnchanged(const RenderExecutor &executor, const CommandBuffer &command) {
+    return executor.DrawRunCommandUnchanged(command);
+  }
+  static bool RunImagesUnchanged(const RenderExecutor &executor) {
+    return executor.DrawRunImagesUnchanged(true);
+  }
   static void DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
     executor.DrawAuto(0, command, args);
@@ -19370,6 +19382,24 @@ public:
       scheduler.Current().FlushBarriers();
       RenderExecutorTestAccess::ResetBindings(executor);
     }
+    // Buffer work may end rendering without changing the native command buffer, scheduler tick,
+    // or kept images. Such a draw must fall back even when the image certificate still holds.
+    draw(false, false);
+    draw(false, false);
+    auto &command = scheduler.Current();
+    const auto identity = command.Identity();
+    const auto tick = scheduler.CurrentTick();
+    RenderExecutorTestAccess::SnapshotRunCommand(executor, command, depth_id);
+    Require(name, "run certificate in active instance",
+            RenderExecutorTestAccess::RunCommandUnchanged(executor, command) &&
+                RenderExecutorTestAccess::RunImagesUnchanged(executor),
+            "the active rendering instance did not certify its unchanged depth target");
+    command.EndRendering();
+    Require(name, "ended instance invalidates run with unchanged images",
+            command.Identity() == identity && scheduler.CurrentTick() == tick &&
+                RenderExecutorTestAccess::RunImagesUnchanged(executor) &&
+                !RenderExecutorTestAccess::RunCommandUnchanged(executor, command),
+            "a run remained certified after rendering ended without an image/command/tick change");
     scheduler.Finish();
     RenderExecutorTestAccess::DestroyDescriptorPipelines(executor, descriptor_pipelines);
     std::printf("[gpu]     %-32s ok\n", name);
@@ -48289,6 +48319,7 @@ int main(int argc, char **argv) {
     vulkan.CheckDrawRun(true);
     vulkan.CheckDrawRun(false, true);
     vulkan.CheckDrawRun(true, true);
+    vulkan.CheckDepthFeedbackKeep();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-run-live") == 0) {
@@ -48321,6 +48352,7 @@ int main(int argc, char **argv) {
     vulkan.CheckDrawRun(true);
     vulkan.CheckDrawRun(false, true);
     vulkan.CheckDrawRun(true, true);
+    vulkan.CheckDepthFeedbackKeep();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--eop-timestamps-only") == 0) {
