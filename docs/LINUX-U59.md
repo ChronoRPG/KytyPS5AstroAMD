@@ -1,5 +1,7 @@
 # U59 + Demon's Souls: Linux x86-64 build
 
+> Written for the 2026-09-30 release (`u59-windows-20260930-demons`); main has moved on since then.
+
 This branch builds the source of `u59-windows-20260930-demons`
 (commit `3ea4c7562ee5c6cdc8009367d34770fc50eb1d6e`) with two Linux portability fixes.
 It does not add U60 or RT work, game files, compatibility cheat files, firmware,
