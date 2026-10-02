@@ -1831,37 +1831,41 @@ void TestSopkCompareImmediateExtension() {
   }
 }
 
-void TestDisabledSystemDebugBranch() {
+void TestDisabledDebugBranches() {
   using namespace ShaderRecompiler;
-  // Relocate PPSA08709 MS pc 0x530 to zero, retaining its displacement to the
-  // system validation helper immediately after the main shader's S_ENDPGM.
-  std::array<uint32_t, 274> shader;
-  shader.fill(EncodeSopp(0x00));
-  shader[0] = 0xbf97010fu;
-  shader[1] = EncodeVop1(0x01, 1, 129);
-  shader[2] = EncodeMubuf0(0x1c, 0, false);
-  shader[3] = EncodeMubuf1(1, 0, 0);
-  shader[271] = EncodeSopp(0x01);
-  shader[272] = 0xffffffffu; // System-only helper must not be decoded.
-  shader[273] = 0xffffffffu;
-  Decoder::Program decoded;
-  Decoder::DecodeProgram(shader, decoded);
-  Check(decoded.instructions.front().opcode == Decoder::Opcode::S_CBRANCH_CDBGSYS &&
-            decoded.instructions.front().branch_target == 0x440u &&
-            decoded.instructions.back().pc == 0x43cu &&
-            decoded.instructions.back().opcode == Decoder::Opcode::S_ENDPGM,
-        "disabled system debug branch reached its post-ENDPGM validation helper");
-  auto graph = CFG::BuildGraph(decoded);
-  Check(graph.blocks.size() == 1u && graph.FindBlockByPc(0x440u) == nullptr &&
-            graph.blocks.front().terminator.kind == CFG::TerminatorKind::Return,
-        "disabled system debug branch changed normal shader control flow");
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-  auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("S_CBRANCH_CDBGSYS 0x00000440") != std::string::npos) &&
-            (result.ir_dump.find("StoreBufferU32") != std::string::npos),
-        "disabled system debug branch lost its identity or fallthrough write");
-  CheckSpirvBinaryValidates(result.spirv);
+  // Both debug branches fall through when conditional shader debugging is disabled.
+  // Retain the post-ENDPGM helper displacement from PPSA08709 and exercise the
+  // OR_USER variant encountered in PPSA03671 with the same body.
+  for (const auto opcode : {Decoder::Opcode::S_CBRANCH_CDBGSYS,
+                            Decoder::Opcode::S_CBRANCH_CDBGSYS_OR_USER}) {
+    std::array<uint32_t, 274> shader;
+    shader.fill(EncodeSopp(0x00));
+    shader[0] = EncodeSopp(opcode == Decoder::Opcode::S_CBRANCH_CDBGSYS ? 0x17 : 0x19, 0x10f);
+    shader[1] = EncodeVop1(0x01, 1, 129);
+    shader[2] = EncodeMubuf0(0x1c, 0, false);
+    shader[3] = EncodeMubuf1(1, 0, 0);
+    shader[271] = EncodeSopp(0x01);
+    shader[272] = 0xffffffffu; // Debug-only helper must not be decoded.
+    shader[273] = 0xffffffffu;
+    Decoder::Program decoded;
+    Decoder::DecodeProgram(shader, decoded);
+    Check(decoded.instructions.front().opcode == opcode &&
+              decoded.instructions.front().branch_target == 0x440u &&
+              decoded.instructions.back().pc == 0x43cu &&
+              decoded.instructions.back().opcode == Decoder::Opcode::S_ENDPGM,
+          "disabled debug branch reached its post-ENDPGM validation helper");
+    auto graph = CFG::BuildGraph(decoded);
+    Check(graph.blocks.size() == 1u && graph.FindBlockByPc(0x440u) == nullptr &&
+              graph.blocks.front().terminator.kind == CFG::TerminatorKind::Return,
+          "disabled debug branch changed normal shader control flow");
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.dump_ir = true;
+    auto result = RecompileForTest(shader, options);
+    Check((result.decoded_dump.find(" 0x00000440") != std::string::npos) &&
+              (result.ir_dump.find("StoreBufferU32") != std::string::npos),
+          "disabled debug branch lost its identity or fallthrough write");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
 }
 
 void TestNewShaderRecompilerRdna2ScalarOpcodes() {
@@ -10085,6 +10089,39 @@ void TestEmbeddedFetchPreservesSharedScalarLoad() {
                        result.resources.buffers[0].dwords.begin()),
         "embedded fetch discarded a scalar-load component used by another buffer read");
   CheckSpirvBinaryValidates(result.spirv);
+
+  const auto key = MakeStageStaticKey(input);
+  const auto compile = [&](const ShaderVertexInputInfo &vertex) {
+    auto variant_options = options;
+    variant_options.input_info.vertex = &vertex;
+    return RecompileForTest(code, variant_options).spirv;
+  };
+  auto layout = input;
+  layout.resources_dst[0].register_start = 32;
+  layout.resources_dst[0].fetch_index = 1;
+  layout.resources[0].UpdateAddress48(0x56780000u);
+  layout.resources[0].fields[1] = 52u << 16u;
+  layout.resources[0].fields[2] = 128;
+  layout.resources[0].fields[3] |= 3u << 28u;
+  layout.buffers_num = 1;
+  layout.buffers[0] = {.addr = 0x56780000u, .stride = 52, .num_records = 128,
+                       .fetch_index = 1};
+  Check(compile(layout) == result.spirv,
+        "pipeline-only vertex layout changed the embedded-fetch shader");
+  Check(MakeStageStaticKey(layout) == key,
+        "pipeline-only vertex layout fragmented the shader module cache key");
+
+  auto formatted = input;
+  formatted.resources[0].fields[3] =
+      (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32UInt) << 12u) |
+      DstSel(4, 5, 6, 7);
+  Check(compile(formatted) != result.spirv && MakeStageStaticKey(formatted) != key,
+        "vertex input numeric type lost its shader module specialization");
+  auto swizzled = input;
+  swizzled.resources[0].fields[3] =
+      (swizzled.resources[0].fields[3] & ~0xfffu) | DstSel(5, 4, 6, 7);
+  Check(compile(swizzled) != result.spirv && MakeStageStaticKey(swizzled) != key,
+        "vertex input destination selectors lost their shader module specialization");
 }
 
 void TestEmbeddedVertexFormatSwizzle() {
@@ -10136,7 +10173,7 @@ void TestEmbeddedVertexFormatSwizzle() {
     Decoder::Program decoded;
     Decoder::DecodeProgram(code, decoded);
     const uint32_t attribute = static_cast<uint32_t>(test.attribute_format) << 5u;
-    const uint32_t buffer[] = {0x10000000u, 16u << 16u, 1u,
+    uint32_t buffer[] = {0x10000000u, 16u << 16u, 1u,
                                (static_cast<uint32_t>(test.format) << 12u) | test.swizzle};
     HW::VertexShaderInfo regs{};
     regs.es_regs.data_addr = reinterpret_cast<uint64_t>(code);
@@ -10155,6 +10192,16 @@ void TestEmbeddedVertexFormatSwizzle() {
     ShaderMapUserData(regs.es_regs.data_addr, mapped);
     ShaderVertexInputInfo input{};
     PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    if (&test == cases) {
+      for (const auto [word, flag] : {std::pair{1u, 1u << 31u}, std::pair{3u, 1u << 23u}}) {
+        buffer[word] |= flag;
+        ExpectFatal([&] { PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input); },
+                    "unsupported vertex fetch flags bypassed acquisition validation");
+        buffer[word] &= ~flag;
+      }
+    }
+#endif
     Frontend::EmbeddedFetchPlan fetch;
     fetch.loads.push_back({.pc = 0, .attrib_id = 0, .components = test.components});
     Frontend::TranslateOptions options{};
@@ -10556,38 +10603,6 @@ void TestNewShaderRecompilerClipDisabledPosition() {
   shifted.clip_space.offset[0] += 1.0f;
   Check(MakeStageStaticKey(clipped) != MakeStageStaticKey(shifted),
         "clip-disabled viewport transform is absent from the shader cache key");
-
-  ShaderVertexInputInfo layout_a{};
-  layout_a.resources_num = 1;
-  layout_a.buffers_num = 1;
-  layout_a.buffers[0].attr_num = 1;
-  layout_a.buffers[0].attr_indices[0] = 0;
-  layout_a.buffers[0].stride = 16;
-  auto layout_b = layout_a;
-  layout_b.buffers[0].stride = 32;
-  layout_b.buffers[0].fetch_index = 1;
-  layout_b.buffers[0].attr_offsets[0] = 4;
-  Check(MakeStageStaticKey(layout_a) == MakeStageStaticKey(layout_b),
-        "pipeline-only vertex layout fragmented the shader module cache key");
-
-  // Upstream 0fbeac6d3: the packed V# words keep exactly the fields translation reads.
-  const auto descriptor_state = [](const ShaderBufferResource &resource) {
-    return std::array<uint32_t, 9>{
-        resource.Stride(), resource.SwizzleEnabled(), resource.DstSelX(),
-        resource.DstSelY(), resource.DstSelZ(), resource.DstSelW(),
-        resource.RawFormat(), resource.OutOfBounds(), resource.AddTid()};
-  };
-  const auto key = MakeStageStaticKey(layout_a);
-  const auto state = descriptor_state(layout_a.resources[0]);
-  for (uint32_t word = 0; word < 4; word++) {
-    for (uint32_t bit = 0; bit < 32; bit++) {
-      auto changed = layout_a;
-      changed.resources[0].fields[word] ^= 1u << bit;
-      Check((MakeStageStaticKey(changed) == key) ==
-                (descriptor_state(changed.resources[0]) == state),
-            "vertex key lost a descriptor field or included runtime-only bits");
-    }
-  }
 }
 
 void TestNewShaderRecompilerAuxPositionExports() {
@@ -11413,6 +11428,124 @@ void TestValuePhiValidation() {
                    "validation");
   }
 #endif
+}
+
+void TestWave32MaskProjection() {
+  using namespace ShaderRecompiler::IR;
+  for (const uint32_t wave_size : {32u, 64u}) {
+    Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = wave_size;
+    for (uint32_t id = 0; id < 3; ++id) {
+      program.block_storage.push_back(std::make_unique<Block>());
+      program.blocks.push_back(program.block_storage.back().get());
+      program.block_info.push_back({.id = id});
+    }
+    auto *entry = program.blocks[0];
+    auto *loop = program.blocks[1];
+    entry->AddBranch(loop);
+    loop->AddBranch(loop);
+    loop->AddBranch(program.blocks[2]);
+    program.block_info[0].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1;
+    program.block_info[1].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    program.block_info[1].terminator.true_block = 1;
+    program.block_info[1].terminator.false_block = 2;
+    program.block_info[2].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Return;
+    IREmitter e(entry);
+    const auto zero = U32(Value(0u));
+    const auto raw = e.GetUserData(static_cast<ScalarReg>(0));
+    const auto active = e.INotEqual(raw, zero);
+    const auto selected = e.IEqual(raw, U32(Value(7u)));
+    const auto ballot = [&](IREmitter &ir, U1 predicate, uint32_t component = 0u) {
+      return ir.CompositeExtract(ir.Emit(ValueOpcode::Ballot, {predicate}), component);
+    };
+    const auto thread_bit = [&](IREmitter &ir, U32 word, bool own_lane = true) {
+      const auto bit = own_lane
+          ? ir.BitwiseAnd(U32(ir.Emit(ValueOpcode::LaneId)), U32(Value(31u)))
+          : U32(Value(3u));
+      return ir.INotEqual(ir.BitwiseAnd(ir.ShiftRightLogical(word, bit), U32(Value(1u))), zero);
+    };
+    const auto active_mask = ballot(e, active);
+    const auto direct = thread_bit(e, active_mask);
+    const auto arbitrary = thread_bit(e, raw);
+    const auto mixed = thread_bit(e, e.BitwiseAnd(active_mask, raw));
+    const auto mixed_or = thread_bit(e, e.BitwiseOr(active_mask, raw));
+    const auto mixed_select = thread_bit(e, e.Select(selected, active_mask, raw));
+    const auto different_lane = thread_bit(e, active_mask, false);
+    const auto high_half = thread_bit(e, ballot(e, active, 1u));
+    const auto initial_mask = e.BitwiseAnd(active_mask, ballot(e, selected));
+    const auto raw_consumer = e.Emit(ValueOpcode::IAdd32, {initial_mask, Value(3u)});
+    const auto initial_predicate = e.LogicalAnd(active, selected);
+    const auto entry_size = entry->Instructions().size();
+    ConstantPropagationPass({entry}, wave_size);
+    Check(entry->Instructions().size() == entry_size,
+          "rejected mixed mask graph left unused projected instructions");
+    const auto combined_mask = e.BitwiseOr(active_mask, ballot(e, selected));
+    const auto combined = thread_bit(e, combined_mask);
+    const auto gated_mask = e.Select(selected, combined_mask, zero);
+    const auto gated = thread_bit(e, gated_mask);
+    const auto rejected = thread_bit(e, e.Select(selected, zero, combined_mask));
+    const auto combined_predicate = e.LogicalOr(active, selected);
+    const auto gated_predicate = e.LogicalAnd(selected, combined_predicate);
+    const auto rejected_predicate = e.Emit(ValueOpcode::SelectU1,
+                                          {selected, Value(false), combined_predicate});
+    const auto gated_raw_consumer = e.Emit(ValueOpcode::IAdd32, {gated_mask, Value(3u)});
+    auto &mask = loop->AppendNewInst(ValueOpcode::Phi);
+    mask.SetFlags(Type::U32);
+    auto &predicate = loop->AppendNewInst(ValueOpcode::Phi);
+    predicate.SetFlags(Type::U1);
+    IREmitter body(loop);
+    const auto matches = body.LogicalAnd(U1(Value(&predicate)), selected);
+    const auto remaining = body.BitwiseAnd(U32(Value(&mask)), body.BitwiseNot(ballot(body, matches)));
+    const auto remaining_predicate = body.LogicalAnd(U1(Value(&predicate)), body.LogicalNot(matches));
+    const auto remaining_live = thread_bit(body, remaining);
+    const auto live = thread_bit(body, U32(Value(&mask)));
+    mask.AddPhiOperand(entry, initial_mask);
+    mask.AddPhiOperand(loop, remaining);
+    predicate.AddPhiOperand(entry, initial_predicate);
+    predicate.AddPhiOperand(loop, remaining_predicate);
+    program.block_info[1].condition = remaining_predicate;
+
+    ConstantPropagationPass(program.blocks, wave_size);
+    if (wave_size == 32u) {
+      Check(direct.Resolve() == active.Resolve(), "wave32 ballot round trip lost its predicate");
+      Check(EquivalentValue(program, combined, combined_predicate),
+            "wave32 OR mask projection changed a lane predicate");
+      Check(EquivalentValue(program, gated, gated_predicate) &&
+                EquivalentValue(program, rejected, rejected_predicate),
+            "wave32 select mask projection changed a scalar gate or selected arm");
+      Check(EquivalentValue(program, live.Resolve(), Value(&predicate)),
+            "projected mask Phi differs from the existing per-lane EXEC Phi");
+      Check(EquivalentValue(program, remaining_live.Resolve(), remaining_predicate) &&
+                std::count_if(loop->begin(), loop->end(), [](const Inst &inst) {
+                  return inst.GetOpcode() == ValueOpcode::LogicalAnd;
+                }) == 3,
+            "backedge-first projection duplicated the loop's logical mask operation");
+      const auto *projected = live.Resolve().TryInstruction();
+      Check(projected != nullptr && projected->GetOpcode() == ValueOpcode::Phi &&
+                projected->GetType() == Type::U1 && projected->PhiBlock(0) == entry &&
+                projected->PhiBlock(1) == loop,
+            "mask projection lost loop Phi type or predecessor order");
+    } else {
+      Check(direct.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
+                live.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
+                combined.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
+                gated.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32 &&
+                rejected.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32,
+            "wave64 low-half mask was projected onto the wrong invocation");
+    }
+    for (const auto value : {arbitrary, mixed, mixed_or, mixed_select, different_lane, high_half}) {
+      Check(value.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32,
+            "mask projection accepted an arbitrary mask, lane or ballot half");
+    }
+    Check(raw_consumer.Resolve().TryInstruction()->Arg(0).Resolve() == initial_mask.Resolve() &&
+              gated_raw_consumer.Resolve().TryInstruction()->Arg(0).Resolve() == gated_mask.Resolve(),
+          "mask projection changed a raw scalar mask consumer");
+    ResolveControlFlowIdentities(program);
+    RemoveIdentities(program.blocks);
+    ValidateProgram(program, true);
+  }
 }
 
 void TestU64ShiftConstantPropagation() {
@@ -13301,6 +13434,44 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
   CompilePixelRuntime(vcc_params, vcc_input);
 }
 
+void TestRegisteredShaderCodeIdentity() {
+  uint32_t shader[] = {EncodeSopp(0x00), EncodeSopp(0x01)};
+  HW::ComputeShaderInfo regs{};
+  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+  regs.cs_regs.num_thread_x = 64;
+  regs.cs_regs.num_thread_y = regs.cs_regs.num_thread_z = 1;
+  ShaderMappedData mapped{};
+  mapped.code_size_bytes = sizeof(shader);
+  const auto prepare = [&] {
+    ShaderComputeInputInfo input{};
+    return PrepareProgram(regs, HW::ShaderRegisters{}, input).hash;
+  };
+  const auto before = ShaderMapGeneration();
+  ShaderMapUserData(regs.cs_regs.data_addr, mapped);
+  Check(ShaderMapGeneration() > before, "shader registration did not invalidate generation memo");
+  const auto first = prepare();
+  Check(first == XXH3_64bits(shader, sizeof(shader)), "registered identity differs from exact code hash");
+  Check(prepare() == first, "memo hit changed registered identity");
+  shader[0] = EncodeSopp(0x00, 1);
+  Check(prepare() != first && prepare() == XXH3_64bits(shader, sizeof(shader)),
+        "serial fallback retained stale identity after headerless guest code write");
+  ShaderMapUserData(regs.cs_regs.data_addr, mapped);
+  const auto second = prepare();
+  Check(second != first && second == XXH3_64bits(shader, sizeof(shader)),
+        "same-address re-registration retained stale code identity");
+  const auto remapped = ShaderMapGeneration();
+  ShaderUnmapCode(regs.cs_regs.data_addr + sizeof(uint32_t), sizeof(uint32_t));
+  const auto* flag = std::getenv("KYTY_REGISTERED_SHADER_CODE");
+  const bool enabled = flag != nullptr && std::strcmp(flag, "0") != 0;
+  Check(enabled ? ShaderMapGeneration() > remapped : ShaderMapGeneration() == remapped,
+        "partial code unmap did not respect registration flag");
+  const auto removed = ShaderMapGeneration();
+  ShaderUnmapCode(regs.cs_regs.data_addr, sizeof(shader));
+  Check(ShaderMapGeneration() == removed, "code identity survived overlapping unmap");
+  ShaderMapUserData(regs.cs_regs.data_addr, mapped);
+  Check(prepare() == second, "re-registration after unmap did not restore identity");
+}
+
 void TestComputeLdsAllocationIdentity() {
   const uint32_t shader[] = {
       EncodeDs0(0x0d, 4288u), // ds_write_b32 v0, v1 offset:4288
@@ -14163,6 +14334,20 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--upsync2-only") == 0) {
+    TestDisabledDebugBranches();
+    TestWave32MaskProjection();
+    TestEmbeddedFetchPreservesSharedScalarLoad();
+    TestEmbeddedVertexFormatSwizzle();
+    TestValuePhiValidation();
+    TestNewShaderRecompilerCfgConsecutiveNativePhis();
+    TestDeferredSpirvPhiPatching();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--registered-shader-code-only") == 0) {
+    TestRegisteredShaderCodeIdentity();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--isa-accuracy-only") == 0) {
     TestRdna2IsaAccuracyDecode();
     TestRdna2LdsWaitcntBarrierAndFloatControls();
@@ -14276,7 +14461,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
   TestWaveRowReduction();
-  TestDisabledSystemDebugBranch();
+  TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
@@ -14295,6 +14480,7 @@ int main(int argc, char **argv) {
   TestFinalSsaRejectsRegisterStatePseudos();
 #endif
   TestValuePhiValidation();
+  TestWave32MaskProjection();
   TestU64ShiftConstantPropagation();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNativeWideValueValidation();

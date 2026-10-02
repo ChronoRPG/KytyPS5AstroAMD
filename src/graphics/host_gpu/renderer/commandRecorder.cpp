@@ -337,6 +337,7 @@ struct CommandRecorder::NativeExecutor {
 				Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::DriverSubmit);
 				result = graphics.queue.submit(1, &submit_info, nullptr);
 			}
+			if (result == vk::Result::eErrorDeviceLost) DumpDeviceLossDiagnostics(graphics, p.tick);
 			if (result != vk::Result::eSuccess) {
 				std::printf("vkQueueSubmit (CP recorder) failed: %s (%d), tick=%" PRIu64
 				            " debug_op=%u debug_submit=%" PRIu64 "\n",

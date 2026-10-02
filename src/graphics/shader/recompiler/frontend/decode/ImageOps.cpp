@@ -367,6 +367,10 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		SetUnsupported(inst, Family::MIMG, opcode,
 		               "MIMG image gather requires exactly one dmask bit");
 	}
+	if (inst.opcode == Opcode::IMAGE_ATOMIC_CMPSWAP && inst.dmask != 0x3u) {
+		SetUnsupported(inst, Family::MIMG, opcode,
+		               "MIMG image compare-and-swap requires 32-bit DMASK 0x3");
+	}
 	const bool supports_d16 = sample != nullptr || gather != nullptr || opcode == 0x00u ||
 	                          opcode == 0x01u || opcode == 0x08u || opcode == 0x09u;
 	if (d16 && !supports_d16) {

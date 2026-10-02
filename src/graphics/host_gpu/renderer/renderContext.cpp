@@ -217,6 +217,10 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
+	if (!m_bda_logged) {
+		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
+		m_bda_logged = true;
+	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_buffer_cache.SynchronizeBdaBuffers(m_mapped_ranges);
 	m_fault_process_pending = true;

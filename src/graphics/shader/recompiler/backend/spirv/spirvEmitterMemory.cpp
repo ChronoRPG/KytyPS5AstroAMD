@@ -558,6 +558,7 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::SharedAtomicSwap32: return spv::OpAtomicExchange;
 		case IR::ValueOpcode::BufferAtomicIAdd32:
 		case IR::ValueOpcode::BufferAtomicIAdd64:
+		case IR::ValueOpcode::SharedAtomicIAdd64:
 		case IR::ValueOpcode::SharedAtomicIAdd32: return spv::OpAtomicIAdd;
 		case IR::ValueOpcode::BufferAtomicISub32:
 		case IR::ValueOpcode::BufferAtomicISub64:
@@ -1066,7 +1067,7 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    });
 }
 
-void EmitSharedAtomicOr64(ValueEmitContext& ctx, const IR::Inst& inst) {
+void EmitSharedAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
 	const auto& mem = ctx.Memory(inst);
 	EnsureLdsStorage(state);
