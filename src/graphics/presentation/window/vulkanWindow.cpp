@@ -891,7 +891,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			create_info.pNext = &diagnostics_features;
 		}
 	}
-	vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
+	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+		vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};
 		vk::PhysicalDeviceFeatures2        fault_query {};
 		fault_query.pNext = &supported_fault;
 		physical_device.getFeatures2(&fault_query);
