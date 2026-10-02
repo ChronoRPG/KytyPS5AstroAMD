@@ -18126,6 +18126,96 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // KYTY_PRESENT_BOX_DOWNSCALE (BryanKAdams/KytyPS5 6b00e83): the path choice, and a one-texel
+  // checkerboard presented at 1.5:1. One linear blit keeps a quarter of the pattern as a beat;
+  // PresentFilter's two-texel box cancels it.
+  void CheckPresentBoxDownscale() {
+    constexpr const char *name = "PresentBoxDownscale";
+    struct FilterCase {
+      vk::Extent2D source;
+      vk::Extent2D target;
+      bool expected;
+    };
+    constexpr FilterCase filter_cases[] = {
+        {{3840, 2160}, {2560, 1369}, true},  {{3840, 2160}, {1920, 1080}, false},
+        {{1920, 1080}, {2560, 1440}, false}, {{1920, 1080}, {1920, 1080}, false},
+        {{1920, 1080}, {1280, 1080}, true},  {{3840, 2160}, {1280, 720}, false},
+        {{1920, 1080}, {1920, 1000}, true},
+    };
+    for (const auto &c : filter_cases) {
+      Require(name, "filter choice",
+              PresentNeedsFilter(c.source, c.target) == c.expected,
+              "presentation picked the wrong downscale path");
+    }
+    constexpr u32 width = 192;
+    constexpr u32 height = 108;
+    constexpr vk::Extent2D near_target{width * 2 / 3, height * 2 / 3};
+    std::vector<u32> checker(static_cast<size_t>(width) * height);
+    for (u32 y = 0; y < height; y++) {
+      for (u32 x = 0; x < width; x++) {
+        checker[y * width + x] = ((x + y) & 1u) != 0 ? 0xffffffffu : 0xff000000u;
+      }
+    }
+    // The red channel's largest distance from mid-grey, without the outermost pixels (both
+    // paths clamp to the edge texel there, which keeps part of the pattern).
+    auto deviation_of = [&](const std::vector<u32> &pixels) {
+      int deviation = 0;
+      for (u32 y = 1; y + 1 < near_target.height; y++) {
+        for (u32 x = 1; x + 1 < near_target.width; x++) {
+          const auto pixel = pixels[y * near_target.width + x];
+          deviation = std::max(deviation,
+                               std::abs(static_cast<int>(pixel & 0xffu) - 128));
+        }
+      }
+      return deviation;
+    };
+    auto present_near = [&](bool filter) {
+      auto source = CreateImage2D(name, width, height, vk::Format::eR8G8B8A8Unorm,
+                                  vk::ImageUsageFlagBits::eSampled, checker, 1,
+                                  filter ? vk::ImageLayout::eShaderReadOnlyOptimal
+                                         : vk::ImageLayout::eTransferSrcOptimal);
+      auto destination =
+          CreateImage2D(name, near_target.width, near_target.height,
+                        vk::Format::eR8G8B8A8Unorm,
+                        vk::ImageUsageFlagBits::eColorAttachment, {}, 1,
+                        filter ? vk::ImageLayout::eColorAttachmentOptimal
+                               : vk::ImageLayout::eTransferDstOptimal);
+      PresentFilter present_filter;
+      auto cmd = BeginCommands(name, "near present");
+      if (filter) {
+        present_filter.Record(m_device, cmd, source.view, 0, {width, height},
+                              destination.view, vk::Format::eR8G8B8A8Unorm,
+                              near_target);
+      } else {
+        vk::ImageBlit region{};
+        region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+        region.srcOffsets[1] = vk::Offset3D{static_cast<int32_t>(width),
+                                            static_cast<int32_t>(height), 1};
+        region.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+        region.dstOffsets[1] =
+            vk::Offset3D{static_cast<int32_t>(near_target.width),
+                         static_cast<int32_t>(near_target.height), 1};
+        cmd.blitImage(source.image, vk::ImageLayout::eTransferSrcOptimal,
+                      destination.image, vk::ImageLayout::eTransferDstOptimal,
+                      1, &region, vk::Filter::eLinear);
+      }
+      EndSubmitAndFree(name, "near present", cmd);
+      present_filter.Release(m_device);
+      const auto pixels = ReadImage(name, &destination);
+      DestroyImage(&destination);
+      DestroyImage(&source);
+      return deviation_of(pixels);
+    };
+    const auto near_blit = present_near(false);
+    const auto near_filter = present_near(true);
+    std::printf("[host]    %-32s 1.5:1 blit %d, filtered %d\n", name, near_blit,
+                near_filter);
+    Require(name, "near fixture", near_blit >= 20,
+            "a single 1.5:1 linear blit no longer aliases the checkerboard");
+    Require(name, "near filter", near_filter <= 2,
+            "the presentation filter aliased a one-texel checkerboard");
+  }
+
   void CheckSamplerBorderColors() {
     constexpr const char *name = "SamplerBorderColors";
     auto &context = RuntimeRenderer();
@@ -47898,6 +47988,11 @@ int main(int argc, char **argv) {
     }
     VulkanHarness vulkan;
     vulkan.CheckPushShadowFreshSkip();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--present-box-downscale-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPresentBoxDownscale();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {

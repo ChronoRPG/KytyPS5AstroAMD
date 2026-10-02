@@ -401,6 +401,7 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_depth_to_color32.comp"
 	"${gpu_tiler_shader_dir}/gpu_blit_color32_to_depth.frag"
 	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
+	"${gpu_tiler_shader_dir}/gpu_video_out_downscale.frag"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)
@@ -915,6 +916,8 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-exact-lookup-only)
 	add_test(NAME image_pressure_retirement
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-pressure-retirement-only)
+	add_test(NAME present_box_downscale
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --present-box-downscale-only)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
