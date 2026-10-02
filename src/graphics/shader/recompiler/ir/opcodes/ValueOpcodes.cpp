@@ -137,7 +137,6 @@ BufferAccess BufferAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::BufferAtomicUMin64:
 		case ValueOpcode::BufferAtomicSMax64:
 		case ValueOpcode::BufferAtomicUMax64:
-		case ValueOpcode::BufferAtomicAnd64:
 		case ValueOpcode::BufferAtomicXor64:
 		case ValueOpcode::BufferAtomicFMin32:
 		case ValueOpcode::BufferAtomicFMax32: return BufferAccess::Atomic;
@@ -157,7 +156,6 @@ uint32_t BufferComponentCount(ValueOpcode opcode) {
 		case ValueOpcode::BufferAtomicUMin64:
 		case ValueOpcode::BufferAtomicSMax64:
 		case ValueOpcode::BufferAtomicUMax64:
-		case ValueOpcode::BufferAtomicAnd64:
 		case ValueOpcode::BufferAtomicXor64:
 		case ValueOpcode::LoadBufferU32x2:
 		case ValueOpcode::StoreBufferU32x2: return 2u;
@@ -252,8 +250,6 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 		case ValueOpcode::ImageAtomicXor32:
 		case ValueOpcode::ImageAtomicCmpSwap32:
 		case ValueOpcode::ImageAtomicISub32:
-		case ValueOpcode::ImageAtomicSMin32:
-		case ValueOpcode::ImageAtomicSMax32:
 		case ValueOpcode::ImageAtomicInc32:
 		case ValueOpcode::ImageAtomicDec32:
 		case ValueOpcode::ImageAtomicFMin32:

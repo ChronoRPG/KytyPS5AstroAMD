@@ -1072,8 +1072,6 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSMax64);
 		case Decoder::Opcode::BUFFER_ATOMIC_UMAX_X2:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicUMax64);
-		case Decoder::Opcode::BUFFER_ATOMIC_AND_X2:
-			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicAnd64);
 		case Decoder::Opcode::BUFFER_ATOMIC_XOR_X2:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicXor64);
 		case Decoder::Opcode::BUFFER_ATOMIC_FMIN:
@@ -1154,10 +1152,6 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicCmpSwap32);
 		case Decoder::Opcode::IMAGE_ATOMIC_SUB:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicISub32);
-		case Decoder::Opcode::IMAGE_ATOMIC_SMIN:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSMin32);
-		case Decoder::Opcode::IMAGE_ATOMIC_SMAX:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSMax32);
 		case Decoder::Opcode::IMAGE_ATOMIC_INC:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicInc32);
 		case Decoder::Opcode::IMAGE_ATOMIC_DEC:

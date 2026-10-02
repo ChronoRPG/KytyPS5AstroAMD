@@ -693,7 +693,6 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_UMIN_X2:
 		case Opcode::BUFFER_ATOMIC_SMAX_X2:
 		case Opcode::BUFFER_ATOMIC_UMAX_X2:
-		case Opcode::BUFFER_ATOMIC_AND_X2:
 		case Opcode::BUFFER_ATOMIC_XOR_X2:
 		case Opcode::BUFFER_LOAD_SBYTE:
 		case Opcode::BUFFER_LOAD_SSHORT:
