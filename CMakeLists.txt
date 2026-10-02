@@ -230,7 +230,7 @@ add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty
 # Steps 1 and 3 need the same compile flags: with /Z7 (debug info) clang-cl names and hashes some
 # lambdas differently, and their profile data then does not match. Releases build without /Z7.
 # The profile finds functions by name, and clang-cl names a function in an anonymous namespace after
-# a hash of its source file's path as written on the compile command line (?A0x<hash>). A profile
+# a hash of the compiled .cpp file's path as written on the command line (?A0x<hash>). A profile
 # fully matches only a build from the same path, spelled the same way. So both steps configure from
 # KYTY_PGO_SOURCE_DIR, a directory junction to the checkout (mklink /J C:\kyty-src <checkout>;
 # cmake -S C:\kyty-src): CMake and clang-cl keep the junction's path. The release workflow does the same.
