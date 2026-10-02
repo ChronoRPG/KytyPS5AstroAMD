@@ -47,7 +47,7 @@
 // computed (targets, texture bindings and views, samplers, pipeline, rendering state, barrier
 // safety, shader writes), and the normal path's skipped work must have been a no-op (no image
 // transition recorded, no dynamic state emitted, no attachment state changed but content serials
-// and LRU marks). Differences are counted, the first 32 logged ("exit" stops at the first).
+// and LRU marks). Differences are counted, the first N logged (KYTY_DRAW_RUN_LOG_LIMIT, default 64) ("exit" stops at the first).
 // One console line every 10 s: "DrawRun 10s: ...".
 namespace Libs::Graphics {
 
