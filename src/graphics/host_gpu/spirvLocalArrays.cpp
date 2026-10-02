@@ -409,7 +409,7 @@ void SetMaxSubgroupSize(uint32_t size) noexcept {
 	}
 }
 
-Result Shrink(std::span<const uint32_t> module, std::vector<uint32_t>& out) {
+Result Shrink(std::span<const uint32_t> module, std::vector<uint32_t>& out, Init init) {
 	Result result;
 	out.clear();
 	if (!HasFunctionArrayPointer(module)) {
@@ -491,6 +491,7 @@ Result Shrink(std::span<const uint32_t> module, std::vector<uint32_t>& out) {
 	uint32_t                                        bound = module[3];
 	std::unordered_map<uint32_t, std::vector<uint32_t>> insert_after; // offset -> words
 	std::unordered_map<uint32_t, uint32_t>              new_type_of;   // variable id -> pointer id
+	std::unordered_map<uint32_t, uint32_t>              init_of;       // variable id -> initializer id
 	for (auto& [id, candidate]: candidates) {
 		if (!candidate.bounded) {
 			result.unbounded_arrays++;
@@ -514,6 +515,24 @@ Result Shrink(std::span<const uint32_t> module, std::vector<uint32_t>& out) {
 		words.insert(words.end(),
 		             {(4u << 16u) | spv::OpTypePointer, pointer_id, spv::StorageClassFunction, array_id});
 		new_type_of[id] = pointer_id;
+		const auto* element_type = analysis.Def(candidate.element);
+		const bool  scalar32     = element_type != nullptr &&
+		                      (element_type->opcode == spv::OpTypeInt || element_type->opcode == spv::OpTypeFloat) &&
+		                      analysis.Word(*element_type, 2) == 32;
+		if (init == Init::Poison && scalar32) {
+			const auto poison_id    = bound++;
+			const auto composite_id = bound++;
+			words.insert(words.end(), {(4u << 16u) | spv::OpConstant, candidate.element, poison_id, 0x7fc00000u});
+			words.push_back(((3u + new_length) << 16u) | spv::OpConstantComposite);
+			words.push_back(array_id);
+			words.push_back(composite_id);
+			words.insert(words.end(), new_length, poison_id);
+			init_of[id] = composite_id;
+		} else if (init != Init::None) {
+			const auto null_id = bound++;
+			words.insert(words.end(), {(3u << 16u) | spv::OpConstantNull, array_id, null_id});
+			init_of[id] = null_id;
+		}
 		result.arrays.push_back({id, analysis.Name(id), candidate.length, new_length,
 		                         static_cast<uint32_t>(element_bytes)});
 		result.bytes_after += element_bytes * new_length;
@@ -526,13 +545,23 @@ Result Shrink(std::span<const uint32_t> module, std::vector<uint32_t>& out) {
 	out[3] = bound;
 	for (const auto& inst: analysis.Instructions()) {
 		const auto begin = module.begin() + inst.offset;
-		out.insert(out.end(), begin, begin + inst.count);
 		if (inst.opcode == spv::OpVariable) {
-			const auto retyped = new_type_of.find(analysis.Word(inst, 2));
+			const auto variable = analysis.Word(inst, 2);
+			const auto retyped  = new_type_of.find(variable);
 			if (retyped != new_type_of.end()) {
-				out[out.size() - inst.count + 1u] = retyped->second;
+				// Candidates have no initializer (4 words); Init adds one.
+				const auto initializer = init_of.find(variable);
+				if (initializer != init_of.end()) {
+					out.insert(out.end(), {(5u << 16u) | spv::OpVariable, retyped->second, variable,
+					                       spv::StorageClassFunction, initializer->second});
+				} else {
+					out.insert(out.end(), {(4u << 16u) | spv::OpVariable, retyped->second, variable,
+					                       spv::StorageClassFunction});
+				}
+				continue;
 			}
 		}
+		out.insert(out.end(), begin, begin + inst.count);
 		if (const auto extra = insert_after.find(inst.offset); extra != insert_after.end()) {
 			out.insert(out.end(), extra->second.begin(), extra->second.end());
 		}

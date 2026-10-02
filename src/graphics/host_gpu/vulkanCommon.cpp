@@ -143,18 +143,35 @@ namespace {
 // GPU keeps resident and never returns it; the recompiler's 8192-dword LDS emulation in vertex and
 // pixel shaders made that 3.9 GiB on an RTX 3090 (Astro Bot's galaxy map), where the pixel shaders
 // only reach 96 dwords. A rewritten module that fails spirv-val is not used (logged once).
-bool FunctionArrayShrinkEnabled() {
-	static const bool enabled = [] {
+// =zero also zero-fills the shrunk arrays at function entry (OpConstantNull initializer), =poison
+// fills them with float NaNs (diagnostic: makes reads of elements no path wrote visible).
+struct ShrinkMode {
+	bool                   enabled = false;
+	SpirvLocalArrays::Init init    = SpirvLocalArrays::Init::None;
+};
+
+const ShrinkMode& FunctionArrayShrinkMode() {
+	static const ShrinkMode mode = [] {
+		ShrinkMode  result;
 		const auto* value = std::getenv("KYTY_FUNCTION_ARRAY_SHRINK");
-		const bool  on    = value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
-		if (on) {
-			std::printf("Kyty Function-storage arrays: shrunk to their proven index bound "
-			            "(KYTY_FUNCTION_ARRAY_SHRINK)\n");
+		result.enabled    = value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+		if (result.enabled) {
+			if (std::strcmp(value, "zero") == 0) {
+				result.init = SpirvLocalArrays::Init::Zero;
+			} else if (std::strcmp(value, "poison") == 0) {
+				result.init = SpirvLocalArrays::Init::Poison;
+			}
+			std::printf("Kyty Function-storage arrays: shrunk to their proven index bound%s "
+			            "(KYTY_FUNCTION_ARRAY_SHRINK=%s)\n",
+			            result.init == SpirvLocalArrays::Init::Zero     ? ", zero-filled"
+			            : result.init == SpirvLocalArrays::Init::Poison ? ", filled with NaNs (diagnostic)"
+			                                                            : "",
+			            value);
 			std::fflush(stdout);
 		}
-		return on;
+		return result;
 	}();
-	return enabled;
+	return mode;
 }
 
 // Returns the rewritten module, or nothing (unchanged or invalid). `declared` / `created`: the
@@ -162,7 +179,7 @@ bool FunctionArrayShrinkEnabled() {
 std::vector<uint32_t> ShrinkFunctionArrays(std::span<const uint32_t> code, uint64_t& declared,
                                            uint64_t& created) {
 	std::vector<uint32_t> shrunk;
-	const auto            result = SpirvLocalArrays::Shrink(code, shrunk);
+	const auto            result = SpirvLocalArrays::Shrink(code, shrunk, FunctionArrayShrinkMode().init);
 	declared                     = result.bytes_before;
 	created                      = result.bytes_before;
 	if (!result.changed) {
@@ -211,7 +228,7 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	std::vector<uint32_t> shrunk;
 	uint64_t              declared = 0;
 	uint64_t              created  = 0;
-	if (FunctionArrayShrinkEnabled()) {
+	if (FunctionArrayShrinkMode().enabled) {
 		shrunk = ShrinkFunctionArrays(code, declared, created);
 		if (!shrunk.empty()) {
 			code = shrunk;

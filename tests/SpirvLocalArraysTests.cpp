@@ -148,6 +148,23 @@ void TestBoundedLds() {
 	Expect(Validate(out128), "128-wide shrunk module validates");
 }
 
+void TestInitModes() {
+	using Libs::Graphics::SpirvLocalArrays::Init;
+	SetMaxSubgroupSize(32);
+	const auto module = Assemble(LdsModule("%lane_var", false));
+	std::vector<uint32_t> zero;
+	const auto            zero_result = Shrink(module, zero, Init::Zero);
+	Expect(zero_result.changed && Validate(zero), "zero-filled shrunk module validates");
+	Expect(Disassemble(zero).find("OpConstantNull") != std::string::npos, "zero fill uses OpConstantNull");
+	std::vector<uint32_t> poison;
+	const auto            poison_result = Shrink(module, poison, Init::Poison);
+	Expect(poison_result.changed && Validate(poison), "NaN-filled shrunk module validates");
+	const auto text = Disassemble(poison);
+	Expect(text.find("OpConstant %uint 2143289344") != std::string::npos, "poison constant 0x7fc00000");
+	Expect(text.find("OpConstantComposite") != std::string::npos, "poison fill is a constant composite");
+	Expect(zero_result.arrays.size() == 1 && zero_result.arrays[0].new_length == 96, "same length with fills");
+}
+
 void TestUnboundedIndex() {
 	// The index comes from an input varying: no bound, no change.
 	const auto            module = Assemble(LdsModule("%in_var", false));
@@ -232,7 +249,16 @@ int ShrinkFile(const char* path) {
 		std::printf("  %s: %u -> %u elements of %u bytes\n", array.name.c_str(), array.old_length,
 		            array.new_length, array.element_bytes);
 	}
-	return valid ? 0 : 1;
+	// The fill variants must validate too.
+	bool fills_valid = true;
+	for (const auto init: {Libs::Graphics::SpirvLocalArrays::Init::Zero, Libs::Graphics::SpirvLocalArrays::Init::Poison}) {
+		std::vector<uint32_t> filled;
+		if (Shrink(module, filled, init).changed && !Validate(filled)) {
+			fills_valid = false;
+		}
+	}
+	std::printf("  zero and NaN fills validate: %d\n", fills_valid ? 1 : 0);
+	return valid && fills_valid ? 0 : 1;
 }
 
 } // namespace
@@ -246,6 +272,7 @@ int main(int argc, char** argv) {
 		return failures == 0 ? 0 : 1;
 	}
 	TestBoundedLds();
+	TestInitModes();
 	TestUnboundedIndex();
 	TestWholeArrayUse();
 	TestNoFunctionArrays();

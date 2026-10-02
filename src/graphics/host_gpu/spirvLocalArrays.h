@@ -45,8 +45,13 @@ struct Result {
 // largest subgroup size, unless set lower (the device's maxSubgroupSize).
 void SetMaxSubgroupSize(uint32_t size) noexcept;
 
+// What a shrunk array starts with. None: undefined, as emitted (Function variables have no
+// initializer). Zero: OpConstantNull (the driver zero-fills it at function entry). Poison: every
+// element 0x7fc00000 (a float NaN), a diagnostic that makes reads of never-written elements visible.
+enum class Init : uint8_t { None, Zero, Poison };
+
 // `out` receives the rewritten module when Result::changed, else it is left empty.
-Result Shrink(std::span<const uint32_t> module, std::vector<uint32_t>& out);
+Result Shrink(std::span<const uint32_t> module, std::vector<uint32_t>& out, Init init = Init::None);
 
 } // namespace Libs::Graphics::SpirvLocalArrays
 
