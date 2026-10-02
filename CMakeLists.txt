@@ -227,6 +227,8 @@ add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty
 # 2. llvm-profdata merge -o <x.profdata> <dumps>, with the llvm-profdata next to the compiler.
 # 3. KYTY_PGO_USE=<x.profdata> builds the optimized emulator. Use a new file name for a new
 #    profile: a compiler cache (sccache) does not see the profile's contents.
+# Steps 1 and 3 need the same compile flags: with /Z7 (debug info) clang-cl names and hashes some
+# lambdas differently, and their profile data then does not match. Releases build without /Z7.
 # The profile finds functions by name, and clang-cl names a function in an anonymous namespace after
 # a hash of its source file's path as written on the compile command line (?A0x<hash>). A profile
 # fully matches only a build from the same path, spelled the same way. So both steps configure from
