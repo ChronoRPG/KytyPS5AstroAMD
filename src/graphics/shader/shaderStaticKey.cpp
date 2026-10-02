@@ -58,14 +58,9 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	for (int i = 0; i < info.resources_num; i++) {
 		const auto& resource    = info.resources[i];
 		const auto& destination = info.resources_dst[i];
-		key.push_back(destination.register_start);
 		key.push_back(destination.registers_num);
-		key.push_back(destination.fetch_index);
 		key.push_back(static_cast<uint32_t>(destination.attr_id));
-		// The V# fields translation reads, packed as stored (upstream 0fbeac6d3): stride and
-		// swizzle enable; destination selects, format, add-TID and out-of-bounds mode.
-		key.push_back(resource.fields[1] & 0xbfff0000u);
-		key.push_back(resource.fields[3] & 0x3087ffffu);
+		key.push_back(resource.fields[3] & 0x7ffffu); // Embedded fetch channels and format.
 	}
 }
 

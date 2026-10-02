@@ -915,6 +915,8 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 			r.fields[2] = sharp[2];
 			r.fields[3] = sharp[3];
 		}
+		EXIT_NOT_IMPLEMENTED(r.AddTid());
+		EXIT_NOT_IMPLEMENTED(r.SwizzleEnabled());
 		if (format != Prospero::VertexAttribFormat::kInvalid) {
 			const auto                   format_raw    = static_cast<uint32_t>(format);
 			const auto                   buffer_format = format_raw >> 2u;
