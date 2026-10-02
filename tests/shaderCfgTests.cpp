@@ -13360,6 +13360,8 @@ void TestRegisteredShaderCodeIdentity() {
   Check(first == XXH3_64bits(shader, sizeof(shader)), "registered identity differs from exact code hash");
   Check(prepare() == first, "memo hit changed registered identity");
   shader[0] = EncodeSopp(0x00, 1);
+  Check(prepare() != first && prepare() == XXH3_64bits(shader, sizeof(shader)),
+        "serial fallback retained stale identity after headerless guest code write");
   ShaderMapUserData(regs.cs_regs.data_addr, mapped);
   const auto second = prepare();
   Check(second != first && second == XXH3_64bits(shader, sizeof(shader)),

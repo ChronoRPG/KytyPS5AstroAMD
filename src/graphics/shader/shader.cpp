@@ -80,9 +80,19 @@ static bool RegisteredShaderCodeEnabled() {
 struct ShaderMapEntry : ShaderMappedData {
 	uint64_t code_hash = 0;
 	uint64_t registered_hash = 0;
+	bool has_declared_hash = false;
 };
 
 static uint64_t GetDeclaredShaderHash(uint64_t shader_addr);
+
+static uint64_t RegisteredOrDeclaredShaderHash(uint64_t addr, const ShaderMapEntry& entry) {
+	if (RegisteredShaderCodeEnabled()) {
+		// Headerless serial preparations keep exact code hashing, including guest writes
+		// without re-registration. Declared IDs continue to select title-specific options.
+		return entry.has_declared_hash ? entry.registered_hash : 0;
+	}
+	return GetDeclaredShaderHash(addr);
+}
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
@@ -110,6 +120,7 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 		const auto declared = GetDeclaredShaderHash(addr);
 		// Keep declared IDs used by our title-specific codegen options; headerless code uses XXH3.
 		entry.registered_hash = declared != 0 ? declared : entry.code_hash;
+		entry.has_declared_hash = declared != 0;
 	}
 	std::scoped_lock lock(g_shader_map_mutex);
 
@@ -458,19 +469,22 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uin
 	}
 	const auto code_words = data.code_size_bytes / sizeof(uint32_t);
 	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
+	uint64_t effective_hash = declared_hash;
 	if (RegisteredShaderCodeEnabled() && DrawPrep::Speculative()) {
 		// Keep the worker's exact code certificate, including failed-read fallback at commit.
-		if (HashShaderCodeCertified(code) != data.code_hash || DrawPrep::SpeculativeFailed()) {
+		const auto certified_hash = HashShaderCodeCertified(code);
+		if (certified_hash != data.code_hash || DrawPrep::SpeculativeFailed()) {
 			DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
 			return {};
 		}
+		if (effective_hash == 0) effective_hash = certified_hash;
 	}
 	// A draw-prep preparation hashes headerless code through its recorder (the code becomes part
 	// of its certificate; KYTY_DRAW_PREP_CODE_CERT=0 fails it instead).
 	ShaderParams params {
 	    .code            = code,
 	    .user_data_count = static_cast<uint32_t>(user_data.size()) + user_data_base,
-	    .hash            = declared_hash != 0 ? declared_hash : HashShaderCode(code),
+	    .hash            = effective_hash != 0 ? effective_hash : HashShaderCode(code),
 	};
 	EXIT_IF(user_data.size() > HW::UserSgprInfo::SGPRS_MAX ||
 	        params.user_data_count > params.user_data.size());
@@ -1244,7 +1258,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	const bool merged = (context.GetShaderStages() & 0x20u) != 0;
 	auto        params = GetShaderParams(
 	    regs.es_regs.data_addr, "ShaderRecompiler VS",
-	    (RegisteredShaderCodeEnabled() ? data.registered_hash : GetDeclaredShaderHash(regs.es_regs.data_addr)),
+	    RegisteredOrDeclaredShaderHash(regs.es_regs.data_addr, data),
 	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
 	    merged ? 8u : 0u);
 	if (DrawPrep::SpeculativeFailed()) {
@@ -1293,7 +1307,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		const auto back = ShaderGetMappedData(regs.gs_regs.data_addr, "ShaderGetInputInfoGS():");
 		const auto back_params =
 		    GetShaderParams(regs.gs_regs.data_addr, "ShaderRecompiler GS",
-		                    (RegisteredShaderCodeEnabled() ? back.registered_hash : GetDeclaredShaderHash(regs.gs_regs.data_addr)), {}, back);
+		                    RegisteredOrDeclaredShaderHash(regs.gs_regs.data_addr, back), {}, back);
 		if (DrawPrep::SpeculativeFailed()) {
 			return params;
 		}
@@ -1349,11 +1363,11 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	const auto evaluation_users = std::span(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr);
 	std::array<ShaderParams, 3> params {
 	    GetShaderParams(regs.ls_regs.data_addr, "ShaderRecompiler LS",
-	                    (RegisteredShaderCodeEnabled() ? local.registered_hash : GetDeclaredShaderHash(regs.ls_regs.data_addr)), local_users, local),
+	                    RegisteredOrDeclaredShaderHash(regs.ls_regs.data_addr, local), local_users, local),
 	    GetShaderParams(regs.hs_regs.data_addr, "ShaderRecompiler HS",
-	                    (RegisteredShaderCodeEnabled() ? control.registered_hash : GetDeclaredShaderHash(regs.hs_regs.data_addr)), local_users, control, 8u),
+	                    RegisteredOrDeclaredShaderHash(regs.hs_regs.data_addr, control), local_users, control, 8u),
 	    GetShaderParams(regs.es_regs.data_addr, "ShaderRecompiler TES",
-	                    (RegisteredShaderCodeEnabled() ? evaluation.registered_hash : GetDeclaredShaderHash(regs.es_regs.data_addr)), evaluation_users,
+	                    RegisteredOrDeclaredShaderHash(regs.es_regs.data_addr, evaluation), evaluation_users,
 	                    evaluation),
 	};
 	// The fused HS back half receives its separate user-data address in s0:s1.
@@ -1406,7 +1420,7 @@ ShaderParams PrepareProgram(
 		ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
 	}
 	return GetShaderParams(
-	    regs.ps_regs.data_addr, "ShaderRecompiler PS", (RegisteredShaderCodeEnabled() ? data.registered_hash : GetDeclaredShaderHash(regs.ps_regs.data_addr)),
+	    regs.ps_regs.data_addr, "ShaderRecompiler PS", RegisteredOrDeclaredShaderHash(regs.ps_regs.data_addr, data),
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
 }
 
@@ -1415,7 +1429,7 @@ ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderR
 	const auto data = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
 	ShaderGetStaticInputInfoCS(regs, sh, data, info);
 	return GetShaderParams(
-	    regs.cs_regs.data_addr, "ShaderRecompiler CS", (RegisteredShaderCodeEnabled() ? data.registered_hash : GetDeclaredShaderHash(regs.cs_regs.data_addr)),
+	    regs.cs_regs.data_addr, "ShaderRecompiler CS", RegisteredOrDeclaredShaderHash(regs.cs_regs.data_addr, data),
 	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data);
 }
 
