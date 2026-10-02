@@ -14238,6 +14238,14 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--upsync2-only") == 0) {
+    TestDisabledDebugBranches();
+    TestWave32MaskProjection();
+    TestValuePhiValidation();
+    TestNewShaderRecompilerCfgConsecutiveNativePhis();
+    TestDeferredSpirvPhiPatching();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--registered-shader-code-only") == 0) {
     TestRegisteredShaderCodeIdentity();
     return 0;

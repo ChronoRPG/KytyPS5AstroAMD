@@ -47931,6 +47931,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferAtomicAndX2GlcAndExec());
     RunCase(&vulkan, ImageAtomicSignedMinMax<false>());
     RunCase(&vulkan, ImageAtomicSignedMinMax<true>());
+    RunCase(&vulkan, ImageAtomicCompareSwapGlcAndExec());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
