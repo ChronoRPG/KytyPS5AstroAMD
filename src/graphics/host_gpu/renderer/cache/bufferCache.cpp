@@ -36,6 +36,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
+#include <xmmintrin.h>
+#endif
+
 namespace Libs::Graphics {
 
 namespace {
@@ -44,6 +48,7 @@ constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
 Live::Switch g_cpu_only_query("KYTY_CP_CPU_ONLY_QUERY", Live::ParseDefaultOff);
+Live::Switch g_binding_memo_prefetch("KYTY_CP_BINDING_MEMO_PREFETCH", Live::ParseDefaultOff);
 
 bool IncrementalBdaSyncEnabled() {
 	const auto* value = std::getenv("KYTY_BDA_INCREMENTAL_SYNC");
@@ -2753,9 +2758,19 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint64_t size,
                                                             BufferId id) {
 	// KYTY_BINDING_EPOCH_MEMO (bufferCache.h).
+	// KYTY_CP_BINDING_MEMO_PREFETCH (default off, live): issue the read hint before the tracker
+	// query, so its region/serial loads can overlap the random memo-line fetch. This is a CPU cache
+	// hint only: every key, signature, epoch, tick and structure check below still runs.
+	auto& memo = BindingMemoSlot(vaddr, size);
+	if (g_binding_memo_prefetch.On()) {
+#if defined(__clang__) || defined(__GNUC__)
+		__builtin_prefetch(&memo, 0, 3);
+#elif defined(_M_X64) || defined(_M_IX86)
+		_mm_prefetch(reinterpret_cast<const char*>(&memo), _MM_HINT_T0);
+#endif
+	}
 	const auto epoch  = SyncEpoch::Current();
 	const auto before = m_memory_tracker.RangeSignature(vaddr, size);
-	auto&      memo   = BindingMemoSlot(vaddr, size);
 	if (before == 0 || memo.vaddr != vaddr || memo.size != size ||
 	    memo.kind == BindingMemoKind::Empty) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoMissSlot);
