@@ -41,6 +41,10 @@ the shared settings file `C:\ProgramData\Kyty\Kyty.ini`, so existing game direct
 available. If an older archive left a `Kyty.ini` beside the launcher, move it aside. No game files, saves, caches or
 patches are distributed.
 
+Optional: `"KYTY_PRESENT_BOX_DOWNSCALE": "1"` in `u59-preset.json` presents the 4K frame with a two-texel box filter
+when the window is between half and full size (for example 2560x1440), which removes a fine one-pixel stipple
+the default blit leaves. It is off by default; other window sizes are unaffected.
+
 ## Caveats
 
 - The first launch of each game compiles its shaders again. Program caches from older builds are not reused, so the
