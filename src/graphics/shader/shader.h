@@ -318,6 +318,7 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+void ShaderUnmapCode(uint64_t addr, uint64_t size);
 // Changes after every shader map update (draw-prep certificates compare it).
 [[nodiscard]] uint64_t ShaderMapGeneration();
 

@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/gpuReadDelegate.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/shader.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -2984,8 +2985,10 @@ int KYTY_SYSV_ABI KernelClearVirtualRangeName(const void* addr, uint64_t len) {
 }
 
 static bool FreeGuestMemoryOwner(uint64_t vaddr, uint64_t size) {
-	return g_guest_address_space->ReleaseCommitted(vaddr, size) &&
-	       g_virtual_ranges->Remove(vaddr, size);
+	if (!g_guest_address_space->ReleaseCommitted(vaddr, size) ||
+	    !g_virtual_ranges->Remove(vaddr, size)) return false;
+	Libs::Graphics::ShaderUnmapCode(vaddr, size);
+	return true;
 }
 
 static int UnmapMemoryRange(uint64_t vaddr, size_t len) {
@@ -3054,6 +3057,7 @@ static int UnmapMemoryRange(uint64_t vaddr, size_t len) {
 	}
 
 	g_virtual_ranges->Remove(vaddr, len);
+	Libs::Graphics::ShaderUnmapCode(vaddr, len);
 
 	if (g_free_callback != nullptr && IsCommittedRangeType(range.type)) {
 		g_free_callback(vaddr, len);
