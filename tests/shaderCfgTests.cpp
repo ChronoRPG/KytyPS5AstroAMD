@@ -13905,14 +13905,15 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x02, 0xfffeu), // B -> C
       EncodeSopp(0x01),
   };
+  // The transition counter of KYTY_DISPATCHER_CAP adds one Phi and six words.
   const auto dispatcher_result = compile("dispatcher", dispatcher,
-                                         {.words = 242,
+                                         {.words = 248,
                                           .instructions = 67,
                                           .variables = 3,
                                           .function_variables = 3,
                                           .loads = 3,
                                           .stores = 6,
-                                          .phis = 2,
+                                          .phis = 3,
                                           .labels = 13,
                                           .loop_merges = 1,
                                           .selection_merges = 1,
@@ -13921,9 +13922,9 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
                                           .switches = 1});
   Check(dispatcher_result.program.dispatcher_fallback &&
             (dispatcher_result.ir_dump.find("Phi") != std::string::npos) &&
-            SpirvInstructionOpcodeCount(dispatcher_result.spirv, 245u) == 2u &&
+            SpirvInstructionOpcodeCount(dispatcher_result.spirv, 245u) == 3u &&
             SpirvInstructionOpcodeCount(dispatcher_result.spirv, 251u) == 1u,
-        "dispatcher size fixture lost its two control Phis or switch");
+        "dispatcher size fixture lost its control Phis (pc, transitions, next pc) or switch");
   CheckSpirvPhiParents(dispatcher_result.spirv);
 }
 
