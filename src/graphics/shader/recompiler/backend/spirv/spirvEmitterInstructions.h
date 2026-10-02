@@ -214,6 +214,7 @@ uint32_t              EmitGetAttributeWithBary(ValueEmitContext& ctx, const IR::
 uint32_t              EmitGetInterpolationParameter(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetShaderBase(ValueEmitContext& ctx);
+uint32_t              EmitReadClockRealtime64(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitGetSrtResource     = EmitVoid;
 inline constexpr auto EmitGetBufferResource  = EmitGetSrtResource;
 inline constexpr auto EmitGetAddressResource = EmitGetSrtResource;

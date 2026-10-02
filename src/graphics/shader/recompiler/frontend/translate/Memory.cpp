@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
@@ -983,6 +984,21 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX8:
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16: return S_LOAD(inst, false);
 		case Decoder::Opcode::S_MEMREALTIME: {
+			if (GetCodegenOptions().realtime_clock) {
+				static std::atomic_flag noted = ATOMIC_FLAG_INIT;
+				if (!noted.test_and_set(std::memory_order_relaxed)) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "Shader: S_MEMREALTIME reads the host GPU clock (first in 0x{:016x}; "
+					    "KYTY_REALTIME_CLOCK=0 restores the placeholder)\n",
+					    program.shader_hash));
+				}
+				const auto words =
+				    ExtractU64(IR::U64(ir.Emit(IR::ValueOpcode::ReadClockRealtime64)));
+				for (uint32_t component = 0; component < 2; component++) {
+					WriteOperand(ScalarDestinationOperand(inst.dst, component), words[component]);
+				}
+				return;
+			}
 			static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 			if (!warned.test_and_set(std::memory_order_relaxed)) {
 				Log::WriteToConsoleAndLog(

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -23,6 +24,8 @@ enum HostFloatControlBits : uint32_t {
 std::atomic_uint32_t g_host_float_controls {0};
 std::atomic_bool     g_storage_dword_loads_return_zero {false};
 std::atomic_bool     g_image_min_lod {false};
+std::atomic_uint8_t  g_shader_clock_scope {0};
+std::atomic_int32_t  g_shader_clock_shift {0};
 
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
@@ -330,6 +333,13 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					requirements.subgroup_local_invocation_id |=
 					    program.stage != ShaderType::TessellationControl;
 					break;
+				case IR::ValueOpcode::ReadClockRealtime64:
+					if (GetHostShaderClock().scope != HostClockScope::None) {
+						requirements.shader_clock = true;
+						// The read is made wave-uniform (OpGroupNonUniformBroadcastFirst).
+						requirements.subgroup_ballot = true;
+					}
+					break;
 				case IR::ValueOpcode::ImageQueryLod: requirements.compute_derivatives = true; break;
 				case IR::ValueOpcode::ImageGatherRaw:
 					requirements.image_gather_extended = true;
@@ -385,6 +395,29 @@ void SetHostImageFeatures(const HostImageFeatures& features) {
 
 HostImageFeatures GetHostImageFeatures() {
 	return {.min_lod = g_image_min_lod.load(std::memory_order_relaxed)};
+}
+
+void SetHostShaderClock(const HostShaderClock& clock) {
+	g_shader_clock_scope.store(static_cast<uint8_t>(clock.scope), std::memory_order_relaxed);
+	g_shader_clock_shift.store(std::clamp(clock.shift, -8, 8), std::memory_order_relaxed);
+}
+
+HostShaderClock GetHostShaderClock() {
+	return {.scope = static_cast<HostClockScope>(g_shader_clock_scope.load(std::memory_order_relaxed)),
+	        .shift = g_shader_clock_shift.load(std::memory_order_relaxed)};
+}
+
+int32_t RealtimeClockShift(double timestamp_period_ns) {
+	const double     rate = timestamp_period_ns > 0.0 ? 1e9 / timestamp_period_ns : 1e9;
+	constexpr double Low  = 100e6 / 1.5;
+	int32_t          shift = 0;
+	while (shift < 8 && rate / std::ldexp(1.0, shift + 1) >= Low) {
+		shift++;
+	}
+	while (shift > -8 && rate * std::ldexp(1.0, -shift) < Low) {
+		shift--;
+	}
+	return shift;
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,

@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include <algorithm>
 #include <atomic>
@@ -884,6 +885,57 @@ uint32_t EmitGetShaderBase(ValueEmitContext& ctx) {
 	// Guest S_GETPC values stay shader-relative in SPIR-V, matching the runtime ABI. The
 	// runtime descriptor evaluator supplies the mapped shader base for host-side planning.
 	return ctx.Def(IR::Value(uint64_t {0}));
+}
+
+uint32_t EmitReadClockRealtime64(ValueEmitContext& ctx, const IR::Inst& inst) {
+	// S_MEMREALTIME is a scalar instruction: one value per wave. The second half of a wave64 that
+	// one invocation runs (lane_count 2) takes the first half's value.
+	if (ctx.half == 1) {
+		return ctx.other_half->Def(IR::Value(const_cast<IR::Inst*>(&inst)));
+	}
+	auto&      state = ctx.state;
+	const auto clock = GetHostShaderClock();
+	if (clock.scope == HostClockScope::None) {
+		// No shader clock on this device: the placeholder.
+		return ctx.Def(IR::Value(UINT64_MAX));
+	}
+	// Read the clock once as a uvec2 (the halves cannot tear) and take the subgroup's first active
+	// invocation's value, so every lane sees the same time, as on the guest.
+	const auto read = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpReadClockKHR, TypeU32Vector(state, 2), read,
+	    ConstantU32(state, clock.scope == HostClockScope::Device ? spv::ScopeDevice
+	                                                             : spv::ScopeSubgroup));
+	const auto uniform = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBroadcastFirst, TypeU32Vector(state, 2), uniform,
+	                          ConstantU32(state, spv::ScopeSubgroup), read);
+	if (clock.shift == 0) {
+		return uniform;
+	}
+	// Scale toward 100 MHz with a shift (no 64-bit arithmetic): right by `shift` bits for a faster
+	// clock (1 GHz: 125 MHz, so guest timeouts expire slightly early rather than 10x late), left
+	// for a slower one.
+	const auto low  = state.builder.AllocateId();
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, uniform, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, uniform, 1);
+	const bool     right  = clock.shift > 0;
+	const uint32_t amount = static_cast<uint32_t>(right ? clock.shift : -clock.shift);
+	const auto     shift  = right ? spv::OpShiftRightLogical : spv::OpShiftLeftLogical;
+	const auto     carry  = right ? spv::OpShiftLeftLogical : spv::OpShiftRightLogical;
+	// Right: low' = low >> n | high << (32 - n), high' = high >> n.
+	// Left: high' = high << n | low >> (32 - n), low' = low << n.
+	const auto receiving = right ? low : high; // gets the bits that cross the word boundary
+	const auto giving    = right ? high : low;
+	const auto kept      = Binary(state, shift, TypeU32(state), receiving, ConstantU32(state, amount));
+	const auto crossing =
+	    Binary(state, carry, TypeU32(state), giving, ConstantU32(state, 32u - amount));
+	const auto received = Binary(state, spv::OpBitwiseOr, TypeU32(state), kept, crossing);
+	const auto given    = Binary(state, shift, TypeU32(state), giving, ConstantU32(state, amount));
+	const auto result   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU64(state), result,
+	                          right ? received : given, right ? given : received);
+	return result;
 }
 
 void EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst) {

@@ -134,6 +134,11 @@ struct CodegenOptions {
 	// parameter block at the device address in dwords 0-1 (a GPU-converted indirect mesh draw,
 	// renderer/meshIndirect.h). Unset, 0 or "empty": the dwords are only ever pushed.
 	bool mesh_indirect_params = false;
+	// KYTY_REALTIME_CLOCK=0: S_MEMREALTIME returns the placeholder UINT64_MAX (the behaviour before
+	// the real clock) instead of the host GPU clock. With the placeholder a guest spin-wait timed by
+	// S_MEMREALTIME never times out, and only a GPU reset ends it. The emitter reads the clock the
+	// device layer enabled (Spirv::HostShaderClock); a device without one keeps the placeholder.
+	bool realtime_clock = true;
 };
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.

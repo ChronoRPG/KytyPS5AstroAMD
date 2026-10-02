@@ -27223,6 +27223,25 @@ private:
       available_mesh.pNext = available_min_lod.pNext;
       available_min_lod.pNext = &available_mesh;
     }
+    // Optional, as in the emulator (KYTY_REALTIME_CLOCK): the shader clock S_MEMREALTIME reads.
+    bool clock_extension = false;
+    {
+      u32 count = 0;
+      (void)m_physical_device.enumerateDeviceExtensionProperties(nullptr, &count, nullptr);
+      std::vector<vk::ExtensionProperties> extensions(count);
+      (void)m_physical_device.enumerateDeviceExtensionProperties(nullptr, &count,
+                                                                 extensions.data());
+      clock_extension =
+          ShaderRecompiler::GetCodegenOptions().realtime_clock &&
+          std::ranges::any_of(extensions, [](const auto &extension) {
+            return std::strcmp(extension.extensionName, VK_KHR_SHADER_CLOCK_EXTENSION_NAME) == 0;
+          });
+    }
+    vk::PhysicalDeviceShaderClockFeaturesKHR available_clock{};
+    if (clock_extension) {
+      available_clock.pNext = available_min_lod.pNext;
+      available_min_lod.pNext = &available_clock;
+    }
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_min_lod;
@@ -27393,6 +27412,15 @@ private:
       mesh_features.pNext = const_cast<void *>(device_info.pNext);
       device_info.pNext = &mesh_features;
     }
+    vk::PhysicalDeviceShaderClockFeaturesKHR clock_features{};
+    clock_features.shaderSubgroupClock = available_clock.shaderSubgroupClock;
+    clock_features.shaderDeviceClock = available_clock.shaderDeviceClock;
+    const bool shader_clock = clock_extension && (available_clock.shaderDeviceClock == VK_TRUE ||
+                                                  available_clock.shaderSubgroupClock == VK_TRUE);
+    if (shader_clock) {
+      clock_features.pNext = const_cast<void *>(device_info.pNext);
+      device_info.pNext = &clock_features;
+    }
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -27408,6 +27436,9 @@ private:
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
     if (robustness2_supported) {
       device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    }
+    if (shader_clock) {
+      device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     }
     if (m_mesh_shader) {
       device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
@@ -27488,6 +27519,13 @@ private:
           {.storage_dword_loads_return_zero = m_robust_storage_alignment == 1u});
       ShaderRecompiler::Spirv::SetHostImageFeatures(
           {.min_lod = available_features.shaderResourceMinLod == VK_TRUE});
+      namespace Spirv = ShaderRecompiler::Spirv;
+      Spirv::SetHostShaderClock(
+          {.scope = !shader_clock ? Spirv::HostClockScope::None
+                    : available_clock.shaderDeviceClock == VK_TRUE
+                        ? Spirv::HostClockScope::Device
+                        : Spirv::HostClockScope::Subgroup,
+           .shift = Spirv::RealtimeClockShift(properties.properties.limits.timestampPeriod)});
     }
 
     vk::CommandPoolCreateInfo pool_info{};
@@ -35465,14 +35503,16 @@ TestCase BranchVccnzUsesWaveMask() {
   return test;
 }
 
-TestCase ScalarMemRealtimeCapturedPlaceholder() {
+// The values are the host clock's (KYTY_REALTIME_CLOCK), so this case only compiles; the clock
+// read and its GPU behaviour are CodegenTests::CheckRealtimeClock (--s-memrealtime-only).
+TestCase ScalarMemRealtimeCaptured() {
   using O = ShaderOpcode;
   namespace D = ShaderRecompiler::Decoder;
 
   std::vector<u32> code = {0xf4940300u, 0xfa000000u};
   D::Instruction decoded;
   D::DecodeInstruction(code, 0, decoded);
-  Require("ScalarMemRealtimeCapturedPlaceholder", "decode",
+  Require("ScalarMemRealtimeCaptured", "decode",
           decoded.opcode == O::S_MEMREALTIME && decoded.word_count == 2 &&
               decoded.dst.kind == D::OperandKind::Sgpr && decoded.dst.reg == 12 &&
               decoded.data_dwords == 2 && decoded.src_count == 0 &&
@@ -35483,11 +35523,13 @@ TestCase ScalarMemRealtimeCapturedPlaceholder() {
   code.insert(code.end(), {0xf4940300u, 0xfa000000u});
   AppendStoreSgprPair(&code, 12, 2);
   AppendEnd(&code);
-  return {"ScalarMemRealtimeCapturedPlaceholder",
-          code,
-          {},
-          {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX},
-          {O::S_MEMREALTIME, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test{"ScalarMemRealtimeCaptured",
+                code,
+                {},
+                {},
+                {O::S_MEMREALTIME, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.compile_only = true;
+  return test;
 }
 
 TestCase ScalarMemoryLoadVariants() {
@@ -42214,7 +42256,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(SharedReturnKeepsSelectedValues);
   AddCase(BranchVccnzUsesWaveMask);
   AddCase(BranchVccnzUsesCarryProducedWaveMask);
-  AddCase(ScalarMemRealtimeCapturedPlaceholder);
+  AddCase(ScalarMemRealtimeCaptured);
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
@@ -47554,7 +47596,8 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, ScalarMemRealtimeCapturedPlaceholder());
+    RunCase(&vulkan, ScalarMemRealtimeCaptured());
+    CodegenTests::CheckRealtimeClock(&vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {

@@ -24,6 +24,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
@@ -686,6 +687,43 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = shader_resource_min_lod});
 	LOGF("Vulkan shaderResourceMinLod (IMAGE_SAMPLE*_CL): %s\n",
 	     shader_resource_min_lod ? "true" : "false");
+	// S_MEMREALTIME (KYTY_REALTIME_CLOCK): the device clock, else the subgroup clock, else the
+	// placeholder UINT64_MAX. Without a clock a guest spin-wait timed by S_MEMREALTIME never ends.
+	vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock {};
+	{
+		namespace Spirv = ShaderRecompiler::Spirv;
+		Spirv::HostShaderClock clock {};
+		if (HasExtension(device_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
+			vk::PhysicalDeviceShaderClockFeaturesKHR supported_clock {};
+			vk::PhysicalDeviceFeatures2              clock_query {};
+			clock_query.pNext = &supported_clock;
+			physical_device.getFeatures2(&clock_query);
+			shader_clock.shaderSubgroupClock = supported_clock.shaderSubgroupClock;
+			shader_clock.shaderDeviceClock   = supported_clock.shaderDeviceClock;
+			clock.scope = supported_clock.shaderDeviceClock     ? Spirv::HostClockScope::Device
+			              : supported_clock.shaderSubgroupClock ? Spirv::HostClockScope::Subgroup
+			                                                    : Spirv::HostClockScope::None;
+		}
+		const double period = properties2.properties.limits.timestampPeriod;
+		clock.shift         = Spirv::RealtimeClockShift(period);
+		Spirv::SetHostShaderClock(clock);
+		const bool requested = ShaderRecompiler::GetCodegenOptions().realtime_clock;
+		std::printf("Kyty shader clock (S_MEMREALTIME, KYTY_REALTIME_CLOCK): %s; timestamp period "
+		            "%.3f ns, shift %d\n",
+		            !requested                                      ? "off (placeholder)"
+		            : clock.scope == Spirv::HostClockScope::Device   ? "device clock"
+		            : clock.scope == Spirv::HostClockScope::Subgroup ? "subgroup clock"
+		                                                             : "none (placeholder)",
+		            period, clock.shift);
+		if (requested && clock.scope == Spirv::HostClockScope::Subgroup) {
+			Log::WriteToConsoleAndLog("Warning: the Vulkan device has no shaderDeviceClock; "
+			                          "S_MEMREALTIME reads the subgroup clock\n");
+		} else if (requested && clock.scope == Spirv::HostClockScope::None) {
+			Log::WriteToConsoleAndLog("Warning: the Vulkan device has no shader clock "
+			                          "(VK_KHR_shader_clock); S_MEMREALTIME returns the placeholder "
+			                          "UINT64_MAX, so guest timed waits may not end\n");
+		}
+	}
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
@@ -884,6 +922,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		pipeline_library.graphicsPipelineLibrary = VK_TRUE;
 		pipeline_library.pNext                   = const_cast<void*>(create_info.pNext);
 		create_info.pNext                        = &pipeline_library;
+	}
+	if (shader_clock.shaderDeviceClock == VK_TRUE || shader_clock.shaderSubgroupClock == VK_TRUE) {
+		shader_clock.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext  = &shader_clock;
 	}
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
@@ -1325,6 +1367,11 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
+		}
+		// S_MEMREALTIME reads a shader clock (KYTY_REALTIME_CLOCK, default on; VulkanCreateDevice).
+		if (ShaderRecompiler::GetCodegenOptions().realtime_clock &&
+		    HasExtension(available_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,

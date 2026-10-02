@@ -215,18 +215,21 @@ void CheckFingerprint() {
                  [](CodegenOptions &o) { o.srt_variant_reads = !o.srt_variant_reads; });
   options_differ("mesh_indirect_params",
                  [](CodegenOptions &o) { o.mesh_indirect_params = !o.mesh_indirect_params; });
+  options_differ("realtime_clock", [](CodegenOptions &o) { o.realtime_clock = !o.realtime_clock; });
 
   // Host state the emitter reads.
   namespace Spirv = ShaderRecompiler::Spirv;
   const auto float_controls = Spirv::GetHostFloatControls();
   const auto robustness = Spirv::GetHostBufferRobustness();
   const auto image_features = Spirv::GetHostImageFeatures();
+  const auto shader_clock = Spirv::GetHostShaderClock();
   const auto host_differs = [&](const char *what, auto &&set) {
     set();
     const bool differs = ShaderRecompiler::CodegenFingerprint() != base;
     Spirv::SetHostFloatControls(float_controls);
     Spirv::SetHostBufferRobustness(robustness);
     Spirv::SetHostImageFeatures(image_features);
+    Spirv::SetHostShaderClock(shader_clock);
     Require(name, what, differs, std::string("the fingerprint does not depend on ") + what);
   };
   host_differs("denorm_flush_f32", [&] {
@@ -249,6 +252,15 @@ void CheckFingerprint() {
         {.storage_dword_loads_return_zero = !robustness.storage_dword_loads_return_zero});
   });
   host_differs("min_lod", [&] { Spirv::SetHostImageFeatures({.min_lod = !image_features.min_lod}); });
+  host_differs("shader clock scope", [&] {
+    Spirv::SetHostShaderClock({.scope = shader_clock.scope == Spirv::HostClockScope::Device
+                                            ? Spirv::HostClockScope::Subgroup
+                                            : Spirv::HostClockScope::Device,
+                               .shift = shader_clock.shift});
+  });
+  host_differs("shader clock shift", [&] {
+    Spirv::SetHostShaderClock({.scope = shader_clock.scope, .shift = shader_clock.shift == 0 ? 3 : 0});
+  });
   Require(name, "host state restored", ShaderRecompiler::CodegenFingerprint() == base,
           "restoring the host state did not restore the fingerprint");
 
@@ -264,7 +276,8 @@ void CheckFingerprint() {
         "KYTY_EXEC_SELECTS", "KYTY_PS_APPEND_LIVE_ELECTION", "KYTY_PS_LIVE_EXEC",
         "KYTY_LOOP_GUARD", "KYTY_LOOP_GUARD_SHADERS", "KYTY_SRT_VARIANT_READS",
         "KYTY_NATIVE_INDIRECT_MESH", "KYTY_LDS_WAITCNT_BARRIER", "KYTY_LOD_STATS_MODE",
-        "KYTY_SRT_COMPILED_RECIPES", "KYTY_SRT_DECODED_ROOTS", "KYTY_SRT_ARITHMETIC_TAPES"}) {
+        "KYTY_SRT_COMPILED_RECIPES", "KYTY_SRT_DECODED_ROOTS", "KYTY_SRT_ARITHMETIC_TAPES",
+        "KYTY_REALTIME_CLOCK"}) {
     Require(name, "codegen switch list", listed(required),
             std::string("the codegen switch list misses ") + required);
   }

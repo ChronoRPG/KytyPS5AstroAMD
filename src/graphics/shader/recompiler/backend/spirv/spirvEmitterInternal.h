@@ -73,6 +73,8 @@ struct SpirvRequirements {
 	bool shared_int64_atomics         = false;
 	bool coherent_buffers             = false;
 	bool float64                      = false;
+	// S_MEMREALTIME reads the host shader clock (OpReadClockKHR, VK_KHR_shader_clock).
+	bool shader_clock                 = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);

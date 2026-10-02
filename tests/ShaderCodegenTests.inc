@@ -1697,6 +1697,178 @@ int CorpusPipelineTimes(VulkanHarness *vulkan, const char *directory) {
   return 0;
 }
 
+// The Scope operand of every OpReadClockKHR (Device 1, Subgroup 3), from the 32-bit constants.
+std::vector<u32> ReadClockScopes(const std::vector<u32> &spirv) {
+  constexpr u32 OpConstant = 43;
+  constexpr u32 OpReadClockKHR = 5056;
+  std::unordered_map<u32, u32> constants;
+  std::vector<u32> scope_ids;
+  for (size_t at = 5; at < spirv.size();) {
+    const u32 words = spirv[at] >> 16u;
+    const u32 opcode = spirv[at] & 0xffffu;
+    if (words == 0 || at + words > spirv.size()) {
+      break;
+    }
+    if (opcode == OpConstant && words == 4) {
+      constants[spirv[at + 2]] = spirv[at + 3];
+    } else if (opcode == OpReadClockKHR && words == 4) {
+      scope_ids.push_back(spirv[at + 3]);
+    }
+    at += words;
+  }
+  std::vector<u32> scopes;
+  for (const auto id : scope_ids) {
+    const auto found = constants.find(id);
+    scopes.push_back(found != constants.end() ? found->second : UINT32_MAX);
+  }
+  return scopes;
+}
+
+// S_MEMREALTIME (KYTY_REALTIME_CLOCK, default on): a guest spin-wait timed by it. t0 = clock; the
+// loop reads the clock until it is 1000 ticks (10 us at 100 MHz) past t0 or 2^24 reads were made,
+// then stores whether it advanced, the ticks and the reads. Codegen for every host clock (CPU),
+// then the wait on the GPU: with the device's clock it ends by time; with KYTY_REALTIME_CLOCK=0
+// (the placeholder UINT64_MAX) the clock never advances and only the read limit ends it.
+void CheckRealtimeClock(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenRealtimeClock";
+  namespace Spirv = ShaderRecompiler::Spirv;
+  using O = ShaderOpcode;
+  Require(name, "shift",
+          Spirv::RealtimeClockShift(1.0) == 3 && Spirv::RealtimeClockShift(10.0) == 0 &&
+              Spirv::RealtimeClockShift(0.5) == 4 && Spirv::RealtimeClockShift(52.083) == -2 &&
+              Spirv::RealtimeClockShift(83.333) == -3 && Spirv::RealtimeClockShift(0.0) == 3,
+          "unexpected shift toward the 100 MHz S_MEMREALTIME rate");
+
+  TestCase test;
+  test.name = name;
+  auto &code = test.code;
+  code.push_back(EncodeSmem0(0x25, 12));            // s_memrealtime s[12:13]
+  code.push_back(EncodeSmem1(0, 0x7d));
+  code.push_back(EncodeSopp(0x0c, 0));              // s_waitcnt 0
+  code.push_back(EncodeSMovB32(20, InlineU32(0)));  // s_mov_b32 s20, 0
+  const size_t loop = code.size();
+  code.push_back(EncodeSmem0(0x25, 14));            // s_memrealtime s[14:15]
+  code.push_back(EncodeSmem1(0, 0x7d));
+  code.push_back(EncodeSopp(0x0c, 0));              // s_waitcnt 0
+  code.push_back(EncodeSop2(0x01, 16, 14, 12));     // s_sub_u32 s16, s14, s12
+  code.push_back(EncodeSop2(0x05, 17, 15, 13));     // s_subb_u32 s17, s15, s13
+  code.push_back(EncodeSop2(0x00, 20, 20, InlineU32(1))); // s_add_u32 s20, s20, 1
+  code.push_back(EncodeSopc(0x07, 17, InlineU32(0))); // s_cmp_lg_u32 s17, 0
+  const size_t exit_high = code.size();
+  code.push_back(0);                                // s_cbranch_scc1 done
+  code.push_back(EncodeSopc(0x09, 16, 255));        // s_cmp_ge_u32 s16, 1000
+  code.push_back(1000u);
+  const size_t exit_low = code.size();
+  code.push_back(0);                                // s_cbranch_scc1 done
+  code.push_back(EncodeSopc(0x0a, 20, 255));        // s_cmp_lt_u32 s20, 1 << 24
+  code.push_back(1u << 24u);
+  const size_t back = code.size();
+  code.push_back(0);                                // s_cbranch_scc1 loop
+  const size_t done = code.size();
+  const auto branch = [&](size_t at, size_t target) {
+    const auto offset = static_cast<int32_t>(target) - static_cast<int32_t>(at + 1);
+    code[at] = EncodeSopp(0x05, static_cast<u32>(offset) & 0xffffu);
+  };
+  branch(exit_high, done);
+  branch(exit_low, done);
+  branch(back, loop);
+  code.push_back(EncodeSopc(0x09, 16, 255));        // s_cmp_ge_u32 s16, 1000
+  code.push_back(1000u);
+  code.push_back(EncodeSop2(0x0a, 22, InlineU32(1), InlineU32(0))); // s_cselect_b32 s22, 1, 0
+  code.push_back(EncodeSopc(0x07, 17, InlineU32(0)));               // s_cmp_lg_u32 s17, 0
+  code.push_back(EncodeSop2(0x0a, 23, InlineU32(1), InlineU32(0))); // s_cselect_b32 s23, 1, 0
+  code.push_back(EncodeSop2(0x10, 22, 22, 23));                     // s_or_b32 s22, s22, s23
+  AppendStoreSgpr(&code, 22, 0);
+  AppendStoreSgpr(&code, 16, 1);
+  AppendStoreSgpr(&code, 20, 2);
+  AppendEnd(&code);
+  test.initial = {0u, 0u, 0u};
+  test.opcodes = {O::S_MEMREALTIME, O::S_WAITCNT,     O::S_MOV_B32,      O::S_SUB_U32,
+                  O::S_SUBB_U32,    O::S_ADD_U32,     O::S_CMP_LG_U32,   O::S_CBRANCH_SCC1,
+                  O::S_CMP_GE_U32,  O::S_CMP_LT_U32,  O::S_CSELECT_B32,  O::S_OR_B32,
+                  O::V_MOV_B32,     O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+
+  // Codegen: the clock read for each host clock, with the shift toward 100 MHz.
+  const auto saved_clock = Spirv::GetHostShaderClock();
+  const auto compile = [&](Spirv::HostShaderClock clock, bool realtime_clock) {
+    CodegenOptions options = GetCodegenOptions();
+    options.realtime_clock = realtime_clock;
+    ScopedCodegenOptions scope(options);
+    Spirv::SetHostShaderClock(clock);
+    auto spirv = CompileCase(test, 32).spirv;
+    Spirv::SetHostShaderClock(saved_clock);
+    ValidateSpirv(name, spirv);
+    return spirv;
+  };
+  using Scope = Spirv::HostClockScope;
+  const auto device3 = compile({Scope::Device, 3}, true);
+  const auto device0 = compile({Scope::Device, 0}, true);
+  const auto left2 = compile({Scope::Device, -2}, true);
+  const auto subgroup = compile({Scope::Subgroup, 3}, true);
+  const auto none = compile({Scope::None, 3}, true);
+  const auto off = compile({Scope::Device, 3}, false);
+  const auto right_shifts = [](const std::vector<u32> &spirv) {
+    return CountSpirv(spirv, "OpShiftRightLogical");
+  };
+  const auto left_shifts = [](const std::vector<u32> &spirv) {
+    return CountSpirv(spirv, "OpShiftLeftLogical");
+  };
+  Require(name, "device clock",
+          ReadClockScopes(device3) == std::vector<u32>{1u, 1u} &&
+              CountSpirv(device3, "OpGroupNonUniformBroadcastFirst") ==
+                  CountSpirv(off, "OpGroupNonUniformBroadcastFirst") + 2u &&
+              CountSpirv(device3, "ShaderClockKHR") >= 1u &&
+              ReadClockScopes(device0) == std::vector<u32>{1u, 1u},
+          "S_MEMREALTIME did not read the device clock once per instruction, wave-uniform");
+  Require(name, "shift",
+          right_shifts(device3) == right_shifts(device0) + 4u &&
+              left_shifts(device3) == left_shifts(device0) + 2u &&
+              right_shifts(left2) == right_shifts(device0) + 2u &&
+              left_shifts(left2) == left_shifts(device0) + 4u,
+          "the clock was not scaled by the host clock's shift");
+  Require(name, "subgroup clock", ReadClockScopes(subgroup) == std::vector<u32>{3u, 3u},
+          "the subgroup-clock fallback did not read at subgroup scope");
+  Require(name, "placeholder",
+          ReadClockScopes(none).empty() && CountSpirv(none, "ShaderClockKHR") == 0u &&
+              ReadClockScopes(off).empty() && CountSpirv(off, "ShaderClockKHR") == 0u,
+          "no host clock or KYTY_REALTIME_CLOCK=0 still read a clock");
+
+  // GPU: the wait ends by time with this device's clock; KYTY_REALTIME_CLOCK=0 never advances.
+  const auto host = Spirv::GetHostShaderClock();
+  std::vector<u32> clock_words;
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.realtime_clock = true;
+    ScopedCodegenOptions scope(options);
+    clock_words = RunCollect(vulkan, test, 3);
+  }
+  std::vector<u32> placeholder_words;
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.realtime_clock = false;
+    ScopedCodegenOptions scope(options);
+    placeholder_words = RunCollect(vulkan, test, 3);
+  }
+  Require(name, "placeholder wait",
+          placeholder_words[0] == 0u && placeholder_words[1] == 0u &&
+              placeholder_words[2] == (1u << 24u),
+          "with the placeholder the clock advanced or the read limit did not end the wait");
+  if (host.scope == Scope::None) {
+    Require(name, "no host clock", clock_words == placeholder_words,
+            "without a host clock S_MEMREALTIME did not keep the placeholder");
+  } else {
+    Require(name, "clock wait",
+            clock_words[0] == 1u && clock_words[2] < (1u << 24u),
+            "S_MEMREALTIME did not advance 1000 ticks within 2^24 reads");
+  }
+  std::printf("[codegen] %-32s ok (%s clock, shift %d: 1000 ticks after %u reads, %u ticks)\n",
+              name,
+              host.scope == Scope::Device     ? "device"
+              : host.scope == Scope::Subgroup ? "subgroup"
+                                              : "no",
+              host.shift, clock_words[2], clock_words[1]);
+}
+
 void RunAll(VulkanHarness *vulkan) {
   CheckCompressedSnormExport();
   CheckTranscendentalDenormInputs(vulkan);
