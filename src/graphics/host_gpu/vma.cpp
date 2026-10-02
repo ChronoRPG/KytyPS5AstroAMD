@@ -20,6 +20,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/vramBudget.h"
 #include "graphics/host_gpu/vramStats.h"
 
 #include <algorithm>
@@ -105,6 +106,18 @@ std::chrono::milliseconds RetiredImageIdleLimit() {
 		return std::chrono::milliseconds(static_cast<int64_t>(std::min(ms, 3600000ull)));
 	}();
 	return limit;
+}
+
+// The native image pool keeps nothing while device usage is at this mark: the planning budget, or
+// with KYTY_VRAM_GC_BUDGET the image collector's trigger (it frees cached images there; holding
+// retired native images instead would only move the pressure).
+bool PoolPressure(const GraphicContext& graphics) {
+	if (!graphics.CanReportMemoryUsage()) {
+		return false;
+	}
+	const auto budget = graphics.GetTotalMemoryBudget();
+	const auto mark   = VramBudget::GcEnabled() ? VramBudget::ImageTrigger(budget) : budget;
+	return graphics.GetDeviceMemoryUsage() >= mark;
 }
 
 bool CanRecycleImage(const vk::ImageCreateInfo& info) {
@@ -659,7 +672,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 
 	const bool recycle = NativeImagePoolEnabled() && CanRecycleImage(image_info);
 	if (recycle) {
-		if (CanReportMemoryUsage() && GetDeviceMemoryUsage() >= GetTotalMemoryBudget()) {
+		if (PoolPressure(*this)) {
 			ClearRetiredImages();
 		}
 		std::scoped_lock lock(m_retired_image_mutex);
@@ -782,7 +795,7 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	}
 	bool retained = false;
 	if (image.pool_eligible && NativeImagePoolEnabled()) {
-		const bool pressure = CanReportMemoryUsage() && GetDeviceMemoryUsage() >= GetTotalMemoryBudget();
+		const bool pressure = PoolPressure(*this);
 		if (pressure) {
 			ClearRetiredImages();
 		} else {

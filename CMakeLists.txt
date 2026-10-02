@@ -657,6 +657,10 @@ add_executable(spirv_local_arrays_tests EXCLUDE_FROM_ALL
 target_link_libraries(spirv_local_arrays_tests spirv-tools)
 target_include_directories(spirv_local_arrays_tests PRIVATE ${inc_headers})
 
+# KYTY_VRAM_GC_BUDGET: the budget-relative collection marks (graphics/host_gpu/vramBudget.h).
+add_executable(vram_budget_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/VramBudgetTests.cpp")
+target_include_directories(vram_budget_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -970,6 +974,7 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatcher-cap-only)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME spirv_local_arrays COMMAND $<TARGET_FILE:spirv_local_arrays_tests>)
+	add_test(NAME vram_budget COMMAND $<TARGET_FILE:vram_budget_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -1876,6 +1881,7 @@ if(BUILD_TESTING)
 		game_patch_filter_tests
 		lru_cache_tests
 		spirv_local_arrays_tests
+		vram_budget_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
