@@ -174,6 +174,8 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
                               const IR::BlockInfo& info) {
 	const auto& program = ctx.state.program;
 	const auto& term       = info.terminator;
+	const bool  degenerate_branch = term.kind == CFG::TerminatorKind::ConditionalBranch &&
+	                               !term.loop_header && term.true_block == term.false_block;
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
 			if (ctx.state.loop_guard_variable != 0) {
@@ -210,6 +212,11 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			const auto* false_block = TargetBlock(program, term.false_block);
 			if (true_block == nullptr || false_block == nullptr || info.condition.IsEmpty()) {
 				EmitReturn(ctx);
+				return;
+			}
+			if (degenerate_branch) {
+				// SPIRV-Cross discards all code after a selection whose branch targets equal its merge.
+				ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(true_block));
 				return;
 			}
 			auto condition = BranchCondition(ctx, info);
