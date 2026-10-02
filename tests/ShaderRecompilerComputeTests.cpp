@@ -29,6 +29,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/eopTimestamps.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
@@ -658,6 +659,18 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  static void SnapshotRunCommand(RenderExecutor &executor, const CommandBuffer &command, ImageId id) {
+    executor.m_run.command = command.Identity();
+    executor.m_run.tick = executor.m_context.GetCommandScheduler().CurrentTick();
+    executor.m_run.rendering_serial = command.ActiveRenderingSerial();
+    executor.m_run.images.assign(1, executor.MakeDrawRunImage(id, false));
+  }
+  static bool RunCommandUnchanged(const RenderExecutor &executor, const CommandBuffer &command) {
+    return executor.DrawRunCommandUnchanged(command);
+  }
+  static bool RunImagesUnchanged(const RenderExecutor &executor) {
+    return executor.DrawRunImagesUnchanged(true);
+  }
   static void DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
     executor.DrawAuto(0, command, args);
@@ -743,6 +756,14 @@ struct RenderExecutorTestAccess {
 
   static TextureBindingMemo::Totals TextureMemoTotals(const RenderExecutor &executor) {
     return executor.m_texture_memo.GetTotals();
+  }
+
+  // The image of the last draw's pixel-stage texture binding `index`.
+  static ImageId PixelTexture(const RenderExecutor &executor, uint32_t index) {
+    return executor.m_graphics_bindings.pixel.has_value() &&
+                   index < executor.m_graphics_bindings.pixel->images.size()
+               ? executor.m_graphics_bindings.pixel->images[index].image_id
+               : ImageId{};
   }
 
   // KYTY_DRAW_SEQUENCE_FAST: a target lookup through `record`, as a target slot makes it.
@@ -16241,6 +16262,338 @@ public:
                 static_cast<unsigned long long>(binding.verify_checks.load()));
   }
 
+  // KYTY_DRAW_RUN (drawPrep/drawRun.h): draws of one structure (program, T#, S#, registers) that
+  // differ only in a user SGPR, blended ONE/ONE, through the command processor's draw-prep engine,
+  // against the same draws made serially (never a run). Between the two streams of each phase the
+  // guest rewrites the texture (a CPU write the kept bindings do not see, the rendering instance
+  // continues): the second stream's first draw must fall back late and sample the new texels.
+  // alternate_samplers: consecutive draws alternate between two S# words that sample alike (border
+  // colour type under clamp-to-edge), so no draw continues a run and every draw after a stream's
+  // first keeps its predecessor's attachment acquisition (KYTY_DRAW_RUN_ACQUIRE).
+  void CheckDrawRun(bool alternate_samplers = false, bool read_only_depth = false) {
+    const char *name = read_only_depth ? (alternate_samplers ? "DrawRunDepthAcquire" : "DrawRunDepth")
+                                        : (alternate_samplers ? "DrawRunAcquire" : "DrawRun");
+    constexpr uintptr_t base = 0x000000020b000000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t vertex_offset = 0x1000;
+    constexpr uint64_t pixel_offset = 0x2000;
+    constexpr uint64_t user_data_offset = 0x4000;
+    constexpr uint64_t target_offset = 0x20000;
+    // Texture A for the serial phase, B for the command-processor phase (same contents).
+    constexpr std::array<uint64_t, 2> texture_offsets{0x100000, 0x200000};
+    constexpr uint64_t texture_bytes = 0x10000;
+    constexpr uint32_t extent = 32;
+    constexpr uint32_t texture_extent = 8;
+    constexpr uint32_t draws_per_stream = 4;
+    constexpr u32 old_texel = 0x40u | (0x80u << 8u) | (0xc0u << 16u) | (0xffu << 24u);
+    constexpr u32 new_texel = 0x10u | (0x20u << 8u) | (0x30u << 16u) | (0x40u << 24u);
+
+    // A fullscreen triangle from the vertex index (as in CheckDrawPrepEngineDraw).
+    std::vector<u32> vertex_code;
+    AppendVMovLiteral(&vertex_code, 1, 0xbf800000u);
+    AppendVMovLiteral(&vertex_code, 2, 0x40400000u);
+    vertex_code.push_back(EncodeVopc(0xc2, InlineU32(1), 5));
+    vertex_code.push_back(EncodeVop2(0x01, 3, Vgpr(1), 2));
+    vertex_code.push_back(EncodeVopc(0xc2, InlineU32(2), 5));
+    vertex_code.push_back(EncodeVop2(0x01, 4, Vgpr(1), 2));
+    AppendVMovU32(&vertex_code, 0, 0);
+    AppendVMovLiteral(&vertex_code, 6, 0x3f800000u);
+    vertex_code.push_back(EncodeExp0(0x0c, 0xf));
+    vertex_code.push_back(EncodeExp1(3, 4, 0, 6));
+    for (u32 parameter = 0; parameter < 8; parameter++) {
+      vertex_code.push_back(EncodeExp0(0x20 + parameter, 0xf));
+      vertex_code.push_back(EncodeExp1(0, 0, 0, 0));
+    }
+    AppendEnd(&vertex_code);
+    // The texel at (0.5, 0.5) (T# s[0:7], S# s[8:11]); red replaced by the per-draw user SGPR s12.
+    std::vector<u32> pixel_code;
+    AppendVMovLiteral(&pixel_code, 20, 0x3f000000u);
+    AppendVMovLiteral(&pixel_code, 21, 0x3f000000u);
+    pixel_code.push_back(EncodeMimg0(0x27, 0xf)); // IMAGE_SAMPLE_LZ
+    pixel_code.push_back(EncodeMimg1(0, 20, 0, 2));
+    pixel_code.push_back(EncodeVop1(0x01, 0, 12)); // V_MOV_B32 v0, s12
+    pixel_code.push_back(EncodeExp0(0x00, 0xf));
+    pixel_code.push_back(EncodeExp1(0, 1, 2, 3));
+    AppendEnd(&pixel_code);
+
+    EnsureRuntimeContext();
+    // Push descriptors as in the product (KYTY_DRAW_RUN_PUSH updates them incrementally).
+    const PushDescriptorsScope push_descriptors(m_runtime_context, MaxPushDescriptors());
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "draw-run allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "draw-run mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    std::memset(memory, 0, allocation_size);
+    const auto vertex_address = base + vertex_offset;
+    const auto pixel_address = base + pixel_offset;
+    auto *user_data = reinterpret_cast<ShaderUserData *>(memory + user_data_offset);
+    std::memcpy(memory + vertex_offset, vertex_code.data(), vertex_code.size() * sizeof(u32));
+    std::memcpy(memory + pixel_offset, pixel_code.data(), pixel_code.size() * sizeof(u32));
+    ShaderMapUserData(vertex_address,
+                      {.type = Prospero::ShaderBinaryType::kGs,
+                       .user_data = user_data,
+                       .code_size_bytes = static_cast<uint32_t>(vertex_code.size() * sizeof(u32))});
+    ShaderMapUserData(pixel_address,
+                      {.type = Prospero::ShaderBinaryType::kPs,
+                       .user_data = user_data,
+                       .code_size_bytes = static_cast<uint32_t>(pixel_code.size() * sizeof(u32))});
+    std::array<ShaderTextureResource, 2> t_sharps{};
+    for (size_t t = 0; t < t_sharps.size(); t++) {
+      const auto address = base + texture_offsets[t];
+      std::fill_n(reinterpret_cast<u32 *>(memory + texture_offsets[t]),
+                  texture_bytes / sizeof(u32), old_texel);
+      t_sharps[t] = ShaderTextureResource{{
+          static_cast<uint32_t>(address >> 8u),
+          (static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8UNorm) << 20u) |
+              (((texture_extent - 1u) & 3u) << 30u),
+          ((texture_extent - 1u) >> 2u) | ((texture_extent - 1u) << 14u),
+          DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0, 0}};
+    }
+    // Clamp to edge, bilinear, no mip filter; the alternative has an opaque-black border colour,
+    // which clamp-to-edge never samples.
+    const ShaderSamplerResource s_sharp{
+        {2u | (2u << 3u) | (2u << 6u), 0, (1u << 20u) | (1u << 22u), 0}};
+    const ShaderSamplerResource s_sharp_alternate{
+        {2u | (2u << 3u) | (2u << 6u), 0, (1u << 20u) | (1u << 22u), 1u << 30u}};
+    const auto sampler_for = [&](u32 k) -> const ShaderSamplerResource & {
+      return alternate_samplers && (k & 1u) != 0 ? s_sharp_alternate : s_sharp;
+    };
+    const std::array<u32, 3> draw{0xc0012d00u, 3u, 0x2u};
+    // Draw k's red: (k + 1) / 8, exact in every sum.
+    const auto constant = [](u32 k) { return std::bit_cast<u32>(0.125f * static_cast<float>(k + 1u)); };
+
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    uint64_t continued = 0;
+    uint64_t late = 0;
+    uint64_t mismatches = 0;
+    uint64_t reused = 0;
+    uint64_t partial = 0;
+    context.GetGpu().SendCommandSync([&] {
+      GraphicsInitJmpTables();
+      CommandProcessor processor(context, 0);
+      processor.Reset();
+      processor.BufferInit();
+      context.MapMemory(base, allocation_size);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &executor = context.GetRenderExecutor();
+      auto &texture_cache = context.GetTextureCache();
+      auto &registers = processor.GetCtx();
+      auto &shaders = processor.GetShCtx();
+      registers.SetViewportTransformControl(0x300);
+      registers.SetViewportScaleOffset(0, extent / 2, extent / 2, extent / 2, extent / 2, 1, 0);
+      registers.SetViewportZMax(0, 1);
+      registers.SetScreenScissor(0, 0, extent, extent);
+      registers.SetWindowScissor(0, 0, extent, extent, false);
+      registers.SetGenericScissor(0, 0, extent, extent, false);
+      registers.SetViewportScissor(0, 0, 0, extent, extent, false);
+      registers.SetRenderTargetMask(0xf);
+      registers.SetShaderMask(0xf);
+      registers.SetPsInControl(0x8000);
+      registers.SetColorBase(0, {.addr = base + target_offset});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32_32_32_32,
+                                 .channel_type = Prospero::ChannelType::kFloat,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = extent - 1, .width = extent - 1});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+      registers.SetTargetOutputMode(0, 4);
+      auto blend = registers.GetBlendControl(0);
+      blend.enable = true;
+      blend.color_srcblend = blend.color_destblend = blend.alpha_srcblend =
+          blend.alpha_destblend = static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+      registers.SetBlendControl(0, blend);
+      auto target_info = registers.GetRenderTarget(0).info;
+      target_info.blend_bypass = false;
+      registers.SetColorInfo(0, target_info);
+      processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      shaders.SetEsShaderBase(vertex_address);
+      shaders.SetPsShaderBase(pixel_address);
+      shaders.SetPsShaderResource2({.user_sgpr = 13});
+      if (read_only_depth) {
+        // An unsampled, read-only D32 attachment: its first draw establishes the feedback proof;
+        // the next acquisition broadens attachment access to include shader reads even unsampled.
+        HW::DepthRenderTarget depth_target{};
+        depth_target.z_info = HW::DepthZInfo::Decode(0x22900983u);
+        depth_target.stencil_info = HW::DepthStencilInfo::Decode(0x00100980u);
+        depth_target.z_read_base_addr = base + 0x30000;
+        depth_target.z_write_base_addr = base + 0x30000;
+        depth_target.htile_data_base_addr = base + 0x50000;
+        depth_target.size = {extent - 1, extent - 1, true};
+        registers.SetDepthRenderTarget(depth_target);
+        HW::DepthControl depth_control{};
+        depth_control.z_enable = true;
+        depth_control.zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways);
+        registers.SetDepthControl(depth_control);
+      }
+
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color, 0);
+      Require(name, "color target", static_cast<bool>(color.image_id),
+              "the 32x32 RGBA32F target was not created");
+      const auto clear = [&] {
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), color.image_id,
+                                           {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+      };
+      const auto read = [&] {
+        return ReadCachedTexel(name, context, color.image_id, {}, {extent, extent, 1});
+      };
+      // The guest rewrites texture t (the backing, then the write fault's invalidation).
+      const auto rewrite = [&](size_t t) {
+        std::vector<u32> texels(texture_bytes / sizeof(u32), new_texel);
+        Require(name, "texture rewrite",
+                Libs::LibKernel::Memory::TryWriteBacking(base + texture_offsets[t], texels.data(),
+                                                         texture_bytes),
+                "the texture backing could not be written");
+        texture_cache.InvalidateMemory(base + texture_offsets[t], texture_bytes);
+      };
+
+      // Serial reference with texture A: never a run (these draws are no engine commits).
+      clear();
+      for (u32 k = 0; k < 2 * draws_per_stream; k++) {
+        if (k == draws_per_stream) {
+          rewrite(0);
+        }
+        for (u32 i = 0; i < 8; i++) {
+          shaders.SetPsUserSgpr(i, t_sharps[0].fields[i], HW::UserSgprType::Unknown);
+        }
+        for (u32 i = 0; i < 4; i++) {
+          shaders.SetPsUserSgpr(8 + i, sampler_for(k).fields[i], HW::UserSgprType::Unknown);
+        }
+        shaders.SetPsUserSgpr(12, constant(k), HW::UserSgprType::Unknown);
+        RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                           {.vertex_count = 3, .instance_count = 1});
+      }
+      const auto serial = read();
+      const auto expect = [](u32 texel, u32 component) {
+        return static_cast<float>((texel >> (8u * component)) & 0xffu) / 255.0f;
+      };
+      bool sampled = serial.size() == size_t{extent} * extent * 4u;
+      for (size_t i = 0; sampled && i < serial.size(); i++) {
+        const auto component = static_cast<u32>(i % 4);
+        const float wanted =
+            component == 0 ? 4.5f
+                           : static_cast<float>(draws_per_stream) *
+                                 (expect(old_texel, component) + expect(new_texel, component));
+        sampled = std::abs(std::bit_cast<float>(serial[i]) - wanted) < 1e-4f;
+      }
+      Require(name, "serial run draws", sampled,
+              "the serial draws did not sum as expected: " +
+                  (serial.size() >= 4 ? std::to_string(std::bit_cast<float>(serial[0])) + ", " +
+                                            std::to_string(std::bit_cast<float>(serial[1])) + ", " +
+                                            std::to_string(std::bit_cast<float>(serial[2])) + ", " +
+                                            std::to_string(std::bit_cast<float>(serial[3]))
+                                      : std::string("no pixels")));
+
+      // The same draws with texture B through the command processor, in two streams.
+      const auto stream = [&](u32 first) {
+        std::vector<u32> words;
+        for (u32 k = first; k < first + draws_per_stream; k++) {
+          words.push_back(KYTY_PM4(15, Pm4::IT_SET_SH_REG, Pm4::R_ZERO));
+          words.push_back(Pm4::SPI_SHADER_USER_DATA_PS_0);
+          words.insert(words.end(), std::begin(t_sharps[1].fields), std::end(t_sharps[1].fields));
+          words.insert(words.end(), std::begin(sampler_for(k).fields), std::end(sampler_for(k).fields));
+          words.push_back(constant(k));
+          words.insert(words.end(), draw.begin(), draw.end());
+        }
+        Pm4Execution execution;
+        Require(name, "run stream", processor.Process(execution, words) == Pm4ProcessResult::Complete,
+                "the draw stream did not complete");
+      };
+      auto &totals = DrawRun::GetTotals();
+      const auto continued_before = totals.continued.load();
+      const auto late_before = totals.late_fallbacks.load();
+      const auto mismatches_before = totals.verify_mismatches.load();
+      const auto reused_before = totals.acquire_reused.load();
+      const auto partial_before = totals.partial_pushes.load();
+      const auto depth_excluded_before = totals.depth_promotions_excluded.load();
+      clear();
+      stream(0);
+      rewrite(1);
+      stream(draws_per_stream);
+      continued = totals.continued.load() - continued_before;
+      late = totals.late_fallbacks.load() - late_before;
+      mismatches = totals.verify_mismatches.load() - mismatches_before;
+      reused = totals.acquire_reused.load() - reused_before;
+      partial = totals.partial_pushes.load() - partial_before;
+      Require(name, "serial and command-processor run draws", read() == serial,
+              "the command processor's draws differ from the serial draws (continued " +
+                  std::to_string(continued) + ", late fallbacks " + std::to_string(late) + ")");
+      Require(name, "verify", mismatches == 0,
+              std::to_string(mismatches) + " continuation(s) would have reused a different value");
+      const auto *code_cert = std::getenv("KYTY_DRAW_PREP_CODE_CERT");
+      const bool certified = code_cert == nullptr || std::strcmp(code_cert, "0") != 0;
+      if (DrawRun::Enabled() && DrawPrep::GetMode() != DrawPrep::Mode::Off && certified) {
+        if (read_only_depth && DepthFeedbackKeepEnabled()) {
+          Require(name, "depth access promotion is not reusable",
+                  totals.depth_promotions_excluded.load() > depth_excluded_before,
+                  "the first read-only depth draw seeded a run before the access promotion");
+        }
+        // Every draw after a stream's first continues (the second stream's first one continues
+        // the first stream's run, then falls back late: its texture was rewritten). With
+        // alternating samplers no draw continues, and every draw after a stream's first keeps its
+        // predecessor's acquisition; the second stream's first one cannot: the upload of its
+        // rewritten texture ended the rendering instance.
+        const uint64_t want_continued = alternate_samplers ? 0 : 2 * draws_per_stream - 1;
+        const uint64_t want_late = alternate_samplers ? 0 : 1;
+        const uint64_t want_reused = !DrawRun::AcquireReuseEnabled() || !alternate_samplers
+                                         ? 0
+                                         : 2 * (draws_per_stream - 1);
+        // KYTY_DRAW_RUN_PUSH: every continuation but the late fallback pushes only its per-draw
+        // descriptors (verify mode: would have).
+        const uint64_t want_partial =
+            DrawRun::PushPartialEnabled() ? want_continued - want_late : 0;
+        Require(name, "continuations",
+                read_only_depth ? (alternate_samplers ? (DrawRun::AcquireReuseEnabled() ? reused > 0 : reused == 0)
+                                                     : continued > 0) :
+                continued == want_continued && late == want_late && reused == want_reused &&
+                    partial == want_partial,
+                "continued " + std::to_string(continued) + ", late fallbacks " +
+                    std::to_string(late) + ", acquisitions reused " + std::to_string(reused) +
+                    ", partial pushes " + std::to_string(partial) + "; expected " +
+                    std::to_string(want_continued) + ", " + std::to_string(want_late) + ", " +
+                    std::to_string(want_reused) + " and " + std::to_string(want_partial));
+      } else {
+        Require(name, "no run without the switch",
+                continued == 0 && late == 0 && reused == 0 && partial == 0,
+                "the run bookkeeping ran without KYTY_DRAW_RUN");
+      }
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "draw-run mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "draw-run allocation release failed");
+    std::printf("[gpu]     %-32s ok (mode %s, continued %llu, late fallbacks %llu, acquisitions "
+                "reused %llu, partial pushes %llu, verify checks %llu)\n",
+                name,
+                DrawRun::GetMode() == DrawRun::Mode::Off
+                    ? "off"
+                    : (DrawRun::GetMode() == DrawRun::Mode::Verify ? "verify" : "on"),
+                static_cast<unsigned long long>(continued), static_cast<unsigned long long>(late),
+                static_cast<unsigned long long>(reused), static_cast<unsigned long long>(partial),
+                static_cast<unsigned long long>(DrawRun::GetTotals().verify_checks.load()));
+  }
+
   // KYTY_EOP_TIMESTAMPS: end-of-pipe clock writes (RELEASE_MEM, data select 3).
   // - record: the slots keep their record-time values.
   // - gpu: the record-time values are written at once. Once the tick has completed, the next clock
@@ -19029,6 +19382,24 @@ public:
       scheduler.Current().FlushBarriers();
       RenderExecutorTestAccess::ResetBindings(executor);
     }
+    // Buffer work may end rendering without changing the native command buffer, scheduler tick,
+    // or kept images. Such a draw must fall back even when the image certificate still holds.
+    draw(false, false);
+    draw(false, false);
+    auto &command = scheduler.Current();
+    const auto identity = command.Identity();
+    const auto tick = scheduler.CurrentTick();
+    RenderExecutorTestAccess::SnapshotRunCommand(executor, command, depth_id);
+    Require(name, "run certificate in active instance",
+            RenderExecutorTestAccess::RunCommandUnchanged(executor, command) &&
+                RenderExecutorTestAccess::RunImagesUnchanged(executor),
+            "the active rendering instance did not certify its unchanged depth target");
+    command.EndRendering();
+    Require(name, "ended instance invalidates run with unchanged images",
+            command.Identity() == identity && scheduler.CurrentTick() == tick &&
+                RenderExecutorTestAccess::RunImagesUnchanged(executor) &&
+                !RenderExecutorTestAccess::RunCommandUnchanged(executor, command),
+            "a run remained certified after rendering ended without an image/command/tick change");
     scheduler.Finish();
     RenderExecutorTestAccess::DestroyDescriptorPipelines(executor, descriptor_pipelines);
     std::printf("[gpu]     %-32s ok\n", name);
@@ -47942,6 +48313,48 @@ int main(int argc, char **argv) {
     vulkan.CheckDrawPrepEngineTextures();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--draw-run-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDrawRun();
+    vulkan.CheckDrawRun(true);
+    vulkan.CheckDrawRun(false, true);
+    vulkan.CheckDrawRun(true, true);
+    vulkan.CheckDepthFeedbackKeep();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--draw-run-live") == 0) {
+    // KYTY_DRAW_RUN* as live switches (ab-testing.md): on through a staged change, then off again.
+    VulkanHarness vulkan;
+    const auto off_certificate = DrawRun::ActivityEpoch();
+    Live::Testing::StageText("KYTY_DRAW_RUN=1\nKYTY_DRAW_RUN_ACQUIRE=1\nKYTY_DRAW_RUN_PUSH=1\n");
+    Live::OnCpFlip();
+    Require("DrawRunLive", "off-to-on invalidates certificates",
+            DrawRun::ActivityEpoch() != off_certificate,
+            "a certificate survived operations whose activity was not tracked while off");
+    vulkan.CheckDrawRun();
+    vulkan.CheckDrawRun(true);
+    vulkan.CheckDrawRun(false, true);
+    vulkan.CheckDrawRun(true, true);
+    const auto on_certificate = DrawRun::ActivityEpoch();
+    Live::Testing::StageText("KYTY_DRAW_RUN=\nKYTY_DRAW_RUN_ACQUIRE=\nKYTY_DRAW_RUN_PUSH=\n");
+    Live::OnCpFlip();
+    Require("DrawRunLive", "on-to-off invalidates certificates",
+            DrawRun::ActivityEpoch() != on_certificate,
+            "a pre-switch certificate remained valid");
+    vulkan.CheckDrawRun();
+    const auto stale_certificate = DrawRun::ActivityEpoch();
+    Live::Testing::StageText("KYTY_DRAW_RUN=verify\nKYTY_DRAW_RUN_ACQUIRE=1\nKYTY_DRAW_RUN_PUSH=1\n");
+    Live::OnCpFlip();
+    Require("DrawRunLive", "off-to-verify invalidates certificates",
+            DrawRun::ActivityEpoch() != stale_certificate,
+            "verify accepted a certificate from the off period");
+    vulkan.CheckDrawRun();
+    vulkan.CheckDrawRun(true);
+    vulkan.CheckDrawRun(false, true);
+    vulkan.CheckDrawRun(true, true);
+    vulkan.CheckDepthFeedbackKeep();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--eop-timestamps-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckEopTimestamps();
@@ -48209,6 +48622,8 @@ int main(int argc, char **argv) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckDrawPrepEngineDraw();
   vulkan.CheckDrawPrepEngineTextures();
+  vulkan.CheckDrawRun();
+  vulkan.CheckDrawRun(true);
   vulkan.CheckTextureMemoRevalidation();
   vulkan.CheckRenderExecutorColorDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();

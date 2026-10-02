@@ -310,6 +310,14 @@ public:
 	                        uint32_t count, const vk::WriteDescriptorSet* writes,
 	                        bool known_miss = false);
 	void InvalidateDescriptors(vk::PipelineBindPoint point);
+	// Advances whenever a descriptor command is recorded for the bind point (a push or a set bind),
+	// its state is forgotten, or the command buffer begins. Unchanged since a push: the descriptors
+	// it pushed are still in effect (descriptor commands go through this class only, see
+	// BindDescriptorSet), so a later push with the same layout may update them incrementally
+	// (KYTY_DRAW_RUN_PUSH).
+	[[nodiscard]] uint64_t DescriptorEpoch(vk::PipelineBindPoint point) const {
+		return m_descriptor_epochs[point == vk::PipelineBindPoint::eCompute ? 1u : 0u];
+	}
 	// Binds `set` as set 0 unless it is still the set bound there with this layout
 	// (KYTY_DESCRIPTOR_SET_REUSE). Bound sets are disturbed only by another bind or a push
 	// descriptor update of set 0 at that bind point, both of which go through this class.
@@ -416,6 +424,7 @@ private:
 		std::vector<vk::DescriptorImageInfo> images;
 	};
 	std::array<DescriptorState, 2> m_descriptor_states;
+	std::array<uint64_t, 2>        m_descriptor_epochs {};
 	struct PushConstantShadow {
 		bool                     valid  = false;
 		vk::PipelineLayout       layout = nullptr;
@@ -937,14 +946,18 @@ public:
 	                      uint32_t mode);
 
 	// plan: the committed draw's binding plan for this stage (KYTY_DRAW_PREP_BINDINGS), or null.
+	// keep_images (KYTY_DRAW_RUN continuation): the stage's texture and sampler bindings are the
+	// previous draw's, kept as they are; only the per-draw data is prepared.
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared,
-	                     DrawPrep::StagePlan* plan = nullptr);
+	                     DrawPrep::StagePlan* plan = nullptr, bool keep_images = false);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
+	// keep_images (KYTY_DRAW_RUN continuation): no image transition is recorded; the images are in
+	// the states the previous draw left them in (DrawRunImagesUnchanged).
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
-	                    std::span<PreparedBindings* const> bindings);
+	                    std::span<PreparedBindings* const> bindings, bool keep_images = false);
 
 	// Draw-prep: hands the committed draw's preparation to its program refresh (once).
 	[[nodiscard]] DrawPrep::PreparedDraw* TakePreparedDraw() noexcept {
@@ -959,6 +972,9 @@ public:
 		return m_binding_plan;
 	}
 	void ActivateBindingPlan() noexcept { m_binding_plan_active = m_binding_plan != nullptr; }
+	// KYTY_DRAW_RUN: RefreshShaders accepted the committed draw's preparation (the structure key the
+	// preparing thread computed describes the draw).
+	void NotePreparedValidated() noexcept { m_prepared_validated = true; }
 	// KYTY_DRAW_PREP_BINDINGS texturememo: the memo draw-prep threads read hints from (FindHint).
 	[[nodiscard]] const TextureBindingMemo& GetTextureMemo() const noexcept { return m_texture_memo; }
 
@@ -999,8 +1015,10 @@ private:
 	[[nodiscard]] vk::Sampler NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
 	                                        uint32_t                                        index,
 	                                        const ShaderRecompiler::IR::DescriptorValue&    value);
+	// keep_images (KYTY_DRAW_RUN continuation): the image rebinding and target rediscovery are
+	// skipped (the previous draw's bindings are kept).
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-	                             std::span<RenderColorInfo> colors);
+	                             std::span<RenderColorInfo> colors, bool keep_images = false);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);
@@ -1187,6 +1205,110 @@ private:
 	std::vector<vk::ImageView> m_claimed_run_views;
 	// KYTY_NATIVE_INDIRECT_MESH (meshIndirect.h): created by the first native indirect mesh draw.
 	std::unique_ptr<MeshIndirect::Converter> m_mesh_indirect;
+
+	// KYTY_DRAW_RUN (drawPrep/drawRun.h): the run the last recorded draw can seed and the committed
+	// draw's part in it (GPU thread; draws hold the render mutex).
+	struct DrawRunImage {
+		ImageId                 id {};
+		vk::Image               image = nullptr;
+		vk::PipelineStageFlags2 stage;
+		vk::AccessFlags2        access;
+		vk::ImageLayout         layout         = vk::ImageLayout::eUndefined;
+		uint64_t                serial         = 0;
+		uint64_t                address        = 0; // guest range (info.data)
+		uint64_t                size           = 0;
+		uint32_t                resident_first = 0;
+		bool                    registered     = false;
+		bool                    single_state   = false; // no per-subresource states
+		bool                    texture        = false; // a sampled binding (else an attachment)
+	};
+	struct DrawRunRecord {
+		bool              valid            = false;
+		uint64_t          key              = 0;
+		uint64_t          activity         = 0;
+		vk::CommandBuffer command          = nullptr;
+		uint64_t          tick             = 0;
+		uint64_t          rendering_serial = 0;
+		uint32_t          slice_offset     = 0;
+		const void*       vertex_program   = nullptr;
+		const void*       pixel_program    = nullptr;
+		bool              ps_active        = false;
+		uint32_t          color_count      = 0;
+		uint32_t          color_slots      = 0;
+		RenderState       rendering;
+		// The textures of the recorded stages, then the attachments, as the draw left them.
+		std::vector<DrawRunImage> images;
+		// KYTY_DRAW_RUN_ACQUIRE and verify mode: the resolved targets (depth: one entry) and the
+		// scissor union (KYTY_ALIAS_BYTES claims) the attachments were acquired for.
+		std::vector<RenderColorInfo> colors;
+		std::vector<RenderDepthInfo> depth;
+		vk::Rect2D                   written {};
+		bool                         bounded = false;
+		// The record stored colors/depth/written (acquisition reuse) and the verify copies (the
+		// flags are live switches: a later draw must not read what an earlier record left).
+		bool acquire_valid = false;
+		bool verify_valid  = false;
+		// KYTY_DRAW_RUN_PUSH: the graphics descriptor epoch after the draw's push, and its layout.
+		uint64_t           push_epoch  = 0;
+		vk::PipelineLayout push_layout = nullptr;
+		bool               push_valid  = false; // pushed (not a descriptor set)
+		// Verify mode: what the normal path must reproduce for a continuation.
+		std::vector<TextureBinding>          textures;
+		std::vector<vk::Sampler>             samplers;
+		std::vector<vk::DescriptorImageInfo> pushed_images; // image and sampler descriptors
+	};
+	// DrawIndex/DrawAuto under the render mutex: the previous run's validity is taken for this draw,
+	// and a draw the draw-prep engine does not commit counts as other command-processor work.
+	void                       BeginDrawRun();
+	[[nodiscard]] bool DrawRunCommandUnchanged(const CommandBuffer& buffer) const;
+	[[nodiscard]] DrawRunImage MakeDrawRunImage(ImageId id, bool texture) const;
+	// attachments_only: the textures of the record are not checked (KYTY_DRAW_RUN_ACQUIRE).
+	// DrawRunImagesChange: 0 when unchanged, else the first difference (verify-mode detail).
+	[[nodiscard]] uint32_t DrawRunImagesChange(bool compare_serials,
+	                                           bool attachments_only = false, bool log_change = false) const;
+	[[nodiscard]] bool     DrawRunImagesUnchanged(bool compare_serials,
+	                                              bool attachments_only = false) const {
+		return DrawRunImagesChange(compare_serials, attachments_only) == 0;
+	}
+	// Whether a guest range lies over one of the marked attachments.
+	[[nodiscard]] static bool DrawRunOverAttachment(std::span<const DrawRunImage> marks,
+	                                                uint64_t address, uint64_t size);
+	// KYTY_DRAW_RUN_ACQUIRE: a draw that does not continue the run but resolved the recorded targets
+	// for the same scissor union, in the same rendering instance right after the recorded draw, with
+	// no texture over an attachment's memory, keeps the recorded attachment acquisition.
+	[[nodiscard]] bool DrawRunAcquireCandidate(const CommandBuffer&               buffer,
+	                                           const DrawRenderState&             state,
+	                                           std::span<PreparedBindings* const> stages,
+	                                           const vk::Rect2D*                  written) const;
+	// A continuation's kept textures and attachments are marked bound for the draw as their
+	// resolution marks them (BindImage, BindRenderTarget), before the draw's buffer work.
+	void                       DrawRunMarkBindings();
+	// Whether the committed draw continues the recorded run (the certificate without the images),
+	// PrepareDrawRenderState after the program refresh.
+	[[nodiscard]] bool DrawRunCandidate(const CommandBuffer& buffer, const DrawRenderState& state,
+	                                    uint32_t render_target_slice_offset);
+	void               DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                  uint32_t render_target_slice_offset, DrawRenderState& state);
+	// written: the scissor union the attachments were acquired for (null: unbounded claims).
+	void DrawRunRecordDraw(const CommandBuffer& buffer, const DrawRenderState& state,
+	                       uint32_t render_target_slice_offset, const RenderState& rendering,
+	                       std::span<PreparedBindings* const> stages, const vk::Rect2D* written,
+	                       const PipelineCache::Pipeline& pipeline);
+	// KYTY_DRAW_RUN_PUSH: whether a continuation's CommitBindings may push only its per-draw
+	// descriptors (the previous draw's image and sampler descriptors still in effect).
+	[[nodiscard]] bool DrawRunPartialPush(const CommandBuffer&           buffer,
+	                                      const PipelineCache::Pipeline& pipeline) const;
+	void DrawRunVerify(const DrawRenderState& state, const RenderState& rendering,
+	                   vk::ImageAspectFlags feedback_aspects,
+	                   std::span<PreparedBindings* const> stages);
+	DrawRunRecord m_run;
+	bool          m_run_prev_valid     = false; // m_run.valid when the committed draw began
+	bool          m_run_active         = false; // the draw takes the delta path
+	bool          m_run_verify         = false; // verify mode: the draw would have continued
+	uint64_t      m_run_key            = 0;     // the committed draw's structure key (the engine)
+	bool          m_in_engine_commit   = false;
+	bool          m_prepared_validated = false; // RefreshShaders accepted the draw's preparation
+	uint32_t      m_run_slice_offset   = 0;
 
 	friend class CommandProcessor;
 	friend class DrawPrep::Engine;
