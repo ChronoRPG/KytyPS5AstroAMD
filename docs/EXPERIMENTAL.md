@@ -27,9 +27,9 @@ This release builds on the U59 renderer and the Demon's Souls changes of the pre
   audio popping and time-stretching; Hades II startup and colour-clear fixes; a `NetResolverAbort` stub; and more
   shader opcodes (64-bit ALU and atomics, FP64 equality comparisons, 32-bit image compare-swap atomics, BVH
   intersections).
-- `KYTY_CPU_RESERVE` is now `off` in the preset (it was `cp`): reserving a whole core for the command processor can
-  starve the game's other threads on CPUs with fewer cores. `"KYTY_CPU_RESERVE": "cp"` restores the reservation.
-- `kyty_emulator.exe` is built with a new PGO profile, recorded in Astro Bot with this preset (`tools/pgo/`).
+- Text that games draw with the system font (for example Astro Bot's galaxy-map prompts) uses the bundled Roboto
+  font again (`3rdparty/tracy/profiler/src/font/` in the package) instead of a blocky 8x16 fallback.
+- `kyty_emulator.exe` is built with a new PGO profile, recorded in Astro Bot (`tools/pgo/`).
 - New flags, off by default and left off by the preset: `KYTY_CP_CPU_ONLY_QUERY`, `KYTY_CP_BINDING_MEMO_PREFETCH`,
   `KYTY_CP_BINDING_HOT_MEMO`, `KYTY_BUFFER_REFRESH_FUSION` and `KYTY_CPU_COPY_PAGE_SKIP` (no measurable effect in
   same-process A/B launches), and `KYTY_REGISTERED_SHADER_CODE` (not measured).

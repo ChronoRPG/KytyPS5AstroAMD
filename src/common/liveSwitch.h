@@ -7,7 +7,7 @@
 #include <string_view>
 
 // Live switches: KYTY_* flags that can change while the game runs, for same-process A/B
-// measurement (Profiling\tools\Run-AstroAB.ps1; how-to in KytyTiming\ab-testing.md).
+// measurement: an external harness writes the file named by KYTY_LIVE_FILE (see below).
 //
 // A flag that may change at runtime is a Live::Switch with static storage duration, defined at
 // namespace scope so that it registers before main:
