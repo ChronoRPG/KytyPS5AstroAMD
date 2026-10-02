@@ -3191,8 +3191,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
 		// The repeated binding work may merge/retire cache buffers or restart the command buffer.
-		// Reacquire the per-draw vertex/index reservations after it, just as on the normal path.
-		AcquireVertexBuffersInto(buffer, state.vertex_info[0], nullptr, vertex_bindings);
+		// Reacquire the per-draw vertex/index reservations after it, just as on the normal path,
+		// into fresh bindings: the first acquisition above filled them (AcquireVertexBuffersInto
+		// requires value-initialised bindings and stopped the emulator for a draw with vertex
+		// buffers).
+		vertex_bindings = PreparedVertexBuffers {};
+		if (CpCommit::Enabled(CpCommit::Part::Draws)) {
+			AcquireVertexBuffersInto(buffer, state.vertex_info[0], nullptr, vertex_bindings);
+		} else {
+			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0], nullptr);
+		}
 		index_binding = PrepareIndexBuffer(buffer, index_source);
 	}
 	// KYTY_DRAW_RUN=verify: whether the kept images would have passed the check above (the normal
