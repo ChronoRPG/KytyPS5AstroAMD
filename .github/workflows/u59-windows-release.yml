@@ -133,7 +133,7 @@ jobs:
         run: |
           # Functions with mismatched or missing profile data are optimized without it (not an error). A local
           # build of u59-int4-sg-1's commit from C:\kyty-src (VS 18.10, LLVM 22.1.3) reports 0 mismatched and
-          # 47 without data, all in the launcher's Qt moc file; the same build from another path, 2,499 more.
+          # 47 without data, all in the launcher's Qt moc file; a build from another path, about 2,500 more.
           $log = Get-Content -LiteralPath 'pgo-build.log'
           $sum = { param($pattern) ($log | Select-String -Pattern $pattern | ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Measure-Object -Sum).Sum }
           $mismatched = & $sum 'profile data may be out of date: of \d+ functions?, (\d+)'
