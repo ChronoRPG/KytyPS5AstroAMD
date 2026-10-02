@@ -119,10 +119,11 @@ jobs:
         shell: cmd
         run: |
           rem -Wprofile-instr-missing (diagnostics only) reports, per file, the functions the profile has no data for.
-          set _CL_=-Wprofile-instr-missing
+          rem clang-cl prepends CL to its arguments (_CL_ would land after CMake's "--" and count as a file).
+          set CL=-Wprofile-instr-missing
           cmake --build _Build/windows --target launcher kyty_emulator --parallel > pgo-build.log 2>&1
           set BUILD_EXIT=%ERRORLEVEL%
-          set _CL_=
+          set CL=
           type pgo-build.log
           if %BUILD_EXIT% neq 0 exit /b %BUILD_EXIT%
           cmake --install _Build/windows --prefix _Build/windows/install
