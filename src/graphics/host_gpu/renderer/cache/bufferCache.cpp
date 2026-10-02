@@ -49,6 +49,16 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 
 Live::Switch g_cpu_only_query("KYTY_CP_CPU_ONLY_QUERY", Live::ParseDefaultOff);
 Live::Switch g_binding_memo_prefetch("KYTY_CP_BINDING_MEMO_PREFETCH", Live::ParseDefaultOff);
+std::atomic<uint64_t> g_binding_hot_generation {1};
+void BindingHotChanged(int64_t, int64_t) {
+	// The live registry serializes callbacks. Saturation makes lookups clear the tier each time.
+	const auto generation = g_binding_hot_generation.load(std::memory_order_relaxed);
+	if (generation != UINT64_MAX) {
+		g_binding_hot_generation.store(generation + 1, std::memory_order_relaxed);
+	}
+}
+Live::Switch g_binding_hot_memo("KYTY_CP_BINDING_HOT_MEMO", Live::ParseDefaultOff,
+                               BindingHotChanged);
 
 bool IncrementalBdaSyncEnabled() {
 	const auto* value = std::getenv("KYTY_BDA_INCREMENTAL_SYNC");
@@ -2761,8 +2771,22 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 	// KYTY_CP_BINDING_MEMO_PREFETCH (default off, live): issue the read hint before the tracker
 	// query, so its region/serial loads can overlap the random memo-line fetch. This is a CPU cache
 	// hint only: every key, signature, epoch, tick and structure check below still runs.
-	auto& memo = BindingMemoSlot(vaddr, size);
-	if (g_binding_memo_prefetch.On()) {
+	m_binding_hot_enabled = g_binding_hot_memo.On();
+	if (m_binding_hot_enabled) {
+		const auto generation = g_binding_hot_generation.load(std::memory_order_relaxed);
+		if (generation == UINT64_MAX || m_binding_hot_generation != generation) {
+			for (auto& entry: m_binding_hot_memo) {
+				entry.kind = BindingMemoKind::Empty;
+			}
+			m_binding_hot_generation = generation;
+		}
+	}
+	auto& full = BindingMemoSlot(vaddr, size);
+	auto& hot  = BindingHotMemoSlot(vaddr, size);
+	const bool hot_key = m_binding_hot_enabled && hot.kind != BindingMemoKind::Empty &&
+	                     hot.vaddr == vaddr && hot.size == size;
+	auto& memo = hot_key ? hot : full;
+	if (!hot_key && g_binding_memo_prefetch.On()) {
 #if defined(__clang__) || defined(__GNUC__)
 		__builtin_prefetch(&memo, 0, 3);
 #elif defined(_M_X64) || defined(_M_IX86)
@@ -2808,6 +2832,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainReadBinding(uint64_t vaddr, uint
 			}
 		}
 		if (memo.epoch == epoch) {
+			if (m_binding_hot_enabled) {
+				if (hot_key) {
+					m_binding_memo_totals.hot_hits++;
+				} else {
+					hot = memo;
+				}
+			}
 			std::pair<Buffer*, uint64_t> hit {nullptr, memo.offset};
 			if (stream) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoStreamHits);
@@ -2873,6 +2904,9 @@ void BufferCache::RecordBinding(uint64_t vaddr, uint64_t size, uint64_t epoch, u
 		entry.kind      = BindingMemoKind::Cached;
 	}
 	BindingMemoSlot(vaddr, size) = entry;
+	if (m_binding_hot_enabled) {
+		BindingHotMemoSlot(vaddr, size) = entry;
+	}
 	Profiler::CountFrameEvent(Profiler::FrameEvent::BindingEpochMemoRecords);
 	m_binding_memo_totals.records++;
 }

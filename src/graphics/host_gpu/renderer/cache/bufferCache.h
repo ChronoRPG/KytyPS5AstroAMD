@@ -408,10 +408,26 @@ private:
 	static constexpr size_t BindingMemoSlots = 2048;
 	// KYTY_CP_COMMIT=bindslots: 32,768 slots, indexed by the hash's top 15 bits (11 above).
 	static constexpr size_t BindingMemoSlotsLarge = 32768;
+	static uint64_t BindingMemoHash(uint64_t vaddr, uint64_t size) noexcept {
+		return (vaddr >> 4u) * 0x9e3779b97f4a7c15ull ^ size * 0xc2b2ae3d27d4eb4full;
+	}
 	[[nodiscard]] BindingMemo& BindingMemoSlot(uint64_t vaddr, uint64_t size) noexcept {
-		const auto hash = (vaddr >> 4u) * 0x9e3779b97f4a7c15ull ^ size * 0xc2b2ae3d27d4eb4full;
+		const auto hash = BindingMemoHash(vaddr, size);
 		return m_binding_memo[static_cast<size_t>(hash >> m_binding_memo_shift)];
 	}
+	// KYTY_CP_BINDING_HOT_MEMO (default off, live): a 4 KiB front tier for recent binding memos.
+	// Copies carry exactly the main memo's certificates. Its hash prefix is shorter than either
+	// main table's: a main-slot collision is also a hot-slot collision, and records mirror both.
+	// A live-switch generation clears the tier on the next enabled lookup, including off periods
+	// without any binding lookup. The main table and every invalidation guard stay unchanged.
+	static constexpr size_t BindingHotMemoSlots = 64;
+	static_assert(BindingHotMemoSlots <= BindingMemoSlots);
+	[[nodiscard]] BindingMemo& BindingHotMemoSlot(uint64_t vaddr, uint64_t size) noexcept {
+		return m_binding_hot_memo[static_cast<size_t>(BindingMemoHash(vaddr, size) >> 58u)];
+	}
+	std::array<BindingMemo, BindingHotMemoSlots> m_binding_hot_memo {};
+	uint64_t m_binding_hot_generation = 0;
+	bool     m_binding_hot_enabled = false;
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainReadBinding(uint64_t vaddr, uint64_t size,
 	                                                             BufferId id);
 	// The binding without the memo; *obtained receives the cache buffer's id (unchanged for a
@@ -637,6 +653,7 @@ private:
 	int                                               m_binding_memo_verify = 0;
 	bool                                              m_binding_memo_cross  = false;
 	struct BindingMemoTotals {
+		uint64_t hot_hits          = 0; // successful hits through the optional front tier
 		uint64_t stream_hits       = 0;
 		uint64_t cached_hits       = 0; // cross-epoch hits included
 		uint64_t cross_hits        = 0;
