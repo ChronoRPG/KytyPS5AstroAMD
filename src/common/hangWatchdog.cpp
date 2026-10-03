@@ -59,12 +59,16 @@ struct GuestModule {
 	Record                            range;
 	std::array<std::atomic<char>, 64> name {};
 };
-std::array<GuestModule, 64>    g_modules;
-std::atomic<size_t>            g_module_count {0};
-std::array<Thread, MaxThreads> g_threads;
-std::array<Queue, MaxQueues>   g_queues;
-std::array<Event, MaxEvents>   g_events;
-constexpr size_t               NativeHistory = 256, NativeSemaphores = 8;
+std::array<GuestModule, 64>         g_modules;
+std::atomic<size_t>                 g_module_count {0};
+Record                              g_fatal;
+std::atomic_flag                    g_fatal_claimed = ATOMIC_FLAG_INIT;
+std::array<std::atomic<char>, 1024> g_fatal_text {};
+std::array<std::atomic<char>, 128>  g_fatal_file {};
+std::array<Thread, MaxThreads>      g_threads;
+std::array<Queue, MaxQueues>        g_queues;
+std::array<Event, MaxEvents>        g_events;
+constexpr size_t                    NativeHistory = 256, NativeSemaphores = 8;
 struct NativeSubmit {
 	std::atomic_flag                     writing = ATOMIC_FLAG_INIT;
 	Record                               header;
@@ -164,6 +168,9 @@ std::string Snapshot() {
 	       "last observations; no driver/guest reads are made here.\n";
 	const char*             kind = nullptr;
 	std::array<uint64_t, 8> a {};
+	if (Read(g_fatal, kind, a))
+		out += fmt::format("fatal-before-shutdown tid={} t_ms={} file='{}' line={} message='{}'\n",
+		                   a[1], a[2], ReadName(g_fatal_file), a[0], ReadName(g_fatal_text));
 	for (const auto& module: g_modules)
 		if (Read(module.range, kind, a))
 			out += fmt::format("guest-module name='{}' base=0x{:x} size=0x{:x}\n",
@@ -532,6 +539,13 @@ void RegisterGuestCode(uint64_t base, uint64_t size, std::string_view name) {
 	}
 	CopyName(g_modules[index].name, name);
 	Store(g_modules[index].range, "guest-module", {base, size});
+}
+void NoteFatal(std::string_view text, std::string_view file, uint32_t line) {
+	if (!Enabled() || g_fatal_claimed.test_and_set(std::memory_order_acquire)) return;
+	CopyName(g_fatal_text, text);
+	const auto separator = file.find_last_of("/\\");
+	CopyName(g_fatal_file, separator == std::string_view::npos ? file : file.substr(separator + 1));
+	Store(g_fatal, "fatal", {line, Tid(), NowMs()});
 }
 void NoteFlip() {
 	if (Enabled()) g_flips.fetch_add(1, std::memory_order_relaxed);

@@ -164,6 +164,13 @@ int main(int argc, char **argv) {
   Decisions();
   ConcurrentSnapshot();
   PublicationStress();
+  HangWatchdog::NoteFatal("first mock fatal", "source/renderer.cpp", 53);
+  HangWatchdog::NoteFatal("later cleanup failure", "source/cleanup.cpp", 99);
+  const auto fatal = HangWatchdog::SnapshotForTest();
+  Check(fatal.find("file='renderer.cpp' line=53 message='first mock fatal'") !=
+            std::string::npos &&
+            fatal.find("later cleanup failure") == std::string::npos,
+        "original failure survives later teardown errors");
   const auto dir =
       std::filesystem::temp_directory_path() /
       ("kyty-watchdog-test-" +

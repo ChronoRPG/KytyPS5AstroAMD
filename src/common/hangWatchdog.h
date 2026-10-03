@@ -23,6 +23,7 @@ void     SetCpContext(uint32_t queue, uint64_t submission);
 uint32_t CurrentCpQueue();
 uint64_t CurrentCpSubmission();
 void     RegisterGuestCode(uint64_t base, uint64_t size, std::string_view name);
+void     NoteFatal(std::string_view text, std::string_view file, uint32_t line);
 void     NoteFlip();
 void     NoteSubmission();
 void     NotePacket(uint32_t queue, uint64_t submission, uint64_t address, uint32_t opcode,

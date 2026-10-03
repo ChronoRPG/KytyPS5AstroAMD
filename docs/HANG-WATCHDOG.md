@@ -39,6 +39,8 @@ The report contains:
   identify binary semaphores. Timeline values are last observations, not watchdog queries.
 - Active APR file reads and guest copies, with file ID, offset, destination and byte count.
 - Windows native module inventory and thread contexts/stacks, including waits inside uninstrumented library calls.
+- The first fatal report before emergency shutdown, if one occurred, so cleanup waits do not
+  obscure the original failure when console output is unavailable.
 
 Internal queue 0 is graphics. Internal compute queue `q` maps to guest queue `q + 31`.
 Typed packet opcodes use `0x10000 + OpKind`; their type names identify the operation. Typed
