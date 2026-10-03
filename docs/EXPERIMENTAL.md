@@ -8,8 +8,15 @@ This release builds on the U59 renderer and the Demon's Souls changes of the pre
   recording (`KYTY_SHADER_WRITE_RETICK=1` in the preset). This prevents a side readback from publishing old
   contents before the actual GPU write. A deterministic Vulkan test reproduces the race; whether it fixes the
   reported RTX 40/50 hangs remains unproven. `KYTY_SHADER_WRITE_RETICK=0` restores the previous behavior.
+  - The logs of RTX 50 PCs that freeze at the title screen -> galaxy map step all end in this readback path:
+    the game's render threads re-read small flags a shader writes every frame. If your RTX 40/50 PC freezes
+    there, try this release with its bundled preset.
 - The hang watchdog is disabled in the release preset (`KYTY_HANG_WATCHDOG=0`). Test kits can enable it with
   `KYTY_HANG_WATCHDOG=1`; see `docs/HANG-WATCHDOG.md`. Disabled hot paths skip diagnostic record updates.
+- Measured on one PC (RTX 3090, Ryzen 9 7950X3D): no fps or VRAM change against int5. With the fix switched off
+  and on in the same process: Sky Garden -0.14% +/- 0.50%, Creamy Canyon -0.13% +/- 0.66%, identical VRAM.
+
+From int5 (`u59-windows-20261003-int5`):
 
 - Batched occlusion queries, on in the bundled `u59-preset.json` (`KYTY_OCCLUSION_BATCH=1`,
   `KYTY_OCCLUSION_SLOTS=16384`):
