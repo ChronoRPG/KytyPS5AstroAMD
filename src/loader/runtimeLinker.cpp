@@ -772,19 +772,27 @@ static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo
 }
 
 // The live log's line for the AMD CPU patch (FaultCost::SetPeriodicReporter): VRSQRTPS traps per
-// frame and the emulation time inside the handler (the exception dispatch comes on top).
+// frame; each costs about one guest fault round trip of the startup benchmark (the exception
+// dispatch; the emulation itself ~0.07 us, timed with KYTY_AMD_CPU_TIMING=1).
 static void ReportReciprocalSqrtTraps(double seconds, uint64_t frames) {
 	static Loader::X64InstructionEmulator::ReciprocalSqrtStats previous {};
 	const auto current = Loader::X64InstructionEmulator::GetReciprocalSqrtStats();
 	const auto traps   = current.traps - previous.traps;
 	const auto ns      = current.emulate_ns - previous.emulate_ns;
 	previous           = current;
-	std::printf("Kyty AMD CPU patch: last %.0f s: %.1f VRSQRTPS traps/frame (%.0f/s), %.2f us emulation each "
-	            "(%.2f ms/frame in the handler, plus the exception dispatch)\n",
-	            seconds, frames != 0 ? static_cast<double>(traps) / static_cast<double>(frames) : 0.0,
-	            seconds > 0 ? static_cast<double>(traps) / seconds : 0.0,
-	            traps != 0 ? static_cast<double>(ns) / static_cast<double>(traps) / 1e3 : 0.0,
-	            frames != 0 ? static_cast<double>(ns) / static_cast<double>(frames) / 1e6 : 0.0);
+	const auto& bench  = Libs::Graphics::FaultCost::StartupBenchmark();
+	const auto  rate   = seconds > 0 ? static_cast<double>(traps) / seconds : 0.0;
+	std::printf("Kyty AMD CPU patch: last %.0f s: %.1f VRSQRTPS traps/frame (%.0f/s)", seconds,
+	            frames != 0 ? static_cast<double>(traps) / static_cast<double>(frames) : 0.0, rate);
+	if (bench.valid) {
+		std::printf(", ~%.1f CPU cores busy trapping (%.2f us per trap round trip)",
+		            rate * (bench.fault_us - bench.fault_handler_us) / 1e6,
+		            bench.fault_us - bench.fault_handler_us);
+	}
+	if (ns != 0 && traps != 0) {
+		std::printf(", %.2f us emulation each", static_cast<double>(ns) / static_cast<double>(traps) / 1e3);
+	}
+	std::printf("\n");
 }
 
 // KYTY_VEH_FIRST=0 leaves guest tracking faults to the last-registered handler only, so every
