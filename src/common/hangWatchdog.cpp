@@ -373,6 +373,14 @@ void WriteStacks(FILE* file) {
 		std::fprintf(file, "native tid=%lu rip=0x%llx rsp=0x%llx registers=%llx,%llx,%llx,%llx\n",
 		             entry.th32ThreadID, rip, live, context.Rcx, context.Rdx, context.R8,
 		             context.R9);
+		std::fprintf(file,
+		             "  registers rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx "
+		             "rbp=%llx r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx "
+		             "r14=%llx r15=%llx eflags=%lx\n",
+		             context.Rax, context.Rbx, context.Rcx, context.Rdx, context.Rsi,
+		             context.Rdi, context.Rbp, context.R8, context.R9, context.R10,
+		             context.R11, context.R12, context.R13, context.R14, context.R15,
+		             context.EFlags);
 		if (!captured) {
 			std::fprintf(file, "  stack unavailable (register context retained)\n");
 			continue;
