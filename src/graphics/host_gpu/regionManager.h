@@ -44,7 +44,7 @@ public:
 		}
 		if (!m_lock.try_lock()) [[unlikely]] {
 			HangWatchdog::Scope wait("tracker-owner", reinterpret_cast<uint64_t>(this), thread,
-			                         m_owner.load(std::memory_order_relaxed));
+			                         HangWatchdog::Enabled() ? m_owner.load(std::memory_order_relaxed) : 0);
 			MemoryStats::Count(MemoryStats::Counter::TrackerLockContended);
 			if (m_owner.load(std::memory_order_relaxed) == thread) {
 				EXIT("recursive region tracking lock while contended\n");

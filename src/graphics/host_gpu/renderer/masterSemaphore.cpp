@@ -38,7 +38,7 @@ MasterSemaphore::~MasterSemaphore() {
 void MasterSemaphore::Refresh() {
 	HangWatchdog::Scope query("master-counter-query",
 	                          reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)),
-	                          CurrentTick());
+	                          HangWatchdog::Enabled() ? CurrentTick() : 0);
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	if (result != vk::Result::eSuccess) {
@@ -56,9 +56,11 @@ void MasterSemaphore::Refresh() {
 	       !m_gpu_tick.compare_exchange_weak(known, counter, std::memory_order_release,
 	                                         std::memory_order_relaxed)) {
 	}
-	HangWatchdog::UpdateTimeline(
-	    m_watchdog_timeline, CurrentTick(), counter,
-	    m_submission_progress ? m_submission_progress->dispatched_tick.load() : CurrentTick() - 1);
+	if (HangWatchdog::Enabled()) {
+		HangWatchdog::UpdateTimeline(
+		    m_watchdog_timeline, CurrentTick(), counter,
+		    m_submission_progress ? m_submission_progress->dispatched_tick.load() : CurrentTick() - 1);
+	}
 }
 
 void MasterSemaphore::Wait(uint64_t tick) {
@@ -75,7 +77,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		auto submitted = m_submission_progress->dispatched_tick.load(std::memory_order_acquire);
 		HangWatchdog::Scope dispatch(
 		    "master-dispatch", reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)),
-		    tick, submitted, 0, CurrentTick());
+		    tick, submitted, 0, HangWatchdog::Enabled() ? CurrentTick() : 0);
 		while (submitted < tick) {
 			m_submission_progress->dispatched_tick.wait(submitted, std::memory_order_acquire);
 			submitted = m_submission_progress->dispatched_tick.load(std::memory_order_acquire);
@@ -97,7 +99,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	HangWatchdog::Scope wait("master-gpu",
 	                         reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)),
-	                         tick, KnownGpuTick(), 0, CurrentTick());
+	                         tick, HangWatchdog::Enabled() ? KnownGpuTick() : 0, 0,
+	                         HangWatchdog::Enabled() ? CurrentTick() : 0);
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	if (result != vk::Result::eSuccess) {
 		HangWatchdog::Scope error("master-wait-error",

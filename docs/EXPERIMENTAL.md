@@ -4,6 +4,13 @@ This release builds on the U59 renderer and the Demon's Souls changes of the pre
 
 ## New in this update
 
+- Shader storage writes are tagged again at command emission when binding preparation submitted their original
+  recording (`KYTY_SHADER_WRITE_RETICK=1` in the preset). This prevents a side readback from publishing old
+  contents before the actual GPU write. A deterministic Vulkan test reproduces the race; whether it fixes the
+  reported RTX 40/50 hangs remains unproven. `KYTY_SHADER_WRITE_RETICK=0` restores the previous behavior.
+- The hang watchdog is disabled in the release preset (`KYTY_HANG_WATCHDOG=0`). Test kits can enable it with
+  `KYTY_HANG_WATCHDOG=1`; see `docs/HANG-WATCHDOG.md`. Disabled hot paths skip diagnostic record updates.
+
 - Batched occlusion queries, on in the bundled `u59-preset.json` (`KYTY_OCCLUSION_BATCH=1`,
   `KYTY_OCCLUSION_SLOTS=16384`):
   - Astro Bot's Creamy Canyon (the snow level in the Gorilla Nebula) draws about 4,700 small depth-only boxes per

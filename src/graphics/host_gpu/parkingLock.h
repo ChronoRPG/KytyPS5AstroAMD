@@ -79,7 +79,7 @@ public:
 	// back to back (the two historical spin loops). Returns true when it parked.
 	bool LockContended(bool shared_spin = true) noexcept {
 		HangWatchdog::Scope wait("resource-parking-lock", reinterpret_cast<uint64_t>(this), 0,
-		                         m_state.load(std::memory_order_relaxed));
+		                         HangWatchdog::Enabled() ? m_state.load(std::memory_order_relaxed) : 0);
 		if (!TrackerLockParkEnabled()) {
 			for (;;) {
 				if (shared_spin) {

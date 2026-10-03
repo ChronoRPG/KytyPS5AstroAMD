@@ -1814,7 +1814,7 @@ bool CommandProcessor::ProcessPacket(Pm4Execution& execution) {
 	}
 
 	EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
-	if (!reference && !sequencer) {
+	if (HangWatchdog::Enabled() && !reference && !sequencer) {
 		const auto q =
 		    m_interrupt_event_id == 0 ? 0u : static_cast<uint32_t>(m_interrupt_event_id - 0x20 + 1);
 		const auto word = [&](uint32_t i) {

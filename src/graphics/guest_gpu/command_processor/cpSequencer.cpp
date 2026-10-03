@@ -171,7 +171,7 @@ bool Sequencer::WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewak
 
 uint64_t Sequencer::AwaitAnswer(uint64_t op_sequence) {
 	HangWatchdog::Scope wait("sequencer-answer", reinterpret_cast<uint64_t>(this), op_sequence + 1,
-	                         m_answered.load());
+	                         HangWatchdog::Enabled() ? m_answered.load() : 0);
 	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqBarriers);
 	// Pre-wake: a parked sequencer is woken this many ops before the lockstep op, so it spins
 	// again when the answer comes (the resolver has nothing else to execute until then).
