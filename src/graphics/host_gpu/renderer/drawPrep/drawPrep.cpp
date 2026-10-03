@@ -1084,7 +1084,7 @@ void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 		// Diagnostics: what the wait began with (the window's depth, a waiting unclaimed slot).
 		const auto occupancy = window.Occupancy();
 		HangWatchdog::Scope wait("draw-prep-head", reinterpret_cast<uint64_t>(&window),
-		                         window.Head(), occupancy);
+		                         HangWatchdog::Enabled() ? window.Head() : 0, occupancy);
 		if (window.Unclaimed() != 0) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaitsUnclaimed);
 		}

@@ -182,8 +182,10 @@ void QueueSubmissionBroker::SubmitBatch(const QueuedSubmission* records, size_t 
 		    reinterpret_cast<uint64_t>(static_cast<VkQueue>(m_graphics->queue)),
 		    records[count - 1].tick, records[0].tick, native_count, count);
 		HangWatchdog::DebugDelay("submit", records[count - 1].tick);
-		for (size_t i = 0; i < native_count; ++i)
-			NoteWatchdogSubmit(m_graphics->queue, submits[i]);
+		if (HangWatchdog::Enabled()) {
+			for (size_t i = 0; i < native_count; ++i)
+				NoteWatchdogSubmit(m_graphics->queue, submits[i]);
+		}
 		result = m_graphics->queue.submit(static_cast<uint32_t>(native_count), submits.data(), nullptr);
 	}
 	++m_driver_calls;

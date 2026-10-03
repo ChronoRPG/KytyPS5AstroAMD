@@ -626,7 +626,8 @@ void CommandRecorder::Submit(const CommandStream::SubmitPacket& submit) {
 
 void CommandRecorder::Drain(const void* site_key, bool is_site) {
 	HangWatchdog::Scope wait("recorder-drain", reinterpret_cast<uint64_t>(this),
-	                         m_ring.WritePosition(), m_ring.Consumed());
+	                         HangWatchdog::Enabled() ? m_ring.WritePosition() : 0,
+	                         HangWatchdog::Enabled() ? m_ring.Consumed() : 0);
 	const auto start = NowNs();
 	// Idle: the recorder released everything encoded (published or not), so it executed every
 	// packet and records nothing until the next one. The window opens without a marker and
@@ -667,7 +668,7 @@ void CommandRecorder::WaitRecorded(uint64_t tick, bool from_producer) {
 	}
 	EXIT_IF(m_mode != Mode::Thread);
 	HangWatchdog::Scope wait("recorder-recorded-tick", reinterpret_cast<uint64_t>(this), tick,
-	                         m_recorded_tick.load());
+	                         HangWatchdog::Enabled() ? m_recorded_tick.load() : 0);
 	if (from_producer) {
 		m_ring.Kick(m_encoder.Stats());
 	}
