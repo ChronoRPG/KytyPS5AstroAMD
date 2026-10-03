@@ -1,0 +1,94 @@
+# Hang watchdog
+
+`KYTY_HANG_WATCHDOG=1` is the default. After both a guest flip and a renderer submission have
+occurred, the watchdog writes one report if neither counter advances for five seconds. It checks
+once a second, so detection can take approximately five to six seconds. It does not recover,
+time out, reorder, or skip guest or GPU work. A long legitimate loading stall can also trigger it.
+
+The report is `watchdog.txt` in the active hang-trace directory. With tracing disabled, it is in
+`_HangTrace/watchdog-<timestamp>-pid<PID>/` beside the emulator on Windows. An explicit
+`KYTY_HANG_TRACE_DIR` also works without `KYTY_HANG_TRACE`. The report does not depend on console
+or guest printf redirection. If an explicit directory is unwritable, the executable-relative
+directory is tried. Wait metadata is flushed before thread stacks are collected.
+
+Normal operation records bounded atomic metadata and polls two counters once a second. There
+are no watchdog file writes, stack walks or additional Vulkan queries until a stall fires.
+The watchdog never takes guest, renderer, event-owner or submission locks to take its snapshot.
+Event publishers use a separate short registry lock. On Windows, each process-owned thread is
+briefly suspended to copy its context and at most 64 KiB of its stack, then resumed **before**
+unwinding or writing. Native module offsets require the matching executable and PDB/link map.
+Guest module bases are copied at load time, independently of hang tracing.
+
+The report contains:
+
+- Nested active wait/operation scopes, host thread IDs, guest thread objects and names, CP queue
+  and admission sequence. Guest mutex owner objects can be matched to thread `guest` fields.
+- Suspended `WAIT_REG_MEM` operands (address, reference, observed value, mask, comparison and
+  width), frame-fence state, pending EOP labels and their timeline ticks.
+- Guest event queue registrations and active waits; condition, rwlock, semaphore, event-flag,
+  sync-on-address and join waits. Observations are captured by the owning thread, not read live.
+- In-flight shader hashes/stages, native graphics/compute pipeline creation, background shader
+  validation/checks, pipeline optimization and pipeline-cache serialization.
+- Recorder, sequencer, draw-prep, broker, readback, priority-callback and master timeline waits.
+  Returned master errors and device-loss diagnostic calls remain visible if fatal reporting blocks.
+- The last 32 PM4/typed packets per internal queue and last 256 native submission bundles,
+  including semaphore waits/signals and pipeline stage masks. A native bundle means the host
+  was about to submit; it does not prove the driver call returned. Zero semaphore values may
+  identify binary semaphores. Timeline values are last observations, not watchdog queries.
+- Active APR file reads and guest copies, with file ID, offset, destination and byte count.
+- Windows native module inventory and thread contexts/stacks, including waits inside uninstrumented library calls.
+
+Internal queue 0 is graphics. Internal compute queue `q` maps to guest queue `q + 31`.
+Typed packet opcodes use `0x10000 + OpKind`; their type names identify the operation. Typed
+snapshot payloads may start with host register-snapshot addresses. Raw PM4 records retain the
+header and first four payload words. No guest memory is dereferenced while reporting.
+
+Storage is bounded (512 registered threads, 16 nested scopes, 57 CP queues, 1,024 event/label
+registrations, 64 timeline slots, 64 guest modules). `overflow` reports capacity/publication
+loss. Snapshots are observations made across threads, not a simultaneous global stop. Native
+stacks can stop at generated/guest frames without unwind metadata. A report narrows the blocked
+call; it cannot by itself prove a GPU shader or driver defect.
+
+`KYTY_HANG_WATCHDOG=0` disables monitoring and metadata publication. It is a live switch for
+same-process A/B; a process started disabled needs `KYTY_LIVE_FILE` to allow later activation.
+`KYTY_HANG_WATCHDOG_MS` changes the startup threshold (1,000–600,000 ms; default 5,000).
+
+For a timing perturbation, use the default-off `KYTY_HANG_DELAY_SITE`:
+
+| Setting | Purpose |
+| --- | --- |
+| `queue` | Delay the CP before servicing a selected internal queue. |
+| `submit` | Delay a broker/recorder native submission. |
+| `compile` | Delay a program compilation after releasing the program registry lock. |
+| `label` | Delay the CP's deferred label write. |
+| `readback` | Delay a readback publisher before acquiring its publication mutex. |
+| `eager-issue` | Delay after publishing an eager readback, before flushing its producer tick. |
+
+`KYTY_HANG_DELAY_KEY` optionally selects an internal queue ID, timeline tick, shader hash or guest
+address respectively; `eager-issue` selects a tracker page address (decimal or `0x...`). `KYTY_HANG_DELAY_AFTER_MS` defaults to 30,000;
+`KYTY_HANG_DELAY_MS` defaults to 6,000 and is capped at 30,000. Only one matching delay occurs
+per process. An intentional `debug-delay-*` scope identifies it in the report. These controls
+preserve ordering and introduce a finite delay; recovery afterwards is not reproduction of a
+permanent freeze.
+
+With `--graphics-debug-dump true`, matched-input JSON, IR and SPIR-V snapshots also cover
+compute `305afd0aa0f66b9a` and vertices `cf1834bb2d5ac83d`/`d9cc5c62178518fa`. JSON records
+the compiling CP queue/admission sequence and direct compute buffer descriptor operands; these
+are compile-permutation inputs, not a complete record of later dispatches.
+
+Build `hang_watchdog_tests`, then run CTest `hang_watchdog` and `hang_watchdog_fire`. They cover
+arming/progress/once-only decisions, nested in-flight metadata, publication consistency during
+concurrent reads, packet-ring wrap, event removal, native dependencies, file output with tracing
+disabled, no output before arming, and Windows stack capture. Include this target in `kyty_tests`.
+For Windows diagnosis a Release linker map (`/MAP`) can preserve symbol addresses without
+changing shader codegen compile flags; keep it alongside the exact executable used for the test.
+
+Resolve emulator frame offsets offline with the map from the **exact same executable**:
+
+```text
+python tools/symbolize_watchdog.py watchdog.txt kyty_emulator.map --output watchdog-symbolized.txt
+```
+
+This adds the nearest function symbol and displacement, preserves the original report, and
+requires no debugger/symbol server. It does not resolve driver DLL offsets or inlined source
+lines. Use `--module` if the executable was renamed; do not substitute a different build map.

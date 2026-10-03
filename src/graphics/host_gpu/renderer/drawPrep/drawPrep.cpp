@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/cpuPlacement.h"
+#include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
@@ -1082,6 +1083,8 @@ void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaits);
 		// Diagnostics: what the wait began with (the window's depth, a waiting unclaimed slot).
 		const auto occupancy = window.Occupancy();
+		HangWatchdog::Scope wait("draw-prep-head", reinterpret_cast<uint64_t>(&window),
+		                         window.Head(), occupancy);
 		if (window.Unclaimed() != 0) {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepCommitWaitsUnclaimed);
 		}

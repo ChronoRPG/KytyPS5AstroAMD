@@ -1,6 +1,7 @@
 #include "common/hangTrace.h"
 
 #include "common/cpuPlacement.h"
+#include "common/hangWatchdog.h"
 
 #include <algorithm>
 #include <array>
@@ -1254,6 +1255,7 @@ void Shutdown() {
 }
 
 void RegisterGuestCode(uint64_t base, uint64_t size, std::string_view name) {
+	HangWatchdog::RegisterGuestCode(base, size, name);
 	if (!Enabled() || size == 0) {
 		return;
 	}
@@ -1859,6 +1861,7 @@ void RecordDoneWait(uint64_t wait_ns) {
 }
 
 void RecordFlip() {
+	HangWatchdog::NoteFlip();
 	if (!Enabled()) {
 		return;
 	}

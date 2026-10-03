@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/command_processor/cpSequencer.h"
 
 #include "common/assert.h"
+#include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -156,6 +157,8 @@ bool Sequencer::WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewak
 		const auto observed = m_progress.load(std::memory_order_seq_cst);
 		m_parked.fetch_add(1, std::memory_order_seq_cst);
 		if (!ready() && !Stopping()) {
+			HangWatchdog::Scope wait("sequencer-progress", reinterpret_cast<uint64_t>(this),
+			                         wake_at, observed, 0, rewake_at);
 			m_progress.wait(observed, std::memory_order_seq_cst);
 		}
 		m_parked.fetch_sub(1, std::memory_order_seq_cst);
@@ -167,6 +170,8 @@ bool Sequencer::WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewak
 }
 
 uint64_t Sequencer::AwaitAnswer(uint64_t op_sequence) {
+	HangWatchdog::Scope wait("sequencer-answer", reinterpret_cast<uint64_t>(this), op_sequence + 1,
+	                         m_answered.load());
 	Profiler::CountFrameEvent(Profiler::FrameEvent::CpSeqBarriers);
 	// Pre-wake: a parked sequencer is woken this many ops before the lockstep op, so it spins
 	// again when the answer comes (the resolver has nothing else to execute until then).
@@ -196,6 +201,7 @@ void Sequencer::Run() {
 		Intake intake;
 		{
 			std::unique_lock lock(m_intake_mutex);
+			HangWatchdog::Scope wait("sequencer-intake", reinterpret_cast<uint64_t>(this));
 			m_intake_ready.wait(lock, [this] { return m_stop || !m_intake.empty(); });
 			if (m_intake.empty()) {
 				return;

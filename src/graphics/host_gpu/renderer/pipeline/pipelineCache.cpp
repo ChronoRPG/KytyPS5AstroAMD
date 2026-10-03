@@ -4,15 +4,16 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hangTrace.h"
+#include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
-#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.h"
@@ -706,7 +707,10 @@ void DumpMatchedShaderInputs(const ShaderParams& params,
                              const std::vector<uint32_t>& spirv, std::string_view ir_dump) {
 	if (!Config::GraphicsDebugDumpEnabled() ||
 	    !((options.stage == ShaderType::Pixel && options.shader_hash == 0x3b809f9d156a95ddull) ||
-	      (options.stage == ShaderType::Vertex && options.shader_hash == 0xe5398a1c6007f356ull))) {
+	      (options.stage == ShaderType::Vertex && (options.shader_hash == 0xe5398a1c6007f356ull ||
+	                                               options.shader_hash == 0xcf1834bb2d5ac83dull ||
+	                                               options.shader_hash == 0xd9cc5c62178518faull)) ||
+	      (options.stage == ShaderType::Compute && options.shader_hash == 0x305afd0aa0f66b9aull))) {
 		return;
 	}
 
@@ -728,25 +732,30 @@ void DumpMatchedShaderInputs(const ShaderParams& params,
 	ir_path += ".ir.txt";
 	constexpr size_t MaxIrDumpBytes = 16 * 1024 * 1024;
 	const auto ir_bytes = std::min(ir_dump.size(), MaxIrDumpBytes);
-	Json metadata = {
+	Json             metadata       = {
 	    {"schema_version", 1},
 	    {"snapshot_kind", "compile_permutation"},
+	    {"cp_queue", HangWatchdog::CurrentCpQueue()},
+	    {"cp_submission", HangWatchdog::CurrentCpSubmission()},
 	    {"stage", stage_name},
 	    {"shader_hash", fmt::format("0x{:016x}", options.shader_hash)},
 	    {"guest_code_base", fmt::format("0x{:016x}", params.Base())},
 	    {"guest_code_words", params.code.size()},
-	    {"guest_code_xxh3_64", fmt::format("0x{:016x}", XXH3_64bits(params.code.data(), params.code.size_bytes()))},
+	    {"guest_code_xxh3_64",
+	     fmt::format("0x{:016x}", XXH3_64bits(params.code.data(), params.code.size_bytes()))},
 	    {"spirv_file", Common::PathToString(spirv_path.filename())},
 	    {"spirv_bytes", spirv_bytes},
 	    {"spirv_xxh3_64", fmt::format("0x{:016x}", spirv_hash)},
 	    {"ir_file", Common::PathToString(ir_path.filename())},
-	    {"ir_bytes", ir_bytes}, {"ir_original_bytes", ir_dump.size()},
+	    {"ir_bytes", ir_bytes},
+	    {"ir_original_bytes", ir_dump.size()},
 	    {"ir_truncated", ir_bytes != ir_dump.size()},
 	    {"static_state_xxh3_64", fmt::format("0x{:016x}", key_hash)},
 	    {"static_state_words", std::vector<uint32_t>(static_state.begin(), static_state.end())},
 	    {"user_data_count", params.user_data_count},
 	    {"user_data_base", options.user_data_base},
-	    {"user_data_words", std::vector<uint32_t>(options.user_data.begin(), options.user_data.end())},
+	    {"user_data_words",
+	     std::vector<uint32_t>(options.user_data.begin(), options.user_data.end())},
 	    {"captured_user_data_storage", params.user_data},
 	    {"compile_wave_size", options.wave_size},
 	    {"push_data_start_dword", push_data_start_dword},
@@ -843,6 +852,30 @@ void DumpMatchedShaderInputs(const ShaderParams& params,
 				                  : Json::array()},
 				};
 			}
+		}
+	} else if (options.stage == ShaderType::Compute) {
+		const auto& cs      = *options.input_info.compute;
+		metadata["compute"] = {
+		    {"dispatch_threads_num",
+		     {cs.dispatch_threads_num[0], cs.dispatch_threads_num[1], cs.dispatch_threads_num[2]}},
+		    {"wave_size", cs.wave_size},
+		    {"host_subgroup_size", cs.host_subgroup_size},
+		    {"thread_ids_num", cs.thread_ids_num},
+		    {"workgroup_register", cs.workgroup_register},
+		};
+		// This short argument-preparation shader carries four direct buffer descriptors.
+		// Copy descriptor words only; diagnosis must not read or synchronize GPU memory.
+		auto& buffers = metadata["compute"]["direct_buffers"];
+		buffers       = Json::array();
+		for (size_t i = 0; i + 4 <= std::min<size_t>(16, options.user_data.size()); i += 4) {
+			ShaderBufferResource resource {};
+			std::copy_n(options.user_data.data() + i, 4, resource.fields);
+			buffers.push_back(
+			    {{"sgpr", i},
+			     {"fields", std::vector<uint32_t>(resource.fields, resource.fields + 4)},
+			     {"base", fmt::format("0x{:016x}", resource.Base48())},
+			     {"size", resource.GetSize()},
+			     {"stride", resource.Stride()}});
 		}
 	} else {
 		const auto& vs = *options.input_info.vertex;
@@ -988,6 +1021,7 @@ private:
 				m_jobs.pop_front();
 			}
 			const auto begin = CompileClockNs();
+			HangWatchdog::Scope validate("program-background-validation", job.shader_hash);
 			const bool valid = ValidateShaderSpirv(job.label, job.shader_hash, job.spirv);
 			const auto ns    = CompileClockNs() - begin;
 			g_compile_totals.validate_async.fetch_add(1, std::memory_order_relaxed);
@@ -1431,6 +1465,8 @@ struct PipelineCache::ProgramCache {
 	                              ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                              ProgramCompileTimes& times, EmittedProgram* words = nullptr) {
 		const char* stage_name = ProgramStageName(options.stage);
+		HangWatchdog::Scope finish("program-finish", options.shader_hash,
+		                           static_cast<uint64_t>(options.stage));
 		if (words != nullptr) {
 			words->spirv       = emitted.spirv;
 			words->spirv_plain = emitted.spirv_plain;
@@ -1734,6 +1770,8 @@ struct PipelineCache::ProgramCache {
 			return false;
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ProgramCompileWaits);
+		HangWatchdog::Scope wait("program-in-flight", reinterpret_cast<uint64_t>(this),
+		                         in_flight.size());
 		compile_done.wait(lock, [&] { return !busy(); });
 		return true;
 	}
@@ -1967,6 +2005,8 @@ struct PipelineCache::ProgramCache {
 
 	// Translates and emits a reloaded program again and compares it with the stored bytes.
 	void RunBackgroundCheck(const BackgroundCheck& job) {
+		HangWatchdog::Scope              compile("program-background-check", job.shader_hash,
+		                                         static_cast<uint64_t>(job.stage));
 		ShaderRecompiler::CompileOptions options;
 		options.stage                   = job.stage;
 		options.shader_hash             = job.shader_hash;
@@ -2268,8 +2308,11 @@ struct PipelineCache::ProgramCache {
 			record.specialization_known = true;
 		}
 		in_flight.push_back(&record);
+		HangWatchdog::Scope compiling("program-compile", params.hash,
+		                              static_cast<uint64_t>(key.stage));
 		const InFlightScope in_flight_scope(*this, record, lock);
 		lock.unlock();
+		HangWatchdog::DebugDelay("compile", params.hash);
 
 		const auto stage = key.stage;
 		ShaderStageInputInfo stage_input {};
@@ -3107,6 +3150,10 @@ struct PipelineCache::LibraryState {
 			// so the result is the pipeline it would have created.
 			const auto   begin     = CompileClockNs();
 			vk::Pipeline optimized = nullptr;
+			HangWatchdog::Scope compile(
+			    "graphics-pipeline-optimize",
+			    reinterpret_cast<uint64_t>(static_cast<VkPipeline>(job.linked)),
+			    job.key->vertex_shader_ids[0], job.key->ps_shader_id);
 			const auto   result    = cache.m_graphics.device.createGraphicsPipelines(
 			    cache.m_driver_cache, 1, &job.snapshot->Info(), nullptr, &optimized);
 			const auto ns = CompileClockNs() - begin;
@@ -3440,6 +3487,9 @@ void PipelineCache::NotePipelineCreated(uint64_t create_ns) {
 }
 
 uint64_t PipelineCache::WriteDriverCache(bool periodic) {
+	HangWatchdog::Scope snapshot(
+	    "pipeline-cache-snapshot",
+	    reinterpret_cast<uint64_t>(static_cast<VkPipelineCache>(m_driver_cache)), periodic);
 	const auto begin = CompileClockNs();
 	// Synchronization: vkGetPipelineCacheData has no externally synchronized parameter (vk.xml
 	// declares none for pipelineCache), and m_driver_cache is created without
@@ -4386,6 +4436,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 	{
 		Profiler::ScopedFrameWait pipeline_create(Profiler::FrameWait::GraphicsPipelineCreate);
+		HangWatchdog::Scope       compile(
+		    "graphics-pipeline",
+		    vertex_info[0].stage.program ? vertex_info[0].stage.program->shader_hash : 0, vs_id,
+		    ps_id);
 		CreatePipelineInternal(m_graphics, *cached, key.rendering, key.vertex_input, vertex_info,
 		                       ps_input_info, programs, key.static_params, m_driver_cache,
 		                       m_library != nullptr ? &library_hook : nullptr);
@@ -4463,6 +4517,9 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
+	HangWatchdog::Scope compile(
+	    "compute-pipeline", input_info.stage.program ? input_info.stage.program->shader_hash : 0,
+	    compute_program.id);
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
 	GpuOpProfiler::RegisterComputePipeline(cached->pipeline, compute_program.id);
 

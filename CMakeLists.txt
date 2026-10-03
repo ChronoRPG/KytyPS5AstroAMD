@@ -624,6 +624,13 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(hang_watchdog_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/HangWatchdogTests.cpp")
+target_link_libraries(hang_watchdog_tests common)
+target_include_directories(hang_watchdog_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(hang_watchdog_tests Threads::Threads)
+endif()
+
 # Per-thread profiler counters (common/profiler.h); also prints a timing of the counting paths.
 add_executable(profiler_counter_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ProfilerCounterTests.cpp"
@@ -976,6 +983,9 @@ if(BUILD_TESTING)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME hang_watchdog COMMAND $<TARGET_FILE:hang_watchdog_tests>)
+	add_test(NAME hang_watchdog_fire COMMAND $<TARGET_FILE:hang_watchdog_tests> --fire)
+	set_tests_properties(hang_watchdog_fire PROPERTIES TIMEOUT 15)
 	add_test(NAME profiler_counters COMMAND $<TARGET_FILE:profiler_counter_tests>)
 	add_test(NAME cpu_placement COMMAND $<TARGET_FILE:cpu_placement_tests>)
 	add_test(NAME cpu_placement_recorder COMMAND $<TARGET_FILE:cpu_placement_tests> --mode cp+recorder)
@@ -1890,6 +1900,7 @@ if(BUILD_TESTING)
 		"Tests: failed: ;Tests: [^\n]* failed at ;Tests: [^\n]* failed: ;FAILED: ;test failed: ;SaveDataMemoryTests:[0-9]+: ")
 
 	add_custom_target(kyty_tests DEPENDS
+		hang_watchdog_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
