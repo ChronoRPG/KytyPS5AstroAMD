@@ -21,10 +21,10 @@ This release builds on the U59 renderer and the Demon's Souls changes of the pre
     (about what a 12 GB card leaves, and less than an 8 GB card leaves): Astro Bot now reaches the Sky Garden and runs
     at 32-33 fps there. With the previous release's preset it got stuck in the galaxy map in both cases. With 16 GiB
     held, about 0.3 GB spilled to shared memory. Tested on NVIDIA only.
-- Release builds get the whole PGO profile. clang-cl names functions in anonymous namespaces after a hash of the source
+- Release builds compile from the PGO profile's source path. clang-cl names functions in anonymous namespaces after a hash of the source
   path, so earlier GitHub builds missed the profile for all of them (2,499 of the 17,426 functions in the previous
-  release's profile). The release now compiles from the path the profile was recorded at (`C:\kyty-src`) and with
-  Visual Studio 2026, as the profile was. This did not change the Astro Bot frame rate measurably.
+  release's profile). The release now compiles from the path the profile was recorded at (`C:\kyty-src`). This did
+  not change the Astro Bot frame rate measurably.
 - `kyty_emulator.exe` is built with a new PGO profile, recorded in Astro Bot with this source (`tools/pgo/`).
 
 ## Earlier in U59 integration

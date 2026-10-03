@@ -11,9 +11,7 @@ permissions:
 jobs:
   windows:
     if: github.repository == 'Jetsku/KytyPS5-experimental' || github.repository == 'Jetsku/KytyPS5'
-    # Visual Studio 2026 18.10 (MSVC 14.51), as on the PC that records the PGO profile: standard-library
-    # functions only match their profile data when they are compiled from the same headers.
-    runs-on: windows-2025-vs2026
+    runs-on: windows-2022
     steps:
       - name: Check out experimental source
         uses: actions/checkout@v4
@@ -128,6 +126,16 @@ jobs:
           if %BUILD_EXIT% neq 0 exit /b %BUILD_EXIT%
           cmake --install _Build/windows --prefix _Build/windows/install
 
+      - name: Show build errors
+        if: failure()
+        shell: pwsh
+        run: |
+          # Job logs need a GitHub sign-in to read; annotations do not. Repeat the first error lines as annotations.
+          if (Test-Path -LiteralPath 'pgo-build.log') {
+            $lines = @(Get-Content -LiteralPath 'pgo-build.log' | Select-String -Pattern 'error|FAILED|fatal' | Select-Object -First 8)
+            if (-not $lines) { $lines = @(Get-Content -LiteralPath 'pgo-build.log' | Select-Object -Last 8) }
+            foreach ($line in $lines) { Write-Host ('::error::' + "$line".Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')) }
+          } else { Write-Host '::error::pgo-build.log was not written' }
       - name: Report PGO coverage
         shell: pwsh
         run: |
@@ -172,5 +180,5 @@ jobs:
         run: |
           gh release create $env:GITHUB_REF_NAME 'KytyPS5-U59-Demons-Windows-x64.zip' `
             --repo $env:GITHUB_REPOSITORY `
-            --title "U59 integration: lower VRAM use, whole PGO profile in release builds (Windows x64, $env:GITHUB_REF_NAME)" `
-            --notes "New since u59-windows-20261002-int3: lower VRAM use, on in the bundled u59-preset.json. The shader recompiler emulates LDS in vertex and pixel shaders with a 32 KiB array per shader invocation, and the NVIDIA driver reserves memory for that array for every thread the GPU can keep resident (about 3.9 GiB on an RTX 3090) until the game exits. KYTY_FUNCTION_ARRAY_SHRINK shrinks these arrays to the elements a shader can reach before the driver sees it; KYTY_VRAM_GC_BUDGET collects textures and buffers against the VRAM budget while the game runs instead of thresholds fixed at startup. Measured on one PC (RTX 3090, Ryzen 9 7950X3D, 120 Hz vblank), Astro Bot Sky Garden start view, six alternating runs each: dedicated VRAM 9.4 GB with int3 and 6.3 GB with a local build of this source, peak since start 12.4 GB and 7.5 GB; 33.6 fps with int3 and 33.0 fps with the local build (within the spread between runs). Smaller cards were imitated by another process that holds 12 GiB or 16 GiB of the card's 24 GiB from boot: Astro Bot now reaches the Sky Garden and runs at 32-33 fps there, where int3's preset got stuck in the galaxy map. Tested on NVIDIA only; setting either flag to 0 in u59-preset.json turns it off. Release builds now get the whole PGO profile: they compile from the source path the profile was recorded at (C:\kyty-src) and with Visual Studio 2026, as the profile was; earlier GitHub builds missed it for every function in an anonymous namespace (2,499 of the 17,426 functions in int3's profile). This did not change the frame rate measurably. kyty_emulator is built with a new PGO profile recorded in Astro Bot with this source. Open launcher.exe directly; the existing shared Kyty.ini supplies game paths and display settings. The first launch can compile shaders again. See U59-README.md."
+            --title "U59 integration: lower VRAM use (Windows x64, $env:GITHUB_REF_NAME)" `
+            --notes "New since u59-windows-20261002-int3: lower VRAM use, on in the bundled u59-preset.json. The shader recompiler emulates LDS in vertex and pixel shaders with a 32 KiB array per shader invocation, and the NVIDIA driver reserves memory for that array for every thread the GPU can keep resident (about 3.9 GiB on an RTX 3090) until the game exits. KYTY_FUNCTION_ARRAY_SHRINK shrinks these arrays to the elements a shader can reach before the driver sees it; KYTY_VRAM_GC_BUDGET collects textures and buffers against the VRAM budget while the game runs instead of thresholds fixed at startup. Measured on one PC (RTX 3090, Ryzen 9 7950X3D, 120 Hz vblank), Astro Bot Sky Garden start view, six alternating runs each: dedicated VRAM 9.4 GB with int3 and 6.3 GB with a local build of this source, peak since start 12.4 GB and 7.5 GB; 33.6 fps with int3 and 33.0 fps with the local build (within the spread between runs). Smaller cards were imitated by another process that holds 12 GiB or 16 GiB of the card's 24 GiB from boot: Astro Bot now reaches the Sky Garden and runs at 32-33 fps there, where int3's preset got stuck in the galaxy map. Tested on NVIDIA only; setting either flag to 0 in u59-preset.json turns it off. Release builds now compile from the source path the PGO profile was recorded at (C:\kyty-src); earlier GitHub builds missed the profile for every function in an anonymous namespace (2,499 of the 17,426 functions in int3's profile). This did not change the frame rate measurably. kyty_emulator is built with a new PGO profile recorded in Astro Bot with this source. Open launcher.exe directly; the existing shared Kyty.ini supplies game paths and display settings. The first launch can compile shaders again. See U59-README.md."
