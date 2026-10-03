@@ -154,6 +154,34 @@ void ConcurrentPackets() {
 }
 } // namespace
 int main(int argc, char **argv) {
+  if (argc > 1 && std::string_view(argv[1]) == "--fatal-shutdown") {
+    const auto dir =
+        std::filesystem::temp_directory_path() /
+        ("kyty-watchdog-fatal-" +
+         std::to_string(
+             std::chrono::steady_clock::now().time_since_epoch().count()));
+    HangWatchdog::Initialize(dir.string());
+    HangWatchdog::Scope scope("test-fatal-operation", 0x12345678, 99);
+    HangWatchdog::NoteFatal("mock terminal failure", "renderer/master.cpp", 53);
+    HangWatchdog::Shutdown();
+    Check(std::filesystem::is_regular_file(dir / "watchdog.txt"),
+          "fatal shutdown saves a report before stopping the monitor");
+    std::ifstream file(dir / "watchdog.txt");
+    const std::string text((std::istreambuf_iterator<char>(file)), {});
+    Check(text.find("trigger=terminal-error") != std::string::npos &&
+              text.find("mock terminal failure") != std::string::npos &&
+              text.find("test-fatal-operation") != std::string::npos,
+          "fatal report is explicit and retains the failure and active scope");
+#ifdef _WIN32
+    Check(text.find("rip=0x") != std::string::npos,
+          "fatal shutdown also preserves native contexts");
+#endif
+    file.close();
+    std::filesystem::remove(dir / "watchdog.txt");
+    std::filesystem::remove(dir);
+    std::puts("HangWatchdogTests: fatal shutdown passed");
+    return 0;
+  }
   if (argc > 1 && std::string_view(argv[1]) == "--fire") {
     const auto dir =
         std::filesystem::temp_directory_path() /

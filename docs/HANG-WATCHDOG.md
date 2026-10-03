@@ -42,6 +42,11 @@ The report contains:
 - The first fatal report before emergency shutdown, if one occurred, so cleanup waits do not
   obscure the original failure when console output is unavailable.
 
+Fatal emergency shutdown also stops the profiler. Before it stops the monitor, an enabled
+watchdog saves the terminal error, active scopes and native contexts immediately if no report
+has fired. That file is marked `trigger=terminal-error`; a five-second stall report is marked
+`trigger=stopped-progress`. Neither trigger changes normal execution or recovers failed GPU work.
+
 Internal queue 0 is graphics. Internal compute queue `q` maps to guest queue `q + 31`.
 Common scope operands can be read as follows (generic scope values are printed in hexadecimal):
 

@@ -94,6 +94,8 @@ std::mutex                  g_sleep_mutex;
 std::condition_variable_any g_sleep;
 std::jthread                g_watchdog;
 std::string                 g_directory;
+std::atomic<bool>           g_terminal_requested {false};
+std::atomic<uint32_t>       g_report_reason {0};
 const auto                  g_start = std::chrono::steady_clock::now();
 
 uint64_t NowMs() {
@@ -168,6 +170,9 @@ std::string Snapshot() {
 	std::string out = fmt::format(
 	    "Kyty hang watchdog v1\nbuild={}\npid={} t_ms={} flips={} cp_submissions={} overflow={}\n",
 	    KYTY_BUILD_LABEL, Pid(), NowMs(), g_flips.load(), g_submissions.load(), g_overflow.load());
+	out += fmt::format("trigger={}\n", g_report_reason.load() == 2   ? "terminal-error"
+	                                   : g_report_reason.load() == 1 ? "stopped-progress"
+	                                                                 : "manual-snapshot");
 	out += "Scope operands: address/resource, expected, observed, mask, aux, start_ms. Values are "
 	       "last observations; no driver/guest reads are made here.\n";
 	const char*             kind = nullptr;
@@ -478,12 +483,16 @@ void Initialize(std::string_view trace_directory) {
 			try {
 				StallDetector    detector;
 				std::unique_lock lock(g_sleep_mutex);
-				while (!stop.stop_requested()) {
+				for (;;) {
+					const bool terminal = g_terminal_requested.exchange(false);
+					if (stop.stop_requested() && !terminal) return;
 					const auto now = NowMs();
 					g_time_ms.store(now, std::memory_order_relaxed);
-					if (!Enabled())
+					if (!Enabled() && !terminal)
 						detector = {};
-					else if (detector.Poll(now, g_flips.load(), g_submissions.load(), timeout)) {
+					else if (terminal ||
+					         detector.Poll(now, g_flips.load(), g_submissions.load(), timeout)) {
+						g_report_reason.store(terminal ? 2 : 1);
 						lock.unlock();
 						if (!WriteSnapshot(g_directory, true)) {
 							// An explicit unwritable trace path must not silently discard the
@@ -492,7 +501,8 @@ void Initialize(std::string_view trace_directory) {
 						}
 						return;
 					}
-					g_sleep.wait_for(lock, stop, std::chrono::seconds(1), [] { return false; });
+					g_sleep.wait_for(lock, stop, std::chrono::seconds(1),
+					                 [] { return g_terminal_requested.load(); });
 				}
 			} catch (...) {
 				// A monitor failure must not change guest execution or terminate the process.
@@ -504,6 +514,9 @@ void Initialize(std::string_view trace_directory) {
 }
 void Shutdown() {
 	if (g_watchdog.joinable()) {
+		// Fatal emergency shutdown calls Profiler::Shutdown too. Preserve its error and active
+		// scopes before stopping the monitor, even if there has not yet been a five-second stall.
+		if (g_fatal_claimed.test(std::memory_order_acquire)) g_terminal_requested.store(true);
 		g_watchdog.request_stop();
 		g_sleep.notify_all();
 		g_watchdog.join();
