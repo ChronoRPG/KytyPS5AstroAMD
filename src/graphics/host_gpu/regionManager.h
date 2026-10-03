@@ -236,8 +236,11 @@ public:
 		bool copy_outside_lock = false;
 	};
 	struct FaultResult {
-		uint64_t ahead_pages = 0;
-		uint32_t promoted    = 0;
+		uint64_t ahead_pages   = 0;
+		uint32_t promoted      = 0;
+		// A faulting page was CPU-dirty already: another thread's fault (or fault-ahead) made it
+		// so and its host unprotect had not landed yet, or another watcher (an image) protects it.
+		bool     already_dirty = false;
 	};
 	template <typename AheadFunc>
 	FaultResult MarkWriteFault(uint64_t vaddr, uint64_t size, const FaultPolicy& policy,
@@ -254,6 +257,7 @@ public:
 		// Only pages this tracker protected fault through it; already CPU-dirty pages fault for
 		// another watcher (an image) and are not part of a fault/reprotect cycle.
 		const RegionBits already_dirty(m_cpu_dirty, start, end);
+		result.already_dirty = already_dirty.Any();
 		m_cpu_dirty.SetRange(start, end);
 		// The pages whose CPU-dirty bits may change: the faulting ones and the fault-ahead window.
 		size_t changed_begin = start;

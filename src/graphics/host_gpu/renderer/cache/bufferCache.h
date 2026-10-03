@@ -719,6 +719,8 @@ private:
 		uint64_t verify_mismatch_pages = 0;
 	};
 	BdaLogTotals                                      m_bda_log_totals;
+	// Upload bytes of the last dirty-log pass (FaultCost::NoteBdaPass, the live cost log).
+	uint64_t                                          m_bda_last_pass_bytes = 0;
 	// KYTY_BDA_SYNC_EPOCH (SynchronizeBdaBuffers): the sync, BDA structure and fault epochs taken
 	// before the last completed pass (GPU thread; 0: none yet), and the outcomes (tests read them).
 	bool     m_bda_epoch_skip        = false;

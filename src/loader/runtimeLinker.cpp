@@ -13,6 +13,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -760,11 +761,38 @@ static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo
 		HangTrace::SetReadbackKind(access == GpuAccess::Write ? HangTrace::ReadbackKind::FaultWrite
 		                                                      : HangTrace::ReadbackKind::FaultRead);
 	}
+	if (Libs::Graphics::FaultCost::MapEnabled()) {
+		Libs::Graphics::FaultCost::SetFaultInstruction(info->exception_address);
+	}
 	const bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
 	if (HangTrace::Enabled()) {
 		HangTrace::ClearFaultContext();
 	}
 	return handled;
+}
+
+// The live log's line for the AMD CPU patch (FaultCost::SetPeriodicReporter): VRSQRTPS traps per
+// frame; each costs about one guest fault round trip of the startup benchmark (the exception
+// dispatch; the emulation itself ~0.07 us, timed with KYTY_AMD_CPU_TIMING=1).
+static void ReportReciprocalSqrtTraps(double seconds, uint64_t frames) {
+	static Loader::X64InstructionEmulator::ReciprocalSqrtStats previous {};
+	const auto current = Loader::X64InstructionEmulator::GetReciprocalSqrtStats();
+	const auto traps   = current.traps - previous.traps;
+	const auto ns      = current.emulate_ns - previous.emulate_ns;
+	previous           = current;
+	const auto& bench  = Libs::Graphics::FaultCost::StartupBenchmark();
+	const auto  rate   = seconds > 0 ? static_cast<double>(traps) / seconds : 0.0;
+	std::printf("Kyty AMD CPU patch: last %.0f s: %.1f VRSQRTPS traps/frame (%.0f/s)", seconds,
+	            frames != 0 ? static_cast<double>(traps) / static_cast<double>(frames) : 0.0, rate);
+	if (bench.valid) {
+		std::printf(", ~%.1f CPU cores busy trapping (%.2f us per trap round trip)",
+		            rate * (bench.fault_us - bench.fault_handler_us) / 1e6,
+		            bench.fault_us - bench.fault_handler_us);
+	}
+	if (ns != 0 && traps != 0) {
+		std::printf(", %.2f us emulation each", static_cast<double>(ns) / static_cast<double>(traps) / 1e3);
+	}
+	std::printf("\n");
 }
 
 // KYTY_VEH_FIRST=0 leaves guest tracking faults to the last-registered handler only, so every
@@ -2097,6 +2125,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		if (reciprocal_sqrt_count != 0) {
 			LOGF("Guest VRSQRTPS emulation: %s, instructions=%" PRIu64 "\n",
 			     Common::PathToString(program->file_name.filename()).c_str(), reciprocal_sqrt_count);
+			std::printf("Kyty AMD CPU patch: %s: %" PRIu64 " VRSQRTPS instructions emulated (each run traps)\n",
+			            Common::PathToString(program->file_name.filename()).c_str(), reciprocal_sqrt_count);
+			std::fflush(stdout);
+			Libs::Graphics::FaultCost::SetPeriodicReporter(ReportReciprocalSqrtTraps);
 		}
 	}
 
