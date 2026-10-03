@@ -1,12 +1,11 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
-#include "graphics/host_gpu/renderer/cache/uploadDma.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/hangTrace.h"
+#include "common/hangWatchdog.h"
 #include "common/liveSwitch.h"
 #include "common/logging/log.h"
-#include "common/liveSwitch.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -15,16 +14,18 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/cache/uploadDma.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vramBudget.h"
 #include "graphics/host_gpu/vramStats.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/watchdogSubmit.h"
 #include "kernel/memory.h"
-#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
 #include <algorithm>
 #include <array>
@@ -48,6 +49,7 @@ namespace Libs::Graphics {
 namespace {
 
 Live::Switch g_cpu_copy_page_skip("KYTY_CPU_COPY_PAGE_SKIP", Live::ParseDefaultOff);
+Live::Switch g_shader_write_retick("KYTY_SHADER_WRITE_RETICK", Live::ParseDefaultOff);
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
@@ -512,6 +514,9 @@ struct BufferCache::SideReadbackState {
 	KYTY_CLASS_NO_COPY(SideReadbackState);
 
 	void Wait(uint64_t target) const {
+		HangWatchdog::Scope wait("side-readback-gpu",
+		                         reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(semaphore)),
+		                         target);
 		uint64_t current = 0;
 		RequireVulkanSuccess(graphics.device.getSemaphoreCounterValue(semaphore, &current),
 		                     "query side-readback semaphore");
@@ -596,6 +601,8 @@ struct BufferCache::SparsePageTable {
 	// One submission to the side queue (queue 0 without one), waited for on the host.
 	template <typename Submit>
 	void SubmitAndWait(Submit&& submit, const char* operation) {
+		HangWatchdog::Scope wait("sparse-page-table",
+		                         reinterpret_cast<uint64_t>(static_cast<VkFence>(fence)));
 		vk::Result result {};
 		if (graphics.side_queue != nullptr) {
 			Common::LockGuard lock(graphics.side_queue_mutex);
@@ -1345,6 +1352,7 @@ void BufferCache::CollectHotPages(Buffer& buffer, std::span<const GuestRange> ho
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	HangWatchdog::Scope       read("buffer-readback", vaddr, size, 0, 0, is_write);
 	Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::ReadMemory);
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -1504,6 +1512,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
                                   ReadMemoryTrace& trace) {
 	EXIT_IF(!GuestGpu::IsGpuThread());
+	HangWatchdog::Scope drain("buffer-readback-drain", vaddr, size, 0, 0, is_write);
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return;
 	}
@@ -1807,6 +1816,11 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 			m_graphics.submission_queue.DrainPendingLocked();
 		}
 		Common::LockGuard lock(m_graphics.side_queue_mutex);
+		HangWatchdog::Scope native(
+		    "vkQueueSubmit-side-readback",
+		    reinterpret_cast<uint64_t>(static_cast<VkQueue>(m_graphics.side_queue)), value,
+		    producer);
+		NoteWatchdogSubmit(m_graphics.side_queue, submit);
 		submit_result = m_graphics.side_queue.submit(1, &submit, nullptr);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ReadbackSideQueueCopies);
 	} else {
@@ -1815,6 +1829,10 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 		// copy waits on it. The current recording follows this copy in submission order.
 		Common::LockGuard lock(m_graphics.queue_mutex);
 		m_graphics.submission_queue.DrainPendingLocked();
+		HangWatchdog::Scope native(
+		    "vkQueueSubmit-shared-readback",
+		    reinterpret_cast<uint64_t>(static_cast<VkQueue>(m_graphics.queue)), value, producer);
+		NoteWatchdogSubmit(m_graphics.queue, submit);
 		submit_result = m_graphics.queue.submit(1, &submit, nullptr);
 	}
 	RequireVulkanSuccess(submit_result, "submit side readback");
@@ -1831,6 +1849,9 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 }
 
 bool BufferCache::CompleteSideReadback(SideReadback& readback) {
+	HangWatchdog::Scope wait("readback-publication", readback.begin, readback.value, readback.end,
+	                         0, readback.eager);
+	HangWatchdog::DebugDelay("readback", readback.begin);
 	std::scoped_lock lock(readback.mutex);
 	if (readback.done.load(std::memory_order_acquire)) {
 		return false;
@@ -1966,6 +1987,16 @@ void BufferCache::NoteBufferContentWrite(uint64_t vaddr, uint64_t size) {
 		// A page the command processor reads back: submit this recording once the writer is
 		// recorded, so the read after it finds a submitted (ideally finished) producer.
 		m_eager_flush = true;
+	}
+}
+
+bool BufferCache::ShaderWriteRetickEnabled() {
+	return g_shader_write_retick.On();
+}
+
+void BufferCache::RetagShaderWrite(uint64_t vaddr, uint64_t size, uint64_t preparation_tick) {
+	if (vaddr != 0 && size != 0 && preparation_tick != m_scheduler.CurrentTick()) {
+		NoteBufferContentWrite(vaddr, size);
 	}
 }
 
@@ -2121,6 +2152,9 @@ EagerReadbackPages::IssueResult BufferCache::TryIssueEagerReadback(uint64_t page
 		side.pending.push_back(readback);
 		side.pending_count.store(side.pending.size(), std::memory_order_release);
 	}
+	// Diagnostic only: allow a guest reader to acquire this publication before the CP flushes
+	// its producer tick, opening the issue-to-submit race window without changing ordering.
+	HangWatchdog::DebugDelay("eager-issue", page);
 	// Queued for this recording's tick: the completion runner publishes it once the recording
 	// has finished, unless a reader (guest fault, CP read) completed it first.
 	m_scheduler.DeferPriorityOperation(

@@ -7474,6 +7474,96 @@ public:
     CheckEagerReadbackDisabled();
   }
 
+  void CheckLateStorageWrite(bool control = false) {
+    constexpr const char *name = "LateStorageWrite";
+    constexpr uintptr_t base = 0x0000000200d00000ull;
+    constexpr uint64_t size = 0x10000, offset = 0x1dd0;
+    constexpr uint32_t before = 0x11111111u, produced = 0x22222222u;
+    EnsureRuntimeContext();
+    const auto context_owner = MakeRenderContext();
+    auto &context = *context_owner;
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct = -1;
+    Require(name, "allocate", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size,
+                0x10000, 0, &direct) == 0, "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, size, 0x3, 0x10, direct, 0x10000) == 0,
+            "mapping failed");
+    std::memset(mapped, 0, size);
+    context.MapMemory(base, size);
+    auto &cache = context.GetBufferCache();
+    uint64_t marked_tick = 0, producer_tick = 0;
+    PipelineCache::Pipeline descriptor_pipeline{};
+    OnGpuThread(context, [&] {
+      cache.FillBuffer(base + offset, 4, before, false);
+      scheduler.Finish();
+      // Storage descriptors mark their writes during RebindBuffers, before table uploads
+      // and before recording the dispatch. A later upload ring wrap can submit that tick.
+      const auto allocation = cache.ObtainBuffer(base + offset, 4, true, false);
+      marked_tick = scheduler.CurrentTick();
+      scheduler.Flush();
+      producer_tick = scheduler.CurrentTick();
+      ShaderRecompiler::IR::CompiledShaderInfo program{};
+      program.stage = ShaderType::Compute;
+      program.info.buffers.resize(1);
+      program.info.buffers[0].written = true;
+      ShaderRecompiler::IR::ResourceSnapshot snapshot{};
+      ShaderStageRuntime runtime{&program, &snapshot};
+      PreparedBindings bindings{};
+      bindings.runtime = &runtime;
+      bindings.buffer_sources.push_back({base + offset, 4, {}});
+      bindings.write_preparation_tick = marked_tick;
+      // Exercise the product emission point rather than updating the cache from the test.
+      descriptor_pipeline = RenderExecutorTestAccess::CommitBindings(
+          context.GetRenderExecutor(), scheduler.Current(), bindings);
+      // As a native shader dispatch does, this command writes the bound buffer without
+      // going back through ObtainBuffer to update its earlier preparation-time marker.
+      scheduler.Current().Sink().fillBuffer(allocation.first->Handle(),
+                                            allocation.second, 4, produced);
+      // Consume indirect/control data in the same CP service slice, before its idle flush
+      // can submit the producer. This makes the ordering window deterministic.
+      cache.ReadMemory(base + offset, 4);
+    });
+    Require(name, "late flush", producer_tick > marked_tick,
+            "the fixture did not move the producing command to a later tick");
+    uint32_t observed = 0;
+    Require(name, "backing read", Libs::LibKernel::Memory::TryReadBacking(
+                base + offset, &observed, 4), "backing unavailable");
+    std::printf("[gpu] LateStorageWrite marked=%" PRIu64 " producer=%" PRIu64
+                " observed=0x%08x expected=0x%08x\n", marked_tick, producer_tick,
+                observed, control ? before : produced);
+    std::fflush(stdout);
+    Require(name, "latest producer", observed == (control ? before : produced),
+            "readback returned data from before the unsubmitted producing command");
+    OnGpuThread(context, [&] { scheduler.Finish(); });
+    Require(name, "producer completed",
+            scheduler.GetMasterSemaphore().KnownGpuTick() >= producer_tick,
+            "the actual GPU producer did not complete");
+    uint32_t completed_value = 0;
+    Require(name, "completed backing read", Libs::LibKernel::Memory::TryReadBacking(
+                base + offset, &completed_value, 4), "backing unavailable");
+    Require(name, "persistent publication",
+            completed_value == (control ? before : produced),
+            "unexpected backing contents after GPU completion");
+    std::printf("[gpu] LateStorageWrite GPU complete; backing still=0x%08x\n",
+                completed_value);
+    RenderExecutorTestAccess::DestroyDescriptorPipelines(
+        context.GetRenderExecutor(), std::span(&descriptor_pipeline, 1));
+    context.UnmapMemory(base, size);
+    context.ShutdownGpu();
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct, size) == 0, "release failed");
+  }
+
   struct EagerReadbackFixture {
     static constexpr uintptr_t base = 0x0000000200700000ull;
     static constexpr uint64_t allocation_size = 0x400000;
@@ -49655,6 +49745,16 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--readback-eager-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckEagerReadback();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--late-storage-write-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckLateStorageWrite();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--late-storage-write-control") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckLateStorageWrite(true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mesh-indirect-only") == 0) {

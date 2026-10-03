@@ -5,6 +5,7 @@
 #include "common/cpuPlacement.h"
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
+#include "common/hangWatchdog.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
@@ -30,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1080,6 +1082,7 @@ void PthreadInitSelfForMainThread() {
 	UpdateCurrentThreadStackAttr(&g_pthread_self->attr);
 	g_pthread_self->p               = pthread_self();
 	g_pthread_self->name            = "MainThread";
+	HangWatchdog::SetGuestThread(reinterpret_cast<uint64_t>(g_pthread_self), "MainThread");
 	g_pthread_self->guest.thread_id = ++g_pthread_thread_id;
 	g_pthread_self->unique_id       = Common::Thread::GetThreadIdUnique();
 	g_pthread_self->free            = false;
@@ -1339,8 +1342,13 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		return EDEADLK;
 	}
 
+	std::optional<HangWatchdog::Scope> blocked;
+	if (mutex->owner != nullptr)
+		blocked.emplace("guest-mutex", reinterpret_cast<uint64_t>(mutex),
+		                reinterpret_cast<uint64_t>(self), reinterpret_cast<uint64_t>(mutex->owner));
 	if (timeout_us == nullptr) {
 		while (mutex->owner != nullptr) {
+			if (blocked) blocked->Observed(reinterpret_cast<uint64_t>(mutex->owner));
 			mutex->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
 			if (mutex->owner != nullptr) {
 				lock.unlock();
@@ -2461,6 +2469,10 @@ static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUsecond
 				}
 			}
 
+			HangWatchdog::Scope wait(write ? "guest-rwlock-write" : "guest-rwlock-read",
+			                         reinterpret_cast<uint64_t>(rwlock), write,
+			                         reinterpret_cast<uint64_t>(rwlock->writer), 0,
+			                         rwlock->reader_count);
 			if (has_timeout) {
 				const auto now = std::chrono::steady_clock::now();
 				if (*timeout_us == 0 || now >= deadline) {
@@ -2935,6 +2947,8 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 		return KERNEL_ERROR_EPERM;
 	}
 
+	HangWatchdog::Scope wait("guest-condition", reinterpret_cast<uint64_t>(cond_value),
+	                         reinterpret_cast<uint64_t>(mutex_value));
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -3024,6 +3038,8 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 		return KERNEL_ERROR_EPERM;
 	}
 
+	HangWatchdog::Scope wait("guest-condition", reinterpret_cast<uint64_t>(cond_value),
+	                         reinterpret_cast<uint64_t>(mutex_value));
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -3100,6 +3116,8 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		return KERNEL_ERROR_EPERM;
 	}
 
+	HangWatchdog::Scope wait("guest-condition", reinterpret_cast<uint64_t>(cond_value),
+	                         reinterpret_cast<uint64_t>(mutex_value));
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -3150,6 +3168,7 @@ Pthread PthreadSelfOrNull() {
 Pthread PthreadSwapSelfForSignal(Pthread thread) {
 	auto* previous = g_pthread_self;
 	g_pthread_self = thread;
+	HangWatchdog::SetGuestThread(reinterpret_cast<uint64_t>(thread), {});
 	return previous;
 }
 
@@ -3285,6 +3304,7 @@ static void* RunThread(void* arg) {
 	thread->unique_id = Common::Thread::GetThreadIdUnique();
 
 	g_pthread_self = thread;
+	HangWatchdog::SetGuestThread(reinterpret_cast<uint64_t>(thread), thread->name);
 
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -3418,6 +3438,8 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	HangWatchdog::Scope wait("guest-thread-join", reinterpret_cast<uint64_t>(thread),
+	                         thread->host_thread_id);
 	int result = pthread_join(thread->p, value);
 
 	if (PRINT_NAME_ENABLED) {

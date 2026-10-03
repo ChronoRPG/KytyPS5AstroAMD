@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/commandStream.h"
 
+#include "common/hangWatchdog.h"
+
 #include <chrono>
 #include <cinttypes>
 #include <new>
@@ -641,6 +643,8 @@ bool Ring::EnsureSpace(uint64_t bytes, const WaitPolicy& policy, WaitStats& stat
 		return false;
 	}
 	// The consumer may be parked on packets published without a wake.
+	HangWatchdog::Scope wait("recorder-ring-space", reinterpret_cast<uint64_t>(this),
+	                         m_write + bytes, m_consumed_cache, 0, m_capacity);
 	Kick(stats);
 	const auto start = NowNs();
 	stats.spins++;
@@ -702,6 +706,8 @@ void Ring::WaitConsumed(uint64_t position, const WaitPolicy& policy, WaitStats& 
 	if (done()) {
 		return;
 	}
+	HangWatchdog::Scope wait("recorder-ring-consumed", reinterpret_cast<uint64_t>(this), position,
+	                         m_consumed_cache);
 	Kick(stats);
 	const auto start = NowNs();
 	stats.spins++;
@@ -739,6 +745,8 @@ bool Ring::WaitPublished(const std::atomic<bool>& stop, const WaitPolicy& policy
 	if (available()) {
 		return true;
 	}
+	HangWatchdog::Scope wait("recorder-ring-published", reinterpret_cast<uint64_t>(this), m_read,
+	                         m_published_cache);
 	const auto start = NowNs();
 	stats.spins++;
 	const bool spun =

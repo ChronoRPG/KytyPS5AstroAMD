@@ -625,6 +625,13 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(hang_watchdog_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/HangWatchdogTests.cpp")
+target_link_libraries(hang_watchdog_tests common)
+target_include_directories(hang_watchdog_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(hang_watchdog_tests Threads::Threads)
+endif()
+
 # Per-thread profiler counters (common/profiler.h); also prints a timing of the counting paths.
 add_executable(profiler_counter_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ProfilerCounterTests.cpp"
@@ -978,6 +985,10 @@ if(BUILD_TESTING)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME hang_watchdog COMMAND $<TARGET_FILE:hang_watchdog_tests>)
+	add_test(NAME hang_watchdog_fire COMMAND $<TARGET_FILE:hang_watchdog_tests> --fire)
+	add_test(NAME hang_watchdog_fatal_shutdown COMMAND $<TARGET_FILE:hang_watchdog_tests> --fatal-shutdown)
+	set_tests_properties(hang_watchdog_fire hang_watchdog_fatal_shutdown PROPERTIES TIMEOUT 15)
 	add_test(NAME profiler_counters COMMAND $<TARGET_FILE:profiler_counter_tests>)
 	add_test(NAME cpu_placement COMMAND $<TARGET_FILE:cpu_placement_tests>)
 	add_test(NAME cpu_placement_recorder COMMAND $<TARGET_FILE:cpu_placement_tests> --mode cp+recorder)
@@ -1716,6 +1727,29 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_BACKING_INPLACE=0")
 	add_test(NAME buffer_cache_eager_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --readback-eager-only)
+	# A storage descriptor is prepared on tick N, an upload submits N, and its producer is
+	# recorded on N+1. The control deliberately observes the old value; the fix must observe
+	# the producer. Turning off side readback also removes the stale-value race.
+	foreach(mode IN ITEMS fixed control queued_fixed queued_control no_side no_gpu_side)
+		set(write_mode --late-storage-write-only)
+		set(write_env KYTY_SHADER_WRITE_RETICK=1 KYTY_READBACK_SIDE_GPU_THREAD=1)
+		if(mode MATCHES "control")
+			set(write_mode --late-storage-write-control)
+			set(write_env KYTY_SHADER_WRITE_RETICK=0 KYTY_READBACK_SIDE_GPU_THREAD=1)
+		elseif(mode STREQUAL "no_side")
+			set(write_env KYTY_SHADER_WRITE_RETICK=0 KYTY_READBACK_SIDE_COPY=0)
+		elseif(mode STREQUAL "no_gpu_side")
+			set(write_env KYTY_SHADER_WRITE_RETICK=0 KYTY_READBACK_SIDE_GPU_THREAD=0)
+		endif()
+		if(mode MATCHES "^queued_")
+			list(APPEND write_env KYTY_CP_RECORDER=1 KYTY_CP_RECORDER_VERIFY=1
+				KYTY_RECORDER_DESCRIPTOR_SETS=1 KYTY_SUBMISSION_MODE=queued)
+		endif()
+		add_test(NAME buffer_cache_late_storage_${mode}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> ${write_mode})
+		set_tests_properties(buffer_cache_late_storage_${mode} PROPERTIES
+			ENVIRONMENT "${write_env}")
+	endforeach()
 	# KYTY_ALIAS_BYTES: byte ownership across partially overlapping writes (default), with image
 	# writebacks on, and off (whole-image ownership: the checks' failures are only reported).
 	add_test(NAME texture_cache_alias_bytes
@@ -1896,6 +1930,7 @@ if(BUILD_TESTING)
 		"Tests: failed: ;Tests: [^\n]* failed at ;Tests: [^\n]* failed: ;FAILED: ;test failed: ;SaveDataMemoryTests:[0-9]+: ")
 
 	add_custom_target(kyty_tests DEPENDS
+		hang_watchdog_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
