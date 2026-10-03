@@ -45,10 +45,14 @@ struct Thread {
 	std::array<Record, MaxDepth>      scopes;
 };
 struct Queue {
+	struct Packet {
+		std::atomic_flag writing = ATOMIC_FLAG_INIT;
+		Record           record;
+	};
 	Record                      state, wait;
-	std::array<Record, History> packets;
-	// Single CP writer; never read by the watchdog.
-	uint64_t next_packet = 0;
+	std::array<Packet, History> packets;
+	// Queue 0 has concurrent parser and resolver publishers when the sequencer is enabled.
+	std::atomic<uint64_t> next_packet {0};
 };
 struct Event {
 	bool   used = false; // publisher mutex only; tombstones keep probing chains intact
@@ -211,7 +215,7 @@ std::string Snapshot() {
 		std::array<Packet, History> packets {};
 		size_t                      count = 0;
 		for (const auto& p: g_queues[q].packets)
-			if (Read(p, kind, a)) packets[count++] = {kind, a};
+			if (Read(p.record, kind, a)) packets[count++] = {kind, a};
 		std::sort(packets.begin(), packets.begin() + count,
 		          [](const Packet& x, const Packet& y) { return x.a[7] < y.a[7]; });
 		for (size_t i = 0; i < count; ++i) {
@@ -581,8 +585,18 @@ void NotePacket(uint32_t queue, uint64_t submission, uint64_t address, uint32_t 
                 uint64_t b, uint64_t c, uint64_t d, const char* kind) {
 	if (!Enabled() || queue >= MaxQueues) return;
 	auto&      q  = g_queues[queue];
-	const auto id = ++q.next_packet;
-	Store(q.packets[id % History], kind, {submission, address, opcode, a, b, c, d, id});
+	const auto id = q.next_packet.fetch_add(1, std::memory_order_relaxed) + 1;
+	auto&      p  = q.packets[id % History];
+	if (p.writing.test_and_set(std::memory_order_acquire)) {
+		++g_overflow;
+		return; // A preempted diagnostic publisher must never park either CP thread.
+	}
+	if (p.record.args[7].load(std::memory_order_relaxed) >= id) {
+		++g_overflow; // An older publisher resumed after this slot was already replaced.
+	} else {
+		Store(p.record, kind, {submission, address, opcode, a, b, c, d, id});
+	}
+	p.writing.clear(std::memory_order_release);
 }
 void NoteNativeSubmit(uint64_t queue, uint64_t tick, uint64_t command,
                       std::span<const SemaphoreValue> waits,

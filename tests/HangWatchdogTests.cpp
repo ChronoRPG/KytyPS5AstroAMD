@@ -114,6 +114,44 @@ void PublicationStress() {
   }
   writer.join();
 }
+void ConcurrentPackets() {
+  std::atomic<unsigned> finished{0};
+  std::atomic<bool> start{false};
+  auto publish = [&](uint64_t worker) {
+    start.wait(false);
+    for (uint64_t n = 1; n <= 50000; ++n) {
+      const auto marker = (worker << 48) | n;
+      HangWatchdog::NotePacket(0, marker, marker, 0x3c, marker, marker, marker,
+                               marker, "concurrent-packet");
+    }
+    finished.fetch_add(1);
+  };
+  std::thread parser(publish, 1), resolver(publish, 2);
+  unsigned checked = 0;
+  start.store(true);
+  start.notify_all();
+  do {
+    const auto text = HangWatchdog::SnapshotForTest();
+    size_t pos = 0;
+    while ((pos = text.find("type=concurrent-packet ", pos)) !=
+           std::string::npos) {
+      unsigned long long submission, address, opcode, a, b, c, d;
+      Check(std::sscanf(text.c_str() + pos,
+                        "type=concurrent-packet submission=%llu address=0x%llx "
+                        "opcode=0x%llx args=0x%llx,0x%llx,0x%llx,0x%llx",
+                        &submission, &address, &opcode, &a, &b, &c, &d) == 7,
+            "concurrent packets parse");
+      Check(submission == address && address == a && a == b && b == c &&
+                c == d && opcode == 0x3c,
+            "parser and resolver cannot mix a packet publication");
+      ++checked;
+      ++pos;
+    }
+  } while (finished.load() != 2);
+  parser.join();
+  resolver.join();
+  Check(checked != 0, "concurrent packet snapshots exercised");
+}
 } // namespace
 int main(int argc, char **argv) {
   if (argc > 1 && std::string_view(argv[1]) == "--fire") {
@@ -164,11 +202,12 @@ int main(int argc, char **argv) {
   Decisions();
   ConcurrentSnapshot();
   PublicationStress();
+  ConcurrentPackets();
   HangWatchdog::NoteFatal("first mock fatal", "source/renderer.cpp", 53);
   HangWatchdog::NoteFatal("later cleanup failure", "source/cleanup.cpp", 99);
   const auto fatal = HangWatchdog::SnapshotForTest();
   Check(fatal.find("file='renderer.cpp' line=53 message='first mock fatal'") !=
-            std::string::npos &&
+                std::string::npos &&
             fatal.find("later cleanup failure") == std::string::npos,
         "original failure survives later teardown errors");
   const auto dir =

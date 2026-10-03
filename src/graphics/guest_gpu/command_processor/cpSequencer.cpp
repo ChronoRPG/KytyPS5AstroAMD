@@ -139,7 +139,7 @@ void Sequencer::NoteHandoffDone(uint64_t submission) {
 
 bool Sequencer::WaitSlow(const ReadyRef& ready, uint64_t wake_at, uint64_t rewake_at) {
 	Profiler::ScopedFrameWait frame_wait(Profiler::FrameWait::CpSeqSequencerWait);
-	auto start = NowNs();
+	auto                      start = NowNs();
 	for (uint32_t spins = 0;; spins++) {
 		if (ready()) {
 			return true;
@@ -200,7 +200,7 @@ void Sequencer::Run() {
 	for (;;) {
 		Intake intake;
 		{
-			std::unique_lock lock(m_intake_mutex);
+			std::unique_lock    lock(m_intake_mutex);
 			HangWatchdog::Scope wait("sequencer-intake", reinterpret_cast<uint64_t>(this));
 			m_intake_ready.wait(lock, [this] { return m_stop || !m_intake.empty(); });
 			if (m_intake.empty()) {
@@ -209,7 +209,10 @@ void Sequencer::Run() {
 			intake = m_intake.front();
 			m_intake.pop_front();
 		}
-		if (!m_processor.SequenceSubmission(intake)) {
+		HangWatchdog::SetCpContext(0, intake.sequence);
+		const bool running = m_processor.SequenceSubmission(intake);
+		HangWatchdog::SetCpContext(UINT32_MAX, 0);
+		if (!running) {
 			return; // stopping
 		}
 	}

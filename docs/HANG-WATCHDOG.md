@@ -78,6 +78,10 @@ loss. Snapshots are observations made across threads, not a simultaneous global 
 stacks can stop at generated/guest frames without unwind metadata. A report narrows the blocked
 call; it cannot by itself prove a GPU shader or driver defect.
 
+The graphics parser and resolver can publish packets concurrently. Packet slots have nonblocking
+writer guards; a collision or a publisher overtaken after preemption increments `overflow`
+instead of waiting or overwriting a newer packet. Their shared history carries monotonic IDs.
+
 `KYTY_HANG_WATCHDOG=0` disables monitoring and metadata publication. It is a live switch for
 same-process A/B; a process started disabled needs `KYTY_LIVE_FILE` to allow later activation.
 `KYTY_HANG_WATCHDOG_MS` changes the startup threshold (1,000–600,000 ms; default 5,000).
