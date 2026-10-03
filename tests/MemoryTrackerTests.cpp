@@ -1316,6 +1316,15 @@ void TestSlowLevelTracker() {
   SlowLevelTracker slow_faults;
   slow_faults.Seed(0.5, 12.0);
   Check(slow_faults.Level() == 1, "a slow fault round trip did not seed level 1");
+  SlowLevelTracker linux_mprotect;
+  linux_mprotect.Seed(1.2, 4.0); // WSL2's uncontended numbers
+  linux_mprotect.Raise(2);
+  for (int i = 0; i < 2 * SlowLevelTracker::PeriodsNeeded; i++) {
+    linux_mprotect.Update(6.0);
+  }
+  Check(linux_mprotect.Level() == 2, "the Linux mprotect floor did not hold");
+  linux_mprotect.Raise(7);
+  Check(linux_mprotect.Level() == 2, "a raise went past level 2");
 }
 
 // KYTY_FAULT_AHEAD_ADAPT (BufferCache): a larger fault-ahead window for write faults (only larger

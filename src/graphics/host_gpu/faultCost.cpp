@@ -892,9 +892,17 @@ void RunStartupBenchmark() {
 		            b.fault_us, b.fault_handler_us, call, call, b.protect_call_us, b.protect_page_us,
 		            b.unprotect_call_us, b.unprotect_page_us, b.clock_ns, frame_ms, spent);
 		g_slow_tracker.Seed(b.protect_call_us, b.fault_us);
+		const char* why = "startup benchmark";
+#if defined(__linux__)
+		if (!Common::UffdWriteWatch::Enabled()) {
+			// mprotect convoys on the mmap lock (SlowLevel in faultCost.h).
+			g_slow_tracker.Raise(2);
+			why = "Linux mprotect tracking";
+		}
+#endif
 		if (g_slow_tracker.Level() != 0) {
 			g_slow_level.store(g_slow_tracker.Level(), std::memory_order_relaxed);
-			std::printf("Kyty fault cost: write tracking is slow on this PC (startup benchmark): level %d\n",
+			std::printf("Kyty fault cost: write tracking is slow on this PC (%s): level %d\n", why,
 			            g_slow_tracker.Level());
 		}
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS

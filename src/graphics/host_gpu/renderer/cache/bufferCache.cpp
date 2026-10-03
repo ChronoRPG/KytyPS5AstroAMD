@@ -68,7 +68,8 @@ Live::Switch g_binding_hot_memo("KYTY_CP_BINDING_HOT_MEMO", Live::ParseDefaultOf
 // KYTY_FAULT_AHEAD_ADAPT (live): the fault-ahead window of write faults
 // (MemoryTracker::SetFaultAheadOverride, applied at every guest flip).
 //   auto   (default) 256 KiB, 512 KiB or 1 MiB by FaultCost::SlowLevel() 0 / 1 / 2: how slow
-//          protection changes are on this PC (measured, only ever rising)
+//          protection changes are on this PC (measured, only ever rising; Linux with mprotect
+//          tracking: 1 MiB from the start)
 //   <KiB>  a power of two, 8..4096
 //   0      KYTY_FAULT_AHEAD_KB alone (32 KiB), as before
 // At the Sky Garden the guest's job threads fill ~16 MB of triple-buffered data per frame. With
