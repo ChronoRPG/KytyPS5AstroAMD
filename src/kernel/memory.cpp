@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/hangTrace.h"
 #include "common/logging/log.h"
+#include "common/platform/uffdWriteWatch.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
 #include "common/stringUtils.h"
@@ -21,6 +22,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <bitset>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdio>
@@ -30,6 +32,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
