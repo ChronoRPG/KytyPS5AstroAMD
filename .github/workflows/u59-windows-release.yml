@@ -87,7 +87,7 @@ jobs:
         shell: cmd
         run: |
           set LLVM=C:/LLVM-22.1.3/bin
-          set PGO_PROFILE=C:/kyty-src/tools/pgo/u59-int5-sg-1.profdata
+          set PGO_PROFILE=C:/kyty-src/tools/pgo/u59-int6-sg-1.profdata
           cmake -S C:\kyty-src -B _Build/windows ^
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
@@ -140,10 +140,9 @@ jobs:
         shell: pwsh
         run: |
           # Functions with mismatched or missing profile data are optimized without it (not an error). A local
-          # build of u59-int5-sg-1's commit from C:\kyty-src (VS 18.10, LLVM 22.1.3) reports 0 mismatched and
-          # 47 without data, all in the launcher's Qt moc file; a build from another path, about 2,550 more. The
-          # swapchain fixes added after the profile (upstream PR #1001) add 9 mismatched and 3 without data, all in
-          # window.cpp and swapchain.cpp.
+          # build of the int6 profile's commit from C:\kyty-src (LLVM 22.1.3) is expected to match the
+          # hot renderer functions. The profile was retrained after merging the storage-write retick
+          # and watchdog code. Check the actual mismatch and missing-data counts below.
           $log = Get-Content -LiteralPath 'pgo-build.log'
           $sum = { param($pattern) ($log | Select-String -Pattern $pattern | ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Measure-Object -Sum).Sum }
           $mismatched = & $sum 'profile data may be out of date: of \d+ functions?, (\d+)'
