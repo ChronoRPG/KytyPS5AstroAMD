@@ -18,16 +18,23 @@ def read_symbols(path):
         raise ValueError("map has no preferred load address")
     preferred = int(base.group(1), 16)
     symbols = {}
-    # The f marker distinguishes function symbols from adjacent data symbols.
-    pattern = re.compile(r"^\s*[0-9a-fA-F]{4}:[0-9a-fA-F]+\s+(\S+)\s+([0-9a-fA-F]+)\s+f(?:\s|$)")
+    # lld's MSVC-compatible map omits the f marker. Its CODE section inventory
+    # still excludes data/absolute symbols; MSVC maps have the same inventory.
+    code_sections = {
+        int(match.group(1), 16)
+        for match in re.finditer(
+            r"^\s*([0-9a-fA-F]{4}):[0-9a-fA-F]+\s+[0-9a-fA-F]+H\s+\S+\s+CODE\s*$",
+            text, re.MULTILINE)
+    }
+    pattern = re.compile(r"^\s*([0-9a-fA-F]{4}):[0-9a-fA-F]+\s+(\S+)\s+([0-9a-fA-F]+)(?:\s|$)")
     for line in text.splitlines():
         match = pattern.match(line)
-        if match:
-            rva = int(match.group(2), 16) - preferred
+        if match and int(match.group(1), 16) in code_sections:
+            rva = int(match.group(3), 16) - preferred
             if rva >= 0:
-                symbols.setdefault(rva, match.group(1))
+                symbols.setdefault(rva, match.group(2))
     if not symbols:
-        raise ValueError("map has no function symbols")
+        raise ValueError("map has no code symbols")
     addresses = sorted(symbols)
     return addresses, symbols
 
