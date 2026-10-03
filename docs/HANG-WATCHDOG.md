@@ -43,6 +43,30 @@ The report contains:
   obscure the original failure when console output is unavailable.
 
 Internal queue 0 is graphics. Internal compute queue `q` maps to guest queue `q + 31`.
+Common scope operands can be read as follows (generic scope values are printed in hexadecimal):
+
+| Scope | Address/resource | Expected | Observed | Aux |
+| --- | --- | --- | --- | --- |
+| `master-dispatch` | Timeline semaphore | Required tick | Last host-dispatched tick | Current recording tick |
+| `master-gpu` | Timeline semaphore | Required tick | Last known completion tick | Current recording tick |
+| `master-counter-query` | Timeline semaphore | Current recording tick | Unused | Unused |
+| `master-*-error` | Timeline semaphore | Required/current tick | Returned signed VkResult as 64 bits | Unused |
+| `program-compile` / `program-finish` | Guest shader hash | Shader stage enum | Unused | Unused |
+| `graphics-pipeline` | Guest vertex shader hash | Vertex program ID | Pixel program ID | Unused |
+| `compute-pipeline` | Guest compute shader hash | Compute program ID | Unused | Unused |
+| `readback-publication` | Guest page/window begin | Completion tick/value | Page/window end | Eager copy flag |
+| `buffer-readback` | Guest address | Requested bytes | Unused | Write fault flag |
+| `guest-mutex` | Mutex object | Requesting guest thread object | Last owner guest thread object | Unused |
+| `guest-condition` | Condition object | Associated mutex object | Unused | Unused |
+| `guest-equeue` | Queue object | Requested event count | Unused | Timeout in microseconds |
+| `tracker-owner` | Tracking lock | Requesting host thread ID | Last owner host thread ID | Unused |
+| `resource-parking-lock` | Parking lock | Free state (0) | Last lock state | Unused |
+
+An active `master-dispatch` with observed below expected means the host has not finished handing
+that tick to the driver. An active `master-gpu` has passed that host-dispatch check. An active
+counter query instead means the host API has not returned; its scope cannot report a fresh GPU
+value. Native stacks and the first fatal report help distinguish driver calls from teardown waits.
+
 Typed packet opcodes use `0x10000 + OpKind`; their type names identify the operation. Typed
 snapshot payloads may start with host register-snapshot addresses. Raw PM4 records retain the
 header and first four payload words. No guest memory is dereferenced while reporting.
