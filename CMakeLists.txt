@@ -445,7 +445,7 @@ endforeach()
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 set(gpu_dcc_generated_dir "${PROJECT_BINARY_DIR}/gpu_dcc_shaders")
-set(gpu_dcc_shader_names validate clear occlusion)
+set(gpu_dcc_shader_names validate clear occlusion occlusion_batch)
 foreach(shader_name IN LISTS gpu_dcc_shader_names)
 	set(shader_source "${gpu_tiler_shader_dir}/gpu_dcc_${shader_name}.comp")
 	set(shader_spv "${gpu_dcc_generated_dir}/gpu_dcc_${shader_name}.spv")
@@ -1060,6 +1060,10 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_PRIORITY_WAIT_SPIN_US=500")
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
+	# KYTY_OCCLUSION_BATCH: the batch reduction shader against the per-dump reduction, and the
+	# scheduler's pre-submit hook it flushes from.
+	add_test(NAME occlusion_batch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --occlusion-batch-only)
 	add_test(NAME gpu_command_lane
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
 	add_test(NAME pm4_context_state

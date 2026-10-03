@@ -640,6 +640,13 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
+	if (m_pre_submit_hook != nullptr && !m_in_pre_submit && Active()) {
+		// Work its owner deferred to the end of this command buffer (SetPreSubmitHook).
+		m_in_pre_submit = true;
+		m_pre_submit_hook(m_pre_submit_hook_context);
+		m_in_pre_submit = false;
+		EXIT_IF(m_command.IsInvalid());
+	}
 	for (auto* dependency: m_submit_dependencies) {
 		if (dependency == nullptr) {
 			continue;
