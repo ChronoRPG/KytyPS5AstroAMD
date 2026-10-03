@@ -130,3 +130,15 @@ python tools/symbolize_watchdog.py watchdog.txt kyty_emulator.map --output watch
 This adds the nearest function symbol and displacement, preserves the original report, and
 requires no debugger/symbol server. It does not resolve driver DLL offsets or inlined source
 lines. Use `--module` if the executable was renamed; do not substitute a different build map.
+
+`KYTY_SHADER_WRITE_RETICK=1` enables a separate, default-off readback correctness candidate.
+Writable storage buffers are reserved while bindings are prepared. If a later upload submits
+that recording before its draw/dispatch is emitted, the candidate retags those buffers with
+the final producer tick in `CommitBindings`. A side readback then recognizes an unsubmitted
+writer and drains it instead of publishing older GPU contents. Dirty/protected ranges do not
+expand, and no extra submission is introduced by retagging itself.
+
+CTest `buffer_cache_late_storage_*` forces this timing window on Vulkan: controls observe the
+old value, the candidate observes the producer, and disabling side copies also removes the
+race. The fixed/control pair also runs through the queued CP recorder. This proves a stale
+readback mechanism; it does not establish that a particular game freeze has that cause.

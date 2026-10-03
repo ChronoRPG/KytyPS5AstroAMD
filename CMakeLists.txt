@@ -1721,6 +1721,29 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_BACKING_INPLACE=0")
 	add_test(NAME buffer_cache_eager_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --readback-eager-only)
+	# A storage descriptor is prepared on tick N, an upload submits N, and its producer is
+	# recorded on N+1. The control deliberately observes the old value; the fix must observe
+	# the producer. Turning off side readback also removes the stale-value race.
+	foreach(mode IN ITEMS fixed control queued_fixed queued_control no_side no_gpu_side)
+		set(write_mode --late-storage-write-only)
+		set(write_env KYTY_SHADER_WRITE_RETICK=1 KYTY_READBACK_SIDE_GPU_THREAD=1)
+		if(mode MATCHES "control")
+			set(write_mode --late-storage-write-control)
+			set(write_env KYTY_SHADER_WRITE_RETICK=0 KYTY_READBACK_SIDE_GPU_THREAD=1)
+		elseif(mode STREQUAL "no_side")
+			set(write_env KYTY_SHADER_WRITE_RETICK=0 KYTY_READBACK_SIDE_COPY=0)
+		elseif(mode STREQUAL "no_gpu_side")
+			set(write_env KYTY_SHADER_WRITE_RETICK=0 KYTY_READBACK_SIDE_GPU_THREAD=0)
+		endif()
+		if(mode MATCHES "^queued_")
+			list(APPEND write_env KYTY_CP_RECORDER=1 KYTY_CP_RECORDER_VERIFY=1
+				KYTY_RECORDER_DESCRIPTOR_SETS=1 KYTY_SUBMISSION_MODE=queued)
+		endif()
+		add_test(NAME buffer_cache_late_storage_${mode}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> ${write_mode})
+		set_tests_properties(buffer_cache_late_storage_${mode} PROPERTIES
+			ENVIRONMENT "${write_env}")
+	endforeach()
 	# KYTY_ALIAS_BYTES: byte ownership across partially overlapping writes (default), with image
 	# writebacks on, and off (whole-image ownership: the checks' failures are only reported).
 	add_test(NAME texture_cache_alias_bytes

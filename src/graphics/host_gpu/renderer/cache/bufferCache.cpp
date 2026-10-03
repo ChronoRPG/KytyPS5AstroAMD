@@ -48,6 +48,7 @@ namespace Libs::Graphics {
 namespace {
 
 Live::Switch g_cpu_copy_page_skip("KYTY_CPU_COPY_PAGE_SKIP", Live::ParseDefaultOff);
+Live::Switch g_shader_write_retick("KYTY_SHADER_WRITE_RETICK", Live::ParseDefaultOff);
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
@@ -1938,6 +1939,16 @@ void BufferCache::NoteBufferContentWrite(uint64_t vaddr, uint64_t size) {
 		// A page the command processor reads back: submit this recording once the writer is
 		// recorded, so the read after it finds a submitted (ideally finished) producer.
 		m_eager_flush = true;
+	}
+}
+
+bool BufferCache::ShaderWriteRetickEnabled() {
+	return g_shader_write_retick.On();
+}
+
+void BufferCache::RetagShaderWrite(uint64_t vaddr, uint64_t size, uint64_t preparation_tick) {
+	if (vaddr != 0 && size != 0 && preparation_tick != m_scheduler.CurrentTick()) {
+		NoteBufferContentWrite(vaddr, size);
 	}
 }
 
