@@ -7239,6 +7239,17 @@ public:
     Require(name, "latest producer", observed == (control ? before : produced),
             "readback returned data from before the unsubmitted producing command");
     OnGpuThread(context, [&] { scheduler.Finish(); });
+    Require(name, "producer completed",
+            scheduler.GetMasterSemaphore().KnownGpuTick() >= producer_tick,
+            "the actual GPU producer did not complete");
+    uint32_t completed_value = 0;
+    Require(name, "completed backing read", Libs::LibKernel::Memory::TryReadBacking(
+                base + offset, &completed_value, 4), "backing unavailable");
+    Require(name, "persistent publication",
+            completed_value == (control ? before : produced),
+            "unexpected backing contents after GPU completion");
+    std::printf("[gpu] LateStorageWrite GPU complete; backing still=0x%08x\n",
+                completed_value);
     RenderExecutorTestAccess::DestroyDescriptorPipelines(
         context.GetRenderExecutor(), std::span(&descriptor_pipeline, 1));
     context.UnmapMemory(base, size);
