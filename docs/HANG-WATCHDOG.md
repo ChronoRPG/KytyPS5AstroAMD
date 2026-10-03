@@ -30,6 +30,8 @@ The report contains:
 - In-flight shader hashes/stages, native graphics/compute pipeline creation, background shader
   validation/checks, pipeline optimization and pipeline-cache serialization.
 - Recorder, sequencer, draw-prep, broker, readback, priority-callback and master timeline waits.
+  Contended tracking-region locks include the last owner host thread ID; resource parking locks
+  include their lock address and last state.
   Returned master errors and device-loss diagnostic calls remain visible if fatal reporting blocks.
 - The last 32 PM4/typed packets per internal queue and last 256 native submission bundles,
   including semaphore waits/signals and pipeline stage masks. A native bundle means the host
@@ -51,7 +53,7 @@ call; it cannot by itself prove a GPU shader or driver defect.
 
 `KYTY_HANG_WATCHDOG=0` disables monitoring and metadata publication. It is a live switch for
 same-process A/B; a process started disabled needs `KYTY_LIVE_FILE` to allow later activation.
-`KYTY_HANG_WATCHDOG_MS` changes the startup threshold (1,000–600,000 ms; default 5,000).
+`KYTY_HANG_WATCHDOG_MS` changes the startup threshold (1,000â€“600,000 ms; default 5,000).
 
 For a timing perturbation, use the default-off `KYTY_HANG_DELAY_SITE`:
 

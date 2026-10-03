@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "common/hangWatchdog.h"
 #include "common/rendererBatch.h"
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/pageManager.h"
@@ -42,6 +43,8 @@ public:
 			EXIT("recursive region tracking lock\n");
 		}
 		if (!m_lock.try_lock()) [[unlikely]] {
+			HangWatchdog::Scope wait("tracker-owner", reinterpret_cast<uint64_t>(this), thread,
+			                         m_owner.load(std::memory_order_relaxed));
 			MemoryStats::Count(MemoryStats::Counter::TrackerLockContended);
 			if (m_owner.load(std::memory_order_relaxed) == thread) {
 				EXIT("recursive region tracking lock while contended\n");
@@ -163,8 +166,8 @@ public:
 		{
 			const RegionBits current(bits, start, end);
 			const bool       changes = enable ? current.Count() != end - start : current.Any();
-			if (changes || (source == DirtySource::Gpu &&
-			                RegionBits(m_readback_pending, start, end).Any())) {
+			if (changes ||
+			    (source == DirtySource::Gpu && RegionBits(m_readback_pending, start, end).Any())) {
 				Bump();
 			}
 			if (source == DirtySource::Cpu && enable && changes) {
@@ -260,19 +263,20 @@ public:
 		size_t changed_end   = end;
 		if (policy.ahead_pages > 1) {
 			const size_t window_begin = start / policy.ahead_pages * policy.ahead_pages;
-			const size_t window_end   = std::min<size_t>(
-                (end + policy.ahead_pages - 1) / policy.ahead_pages * policy.ahead_pages,
-                TRACKER_REGION_PAGES);
-			changed_begin = std::min(changed_begin, window_begin);
-			changed_end   = std::max(changed_end, window_end);
+			const size_t window_end = std::min<size_t>((end + policy.ahead_pages - 1) /
+			                                               policy.ahead_pages * policy.ahead_pages,
+			                                           TRACKER_REGION_PAGES);
+			changed_begin           = std::min(changed_begin, window_begin);
+			changed_end             = std::max(changed_end, window_end);
 			RegionBits all;
 			all.Fill();
-			const RegionBits window = RegionBits(all, window_begin, window_end) & ~m_gpu_dirty &
-			                          ~m_cpu_dirty;
+			const RegionBits window =
+			    RegionBits(all, window_begin, window_end) & ~m_gpu_dirty & ~m_cpu_dirty;
 			result.ahead_pages = window.Count();
 			m_cpu_dirty |= window;
 			for (const auto [first, last]: window) {
-				on_ahead(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+				on_ahead(m_cpu_addr + first * TRACKER_PAGE_SIZE,
+				         (last - first) * TRACKER_PAGE_SIZE);
 			}
 		}
 		// Published before the pages become writable: a guest write can only land after it.
@@ -295,7 +299,7 @@ public:
 			streak = (streak != 0 && last == previous && streak != UINT8_MAX)
 			             ? static_cast<uint8_t>(streak + 1)
 			             : uint8_t {1};
-			last = current;
+			last   = current;
 			if (streak < policy.hot_frames) {
 				continue;
 			}
@@ -432,7 +436,7 @@ public:
 	// (CollectUpload, then ChangeState<Gpu, true>) collects nothing and changes no bit, serial or
 	// protection.
 	[[nodiscard]] bool IsGpuOwned(uint64_t offset, uint64_t size) const {
-		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		const auto [start, end]  = GetPageRange(m_cpu_addr + offset, size);
 		const bool all_gpu_dirty = !RegionBits::AnyInRange(
 		    start, end, [this](size_t word) { return ~m_gpu_dirty.Word(word); });
 		return all_gpu_dirty && !m_readback_pending.AnyInRange(start, end);
