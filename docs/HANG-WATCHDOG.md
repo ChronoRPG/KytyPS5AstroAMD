@@ -142,3 +142,14 @@ CTest `buffer_cache_late_storage_*` forces this timing window on Vulkan: control
 old value, the candidate observes the producer, and disabling side copies also removes the
 race. The fixed/control pair also runs through the queued CP recorder. This proves a stale
 readback mechanism; it does not establish that a particular game freeze has that cause.
+
+The existing `_device_fault.nv-gpudmp` contains a Vulkan vendor-binary header before the
+vendor payload. If an installed NVIDIA Aftermath reader rejects it, preserve the original
+and extract a separate payload first:
+
+```text
+python tools/unwrap_device_fault.py _device_fault.nv-gpudmp vendor-payload.nv-gpudmp
+```
+
+This offline helper validates the version/length, prints header metadata, and refuses to
+overwrite an existing output. It neither installs software nor changes driver settings.
