@@ -1282,6 +1282,28 @@ void TestDirtiedLog() {
   Release(memory);
 }
 
+// KYTY_FAULT_MAP's duplicate counter (MemoryTracker::TakeFaultFoundDirty): a write fault on a page
+// another fault already made CPU-dirty (its unprotect not landed yet) reports it; a first fault
+// does not.
+void TestFaultFoundDirty() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 4;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 16);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  UploadAll(tracker, address, page_size * 16);
+  (void)MemoryTracker::TakeFaultFoundDirty();
+  WriteFault(tracker, address + page_size * 5); // pages 4-7 turn CPU-dirty
+  Check(!MemoryTracker::TakeFaultFoundDirty(), "a first fault was reported as finding its page dirty");
+  WriteFault(tracker, address + page_size * 6 + 100); // another thread's duplicate
+  Check(MemoryTracker::TakeFaultFoundDirty(), "a duplicate fault was not reported");
+  Check(!MemoryTracker::TakeFaultFoundDirty(), "the duplicate flag was not reset");
+  tracker.UntrackMemory(address, page_size * 16);
+  Release(memory);
+}
+
 void TestForeignWatcherFaultsDoNotPromote() {
   MemoryTracker::FaultPolicy policy;
   policy.hot_frames = 2;
@@ -2710,6 +2732,7 @@ int main(int argc, char **argv) {
   TestHotPageDemotionPaths();
   TestFaultMutationEpochWithHotPages();
   TestDirtiedLog();
+  TestFaultFoundDirty();
   TestForeignWatcherFaultsDoNotPromote();
   TestWrittenUploadCopiesOutsideLock();
   TestHotPageSettle();

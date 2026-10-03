@@ -180,6 +180,9 @@ private:
 			if (should_flush) {
 				on_flush();
 			}
+			if (fault.already_dirty) {
+				t_fault_found_dirty = true;
+			}
 			MemoryStats::Count(MemoryStats::Counter::FaultAheadPages, fault.ahead_pages);
 			MemoryStats::Count(MemoryStats::Counter::HotPromotions, fault.promoted);
 		});
@@ -188,6 +191,11 @@ private:
 public:
 	// Fault policy knobs (constant after construction).
 	[[nodiscard]] const FaultPolicy& GetFaultPolicy() const noexcept { return m_fault_policy; }
+	// Diagnostics (KYTY_FAULT_MAP): whether a write fault on this thread since the last call found
+	// a faulting page CPU-dirty already (FaultResult::already_dirty). Resets the flag.
+	[[nodiscard]] static bool TakeFaultFoundDirty() noexcept {
+		return std::exchange(t_fault_found_dirty, false);
+	}
 	// Guest frame counter for hot-page detection (any thread, once per completed guest flip).
 	void AdvanceFrame() noexcept { m_frame.fetch_add(1, std::memory_order_relaxed); }
 	[[nodiscard]] uint32_t Frame() const noexcept {
@@ -408,6 +416,7 @@ private:
 	// (RegionManager::MarkWriteFault's fault-ahead window).
 	[[nodiscard]] std::pair<uint64_t, uint64_t> FaultWindow(uint64_t offset,
 	                                                        uint64_t bytes) const noexcept;
+	inline static thread_local bool t_fault_found_dirty = false;
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;

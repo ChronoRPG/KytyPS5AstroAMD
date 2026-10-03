@@ -11,6 +11,7 @@
 #include "common/rendererBatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/cleanVerdictCache.h"
+#include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/memoryStats.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -1153,6 +1154,7 @@ BufferCache::UploadBatch::~UploadBatch() {
 
 void BufferCache::AdvanceFrame() noexcept {
 	m_memory_tracker.AdvanceFrame();
+	FaultCost::AdvanceFrame();
 }
 
 void BufferCache::EraseHotShadows(uint64_t vaddr, uint64_t size) {
@@ -3956,10 +3958,12 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 			if (collect) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncSkips);
 			}
+			FaultCost::NoteBdaPass(0, 0);
 			return;
 		}
 		BdaSyncStats stats;
 		if (SynchronizeBdaHotRanges(stats)) {
+			FaultCost::NoteBdaPass(1, stats.upload_bytes);
 			if (collect) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncHotPasses);
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncHotRanges,
@@ -3976,6 +3980,7 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 		// A recorded buffer is gone although the structure epoch held: scan everything.
 	} else if (structure_holds && m_bda_dirty_log && log_complete && m_bda_log_baseline &&
 	           SynchronizeBdaDirtied(mapped_ranges)) {
+		FaultCost::NoteBdaPass(2, m_bda_last_pass_bytes);
 		m_bda_scanned_cpu_epoch = cpu_epoch;
 		if (m_bda_log_verify != 0) {
 			m_bda_log_totals.verify_checks++;
@@ -4018,6 +4023,7 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 	}
 	// The log taken above holds nothing this scan did not cover; later transitions log again.
 	m_bda_log_baseline = m_bda_dirty_log;
+	FaultCost::NoteBdaPass(3, stats.upload_bytes);
 	if (collect) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncPasses);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncScannedBuffers, stats.scanned_buffers);
@@ -4072,6 +4078,7 @@ bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges) {
 	}
 	m_bda_log_totals.passes++;
 	m_bda_log_totals.ranges += logged;
+	m_bda_last_pass_bytes = stats.upload_bytes;
 	if (Profiler::AggregateEnabled()) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncLogPasses);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncLogRanges, logged);

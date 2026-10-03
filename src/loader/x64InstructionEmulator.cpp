@@ -3,7 +3,9 @@
 #include "common/common.h"
 
 #include <Zydis/Zydis.h>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #if !defined(__APPLE__)
 #include <emmintrin.h>
@@ -668,7 +670,11 @@ static uint32_t ReciprocalSquareRoot(uint32_t bits) {
 	return std::bit_cast<uint32_t>(_mm_cvtss_f32(_mm_cvtsd_ss(_mm_setzero_ps(), result)));
 }
 
+static std::atomic<uint64_t> g_rsqrt_traps {0};
+static std::atomic<uint64_t> g_rsqrt_ns {0};
+
 static bool TryEmulateReciprocalSquareRoot(Context& context) {
+	const auto  start          = std::chrono::steady_clock::now();
 	const auto* rip            = reinterpret_cast<const uint8_t*>(context.Rip());
 	size_t      prefix_size    = 0;
 	uint8_t     dest_extension = 0;
@@ -708,6 +714,11 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 	std::memcpy(dest_xmm, &result, sizeof(result));
 	context.ClearUpperYmm(dest);
 	context.Advance(prefix_size + 2);
+	g_rsqrt_traps.fetch_add(1, std::memory_order_relaxed);
+	g_rsqrt_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                                std::chrono::steady_clock::now() - start)
+	                                                .count()),
+	                     std::memory_order_relaxed);
 	return true;
 }
 
@@ -751,6 +762,15 @@ uint64_t PatchReciprocalSquareRoots(uint64_t address, uint64_t size) {
 	(void)size;
 #endif
 	return patched;
+}
+
+ReciprocalSqrtStats GetReciprocalSqrtStats() {
+	ReciprocalSqrtStats stats;
+#if !defined(__APPLE__)
+	stats.traps      = g_rsqrt_traps.load(std::memory_order_relaxed);
+	stats.emulate_ns = g_rsqrt_ns.load(std::memory_order_relaxed);
+#endif
+	return stats;
 }
 
 bool TryEmulate(void* native_context) {
