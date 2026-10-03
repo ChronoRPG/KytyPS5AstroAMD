@@ -52,6 +52,7 @@ Common scope operands can be read as follows (generic scope values are printed i
 | `master-counter-query` | Timeline semaphore | Current recording tick | Unused | Unused |
 | `master-*-error` | Timeline semaphore | Required/current tick | Returned signed VkResult as 64 bits | Unused |
 | `program-compile` / `program-finish` | Guest shader hash | Shader stage enum | Unused | Unused |
+| `program-in-flight` | Requested guest shader hash | Shader stage enum | In-flight compile count | Program cache object |
 | `graphics-pipeline` | Guest vertex shader hash | Vertex program ID | Pixel program ID | Unused |
 | `compute-pipeline` | Guest compute shader hash | Compute program ID | Unused | Unused |
 | `readback-publication` | Guest page/window begin | Completion tick/value | Page/window end | Eager copy flag |

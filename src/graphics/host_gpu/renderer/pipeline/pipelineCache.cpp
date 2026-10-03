@@ -1761,7 +1761,8 @@ struct PipelineCache::ProgramCache {
 	// Requires m_programs_mutex exclusively (held by `lock`). Waits while `covered` holds for an
 	// in-flight compile and returns whether it waited (the caller then repeats its lookup).
 	template <typename Covered>
-	bool WaitForInFlight(std::unique_lock<std::shared_mutex>& lock, Covered&& covered) {
+	bool WaitForInFlight(std::unique_lock<std::shared_mutex>& lock, const ProgramKey& key,
+	                     Covered&& covered) {
 		const auto busy = [&] {
 			return std::any_of(in_flight.begin(), in_flight.end(),
 			                   [&](const InFlightCompile* record) { return covered(*record); });
@@ -1770,8 +1771,8 @@ struct PipelineCache::ProgramCache {
 			return false;
 		}
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ProgramCompileWaits);
-		HangWatchdog::Scope wait("program-in-flight", reinterpret_cast<uint64_t>(this),
-		                         in_flight.size());
+		HangWatchdog::Scope wait("program-in-flight", key.hash, static_cast<uint64_t>(key.stage),
+		                         in_flight.size(), 0, reinterpret_cast<uint64_t>(this));
 		compile_done.wait(lock, [&] { return !busy(); });
 		return true;
 	}
@@ -2265,7 +2266,7 @@ struct PipelineCache::ProgramCache {
 			// Another preparer may have inserted or compiled this source since the shared lookup.
 			const auto entry = programs.find(key);
 			if (entry == programs.end()) {
-				if (WaitForInFlight(lock, [&](const InFlightCompile& record) {
+				if (WaitForInFlight(lock, key, [&](const InFlightCompile& record) {
 					    return record.CoversSource(key);
 				    })) {
 					continue;
@@ -2288,7 +2289,7 @@ struct PipelineCache::ProgramCache {
 			        FindPermutation(*source, prep.specialization, push_data_cursor, true)) {
 				return publish_index(*source, *published);
 			}
-			if (WaitForInFlight(lock, [&](const InFlightCompile& record) {
+			if (WaitForInFlight(lock, key, [&](const InFlightCompile& record) {
 				    return record.CoversPermutation(source, prep.specialization, push_data_cursor);
 			    })) {
 				continue;
