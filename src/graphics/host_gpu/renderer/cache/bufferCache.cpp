@@ -65,6 +65,48 @@ void BindingHotChanged(int64_t, int64_t) {
 Live::Switch g_binding_hot_memo("KYTY_CP_BINDING_HOT_MEMO", Live::ParseDefaultOff,
                                BindingHotChanged);
 
+// KYTY_FAULT_AHEAD_ADAPT (live): the fault-ahead window of write faults
+// (MemoryTracker::SetFaultAheadOverride, applied at every guest flip).
+//   auto   (default) scaled with the measured cost of a fault (FaultCost::Model): 256 KiB while a
+//          fault costs up to 20 us, doubled for every further doubling of the cost, at most 1 MiB.
+//   <KiB>  a power of two, 8..4096
+//   0      KYTY_FAULT_AHEAD_KB alone (32 KiB), as before
+// At the Sky Garden the guest's job threads fill ~16 MB of triple-buffered data per frame. With
+// 32 KiB windows that took ~1,700 faults per frame, 62% of them duplicates (another thread wrote
+// the same page while the first fault was in flight). 256 KiB windows: ~300 faults and ~100
+// loosening calls per frame instead of ~1,700 and ~620, for ~14% more upload bytes (pages a window
+// opened that the guest did not write are uploaded once more than needed: bytes, not faults).
+Live::Switch g_fault_ahead_adapt("KYTY_FAULT_AHEAD_ADAPT", [](const char* value) -> int64_t {
+	if (value == nullptr || value[0] == '\0' || std::strcmp(value, "auto") == 0) {
+		return -2;
+	}
+	if (std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	char*      end = nullptr;
+	const auto kib = std::strtoll(value, &end, 10);
+	if (end == value || kib < 8 || kib > 4096 || (kib & (kib - 1)) != 0) {
+		return 0;
+	}
+	return kib;
+});
+
+uint32_t FaultAheadOverridePages() {
+	const auto value = g_fault_ahead_adapt.Get();
+	if (value == 0) {
+		return 0;
+	}
+	uint64_t kib = static_cast<uint64_t>(value);
+	if (value == -2) {
+		const auto cost = FaultCost::Model().fault_us;
+		kib             = 256;
+		for (double limit = 20.0; cost > limit && kib < 1024; limit *= 2.0) {
+			kib *= 2;
+		}
+	}
+	return static_cast<uint32_t>(kib * 1024 / TRACKER_PAGE_SIZE);
+}
+
 bool IncrementalBdaSyncEnabled() {
 	const auto* value = std::getenv("KYTY_BDA_INCREMENTAL_SYNC");
 	return value != nullptr && value[0] == '1' && value[1] == '\0';
@@ -1037,6 +1079,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		m_binding_memo_verify = BindingEpochMemoVerifyMode();
 		m_binding_memo_cross  = BindingMemoCrossEpochEnabled();
 	}
+	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
 	m_written_sync_skip = WrittenSyncSkipEnabled();
 	if (m_written_sync_skip) {
 		m_written_sync_skip_verify = EnvVerifyMode("KYTY_WRITTEN_SYNC_SKIP_VERIFY");
@@ -1155,6 +1198,8 @@ BufferCache::UploadBatch::~UploadBatch() {
 void BufferCache::AdvanceFrame() noexcept {
 	m_memory_tracker.AdvanceFrame();
 	FaultCost::AdvanceFrame();
+	// KYTY_FAULT_AHEAD_ADAPT, applied once per guest flip (the cost model moves slowly).
+	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
 }
 
 void BufferCache::EraseHotShadows(uint64_t vaddr, uint64_t size) {

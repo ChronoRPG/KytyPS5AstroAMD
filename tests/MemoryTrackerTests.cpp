@@ -1282,6 +1282,42 @@ void TestDirtiedLog() {
   Release(memory);
 }
 
+// KYTY_FAULT_AHEAD_ADAPT (BufferCache): a larger fault-ahead window for write faults (only larger
+// than the policy's), and the dirtied log and the dirty bits agree on it.
+void TestFaultAheadOverride() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 4;
+  PolicyHarness harness(policy, true);
+  auto &tracker = harness.tracker;
+  tracker.EnableDirtiedLog();
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 16);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  RangeSet ranges;
+  uint64_t epoch = 0;
+  UploadAll(tracker, address, page_size * 16);
+  (void)tracker.TakeDirtiedRanges(ranges, epoch);
+  MemoryTracker::SetFaultAheadOverride(16);
+  WriteFault(tracker, address + page_size * 9);
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Contains(address, page_size * 16) &&
+            tracker.IsRegionCpuModified(address, page_size) &&
+            tracker.IsRegionCpuModified(address + page_size * 15, page_size),
+        "the fault-ahead override did not widen the window");
+  UploadAll(tracker, address, page_size * 16);
+  (void)tracker.TakeDirtiedRanges(ranges, epoch);
+  MemoryTracker::SetFaultAheadOverride(2); // smaller than the policy's 4: ignored
+  WriteFault(tracker, address + page_size * 9);
+  Check(tracker.TakeDirtiedRanges(ranges, epoch) && ranges.Contains(address + page_size * 8, page_size * 4) &&
+            !ranges.Intersects(address, page_size * 8) && !tracker.IsRegionCpuModified(address, page_size * 8),
+        "a smaller fault-ahead override changed the window");
+  MemoryTracker::SetFaultAheadOverride(3); // not a power of two: off
+  Check(MemoryTracker::FaultAheadOverride() == 0, "an invalid fault-ahead override was kept");
+  MemoryTracker::SetFaultAheadOverride(0);
+
+  tracker.UntrackMemory(address, page_size * 16);
+  Release(memory);
+}
+
 // KYTY_FAULT_MAP's duplicate counter (MemoryTracker::TakeFaultFoundDirty): a write fault on a page
 // another fault already made CPU-dirty (its unprotect not landed yet) reports it; a first fault
 // does not.
@@ -2732,6 +2768,7 @@ int main(int argc, char **argv) {
   TestHotPageDemotionPaths();
   TestFaultMutationEpochWithHotPages();
   TestDirtiedLog();
+  TestFaultAheadOverride();
   TestFaultFoundDirty();
   TestForeignWatcherFaultsDoNotPromote();
   TestWrittenUploadCopiesOutsideLock();
