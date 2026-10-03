@@ -6,6 +6,8 @@
 #include "common/rendererBatch.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
+#include "gpu_dcc_shaders/gpu_dcc_occlusion_batch_spv.h"
+#include "gpu_dcc_shaders/gpu_dcc_occlusion_spv.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
@@ -2962,6 +2964,308 @@ public:
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyDescriptorSetLayout(layout, nullptr);
     std::printf("[host]    %-32s ok\n", "DescriptorHeapLargeSet");
+  }
+
+  // KYTY_OCCLUSION_BATCH (occlusion.h): for every dump of a batch, the batch reduction shader
+  // writes what the per-dump path (gpu_dcc_occlusion.comp mode 0 over the dump's new queries, then
+  // mode 1) writes into that dump's publish slot. Both run on the same inputs: slots that wrap
+  // around, repeated prefixes, queries after the last dump, and a counter that crosses the 63-bit
+  // wrap; both must equal OcclusionCounter::ReferenceBatch. The batch also writes each dump's tag
+  // into the slot's last qword and leaves every other word (second pair members, other slots) as
+  // it was.
+  void CheckOcclusionBatchShader() {
+    constexpr const char *name = "OcclusionBatchShader";
+    constexpr u32 slot_count = 16;
+    constexpr u32 first_slot = 11;
+    constexpr u32 slot_words = 64;
+    constexpr u32 sentinel = 0xa5a5a5a5u;
+    constexpr u32 tag_base = 1000;
+    const std::vector<u32> prefixes{0, 3, 3, 7, 8, 8, 8, 15, 22, 30, 31, 40};
+    const auto dump_count = static_cast<u32>(prefixes.size());
+    constexpr u32 query_count = 45; // the last five queries only reach the counter
+    std::vector<uint64_t> results(query_count);
+    uint64_t state = 0x9e3779b97f4a7c15ull;
+    for (auto &value : results) {
+      state ^= state << 13u;
+      state ^= state >> 7u;
+      state ^= state << 17u;
+      value = state & 0x0000ffffffffffffull;
+    }
+    results[20] = 0x7ffffffffff00000ull; // the counter crosses the 63-bit wrap here
+    const uint64_t counter_before = 0x7fffffffffffff00ull;
+    std::vector<uint64_t> expected;
+    uint64_t expected_counter = 0;
+    OcclusionCounter::ReferenceBatch(counter_before, results, prefixes, expected, expected_counter);
+    Require(name, "reference", expected.size() == dump_count, "one value per dump");
+
+    const auto words64 = [](const std::vector<uint64_t> &values) {
+      std::vector<u32> words;
+      for (const auto value : values) {
+        words.push_back(static_cast<u32>(value));
+        words.push_back(static_cast<u32>(value >> 32u));
+      }
+      return words;
+    };
+    const auto usage = vk::BufferUsageFlagBits::eStorageBuffer;
+    const std::vector<u32> output_init(slot_count * slot_words, sentinel);
+    const std::vector<u32> counter_init = words64({counter_before});
+    std::vector<u32> table(slot_count * 2u, sentinel);
+    for (u32 i = 0; i < dump_count; i++) {
+      const u32 slot = (first_slot + i) % slot_count;
+      table[slot * 2u] = prefixes[i];
+      table[slot * 2u + 1u] = tag_base + i;
+    }
+    auto batch_results = CreateHostBuffer(name, query_count * 8u, usage, words64(results));
+    auto batch_counter = CreateHostBuffer(name, 8u, usage, counter_init);
+    auto batch_output = CreateHostBuffer(name, output_init.size() * 4u, usage, output_init);
+    auto batch_table = CreateHostBuffer(name, table.size() * 4u, usage, table);
+    auto old_counter = CreateHostBuffer(name, 8u, usage, counter_init);
+    auto old_output = CreateHostBuffer(name, output_init.size() * 4u, usage, output_init);
+    // The per-dump path reduces each dump's new queries, and later the ones after the last dump.
+    std::vector<Buffer> old_results;
+    std::vector<u32> old_counts;
+    for (u32 i = 0, previous = 0; i <= dump_count; i++) {
+      const u32 end = i < dump_count ? prefixes[i] : query_count;
+      const std::vector<uint64_t> segment(results.begin() + previous, results.begin() + end);
+      old_results.push_back(CreateHostBuffer(
+          name, std::max<vk::DeviceSize>(segment.size(), 1u) * 8u, usage, words64(segment)));
+      old_counts.push_back(end - previous);
+      previous = end;
+    }
+
+    const auto make_pipeline = [&](std::span<const uint32_t> code, u32 binding_count, u32 push_size,
+                                   vk::DescriptorSetLayout *set_layout,
+                                   vk::PipelineLayout *pipeline_layout) {
+      std::vector<vk::DescriptorSetLayoutBinding> bindings;
+      for (u32 binding = 0; binding < binding_count; binding++) {
+        bindings.push_back(
+            {binding, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute});
+      }
+      vk::DescriptorSetLayoutCreateInfo layout_info{};
+      layout_info.bindingCount = binding_count;
+      layout_info.pBindings = bindings.data();
+      RequireVk(name, "layout", m_device.createDescriptorSetLayout(&layout_info, nullptr, set_layout),
+                "vkCreateDescriptorSetLayout");
+      const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute, 0, push_size};
+      vk::PipelineLayoutCreateInfo pipeline_layout_info{};
+      pipeline_layout_info.setLayoutCount = 1;
+      pipeline_layout_info.pSetLayouts = set_layout;
+      pipeline_layout_info.pushConstantRangeCount = 1;
+      pipeline_layout_info.pPushConstantRanges = &push;
+      RequireVk(name, "layout",
+                m_device.createPipelineLayout(&pipeline_layout_info, nullptr, pipeline_layout),
+                "vkCreatePipelineLayout");
+      const auto module = CreateShaderModule(name, std::vector<u32>(code.begin(), code.end()));
+      vk::ComputePipelineCreateInfo pipeline_info{};
+      pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+      pipeline_info.stage.module = module;
+      pipeline_info.stage.pName = "main";
+      pipeline_info.layout = *pipeline_layout;
+      vk::Pipeline pipeline = nullptr;
+      RequireVk(name, "pipeline",
+                m_device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+                "vkCreateComputePipelines");
+      m_device.destroyShaderModule(module, nullptr);
+      return pipeline;
+    };
+    vk::DescriptorSetLayout batch_set_layout = nullptr;
+    vk::PipelineLayout batch_layout = nullptr;
+    const auto batch_pipeline =
+        make_pipeline(GPU_DCC_OCCLUSION_BATCH_SPV, 4, 16, &batch_set_layout, &batch_layout);
+    vk::DescriptorSetLayout old_set_layout = nullptr;
+    vk::PipelineLayout old_layout = nullptr;
+    const auto old_pipeline =
+        make_pipeline(GPU_DCC_OCCLUSION_SPV, 3, 12, &old_set_layout, &old_layout);
+
+    const auto set_count = dump_count + 2u;
+    const vk::DescriptorPoolSize pool_size{vk::DescriptorType::eStorageBuffer, set_count * 4u};
+    vk::DescriptorPoolCreateInfo pool_info{};
+    pool_info.maxSets = set_count;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes = &pool_size;
+    vk::DescriptorPool pool = nullptr;
+    RequireVk(name, "pool", m_device.createDescriptorPool(&pool_info, nullptr, &pool),
+              "vkCreateDescriptorPool");
+    const auto make_set = [&](vk::DescriptorSetLayout set_layout,
+                              const std::vector<const Buffer *> &buffers) {
+      vk::DescriptorSetAllocateInfo allocate{};
+      allocate.descriptorPool = pool;
+      allocate.descriptorSetCount = 1;
+      allocate.pSetLayouts = &set_layout;
+      vk::DescriptorSet set = nullptr;
+      RequireVk(name, "set", m_device.allocateDescriptorSets(&allocate, &set),
+                "vkAllocateDescriptorSets");
+      std::vector<vk::DescriptorBufferInfo> infos;
+      for (const auto *buffer : buffers) {
+        infos.push_back({buffer->buffer, 0, buffer->size});
+      }
+      std::vector<vk::WriteDescriptorSet> writes(buffers.size());
+      for (u32 binding = 0; binding < writes.size(); binding++) {
+        writes[binding].dstSet = set;
+        writes[binding].dstBinding = binding;
+        writes[binding].descriptorCount = 1;
+        writes[binding].descriptorType = vk::DescriptorType::eStorageBuffer;
+        writes[binding].pBufferInfo = &infos[binding];
+      }
+      m_device.updateDescriptorSets(static_cast<u32>(writes.size()), writes.data(), 0, nullptr);
+      return set;
+    };
+    const auto batch_set = make_set(batch_set_layout,
+                                    {&batch_results, &batch_counter, &batch_output, &batch_table});
+    std::vector<vk::DescriptorSet> old_sets;
+    for (const auto &segment : old_results) {
+      old_sets.push_back(make_set(old_set_layout, {&segment, &old_counter, &old_output}));
+    }
+
+    const auto cmd = BeginCommands(name, "dispatch");
+    vk::MemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+    const auto compute_barrier = [&] {
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                          vk::PipelineStageFlagBits::eComputeShader, {}, 1, &barrier, 0, nullptr,
+                          0, nullptr);
+    };
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, batch_pipeline);
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, batch_layout, 0, 1, &batch_set, 0,
+                           nullptr);
+    const u32 batch_push[]{first_slot, dump_count, query_count, slot_count};
+    cmd.pushConstants(batch_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(batch_push),
+                      batch_push);
+    cmd.dispatch(1, 1, 1);
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, old_pipeline);
+    for (u32 i = 0; i <= dump_count; i++) {
+      cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, old_layout, 0, 1, &old_sets[i], 0,
+                             nullptr);
+      const u32 reduce[]{0u, 0u, old_counts[i]};
+      cmd.pushConstants(old_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(reduce), reduce);
+      cmd.dispatch(1, 1, 1);
+      compute_barrier();
+      if (i < dump_count) {
+        const u32 slot = (first_slot + i) % slot_count;
+        const u32 publish[]{1u, slot * slot_words * 4u, 0u};
+        cmd.pushConstants(old_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(publish),
+                          publish);
+        cmd.dispatch(1, 1, 1);
+        compute_barrier();
+      }
+    }
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost,
+                        {}, 1, &barrier, 0, nullptr, 0, nullptr);
+    EndSubmitAndFree(name, "dispatch", cmd);
+
+    const auto read64 = [](const std::vector<u32> &words, size_t index) {
+      return uint64_t{words[index]} | (uint64_t{words[index + 1]} << 32u);
+    };
+    const auto batch_words = ReadBuffer(name, batch_output, output_init.size());
+    const auto old_words = ReadBuffer(name, old_output, output_init.size());
+    Require(name, "counter", read64(ReadBuffer(name, batch_counter, 2), 0) == expected_counter,
+            "batch counter after the batch differs from the reference");
+    Require(name, "counter", read64(ReadBuffer(name, old_counter, 2), 0) == expected_counter,
+            "per-dump counter after the batch's queries differs from the reference");
+    for (u32 slot = 0; slot < slot_count; slot++) {
+      const u32 dump = (slot + slot_count - first_slot) % slot_count;
+      const bool used = dump < dump_count;
+      const u32 base = slot * slot_words;
+      for (u32 word = 0; word < slot_words; word++) {
+        const u32 db = word / 4u;
+        const u32 member = word % 4u; // 0/1: first pair member (published); 2/3: second
+        uint64_t expected_word = sentinel;
+        u32 old_expected = sentinel;
+        if (used && member < 2u) {
+          const uint64_t value = (db == 0 ? expected[dump] : 0) | (1ull << 63u);
+          expected_word = member == 0 ? static_cast<u32>(value) : static_cast<u32>(value >> 32u);
+          old_expected = static_cast<u32>(expected_word);
+        } else if (used && word == 62u) {
+          expected_word = tag_base + dump;
+        } else if (used && word == 63u) {
+          expected_word = ~(tag_base + dump);
+        }
+        if (batch_words[base + word] != static_cast<u32>(expected_word) ||
+            old_words[base + word] != old_expected) {
+          char detail[160];
+          std::snprintf(detail, sizeof(detail),
+                        "slot %u word %u: batch 0x%08x, per-dump 0x%08x, expected 0x%08x / 0x%08x",
+                        slot, word, batch_words[base + word], old_words[base + word],
+                        static_cast<u32>(expected_word), old_expected);
+          Require(name, "slots", false, detail);
+        }
+      }
+    }
+
+    m_device.destroyDescriptorPool(pool, nullptr);
+    m_device.destroyPipeline(batch_pipeline, nullptr);
+    m_device.destroyPipeline(old_pipeline, nullptr);
+    m_device.destroyPipelineLayout(batch_layout, nullptr);
+    m_device.destroyPipelineLayout(old_layout, nullptr);
+    m_device.destroyDescriptorSetLayout(batch_set_layout, nullptr);
+    m_device.destroyDescriptorSetLayout(old_set_layout, nullptr);
+    for (auto *buffer : {&batch_results, &batch_counter, &batch_output, &batch_table, &old_counter,
+                         &old_output}) {
+      DestroyBuffer(buffer);
+    }
+    for (auto &segment : old_results) {
+      DestroyBuffer(&segment);
+    }
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // CommandScheduler::SetPreSubmitHook (KYTY_OCCLUSION_BATCH's flush point): the hook runs once per
+  // submission while the scheduler is active, before the command buffer ends, so what it records
+  // executes in that submission; after it is cleared it no longer runs.
+  void CheckSchedulerPreSubmitHook() {
+    constexpr const char *name = "SchedulerPreSubmitHook";
+    auto target = CreateHostBuffer(name, 16u * 4u, vk::BufferUsageFlagBits::eTransferDst,
+                                   std::vector<u32>(16, 0u));
+    struct HookState {
+      CommandScheduler *scheduler = nullptr;
+      vk::Buffer buffer = nullptr;
+      u32 calls = 0;
+      uint64_t tick = 0;
+      bool same_tick = true;
+    };
+    HookState state;
+    {
+      const auto context_owner = MakeRenderContext();
+      auto &scheduler = context_owner->GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      state.scheduler = &scheduler;
+      state.buffer = target.buffer;
+      scheduler.SetPreSubmitHook(
+          [](void *context) {
+            auto &hook = *static_cast<HookState *>(context);
+            hook.calls++;
+            hook.tick = hook.scheduler->CurrentTick();
+            hook.scheduler->Current().Sink().fillBuffer(hook.buffer, hook.calls * 4u, 4u,
+                                                        0xc0de0000u + hook.calls);
+            hook.same_tick = hook.same_tick && hook.scheduler->CurrentTick() == hook.tick;
+          },
+          &state);
+      const auto first = scheduler.CurrentTick();
+      scheduler.Flush();
+      Require(name, "flush", state.calls == 1 && state.tick == first,
+              "the hook did not run once for the flushed command buffer");
+      scheduler.FlushAndWait();
+      Require(name, "flush and wait", state.calls == 2, "the hook did not run for FlushAndWait");
+      const auto words = ReadBuffer(name, target, 16);
+      Require(name, "flush and wait", words[1] == 0xc0de0001u && words[2] == 0xc0de0002u,
+              "work recorded by the hook did not execute in its submission");
+      scheduler.Finish();
+      Require(name, "finish", state.calls == 3, "the hook did not run for Finish");
+      scheduler.SetPreSubmitHook(nullptr, nullptr);
+      scheduler.FlushAndWait();
+      Require(name, "cleared", state.calls == 3, "a cleared hook still ran");
+      Require(name, "tick", state.same_tick, "the hook's recording changed the current tick");
+    }
+    const auto words = ReadBuffer(name, target, 16);
+    Require(name, "finish", words[3] == 0xc0de0003u && words[4] == 0u,
+            "the hook's last recording is missing or an extra one ran");
+    DestroyBuffer(&target);
+    std::printf("[host]    %-32s ok\n", name);
   }
 
   void CheckGraphicsPushConstantBank() {
@@ -48809,6 +49113,12 @@ int main(int argc, char **argv) {
     CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--occlusion-batch-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckOcclusionBatchShader();
+    vulkan.CheckSchedulerPreSubmitHook();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--predication-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4Predication(vulkan.RuntimeRenderer());
@@ -49568,6 +49878,8 @@ int main(int argc, char **argv) {
   CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
   CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
   CheckPm4Predication(vulkan.RuntimeRenderer());
+  vulkan.CheckOcclusionBatchShader();
+  vulkan.CheckSchedulerPreSubmitHook();
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
   CheckPm4NativeTargetGeometryRegisters(vulkan.RuntimeRenderer());
   CheckPm4PrivateAgcShaderRegisters(vulkan.RuntimeRenderer());
