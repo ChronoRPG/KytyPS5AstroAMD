@@ -86,6 +86,17 @@ struct MeshDrawSegment {
 	return std::min(limits.maxMeshWorkGroupCount[1], limits.maxMeshWorkGroupTotalCount / groups);
 }
 
+// Workgroups one mesh dispatch takes in X: all of them, or with split_groups (a device whose X
+// limit is below its total, RADV) at most that limit; the program adds each part's first group
+// (draw dword IR::PushData::MeshFirstGroupDword).
+[[nodiscard]] static uint32_t MeshGroupsPerDispatch(uint32_t groups, const ShaderMeshInputInfo& mesh,
+                                                    const vk::PhysicalDeviceMeshShaderPropertiesEXT& limits) {
+	if (mesh.split_groups == 0) {
+		return groups;
+	}
+	return std::min({groups, limits.maxMeshWorkGroupCount[0], limits.maxMeshWorkGroupTotalCount});
+}
+
 static void SplitMeshRestartIndices(uint64_t address, uint32_t count, uint32_t element_size,
                                     uint32_t marker, const ShaderMeshInputInfo& mesh,
                                     std::vector<MeshDrawSegment>& segments) {
@@ -958,7 +969,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			}
 		}
 		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
-			EXIT("depth attachment feedback loop is not supported by the host\n");
+			// Without VK_EXT_attachment_feedback_loop_layout/dynamic_state (AMD's Windows driver)
+			// the draw samples the depth target it writes in the GENERAL layout, chosen below: not
+			// defined by Vulkan, but what the hardware does, and better than ending the emulator.
+			static std::atomic_bool warned {false};
+			if (!warned.exchange(true, std::memory_order_relaxed)) {
+				Log::WriteToConsoleAndLog("Warning: depth attachment feedback loop without host "
+				                          "support; using the GENERAL layout\n");
+			}
 		}
 		auto layout = depth_attachment_layout(depth);
 		if (!sampled_aspects && DepthLayoutStableEnabled()) {
@@ -3049,8 +3067,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
 		uint64_t total_groups = 0;
 		for (const auto& segment: mesh_segments) {
-			// More instances than one dispatch carries are split when the draw is recorded.
-			if (MeshInstancesPerDispatch(segment.groups, limits) == 0) {
+			// More instances than one dispatch carries are split when the draw is recorded, and
+			// with split_groups (MeshGroupsPerDispatch) so are more groups than X allows.
+			if (MeshInstancesPerDispatch(MeshGroupsPerDispatch(segment.groups, mesh, limits),
+			                             limits) == 0) {
 				EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", segment.groups, draw.instance_count);
 			}
 			total_groups += segment.groups;
@@ -3493,41 +3513,59 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x500u);
 	}
+	// Mesh programs with split_groups read a seventh draw dword (MeshFirstGroupDword).
+	const uint32_t mesh_draw_dwords =
+	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwords(
+	                      state.vertex_info[0].mesh.split_groups != 0)
+	                : 0u;
 	if (mesh_indirect) {
 		// One indirect dispatch per conversion record, each reading its draw dwords from its own
-		// parameter block (a record the draw does not need has no workgroups).
+		// parameter block (a record the draw does not need has no workgroups). Indirect draws are
+		// never split: the block's dword 6 is 0.
 		for (uint32_t record = 0; record < MeshIndirect::Records; record++) {
 			const auto     address = mesh_slot.ParamsAddress(record);
 			const uint32_t draw_data[] {static_cast<uint32_t>(address),
 			                            static_cast<uint32_t>(address >> 32u), 0u,
-			                            ShaderRecompiler::IR::PushData::MeshIndirectSentinel, 0u, 0u};
-			static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+			                            ShaderRecompiler::IR::PushData::MeshIndirectSentinel, 0u, 0u,
+			                            0u};
+			static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwords(true));
 			vk_buffer.pushConstants(pipeline.pipeline_layout,
 			    vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eFragment, 0,
-			    sizeof(draw_data), draw_data);
+			    mesh_draw_dwords * sizeof(uint32_t), draw_data);
 			vk_buffer.drawMeshTasksIndirectEXT(mesh_slot.buffer, mesh_slot.CommandOffset(record), 1,
 			                                   MeshIndirect::CommandDwords * 4u);
 		}
 	} else if (mesh_active) {
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+		const auto& mesh   = state.vertex_info[0].mesh;
 		for (const auto& segment: mesh_segments) {
 			const auto address = index_source.address +
 			    static_cast<uint64_t>(segment.first) * index_source.guest_element_size;
-			// The shader's instance index is the pushed first instance plus WorkgroupId.y, so a
-			// draw with more instances than one dispatch carries is split into instance ranges.
-			const auto instances_per_dispatch = MeshInstancesPerDispatch(segment.groups, limits);
-			for (uint32_t base = 0; base < draw.instance_count; base += instances_per_dispatch) {
-				const uint32_t draw_data[] {
-				    segment.count,
-				    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-				    emit.first_instance + base, index_source.guest_element_size,
-				    static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u)};
-				static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
-				vk_buffer.pushConstants(pipeline.pipeline_layout,
-				    vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eFragment,
-				    0, sizeof(draw_data), draw_data);
-				vk_buffer.drawMeshTasksEXT(segment.groups,
-				                           std::min(instances_per_dispatch, draw.instance_count - base), 1);
+			// A segment with more groups than X allows is dispatched in parts (split_groups only),
+			// each pushing its first group. The shader's instance index is the pushed first instance
+			// plus WorkgroupId.y, so a part with more instances than one dispatch carries is split
+			// into instance ranges.
+			const auto groups_per_dispatch = MeshGroupsPerDispatch(segment.groups, mesh, limits);
+			for (uint32_t first_group = 0; first_group < segment.groups;
+			     first_group += groups_per_dispatch) {
+				const auto groups = std::min(groups_per_dispatch, segment.groups - first_group);
+				const auto instances_per_dispatch = MeshInstancesPerDispatch(groups, limits);
+				for (uint32_t base = 0; base < draw.instance_count; base += instances_per_dispatch) {
+					const uint32_t draw_data[] {
+					    segment.count,
+					    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
+					    emit.first_instance + base, index_source.guest_element_size,
+					    static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
+					    first_group};
+					static_assert(std::size(draw_data) ==
+					              ShaderRecompiler::IR::PushData::MeshDrawDwords(true));
+					vk_buffer.pushConstants(pipeline.pipeline_layout,
+					    vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eFragment,
+					    0, mesh_draw_dwords * sizeof(uint32_t), draw_data);
+					vk_buffer.drawMeshTasksEXT(groups,
+					                           std::min(instances_per_dispatch, draw.instance_count - base),
+					                           1);
+				}
 			}
 		}
 	} else if (indirect != nullptr) {

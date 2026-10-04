@@ -219,6 +219,14 @@ bool IsFmaskTextureFormat(BufferFormat format) {
 	return format >= BufferFormat::kFmask8_S2_F1 && format <= BufferFormat::kFmask64_S16_F8;
 }
 
+/// True for the values BufferFormat names, false for the gaps in the encoding. The ranges are the
+/// enum's, not kFormatInfo's: that table lacks formats the enum defines (k10_11_11Float, ...).
+bool IsDefinedBufferFormat(BufferFormat format) {
+	return (format >= BufferFormat::k8UNorm && format <= BufferFormat::k32_32_32_32Float) ||
+	       (format >= BufferFormat::k8Srgb && format <= BufferFormat::k4_4_4_4UNorm) ||
+	       (format >= BufferFormat::kFmask8_S2_F1 && format <= BufferFormat::kBc7Srgb);
+}
+
 TextureNumericClass SampledTextureNumericClass(BufferFormat format) {
 	const auto* info = FindFormatInfo(format);
 	if (info == nullptr || !info->sampled_texture) {

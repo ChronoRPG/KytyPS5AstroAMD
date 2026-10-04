@@ -3999,9 +3999,16 @@ namespace {
 // preparation: pure functions of the registers and constant device limits.
 void FinishMeshStage(const GraphicContext& graphics, ShaderVertexInputInfo& vertex_info) {
 	EXIT_NOT_IMPLEMENTED(!graphics.mesh_shader_enabled);
-	auto& mesh              = vertex_info.mesh;
-	mesh.host_subgroup_size = graphics.subgroup_size;
+	auto& mesh = vertex_info.mesh;
+	// The pipeline requires the wave size where it can (CreatePipelineInternal, shaders.cpp).
+	const auto required =
+	    graphics.GraphicsSubgroupSize(vk::ShaderStageFlagBits::eMeshEXT, mesh.wave_size);
+	mesh.host_subgroup_size = required != 0 ? required : graphics.subgroup_size;
 	const auto& limits      = graphics.mesh_shader_properties;
+	// A device whose X limit is below its total limit (RADV: 65,535) gets programs that take a
+	// group offset, so ExecutePreparedDraw can split a draw with more groups along X.
+	mesh.split_groups =
+	    limits.maxMeshWorkGroupCount[0] < limits.maxMeshWorkGroupTotalCount ? 1u : 0u;
 	const auto  logical_threads = mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
 	const auto  host_threads    = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
 	                          std::min(mesh.host_subgroup_size, mesh.wave_size);
@@ -4097,7 +4104,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	auto& scratch    = ProgramCache::ThreadScratch();
 	auto& evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
 	const uint32_t push_data_start =
-	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwords(
+	                      vertex_info[0].mesh.split_groups != 0)
+	                : 0;
 	const auto serial = [&](std::array<ShaderVertexInputInfo, 3>& vertex_inputs,
 	                        ShaderPixelInputInfo& pixel_input,
 	                        GraphicsStagePreps& preps) -> GraphicsPrograms {
@@ -4170,7 +4179,8 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareGraphicsProgramsSpeculati
 		return SpeculativeResult::ReadFailed;
 	}
 	const uint32_t push_data_start = vertex_info.logical_stage == ShaderType::Mesh
-	                                     ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount
+	                                     ? ShaderRecompiler::IR::PushData::MeshDrawDwords(
+	                                           vertex_info.mesh.split_groups != 0)
 	                                     : 0;
 	const bool compile_ahead = g_program_prefetch.On();
 	const auto result = m_program_cache->TryPrepareSpeculative(

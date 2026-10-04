@@ -1173,8 +1173,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				return entry_ir.ISub(lhs, minimum(lhs, rhs));
 			};
 			const auto local = builtin(IR::StageInputKind::LocalInvocationIndex);
-			const auto primitive_chunk = entry_ir.IMul(builtin(IR::StageInputKind::WorkgroupId, 0),
-			                                           u32(mesh.primitives_per_group));
+			// split_groups: a draw past the host's X group limit is dispatched in parts, and draw
+			// dword 6 is the first group of this part (0 for an unsplit or indirect draw).
+			IR::U32 group = builtin(IR::StageInputKind::WorkgroupId, 0);
+			if (mesh.split_groups != 0) {
+				group = entry_ir.IAdd(group, draw(IR::PushData::MeshFirstGroupDword));
+			}
+			const auto primitive_chunk = entry_ir.IMul(group, u32(mesh.primitives_per_group));
 			const auto step  = u32(mesh.InputPrimitiveStep());
 			const auto size  = u32(mesh.InputPrimitiveSize());
 			const auto chunk = entry_ir.IMul(primitive_chunk, step);
