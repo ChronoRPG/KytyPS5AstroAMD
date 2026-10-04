@@ -3999,8 +3999,11 @@ namespace {
 // preparation: pure functions of the registers and constant device limits.
 void FinishMeshStage(const GraphicContext& graphics, ShaderVertexInputInfo& vertex_info) {
 	EXIT_NOT_IMPLEMENTED(!graphics.mesh_shader_enabled);
-	auto& mesh              = vertex_info.mesh;
-	mesh.host_subgroup_size = graphics.subgroup_size;
+	auto& mesh = vertex_info.mesh;
+	// The pipeline requires the wave size where it can (CreatePipelineInternal, shaders.cpp).
+	const auto required =
+	    graphics.GraphicsSubgroupSize(vk::ShaderStageFlagBits::eMeshEXT, mesh.wave_size);
+	mesh.host_subgroup_size = required != 0 ? required : graphics.subgroup_size;
 	const auto& limits      = graphics.mesh_shader_properties;
 	const auto  logical_threads = mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
 	const auto  host_threads    = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
