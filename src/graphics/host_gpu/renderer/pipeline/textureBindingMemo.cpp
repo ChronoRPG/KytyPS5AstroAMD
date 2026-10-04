@@ -136,6 +136,7 @@ TextureBindingMemo::Key TextureBindingMemo::MakeKey(const ShaderRecompiler::IR::
 	key.read              = resource.read;
 	key.written           = resource.written;
 	key.atomic            = resource.atomic;
+	key.atomic64          = resource.atomic64;
 	key.depth_compare     = resource.depth_compare;
 	key.cube              = resource.cube;
 	key.r128              = resource.r128;
@@ -200,7 +201,7 @@ TextureBindingMemo::PackedKey TextureBindingMemo::PackKey(const Key& key) {
 	            (static_cast<uint64_t>(static_cast<uint32_t>(key.mip_mode)) << 32u);
 	const uint64_t flags = (key.read ? 1u : 0u) | (key.written ? 2u : 0u) | (key.atomic ? 4u : 0u) |
 	                       (key.depth_compare ? 8u : 0u) | (key.cube ? 16u : 0u) |
-	                       (key.r128 ? 32u : 0u);
+	                       (key.r128 ? 32u : 0u) | (key.atomic64 ? 64u : 0u);
 	packed[7] = static_cast<uint32_t>(key.conversion_format) | (flags << 32u);
 	return packed;
 }

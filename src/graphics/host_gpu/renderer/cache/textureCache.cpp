@@ -1880,13 +1880,6 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
 			return {depth_id};
 		}
-		if (requested.IsBlock() && !cached.info.IsBlock()) {
-			return {ExpandImage(requested, cached_id)};
-		}
-		if (requested.data.size == cached.info.data.size &&
-		    (requested.IsVolume() || cached.info.IsVolume())) {
-			return {ExpandImage(requested, cached_id)};
-		}
 		// Equal pitch does not imply equal mip placement: a changed extent can move
 		// a level into or out of the mip tail. These are separate guest layouts.
 		if (requested.tile_mode != cached.info.tile_mode ||
@@ -1896,6 +1889,19 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 				FreeImage(cached_id, HangTrace::ImageFreeReason::OverlapLayout);
 			}
 			return {merged_id};
+		}
+		if (requested.IsBlock() && !cached.info.IsBlock()) {
+			return {ExpandImage(requested, cached_id)};
+		}
+		// Volume depth is not an array-layer count. A larger depth can retain the
+		// same block-slice layout while requiring a larger native image.
+		if ((requested.IsVolume() || cached.info.IsVolume()) &&
+		    (requested.data.size == cached.info.data.size ||
+		     (requested.type == cached.info.type && requested.resources == cached.info.resources &&
+		      requested.extent.width == cached.info.extent.width &&
+		      requested.extent.height == cached.info.extent.height &&
+		      requested.extent.depth > cached.info.extent.depth))) {
+			return {ExpandImage(requested, cached_id)};
 		}
 		// PPSA08394
 		if (requested.data.size == cached.info.data.size &&
@@ -1984,7 +1990,12 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	const auto expanded_id = InsertImage(info);
 	auto&      expanded    = m_slot_images[expanded_id];
 	auto&      source      = m_slot_images[source_id];
-	expanded.usage         = source.usage;
+	// A block-compressed image keeps its own guest layout and texture transfers: it does not
+	// inherit render-target or storage usage from the non-block image it replaces (upstream
+	// 0d4f99335, reused BC5 textures).
+	if (!info.IsBlock() || source.info.IsBlock()) {
+		expanded.usage = source.usage;
+	}
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
 	}
@@ -2947,8 +2958,10 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		image.info.metadata = desc.info.metadata;
 		// A native DCC allocation must not retain a reused HTile/CMask/FMask interpretation.
 		EraseSurfaceMeta(range.address);
-		if (range.size == 0 || desc.info.resources.levels != 1 || image.info.resources.levels != 1) {
-			// Decided by the description and the image's level count (fixed for its lifetime).
+		// A single-mip target reused from a cached mip chain clears its view's mip (upstream
+		// 0ec3655f1); the image's own level count does not matter.
+		if (range.size == 0 || desc.info.resources.levels != 1) {
+			// Decided by the description alone.
 			if (noop != nullptr) {
 				noop->provable = true;
 			}
@@ -3216,11 +3229,16 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
 			            image_first + slice, 1}, clear);
 		}
-		// Native expanded keys own consumption. Existing buffer tracking publishes this CPU
-		// write to future GPU readers; FillBuffer can fault and must run outside the texture lock.
+		// Publish the conversion's expanded keys without treating them as guest writes
+		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
 			KYTY_PROFILER_DETAIL_BLOCK("DCC::ConsumeClearKey");
-			m_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
+			// Not a guest write (no write fault): images over the metadata bytes keep their
+			// contents (upstream 190608ae2). Like FillBuffer, retire a metadata clear recorded here.
+			(void)ClearMeta(address);
+			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
+			m_buffer_cache.InvalidateMemory(address, slice_size);
+			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 		if (diagnostic_readback != 0) {
 			TraceDccDiagnostic(

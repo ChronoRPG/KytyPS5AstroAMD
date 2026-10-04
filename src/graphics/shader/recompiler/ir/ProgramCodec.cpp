@@ -19,7 +19,7 @@ namespace {
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
 // Update the encoders and decoders below, then these sizes, when one of these types changes.
 // Members: Inst 7; Value 2 (type and one union member); MemoryInfo 25; BufferResource 12;
-// ImageResource 19; SamplerResource 4; SampledResourcePair 3; StageInput 5; StageOutput 4;
+// ImageResource 20; SamplerResource 7; SampledResourcePair 3; StageInput 5; StageOutput 4;
 // ShaderInfo 10; DescriptorBinding 2; BindingLayout 6; WriteRangeNode 6; WriteRangeAccess 5;
 // BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 3 (IndirectImage
 // 7); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
@@ -30,7 +30,7 @@ static_assert(sizeof(Value) == 16, "IR::Value changed: update ProgramCodec");
 static_assert(sizeof(MemoryInfo) == 72, "IR::MemoryInfo changed: update ProgramCodec");
 static_assert(sizeof(BufferResource) == 36, "IR::BufferResource changed: update ProgramCodec");
 static_assert(sizeof(ImageResource) == 80, "IR::ImageResource changed: update ProgramCodec");
-static_assert(sizeof(SamplerResource) == 12, "IR::SamplerResource changed: update ProgramCodec");
+static_assert(sizeof(SamplerResource) == 16, "IR::SamplerResource changed: update ProgramCodec");
 static_assert(sizeof(SampledResourcePair) == 12, "IR::SampledResourcePair changed: update ProgramCodec");
 static_assert(sizeof(StageInput) == 56, "IR::StageInput changed: update ProgramCodec");
 static_assert(sizeof(StageOutput) == 48, "IR::StageOutput changed: update ProgramCodec");
@@ -383,6 +383,7 @@ void Write(CodecWriter& w, const ImageResource& v) {
 	w.Bool(v.read);
 	w.Bool(v.written);
 	w.Bool(v.atomic);
+	w.Bool(v.atomic64);
 	w.Bool(v.depth_compare);
 	w.Bool(v.cube);
 	w.Bool(v.r128);
@@ -405,6 +406,7 @@ void Read(CodecReader& r, ImageResource& v) {
 	v.read                       = r.Bool();
 	v.written                    = r.Bool();
 	v.atomic                     = r.Bool();
+	v.atomic64                   = r.Bool();
 	v.depth_compare              = r.Bool();
 	v.cube                       = r.Bool();
 	v.r128                       = r.Bool();
@@ -417,17 +419,21 @@ void Read(CodecReader& r, ImageResource& v) {
 void Write(CodecWriter& w, const SamplerResource& v) {
 	w.U32(v.source);
 	w.U32(v.first_use_pc);
+	w.U32(v.snapshot_index);
 	w.Bool(v.force_point_filtering);
 	w.Bool(v.depth_compare);
 	w.Bool(v.integer_border);
+	w.Bool(v.gather_lod);
 }
 
 void Read(CodecReader& r, SamplerResource& v) {
 	v.source                = r.U32();
 	v.first_use_pc          = r.U32();
+	v.snapshot_index        = r.U32();
 	v.force_point_filtering = r.Bool();
 	v.depth_compare         = r.Bool();
 	v.integer_border        = r.Bool();
+	v.gather_lod            = r.Bool();
 }
 
 void Write(CodecWriter& w, const SampledResourcePair& v) {
@@ -936,7 +942,7 @@ public:
 			}
 			source.dword_count = r.U32();
 			if (r.Bool()) {
-				auto& image           = source.indirect_image.emplace();
+				auto& image = source.indirect_image.emplace(DescriptorSource::IndirectImage {});
 				image.material_source = r.U32();
 				image.table_source    = r.U32();
 				image.selector_stride = r.U32();

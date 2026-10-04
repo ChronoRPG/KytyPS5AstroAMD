@@ -73,8 +73,9 @@ struct WindowContext {
 	void                                                    UpdateIcon();
 	void                                                    UpdateTitle();
 	/// Resizes the drawable surface to the given pixel dimensions.
-	/// Sets `minimized = false` on a positive size; sets `minimized = true` and returns early on zero.
-	void Resize(uint32_t width, uint32_t height);
+	/// Sets `minimized = false` on a positive size; sets `minimized = true` and returns early on a
+	/// nonpositive one.
+	void Resize(int width, int height);
 	/// Dispatches a single SDL window event and keeps `minimized` up to date.
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
