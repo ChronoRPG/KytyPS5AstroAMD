@@ -10318,6 +10318,7 @@ void TestMeshInputAssembly() {
        0x81000608, 32, 33, 34, 0, 43, false, 32},
   };
   for (const auto &test : cases) {
+   for (const uint32_t split : {0u, 1u}) {
     ShaderVertexInputInfo input{};
     auto &mesh = input.mesh;
     mesh.input_primitive = static_cast<uint32_t>(test.topology);
@@ -10326,6 +10327,7 @@ void TestMeshInputAssembly() {
     mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
     mesh.threads_num[0] = 256;
     mesh.threads_num[1] = mesh.threads_num[2] = 1;
+    mesh.split_groups = split;
     Decoder::Program decoded;
     CFG::Graph graph;
     CFG::BasicBlock block;
@@ -10339,23 +10341,32 @@ void TestMeshInputAssembly() {
     options.user_data_count = 0;
     options.input_info.vertex = &input;
     auto program = Frontend::TranslateProgram(decoded, graph, options);
-    const uint32_t draw[] = {test.count, test.base_vertex, 7, test.width,
-                             test.address_low, 0x12};
+    // split_groups: a part of a split draw starts at draw dword 6's group and WorkgroupId.x
+    // counts from there, so the same group is reached with WorkgroupId.x 0. A program without
+    // split_groups (NVIDIA) must not read dword 6.
+    const uint32_t first_group = split != 0 ? test.group : 0u;
+    const uint32_t draw[] = {test.count,       test.base_vertex, 7, test.width,
+                             test.address_low, 0x12,             first_group};
+    static_assert(std::size(draw) == PushData::MeshDrawDwords(true));
+    uint32_t first_group_reads = 0;
     Inst *load = nullptr;
     for (auto &inst : *program.blocks.front()) {
       if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
+        first_group_reads += inst.Arg(0).U32() == PushData::MeshFirstGroupDword ? 1u : 0u;
         inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
       } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
         const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
         const uint32_t value = kind == StageInputKind::LocalInvocationIndex
                                    ? test.lane
-                                   : inst.Arg(1).U32() == 0 ? test.group : 2;
+                                   : inst.Arg(1).U32() == 0 ? test.group - first_group : 2;
         inst.ReplaceUsesWith(Value(value));
       } else if (inst.GetOpcode() == ValueOpcode::LoadAddressU32) {
         Check(load == nullptr, "mesh index fetch emitted duplicate loads");
         load = &inst;
       }
     }
+    Check(first_group_reads == split,
+          "mesh prolog read the first-group draw dword without split_groups, or not with it");
     ConstantPropagationPass(program.blocks);
     Check(load != nullptr && load->Arg(1).Resolve().U32() == test.byte_offset &&
               load->Arg(3).Resolve().U1() == test.fetch,
@@ -10379,6 +10390,7 @@ void TestMeshInputAssembly() {
     Check(sgpr3 == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
               vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id && vgprs[8] == 9,
           "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
+   }
   }
 }
 

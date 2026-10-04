@@ -314,6 +314,13 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 51u);
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// Mesh draw dword 6, only for programs with ShaderMeshInputInfo::split_groups: the first
+	// workgroup of this part of a draw split past the host's X group limit (0 when unsplit; a
+	// native indirect draw's parameter block holds 0 there).
+	static constexpr uint32_t MeshFirstGroupDword = MeshDrawDwordCount;
+	[[nodiscard]] static constexpr uint32_t MeshDrawDwords(bool split_groups) {
+		return MeshDrawDwordCount + (split_groups ? 1u : 0u);
+	}
 	// Mesh draw dword 3 (the index size: 0, 1, 2 or 4 when pushed by the CPU) marking a native
 	// indirect mesh draw: dwords 0-1 then hold the device address of the dispatch's parameter
 	// block, whose first MeshDrawDwordCount dwords replace the pushed ones (CodegenOptions::

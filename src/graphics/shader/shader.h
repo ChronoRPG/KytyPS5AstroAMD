@@ -88,6 +88,11 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_vertices         = 0;
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
+	// 1 when the device's X workgroup limit is below its total (RADV: 65,535 in X): a draw with
+	// more groups is split, and the program adds the part's first group, mesh draw dword
+	// IR::PushData::MeshFirstGroupDword, to WorkgroupId.x. 0 (NVIDIA: X equals the total) keeps
+	// the six draw dwords and the program as before.
+	uint32_t split_groups         = 0;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {

@@ -36,7 +36,8 @@ class StreamBuffer;
 //  - more than Records dispatches (instances per dispatch x Records < instance count): the CPU
 //    path records them all, the GPU conversion drops the rest (StatusOverflow);
 //  - a draw the host cannot dispatch at all (more workgroups than the host limits): the CPU path
-//    stops the emulator, the conversion draws nothing (StatusLimits);
+//    stops the emulator, or with ShaderMeshInputInfo::split_groups dispatches the groups in parts,
+//    the conversion draws nothing (StatusLimits);
 //  - an indexed record whose start + clamped count passes INDEX_BUFFER_SIZE: both read the same
 //    index bytes, but only [INDEX_BASE, +INDEX_BUFFER_SIZE) was registered and synchronized for
 //    the mesh shader's address reads (the CPU path registers the exact range) (StatusIndexRange).
