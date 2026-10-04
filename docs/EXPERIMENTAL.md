@@ -4,6 +4,13 @@ This release builds on the U59 renderer and the Demon's Souls changes of the pre
 
 ## New in this update
 
+- More adaptive trigger fixes, tested in Astro's Playroom: the gacha capsules break on R2 again. A feedback trigger
+  now reports "pushing" only while it is pressed (it did so untouched before, so the game never saw the press); the
+  state follows every effect the game sets; and an L2/R2 that arrives as a button only (input remapping, some pads
+  and tools) counts as a full press. Nothing else changed since int10; program caches stay valid.
+
+From int10 (`u59-windows-20261004-int10`):
+
 - Adaptive triggers: the game now sees the state of the trigger effects it sets (`scePadGetTriggerEffectState`
   always answered 0 before). Astro Bot levels in which L2/R2 actions, such as punches, did nothing now work. The
   state follows from the game's effect and how far the trigger is pressed, so it also works with other pads and the
