@@ -641,11 +641,20 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.module = compute_module;
 	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
+	// One guest wave per host subgroup: the wave size on AMD, 32 where the driver would otherwise
+	// pick the width (Intel), nothing on NVIDIA (GraphicContext::ComputeSubgroupSize).
 	const auto wave_size = input_info.stage.program->wave_size;
-	if (graphics.compute_subgroup_size_control_enabled &&
-	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
-		comp_subgroup_size.requiredSubgroupSize = wave_size;
+	const auto required  = graphics.ComputeSubgroupSize(wave_size, input_info.host_subgroup_size);
+	if (required != 0) {
+		comp_subgroup_size.requiredSubgroupSize = required;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
+	} else if (graphics.min_subgroup_size < graphics.max_subgroup_size) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true)) {
+			LOGF("Vulkan subgroup: wave%u compute shader on a device that cannot require its "
+			     "subgroup size (%u to %u); its lane operations may split or mix waves\n",
+			     wave_size, graphics.min_subgroup_size, graphics.max_subgroup_size);
+		}
 	}
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;

@@ -702,6 +702,11 @@ target_include_directories(shader_code_snapshot_tests PRIVATE ${inc_headers})
 add_executable(vram_budget_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/VramBudgetTests.cpp")
 target_include_directories(vram_budget_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+# Device-capability choices for AMD, Intel and older NVIDIA GPUs (graphics/host_gpu/deviceCompat.h).
+add_executable(device_compat_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/DeviceCompatTests.cpp")
+target_link_libraries(device_compat_tests Vulkan::Headers)
+target_include_directories(device_compat_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -1055,6 +1060,7 @@ if(BUILD_TESTING)
 		ENVIRONMENT "KYTY_PIPELINE_PREFETCH=1;KYTY_DRAW_RUN=exit;KYTY_PIPELINE_COLD_SALT=128"
 		TIMEOUT 180)
 	add_test(NAME vram_budget COMMAND $<TARGET_FILE:vram_budget_tests>)
+	add_test(NAME device_compat COMMAND $<TARGET_FILE:device_compat_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -2017,6 +2023,7 @@ if(BUILD_TESTING)
 		lru_cache_tests
 		spirv_local_arrays_tests
 		vram_budget_tests
+		device_compat_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests

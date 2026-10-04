@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/deviceCompat.h"
 #include "graphics/host_gpu/queueSubmission.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
@@ -164,6 +165,21 @@ struct GraphicContext {
 			return 0;
 		}
 		return wave_size;
+	}
+
+	// The subgroup size a compute pipeline must require so that one host subgroup holds one guest
+	// wave, or 0 (DeviceCompat::ComputeSubgroupSize): the wave size on AMD as before, 32 on devices
+	// whose drivers pick a width per shader (Intel: 8 to 32), nothing on NVIDIA (always 32).
+	[[nodiscard]] uint32_t ComputeSubgroupSize(uint32_t wave_size,
+	                                           uint32_t host_subgroup_size) const noexcept {
+		return DeviceCompat::ComputeSubgroupSize(
+		    {.min_size       = min_subgroup_size,
+		     .max_size       = max_subgroup_size,
+		     .enabled        = subgroup_size_control_enabled,
+		     .compute        = static_cast<bool>(required_subgroup_size_stages &
+		                                         vk::ShaderStageFlagBits::eCompute),
+		     .compute_wave64 = compute_subgroup_size_control_enabled},
+		    wave_size, host_subgroup_size);
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {
