@@ -992,11 +992,13 @@ void TextureCache::UnregisterImage(ImageId id) {
 	});
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
-	if (accounted > m_total_used_memory) {
+	// With VK_EXT_memory_budget the collector sets m_total_used_memory to the device-local usage,
+	// which can be below the images' own bytes (allocations outside the device-local heaps when
+	// VRAM runs short), so it saturates. m_registered_image_memory is the exact owned count.
+	m_total_used_memory -= std::min(m_total_used_memory, accounted);
+	if (accounted > m_registered_image_memory) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
-	m_total_used_memory -= accounted;
-	EXIT_IF(accounted > m_registered_image_memory);
 	m_registered_image_memory -= accounted;
 	image.registered = false;
 }

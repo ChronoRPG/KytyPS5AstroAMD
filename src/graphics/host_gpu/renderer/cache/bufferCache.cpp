@@ -792,8 +792,12 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
 		m_buffers.erase(found);
-		EXIT_IF(buffer.Size() > m_total_used_memory);
-		m_total_used_memory -= buffer.Size();
+		// With VK_EXT_memory_budget the collector sets m_total_used_memory to the device-local
+		// usage, which can be below the buffers' own bytes (allocations outside the device-local
+		// heaps when VRAM runs short), so it saturates. Without it the counter is the buffers'
+		// own bytes and must not underflow.
+		EXIT_IF(buffer.Size() > m_total_used_memory && !m_graphics.CanReportMemoryUsage());
+		m_total_used_memory -= std::min(m_total_used_memory, buffer.Size());
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(pages.first * sizeof(vk::DeviceAddress),
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
