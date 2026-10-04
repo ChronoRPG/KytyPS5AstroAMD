@@ -36,8 +36,7 @@ static int KYTY_SYSV_ABI PadGetTriggerEffectState(int                           
 		return -2137653243; /* 0x80960005 */
 	}
 
-	info->state[0] = 0;
-	info->state[1] = 0;
+	Controller::GetTriggerEffectState(info->state);
 
 	return 0;
 }

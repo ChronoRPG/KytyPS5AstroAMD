@@ -120,6 +120,7 @@ public:
 	int  GetActiveControllerId();
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
 	bool SetTriggerEffect(const PadTriggerEffectParam& param);
+	void GetTriggerEffectState(int32_t* state);
 	void  CycleSetting(Setting setting);
 	float GetSettingScale(Setting setting) const;
 	void ReadState(ControllerState* state, bool* flag, int* count);
@@ -328,6 +329,61 @@ static bool trigger_effect_to_dualsense(const PadTriggerEffectCommand& command, 
 		case 6: return trigger_effect_zones(effect, command.data + 1, scale, 0x26, command.data[0]);
 		default: return false;
 	}
+}
+
+// scePadGetTriggerEffectState values (libScePad; duaLib names them SCE_PAD_TRIGGER_STATE_*).
+enum TriggerState : int32_t {
+	TRIGGER_STATE_FEEDBACK_NO_FORCE     = 1,
+	TRIGGER_STATE_FEEDBACK_IS_PUSHING   = 2,
+	TRIGGER_STATE_WEAPON_NOT_PRESSED    = 3,
+	TRIGGER_STATE_WEAPON_ALMOST_PRESSED = 4,
+	TRIGGER_STATE_WEAPON_FULLY_PRESSED  = 5,
+	TRIGGER_STATE_VIBRATION_NOT_FIRING  = 6,
+	TRIGGER_STATE_VIBRATION_IS_FIRING   = 7,
+};
+
+// A real DualSense reports which effect runs and where the trigger is against it. Without that
+// report (SDL does not expose it, and other pads have no trigger motors) the state follows from the
+// game's effect and the trigger's travel: 0..255 maps to the effect's ten positions 0..9. Games
+// such as Astro Bot wait for the weapon or feedback state before acting on L2/R2; the state
+// stayed 0 before, so those actions never happened.
+int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int value) {
+	const int pos = std::clamp(value, 0, 255) * 10 / 256;
+	switch (command.mode) {
+		case 1: // feedback: resistance from position data[0], strength data[1]
+			return command.data[1] != 0 && pos >= command.data[0] ? TRIGGER_STATE_FEEDBACK_IS_PUSHING
+			                                                      : TRIGGER_STATE_FEEDBACK_NO_FORCE;
+		case 2: // weapon: resistance from data[0], released at data[1]
+			if (pos >= command.data[1]) {
+				return TRIGGER_STATE_WEAPON_FULLY_PRESSED;
+			}
+			return pos >= command.data[0] ? TRIGGER_STATE_WEAPON_ALMOST_PRESSED
+			                              : TRIGGER_STATE_WEAPON_NOT_PRESSED;
+		case 3: // vibration from position data[0], amplitude data[1], frequency data[2]
+			return command.data[1] != 0 && command.data[2] != 0 && pos >= command.data[0]
+			           ? TRIGGER_STATE_VIBRATION_IS_FIRING
+			           : TRIGGER_STATE_VIBRATION_NOT_FIRING;
+		case 4: // multiple-position feedback: strength per position
+			return command.data[pos] != 0 ? TRIGGER_STATE_FEEDBACK_IS_PUSHING
+			                              : TRIGGER_STATE_FEEDBACK_NO_FORCE;
+		case 5: // slope feedback from position data[0]
+			return pos >= command.data[0] ? TRIGGER_STATE_FEEDBACK_IS_PUSHING
+			                              : TRIGGER_STATE_FEEDBACK_NO_FORCE;
+		case 6: // multiple-position vibration: frequency data[0], amplitude per position
+			return command.data[0] != 0 && command.data[1 + pos] != 0
+			           ? TRIGGER_STATE_VIBRATION_IS_FIRING
+			           : TRIGGER_STATE_VIBRATION_NOT_FIRING;
+		default: return 0;
+	}
+}
+
+void GetTriggerEffectState(int32_t* state) {
+	if (g_controller == nullptr) {
+		state[0] = 0;
+		state[1] = 0;
+		return;
+	}
+	g_controller->GetTriggerEffectState(state);
 }
 
 void Initialize() {
@@ -743,6 +799,16 @@ bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
 		}
 	}
 	return true;
+}
+
+void GameController::GetTriggerEffectState(int32_t* state) {
+	Common::LockGuard lock(m_mutex);
+	const int         axes[2] = {static_cast<int>(Axis::TriggerLeft), static_cast<int>(Axis::TriggerRight)};
+	for (int i = 0; i < 2; i++) {
+		state[i] = (m_trigger_effect.trigger_mask & (1u << i)) != 0
+		               ? TriggerEffectState(m_trigger_effect.command[i], m_state.axes[axes[i]])
+		               : 0;
+	}
 }
 
 bool GameController::SendTriggerEffect(const PadTriggerEffectParam& param) {

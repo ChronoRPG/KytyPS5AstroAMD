@@ -79,6 +79,8 @@ enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity }
 
 void  CycleSetting(Setting setting);
 float GetSettingScale(Setting setting);
+// scePadGetTriggerEffectState: per trigger, the state of the game's effect at the trigger's travel.
+void GetTriggerEffectState(int32_t* state);
 
 int KYTY_SYSV_ABI PadInit();
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param);
