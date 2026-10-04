@@ -5062,6 +5062,11 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
   CheckSpirvBinaryValidates(buffer.spirv);
 }
 
+// IMAGE_GET_LOD whose result is never read: the query is dead code and goes before resource
+// tracking, so the program has no image resource. Materialization must not remap the memory entry
+// the removed query left behind (it exited at ImageRemap::operator[] with no image in the
+// specialization). The query of a used result is covered by the pixel fixture in
+// TestDemandDrivenSpirvDeclarations.
 void TestNewShaderRecompilerImageQueryTranslation() {
   const uint32_t shader[] = {
       EncodeMimg0(0x60, 0x3),
@@ -5075,32 +5080,14 @@ void TestNewShaderRecompilerImageQueryTranslation() {
   options.user_data = user_data;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("image_get_lod") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_GET_LOD") != std::string::npos),
         "new decoder did not decode MIMG image get-lod query");
   Check((result.decoded_dump.find("dmask=0x3") != std::string::npos),
         "image_get_lod decode did not preserve dmask metadata");
-  Check((result.ir_dump.find("ImageGetLod v6") != std::string::npos),
-        "image_get_lod did not lower to explicit query IR");
-  Check((result.ir_dump.find("data_dwords=2") != std::string::npos),
-        "image_get_lod did not preserve two-component result metadata");
-  Check((result.ir_dump.find("image_addr=2") != std::string::npos),
-        "image_get_lod did not preserve address component metadata");
-  Check(SpirvContainsOpcode(result.spirv, 105),
-        "SPIR-V binary does not contain OpImageQueryLod");
-  Check(
-      SpirvContainsOpcode(result.spirv, 80),
-      "SPIR-V binary does not contain coordinate composite for image_get_lod");
-  Check(SpirvContainsOpcode(result.spirv, 81),
-        "SPIR-V binary does not contain dmask extraction for image_get_lod");
-  Check(SpirvContainsOpcode(result.spirv, 124),
-        "SPIR-V binary does not contain result bitcast for image_get_lod");
-  Check(std::find(result.spirv.begin(), result.spirv.end(), 5288u) !=
-            result.spirv.end(),
-        "SPIR-V binary does not request compute derivative group capability");
-  Check(
-      std::find(result.spirv.begin(), result.spirv.end(), 5289u) !=
-          result.spirv.end(),
-      "SPIR-V binary does not request compute derivative group execution mode");
+  Check((result.ir_dump.find("ImageQueryLod") == std::string::npos),
+        "image_get_lod with an unused result was not removed as dead code");
+  Check(!SpirvContainsOpcode(result.spirv, 105),
+        "SPIR-V binary queries the LOD of an unused image_get_lod");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -14750,6 +14737,7 @@ int main(int argc, char **argv) {
   TestWaveRowReduction();
   TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
+  TestNewShaderRecompilerImageQueryTranslation();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
   TestFusedShaderHandoffPreservesRegisters();

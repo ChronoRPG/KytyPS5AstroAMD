@@ -1496,15 +1496,24 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
 		}
 	}
+	// Dead-code elimination can remove an image operation (an unused IMAGE_GET_LOD result) before
+	// resource tracking, which leaves its memory entry behind with the frontend's descriptor
+	// register as the resource: no image was tracked for it, so it is not remapped.
+	std::vector<bool> memory_used(memory_info.size(), false);
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {
 			if (inst.GetOpcode() == ValueOpcode::GetImageResource) {
 				inst.SetFlags(image_remap[inst.Flags<uint32_t>()]);
+			} else if (ImageOpcodeInfoOf(inst.GetOpcode()).access != ImageAccess::None) {
+				const auto index = inst.Flags<MemoryFlags>().index;
+				EXIT_IF(index >= memory_info.size());
+				memory_used[index] = true;
 			}
 		}
 	}
-	for (auto& memory: memory_info) {
-		if (memory.kind == ResourceKind::Image && !memory.planning_only) {
+	for (size_t index = 0; index < memory_info.size(); index++) {
+		auto& memory = memory_info[index];
+		if (memory.kind == ResourceKind::Image && !memory.planning_only && memory_used[index]) {
 			memory.resource = image_remap[memory.resource];
 		}
 	}
