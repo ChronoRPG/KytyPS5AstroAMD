@@ -18,6 +18,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -155,11 +156,22 @@ private:
 	std::array<uint8_t, 2> m_vibration {};
 	uint64_t               m_vibration_until = 0;
 	PadTriggerEffectParam  m_trigger_effect {};
+	// Every effect the game set, for scePadGetTriggerEffectState (m_trigger_effect only keeps sent ones).
+	PadTriggerEffectParam  m_state_effect {};
 	// Setting changes share the output lock; audio only needs an atomic scale snapshot.
 	std::array<std::atomic<uint32_t>, 3> m_setting_steps {};
 };
 
 static GameController* g_controller = nullptr;
+
+// A trigger's travel, 0..255. An L2/R2 that arrives as a button only (input remapping, pads or tools
+// that report the trigger digitally) counts as full travel, as for the keyboard.
+static int TriggerTravel(const ControllerState& state, Axis axis) {
+	const auto button = axis == Axis::TriggerLeft ? PAD_BUTTON_L2 : PAD_BUTTON_R2;
+	const int  value  = state.axes[static_cast<int>(axis)];
+	// An analog press also sets the button, so only a button without any travel is digital.
+	return (state.buttons & button) != 0 && value == 0 ? 255 : value;
+}
 
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
                           int connected_count) {
@@ -172,8 +184,8 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	data->left_stick_y      = state.axes[static_cast<int>(Axis::LeftY)];
 	data->right_stick_x     = state.axes[static_cast<int>(Axis::RightX)];
 	data->right_stick_y     = state.axes[static_cast<int>(Axis::RightY)];
-	data->analog_buttons_l2 = state.axes[static_cast<int>(Axis::TriggerLeft)];
-	data->analog_buttons_r2 = state.axes[static_cast<int>(Axis::TriggerRight)];
+	data->analog_buttons_l2 = static_cast<uint8_t>(TriggerTravel(state, Axis::TriggerLeft));
+	data->analog_buttons_r2 = static_cast<uint8_t>(TriggerTravel(state, Axis::TriggerRight));
 	data->acceleration_x     = state.accel[0];
 	data->acceleration_y     = state.accel[1];
 	data->acceleration_z     = state.accel[2];
@@ -347,11 +359,17 @@ enum TriggerState : int32_t {
 // game's effect and the trigger's travel: 0..255 maps to the effect's ten positions 0..9. Games
 // such as Astro Bot wait for the weapon or feedback state before acting on L2/R2; the state
 // stayed 0 before, so those actions never happened.
+// Travel below which a trigger counts as released (analog rest noise).
+constexpr int TRIGGER_PRESSED_MIN = 8;
+
 int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int value) {
 	const int pos = std::clamp(value, 0, 255) * 10 / 256;
+	// A feedback trigger pushes against the finger only while it is pressed: an effect from
+	// position 0 on an untouched trigger is "no force" (Astro's Playroom waits for the change).
+	const bool pressed = value >= TRIGGER_PRESSED_MIN;
 	switch (command.mode) {
 		case 1: // feedback: resistance from position data[0], strength data[1]
-			return command.data[1] != 0 && pos >= command.data[0] ? TRIGGER_STATE_FEEDBACK_IS_PUSHING
+			return pressed && command.data[1] != 0 && pos >= command.data[0] ? TRIGGER_STATE_FEEDBACK_IS_PUSHING
 			                                                      : TRIGGER_STATE_FEEDBACK_NO_FORCE;
 		case 2: // weapon: resistance from data[0], released at data[1]
 			if (pos >= command.data[1]) {
@@ -364,10 +382,10 @@ int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int value) {
 			           ? TRIGGER_STATE_VIBRATION_IS_FIRING
 			           : TRIGGER_STATE_VIBRATION_NOT_FIRING;
 		case 4: // multiple-position feedback: strength per position
-			return command.data[pos] != 0 ? TRIGGER_STATE_FEEDBACK_IS_PUSHING
+			return pressed && command.data[pos] != 0 ? TRIGGER_STATE_FEEDBACK_IS_PUSHING
 			                              : TRIGGER_STATE_FEEDBACK_NO_FORCE;
 		case 5: // slope feedback from position data[0]
-			return pos >= command.data[0] ? TRIGGER_STATE_FEEDBACK_IS_PUSHING
+			return pressed && pos >= command.data[0] ? TRIGGER_STATE_FEEDBACK_IS_PUSHING
 			                              : TRIGGER_STATE_FEEDBACK_NO_FORCE;
 		case 6: // multiple-position vibration: frequency data[0], amplitude per position
 			return command.data[0] != 0 && command.data[1 + pos] != 0
@@ -486,6 +504,7 @@ void GameController::CheckActive() {
 	m_vibration          = {};
 	m_vibration_until    = 0;
 	m_trigger_effect     = {};
+	m_state_effect       = {};
 }
 
 void GameController::AddState() {
@@ -789,7 +808,30 @@ void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
 
 bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
 	Common::LockGuard lock(m_mutex);
+	// The state the game reads back follows every effect it sets, also one the DualSense output
+	// cannot reproduce (values outside the ranges trigger_effect_to_dualsense converts).
+	if ((param.trigger_mask & ~0x03u) == 0) {
+		for (int i = 0; i < 2; i++) {
+			if ((param.trigger_mask & (1u << i)) != 0) {
+				m_state_effect.trigger_mask |= static_cast<uint8_t>(1u << i);
+				m_state_effect.command[i] = param.command[i];
+			}
+		}
+	}
 	if (!SendTriggerEffect(param)) {
+		static std::atomic<int> logged {0};
+		if (logged.fetch_add(1) < 16) {
+			for (int i = 0; i < 2; i++) {
+				if ((param.trigger_mask & (1u << i)) != 0) {
+					const auto& c = param.command[i];
+					std::fprintf(stderr,
+					             "Pad: trigger effect not sent to the controller: mask=0x%x trigger=%d mode=%u "
+					             "data=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
+					             param.trigger_mask, i, c.mode, c.data[0], c.data[1], c.data[2], c.data[3],
+					             c.data[4], c.data[5], c.data[6], c.data[7], c.data[8], c.data[9], c.data[10]);
+				}
+			}
+		}
 		return false;
 	}
 	for (int i = 0; i < 2; i++) {
@@ -803,11 +845,22 @@ bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
 
 void GameController::GetTriggerEffectState(int32_t* state) {
 	Common::LockGuard lock(m_mutex);
-	const int         axes[2] = {static_cast<int>(Axis::TriggerLeft), static_cast<int>(Axis::TriggerRight)};
+	const int axes[2] = {static_cast<int>(Controller::Axis::TriggerLeft), static_cast<int>(Controller::Axis::TriggerRight)};
 	for (int i = 0; i < 2; i++) {
-		state[i] = (m_trigger_effect.trigger_mask & (1u << i)) != 0
-		               ? TriggerEffectState(m_trigger_effect.command[i], m_state.axes[axes[i]])
+		state[i] = (m_state_effect.trigger_mask & (1u << i)) != 0
+		               ? TriggerEffectState(m_state_effect.command[i],
+		                                    TriggerTravel(m_state, static_cast<Controller::Axis>(axes[i])))
 		               : 0;
+	}
+	// The first changes, for reports from games whose trigger actions still do not react.
+	static int                    reports = 0;
+	static std::array<int32_t, 2> last {-1, -1};
+	if (reports < 32 && (state[0] != last[0] || state[1] != last[1])) {
+		std::fprintf(stderr, "Pad: trigger state %d,%d (modes %u,%u, travel %d,%d)\n", state[0], state[1],
+		             m_state_effect.command[0].mode, m_state_effect.command[1].mode,
+		             TriggerTravel(m_state, Controller::Axis::TriggerLeft), TriggerTravel(m_state, Controller::Axis::TriggerRight));
+		last = {state[0], state[1]};
+		reports++;
 	}
 }
 

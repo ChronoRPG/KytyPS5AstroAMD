@@ -326,6 +326,70 @@ void TestIndependentOutputsAndPadSwitch() {
 		      "released controller retained a cached vibration");
 	}
 }
+
+// scePadGetTriggerEffectState: the state of each trigger's effect at the trigger's travel.
+void TestTriggerEffectState() {
+	Controller controller;
+	int32_t    state[2] = {-1, -1};
+	GetTriggerEffectState(state);
+	Check(state[0] == 0 && state[1] == 0, "a trigger without an effect reported a state");
+
+	PadTriggerEffectParam param {};
+	param.trigger_mask       = 3;
+	param.command[0].mode    = 1; // feedback from position 4
+	param.command[0].data[0] = 4;
+	param.command[0].data[1] = 8;
+	param.command[1].mode    = 2; // weapon: resistance from 2, released at 7
+	param.command[1].data[0] = 2;
+	param.command[1].data[1] = 7;
+	param.command[1].data[2] = 6;
+	Check(PadSetTriggerEffect(1, &param) == 0, "trigger request failed");
+
+	const auto states_at = [&](int left, int right) {
+		SetAxis(1, Axis::TriggerLeft, left);
+		SetAxis(1, Axis::TriggerRight, right);
+		GetTriggerEffectState(state);
+	};
+	states_at(0, 0);
+	Check(state[0] == 1 && state[1] == 3, "released triggers: feedback no force, weapon not pressed");
+	states_at(102, 52); // positions 3 and 2
+	Check(state[0] == 1 && state[1] == 4, "before the feedback zone, inside the weapon's resistance");
+	states_at(103, 178); // positions 4 and 6
+	Check(state[0] == 2 && state[1] == 4, "feedback pushing, weapon not yet released");
+	states_at(255, 180); // positions 9 and 7
+	Check(state[0] == 2 && state[1] == 5, "full feedback travel, weapon released");
+
+	// Vibration, and the keyboard's digital full press.
+	param.trigger_mask       = 1;
+	param.command[0]         = {};
+	param.command[0].mode    = 3;
+	param.command[0].data[0] = 5;
+	param.command[0].data[1] = 4;
+	param.command[0].data[2] = 20;
+	Check(PadSetTriggerEffect(1, &param) == 0, "vibration request failed");
+	states_at(0, 255);
+	Check(state[0] == 6 && state[1] == 5, "vibration not firing; right trigger kept its weapon");
+	states_at(255, 0);
+	Check(state[0] == 7 && state[1] == 3, "vibration firing at full travel");
+
+	// Feedback from position 0 pushes only while the trigger is pressed (Astro's Playroom waits for it).
+	param.trigger_mask       = 2;
+	param.command[1]         = {};
+	param.command[1].mode    = 1;
+	param.command[1].data[0] = 0;
+	param.command[1].data[1] = 5;
+	Check(PadSetTriggerEffect(1, &param) == 0, "feedback request failed");
+	states_at(0, 0);
+	Check(state[1] == 1, "an untouched trigger with feedback from position 0 reported pushing");
+	states_at(0, 40);
+	Check(state[1] == 2, "a pressed trigger with feedback from position 0 reported no force");
+	states_at(255, 0);
+
+	// The intensity setting changes what the pad feels, not what the game reads.
+	CycleSetting(Setting::TriggerEffectIntensity);
+	GetTriggerEffectState(state);
+	Check(state[0] == 7, "muting trigger effects changed the reported state");
+}
 } // namespace
 
 int main() {
@@ -336,6 +400,7 @@ int main() {
 	TestVibrationLifetime();
 	TestMaskedTriggersAndValidation();
 	TestIndependentOutputsAndPadSwitch();
+	TestTriggerEffectState();
 	Config::Shutdown();
 	return 0;
 }
