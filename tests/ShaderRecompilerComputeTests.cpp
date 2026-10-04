@@ -251,8 +251,6 @@ struct BufferCacheTestAccess {
   // KYTY_BDA_SYNC_EPOCH.
   static bool BdaEpochSkip(const BufferCache &cache) { return cache.m_bda_epoch_skip; }
   static int BdaEpochVerify(const BufferCache &cache) { return cache.m_bda_epoch_verify; }
-  // KYTY_BDA_SYNC_PER_SUBMISSION.
-  static bool BdaSubmissionSkip(const BufferCache &cache) { return cache.m_bda_submission_skip; }
   static bool BdaDirtyLog(const BufferCache &cache) { return cache.m_bda_dirty_log; }
   static int BdaDirtyLogVerify(const BufferCache &cache) { return cache.m_bda_log_verify; }
   static BufferCache::BdaLogTotals BdaLogTotals(const BufferCache &cache) {
@@ -8407,6 +8405,8 @@ public:
   // KYTY_BDA_SYNC_PER_SUBMISSION=1: the BDA pass runs at most once per guest submission while the
   // registered buffers hold. A CPU write made within a submission waits for the next submission's
   // pass, even across an epoch advance (a fence); a new registered buffer runs the pass at once.
+  // The switch is live: within one submission, 0 runs the pass again at the next epoch, verify
+  // runs it and counts its upload as deferred bytes, and 1 skips again.
   void CheckBdaSyncPerSubmission() {
     constexpr const char *name = "BdaSyncPerSubmission";
     constexpr uintptr_t base = 0x0000000206E00000ull;
@@ -8417,14 +8417,12 @@ public:
     constexpr uint64_t other_offset = 0x80000;
 
     EnsureRuntimeContext();
-    // The cache reads the switch when it is constructed.
-    const char *switch_env = std::getenv("KYTY_BDA_SYNC_PER_SUBMISSION");
-    const bool switch_was_set = switch_env != nullptr;
-    const std::string switch_saved = switch_was_set ? switch_env : "";
-    SetEnvironment("KYTY_BDA_SYNC_PER_SUBMISSION", "1");
+    const auto set_gate = [](const char *text) {
+      Live::Testing::StageText(text);
+      Live::OnCpFlip();
+    };
+    set_gate("KYTY_BDA_SYNC_PER_SUBMISSION=1\n");
     const auto context_owner = MakeRenderContext();
-    SetEnvironment("KYTY_BDA_SYNC_PER_SUBMISSION",
-                   switch_was_set ? switch_saved.c_str() : nullptr);
     auto &context = *context_owner;
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
@@ -8454,8 +8452,6 @@ public:
     {
       auto &cache = context.GetBufferCache();
       context.MapMemory(base, allocation_size);
-      Require(name, "switch", BufferCacheTestAccess::BdaSubmissionSkip(cache),
-              "KYTY_BDA_SYNC_PER_SUBMISSION=1 did not enable the per-submission gate");
       const auto totals = [&] { return BufferCacheTestAccess::BdaEpochTotals(cache); };
       const auto cpu_write = [&](uint64_t offset, uint32_t value) {
         Require(name, "write fault",
@@ -8504,6 +8500,58 @@ public:
         Require(name, "pass per submission", false,
                 "the BDA pass did not run exactly once per submission and structure");
       }
+
+      // Live changes within one submission (the structure holds from here on).
+      Totals off{}, verified{}, gated{};
+      set_gate("KYTY_BDA_SYNC_PER_SUBMISSION=0\n");
+      OnGpuThread(context, [&] {
+        cpu_write(buffer_offset + 0x2100, 0x0ff0ff01u);
+        SyncEpoch::Advance();
+        context.PrepareBda(); // off: the epoch moved, so the pass runs
+        off = totals();
+      });
+      set_gate("KYTY_BDA_SYNC_PER_SUBMISSION=verify\n");
+      OnGpuThread(context, [&] {
+        cpu_write(buffer_offset + 0x3100, 0x0ff0ff02u);
+        SyncEpoch::Advance();
+        context.PrepareBda(); // verify: the gated pass runs and counts its upload
+        verified = totals();
+      });
+      set_gate("KYTY_BDA_SYNC_PER_SUBMISSION=1\n");
+      OnGpuThread(context, [&] {
+        SyncEpoch::Advance();
+        context.PrepareBda(); // on again: skipped
+        gated = totals();
+      });
+      if (!(off.passes == restructured.passes + 1 &&
+            off.submission_skips == restructured.submission_skips &&
+            off.submission_verify_passes == restructured.submission_verify_passes &&
+            verified.passes == off.passes + 1 &&
+            verified.submission_verify_passes == off.submission_verify_passes + 1 &&
+            verified.submission_deferred_bytes >= off.submission_deferred_bytes + sizeof(uint32_t) &&
+            gated.passes == verified.passes &&
+            gated.submission_skips == verified.submission_skips + 1)) {
+        std::printf("BdaSyncPerSubmission live: passes %llu/%llu/%llu skips %llu/%llu/%llu "
+                    "verify passes %llu/%llu deferred bytes %llu/%llu\n",
+                    static_cast<unsigned long long>(off.passes),
+                    static_cast<unsigned long long>(verified.passes),
+                    static_cast<unsigned long long>(gated.passes),
+                    static_cast<unsigned long long>(off.submission_skips),
+                    static_cast<unsigned long long>(verified.submission_skips),
+                    static_cast<unsigned long long>(gated.submission_skips),
+                    static_cast<unsigned long long>(off.submission_verify_passes),
+                    static_cast<unsigned long long>(verified.submission_verify_passes),
+                    static_cast<unsigned long long>(off.submission_deferred_bytes),
+                    static_cast<unsigned long long>(verified.submission_deferred_bytes));
+        Require(name, "live switch", false,
+                "the per-submission gate did not follow its live changes within a submission");
+      }
+      set_gate("KYTY_BDA_SYNC_PER_SUBMISSION=\n");
+      OnGpuThread(context, [&] {
+        SyncEpoch::AdvanceSubmission();
+        SyncEpoch::Advance();
+        context.PrepareBda(); // uploads the last write for the readback below
+      });
       auto readback = CreateHostBuffer(name, buffer_size, vk::BufferUsageFlagBits::eTransferDst, {0});
       const vk::BufferCopy copy{offset, 0, buffer_size};
       scheduler.Current().Handle().copyBuffer(buffer->Handle(), readback.buffer, 1, &copy);

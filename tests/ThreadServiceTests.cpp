@@ -1,6 +1,7 @@
 // Service-thread priority (KYTY_SERVICE_PRIORITY), sched_yield (Common::YieldToReadyThread), the
 // sub-microsecond sleep (Common::YieldAndPauseMicro) and the pending-signal fast path
 // (TakeLowestPendingSignal, KYTY_GUEST_SCHED). Prints the per-call costs it measures.
+#include "common/condWaitUntil.h"
 #include "common/threads.h"
 #include "kernel/pendingSignals.h"
 
@@ -8,9 +9,12 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
+#include <vector>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -210,6 +214,57 @@ void TestPendingSignals() {
 	            legacy);
 }
 
+// Common::CondWaitUntil (KYTY_PRECISE_COND_WAITS, Senaxx d069e1e99): a 5 ms timed wait that nobody
+// signals ends at the deadline, not up to a system tick late; a signal in the precise stretch is
+// still seen; dispatch() runs between polls. The old form is measured for comparison only.
+void TestCondWaitUntil() {
+	std::mutex              mutex;
+	std::condition_variable cv;
+	const auto lateness_us = [&](bool precise) {
+		std::vector<double> late;
+		for (int i = 0; i < 25; i++) {
+			std::unique_lock lock(mutex);
+			const auto       deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(5000);
+			uint32_t         dispatched = 0;
+			Common::CondWaitUntil(lock, cv, [] { return false; }, deadline, 10000, precise,
+			                      [&] { dispatched++; });
+			late.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() -
+			                                                         deadline)
+			                   .count());
+			Check(late.back() >= 0.0, "a timed wait never ends before its deadline");
+		}
+		std::sort(late.begin(), late.end());
+		return late[late.size() / 2];
+	};
+	const double precise = lateness_us(true);
+	const double coarse  = lateness_us(false);
+	std::printf("  5 ms timed wait, median lateness: precise %.0f us, condition variable only %.0f us\n",
+	            precise, coarse);
+	Check(precise < 400.0, "a precise timed wait ends within 0.4 ms of its deadline");
+
+	// A wake-up 4 ms into a 6 ms wait (inside the precise stretch) ends the wait at once.
+	bool              flag = false;
+	std::thread       waker([&] {
+        std::this_thread::sleep_for(std::chrono::microseconds(4000));
+        {
+            std::scoped_lock lock(mutex);
+            flag = true;
+        }
+        cv.notify_one();
+	});
+	const auto start = std::chrono::steady_clock::now();
+	{
+		std::unique_lock lock(mutex);
+		Common::CondWaitUntil(lock, cv, [&] { return flag; }, start + std::chrono::microseconds(6000),
+		                      10000, true, [] {});
+		Check(flag, "the signalled flag is seen");
+	}
+	waker.join();
+	const double waited =
+	    std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+	Check(waited < 5900.0, "a signal before the deadline ends a precise wait before the deadline");
+}
+
 } // namespace
 
 int main() {
@@ -217,6 +272,7 @@ int main() {
 	TestYield();
 	TestYieldAndPauseMicro();
 	TestPendingSignals();
+	TestCondWaitUntil();
 	std::printf("ThreadServiceTests: all cases passed\n");
 	return 0;
 }

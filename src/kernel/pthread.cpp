@@ -2,11 +2,13 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/condWaitUntil.h"
 #include "common/cpuPlacement.h"
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
 #include "common/hangWatchdog.h"
 #include "common/hostException.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/ramStats.h"
 #include "common/singleton.h"
@@ -507,6 +509,22 @@ void PthreadWakeForSignal(Pthread thread) {
 }
 
 void KernelDispatchPendingSignalForCurrentThread();
+
+// KYTY_PRECISE_COND_WAITS=1 (default off; live; Senaxx d069e1e99): timed condition waits wake on
+// time. Windows times condition-variable waits in whole milliseconds on the system tick, so a ~5 ms
+// wait woke up to ~1 ms late (Senaxx: the Bink sound thread, pacing 5.33 ms grains with such waits,
+// fell to 0.93x real time and the intro videos' sound crackled). The last 2.5 ms are timed with the
+// high-resolution timer in slices of at most 0.5 ms (a wake-up in that stretch is seen within a
+// slice) and a short yield loop. Off: one condition-variable wait per poll, as before.
+static Live::Switch g_precise_cond_waits("KYTY_PRECISE_COND_WAITS", Live::ParseDefaultOff);
+
+template <class Lock, class Ready>
+static void CondWaitUntil(Lock& lock, std::condition_variable& cv, const Ready& ready,
+                          std::chrono::steady_clock::time_point deadline) {
+	Common::CondWaitUntil(lock, cv, ready, deadline, SIGNAL_APC_POLL_MICROS,
+	                      g_precise_cond_waits.On(),
+	                      [] { KernelDispatchPendingSignalForCurrentThread(); });
+}
 
 // sched_yield (FreeBSD sched_relinquish): another thread that is ready on this CPU runs first;
 // with none, the call returns at once. SwitchToThread is exactly that. The legacy path followed an
@@ -2969,26 +2987,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	if (usec == 0) {
 		result = ETIMEDOUT;
 	} else {
-		while (!ready()) {
-			const auto now = std::chrono::steady_clock::now();
-			if (now >= deadline) {
-				break;
-			}
-
-			const auto remaining = deadline - now;
-			const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-			                            ? remaining
-			                            : std::chrono::steady_clock::duration(
-			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			thread->cond_cv.wait_for(cond_lock, poll);
-
-			if (!ready()) {
-				cond_lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				cond_lock.lock();
-			}
-		}
-
+		CondWaitUntil(cond_lock, thread->cond_cv, ready, deadline);
 		result = (ready() ? OK : ETIMEDOUT);
 	}
 	CondRemoveWaiter(cond_value, thread);
@@ -3056,26 +3055,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
-	while (!ready()) {
-		const auto now = std::chrono::steady_clock::now();
-		if (now >= deadline) {
-			break;
-		}
-
-		const auto remaining = deadline - now;
-		const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-		                            ? remaining
-		                            : std::chrono::steady_clock::duration(
-		                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-		thread->cond_cv.wait_for(cond_lock, poll);
-
-		if (!ready()) {
-			cond_lock.unlock();
-			KernelDispatchPendingSignalForCurrentThread();
-			cond_lock.lock();
-		}
-	}
-
+	CondWaitUntil(cond_lock, thread->cond_cv, ready, deadline);
 	result = (ready() ? OK : ETIMEDOUT);
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();

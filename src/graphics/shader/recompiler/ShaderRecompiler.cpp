@@ -650,6 +650,15 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	IR::ResolveControlFlowIdentities(ir);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
+	// KYTY_FOLD_LANE_MASKS (default off): mask reads that fold can make select conditions and phis
+	// identical, so fold until stable; before read-lane elimination, which then sees the folded
+	// EXEC of a lane reduction (x || !x is every lane).
+	for (int round = 0; round < 4 && IR::FoldLaneMasks(ir) != 0; round++) {
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
 	if (read_lane_stats.rewritten_reads != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),

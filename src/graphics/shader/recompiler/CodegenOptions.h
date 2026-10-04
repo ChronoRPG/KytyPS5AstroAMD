@@ -156,6 +156,20 @@ struct CodegenOptions {
 	// count read from memory an unemulated pass left unwritten) then gives that invocation wrong
 	// results instead of hanging the GPU until a device reset. Structured programs are unaffected.
 	uint32_t dispatcher_cap = 4096;
+	// KYTY_IR_LINEAR_USES=1 (default off; Senaxx 5145dc1f9): IR use-list bookkeeping without the
+	// quadratic searches (Inst::ReplaceUsesWith takes a use list over at once, AddUse searches for
+	// duplicates only in debug builds, RemoveUse searches from the end, RemoveIdentities drops the
+	// removed identities' entries in one pass, ~Program detaches without maintaining use lists) and
+	// RewriteToSsa seals a block as soon as every predecessor is filled. Translation time only: the
+	// same program, but early sealing can create a loop header's phis in another order, which
+	// renumbers the module's ids (same size and meaning; the driver compiles it as a new module).
+	bool ir_linear_uses = false;
+	// KYTY_FOLD_LANE_MASKS=1 (default off; Senaxx 5189ea360): reads of the current lane's bit of a
+	// wave mask that is known per lane (a ballot of a predicate, an all-zero or all-one constant,
+	// and bitwise logic or WQM of those) become that predicate (IR::FoldLaneMasks). Smaller SPIR-V
+	// and shorter driver compiles; not in hull shaders, and in pixel shaders ANDed with the lane's
+	// own bit of a ballot of true (helper invocations may sit out of ballots).
+	bool fold_lane_masks = false;
 };
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.

@@ -731,6 +731,8 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	# The IR it includes (Program.cpp, Value.cpp) reads KYTY_IR_LINEAR_USES from the codegen options.
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"
 )
 target_link_libraries(resource_materialization_tests common fmt::fmt xxhash)
 if(LINUX)
@@ -971,6 +973,17 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME upsync2_shader_ir COMMAND $<TARGET_FILE:shader_cfg_tests> --upsync2-only)
+	# KYTY_IR_LINEAR_USES (Senaxx 5145dc1f9): every test compilation with the switch off and on gives
+	# the same SPIR-V word for word (KYTY_TEST_COMPARE_LINEAR_USES compiles each one both ways).
+	add_test(NAME upsync2_shader_ir_linear_uses COMMAND $<TARGET_FILE:shader_cfg_tests> --upsync2-only)
+	set_tests_properties(upsync2_shader_ir_linear_uses PROPERTIES
+		ENVIRONMENT "KYTY_TEST_COMPARE_LINEAR_USES=1")
+	add_test(NAME wave_reductions_linear_uses COMMAND $<TARGET_FILE:shader_cfg_tests> --wave-reduction-only)
+	set_tests_properties(wave_reductions_linear_uses PROPERTIES
+		ENVIRONMENT "KYTY_TEST_COMPARE_LINEAR_USES=1")
+	add_test(NAME isa_accuracy_linear_uses COMMAND $<TARGET_FILE:shader_cfg_tests> --isa-accuracy-only)
+	set_tests_properties(isa_accuracy_linear_uses PROPERTIES
+		ENVIRONMENT "KYTY_TEST_COMPARE_LINEAR_USES=1")
 	add_test(NAME upsync2_opcodes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --new-opcodes-only)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME registered_shader_code_on COMMAND $<TARGET_FILE:shader_cfg_tests> --registered-shader-code-only)
@@ -1338,6 +1351,15 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --wave-reduction-only)
 	add_test(NAME wave_reductions
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-reductions-only)
+	# KYTY_FOLD_LANE_MASKS (Senaxx 5189ea360): the row reductions with the fold off and on (the
+	# S_ORN2_SAVEEXEC work-list shape among them), and wave64 mask logic folded without growing.
+	add_test(NAME fold_lane_masks_codegen
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --fold-lane-masks-only)
+	# The GPU wave-reduction checks with the fold on.
+	add_test(NAME wave_reductions_fold_lane_masks
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-reductions-only)
+	set_tests_properties(wave_reductions_fold_lane_masks PROPERTIES
+		ENVIRONMENT "KYTY_FOLD_LANE_MASKS=1")
 	# The set-associative sampler memo; KYTY_SET_REUSE_FRESH: default, off, verify.
 	add_test(NAME sampler_memo
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampler-memo-only)

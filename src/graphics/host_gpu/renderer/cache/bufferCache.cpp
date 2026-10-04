@@ -120,6 +120,19 @@ uint32_t FaultAheadOverridePages() {
 	return static_cast<uint32_t>(kib * 1024 / TRACKER_PAGE_SIZE);
 }
 
+// KYTY_BDA_SYNC_PER_SUBMISSION=1|verify (default off; live): see BufferCache::SynchronizeBdaBuffers.
+// 1: at most one BDA pass per guest submission while the BDA structure holds. verify: every pass the
+// gate would skip runs anyway and its uploads are counted, i.e. the bytes the CPU wrote within the
+// submission that 1 leaves for the next submission's pass. Both values only decide whether a pass
+// runs now, and every pass records the epochs both read, so it can switch at any flip.
+int64_t ParseBdaSyncPerSubmission(const char* value) {
+	if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+		return 0;
+	}
+	return std::strcmp(value, "verify") == 0 ? 2 : 1;
+}
+Live::Switch g_bda_sync_per_submission("KYTY_BDA_SYNC_PER_SUBMISSION", ParseBdaSyncPerSubmission);
+
 bool IncrementalBdaSyncEnabled() {
 	const auto* value = std::getenv("KYTY_BDA_INCREMENTAL_SYNC");
 	return value != nullptr && value[0] == '1' && value[1] == '\0';
@@ -1088,7 +1101,6 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	// The verify mode tells guest writes from missed pages by the fault epoch, which the tracker
 	// keeps only with incremental BDA synchronization.
 	m_bda_epoch_verify = m_bda_epoch_skip && m_bda_incremental_sync ? BdaEpochVerifyMode() : 0;
-	m_bda_submission_skip = ParseEnvU64("KYTY_BDA_SYNC_PER_SUBMISSION", 0) != 0;
 	if (SyncEpoch::Enabled() && BindingEpochMemoEnabled()) {
 		const bool large      = CpCommit::Enabled(CpCommit::Part::BindSlots);
 		m_binding_memo_shift  = large ? 49u : 53u;
@@ -3974,26 +3986,70 @@ void BufferCache::SynchronizeBdaBuffers(const RangeSet& mapped_ranges) {
 		}
 		return;
 	}
-	// KYTY_BDA_SYNC_PER_SUBMISSION=1 (default off; upstream KytyPS5 309ba4f5, Senaxx): at most one
-	// pass per guest submission, instead of one per epoch. What the game wrote before submitting
-	// reaches every BDA read of the submission, as on the console. A CPU write made while the
-	// submission runs reaches BDA reads only in the next submission, even behind a fence that
-	// orders it (a WAIT_REG_MEM on a CPU-written label): the epoch pass would have uploaded it.
-	// New buffers and GPU mapping changes still run the pass (structure epoch): a new buffer's
-	// pages start CPU-dirty and have never been uploaded.
-	if (m_bda_submission_skip && submission == m_bda_synced_submission &&
-	    structure == m_bda_synced_structure) {
+	// KYTY_BDA_SYNC_PER_SUBMISSION=1 (default off, live; upstream KytyPS5 309ba4f5, Senaxx
+	// a329b69a8): at most one pass per guest submission, instead of one per epoch. What the game
+	// wrote before submitting reaches every BDA read of the submission, as on the console. A CPU
+	// write made while the submission runs reaches BDA reads only in the next submission, even
+	// behind a fence that orders it (a WAIT_REG_MEM on a CPU-written label): the epoch pass would
+	// have uploaded it. New buffers and GPU mapping changes still run the pass (structure epoch): a
+	// new buffer's pages start CPU-dirty and have never been uploaded. KYTY_BDA_SYNC_PER_SUBMISSION=
+	// verify runs those passes and counts what they upload (the bytes 1 would defer).
+	const auto per_submission  = g_bda_sync_per_submission.Get();
+	const bool same_submission = per_submission != 0 && submission == m_bda_synced_submission &&
+	                             structure == m_bda_synced_structure;
+	if (same_submission && per_submission == 1) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncSubmissionSkips);
 		m_bda_epoch_totals.submission_skips++;
+		ReportBdaSubmissionGate();
 		return;
 	}
-	const auto fault_epoch = m_memory_tracker.FaultMutationEpoch();
+	const auto fault_epoch     = m_memory_tracker.FaultMutationEpoch();
+	const auto uploaded_before = m_bda_pass_upload_bytes;
+	m_bda_count_uploads        = same_submission;
 	SynchronizeBdaBuffersNow(mapped_ranges);
+	m_bda_count_uploads = false;
 	m_bda_epoch_totals.passes++;
+	if (same_submission) {
+		m_bda_epoch_totals.submission_verify_passes++;
+		m_bda_epoch_totals.submission_deferred_bytes += m_bda_pass_upload_bytes - uploaded_before;
+	}
+	if (per_submission != 0) {
+		ReportBdaSubmissionGate();
+	}
 	m_bda_synced_epoch      = sync_epoch;
 	m_bda_synced_submission = submission;
 	m_bda_synced_structure  = structure;
 	m_bda_synced_fault      = fault_epoch;
+}
+
+void BufferCache::ReportBdaSubmissionGate() {
+	// Every 10 s while the gate is on: passes, skips and (verify) the bytes a skip would defer.
+	if ((++m_bda_gate_report_calls & 1023u) != 0) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (m_bda_gate_report_time == std::chrono::steady_clock::time_point {}) {
+		m_bda_gate_report_time = now;
+		m_bda_gate_reported    = m_bda_epoch_totals;
+		return;
+	}
+	const auto elapsed = std::chrono::duration<double>(now - m_bda_gate_report_time).count();
+	if (elapsed < 10.0) {
+		return;
+	}
+	const auto& totals = m_bda_epoch_totals;
+	const auto& last   = m_bda_gate_reported;
+	std::printf("BdaSyncPerSubmission %.0fs (%s): %" PRIu64 " passes, %" PRIu64
+	            " skipped by the submission gate, %" PRIu64 " epoch skips; verify %" PRIu64
+	            " gated passes run, %" PRIu64 " bytes they uploaded\n",
+	            elapsed, g_bda_sync_per_submission.Get() == 2 ? "verify" : "on",
+	            totals.passes - last.passes, totals.submission_skips - last.submission_skips,
+	            totals.skips - last.skips,
+	            totals.submission_verify_passes - last.submission_verify_passes,
+	            totals.submission_deferred_bytes - last.submission_deferred_bytes);
+	std::fflush(stdout);
+	m_bda_gate_report_time = now;
+	m_bda_gate_reported    = totals;
 }
 
 void BufferCache::VerifyBdaEpochSkip(const RangeSet& mapped_ranges) {
@@ -4072,6 +4128,7 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 		BdaSyncStats stats;
 		if (SynchronizeBdaHotRanges(stats)) {
 			FaultCost::NoteBdaPass(1, stats.upload_bytes);
+			m_bda_pass_upload_bytes += stats.upload_bytes;
 			if (collect) {
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncHotPasses);
 				Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSyncHotRanges,
@@ -4117,7 +4174,7 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 		m_bda_hot_ranges.clear();
 		stats.hot_ranges = &m_bda_hot_ranges;
 	}
-	const bool keep_stats = collect || m_bda_hot_sync;
+	const bool keep_stats = collect || m_bda_hot_sync || m_bda_count_uploads;
 	{
 		// Only uploads are recorded while scanning: all of them share one barrier pair.
 		const UploadBatch upload_batch(*this);
@@ -4125,6 +4182,7 @@ void BufferCache::SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges) {
 			SynchronizeBuffersInRange(start, end - start, keep_stats ? &stats : nullptr);
 		});
 	}
+	m_bda_pass_upload_bytes += stats.upload_bytes;
 	if (m_bda_incremental_sync) {
 		m_bda_scanned_cpu_epoch       = cpu_epoch;
 		m_bda_scanned_structure_epoch = structure_epoch;
@@ -4174,6 +4232,7 @@ bool BufferCache::SynchronizeBdaDirtied(const RangeSet& mapped_ranges) {
 		stats.upload_bytes += hot_stats.upload_bytes;
 		stats.upload_copies += hot_stats.upload_copies;
 	}
+	m_bda_pass_upload_bytes += stats.upload_bytes;
 	for (const auto& range: found) {
 		const bool known =
 		    std::any_of(m_bda_hot_ranges.begin(), m_bda_hot_ranges.end(), [&](const auto& other) {
