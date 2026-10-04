@@ -21279,7 +21279,7 @@ public:
         constexpr uint64_t buffer_address = base + allocation_size - 0x5000;
         ShaderBufferResource buffer_descriptor{};
         buffer_descriptor.UpdateAddress48(buffer_address);
-        buffer_descriptor.fields[2] = 0x8000;
+        buffer_descriptor.fields[2] = 0x40000000; // Only oversized descriptors are clamped.
         ShaderRecompiler::IR::ResourceSnapshot buffer_snapshot;
         ShaderStageRuntime buffer_runtime{&buffer_program, &buffer_snapshot};
         auto &value = buffer_snapshot.buffers.emplace_back();
