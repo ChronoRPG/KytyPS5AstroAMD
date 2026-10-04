@@ -4,6 +4,18 @@ This release builds on the U59 renderer and the Demon's Souls changes of the pre
 
 ## New in this update
 
+- Unused occlusion queries are reset in batches (`KYTY_OCCLUSION_RESET_BATCH=1` in the preset), up to 64 per command
+  instead of one each, with every query boundary, result copy and reduction unchanged. Measured with the switch
+  toggled in the same process: Go-Go Archipelago +1.5% to +1.9% fps, Bathhouse Battle +2.6%; Crash Site and the Sky
+  Garden unchanged.
+- New shader pipelines are prepared ahead on worker threads (`KYTY_PIPELINE_PREFETCH=1` and
+  `KYTY_PIPELINE_PREFETCH_PROGRAMS=1` in the preset). Draws still wait for their exact pipeline, so nothing is drawn
+  differently; the work just starts earlier. With an empty shader cache the command processor stalled 68-70 s
+  instead of 87-89 s along the Sky Garden route and 57-59 s instead of 76 s along the Creamy Canyon route, and the
+  slowest 1% of Creamy Canyon frames took about 100-130 ms instead of 230-245 ms. With a warm cache fps is unchanged.
+- Small uploads use their own ring buffer (`KYTY_RAM_SMALL_UPLOAD_RING=1` in the preset): about 430-540 MB less RAM
+  (private bytes), about 385 MB less shared GPU memory and 60-150 MB less VRAM in the Sky Garden and Go-Go
+  Archipelago, with fps differences within run-to-run noise.
 - Shader storage writes are tagged again at command emission when binding preparation submitted their original
   recording (`KYTY_SHADER_WRITE_RETICK=1` in the preset). This prevents a side readback from publishing old
   contents before the actual GPU write. A deterministic Vulkan test reproduces the race; whether it fixes the
@@ -15,8 +27,10 @@ This release builds on the U59 renderer and the Demon's Souls changes of the pre
   GPU, `=0` off). When the picture stops for 5 seconds it writes `_HangTrace\watchdog-*\watchdog.txt` beside the
   emulator: what every thread is doing and waiting for. If your RTX 50 PC still freezes, please send that file.
   On other GPUs its hot paths stay off; see `docs/HANG-WATCHDOG.md`.
-- Measured on one PC (RTX 3090, Ryzen 9 7950X3D): no fps or VRAM change against int5. With the fix switched off
-  and on in the same process: Sky Garden -0.14% +/- 0.50%, Creamy Canyon -0.13% +/- 0.66%, identical VRAM.
+- The storage-write fix costs nothing measurable on one PC (RTX 3090, Ryzen 9 7950X3D): switched off and on in the
+  same process, Sky Garden -0.14% +/- 0.50%, Creamy Canyon -0.13% +/- 0.66%, identical VRAM.
+- kyty_emulator is built with a new PGO profile recorded in Astro Bot with this source. The shader translation is
+  unchanged, so int5's program caches stay valid.
 
 From int5 (`u59-windows-20261003-int5`):
 
