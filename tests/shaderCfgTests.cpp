@@ -18,6 +18,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
@@ -5380,12 +5381,25 @@ void TestNewShaderRecompilerPixelImageSampleLodSelection() {
   {
     const auto result = compile(0x20, 0xf); // image_sample
     const auto metrics = MeasureSpirv(result.spirv);
-    Check(metrics.type_images == 1u && metrics.type_samplers == 1u &&
-              metrics.type_sampled_images == 1u &&
-              metrics.sampled_1d_capabilities == 0u &&
-              metrics.image_1d_capabilities == 0u &&
-              metrics.image_query_capabilities == 0u,
-          "plain 2D sample emitted unrelated image declarations");
+    // GET_LOD_STATS feedback (KYTY_LOD_STATS_MODE=gpu, the default) records the LOD of every
+    // implicit pixel sample with OpImageQueryLod, which needs the ImageQuery capability.
+    const uint32_t lod_queries =
+        ShaderRecompiler::IR::UsesMipStats(result.program) ? 1u : 0u;
+    const bool plain = metrics.type_images == 1u && metrics.type_samplers == 1u &&
+                       metrics.type_sampled_images == 1u &&
+                       metrics.sampled_1d_capabilities == 0u &&
+                       metrics.image_1d_capabilities == 0u &&
+                       metrics.image_query_capabilities == lod_queries;
+    if (!plain) {
+      std::fprintf(stderr,
+                   "plain 2D sample: images=%u samplers=%u sampled images=%u "
+                   "Sampled1D=%u Image1D=%u ImageQuery=%u (expected %u)\n",
+                   metrics.type_images, metrics.type_samplers,
+                   metrics.type_sampled_images, metrics.sampled_1d_capabilities,
+                   metrics.image_1d_capabilities, metrics.image_query_capabilities,
+                   lod_queries);
+    }
+    Check(plain, "plain 2D sample emitted unrelated image declarations");
     Check((result.decoded_dump.find("image_sample") != std::string::npos),
           "plain pixel IMAGE_SAMPLE did not decode");
     Check(SpirvInstructionOpcodeCount(result.spirv, OpImageSampleImplicitLod) ==
@@ -14210,10 +14224,15 @@ void TestRdna2IsaAccuracyDecode() {
       {0x1b, O::IMAGE_ATOMIC_INC},     {0x1c, O::IMAGE_ATOMIC_DEC},
   };
   for (const auto &item : image_atomic_cases) {
-    const uint32_t words[] = {EncodeMimg0(item.encoding, 0x1, true),
+    // A 32-bit compare-and-swap carries the data and the compare value: DMASK 0x3.
+    const uint32_t dmask = item.opcode == O::IMAGE_ATOMIC_CMPSWAP ? 0x3u : 0x1u;
+    const uint32_t words[] = {EncodeMimg0(item.encoding, dmask, true),
                               EncodeMimg1(0, 0, 0, 8)};
     Check(decode(words).opcode == item.opcode, "MIMG atomic opcode did not decode");
   }
+  const uint32_t cmpswap_one_dword[] = {EncodeMimg0(0x10, 0x1, true), EncodeMimg1(0, 0, 0, 8)};
+  Check(decode(cmpswap_one_dword).opcode == O::UNSUPPORTED,
+        "MIMG compare-and-swap with one data dword must stay unsupported");
 
   const uint32_t perm[] = {EncodeVop3Word0(0x344, 3), EncodeVop3Word1(256, 257, 258)};
   const auto perm_inst = decode(perm);

@@ -1090,6 +1090,13 @@ static int ConvertMessageFlags(int flags) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EOPNOTSUPP;
 		return -1;
 	}
+#if defined(_WIN32)
+	// FreeBSD accepts MSG_WAITALL with MSG_PEEK; Winsock fails the call (WSAEOPNOTSUPP). Peek what
+	// is queued instead: a blocking socket still waits for the first byte.
+	if ((host_flags & MSG_PEEK) != 0) {
+		host_flags &= ~MSG_WAITALL;
+	}
+#endif
 
 	return host_flags;
 }
