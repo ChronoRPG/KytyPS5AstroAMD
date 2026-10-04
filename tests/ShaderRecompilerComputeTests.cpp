@@ -28073,6 +28073,9 @@ private:
     }
     m_runtime_context.attachment_feedback_loop_enabled = true;
     m_runtime_context.provoking_vertex_last_enabled = true;
+    // The harness device requires and enables both (production rasterization features).
+    m_runtime_context.color_write_enable_enabled = true;
+    m_runtime_context.depth_clip_enable_enabled = true;
     m_runtime_context.storage_image_read_without_format_enabled =
         m_storage_image_read_without_format;
     m_runtime_context.sampler_filter_minmax_enabled = m_sampler_filter_minmax;

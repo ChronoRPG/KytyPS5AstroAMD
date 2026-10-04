@@ -3993,12 +3993,23 @@ bool PipelineCache::TessellationActive(const HW::UserConfig& user_config) {
 	return user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 }
 
+void ExitWithoutMeshShaders(const GraphicContext& graphics) {
+	EXIT("This game draws with mesh (NGG) shaders, which need the Vulkan extension "
+	     "VK_EXT_mesh_shader with its meshShader feature. The GPU \"%s\" does not support it, "
+	     "and the emulator has no fallback for these draws (NVIDIA GTX 16/RTX 20 series and "
+	     "newer, AMD RX 6000 series and newer and Intel Arc support it).\n",
+	     graphics.GetPhysicalDeviceProperties().deviceName.data());
+	std::abort();
+}
+
 namespace {
 
 // Static stage information shared by GetGraphicsPrograms and the draw-prep speculative
 // preparation: pure functions of the registers and constant device limits.
 void FinishMeshStage(const GraphicContext& graphics, ShaderVertexInputInfo& vertex_info) {
-	EXIT_NOT_IMPLEMENTED(!graphics.mesh_shader_enabled);
+	if (!graphics.mesh_shader_enabled) {
+		ExitWithoutMeshShaders(graphics);
+	}
 	auto& mesh = vertex_info.mesh;
 	// The pipeline requires the wave size where it can (CreatePipelineInternal, shaders.cpp).
 	const auto required =

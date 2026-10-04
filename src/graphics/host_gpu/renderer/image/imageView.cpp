@@ -327,6 +327,20 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 			return cached.view;
 		}
 	}
+	// An image created without what the device refused (Image::Image) cannot have this view.
+	if (is_storage && static_cast<bool>(m_dropped_usage & vk::ImageUsageFlagBits::eStorage)) {
+		EXIT("a shader binds a %s image as a storage image (view format %s), but the Vulkan device "
+		     "does not support storage usage for that format, so the image was created without it\n",
+		     vk::to_string(image.format).c_str(), vk::to_string(normalized.format).c_str());
+	}
+	if (static_cast<bool>(m_dropped_flags & vk::ImageCreateFlagBits::eBlockTexelViewCompatible) &&
+	    normalized.format != vk::Format::eUndefined &&
+	    !DeviceCompat::IsBlockCompressedFormat(static_cast<VkFormat>(normalized.format))) {
+		EXIT("a shader reads a block-compressed %s image through an uncompressed %s view, but the "
+		     "Vulkan device does not support such views of it, so the image was created without "
+		     "them\n",
+		     vk::to_string(image.format).c_str(), vk::to_string(normalized.format).c_str());
+	}
 
 	const bool format_compatible = normalized.format != vk::Format::eUndefined &&
 	                               ImageViewOps::FormatsCompatible(image.format, normalized.format);

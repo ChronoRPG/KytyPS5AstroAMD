@@ -25,6 +25,7 @@ enum HostFloatControlBits : uint32_t {
 std::atomic_uint32_t g_host_float_controls {0};
 std::atomic_bool     g_storage_dword_loads_return_zero {false};
 std::atomic_bool     g_image_min_lod {false};
+std::atomic_uint8_t  g_compute_derivatives {static_cast<uint8_t>(HostComputeDerivatives::Khr)};
 std::atomic_uint8_t  g_shader_clock_scope {0};
 std::atomic_int32_t  g_shader_clock_shift {0};
 
@@ -399,10 +400,14 @@ HostBufferRobustness GetHostBufferRobustness() {
 
 void SetHostImageFeatures(const HostImageFeatures& features) {
 	g_image_min_lod.store(features.min_lod, std::memory_order_relaxed);
+	g_compute_derivatives.store(static_cast<uint8_t>(features.compute_derivatives),
+	                            std::memory_order_relaxed);
 }
 
 HostImageFeatures GetHostImageFeatures() {
-	return {.min_lod = g_image_min_lod.load(std::memory_order_relaxed)};
+	return {.min_lod             = g_image_min_lod.load(std::memory_order_relaxed),
+	        .compute_derivatives = static_cast<HostComputeDerivatives>(
+	            g_compute_derivatives.load(std::memory_order_relaxed))};
 }
 
 void SetHostShaderClock(const HostShaderClock& clock) {

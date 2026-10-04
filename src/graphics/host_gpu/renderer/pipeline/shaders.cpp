@@ -226,7 +226,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	                        rendering.stencil_format != vk::Format::eUndefined;
 	EXIT_IF(!vs_input_info.stage);
 	const bool mesh = vs_input_info.stage.program->stage == ShaderType::Mesh;
-	EXIT_NOT_IMPLEMENTED(mesh && !graphics.mesh_shader_enabled);
+	if (mesh && !graphics.mesh_shader_enabled) {
+		ExitWithoutMeshShaders(graphics);
+	}
 	const bool rect_list =
 	    !mesh && !tessellation && static_params.topology == vk::PrimitiveTopology::ePatchList;
 
@@ -399,9 +401,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	// MoltenVK lacks VK_EXT_depth_clip_enable; omit the depth-clip struct on macOS and accept
 	// Vulkan's default depth clipping (enabled) instead of the PS5's clamp behavior.
 #if !defined(__APPLE__)
-	// The DB clamps depth to the viewport range after polygon offset is applied.
-	rasterizer.depthClampEnable = VK_TRUE;
-	rasterizer.pNext = &clip_ext;
+	// The DB clamps depth to the viewport range after polygon offset is applied; without
+	// VK_EXT_depth_clip_enable the clamp also turns clipping off (DeviceCompat::DepthClampEnable).
+	rasterizer.depthClampEnable = DeviceCompat::DepthClampEnable(graphics.depth_clip_enable_enabled,
+	                                                             static_params.depth_clip_enable)
+	                                  ? VK_TRUE
+	                                  : VK_FALSE;
+	if (graphics.depth_clip_enable_enabled) {
+		rasterizer.pNext = &clip_ext;
+	}
 #endif
 	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex {};
 	EXIT_NOT_IMPLEMENTED(static_params.provoking_vtx_last &&
@@ -458,11 +466,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	color_write.pColorWriteEnables = color_write_enable;
 
 	vk::PipelineColorBlendStateCreateInfo color_blending {};
-	// MoltenVK lacks VK_EXT_color_write_enable; drop the dynamic color-write struct on macOS
-	// and rely on each attachment's static colorWriteMask (all channels enabled by default).
-#if !defined(__APPLE__)
-	color_blending.pNext = &color_write;
-#endif
+	// Without VK_EXT_color_write_enable (MoltenVK, older drivers) drop the dynamic color-write
+	// struct and rely on each attachment's static colorWriteMask (all channels enabled by default).
+	if (graphics.color_write_enable_enabled) {
+		color_blending.pNext = &color_write;
+	}
 	color_blending.logicOp         = vk::LogicOp::eCopy;
 	color_blending.attachmentCount = rendering.color_count;
 	color_blending.pAttachments    = color_blend_attachment;
@@ -513,11 +521,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    vk::DynamicState::eStencilWriteMask,
 	    vk::DynamicState::eBlendConstants,
 	};
-#if !defined(__APPLE__)
-	if (rendering.color_count != 0) {
+	if (graphics.color_write_enable_enabled && rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
-#endif
 	if (PipelineDynamicRasterStateEnabled()) {
 		// Core Vulkan 1.3 (no feature bit). The key holds zeroes for these fields; the draw records
 		// the values from the same registers (SetGraphicsDynamicParams).
@@ -641,11 +647,20 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.module = compute_module;
 	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
+	// One guest wave per host subgroup: the wave size on AMD, 32 where the driver would otherwise
+	// pick the width (Intel), nothing on NVIDIA (GraphicContext::ComputeSubgroupSize).
 	const auto wave_size = input_info.stage.program->wave_size;
-	if (graphics.compute_subgroup_size_control_enabled &&
-	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
-		comp_subgroup_size.requiredSubgroupSize = wave_size;
+	const auto required  = graphics.ComputeSubgroupSize(wave_size, input_info.host_subgroup_size);
+	if (required != 0) {
+		comp_subgroup_size.requiredSubgroupSize = required;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
+	} else if (graphics.min_subgroup_size < graphics.max_subgroup_size) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true)) {
+			LOGF("Vulkan subgroup: wave%u compute shader on a device that cannot require its "
+			     "subgroup size (%u to %u); its lane operations may split or mix waves\n",
+			     wave_size, graphics.min_subgroup_size, graphics.max_subgroup_size);
+		}
 	}
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;

@@ -5,8 +5,32 @@
 
 #include <algorithm>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
+#include <mutex>
+#include <set>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+
+namespace {
+
+// A compute shader with derivatives (IMAGE_GET_LOD) on a device without a compute-derivatives
+// extension keeps the KHR declaration, which the driver may reject; each such shader is named once.
+void NoteMissingComputeDerivatives(uint64_t shader_hash) {
+	static std::mutex         mutex;
+	static std::set<uint64_t> logged;
+	std::scoped_lock          lock(mutex);
+	if (logged.size() >= 64 || !logged.insert(shader_hash).second) {
+		return;
+	}
+	std::fprintf(stderr,
+	             "Warning: compute shader 0x%016" PRIx64 " uses derivatives (IMAGE_GET_LOD), but the "
+	             "Vulkan device has neither VK_KHR_compute_shader_derivatives nor "
+	             "VK_NV_compute_shader_derivatives; the driver may reject its pipeline\n",
+	             shader_hash);
+}
+
+} // namespace
 
 bool UsesPhysicalAddresses(const EmitterState& state) {
 	// Guest address accesses (DMA), or a mesh program that may read its draw dwords from a native
@@ -823,8 +847,15 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_shader_clock");
 	}
 	if (state.requirements.compute_derivatives && state.program.stage == ShaderType::Compute) {
+		// The NV extension declares the same capability (ComputeDerivativeGroupQuadsNV).
+		const auto derivatives = GetHostImageFeatures().compute_derivatives;
 		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
-		state.builder.RequireExtension("SPV_KHR_compute_shader_derivatives");
+		state.builder.RequireExtension(derivatives == HostComputeDerivatives::Nv
+		                                   ? "SPV_NV_compute_shader_derivatives"
+		                                   : "SPV_KHR_compute_shader_derivatives");
+		if (derivatives == HostComputeDerivatives::None) {
+			NoteMissingComputeDerivatives(state.program.shader_hash);
+		}
 	}
 	const bool fragment_barycentric =
 	    state.program.stage == ShaderType::Pixel &&

@@ -100,7 +100,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(float_controls.denorm_preserve_f16 ? 1u : 0u);
 	b.U8(float_controls.denorm_preserve_f64 ? 1u : 0u);
 	b.U8(Spirv::GetHostBufferRobustness().storage_dword_loads_return_zero ? 1u : 0u);
-	b.U8(Spirv::GetHostImageFeatures().min_lod ? 1u : 0u);
+	const auto image_features = Spirv::GetHostImageFeatures();
+	b.U8(image_features.min_lod ? 1u : 0u);
+	b.U8(static_cast<uint8_t>(image_features.compute_derivatives));
 	const auto shader_clock = Spirv::GetHostShaderClock();
 	b.U8(static_cast<uint8_t>(shader_clock.scope));
 	b.U32(static_cast<uint32_t>(shader_clock.shift));

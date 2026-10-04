@@ -759,15 +759,14 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandS
 #endif
 	}
 
-#if defined(__APPLE__)
-	// MoltenVK has no VK_EXT_color_write_enable; the pipeline is created without the
-	// eColorWriteEnableEXT dynamic state and relies on the static colorWriteMask instead.
-#else
-	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> enable {};
-	for (uint32_t slot = 0; slot < rendering.num_color_attachments; slot++) {
-		enable[slot] = rendering.color_attachments[slot].image_view != nullptr;
-	}
-	if (rendering.num_color_attachments != 0) {
+	// Without VK_EXT_color_write_enable (MoltenVK, older drivers) the pipeline is created without
+	// the eColorWriteEnableEXT dynamic state and relies on the static colorWriteMask instead; an
+	// attachment without an image view discards its writes.
+	if (buffer.GetGraphics().color_write_enable_enabled && rendering.num_color_attachments != 0) {
+		std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> enable {};
+		for (uint32_t slot = 0; slot < rendering.num_color_attachments; slot++) {
+			enable[slot] = rendering.color_attachments[slot].image_view != nullptr;
+		}
 		const bool same = recorder.Reuse() && shadow.color_write_valid &&
 		                  shadow.color_write_count == rendering.num_color_attachments &&
 		                  std::memcmp(shadow.color_write.data(), enable.data(),
@@ -782,7 +781,6 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandS
 			recorder.Emitted(1);
 		}
 	}
-#endif
 }
 
 // uc_check and hw_check of DrawIndex/DrawAuto. KYTY_DRAW_PREP_BINDINGS hwcheck: skipped when the

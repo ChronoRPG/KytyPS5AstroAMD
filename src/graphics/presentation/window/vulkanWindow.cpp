@@ -246,23 +246,17 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			}
 		};
 
-#if defined(__APPLE__)
+		// Optional (VulkanCreateDevice): without them the renderer keeps static colour-write masks
+		// and lets depth clamping stand in for the depth-clip switch, as on MoltenVK.
 		if (color_write_ext.colorWriteEnable != VK_TRUE) {
 			LOGF("colorWriteEnable is not supported\n");
 		}
-#else
-		check_feature(color_write_ext.colorWriteEnable, "colorWriteEnable");
-#endif
 		check_feature(image_view_min_lod.minLod, "image view minLod");
 
 		check_feature(depth_clip_control.depthClipControl, "depthClipControl");
-#if defined(__APPLE__)
 		if (depth_clip_enable.depthClipEnable != VK_TRUE) {
 			LOGF("depthClipEnable is not supported\n");
 		}
-#else
-		check_feature(depth_clip_enable.depthClipEnable, "depthClipEnable");
-#endif
 #if !defined(__APPLE__)
 		check_feature(device_features2.features.depthClamp, "depthClamp");
 		check_feature(fragment_barycentric.fragmentShaderBarycentric, "fragmentShaderBarycentric");
@@ -500,23 +494,18 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                ? fmt::format("family {}", graphics.transfer_queue_family).c_str()
 	                : "none");
 
+	// Chained after image_view_min_lod below, each only where enabled (MoltenVK and older drivers
+	// lack them; the renderer then keeps static colour-write masks and depth-clamp-based clipping).
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
 
 	vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip_enable {};
-	depth_clip_enable.pNext = &color_write_ext;
 	depth_clip_enable.depthClipEnable = VK_TRUE;
 
 	vk::PhysicalDeviceDepthClipControlFeaturesEXT depth_clip_control {};
 	vk::PhysicalDeviceImageViewMinLodFeaturesEXT  image_view_min_lod {};
 	image_view_min_lod.minLod = VK_TRUE;
 	depth_clip_control.pNext  = &image_view_min_lod;
-	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable, so drop those
-	// feature structs from the chain on macOS (the renderer falls back to default depth
-	// clipping and static color-write masks).
-#if !defined(__APPLE__)
-	image_view_min_lod.pNext = &depth_clip_enable;
-#endif
 	depth_clip_control.depthClipControl = VK_TRUE;
 
 	auto features12  = WindowContext::RequiredVulkan12Features();
@@ -604,7 +593,40 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = supported_features2.pNext;
 		supported_features2.pNext = &image_atomic_int64;
 	}
+	const bool color_write_extension =
+	    HasExtension(device_extensions, VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
+	vk::PhysicalDeviceColorWriteEnableFeaturesEXT supported_color_write {};
+	if (color_write_extension) {
+		supported_color_write.pNext = supported_features2.pNext;
+		supported_features2.pNext   = &supported_color_write;
+	}
+	const bool depth_clip_extension =
+	    HasExtension(device_extensions, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
+	vk::PhysicalDeviceDepthClipEnableFeaturesEXT supported_depth_clip {};
+	if (depth_clip_extension) {
+		supported_depth_clip.pNext = supported_features2.pNext;
+		supported_features2.pNext  = &supported_depth_clip;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	graphics.color_write_enable_enabled =
+	    color_write_extension && supported_color_write.colorWriteEnable == VK_TRUE;
+	graphics.depth_clip_enable_enabled =
+	    depth_clip_extension && supported_depth_clip.depthClipEnable == VK_TRUE;
+	{
+		void* optional = nullptr;
+		if (graphics.color_write_enable_enabled) {
+			color_write_ext.pNext = optional;
+			optional              = &color_write_ext;
+		}
+		if (graphics.depth_clip_enable_enabled) {
+			depth_clip_enable.pNext = optional;
+			optional                = &depth_clip_enable;
+		}
+		image_view_min_lod.pNext = optional;
+	}
+	LOGF("Vulkan colorWriteEnable: %s, depthClipEnable: %s\n",
+	     graphics.color_write_enable_enabled ? "true" : "false (static colour-write masks)",
+	     graphics.depth_clip_enable_enabled ? "true" : "false (depth clamp only without Z clipping)");
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
@@ -652,6 +674,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	LOGF("Vulkan shader object support: %s (renderer uses pipelines)\n",
 	     supported_shader_object.shaderObject ? "true" : "false");
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	if (!graphics.mesh_shader_enabled) {
+		// Not a reason to reject the device: games without mesh (NGG) shaders still run.
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "WARNING: the GPU \"{}\" has no mesh shaders ({}). Games that draw with mesh (NGG) "
+		    "shaders stop at their first such draw; other games are not affected.\n",
+		    graphics.GetPhysicalDeviceProperties().deviceName.data(),
+		    mesh_extension ? "VK_EXT_mesh_shader without the meshShader feature"
+		                   : "no VK_EXT_mesh_shader"));
+	}
 	// Optional: native indirect draws fall back to CPU-read arguments without these.
 	graphics.draw_indirect_first_instance_enabled =
 	    supported_features2.features.drawIndirectFirstInstance == VK_TRUE;
@@ -710,7 +741,37 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// Optional: IMAGE_SAMPLE*_CL clamps become the MinLod image operand.
 	const bool shader_resource_min_lod =
 	    supported_features2.features.shaderResourceMinLod == VK_TRUE;
-	ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = shader_resource_min_lod});
+	// Derivatives in compute shaders (IMAGE_GET_LOD): VK_KHR_compute_shader_derivatives, else the NV
+	// extension (one feature structure for both); the emitter declares the matching SPIR-V extension.
+	// Without either, such a shader keeps the KHR declaration and is named when it is compiled.
+	vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR compute_derivatives {};
+	const bool derivatives_khr =
+	    HasExtension(device_extensions, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+	const bool derivatives_nv =
+	    HasExtension(device_extensions, VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+	if (derivatives_khr || derivatives_nv) {
+		vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR supported_derivatives {};
+		vk::PhysicalDeviceFeatures2                           derivatives_query {};
+		derivatives_query.pNext = &supported_derivatives;
+		physical_device.getFeatures2(&derivatives_query);
+		compute_derivatives.computeDerivativeGroupQuads =
+		    supported_derivatives.computeDerivativeGroupQuads;
+	}
+	{
+		namespace Spirv = ShaderRecompiler::Spirv;
+		const auto derivatives = compute_derivatives.computeDerivativeGroupQuads != VK_TRUE
+		                             ? Spirv::HostComputeDerivatives::None
+		                         : derivatives_khr ? Spirv::HostComputeDerivatives::Khr
+		                                           : Spirv::HostComputeDerivatives::Nv;
+		Spirv::SetHostImageFeatures(
+		    {.min_lod = shader_resource_min_lod, .compute_derivatives = derivatives});
+		LOGF("Vulkan compute shader derivatives (IMAGE_GET_LOD): %s\n",
+		     derivatives == Spirv::HostComputeDerivatives::Khr
+		         ? VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
+		     : derivatives == Spirv::HostComputeDerivatives::Nv
+		         ? VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
+		         : "unavailable (compute shaders that need them are named when compiled)");
+	}
 	LOGF("Vulkan shaderResourceMinLod (IMAGE_SAMPLE*_CL): %s\n",
 	     shader_resource_min_lod ? "true" : "false");
 	// S_MEMREALTIME (KYTY_REALTIME_CLOCK): the device clock, else the subgroup clock, else the
@@ -990,6 +1051,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (shader_clock.shaderDeviceClock == VK_TRUE || shader_clock.shaderSubgroupClock == VK_TRUE) {
 		shader_clock.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext  = &shader_clock;
+	}
+	if (compute_derivatives.computeDerivativeGroupQuads == VK_TRUE) {
+		compute_derivatives.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext         = &compute_derivatives;
 	}
 	if (graphics.shader_image_int64_atomics_enabled) {
 		image_atomic_int64.pNext = const_cast<void*>(create_info.pNext);
@@ -1390,8 +1455,7 @@ void WindowContext::CreateVulkan() {
 	// requires VK_KHR_portability_subset per the Vulkan portability spec.
 	device_extensions.push_back("VK_KHR_portability_subset");
 #else
-	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
-	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
+	// VK_EXT_depth_clip_enable and VK_EXT_color_write_enable are optional (added below).
 	device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
 #endif
 
@@ -1488,6 +1552,24 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+#if !defined(__APPLE__)
+		// Dynamic colour-write enables and the depth-clip switch: without them (older drivers) the
+		// renderer uses its MoltenVK path (GraphicContext::color_write_enable_enabled and
+		// depth_clip_enable_enabled).
+		for (const auto* extension:
+		     {VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME, VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME}) {
+			if (HasExtension(available_extensions, extension)) {
+				device_extensions.push_back(extension);
+			}
+		}
+#endif
+		// Derivatives in compute shaders (IMAGE_GET_LOD); the NV extension has the same feature.
+		if (HasExtension(available_extensions, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+		} else if (HasExtension(available_extensions,
+		                        VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
 		}
 		// Native 8-bit index buffers for indirect draws; the KHR and EXT features are identical.
 		if (HasExtension(available_extensions, VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME)) {

@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/deviceCompat.h"
 #include "graphics/host_gpu/queueSubmission.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
@@ -64,6 +65,13 @@ struct GraphicContext {
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	// VK_EXT_color_write_enable: draws turn attachments without an image off through dynamic
+	// colour-write enables. Without it (older drivers, MoltenVK) pipelines keep their static write
+	// masks; an attachment without an image view discards its writes anyway.
+	bool                               color_write_enable_enabled            = false;
+	// VK_EXT_depth_clip_enable: depth clipping set apart from the always-on depth clamp (the DB's
+	// behaviour). Without it, pipelines clamp only where the guest turns Z clipping off.
+	bool                               depth_clip_enable_enabled             = false;
 	bool                               supports_block_texel_view              = false;
 	// shaderStorageImageReadWithoutFormat (TileManager::TileFromImage).
 	bool                               storage_image_read_without_format_enabled = false;
@@ -164,6 +172,21 @@ struct GraphicContext {
 			return 0;
 		}
 		return wave_size;
+	}
+
+	// The subgroup size a compute pipeline must require so that one host subgroup holds one guest
+	// wave, or 0 (DeviceCompat::ComputeSubgroupSize): the wave size on AMD as before, 32 on devices
+	// whose drivers pick a width per shader (Intel: 8 to 32), nothing on NVIDIA (always 32).
+	[[nodiscard]] uint32_t ComputeSubgroupSize(uint32_t wave_size,
+	                                           uint32_t host_subgroup_size) const noexcept {
+		return DeviceCompat::ComputeSubgroupSize(
+		    {.min_size       = min_subgroup_size,
+		     .max_size       = max_subgroup_size,
+		     .enabled        = subgroup_size_control_enabled,
+		     .compute        = static_cast<bool>(required_subgroup_size_stages &
+		                                         vk::ShaderStageFlagBits::eCompute),
+		     .compute_wave64 = compute_subgroup_size_control_enabled},
+		    wave_size, host_subgroup_size);
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {

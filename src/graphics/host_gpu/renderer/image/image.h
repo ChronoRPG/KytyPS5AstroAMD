@@ -516,6 +516,10 @@ private:
 	uint64_t          m_dirty_begin      = 0;
 	uint64_t          m_dirty_end        = 0;
 	uint32_t          m_uploads          = 0;
+	// What the device refused for this image and the image was created without
+	// (DeviceCompat::OptionalImageCreateFallbacks): FindView stops at a view that needs it.
+	vk::ImageUsageFlags  m_dropped_usage {};
+	vk::ImageCreateFlags m_dropped_flags {};
 };
 
 namespace ImageOps {

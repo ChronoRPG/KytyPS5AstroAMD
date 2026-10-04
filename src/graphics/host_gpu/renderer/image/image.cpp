@@ -17,7 +17,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <numeric>
+#include <set>
+#include <tuple>
 #include <vector>
 #include <xxhash.h>
 
@@ -166,6 +169,25 @@ bool CopyViaBufferBatchEnabled() {
 		usage |= vk::ImageUsageFlagBits::eStorage;
 	}
 	return usage;
+}
+
+// Once per format and set of drops (Image::Image).
+void LogImageCreateFallback(vk::Format format, vk::ImageUsageFlags dropped_usage,
+                            vk::ImageCreateFlags dropped_flags) {
+	static std::mutex mutex;
+	static std::set<std::tuple<vk::Format, vk::ImageUsageFlags::MaskType,
+	                           vk::ImageCreateFlags::MaskType>>
+	                 logged;
+	std::scoped_lock lock(mutex);
+	if (!logged.emplace(format, static_cast<vk::ImageUsageFlags::MaskType>(dropped_usage),
+	                    static_cast<vk::ImageCreateFlags::MaskType>(dropped_flags))
+	         .second) {
+		return;
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Vulkan image: {} images are created without usage {} and flags {} (the device does not "
+	    "support them for this format)\n",
+	    vk::to_string(format), vk::to_string(dropped_usage), vk::to_string(dropped_flags)));
 }
 
 void ValidateOptionalRange(GuestRange range, const char* name) {
@@ -926,16 +948,41 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.usage         = ImageUsageFlags(graphics, info);
 	create.samples       = vulkan_sample_count(info.samples);
 
-	vk::ImageFormatProperties properties {};
-	if (graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
-	                                      create.usage, create.flags,
-	                                      &properties) != vk::Result::eSuccess ||
-	    !static_cast<bool>(properties.sampleCounts & create.samples)) {
-		EXIT("image format does not support required usage: format=%d type=%d usage=0x%x "
-		     "flags=0x%x samples=%u\n",
-		     static_cast<int>(create.format), static_cast<int>(create.imageType),
-		     static_cast<vk::ImageUsageFlags::MaskType>(create.usage),
-		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
+	const auto accepts = [&](vk::ImageUsageFlags usage, vk::ImageCreateFlags flags) {
+		vk::ImageFormatProperties properties {};
+		return graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
+		                                         usage, flags, &properties) == vk::Result::eSuccess &&
+		       static_cast<bool>(properties.sampleCounts & create.samples);
+	};
+	if (!accepts(create.usage, create.flags)) {
+		// The device refuses the image (AMD and Intel drivers, for some formats): try it without
+		// the usages and flags no role of it needs here. A device that accepts it (NVIDIA) never
+		// gets here, so its images are unchanged.
+		const auto candidates = DeviceCompat::OptionalImageCreateFallbacks(
+		    static_cast<VkImageUsageFlags>(create.usage), static_cast<VkImageCreateFlags>(create.flags),
+		    static_cast<VkFormatFeatureFlags>(
+		        graphics.GetFormatProperties(create.format).optimalTilingFeatures));
+		bool accepted = false;
+		for (uint32_t index = 1; index < candidates.count && !accepted; index++) {
+			const vk::ImageUsageFlags  usage {candidates.list[index].usage};
+			const vk::ImageCreateFlags flags {candidates.list[index].flags};
+			if (accepts(usage, flags)) {
+				m_dropped_usage = create.usage & ~usage;
+				m_dropped_flags = create.flags & ~flags;
+				LogImageCreateFallback(create.format, m_dropped_usage, m_dropped_flags);
+				create.usage = usage;
+				create.flags = flags;
+				accepted     = true;
+			}
+		}
+		if (!accepted) {
+			EXIT("image format does not support required usage: the device refuses %s images "
+			     "(type %s, %u sample(s), extent %ux%ux%u) with usage %s and flags %s, also without "
+			     "the optional ones\n",
+			     vk::to_string(create.format).c_str(), vk::to_string(create.imageType).c_str(),
+			     info.samples, create.extent.width, create.extent.height, create.extent.depth,
+			     vk::to_string(create.usage).c_str(), vk::to_string(create.flags).c_str());
+		}
 	}
 
 	if (sparse_first_level != 0 && graphics.CreateSparseImage(create, sparse_first_level, backing)) {
