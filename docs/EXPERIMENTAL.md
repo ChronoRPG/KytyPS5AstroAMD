@@ -4,33 +4,78 @@ This release builds on the U59 renderer and the Demon's Souls changes of the pre
 
 ## New in this update
 
-- Unused occlusion queries are reset in batches (`KYTY_OCCLUSION_RESET_BATCH=1` in the preset), up to 64 per command
-  instead of one each, with every query boundary, result copy and reduction unchanged. Measured with the switch
-  toggled in the same process: Go-Go Archipelago +1.5% to +1.9% fps, Bathhouse Battle +2.6%; Crash Site and the Sky
-  Garden unchanged.
+This update is about compatibility: the freeze on RTX 50 PCs, AMD and Intel GPUs and CPUs, and older drivers.
+
+- A fix for the freeze on NVIDIA RTX 50 PCs. A hang watchdog report from an RTX 5070 Ti showed the cause: the GPU
+  waited for a texture copy that a CPU thread was about to finish, and that thread's copy-done signal and the frame
+  presentation then blocked each other inside Windows (hardware-accelerated GPU scheduling). The emulator now waits
+  for such copies on the CPU before it hands the GPU work that reads them to the driver, so the GPU never waits for a
+  signal that only the CPU can give later; the upload DMA transfers follow the same rule. In the Sky Garden this came
+  up about twice per frame. The fix is not yet confirmed on an RTX 50 PC.
+  - With int7, one RTX 50 player found that the Fifo present mode (launcher: Configuration -> Present mode) avoids the
+    freeze; with this fix the default Mailbox mode should work too.
+  - If your RTX 50 PC still freezes, please send `_HangTrace\watchdog-*\watchdog.txt` from beside the emulator (the
+    watchdog stays on only for RTX 50 GPUs). `KYTY_SUBMIT_WAIT_BEFORE_SIGNAL=1` restores the old behaviour, for
+    comparisons only.
+- GPUs other than recent NVIDIA ones. Several places where the emulator stopped because a GPU or driver lacked an
+  optional feature now continue:
+  - `VK_EXT_color_write_enable` and `VK_EXT_depth_clip_enable` are no longer required (older drivers). Without them
+    the emulator uses static colour-write masks, and depth clamping only where the game turns depth clipping off.
+  - Images the driver refuses are created without the optional usages and flags they can do without, instead of
+    stopping with "image format does not support required usage". The log names each format once.
+  - Compute shaders that compute a texture LOD enable `VK_KHR_compute_shader_derivatives` (or the NV extension). The
+    shaders used it before without enabling it, which drivers other than NVIDIA's may reject.
+  - Intel GPUs: compute shaders require a 32-wide subgroup, so the driver cannot split one guest wave over several
+    narrower subgroups.
+  - AMD GPUs: pixel and mesh shaders require the guest's wave size where the driver allows it; block-compressed volume
+    textures drop optional flags until the driver accepts them; depth feedback loops without the host extension warn
+    instead of stopping.
+  - An image descriptor whose format names nothing is bound empty instead of aborting; an oversized image readback is
+    staged in a private buffer instead of stopping; a GPU memory report below the caches' own size no longer stops
+    the emulator.
+  - GPUs without mesh shaders (GTX 10 series, RX 5000 series, Intel Iris Xe): a warning at startup, and a game that
+    draws with mesh shaders stops at its first such draw with a message that names `VK_EXT_mesh_shader`, instead of a
+    generic error. There is no fallback for those draws.
+  - Windows: every emulator function the game calls realigns the stack first; game code that called in with a
+    misaligned stack could crash the emulator.
+  - Sources: Senaxx's fork (depth feedback loops, block-compressed volumes), upstream pull requests #845 by Matthew
+    Hurley and #977 by tototomate123 (readback, memory accounting), and new fixes for this release.
+  - On an NVIDIA RTX card each of these paths is the same as before. They were not tested on AMD or Intel hardware
+    for this release.
+- AMD and Intel CPUs (from upstream KytyPS5):
+  - The launcher's "AMD CPU patch" option (`--amd-cpu`) emulates the game's `VRSQRTPS` instructions. Most of them are
+    now patched to native code instead of trapping on every execution: at the Sky Garden start view 31.6 fps instead
+    of 18.9 fps with the option on.
+  - On CPUs without SSE4a (Intel), the game's `EXTRQ` instructions run through native code instead of a trap each, and
+    `INSERTQ`, and `RDPID` and `CLWB` on CPUs without them, are emulated (int7 could not run them).
+- Upstream KytyPS5 changes (third sync, through db1758527): rendering fixes (sampler snapshots shared across shader
+  variants, image contents kept across unrelated buffer writes, BC5 textures, 64-bit image atomic max, explicit gather
+  LOD, compute LDS clamped to the device limit), unopenable gamepads ignored, the cursor hidden over the game window
+  after two idle seconds, DualSense vibration and volume settings in the launcher, periodic kernel timers, batched
+  AIO, and network receives with `MSG_PEEK` and `MSG_WAITALL` on Windows.
+- The first launch of each game rebuilds its shader program cache: the shader translation changed, so earlier
+  caches are not reused. The first visit to each area is slow (Astro Bot's galaxy map ran at about 1 fps on an empty
+  cache) and the game stutters until the cache fills.
+- Opt-in switches, off by default and not in the preset: `KYTY_IR_LINEAR_USES`, `KYTY_FOLD_LANE_MASKS`,
+  `KYTY_PRECISE_COND_WAITS` and `KYTY_BDA_SYNC_PER_SUBMISSION`.
+- kyty_emulator is built with a new PGO profile, recorded in Astro Bot with this source.
+
+From int7 (`u59-windows-20261004-int7`):
+
 - New shader pipelines are prepared ahead on worker threads (`KYTY_PIPELINE_PREFETCH=1` and
-  `KYTY_PIPELINE_PREFETCH_PROGRAMS=1` in the preset). Draws still wait for their exact pipeline, so nothing is drawn
-  differently; the work just starts earlier. With an empty shader cache the command processor stalled 68-70 s
-  instead of 87-89 s along the Sky Garden route and 57-59 s instead of 76 s along the Creamy Canyon route, and the
-  slowest 1% of Creamy Canyon frames took about 100-130 ms instead of 230-245 ms. With a warm cache fps is unchanged.
-- Small uploads use their own ring buffer (`KYTY_RAM_SMALL_UPLOAD_RING=1` in the preset): about 430-540 MB less RAM
-  (private bytes), about 385 MB less shared GPU memory and 60-150 MB less VRAM in the Sky Garden and Go-Go
-  Archipelago, with fps differences within run-to-run noise.
+  `KYTY_PIPELINE_PREFETCH_PROGRAMS=1` in the preset). With an empty shader cache the command processor stalled 68-70 s
+  instead of 87-89 s along the Sky Garden route, and the slowest 1% of Creamy Canyon frames took about 100-130 ms
+  instead of 230-245 ms. With a warm cache fps is unchanged.
+- Small uploads use their own ring buffer (`KYTY_RAM_SMALL_UPLOAD_RING=1` in the preset): about 430-540 MB less RAM,
+  about 385 MB less shared GPU memory and 60-150 MB less VRAM.
+- Unused occlusion queries are reset in batches (`KYTY_OCCLUSION_RESET_BATCH=1` in the preset): Go-Go Archipelago
+  +1.5% to +1.9% fps, Bathhouse Battle +2.6%.
 - Shader storage writes are tagged again at command emission when binding preparation submitted their original
-  recording (`KYTY_SHADER_WRITE_RETICK=1` in the preset). This prevents a side readback from publishing old
-  contents before the actual GPU write. A deterministic Vulkan test reproduces the race; whether it fixes the
-  reported RTX 40/50 hangs remains unproven. `KYTY_SHADER_WRITE_RETICK=0` restores the previous behavior.
-  - The logs of RTX 50 PCs that freeze at the title screen -> galaxy map step all end in this readback path:
-    the game's render threads re-read small flags a shader writes every frame. If your RTX 40/50 PC freezes
-    there, try this release with its bundled preset.
+  recording (`KYTY_SHADER_WRITE_RETICK=1` in the preset), so a side readback cannot publish old contents before the
+  actual GPU write. `KYTY_SHADER_WRITE_RETICK=0` restores the previous behavior.
 - The hang watchdog is on only for NVIDIA RTX 50 GPUs (`KYTY_HANG_WATCHDOG=auto` in the preset; `=1` turns it on for any
   GPU, `=0` off). When the picture stops for 5 seconds it writes `_HangTrace\watchdog-*\watchdog.txt` beside the
-  emulator: what every thread is doing and waiting for. If your RTX 50 PC still freezes, please send that file.
-  On other GPUs its hot paths stay off; see `docs/HANG-WATCHDOG.md`.
-- The storage-write fix costs nothing measurable on one PC (RTX 3090, Ryzen 9 7950X3D): switched off and on in the
-  same process, Sky Garden -0.14% +/- 0.50%, Creamy Canyon -0.13% +/- 0.66%, identical VRAM.
-- kyty_emulator is built with a new PGO profile recorded in Astro Bot with this source. The shader translation is
-  unchanged, so int5's program caches stay valid.
+  emulator: what every thread is doing and waiting for. See `docs/HANG-WATCHDOG.md`.
 
 From int5 (`u59-windows-20261003-int5`):
 
@@ -128,21 +173,16 @@ From int5 (`u59-windows-20261003-int5`):
 
 ## Measured
 
-Astro Bot (PPSA21567); RTX 3090, Ryzen 9 7950X3D; 1920x1080 output at a 120 Hz vblank. Timed runs on one PC,
-alternating between the two builds, each with its bundled preset:
+Astro Bot (PPSA21567); RTX 3090, Ryzen 9 7950X3D; 1920x1080 output at a 120 Hz vblank; warm program caches; the
+bundled preset. This release was checked with single timed runs, not with an alternating comparison:
 
-| Start view | Previous release (`u59-windows-20261003-int4b`) | This release (a local build of the same source) |
-|---|---|---|
-| Creamy Canyon, two runs each | 8.3 fps (8.29-8.34) | 22.0 fps (21.94-22.01) |
-| Sky Garden, three runs each | 33.5 fps (32.8-33.9) | 33.9 fps (33.1-34.5) |
-
-- Creamy Canyon: command-processor time per frame fell from 102 ms to 42 ms, GPU time from 96 ms to 23 ms.
-- Sky Garden: the frame-rate difference is within the spread between runs. A second block, taken while the remote
-  session to the PC was disconnected, read 36.9 fps (two runs) and 36.0 fps (three runs). GPU time per frame was
-  about 0.9 ms higher with this release in both blocks; at the Sky Garden the GPU waits for work 7-9 ms per
-  frame, so the frame rate does not follow it. Dedicated VRAM stayed at 6.2-6.5 GB with both builds.
-- Demon's Souls boots to its menu with the preset (Language Select at 60 fps). Its frame rate with this build was
-  not measured.
+- Sky Garden start view: 35.2 fps with a local build of this release (int7: 33-35 fps in earlier runs).
+- Creamy Canyon start view: 21.3 fps with a local build before the last compatibility merge (int7: 21.7-22.2 fps).
+  The RTX 50 fix costs about 2% there (21.7 vs 22.2 fps when it was compared alone against int7, alternating
+  launches); that scene is limited by the command processor.
+- With the AMD CPU patch (`--amd-cpu`), Sky Garden: 31.6 fps (int7 with the patch: 18.9 fps).
+- Demon's Souls boots to its menu with the preset (Language Select at 60 fps).
+- With int5, batched occlusion queries took the Creamy Canyon start view from 8.3 to 22.0 fps.
 
 ## Launching
 
@@ -179,6 +219,9 @@ line again afterwards.
   Linux user's log. `"KYTY_OCCLUSION_BATCH": "0"` and `"KYTY_FAULT_AHEAD_ADAPT": "0"` in `u59-preset.json` restore
   the previous behaviour.
 - The PGO profile comes from Astro Bot only. Other games run with code laid out for Astro Bot.
+- Microsoft Defender flagged the int7 `launcher.exe` as `Trojan:Win32/Bearfoos.A!ml` on the test PC. The `!ml` marks a
+  machine-learning verdict, not the signature of known malware. The launcher is built by the GitHub Actions workflow
+  `.github/workflows/u59-windows-release.yml` from `src/launcher` in this repository.
 - The upstream controller and audio changes were not tested by hand.
 - The preset also sets `KYTY_SRT_VARIANT_READS=1`, which Demon's Souls needs.
 
