@@ -54,6 +54,16 @@ Live::Switch g_shader_write_retick("KYTY_SHADER_WRITE_RETICK", Live::ParseDefaul
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
+bool SmallUploadRingEnabled() {
+	// Startup only: keep large requests correct through temporary upload buffers.
+	const auto* flag = std::getenv("KYTY_RAM_SMALL_UPLOAD_RING");
+	return flag != nullptr && std::strcmp(flag, "1") == 0;
+}
+
+uint64_t UploadRingSize() {
+	return SmallUploadRingEnabled() ? 128 * MiB : 512 * MiB;
+}
+
 Live::Switch g_cpu_only_query("KYTY_CP_CPU_ONLY_QUERY", Live::ParseDefaultOff);
 Live::Switch g_binding_memo_prefetch("KYTY_CP_BINDING_MEMO_PREFETCH", Live::ParseDefaultOff);
 std::atomic<uint64_t> g_binding_hot_generation {1};
@@ -1059,7 +1069,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_hot_quiet_frames(HotPageQuietFrames()),
       m_hot_check_limit(HotPageCheckLimit()),
       m_range_memo(RangeMemoEnabled() ? std::make_unique<RangeMemo[]>(RangeMemoSlots) : nullptr),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB,
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, UploadRingSize(),
                        graphics.transfer_queue != nullptr),
       m_upload_dma(UploadDma::Create(graphics, scheduler)),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB, false, {},
@@ -3219,6 +3229,19 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainWrittenBuffer(uint64_t vaddr, ui
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
+std::pair<Buffer*, uint64_t> BufferCache::ObtainImageStagingBuffer(uint64_t size) {
+	auto [mapped, offset] = m_staging_buffer.Map(size, 16);
+	if (mapped != nullptr) return {&m_staging_buffer, offset};
+	if (!SmallUploadRingEnabled()) return {nullptr, 0};
+	// The fixed ring must not impose a maximum guest image size. Keep this one-off source
+	// alive until the submission using it has completed, as UploadCopies does for buffers.
+	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
+	                                         AllFlags, size);
+	auto* source = temporary.get();
+	m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	return {source, 0};
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
@@ -3236,13 +3259,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 
-	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
+	auto [source, stage_offset] = ObtainImageStagingBuffer(size);
+	if (source == nullptr) EXIT("BufferCache: failed to read mapped guest image backing\n");
+	auto* staging = source->Mapped().data() + stage_offset;
+	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
+	    !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size)) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
-	m_staging_buffer.Commit();
-	return {&m_staging_buffer, stage_offset};
+	if (source == &m_staging_buffer) m_staging_buffer.Commit();
+	else source->Flush(0, size);
+	return {source, stage_offset};
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {

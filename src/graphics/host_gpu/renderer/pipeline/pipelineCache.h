@@ -264,6 +264,8 @@ public:
 	[[nodiscard]] ProgramDiskCache* GetProgramDiskCache() const { return m_program_disk.get(); }
 	// Returns once the checks KYTY_PROGRAM_CACHE_VERIFY=background has queued are done (tests).
 	void WaitProgramChecks();
+	// Diagnostic only; skips busy cache locks instead of waiting for compiles/preparation.
+	void ReportRamStats();
 
 private:
 	struct ProgramCache;

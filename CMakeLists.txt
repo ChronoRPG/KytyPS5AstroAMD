@@ -1049,6 +1049,16 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --guest-stack-exit-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	if(WIN32)
+		add_test(NAME virtual_memory_allocation_lazy_backing
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+		set_tests_properties(virtual_memory_allocation_lazy_backing PROPERTIES
+			ENVIRONMENT "KYTY_GUEST_BACKING_LAZY_COMMIT=1")
+		add_test(NAME virtual_memory_allocation_lazy_zero
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+		set_tests_properties(virtual_memory_allocation_lazy_zero PROPERTIES
+			ENVIRONMENT "KYTY_GUEST_BACKING_LAZY_COMMIT=1;KYTY_GUEST_BACKING_LAZY_ZERO=1")
+	endif()
 	# KYTY_CLAMP_RANGE_MEMO: verify mode and off.
 	add_test(NAME virtual_memory_allocation_clamp_memo_verify
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
@@ -1080,6 +1090,14 @@ if(BUILD_TESTING)
 	# scheduler's pre-submit hook it flushes from.
 	add_test(NAME occlusion_batch
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --occlusion-batch-only)
+	add_test(NAME stream_buffer_ring_small_upload
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
+	set_tests_properties(stream_buffer_ring_small_upload PROPERTIES
+		ENVIRONMENT "KYTY_RAM_SMALL_UPLOAD_RING=1")
+	add_test(NAME stream_buffer_ring_small_upload_queued
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
+	set_tests_properties(stream_buffer_ring_small_upload_queued PROPERTIES
+		ENVIRONMENT "KYTY_RAM_SMALL_UPLOAD_RING=1;KYTY_SUBMISSION_MODE=queued;KYTY_SUBMISSION_COALESCE=1")
 	add_test(NAME gpu_command_lane
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
 	add_test(NAME pm4_context_state

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "common/ramStats.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -2956,6 +2957,24 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	void ReportRamStats() {
+		std::shared_lock lock(m_programs_mutex, std::try_to_lock);
+		if (lock.owns_lock()) {
+			const auto sources = programs.size();
+			const auto retained = kept_lru.size();
+			const auto bytes = kept_bytes;
+			lock.unlock();
+			std::printf("RAM cache: sources=%zu retained_translations=%zu "
+			            "translation_estimate_bytes=%zu\n", sources, retained, bytes);
+		}
+		std::unique_lock reuse_lock(m_reuse_mutex, std::try_to_lock);
+		if (reuse_lock.owns_lock()) {
+			const auto bytes = history_bytes;
+			reuse_lock.unlock();
+			std::printf("RAM cache: reuse_history_estimate_bytes=%zu\n", bytes);
+		}
+	}
+
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	mutable std::shared_mutex                                   m_programs_mutex;
 	// Serializes O15 reuse-mode preparation; ordered before m_programs_mutex.
@@ -2973,6 +2992,18 @@ struct PipelineCache::ProgramCache {
 	// Background spirv-val; null when validation is off or synchronous.
 	std::unique_ptr<SpirvValidator> validator;
 };
+
+void PipelineCache::ReportRamStats() {
+	if (!Common::RamStats::Enabled()) return;
+	if (m_mutex.TryLock()) {
+		const auto graphics = m_graphics_pipelines.size();
+		const auto compute = m_compute_pipelines.size();
+		m_mutex.Unlock();
+		std::printf("RAM cache: graphics_pipelines=%zu compute_pipelines=%zu "
+		            "driver_heap_bytes=unknown\n", graphics, compute);
+	}
+	m_program_cache->ReportRamStats();
+}
 
 // Classifies each new graphics pipeline for stutter attribution: whether a pipeline already existed
 // for the same program ids (and which key groups differ from the closest one), only for the same
@@ -3315,6 +3346,7 @@ void PipelineCache::InitializeDriverCache() {
 	}
 
 	vk::PipelineCacheCreateInfo create {};
+	Common::RamStats::Range("driver cache load temporary", initial_data.data(), initial_data.capacity());
 	create.initialDataSize = initial_data.size();
 	create.pInitialData    = initial_data.empty() ? nullptr : initial_data.data();
 	auto result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);

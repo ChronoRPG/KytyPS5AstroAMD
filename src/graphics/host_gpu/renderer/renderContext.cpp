@@ -413,6 +413,7 @@ void RenderContext::ReportVram() {
 	}
 	m_texture_cache.ReportVram();
 	m_buffer_cache.ReportVram();
+	m_pipeline_cache.ReportRamStats();
 	VramStats::Flush();
 }
 

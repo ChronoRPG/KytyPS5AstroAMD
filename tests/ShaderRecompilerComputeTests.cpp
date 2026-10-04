@@ -180,6 +180,9 @@ static_assert(BlitHelper::ColorToMsDepthLayout ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
 struct BufferCacheTestAccess {
+  static std::pair<Buffer*, uint64_t> ImageStaging(BufferCache &cache, uint64_t size) {
+    return cache.ObtainImageStagingBuffer(size);
+  }
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
 
@@ -4343,8 +4346,10 @@ public:
     scheduler.Begin(registers, user_config, shaders);
     auto &resources = context;
     auto &cache = resources.GetBufferCache();
-    constexpr std::array<std::pair<MemoryUsage, uint64_t>, 4> utilities{{
-        {MemoryUsage::Upload, 512ull << 20},
+    const auto* small_flag = std::getenv("KYTY_RAM_SMALL_UPLOAD_RING");
+    const bool small_upload = small_flag != nullptr && std::strcmp(small_flag, "1") == 0;
+    const std::array<std::pair<MemoryUsage, uint64_t>, 4> utilities{{
+        {MemoryUsage::Upload, (small_upload ? 128ull : 512ull) << 20},
         {MemoryUsage::Stream, 64ull << 20},
         {MemoryUsage::Download, 64ull << 20},
         {MemoryUsage::DeviceLocal, 128ull << 20},
@@ -4465,6 +4470,56 @@ public:
             "alignment");
     download.Commit();
 
+    auto &image_ring = cache.GetUtilityBuffer(MemoryUsage::Upload);
+    const auto ring_handle = image_ring.Handle();
+    const auto image_size = image_ring.Size() + 16;
+    const auto [large_source, large_offset] =
+        BufferCacheTestAccess::ImageStaging(cache, image_size);
+    if (small_upload) {
+      Require("StreamBufferRing", "oversized image temporary",
+              large_source != nullptr && large_source != &image_ring &&
+                  large_source->Size() == image_size && large_offset == 0,
+              "small ring rejected an oversized image or replaced the persistent ring");
+      constexpr uint64_t head = 0x52414d4845414401ull;
+      constexpr uint64_t tail = 0x52414d5441494c02ull;
+      std::memcpy(large_source->Mapped().data(), &head, sizeof(head));
+      std::memcpy(large_source->Mapped().data() + image_size - sizeof(tail), &tail, sizeof(tail));
+      large_source->Flush(0, image_size);
+      Libs::Graphics::Buffer result(m_runtime_context, scheduler, MemoryUsage::Download, 0,
+                    vk::BufferUsageFlagBits::eTransferDst, 24);
+      result.CopyFrom(scheduler.Current(), *large_source, 0, 0, 8);
+      result.CopyFrom(scheduler.Current(), *large_source, image_size - 8, 8, 8);
+      TileManager tiler(m_runtime_context, scheduler, upload_stream);
+      const auto transformed = tiler.SwapBgra16({large_source->Handle(), image_size - 8, 8});
+      const vk::BufferCopy transformed_copy{transformed.offset, 16, 8};
+      scheduler.Current().Handle().copyBuffer(transformed.buffer, result.Handle(), 1,
+                                             &transformed_copy);
+      vk::BufferMemoryBarrier host_read{};
+      host_read.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      host_read.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      host_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      host_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      host_read.buffer = result.Handle();
+      host_read.size = 24;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &host_read, 0, nullptr);
+      scheduler.Finish();
+      result.Invalidate(0, 24);
+      uint64_t actual_head = 0, actual_tail = 0, actual_swapped = 0;
+      std::memcpy(&actual_head, result.Mapped().data(), 8);
+      std::memcpy(&actual_tail, result.Mapped().data() + 8, 8);
+      std::memcpy(&actual_swapped, result.Mapped().data() + 16, 8);
+      constexpr auto swapped = (tail & 0xffff0000ffff0000ull) | ((tail & 0xffffull) << 32) |
+                               ((tail >> 32) & 0xffffull);
+      Require("StreamBufferRing", "temporary submission lifetime",
+              actual_head == head && actual_tail == tail && actual_swapped == swapped,
+              "deferred image staging lost transfer or storage-shader reads before completion");
+    } else {
+      Require("StreamBufferRing", "default oversized image policy", large_source == nullptr,
+              "flag-off image staging changed its oversize policy");
+    }
+    Require("StreamBufferRing", "persistent image ring", image_ring.Handle() == ring_handle,
+            "one-off image staging changed the shared utility ring");
     scheduler.Finish();
     download.Invalidate(download_offset, 16);
     std::printf("[host]    %-32s ok\n", "StreamBufferRing");

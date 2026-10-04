@@ -53,6 +53,7 @@ public:
 		None,
 		BackingUnavailable,
 		PhysicalRangeOutOfBounds,
+		BackingCommitFailed,
 		FixedMapViewFailed,
 		PlaceholderMapFailed,
 		ProtectFailed,
@@ -62,8 +63,13 @@ public:
 
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		const auto* lazy = std::getenv("KYTY_GUEST_BACKING_LAZY_COMMIT");
+		m_lazy_commit = lazy != nullptr && std::strcmp(lazy, "1") == 0;
+		const auto* lazy_zero = std::getenv("KYTY_GUEST_BACKING_LAZY_ZERO");
+		m_lazy_zero = m_lazy_commit && lazy_zero != nullptr && std::strcmp(lazy_zero, "1") == 0;
 		m_handle = CreateFileMappingA(
-		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+		    INVALID_HANDLE_VALUE, nullptr,
+		    PAGE_EXECUTE_READWRITE | (m_lazy_commit ? SEC_RESERVE : SEC_COMMIT),
 		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
 		if (m_handle == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
@@ -80,6 +86,7 @@ public:
 			CloseHandle(m_handle);
 			m_handle = nullptr;
 		}
+		Common::RamStats::Range("guest shared backing capacity", m_backing_base, m_size);
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #if defined(__APPLE__)
 		{
@@ -153,6 +160,7 @@ public:
 			case FailureReason::None: return "n/a";
 			case FailureReason::BackingUnavailable: return "backing-unavailable";
 			case FailureReason::PhysicalRangeOutOfBounds: return "physical-range-out-of-bounds";
+			case FailureReason::BackingCommitFailed: return "backing-commit-failed";
 			case FailureReason::FixedMapViewFailed: return "fixed-map-view-failed";
 			case FailureReason::PlaceholderMapFailed: return "placeholder-map-failed";
 			case FailureReason::ProtectFailed: return "protect-failed";
@@ -182,6 +190,36 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (m_lazy_zero) {
+			// Uncommitted section pages have never held guest data and Windows supplies zeros
+			// on first access. Commit them without materializing every page with memset. Pages
+			// committed by an earlier allocation are always cleared, including freed flexible
+			// memory reused by a different guest mapping. Never discard direct-memory contents.
+			const auto end = backing_offset + size;
+			while (backing_offset < end) {
+				MEMORY_BASIC_INFORMATION info {};
+				auto* current = m_backing_base + backing_offset;
+				if (VirtualQuery(current, &info, sizeof(info)) != sizeof(info)) {
+					return false;
+				}
+				const auto region_end = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+				const auto bytes = std::min(end - backing_offset,
+				                            region_end - reinterpret_cast<uint64_t>(current));
+				if (bytes == 0) return false;
+				if (info.State == MEM_RESERVE) {
+					if (!EnsureCommitted(backing_offset, bytes)) return false;
+				} else if (info.State == MEM_COMMIT) {
+					std::memset(current, 0, bytes);
+				} else {
+					return false;
+				}
+				backing_offset += bytes;
+			}
+			return true;
+		}
+#endif
+		if (!EnsureCommitted(backing_offset, size)) return false;
 		std::memset(m_backing_base + backing_offset, 0, size);
 		return true;
 	}
@@ -392,6 +430,14 @@ public:
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// Commit through the writable host alias before publishing a guest view. Recommitting
+		// pages preserves their bytes, including direct-memory contents after an unmap/remap.
+		// SEC_RESERVE section pages cannot be decommitted: this saves unused physical offsets,
+		// while retaining the same process-lifetime backing and alias semantics as SEC_COMMIT.
+		if (!EnsureCommitted(backing_offset, size)) {
+			SetFailure(failure_reason, FailureReason::BackingCommitFailed);
+			return false;
+		}
 		void* mapped = ReplacePlaceholderView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			if (mapped != nullptr) {
@@ -795,6 +841,16 @@ private:
 		return size != 0 && backing_offset < m_size && size <= m_size - backing_offset;
 	}
 
+	bool EnsureCommitted(uint64_t backing_offset, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		return !m_lazy_commit ||
+		       VirtualAlloc(m_backing_base + backing_offset, size, MEM_COMMIT, PAGE_READWRITE) !=
+		           nullptr;
+#else
+		return true;
+#endif
+	}
+
 	static void SetFailure(FailureReason* out, FailureReason reason) {
 		if (out != nullptr) {
 			*out = reason;
@@ -857,6 +913,8 @@ private:
 	}
 
 	HANDLE m_handle = nullptr;
+	bool m_lazy_commit = false;
+	bool m_lazy_zero = false;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	[[nodiscard]] static uint64_t GetMappableTestSize() { return 0x4000; }
 

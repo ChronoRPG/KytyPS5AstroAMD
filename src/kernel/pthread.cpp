@@ -8,6 +8,7 @@
 #include "common/hangWatchdog.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/ramStats.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -746,6 +747,7 @@ static int CreateGuestStack(PthreadAttr attr) {
 	attr->stack_user     = false;
 	attr->stack_map_addr = stack_addr;
 	attr->stack_map_size = map_size;
+	Common::RamStats::Range("guest thread stack", reinterpret_cast<void*>(stack_addr), map_size);
 
 	std::memset(attr->stack_addr, 0, stack_size);
 

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandStream.h"
+#include "common/ramStats.h"
 
 #include "common/hangWatchdog.h"
 
@@ -627,6 +628,7 @@ Ring::Ring(uint64_t capacity) {
 	m_capacity = capacity;
 	m_mask     = capacity - 1u;
 	m_data     = static_cast<uint8_t*>(::operator new(capacity, std::align_val_t {64}));
+	Common::RamStats::Range("CP command ring", m_data, capacity);
 }
 
 Ring::~Ring() {

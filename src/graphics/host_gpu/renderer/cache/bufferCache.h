@@ -210,6 +210,7 @@ public:
 
 private:
 	friend struct BufferCacheTestAccess;
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainImageStagingBuffer(uint64_t size);
 
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);

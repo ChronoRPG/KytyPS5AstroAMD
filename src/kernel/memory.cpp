@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/platform/uffdWriteWatch.h"
 #include "common/profiler.h"
+#include "common/ramStats.h"
 #include "common/rendererBatch.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -1548,6 +1549,12 @@ void Initialize() {
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
 	g_physical_memory     = std::make_unique<PhysicalMemory>();
 	g_flexible_memory     = std::make_unique<FlexibleMemory>();
+	const auto backing = g_guest_address_space->GetBackingBase();
+	Common::RamStats::Range("guest direct physical capacity", reinterpret_cast<void*>(backing),
+	                       PhysicalMemory::Size());
+	Common::RamStats::Range("guest flexible physical capacity",
+	                       reinterpret_cast<void*>(backing + PhysicalMemory::Size()),
+	                       FlexibleMemory::Size());
 	g_pooled_memory       = std::make_unique<PooledMemory>();
 	g_virtual_ranges      = std::make_unique<VirtualRanges>();
 	EXIT_IF(!g_guest_address_space->SelfTest());
@@ -3992,6 +3999,10 @@ bool TestGuestBackingOutsideAddressSpace() {
 
 uint64_t TestGuestBackingSize() {
 	return g_guest_address_space->GetBackingSize();
+}
+
+uint64_t TestGuestBackingBase() {
+	return g_guest_address_space->GetBackingBase();
 }
 
 bool TestGuestFreeRangeBounds() {
