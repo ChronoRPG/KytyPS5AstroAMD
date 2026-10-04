@@ -42,6 +42,7 @@
 #include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -190,9 +191,32 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	VkBuffer      buffer = VK_NULL_HANDLE;
 	VmaAllocation memory = nullptr;
 	const auto    raw    = static_cast<VkBufferCreateInfo>(create);
-	RequireVulkanSuccess(static_cast<vk::Result>(vmaCreateBuffer(
-	                         m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr)),
-	                     "allocate TileManager scratch buffer");
+	auto result = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
+	if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+		// VRAM ran short (cards with less memory): the pool holds only buffers whose GPU work has
+		// completed, so free all of them and retry once before giving up.
+		std::vector<Scratch> idle;
+		{
+			std::scoped_lock lock(m_scratch_mutex);
+			idle.swap(m_scratch_pool);
+			m_scratch_pool_bytes = 0;
+		}
+		uint64_t freed = 0;
+		for (const auto& old: idle) {
+			freed += old.capacity;
+			VramStats::Note(VramStats::Kind::TilerScratch, true, -static_cast<int64_t>(old.capacity));
+			vmaDestroyBuffer(m_graphics.allocator, old.buffer, old.allocation);
+		}
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true)) {
+			std::fprintf(stderr, "TileManager: out of device memory for a %llu-byte scratch buffer; freed %llu idle bytes and retried\n",
+			             static_cast<unsigned long long>(capacity), static_cast<unsigned long long>(freed));
+		}
+		if (freed != 0) {
+			result = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
+		}
+	}
+	RequireVulkanSuccess(static_cast<vk::Result>(result), "allocate TileManager scratch buffer");
 	VramStats::Note(VramStats::Kind::TilerScratch, true, static_cast<int64_t>(capacity));
 	return {buffer, memory, size, capacity};
 }
