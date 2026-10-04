@@ -1125,6 +1125,7 @@ private:
 		bool                                     depth_compare     = false;
 		bool                                     cube              = false;
 		bool                                     r128              = false;
+		bool                                     atomic64          = false;
 
 		bool operator==(const TextureDescriptionKey&) const = default;
 	};

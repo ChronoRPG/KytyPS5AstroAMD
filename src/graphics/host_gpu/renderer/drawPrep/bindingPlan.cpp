@@ -143,17 +143,19 @@ vk::Sampler FindPlanSampler(SamplerCache& cache, const ShaderSamplerResource& de
 }
 
 // PrepareBindings' samplers: the handle of every sampler created already (null: the command
-// processor resolves it, creating it). False when a descriptor is too short.
+// processor resolves it, creating it). False when a descriptor is missing or too short. Native
+// filtering/border variants read their source sampler's snapshot entry (snapshot_index).
 bool PlanSamplers(SamplerCache& cache, const CompiledShaderInfo& program,
                   const ResourceSnapshot& resources, StagePlan& stage) {
 	const auto count = program.info.samplers.size();
-	if (resources.samplers.size() < count) {
-		return false;
-	}
 	stage.samplers.assign(count, vk::Sampler {});
 	uint32_t absent = 0;
 	for (size_t i = 0; i < count; i++) {
-		const auto& value = resources.samplers[i];
+		const auto snapshot_index = program.info.samplers[i].snapshot_index;
+		if (snapshot_index >= resources.samplers.size()) {
+			return false;
+		}
+		const auto& value = resources.samplers[snapshot_index];
 		if (value.dword_count < sizeof(ShaderSamplerResource) / sizeof(uint32_t)) {
 			return false;
 		}

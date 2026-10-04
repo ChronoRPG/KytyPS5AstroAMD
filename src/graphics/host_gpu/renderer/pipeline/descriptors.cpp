@@ -397,13 +397,14 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                              resource.written && !resource.read && !resource.atomic;
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
 	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
-	                              resource.atomic;
+	                              resource.atomic && !resource.atomic64;
 	const bool format_ok =
 	    raw_sint_storage || raw_float_atomic ||
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	     numeric_class != Prospero::TextureNumericClass::Sint &&
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
-	     (!resource.atomic || format == Prospero::BufferFormat::k32UInt));
+	     (!resource.atomic || format == (resource.atomic64 ? Prospero::BufferFormat::k32_32UInt
+	                                                       : Prospero::BufferFormat::k32UInt)));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}
@@ -439,7 +440,8 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 			desc.info.guest_format = Prospero::BufferFormat::k32Float;
 			break;
 		case Prospero::TextureNumericClass::Uint:
-			desc.info.guest_format = Prospero::BufferFormat::k32UInt;
+			desc.info.guest_format = resource.atomic64 ? Prospero::BufferFormat::k32_32UInt
+			                                         : Prospero::BufferFormat::k32UInt;
 			break;
 		case Prospero::TextureNumericClass::Sint:
 			desc.info.guest_format = Prospero::BufferFormat::k32SInt;
@@ -450,10 +452,10 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.info.type            = Prospero::ImageType::kColor2D;
 	desc.info.extent          = {1, 1, 1};
 	desc.info.resources       = {1, 1};
-	desc.info.bytes_per_block = 4;
+	desc.info.bytes_per_block = Prospero::NumBytesPerElement(desc.info.guest_format);
 	desc.info.samples         = 1;
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
-	desc.view_info.format     = desc.info.pixel_format;
+	desc.view_info.format     = resource.atomic64 ? vk::Format::eR64Uint : desc.info.pixel_format;
 	desc.view_info.type       = vk::ImageViewType::e2D;
 	switch (resource.dimension) {
 		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
@@ -660,7 +662,7 @@ static TextureCache::ImageDesc BuildTextureDescription(
 	const auto physical_levels = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
 	// IMAGE_STORE addresses BASE_LEVEL; only IMAGE_STORE_MIP selects other view mips.
 	const bool single_storage_mip =
-	    storage && resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+	    storage && resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic;
 	const auto view_levels = multisampled || single_storage_mip
 	                             ? 1u
 	                             : static_cast<uint32_t>(last_level - base_level) + 1u;
@@ -765,8 +767,9 @@ static TextureCache::ImageDesc BuildTextureDescription(
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}
-	const auto storage_view_format = storage && (resource.atomic ||
-	                                            format == Prospero::BufferFormat::k32SInt)
+	const auto storage_view_format = resource.atomic64 ? vk::Format::eR64Uint
+	                                 : storage && (resource.atomic ||
+	                                               format == Prospero::BufferFormat::k32SInt)
 	                                     ? vk::Format::eR32Uint
 	                                     : SrgbStorageViewFormat(pixel_format);
 	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
@@ -888,6 +891,9 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 	const bool storage           = resource.written;
 	const bool description_cache =
 	    Common::RendererBatchEnabled() && resource.indirect_resources.size() <= 256u;
+	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
+		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
+	}
 	if (storage) {
 		ValidateStorageImageResource(resource);
 	}
@@ -923,7 +929,7 @@ void RenderExecutor::ResolveTextureFull(const ShaderRecompiler::IR::ImageResourc
 		                                 resource.shader_swizzle, resource.read,
 		                                 resource.written,        resource.atomic,
 		                                 resource.depth_compare,  resource.cube,
-		                                 resource.r128};
+		                                 resource.r128,           resource.atomic64};
 		// TextureBindingMemo::Hash is this cache's hash of the dwords and key.
 		auto& entry = m_texture_descriptions[hash % m_texture_descriptions.size()];
 		if (entry.valid && entry.key == key &&
@@ -1468,7 +1474,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		auto sampler = plan_samplers ? plan->samplers[i] : vk::Sampler {};
 		planned_samplers += sampler != nullptr ? 1u : 0u;
 		if (sampler == nullptr || verify) {
-			const auto serial = NativeSampler(program, i, snapshot.samplers[i]);
+			// Native filtering/border variants share their source sampler's snapshot entry.
+			const auto serial = NativeSampler(
+			    program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]);
 			if (sampler != nullptr) {
 				DrawPrep::CountBindingVerifyCheck();
 				if (sampler != serial) {
@@ -1813,7 +1821,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	if (DrawSequenceEnabled(DrawSequencePart::Textures) && TextureBindingMemo::Enabled() &&
 	    !images.empty() &&
 	    std::ranges::none_of(program.info.images, [](const auto& resource) {
-		    return resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+		    return resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic;
 	    })) {
 		const bool verify = DrawSequenceVerifyMode() != 0;
 		if (m_texture_memo.TryRepeatViews(texture_cache, images, !verify)) {
@@ -1863,7 +1871,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	const auto run_length   = [&](uint32_t first) {
         uint32_t end = first;
         while (end < count &&
-               program.info.images[end].mip_mode != ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
+               program.info.images[end].mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
             end++;
         }
         return end - first;
@@ -1901,7 +1909,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		auto& binding = images[i];
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
-		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
+		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			EXIT_IF(resource.mip_count == 0u ||
 			        resource.mip_count != binding.desc.view_info.level_count);
 			binding.mip_views.reserve(resource.mip_count);
@@ -1909,6 +1917,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 				auto desc = binding.desc;
 				desc.view_info.base_level += mip;
 				desc.view_info.level_count = 1;
+				// The shader selects the mip after applying the guest minimum LOD.
+				desc.view_info.min_lod = 0;
 				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
 			}
 			binding.image_view = binding.mip_views.front();

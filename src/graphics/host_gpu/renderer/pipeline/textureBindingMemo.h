@@ -77,6 +77,7 @@ public:
 		bool                                      read              = false;
 		bool                                      written           = false;
 		bool                                      atomic            = false;
+		bool                                      atomic64          = false;
 		bool                                      depth_compare     = false;
 		bool                                      cube              = false;
 		bool                                      r128              = false;
