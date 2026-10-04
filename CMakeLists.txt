@@ -1351,6 +1351,15 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --wave-reduction-only)
 	add_test(NAME wave_reductions
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-reductions-only)
+	# KYTY_FOLD_LANE_MASKS (Senaxx 5189ea360): the row reductions with the fold off and on (the
+	# S_ORN2_SAVEEXEC work-list shape among them), and wave64 mask logic folded without growing.
+	add_test(NAME fold_lane_masks_codegen
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --fold-lane-masks-only)
+	# The GPU wave-reduction checks with the fold on.
+	add_test(NAME wave_reductions_fold_lane_masks
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wave-reductions-only)
+	set_tests_properties(wave_reductions_fold_lane_masks PROPERTIES
+		ENVIRONMENT "KYTY_FOLD_LANE_MASKS=1")
 	# The set-associative sampler memo; KYTY_SET_REUSE_FRESH: default, off, verify.
 	add_test(NAME sampler_memo
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampler-memo-only)

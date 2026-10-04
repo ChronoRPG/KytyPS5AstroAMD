@@ -9581,9 +9581,10 @@ void TestCapturedBufferAtomicsX2() {
 // KYTY_LANE_REDUCTIONS=0, stays a scan. Every lane is enabled either by s_mov exec, -1 or as the
 // complement form EXEC = m | ~m (s_orn2_saveexec of a copy of EXEC), which reaches the emitter as
 // a mask test or, after upstream's wave32 lane-mask projection, as p || !p.
-void TestWaveRowReduction() {
-  const auto native_reductions = [](uint32_t last_control, bool row_pairs,
-                                    bool lane_reductions = true, bool complement = false) {
+void TestWaveRowReduction(bool fold_lane_masks = false) {
+  const auto native_reductions = [fold_lane_masks](uint32_t last_control, bool row_pairs,
+                                                   bool lane_reductions = true,
+                                                   bool complement = false) {
     std::vector<uint32_t> shader;
     if (!complement) {
       shader.push_back(row_pairs ? EncodeSop1(0x04, 126, 193)  // s_mov_b64 exec, -1
@@ -9621,6 +9622,7 @@ void TestWaveRowReduction() {
     const auto saved = ShaderRecompiler::GetCodegenOptions();
     auto codegen = saved;
     codegen.lane_reductions = lane_reductions;
+    codegen.fold_lane_masks = fold_lane_masks;
     ShaderRecompiler::SetCodegenOptions(codegen);
     const auto result = RecompileForTest(shader, options);
     ShaderRecompiler::SetCodegenOptions(saved);
@@ -9644,6 +9646,95 @@ void TestWaveRowReduction() {
   Check(native_reductions(0x118, false, true, true) == 2 &&
             native_reductions(0x118, true, true, true) == 2,
         "a DPP row scan under EXEC = m | ~m did not become two lane reductions");
+
+  // Senaxx 5189ea360: the same scan as a pixel shader's work-list loop writes it (PS
+  // 0x00e3d8e3fcdfd5a7): EXEC saved, WQM, the lanes with work through S_AND_SAVEEXEC, every lane
+  // through S_ORN2_SAVEEXEC of that mask, the scan over the lanes with work, EXEC restored. With the
+  // mask reads folded (KYTY_FOLD_LANE_MASKS), EXEC of the scan is x || !x; the scan must still
+  // become native reductions, or the emulated one hangs the GPU. Checked with the fold off and on.
+  {
+    const std::vector<uint32_t> shader = {
+        EncodeVop3Word0(0x365, 3), EncodeVop3Word1(193, 128, 0),    // v_mbcnt_lo_u32_b32 v3, -1, 0
+        EncodeSMovB32(80, 126),                                     // s_mov_b32 s80, exec_lo
+        EncodeSop1(0x09, 126, 126),                                 // s_wqm_b32 exec_lo, exec_lo
+        EncodeVopc(0xd1, 130, 3),                                   // v_cmpx_lt_u32 exec_lo, 2, v3
+        EncodeVopc(0xc1, 132, 3),                                   // v_cmp_lt_u32 vcc_lo, 4, v3
+        EncodeSop1(0x3c, 69, 106),                                  // s_and_saveexec_b32 s69, vcc_lo
+        EncodeSMovB32(126, 69),                                     // s_mov_b32 exec_lo, s69
+        EncodeSop2(0x0e, 0, 69, 80),                                // s_and_b32 s0, s69, s80
+        EncodeSop1(0x40, 106, 69),                                  // s_orn2_saveexec_b32 vcc_lo, s69
+        EncodeVop3Word0(0x101, 1), EncodeVop3Word1(128, 256 + 3, 0), // v_cndmask_b32 v1, 0, v3, s0
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x111),       // v_max_u32 v1, v1 row_shr:1, v1
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x112),
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x114),
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x118),
+        EncodeSMovB32(126, 106),                                    // s_mov_b32 exec_lo, vcc_lo
+        EncodeVop3Word0(0x360, 2), EncodeVop3Word1(256 + 1, 128 + 15, 0), // v_readlane_b32 s2
+        EncodeVop3Word0(0x360, 3), EncodeVop3Word1(256 + 1, 128 + 31, 0), // v_readlane_b32 s3
+        EncodeSop2(0x09, 4, 2, 3),                                  // s_max_u32 s4, s2, s3
+        EncodeVop1(0x01, 2, 4),                                     // v_mov_b32 v2, s4
+        EncodeExp0(0x00, 0xf), EncodeExp1(2, 2, 2, 2),              // exp mrt0
+        0xbf810000u,
+    };
+    auto options      = MakeCompileOptions(ShaderType::Pixel);
+    options.wave_size = 32;
+    const auto saved  = ShaderRecompiler::GetCodegenOptions();
+    auto codegen      = saved;
+    codegen.fold_lane_masks = fold_lane_masks;
+    ShaderRecompiler::SetCodegenOptions(codegen);
+    const auto result = RecompileForTest(shader, options);
+    ShaderRecompiler::SetCodegenOptions(saved);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    size_t     found  = 0;
+    for (auto at = source.find("OpGroupNonUniformUMax"); at != std::string::npos;
+         at = source.find("OpGroupNonUniformUMax", at + 1)) {
+      found++;
+    }
+    Check(found == 2, "a work-list scan after S_ORN2_SAVEEXEC did not become two row reductions");
+  }
+}
+
+// KYTY_FOLD_LANE_MASKS (Senaxx 5189ea360): wave64 mask logic that the wave32 projection does not
+// cover. Two compares written to VCC and an SGPR pair, combined with S_AND_B64 / S_XOR_B64 /
+// S_ANDN2_B64 and read as a V_CNDMASK mask: with the fold the read is the compares' predicates
+// (smaller SPIR-V); both forms validate and the fold never grows the module.
+void TestFoldLaneMasks() {
+  struct Case {
+    uint32_t    opcode;
+    const char *name;
+  };
+  const Case cases[] = {{0x0f, "s_and_b64"}, {0x13, "s_xor_b64"}, {0x15, "s_andn2_b64"}};
+  for (const auto stage : {ShaderType::Pixel}) {
+    for (const auto &c : cases) {
+      const std::vector<uint32_t> shader = {
+          EncodeVopc(0xc1, 132, 0),                                // v_cmp_lt_u32 vcc, 4, v0
+          EncodeSop1(0x04, 10, 106),                               // s_mov_b64 s[10:11], vcc
+          EncodeVopc(0xc4, 136, 0),                                // v_cmp_gt_u32 vcc, 8, v0
+          EncodeSop2(c.opcode, 0, 10, 106),                        // s_<op>_b64 s[0:1], s[10:11], vcc
+          EncodeVop3Word0(0x101, 1), EncodeVop3Word1(128, 256 + 0, 0), // v_cndmask_b32 v1, 0, v0, s[0:1]
+          EncodeExp0(0x00, 0xf), EncodeExp1(1, 1, 1, 1),           // exp mrt0
+          0xbf810000u,
+      };
+      auto options      = MakeCompileOptions(stage);
+      options.wave_size = 64;
+      const auto saved  = ShaderRecompiler::GetCodegenOptions();
+      auto codegen      = saved;
+      codegen.fold_lane_masks = false;
+      ShaderRecompiler::SetCodegenOptions(codegen);
+      const auto off = RecompileForTest(shader, options);
+      codegen.fold_lane_masks = true;
+      ShaderRecompiler::SetCodegenOptions(codegen);
+      const auto on = RecompileForTest(shader, options);
+      ShaderRecompiler::SetCodegenOptions(saved);
+      CheckSpirvBinaryValidates(off.spirv);
+      CheckSpirvBinaryValidates(on.spirv);
+      std::printf("TestFoldLaneMasks: %s %s wave64: %zu -> %zu SPIR-V words\n",
+                  stage == ShaderType::Pixel ? "PS" : "CS", c.name, off.spirv.size(),
+                  on.spirv.size());
+      Check(on.spirv.size() <= off.spirv.size(), "KYTY_FOLD_LANE_MASKS grew a module");
+    }
+  }
 }
 
 void TestNewShaderRecompilerBranchConditionForms() {
@@ -14432,6 +14523,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--wave-reduction-only") == 0) {
     TestWaveRowReduction();
     std::printf("shader_cfg --wave-reduction-only: ok\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--fold-lane-masks-only") == 0) {
+    TestWaveRowReduction(false);
+    TestWaveRowReduction(true);
+    TestFoldLaneMasks();
+    std::printf("shader_cfg --fold-lane-masks-only: ok\n");
     return 0;
   }
   TestRayTracingDispatchDetection();

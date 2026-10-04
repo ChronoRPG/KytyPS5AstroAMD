@@ -163,6 +163,12 @@ struct CodegenOptions {
 	// RewriteToSsa seals a block as soon as every predecessor is filled. Translation time only: the
 	// same program and SPIR-V.
 	bool ir_linear_uses = false;
+	// KYTY_FOLD_LANE_MASKS=1 (default off; Senaxx 5189ea360): reads of the current lane's bit of a
+	// wave mask that is known per lane (a ballot of a predicate, an all-zero or all-one constant,
+	// and bitwise logic or WQM of those) become that predicate (IR::FoldLaneMasks). Smaller SPIR-V
+	// and shorter driver compiles; not in hull shaders, and in pixel shaders ANDed with the lane's
+	// own bit of a ballot of true (helper invocations may sit out of ballots).
+	bool fold_lane_masks = false;
 };
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.
