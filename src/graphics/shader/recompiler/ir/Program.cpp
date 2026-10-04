@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <fmt/format.h>
@@ -112,12 +113,31 @@ ResourcePlan& ResourcePlan::operator=(ResourcePlan&& other) noexcept {
 }
 
 Program::~Program() {
+	// KYTY_IR_LINEAR_USES: every instruction of both goes now, so nobody's use list needs
+	// maintaining (removing each use one by one was quadratic for widely used values).
+	const bool drop = GetCodegenOptions().ir_linear_uses;
 	// Planning expressions can refer to block values but outlive block storage in the base class.
 	for (auto& inst: value_storage) {
-		inst.Invalidate();
+		if (drop) {
+			inst.DropForDestruction();
+		} else {
+			inst.Invalidate();
+		}
 	}
 	// Values may cross block boundaries. Detach all arguments before any block starts destroying
 	// its instruction storage so reverse-use links always point to live definitions.
+	if (drop) {
+		// Every owned block, listed or not: an instruction left attached would look for its entry
+		// in a dropped list when it is destroyed.
+		for (auto& block: block_storage) {
+			if (block != nullptr) {
+				for (auto& inst: *block) {
+					inst.DropForDestruction();
+				}
+			}
+		}
+		return;
+	}
 	for (auto* block: blocks) {
 		for (auto& inst: *block) {
 			inst.Invalidate();

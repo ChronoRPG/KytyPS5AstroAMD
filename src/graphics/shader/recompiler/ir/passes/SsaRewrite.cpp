@@ -1,8 +1,11 @@
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
+#include "graphics/shader/recompiler/CodegenOptions.h"
+
 #include <algorithm>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -349,6 +352,34 @@ void VisitInstruction(Pass& pass, Block* block, Inst& inst) {
 
 void RewriteToSsa(const BlockList& blocks) {
 	Pass pass;
+	if (GetCodegenOptions().ir_linear_uses) {
+		// KYTY_IR_LINEAR_USES (Senaxx 5145dc1f9): Braun et al. seal a block once no predecessor can
+		// still change what flows into it: when every predecessor has been filled. Its reads then
+		// follow a single predecessor or build a complete phi at once. Sealing every block only at
+		// the end made each read in a block without a local definition an incomplete phi, nearly
+		// all of them trivial and removed again. Loop headers, whose back edge is filled later, are
+		// sealed at the end as before.
+		std::unordered_set<const Block*> filled;
+		filled.reserve(blocks.size());
+		for (auto* block: blocks) {
+			const auto predecessors = block->ImmPredecessors();
+			if (std::ranges::all_of(predecessors, [&](const Block* predecessor) {
+				    return filled.contains(predecessor);
+			    })) {
+				pass.Seal(block);
+			}
+			for (auto& inst: *block) {
+				VisitInstruction(pass, block, inst);
+			}
+			filled.insert(block);
+		}
+		for (auto* block: blocks) {
+			if (!block->IsSsaSealed()) {
+				pass.Seal(block);
+			}
+		}
+		return;
+	}
 	for (auto* block: blocks) {
 		for (auto& inst: *block) {
 			VisitInstruction(pass, block, inst);

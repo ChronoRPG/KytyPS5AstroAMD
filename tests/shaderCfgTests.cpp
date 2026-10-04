@@ -131,11 +131,62 @@ struct TestCompileResult {
   ShaderRecompiler::IR::ResourceSnapshot resources;
 };
 
+TestCompileResult RecompileOnceForTest(
+    std::span<const uint32_t> code,
+    const ShaderRecompiler::CompileOptions &options,
+    ShaderRecompiler::IR::SrtMemoryReader read_memory,
+    void *read_memory_data, uint32_t push_data_start_dword);
+
+// KYTY_TEST_COMPARE_LINEAR_USES=1: every test compilation runs with KYTY_IR_LINEAR_USES off and on
+// and the SPIR-V must be the same word for word (Senaxx 5145dc1f9 changes only the IR passes'
+// bookkeeping, not their result). The second result is returned.
 TestCompileResult RecompileForTest(
     std::span<const uint32_t> code,
     const ShaderRecompiler::CompileOptions &options,
     ShaderRecompiler::IR::SrtMemoryReader read_memory = nullptr,
     void *read_memory_data = nullptr, uint32_t push_data_start_dword = 0) {
+  static const bool compare = std::getenv("KYTY_TEST_COMPARE_LINEAR_USES") != nullptr;
+  if (!compare) {
+    return RecompileOnceForTest(code, options, read_memory, read_memory_data,
+                                push_data_start_dword);
+  }
+  const auto saved = ShaderRecompiler::GetCodegenOptions();
+  auto variant = saved;
+  variant.ir_linear_uses = false;
+  ShaderRecompiler::SetCodegenOptions(variant);
+  const auto quadratic = RecompileOnceForTest(code, options, read_memory, read_memory_data,
+                                              push_data_start_dword);
+  variant.ir_linear_uses = true;
+  ShaderRecompiler::SetCodegenOptions(variant);
+  auto linear = RecompileOnceForTest(code, options, read_memory, read_memory_data,
+                                     push_data_start_dword);
+  ShaderRecompiler::SetCodegenOptions(saved);
+  static uint64_t compared = 0;
+  static uint64_t differing = 0;
+  compared++;
+  if (quadratic.spirv != linear.spirv) {
+    differing++;
+    std::fprintf(stderr,
+                 "ShaderCfgTests: KYTY_IR_LINEAR_USES changed the SPIR-V of compilation %llu "
+                 "(hash 0x%016llx: %zu -> %zu words)\n",
+                 static_cast<unsigned long long>(compared),
+                 static_cast<unsigned long long>(options.shader_hash), quadratic.spirv.size(),
+                 linear.spirv.size());
+  }
+  Check(quadratic.spirv == linear.spirv, "KYTY_IR_LINEAR_USES changed a program's SPIR-V");
+  if ((compared & 63u) == 0) {
+    std::printf("ShaderCfgTests: KYTY_IR_LINEAR_USES compared %llu compilations, %llu differ\n",
+                static_cast<unsigned long long>(compared),
+                static_cast<unsigned long long>(differing));
+  }
+  return linear;
+}
+
+TestCompileResult RecompileOnceForTest(
+    std::span<const uint32_t> code,
+    const ShaderRecompiler::CompileOptions &options,
+    ShaderRecompiler::IR::SrtMemoryReader read_memory,
+    void *read_memory_data, uint32_t push_data_start_dword) {
   auto translated = ShaderRecompiler::TranslateProgram(code, options);
   auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;

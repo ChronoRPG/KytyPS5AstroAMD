@@ -1,11 +1,37 @@
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 
+#include "graphics/shader/recompiler/CodegenOptions.h"
+
 #include <algorithm>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 void RemoveIdentities(const BlockList& blocks) {
+	if (GetCodegenOptions().ir_linear_uses) {
+		// KYTY_IR_LINEAR_USES (Senaxx 5145dc1f9): each identity's uses move to its argument in
+		// program order, as below; its own entry in the argument's use list is dropped for all
+		// identities at once at the end. Removing it one by one searched and shifted lists that
+		// grow with every identity folded into the same value.
+		std::unordered_set<const Inst*> removed;
+		std::vector<Inst*>              touched;
+		for (auto* block: blocks) {
+			auto& instructions = block->Instructions();
+			for (auto inst = instructions.begin(); inst != instructions.end();) {
+				if (inst->GetOpcode() != ValueOpcode::Identity) {
+					inst++;
+					continue;
+				}
+				const auto replacement = inst->Arg(0);
+				inst->ReplaceUsesForRemoval(replacement, removed, touched);
+				removed.insert(&*inst);
+				inst = instructions.erase(inst);
+			}
+		}
+		Inst::DropRemovedUses(touched, removed);
+		return;
+	}
 	for (auto* block: blocks) {
 		auto& instructions = block->Instructions();
 		for (auto inst = instructions.begin(); inst != instructions.end();) {

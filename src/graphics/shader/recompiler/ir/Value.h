@@ -7,7 +7,9 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -149,6 +151,18 @@ public:
 	void ReplaceUsesWith(Value replacement, bool preserve = true);
 	void ReplaceOpcode(ValueOpcode opcode);
 	void Invalidate();
+	// KYTY_IR_LINEAR_USES (CodegenOptions::ir_linear_uses), Senaxx 5145dc1f9:
+	// Detaches without maintaining other instructions' use lists: only when every instruction
+	// that refers to this one is destroyed with it (Program::~Program).
+	void DropForDestruction();
+	// RemoveIdentities: ReplaceUsesWith(replacement, false) for an instruction about to be erased,
+	// leaving its own entries in its arguments' use lists; the caller drops those for every
+	// removed instruction at once (DropRemovedUses), which keeps every list in the same order.
+	// Uses by instructions already in `removed` (erased) are skipped. Arguments go to `touched`.
+	void ReplaceUsesForRemoval(Value replacement, const std::unordered_set<const Inst*>& removed,
+	                           std::vector<Inst*>& touched);
+	static void DropRemovedUses(std::span<Inst* const>              touched,
+	                            const std::unordered_set<const Inst*>& removed);
 
 	template <typename T>
 	requires(sizeof(T) <= sizeof(uint64_t) && std::is_trivially_copyable_v<T>)
