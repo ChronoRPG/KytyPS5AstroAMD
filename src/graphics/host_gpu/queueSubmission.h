@@ -18,8 +18,48 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 
+// Work that commands of a batch read and that finishes, or reaches its queue, after the batch was
+// recorded: TextureCache staging copies made on a host worker (StagingCopier) and upload DMA
+// transfers submitted by their own worker (UploadDma).
+//
+// Whichever thread calls vkQueueSubmit for such a batch (the submission broker, the CP recorder or
+// the CP) first waits on the host until the work has finished (host work) or its signal has been
+// submitted (another queue's work): SubmitInfo::WaitHostDependencies. So every semaphore a
+// submitted batch waits for has its signal operation submitted already, and so does every
+// present, which waits for all earlier batches of the queue
+// (VUID-vkQueuePresentKHR-pWaitSemaphores-03268). A GPU wait for a later host signal froze RTX 50
+// systems: vkQueuePresentKHR blocked in the kernel (hardware-scheduled present), and the staging
+// copier's vkSignalSemaphore, which the GPU was waiting for, then blocked behind it.
+class SubmitDependency {
+public:
+	virtual ~SubmitDependency() = default;
+	// A value the next batch depends on, or 0 when all work handed out so far is done (finished on
+	// the host, so its writes precede vkQueueSubmit, or known complete on the device).
+	[[nodiscard]] virtual uint64_t      PendingValue()    = 0;
+	// The semaphore the batch waits for the value on, or null when the host wait before
+	// vkQueueSubmit is all it needs (host work).
+	[[nodiscard]] virtual vk::Semaphore Semaphore() const = 0;
+	// Stages of the batch that wait for it.
+	[[nodiscard]] virtual vk::PipelineStageFlags WaitStages() const {
+		return vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer;
+	}
+	// Whether a batch depending on `value` may be submitted now, and the host wait until it may.
+	// Any thread; never call them with a lock the dependency's worker takes.
+	[[nodiscard]] virtual bool Submittable(uint64_t value) = 0;
+	virtual void               WaitSubmittable(uint64_t value) = 0;
+	// Host-side wait for completion, used when the batch has no free wait slot.
+	virtual void WaitHost(uint64_t value) = 0;
+};
+
+// KYTY_SUBMIT_WAIT_BEFORE_SIGNAL=1 (startup, default off): batches wait for SubmitDependency work
+// on the GPU only, as up to int7: the staging copier signals a timeline semaphore from the host and
+// batches may reach the queue before the upload DMA transfers they wait for. Comparisons only; it
+// can freeze Windows systems with hardware-accelerated GPU scheduling (RTX 50).
+[[nodiscard]] bool SubmitWaitBeforeSignal();
+
 struct SubmitInfo {
-	static constexpr uint32_t MaxSemaphores = 3;
+	static constexpr uint32_t MaxSemaphores       = 3;
+	static constexpr uint32_t MaxHostDependencies = 2;
 
 	std::array<vk::Semaphore, MaxSemaphores>          wait_semaphores {};
 	std::array<uint64_t, MaxSemaphores>               wait_ticks {};
@@ -28,6 +68,11 @@ struct SubmitInfo {
 	std::array<uint64_t, MaxSemaphores>               signal_ticks {};
 	uint32_t                                        num_wait_semaphores   = 0;
 	uint32_t                                        num_signal_semaphores = 0;
+	// SubmitDependency work the batch reads, waited for before vkQueueSubmit. The dependencies
+	// outlive every batch that names them (their owners drain the scheduler first).
+	std::array<SubmitDependency*, MaxHostDependencies> host_dependencies {};
+	std::array<uint64_t, MaxHostDependencies>          host_dependency_values {};
+	uint32_t                                          num_host_dependencies = 0;
 
 	void AddWait(vk::Semaphore semaphore, uint64_t tick = 1,
 	             vk::PipelineStageFlags stage = vk::PipelineStageFlagBits::eAllCommands) {
@@ -42,6 +87,25 @@ struct SubmitInfo {
 		signal_semaphores[num_signal_semaphores] = semaphore;
 		signal_ticks[num_signal_semaphores++]   = tick;
 	}
+
+	void AddHostDependency(SubmitDependency* dependency, uint64_t value) {
+		EXIT_IF(dependency == nullptr || value == 0 ||
+		        num_host_dependencies >= MaxHostDependencies);
+		host_dependencies[num_host_dependencies]        = dependency;
+		host_dependency_values[num_host_dependencies++] = value;
+	}
+
+	[[nodiscard]] bool HostDependenciesReady() const {
+		for (uint32_t i = 0; i < num_host_dependencies; ++i) {
+			if (!host_dependencies[i]->Submittable(host_dependency_values[i])) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// Waits until the batch may be submitted (SubmitDependency). Outside queue_mutex if possible.
+	void WaitHostDependencies() const;
 };
 
 // A completed GPU signal does not prove vkQueueSubmit has returned on its host
@@ -92,7 +156,9 @@ public:
 
 	// The caller MUST own GraphicContext::queue_mutex. Both the worker and direct
 	// queue users acquire that mutex before taking records, so older records can
-	// never be detached but still waiting to enter the native queue.
+	// never be detached but still waiting to enter the native queue. A record whose
+	// host dependencies are not ready is waited for here, once the records before it
+	// were submitted.
 	void DrainPendingLocked();
 	// Called by the window owner after both schedulers stop, before device destruction. Joins
 	// without holding queue_mutex and submits all accepted records before returning.
@@ -102,6 +168,12 @@ private:
 	static constexpr size_t MaxQueued = 256;
 	static constexpr size_t MaxBatch  = 64;
 	void Worker();
+	// Worker, queue_mutex held: submits the records pending at entry up to the first one whose host
+	// dependencies are not ready. Returns true, with that record's SubmitInfo in `blocked`, when it
+	// stopped there; the worker then waits for them without queue_mutex.
+	bool DrainReadyLocked(SubmitInfo* blocked);
+	// Submits `count` popped records in order, waiting for host dependencies in between.
+	void SubmitInOrder(const QueuedSubmission* records, size_t count);
 	void SubmitBatch(const QueuedSubmission* records, size_t count);
 
 	GraphicContext*              m_graphics = nullptr;

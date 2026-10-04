@@ -20,9 +20,11 @@ class Buffer;
 
 // Guest memory -> staging buffer copies for texture refreshes, made on a host worker after the
 // commands reading the staging bytes were recorded (KYTY_TEXTURE_ASYNC_STAGING, default on).
-// Every job signals a timeline semaphore value once its bytes are written and flushed; the
-// guest scheduler's next submission waits for the latest value on the GPU (SubmitDependency),
-// so neither the recording thread nor the submission path waits for the copy.
+// Every job publishes its value once its bytes are written and flushed. The thread that submits
+// the guest scheduler's next batch waits for the latest value on the host before vkQueueSubmit
+// (SubmitDependency), so the recording thread never waits for the copy, and the GPU never waits
+// for a signal that only the host can make later. With KYTY_SUBMIT_WAIT_BEFORE_SIGNAL=1 the job
+// signals a timeline semaphore instead and the batch waits for it on the GPU (up to int7).
 //
 // The source pages are write-protected by the refreshed image before the job is queued. A
 // guest write racing with the copy faults and dirties its chunk (TextureCache), so the next
@@ -45,8 +47,13 @@ public:
 	             uint64_t flush_size);
 
 	[[nodiscard]] uint64_t      PendingValue() override;
+	// Null unless KYTY_SUBMIT_WAIT_BEFORE_SIGNAL=1.
 	[[nodiscard]] vk::Semaphore Semaphore() const override { return m_semaphore; }
-	void                        WaitHost(uint64_t value) override;
+	[[nodiscard]] bool          Submittable(uint64_t value) override {
+		return m_completed.load(std::memory_order_acquire) >= value;
+	}
+	void WaitSubmittable(uint64_t value) override { WaitHost(value); }
+	void WaitHost(uint64_t value) override;
 
 private:
 	struct Job {

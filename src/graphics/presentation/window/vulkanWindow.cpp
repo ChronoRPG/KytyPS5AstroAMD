@@ -1404,6 +1404,12 @@ void WindowContext::CreateVulkan() {
 	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();
 
 	LOGF("Select device: %s\n", device_properties.deviceName.data());
+	if (const auto driver = device_properties.driverVersion; device_properties.vendorID == 0x10de) {
+		LOGF("Vulkan driver: NVIDIA %u.%02u\n", (driver >> 22) & 0x3ffu, (driver >> 14) & 0xffu);
+	} else {
+		LOGF("Vulkan driver: vendor 0x%04x version %u.%u.%u (0x%08x)\n", device_properties.vendorID,
+		     VK_VERSION_MAJOR(driver), VK_VERSION_MINOR(driver), VK_VERSION_PATCH(driver), driver);
+	}
 	switch (HangWatchdog::ResolveAutoForDevice(device_properties.vendorID, device_properties.deviceID,
 	                                           device_properties.deviceName.data())) {
 		case HangWatchdog::AutoResult::On:

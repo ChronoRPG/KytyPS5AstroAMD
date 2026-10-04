@@ -94,8 +94,8 @@ public:
 	[[nodiscard]] uint64_t HostCopyBytesDone() const noexcept {
 		return m_host_bytes_done.load(std::memory_order_acquire);
 	}
-	// Tests: while held, the worker leaves queued jobs (host copies and transfers) alone. A
-	// submission waiting for them would wait until the hold ends.
+	// Tests: while held, the worker leaves queued jobs (host copies and transfers) alone. The
+	// thread submitting a batch that depends on them would wait until the hold ends.
 	void HoldWorkerForTest(bool hold);
 	[[nodiscard]] vk::Buffer RingHandle() const noexcept;
 	[[nodiscard]] uint64_t   RingSize() const noexcept { return m_ring_size; }
@@ -103,12 +103,17 @@ public:
 	[[nodiscard]] uint64_t   Staged() const noexcept { return m_enqueued; }
 	[[nodiscard]] uint64_t   MinBytes() const noexcept { return m_min_bytes; }
 
-	// SubmitDependency (the guest scheduler's submissions).
+	// SubmitDependency (the guest scheduler's submissions). A batch waits for the transfer on the
+	// device, and reaches its queue only after the worker submitted that transfer (Submittable).
 	[[nodiscard]] uint64_t               PendingValue() override;
 	[[nodiscard]] vk::Semaphore          Semaphore() const override { return m_semaphore; }
 	[[nodiscard]] vk::PipelineStageFlags WaitStages() const override {
 		return vk::PipelineStageFlagBits::eTransfer;
 	}
+	[[nodiscard]] bool Submittable(uint64_t value) override {
+		return m_submitted.load(std::memory_order_acquire) >= value;
+	}
+	void WaitSubmittable(uint64_t value) override;
 	void WaitHost(uint64_t value) override;
 
 private:
@@ -160,6 +165,8 @@ private:
 	std::vector<Batch>      m_batches;
 	size_t                  m_next_batch = 0;
 	std::atomic<uint64_t>   m_host_bytes_done {0};
+	// Newest value whose transfer vkQueueSubmit2 has returned for (written by the worker).
+	std::atomic<uint64_t>   m_submitted {0};
 	// Shared.
 	std::mutex              m_mutex;
 	std::condition_variable m_available;

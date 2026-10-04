@@ -492,6 +492,9 @@ void Swapchain::Create() {
 		    return graphics.device.getSwapchainImagesKHR(m_handle, count, images);
 	    });
 	EXIT_NOT_IMPLEMENTED(m_images.empty());
+	// Freeze reports depend on it (RTX 50 PCs froze in Mailbox, not in Fifo).
+	LOGF("Swapchain: %ux%u, %zu images, present mode %s\n", m_extent.width, m_extent.height,
+	     m_images.size(), vk::to_string(create_info.presentMode).c_str());
 
 	m_image_views.resize(m_images.size());
 	for (size_t i = 0; i < m_images.size(); i++) {

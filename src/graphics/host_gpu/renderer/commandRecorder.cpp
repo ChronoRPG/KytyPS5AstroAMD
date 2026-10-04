@@ -333,6 +333,8 @@ struct CommandRecorder::NativeExecutor {
 			submit_info.pCommandBuffers      = &command;
 			submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 			submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+			// The work the batch reads, before queue_mutex (SubmitDependency).
+			submit.WaitHostDependencies();
 			vk::Result result;
 			{
 				Common::LockGuard         lock(graphics.queue_mutex);

@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/image/stagingCopier.h"
 
 #include "common/assert.h"
+#include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -14,13 +15,15 @@
 namespace Libs::Graphics {
 
 StagingCopier::StagingCopier(GraphicContext& graphics): m_graphics(graphics) {
-	vk::SemaphoreTypeCreateInfo type_info {};
-	type_info.semaphoreType = vk::SemaphoreType::eTimeline;
-	type_info.initialValue  = 0;
-	vk::SemaphoreCreateInfo create_info {};
-	create_info.pNext = &type_info;
-	const auto result = m_graphics.device.createSemaphore(&create_info, nullptr, &m_semaphore);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || m_semaphore == nullptr);
+	if (SubmitWaitBeforeSignal()) {
+		vk::SemaphoreTypeCreateInfo type_info {};
+		type_info.semaphoreType = vk::SemaphoreType::eTimeline;
+		type_info.initialValue  = 0;
+		vk::SemaphoreCreateInfo create_info {};
+		create_info.pNext = &type_info;
+		const auto result = m_graphics.device.createSemaphore(&create_info, nullptr, &m_semaphore);
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || m_semaphore == nullptr);
+	}
 	m_worker = std::jthread([this](std::stop_token stop) { Worker(stop); });
 }
 
@@ -62,6 +65,11 @@ uint64_t StagingCopier::PendingValue() {
 
 void StagingCopier::WaitHost(uint64_t value) {
 	auto completed = m_completed.load(std::memory_order_acquire);
+	if (completed >= value) {
+		return;
+	}
+	HangWatchdog::Scope scope("texture-staging-copy", reinterpret_cast<uint64_t>(this), value,
+	                          completed);
 	while (completed < value) {
 		m_completed.wait(completed, std::memory_order_acquire);
 		completed = m_completed.load(std::memory_order_acquire);
@@ -80,7 +88,7 @@ void StagingCopier::Run(Job& job) {
 			if (!LibKernel::Memory::TryReadBacking(src, dst, bytes) &&
 			    !LibKernel::Memory::TryReadPrtBacking(src, dst, bytes)) {
 				// The range was mapped when the refresh was recorded; unmapping drains the GPU
-				// (and so this job) first. Never leave the GPU waiting on a failed copy.
+				// (and so this job) first. Never leave a submission waiting on a failed copy.
 				std::memset(dst, 0, bytes);
 				if (++m_read_failures <= 16) {
 					LOGF("StagingCopier: failed to read guest image backing 0x%016" PRIx64
@@ -113,11 +121,14 @@ void StagingCopier::Worker(std::stop_token stop) {
 		Run(job);
 		m_completed.store(job.value, std::memory_order_release);
 		m_completed.notify_all();
-		vk::SemaphoreSignalInfo signal {};
-		signal.semaphore = m_semaphore;
-		signal.value     = job.value;
-		const auto result = m_graphics.device.signalSemaphore(&signal);
-		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+		if (m_semaphore != nullptr) {
+			// KYTY_SUBMIT_WAIT_BEFORE_SIGNAL=1 only: batches already queued may wait for it.
+			vk::SemaphoreSignalInfo signal {};
+			signal.semaphore = m_semaphore;
+			signal.value     = job.value;
+			const auto result = m_graphics.device.signalSemaphore(&signal);
+			EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+		}
 	}
 }
 

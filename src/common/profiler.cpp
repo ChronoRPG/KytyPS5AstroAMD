@@ -770,6 +770,7 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.DrawPrepCommitWaitDeep.Calls.Cumulative",
     "FrameWait.DrawPrepCommitWaitStart.Calls.Cumulative",
     "FrameWait.CpSeqPrefetch.Calls.Cumulative",
+    "FrameWait.SubmitDependencyWait.Calls.Cumulative",
 };
 static_assert(kFrameWaitCallNames.back() != nullptr, "FrameWait names must match the enum");
 constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
@@ -837,6 +838,7 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.DrawPrepCommitWaitDeep.Nanoseconds.Cumulative",
     "FrameWait.DrawPrepCommitWaitStart.Nanoseconds.Cumulative",
     "FrameWait.CpSeqPrefetch.Nanoseconds.Cumulative",
+    "FrameWait.SubmitDependencyWait.Nanoseconds.Cumulative",
 };
 static_assert(kFrameWaitTimeNames.back() != nullptr, "FrameWait names must match the enum");
 

@@ -23,23 +23,10 @@ class GpuTimestampRing;
 class CommandRecorder;
 class EopTimestampRing;
 
-// Host work that commands of the current recording read and that finishes after recording
-// (TextureCache staging copies made on a worker). Submit makes the batch wait for it on the
-// GPU through a host-signalled timeline semaphore, so the recording thread never blocks.
-class SubmitDependency {
-public:
-	virtual ~SubmitDependency() = default;
-	// A value of Semaphore() the next batch must wait for, or 0 when all work handed out so far
-	// has finished on the host (its writes then precede vkQueueSubmit).
-	[[nodiscard]] virtual uint64_t      PendingValue()    = 0;
-	[[nodiscard]] virtual vk::Semaphore Semaphore() const = 0;
-	// Stages of the batch that wait for it.
-	[[nodiscard]] virtual vk::PipelineStageFlags WaitStages() const {
-		return vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer;
-	}
-	// Host-side wait, used when the batch has no free wait slot.
-	virtual void WaitHost(uint64_t value) = 0;
-};
+// SubmitDependency (queueSubmission.h): host work that commands of the current recording read and
+// that finishes after recording (TextureCache staging copies, upload DMA transfers). Submit hands
+// it to the batch; the thread that calls vkQueueSubmit waits for it, so the recording thread never
+// blocks on it and no GPU wait precedes its signal.
 
 class CommandScheduler {
 public:

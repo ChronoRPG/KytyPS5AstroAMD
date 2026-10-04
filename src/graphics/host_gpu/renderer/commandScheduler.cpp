@@ -661,8 +661,16 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		// Staging bytes that recorded commands read may still be copied by a host worker (or, for
 		// the upload DMA, by the transfer queue).
 		if (const auto value = dependency->PendingValue(); value != 0) {
+			if (!SubmitWaitBeforeSignal()) {
+				// Waited for by the thread that submits the batch (SubmitDependency).
+				submit.AddHostDependency(dependency, value);
+			}
+			const auto semaphore = dependency->Semaphore();
+			if (semaphore == nullptr) {
+				continue; // host work: done before vkQueueSubmit
+			}
 			if (submit.num_wait_semaphores < SubmitInfo::MaxSemaphores) {
-				submit.AddWait(dependency->Semaphore(), value, dependency->WaitStages());
+				submit.AddWait(semaphore, value, dependency->WaitStages());
 			} else {
 				dependency->WaitHost(value);
 			}
@@ -768,6 +776,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		return tick;
 	}
 
+	// Direct submission: this thread waits for the work the batch reads (SubmitDependency).
+	submit.WaitHostDependencies();
 	vk::Result result;
 	uint64_t   tick;
 	{

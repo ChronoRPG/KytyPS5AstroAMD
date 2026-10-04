@@ -67,6 +67,15 @@ Common scope operands can be read as follows (generic scope values are printed i
 | `guest-equeue` | Queue object | Requested event count | Unused | Timeout in microseconds |
 | `tracker-owner` | Tracking lock | Requesting host thread ID | Last owner host thread ID | Unused |
 | `resource-parking-lock` | Parking lock | Free state (0) | Last lock state | Unused |
+| `texture-staging-copy` | Staging copier | Copy job a batch reads | Last finished job at entry | Unused |
+| `upload-dma-submit` | Upload DMA | Transfer value a batch waits for | Last submitted value at entry | Unused |
+| `upload-dma-gpu` | DMA timeline semaphore | Transfer value | Unused | Unused |
+
+`texture-staging-copy` and `upload-dma-submit` are the host waits made before `vkQueueSubmit` (by the
+`Vulkan queue submission` thread, the CP recorder or the CP), so that no batch reaches the GPU before
+the work it reads has finished or been submitted. Up to int7 the GPU waited for the staging copies on a
+semaphore the copier signalled from the host; on an RTX 5070 Ti that `vkSignalSemaphore` and a
+`vkQueuePresentKHR` blocked each other in the kernel (`KYTY_SUBMIT_WAIT_BEFORE_SIGNAL=1` restores it).
 
 An active `master-dispatch` with observed below expected means the host has not finished handing
 that tick to the driver. An active `master-gpu` has passed that host-dispatch check. An active

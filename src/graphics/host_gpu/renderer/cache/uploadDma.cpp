@@ -220,6 +220,19 @@ uint64_t UploadDma::PendingValue() {
 	return m_stage_value;
 }
 
+void UploadDma::WaitSubmittable(uint64_t value) {
+	auto submitted = m_submitted.load(std::memory_order_acquire);
+	if (submitted >= value) {
+		return;
+	}
+	HangWatchdog::Scope wait_scope("upload-dma-submit", reinterpret_cast<uint64_t>(this), value,
+	                               submitted);
+	while (submitted < value) {
+		m_submitted.wait(submitted, std::memory_order_acquire);
+		submitted = m_submitted.load(std::memory_order_acquire);
+	}
+}
+
 void UploadDma::WaitHost(uint64_t value) {
 	HangWatchdog::Scope wait_scope(
 	    "upload-dma-gpu", reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)), value);
@@ -299,6 +312,9 @@ void UploadDma::SubmitBatch(std::vector<Job>& jobs) {
 	}
 	RequireVulkanSuccess(m_graphics.transfer_queue.submit2(1, &submit, nullptr),
 	                     "submit upload DMA copies");
+	// Graphics batches waiting for this value may reach their queue now (SubmitDependency).
+	m_submitted.store(value, std::memory_order_release);
+	m_submitted.notify_all();
 	batch.value = value;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::UploadDmaSubmits);
 }

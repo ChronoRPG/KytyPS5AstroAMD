@@ -1335,6 +1335,10 @@ enum class FrameWait : uint32_t {
 	DrawPrepCommitWaitStart,
 	// KYTY_CP_SEQ_PREFETCH: sequencer time in speculative parses (inside CpSeqSequencerWait).
 	CpSeqPrefetch,
+	// The thread about to submit a batch (submission broker, CP recorder or CP) waiting on the host
+	// for work the batch reads: texture staging copies still running, upload DMA transfers not
+	// submitted yet (SubmitDependency).
+	SubmitDependencyWait,
 	Count,
 };
 
