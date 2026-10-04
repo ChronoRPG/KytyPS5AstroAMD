@@ -174,8 +174,9 @@ TestCompileResult RecompileForTest(
                  linear.spirv.size());
     // KYTY_TEST_COMPARE_LINEAR_USES_DUMP=<prefix>: both modules as <prefix><n>-off.spv / -on.spv.
     if (const char *prefix = std::getenv("KYTY_TEST_COMPARE_LINEAR_USES_DUMP"); prefix != nullptr) {
-      for (const auto &[suffix, words] : {std::pair{"-off.spv", &quadratic.spirv},
-                                          std::pair{"-on.spv", &linear.spirv}}) {
+      using Dump = std::pair<const char *, const std::vector<uint32_t> *>;
+      for (const auto &[suffix, words] :
+           {Dump{"-off.spv", &quadratic.spirv}, Dump{"-on.spv", &linear.spirv}}) {
         const auto path = std::string(prefix) + std::to_string(compared) + suffix;
         if (auto *file = std::fopen(path.c_str(), "wb"); file != nullptr) {
           std::fwrite(words->data(), sizeof(uint32_t), words->size(), file);
