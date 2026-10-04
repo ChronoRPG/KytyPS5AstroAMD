@@ -161,7 +161,8 @@ struct CodegenOptions {
 	// duplicates only in debug builds, RemoveUse searches from the end, RemoveIdentities drops the
 	// removed identities' entries in one pass, ~Program detaches without maintaining use lists) and
 	// RewriteToSsa seals a block as soon as every predecessor is filled. Translation time only: the
-	// same program and SPIR-V.
+	// same program, but early sealing can create a loop header's phis in another order, which
+	// renumbers the module's ids (same size and meaning; the driver compiles it as a new module).
 	bool ir_linear_uses = false;
 	// KYTY_FOLD_LANE_MASKS=1 (default off; Senaxx 5189ea360): reads of the current lane's bit of a
 	// wave mask that is known per lane (a ballot of a predicate, an all-zero or all-one constant,
