@@ -16478,10 +16478,61 @@ public:
                     std::to_string(expected(DrawPrep::BindingPart::HwCheck)) + " and " +
                     std::to_string(expected(DrawPrep::BindingPart::Dynamic)));
       }
+      if (context.GetPipelineCache().PipelinePrefetchEnabled()) {
+        Live::Testing::StageText("KYTY_PIPELINE_PREFETCH=0\nKYTY_PIPELINE_PREFETCH_PROGRAMS=0\n");
+        Live::OnCpFlip();
+        Require(name, "prefetch switched off", !context.GetPipelineCache().PipelinePrefetchEnabled(),
+                "the live switch did not stop new requests");
+        const auto before = context.GetPipelineCache().GetPrefetchTotals();
+        clear();
+        registers.SetPsInControl(0x8002);
+        shaders.SetPsShaderBase(pixel_addresses[0]);
+        Pm4Execution execution;
+        Require(name, "synchronous cold draw after live switch",
+                processor.Process(execution, stream) == Pm4ProcessResult::Complete,
+                "the synchronous draw stream did not complete");
+        Require(name, "pixels after live switch", read() == serial,
+                "turning prefetch off changed the blended pixels");
+        Require(name, "no new worker requests while off",
+                context.GetPipelineCache().GetPrefetchTotals().submitted == before.submitted,
+                "a cold key was submitted while the switch was off");
+        registers.SetPsInControl(0x8000);
+        const auto* programs = std::getenv("KYTY_PIPELINE_PREFETCH_PROGRAMS");
+        Live::Testing::StageText(programs != nullptr && std::strcmp(programs, "0") != 0
+            ? "KYTY_PIPELINE_PREFETCH=1\nKYTY_PIPELINE_PREFETCH_PROGRAMS=1\n"
+            : "KYTY_PIPELINE_PREFETCH=1\nKYTY_PIPELINE_PREFETCH_PROGRAMS=0\n");
+        Live::OnCpFlip();
+      }
+      // Force an uncompiled pixel-program static key after its guest code is clean/cached.
+      // The extra interpolator is unused by these constant-color shaders, so the exact
+      // expected blend remains unchanged. This exercises compilation rather than cache hits.
+      if (const auto* value = std::getenv("KYTY_PIPELINE_PREFETCH_PROGRAMS"); value != nullptr && std::strcmp(value, "0") != 0) {
+        clear();
+        registers.SetPsInControl(0x8001);
+        shaders.SetPsShaderBase(pixel_addresses[0]);
+        Pm4Execution execution;
+        Require(name, "cold program command stream",
+                processor.Process(execution, stream) == Pm4ProcessResult::Complete,
+                "the draw stream with uncompiled pixel programs did not complete");
+        const auto cold_pixels = read();
+        check("cold programs through draw preparation", cold_pixels);
+        Require(name, "cold-program pixels", cold_pixels == serial,
+                "the cold prepared programs differ from the serial reference");
+        registers.SetPsInControl(0x8000);
+      }
       RenderExecutorTestAccess::ResetBindings(executor);
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     });
+    if (context.GetPipelineCache().PipelinePrefetchEnabled()) {
+      const auto stats = context.GetPipelineCache().GetPrefetchTotals();
+      Require(name, "prefetched pipelines consumed", stats.submitted > 0 && stats.used > 0,
+              "prefetch enabled but no worker pipeline was consumed by the GPU readback checks");
+      if (const auto* value = std::getenv("KYTY_PIPELINE_PREFETCH_PROGRAMS"); value != nullptr && std::strcmp(value, "0") != 0) {
+        Require(name, "speculative programs published", stats.programs > 0,
+                "program prefetch enabled but no program was compiled from a clean snapshot");
+      }
+    }
     LibKernel::Memory::InstallGpuResources(nullptr);
     context.ShutdownGpu();
     if (DrawPrep::BindingParts() != 0) {

@@ -687,6 +687,17 @@ add_executable(spirv_local_arrays_tests EXCLUDE_FROM_ALL
 target_link_libraries(spirv_local_arrays_tests spirv-tools)
 target_include_directories(spirv_local_arrays_tests PRIVATE ${inc_headers})
 
+add_executable(spirv_cache_salt_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SpirvCacheSaltTests.cpp")
+target_link_libraries(spirv_cache_salt_tests spirv-tools)
+target_include_directories(spirv_cache_salt_tests PRIVATE ${inc_headers})
+
+add_executable(pipeline_compile_queue_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineCompileQueueTests.cpp")
+target_include_directories(pipeline_compile_queue_tests PRIVATE ${inc_headers})
+
+add_executable(shader_code_snapshot_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ShaderCodeSnapshotTests.cpp")
+target_link_libraries(shader_code_snapshot_tests xxhash)
+target_include_directories(shader_code_snapshot_tests PRIVATE ${inc_headers})
+
 # KYTY_VRAM_GC_BUDGET: the budget-relative collection marks (graphics/host_gpu/vramBudget.h).
 add_executable(vram_budget_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/VramBudgetTests.cpp")
 target_include_directories(vram_budget_tests PRIVATE "${KYTY_SOURCE_DIR}")
@@ -1014,6 +1025,22 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatcher-cap-only)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME spirv_local_arrays COMMAND $<TARGET_FILE:spirv_local_arrays_tests>)
+	add_test(NAME spirv_cache_salt COMMAND $<TARGET_FILE:spirv_cache_salt_tests>)
+	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
+	add_test(NAME shader_code_snapshot COMMAND $<TARGET_FILE:shader_code_snapshot_tests>)
+	set_tests_properties(pipeline_compile_queue PROPERTIES TIMEOUT 30)
+	add_test(NAME pipeline_prefetch_rendering COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(pipeline_prefetch_rendering PROPERTIES
+		ENVIRONMENT "KYTY_PIPELINE_PREFETCH=1;KYTY_PIPELINE_PREFETCH_THREADS=2;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=127"
+		TIMEOUT 180)
+	add_test(NAME pipeline_prefetch_programs COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(pipeline_prefetch_programs PROPERTIES
+		ENVIRONMENT "KYTY_PIPELINE_PREFETCH=1;KYTY_PIPELINE_PREFETCH_PROGRAMS=1;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=129"
+		TIMEOUT 180)
+	add_test(NAME pipeline_prefetch_draw_run COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-run-only)
+	set_tests_properties(pipeline_prefetch_draw_run PROPERTIES
+		ENVIRONMENT "KYTY_PIPELINE_PREFETCH=1;KYTY_DRAW_RUN=exit;KYTY_PIPELINE_COLD_SALT=128"
+		TIMEOUT 180)
 	add_test(NAME vram_budget COMMAND $<TARGET_FILE:vram_budget_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)

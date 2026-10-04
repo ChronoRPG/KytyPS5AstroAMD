@@ -170,8 +170,9 @@ public:
 	                    ShaderPixelInputInfo& pixel_info, GraphicsStagePreps& stage_preps);
 	// Draw-prep: the program preparation of one draw as GetGraphicsPrograms would do it, but
 	// speculative: every guest read goes through the active DrawPrep recorder (readSet.h), nothing
-	// is compiled, synchronized or read back, and only already published sources and permutations
-	// are used. Safe on any thread (the program cache is only read). Writes vertex_info (stage 0),
+	// is synchronized or read back. Normally uses only published programs; the optional
+	// KYTY_PIPELINE_PREFETCH_PROGRAMS also publishes pure compilations from clean snapshots.
+	// Safe on any thread. Writes vertex_info (stage 0),
 	// pixel_info, the two stage preps and programs; outputs are meaningful only for Ok.
 	enum class SpeculativeResult : uint8_t {
 		Ok,
@@ -184,7 +185,8 @@ public:
 	    const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
 	    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	    bool pixel_active, ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info,
-	    StagePrep& vertex_prep, StagePrep& pixel_prep, GraphicsPrograms& programs);
+	    StagePrep& vertex_prep, StagePrep& pixel_prep, GraphicsPrograms& programs,
+	    uint64_t* compile_ns = nullptr);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo& input_info, StagePrep& stage_prep);
@@ -222,6 +224,23 @@ public:
 	[[nodiscard]] static bool SamePipelineTargets(const PipelineTargets&           targets,
 	                                              std::span<const RenderColorInfo> colors,
 	                                              const RenderDepthInfo&           depth);
+	// Early exact-key compilation. Speculation only warms a pipeline; the ordered draw still
+	// obtains its actual key and waits for completion. No draw is deferred or discarded.
+	[[nodiscard]] bool PipelinePrefetchEnabled() const noexcept;
+	struct PrefetchTotals {
+		uint64_t submitted = 0, used = 0, compile_ns = 0, wait_ns = 0, max_wait_ns = 0;
+		uint64_t programs = 0;
+	};
+	[[nodiscard]] PrefetchTotals GetPrefetchTotals() const;
+	void NoteProgramPrefetchWait(uint64_t ns);
+	void PrefetchGraphicsPipeline(const PipelineTargets& targets, const HW::Context& ctx,
+	    const HW::UserConfig& user_config, const ShaderVertexInputInfo& vertex_info,
+	    const ShaderPixelInputInfo* pixel_info, vk::PrimitiveTopology topology,
+	    bool primitive_restart_enable, const GraphicsPrograms& programs);
+	void PrefetchGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+	    std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
+	    const ShaderPixelInputInfo* pixel_info, vk::PrimitiveTopology topology,
+	    bool primitive_restart_enable, const GraphicsPrograms& programs);
 	enum class PlanLookup : uint8_t {
 		Found,
 		Absent,      // no pipeline for the key yet (GetGraphicsPipeline creates it)
@@ -347,6 +366,8 @@ private:
 	// Graphics pipeline libraries and the background compiles that replace linked pipelines
 	// (KYTY_PIPELINE_LIBRARY, pipelineLibrary.h); null when off or unsupported.
 	std::unique_ptr<LibraryState> m_library;
+	struct PrefetchState;
+	std::unique_ptr<PrefetchState> m_prefetch;
 	// Bumped whenever a cached pipeline object is replaced (a linked pipeline by its optimized
 	// build), so that per-thread lookup memos do not keep returning the replaced object. Starts in
 	// a range of its own per cache instance, so memos never match another instance.

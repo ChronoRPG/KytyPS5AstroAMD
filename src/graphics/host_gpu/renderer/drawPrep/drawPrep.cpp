@@ -303,6 +303,7 @@ bool PacketHookActive() {
 
 void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, bool eligible,
              bool exact, PreparedDraw& prepared) {
+	prepared.program_compile_ns = 0;
 	prepared.ok         = false;
 	prepared.failure    = Failure::None;
 	prepared.programs   = {};
@@ -333,7 +334,8 @@ void Prepare(PipelineCache& pipeline_cache, const RegisterSnapshot& registers, b
 	const auto  result = pipeline_cache.PrepareGraphicsProgramsSpeculative(
 	    sh_ctx.GetVs(), sh_ctx.GetPs(), ctx.GetShaderRegisters(), ctx, registers.user_config,
 	    prepared.target_export_mapping, prepared.pixel_active, prepared.vertex_info,
-	    prepared.pixel_info, prepared.vertex_prep, prepared.pixel_prep, prepared.programs);
+	    prepared.pixel_info, prepared.vertex_prep, prepared.pixel_prep, prepared.programs,
+	    &prepared.program_compile_ns);
 	switch (result) {
 		case PipelineCache::SpeculativeResult::Ok: break;
 		case PipelineCache::SpeculativeResult::Ineligible:
@@ -679,6 +681,10 @@ void HashForRepeatTrace(Engine::Slot& slot) {
 
 // After Prepare, on the preparing thread (KYTY_DRAW_PREP_BINDINGS): the slot's binding plan.
 void PlanBindings(Engine::Slot& slot, const BindingPlanContext& context) {
+	if (context.pipelines->PipelinePrefetchEnabled()) {
+		PrefetchBindingPipeline(context, slot.registers,
+		    slot.kind == DrawKind::Index ? &slot.index_args : nullptr, slot.prepared);
+	}
 	if (BindingParts() == 0) [[likely]] {
 		return;
 	}
@@ -915,6 +921,7 @@ bool Engine::Submit(uint64_t submit_id, const DrawIndexArgs* index_args,
 		auto& slot = *m_inline_slot;
 		FillSlot(slot, submit_id, index_args, auto_args, context, user_config, shaders);
 		Prepare(m_renderer.GetPipelineCache(), slot.registers, slot.eligible, true, slot.prepared);
+		m_renderer.GetPipelineCache().NoteProgramPrefetchWait(slot.prepared.program_compile_ns);
 		HashForRepeatTrace(slot);
 		PlanBindings(slot, MakeBindingPlanContext(m_renderer)); // tests: plans on this thread
 		Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepSelfPrepared);
@@ -1101,6 +1108,7 @@ void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 			    Profiler::ScopedFrameWait steal_time(Profiler::FrameWait::DrawPrepSteal);
 			    const WorkerThreadScope   as_worker;
 			    m_workers->PrepareClaimed(claimed, seq);
+			    m_renderer.GetPipelineCache().NoteProgramPrefetchWait(claimed.prepared.program_compile_ns);
 		    },
 		    [this](uint32_t spins, uint64_t spin_start) {
 			    CpuRelax();
@@ -1117,6 +1125,10 @@ void Engine::CommitHead(const std::function<void(Slot&)>* patch) {
 		    [] { Profiler::CountFrameEvent(Profiler::FrameEvent::DrawPrepColdWakes); });
 		// One call per held head; its time is only the idle spin (steals are DrawPrepSteal).
 		Profiler::AddFrameWait(Profiler::FrameWait::DrawPrepCommitWait, 1, stats.spin_ns);
+		// Actual idle CP wait on a shader miss, capped by the compiler call duration. Steals
+		// are accounted separately above. Whole-route flip intervals remain the hitch metric.
+		m_renderer.GetPipelineCache().NoteProgramPrefetchWait(
+		    std::min(stats.spin_ns, slot.prepared.program_compile_ns));
 		// The head is done (acquired): its publication fields are visible.
 		if (slot.speculative) {
 			// P3c: an adopted slot whose speculative preparation had not finished yet.
