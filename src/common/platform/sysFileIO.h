@@ -28,6 +28,8 @@ void        SysFileRead(void* data, uint32_t size, sys_file_t& f,
                         uint32_t* bytes_read = nullptr); // NOLINT(google-runtime-references)
 void        SysFileWrite(const void* data, uint32_t size, sys_file_t& f,
                          uint32_t* bytes_written = nullptr); // NOLINT(google-runtime-references)
+// Number of reads that fell back to a host buffer (Windows: ReadFile failed on protected pages).
+uint64_t    SysFileReadFallbackCount();
 sys_file_t* SysFileCreate(const std::filesystem::path& file_name);
 sys_file_t* SysFileOpenR(const std::filesystem::path& file_name,
                          sys_file_cache_type_t        cache_type = SYS_FILE_CACHE_AUTO);

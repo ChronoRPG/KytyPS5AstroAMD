@@ -6,6 +6,7 @@
 #include "common/file.h"
 #include "ArchiveTestFixture.h"
 #include "common/logging/log.h"
+#include "common/platform/sysFileIO.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/stringUtils.h"
@@ -31,6 +32,13 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
@@ -82,6 +90,95 @@ public:
 private:
   std::filesystem::path m_path;
 };
+
+#ifdef _WIN32
+// Stands in for the emulator's write tracking: unprotect a faulting page and retry.
+LONG CALLBACK UnprotectOnWriteFault(PEXCEPTION_POINTERS info) {
+  if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+      info->ExceptionRecord->ExceptionInformation[0] == 1) {
+    void *address = reinterpret_cast<void *>(info->ExceptionRecord->ExceptionInformation[1]);
+    DWORD old     = 0;
+    if (VirtualProtect(address, 1, PAGE_READWRITE, &old) != 0) {
+      return EXCEPTION_CONTINUE_EXECUTION;
+    }
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void CheckReadIntoProtectedMemory(const std::filesystem::path &root) {
+  // Larger than one bounce chunk (1 MiB) so the chunked path is exercised.
+  constexpr uint32_t file_size = (2u << 20u) + 12345u;
+  std::vector<uint8_t> content(file_size);
+  for (size_t i = 0; i < content.size(); ++i) {
+    content[i] = static_cast<uint8_t>((i * 131u + (i >> 8u)) & 0xFFu);
+  }
+  const auto path = root / "protected_read.bin";
+  {
+    std::FILE *out = _wfopen(path.c_str(), L"wb");
+    Check(out != nullptr, "create protected read file");
+    Check(std::fwrite(content.data(), 1, content.size(), out) == content.size(),
+          "write protected read file");
+    std::fclose(out);
+  }
+
+  const size_t region_size = 4u << 20u;
+  auto *region = static_cast<uint8_t *>(
+      VirtualAlloc(nullptr, region_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  Check(region != nullptr, "allocate protected read region");
+  void *handler = AddVectoredExceptionHandler(1, UnprotectOnWriteFault);
+  Check(handler != nullptr, "install write fault handler");
+
+  auto protect = [&] {
+    DWORD old = 0;
+    Check(VirtualProtect(region, region_size, PAGE_READONLY, &old) != 0, "protect region");
+  };
+
+  const auto before = SysFileReadFallbackCount();
+  auto *file = SysFileOpenR(path);
+  Check(file != nullptr && !SysFileIsError(*file), "open protected read file");
+
+  // Whole file, destination at an unaligned offset inside a read-only region.
+  protect();
+  uint32_t got = 0;
+  SysFileRead(region + 77, file_size, *file, &got);
+  Check(got == file_size, "protected read returns the full size");
+  Check(std::memcmp(region + 77, content.data(), file_size) == 0, "protected read content");
+  Check(SysFileReadFallbackCount() > before, "protected read used the host buffer");
+
+  // Short read at EOF and a read at EOF.
+  Check(SysFileSeek(*file, file_size - 100), "seek near EOF");
+  protect();
+  got = 1234;
+  SysFileRead(region + 4096, 5000, *file, &got);
+  Check(got == 100, "protected read stops at EOF");
+  Check(std::memcmp(region + 4096, content.data() + file_size - 100, 100) == 0,
+        "protected short read content");
+  protect();
+  got = 1234;
+  SysFileRead(region + 4096, 5000, *file, &got);
+  Check(got == 0, "protected read at EOF returns zero");
+
+  // Offsets: the file position continues after the fallback.
+  Check(SysFileSeek(*file, 1000), "seek to offset");
+  protect();
+  SysFileRead(region, 3000, *file, &got);
+  SysFileRead(region + 3000, 3000, *file, &got);
+  Check(got == 3000 && std::memcmp(region, content.data() + 1000, 6000) == 0,
+        "consecutive protected reads keep the file offset");
+
+  // Plain memory still takes the direct path.
+  const auto count = SysFileReadFallbackCount();
+  DWORD      old   = 0;
+  Check(VirtualProtect(region, region_size, PAGE_READWRITE, &old) != 0, "unprotect region");
+  Check(SysFileSeek(*file, 0), "seek to start");
+  SysFileRead(region, 4096, *file, &got);
+  Check(got == 4096 && SysFileReadFallbackCount() == count, "writable read stays on fast path");
+
+  SysFileClose(file);
+  RemoveVectoredExceptionHandler(handler);
+  VirtualFree(region, 0, MEM_RELEASE);
+}
+#endif
 
 void CheckSaveRename(const std::filesystem::path &root,
                      std::string_view payload) {
@@ -1026,6 +1123,9 @@ int main(int, char**) {
   CheckUnicodeLogPath(temporary.Path());
   CheckDirectoryStream(temporary.Path());
   CheckAprPaths(temporary.Path());
+#ifdef _WIN32
+  CheckReadIntoProtectedMemory(temporary.Path());
+#endif
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
   TestAioBatches();

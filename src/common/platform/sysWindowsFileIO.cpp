@@ -13,8 +13,13 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -63,10 +68,60 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 	return FILE_ATTRIBUTE_NORMAL;
 }
 
+static std::atomic<uint64_t> g_read_fallback_count {0};
+
+// The kernel cannot always write into the destination: guest pages that the emulator has
+// write-protected (GPU write tracking) make ReadFile fail with ERROR_NOACCESS or
+// ERROR_INVALID_USER_BUFFER. Read through a bounded per-thread host buffer instead and copy with
+// an ordinary user-mode store, which goes through the emulator's fault handling.
+static DWORD ReadFileViaBounceBuffer(HANDLE handle, void* data, uint32_t size) {
+	constexpr uint32_t                chunk_size = 1u << 20u;
+	thread_local std::vector<uint8_t> chunk;
+	if (chunk.size() < std::min(chunk_size, size)) {
+		chunk.resize(std::min(chunk_size, size));
+	}
+	uint32_t total = 0;
+	while (total < size) {
+		const uint32_t step = std::min(chunk_size, size - total);
+		DWORD          got  = 0;
+		if (ReadFile(handle, chunk.data(), step, &got, nullptr) == 0 || got == 0) {
+			break;
+		}
+		std::memcpy(static_cast<uint8_t*>(data) + total, chunk.data(), got);
+		total += got;
+		if (got < step) {
+			break;
+		}
+	}
+	return total;
+}
+
+static DWORD ReadFileIntoMemory(HANDLE handle, void* data, uint32_t size) {
+	DWORD w = 0;
+	if (ReadFile(handle, data, size, &w, nullptr) != 0) {
+		return w;
+	}
+	const DWORD error = GetLastError();
+	if (error != ERROR_NOACCESS && error != ERROR_INVALID_USER_BUFFER) {
+		return w;
+	}
+	static std::once_flag once;
+	std::call_once(once, [error] {
+		printf("SysFileRead: ReadFile into guest memory failed (error %lu), reading through a "
+		       "host buffer\n",
+		       static_cast<unsigned long>(error));
+	});
+	g_read_fallback_count.fetch_add(1, std::memory_order_relaxed);
+	return w + ReadFileViaBounceBuffer(handle, static_cast<uint8_t*>(data) + w, size - w);
+}
+
+uint64_t SysFileReadFallbackCount() {
+	return g_read_fallback_count.load(std::memory_order_relaxed);
+}
+
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
-		DWORD w = 0;
-		ReadFile(f.handle, data, size, &w, nullptr);
+		const DWORD w = ReadFileIntoMemory(f.handle, data, size);
 		if (bytes_read != nullptr) {
 			*bytes_read = w;
 		}

@@ -81,6 +81,10 @@ static void apply_cache_hint(FILE* f, sys_file_cache_type_t cache_type) {
 #endif
 }
 
+uint64_t SysFileReadFallbackCount() {
+	return 0;
+}
+
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
 		size_t w = fread(data, 1, size, f.f);
