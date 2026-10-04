@@ -160,18 +160,20 @@ struct GraphicContext {
 	}
 
 	// The subgroup size a graphics stage must require so that one host subgroup is one guest
-	// wave, or 0 when the default already is or the device cannot require it for the stage. On
-	// AMD the default is 64; a wave32 pixel or mesh shader would otherwise share a subgroup with
-	// another wave, and its ballots, lane reads and reductions would mix the two. Devices with a
-	// single subgroup size (NVIDIA: 32) always get 0.
+	// wave, or 0 (DeviceCompat::GraphicsSubgroupSize). On AMD the default is 64; a wave32 pixel or
+	// mesh shader would otherwise share a subgroup with another wave, and its ballots, lane reads
+	// and reductions would mix the two. Where the driver picks the width per shader (Intel: 8 to
+	// 32) the default width is required too. Devices with a single subgroup size (NVIDIA: 32)
+	// always get 0.
 	[[nodiscard]] uint32_t GraphicsSubgroupSize(vk::ShaderStageFlagBits stage,
 	                                            uint32_t                wave_size) const noexcept {
-		if (!subgroup_size_control_enabled || wave_size == subgroup_size ||
-		    !(required_subgroup_size_stages & stage) || wave_size < min_subgroup_size ||
-		    wave_size > max_subgroup_size) {
-			return 0;
-		}
-		return wave_size;
+		return DeviceCompat::GraphicsSubgroupSize(
+		    {.min_size       = min_subgroup_size,
+		     .max_size       = max_subgroup_size,
+		     .enabled        = subgroup_size_control_enabled,
+		     .compute        = false,
+		     .compute_wave64 = compute_subgroup_size_control_enabled},
+		    static_cast<bool>(required_subgroup_size_stages & stage), wave_size, subgroup_size);
 	}
 
 	// The subgroup size a compute pipeline must require so that one host subgroup holds one guest

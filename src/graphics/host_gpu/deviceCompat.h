@@ -43,6 +43,33 @@ struct SubgroupSizeControl {
 	return size;
 }
 
+// The subgroup size a mesh or pixel pipeline stage requires so that one host subgroup holds one
+// guest wave, or 0 to require nothing. `default_size` is the device's default subgroup size and
+// `stage_required` says requiredSubgroupSizeStages includes the stage. A device that can run wave64
+// (AMD) requires the wave size where the default differs from it, as before. One with several sizes
+// but no 64 (Intel: 8 to 32) picks the width per shader, so it requires min(wave size, default)
+// even when that equals the default (the driver may choose SIMD8 or SIMD16 for a wave32 shader).
+// A device with one size (NVIDIA: 32) requires nothing.
+[[nodiscard]] constexpr uint32_t GraphicsSubgroupSize(const SubgroupSizeControl& device,
+                                                      bool                       stage_required,
+                                                      uint32_t                   wave_size,
+                                                      uint32_t default_size) noexcept {
+	if (!device.enabled || !stage_required) {
+		return 0u;
+	}
+	if (device.compute_wave64) {
+		return wave_size != default_size && wave_size >= device.min_size &&
+		               wave_size <= device.max_size
+		           ? wave_size
+		           : 0u;
+	}
+	const uint32_t size = wave_size < default_size ? wave_size : default_size;
+	if (device.min_size >= device.max_size || size < device.min_size || size > device.max_size) {
+		return 0u;
+	}
+	return size;
+}
+
 // The rasterizer's depthClampEnable. The DB always clamps depth to the viewport range; with
 // VK_EXT_depth_clip_enable Z clipping is set apart, so the clamp is always on. Without it the clamp
 // also turns clipping off, so it is on only where the guest turns Z clipping off, and a draw that

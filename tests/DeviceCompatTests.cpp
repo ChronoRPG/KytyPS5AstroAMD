@@ -56,6 +56,40 @@ void TestComputeSubgroupSize() {
 	Expect(ComputeSubgroupSize(gcn, 32, 64) == 0, "GCN: wave32 cannot be required");
 }
 
+void TestGraphicsSubgroupSize() {
+	// NVIDIA: one size, nothing is required for either stage.
+	const SubgroupSizeControl nvidia {.min_size = 32, .max_size = 32, .enabled = false};
+	Expect(GraphicsSubgroupSize(nvidia, true, 32, 32) == 0, "NVIDIA: wave32 requires nothing");
+	Expect(GraphicsSubgroupSize(nvidia, true, 64, 32) == 0, "NVIDIA: wave64 requires nothing");
+	auto nvidia_enabled    = nvidia;
+	nvidia_enabled.enabled = true;
+	Expect(GraphicsSubgroupSize(nvidia_enabled, true, 32, 32) == 0, "min == max: nothing");
+	// AMD (default 64): the wave size when it differs from the default, as before.
+	const SubgroupSizeControl amd {.min_size = 32, .max_size = 64, .enabled = true, .compute = true,
+	                               .compute_wave64 = true};
+	Expect(GraphicsSubgroupSize(amd, true, 32, 64) == 32, "AMD: wave32 requires 32");
+	Expect(GraphicsSubgroupSize(amd, true, 64, 64) == 0, "AMD: wave64 is the default, nothing");
+	Expect(GraphicsSubgroupSize(amd, true, 32, 32) == 0, "AMD: wave32 on default 32, nothing");
+	Expect(GraphicsSubgroupSize(amd, false, 32, 64) == 0, "AMD: stage not required: nothing");
+	const SubgroupSizeControl gcn {.min_size = 64, .max_size = 64, .enabled = true, .compute = true,
+	                               .compute_wave64 = true};
+	Expect(GraphicsSubgroupSize(gcn, true, 32, 64) == 0, "GCN: wave32 cannot be required");
+	Expect(GraphicsSubgroupSize(gcn, true, 64, 64) == 0, "GCN: wave64 is the default, nothing");
+	// Intel (8 to 32, default 32): the driver picks the width, so 32 is required for wave32 and
+	// for wave64 (two lanes per invocation); a wave16 or wave8 program requires its own size.
+	const SubgroupSizeControl intel {.min_size = 8, .max_size = 32, .enabled = true, .compute = true};
+	Expect(GraphicsSubgroupSize(intel, true, 32, 32) == 32, "Intel: wave32 requires 32");
+	Expect(GraphicsSubgroupSize(intel, true, 64, 32) == 32, "Intel: wave64 requires 32");
+	Expect(GraphicsSubgroupSize(intel, true, 16, 32) == 16, "Intel: wave16 requires 16");
+	Expect(GraphicsSubgroupSize(intel, false, 32, 32) == 0, "Intel: stage not required: nothing");
+	auto no_feature    = intel;
+	no_feature.enabled = false;
+	Expect(GraphicsSubgroupSize(no_feature, true, 32, 32) == 0, "Intel: no feature: nothing");
+	const SubgroupSizeControl xe2 {.min_size = 16, .max_size = 32, .enabled = true, .compute = true};
+	Expect(GraphicsSubgroupSize(xe2, true, 32, 32) == 32, "Xe2: wave32 requires 32");
+	Expect(GraphicsSubgroupSize(xe2, true, 8, 32) == 0, "Xe2: size below the minimum: nothing");
+}
+
 constexpr VkImageUsageFlags Transfer = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 constexpr VkFormatFeatureFlags TransferFeatures =
     VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
@@ -156,6 +190,7 @@ void TestDepthClamp() {
 
 int main() {
 	TestComputeSubgroupSize();
+	TestGraphicsSubgroupSize();
 	TestImageCreateFallbacks();
 	TestDepthClamp();
 	if (g_failures != 0) {
