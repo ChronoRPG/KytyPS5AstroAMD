@@ -27,11 +27,20 @@
 #endif
 
 namespace HangWatchdog {
-std::atomic<bool>   g_enabled {true};
-static Live::Switch g_switch("KYTY_HANG_WATCHDOG", Live::ParseDefaultOn,
-                             [](int64_t, int64_t value) {
-	                             g_enabled.store(value != 0, std::memory_order_relaxed);
-                             });
+std::atomic<bool> g_enabled {true};
+// KYTY_HANG_WATCHDOG: "0" off, "auto" (value 2) on only for NVIDIA RTX 50 GPUs once the GPU is
+// known (ResolveAutoForDevice), anything else or unset on.
+constexpr int64_t        AutoMode = 2;
+static std::atomic<bool> g_auto_on {false};
+static int64_t ParseWatchdog(const char* value) {
+	if (value != nullptr && (std::strcmp(value, "auto") == 0 || std::strcmp(value, "AUTO") == 0)) {
+		return AutoMode;
+	}
+	return Live::ParseDefaultOn(value);
+}
+static Live::Switch g_switch("KYTY_HANG_WATCHDOG", ParseWatchdog, [](int64_t, int64_t value) {
+	g_enabled.store(value == 1 || (value == AutoMode && g_auto_on.load()), std::memory_order_relaxed);
+});
 namespace {
 constexpr size_t MaxThreads = 512, MaxDepth = 16, MaxQueues = 57, History = 32, MaxEvents = 1024;
 struct Record {
@@ -472,53 +481,87 @@ std::string DefaultDirectory() {
 	const auto path  = (root / fmt::format("watchdog-{}-pid{}", stamp, Pid())).u8string();
 	return std::string(reinterpret_cast<const char*>(path.data()), path.size());
 }
+std::string g_trace_directory; // Initialize's argument, for a monitor that ResolveAutoForDevice starts
+void StartMonitor(std::string_view trace_directory) {
+	if (g_watchdog.joinable()) return;
+	if (!trace_directory.empty())
+		g_directory = trace_directory;
+	else if (const auto* dir = std::getenv("KYTY_HANG_TRACE_DIR"); dir && *dir)
+		g_directory = dir;
+	else
+		g_directory = DefaultDirectory();
+	const auto* value = std::getenv("KYTY_HANG_WATCHDOG_MS");
+	const auto  timeout =
+	    value ? std::clamp<uint64_t>(std::strtoull(value, nullptr, 10), 1000, 600000) : 5000;
+	g_watchdog = std::jthread([timeout](std::stop_token stop) {
+		try {
+			StallDetector    detector;
+			std::unique_lock lock(g_sleep_mutex);
+			for (;;) {
+				const bool terminal = g_terminal_requested.exchange(false);
+				if (stop.stop_requested() && !terminal) return;
+				const auto now = NowMs();
+				g_time_ms.store(now, std::memory_order_relaxed);
+				if (!Enabled() && !terminal)
+					detector = {};
+				else if (terminal ||
+				         detector.Poll(now, g_flips.load(), g_submissions.load(), timeout)) {
+					g_report_reason.store(terminal ? 2 : 1);
+					lock.unlock();
+					if (!WriteSnapshot(g_directory, true)) {
+						// An explicit unwritable trace path must not silently discard the
+						// report.
+						(void)WriteSnapshot(DefaultDirectory(), true);
+					}
+					return;
+				}
+				g_sleep.wait_for(lock, stop, std::chrono::seconds(1),
+				                 [] { return g_terminal_requested.load(); });
+			}
+		} catch (...) {
+			// A monitor failure must not change guest execution or terminate the process.
+		}
+	});
+}
 } // namespace
 void Initialize(std::string_view trace_directory) {
 	try {
-		g_enabled.store(g_switch.On(), std::memory_order_relaxed);
+		g_trace_directory = std::string(trace_directory);
+		// Auto mode stays off until ResolveAutoForDevice knows the GPU.
+		g_enabled.store(g_switch.Get() == 1, std::memory_order_relaxed);
 		const auto* live = std::getenv("KYTY_LIVE_FILE");
-		if ((!Enabled() && (!live || !*live)) || g_watchdog.joinable()) return;
-		if (!trace_directory.empty())
-			g_directory = trace_directory;
-		else if (const auto* dir = std::getenv("KYTY_HANG_TRACE_DIR"); dir && *dir)
-			g_directory = dir;
-		else
-			g_directory = DefaultDirectory();
-		const auto* value = std::getenv("KYTY_HANG_WATCHDOG_MS");
-		const auto  timeout =
-		    value ? std::clamp<uint64_t>(std::strtoull(value, nullptr, 10), 1000, 600000) : 5000;
-		g_watchdog = std::jthread([timeout](std::stop_token stop) {
-			try {
-				StallDetector    detector;
-				std::unique_lock lock(g_sleep_mutex);
-				for (;;) {
-					const bool terminal = g_terminal_requested.exchange(false);
-					if (stop.stop_requested() && !terminal) return;
-					const auto now = NowMs();
-					g_time_ms.store(now, std::memory_order_relaxed);
-					if (!Enabled() && !terminal)
-						detector = {};
-					else if (terminal ||
-					         detector.Poll(now, g_flips.load(), g_submissions.load(), timeout)) {
-						g_report_reason.store(terminal ? 2 : 1);
-						lock.unlock();
-						if (!WriteSnapshot(g_directory, true)) {
-							// An explicit unwritable trace path must not silently discard the
-							// report.
-							(void)WriteSnapshot(DefaultDirectory(), true);
-						}
-						return;
-					}
-					g_sleep.wait_for(lock, stop, std::chrono::seconds(1),
-					                 [] { return g_terminal_requested.load(); });
-				}
-			} catch (...) {
-				// A monitor failure must not change guest execution or terminate the process.
-			}
-		});
+		if (!Enabled() && (!live || !*live)) return;
+		StartMonitor(trace_directory);
 	} catch (...) {
 		g_enabled.store(false, std::memory_order_relaxed);
 	}
+}
+bool IsNvidiaBlackwell(uint32_t vendor_id, uint32_t device_id, std::string_view name) {
+	if (vendor_id != 0x10deu) return false;
+	// GB202 0x2b8x-0x2bbx, GB203 0x2c0x-0x2c3x, GB206/GB207 0x2d0x-0x2dbx, GB205 0x2f0x-0x2f3x.
+	if (device_id >= 0x2b00u && device_id <= 0x2fffu) return true;
+	// A board with a later device id: "RTX 5050" to "RTX 5090" in its name ("Quadro RTX 5000" is Turing).
+	for (auto pos = name.find("RTX 50"); pos != std::string_view::npos; pos = name.find("RTX 50", pos + 1)) {
+		if (pos + 8 > name.size()) break;
+		const char tens = name[pos + 6], ones = name[pos + 7];
+		const bool next_digit = pos + 8 < name.size() && name[pos + 8] >= '0' && name[pos + 8] <= '9';
+		if (tens >= '5' && tens <= '9' && ones == '0' && !next_digit) return true;
+	}
+	return false;
+}
+AutoResult ResolveAutoForDevice(uint32_t vendor_id, uint32_t device_id, std::string_view name) {
+	if (g_switch.Get() != AutoMode) return AutoResult::NotAuto;
+	const bool on = IsNvidiaBlackwell(vendor_id, device_id, name);
+	g_auto_on.store(on, std::memory_order_relaxed);
+	if (!on) return AutoResult::Off;
+	try {
+		g_enabled.store(true, std::memory_order_relaxed);
+		StartMonitor(g_trace_directory);
+	} catch (...) {
+		g_enabled.store(false, std::memory_order_relaxed);
+		return AutoResult::Off;
+	}
+	return AutoResult::On;
 }
 void Shutdown() {
 	if (g_watchdog.joinable()) {

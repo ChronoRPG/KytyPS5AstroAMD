@@ -87,6 +87,9 @@ The graphics parser and resolver can publish packets concurrently. Packet slots 
 writer guards; a collision or a publisher overtaken after preemption increments `overflow`
 instead of waiting or overwriting a newer packet. Their shared history carries monotonic IDs.
 
+`KYTY_HANG_WATCHDOG=auto` (the release preset) keeps it off until the GPU is selected, then turns it on only for
+NVIDIA RTX 50 (Blackwell) GPUs and logs `Kyty hang watchdog: on/off`.
+
 `KYTY_HANG_WATCHDOG=0` disables monitoring and metadata publication. It is a live switch for
 same-process A/B; a process started disabled needs `KYTY_LIVE_FILE` to allow later activation.
 `KYTY_HANG_WATCHDOG_MS` changes the startup threshold (1,000–600,000 ms; default 5,000).

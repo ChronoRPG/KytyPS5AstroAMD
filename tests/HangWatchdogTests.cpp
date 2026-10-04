@@ -152,6 +152,19 @@ void ConcurrentPackets() {
   resolver.join();
   Check(checked != 0, "concurrent packet snapshots exercised");
 }
+void AutoDetection() {
+  using HangWatchdog::IsNvidiaBlackwell;
+  Check(IsNvidiaBlackwell(0x10de, 0x2b85, "NVIDIA GeForce RTX 5090"), "RTX 5090");
+  Check(IsNvidiaBlackwell(0x10de, 0x2d04, "NVIDIA GeForce RTX 5060 Ti"), "RTX 5060 Ti");
+  Check(IsNvidiaBlackwell(0x10de, 0x2c05, "NVIDIA GeForce RTX 5070 Ti"), "RTX 5070 Ti");
+  Check(IsNvidiaBlackwell(0x10de, 0x3001, "NVIDIA GeForce RTX 5080 SUPER"),
+        "later device id, RTX 50 name");
+  Check(!IsNvidiaBlackwell(0x10de, 0x2204, "NVIDIA GeForce RTX 3090"), "RTX 3090");
+  Check(!IsNvidiaBlackwell(0x10de, 0x2684, "NVIDIA GeForce RTX 4090"), "RTX 4090");
+  Check(!IsNvidiaBlackwell(0x10de, 0x1eb0, "Quadro RTX 5000"), "Turing Quadro RTX 5000");
+  Check(!IsNvidiaBlackwell(0x1002, 0x744c, "AMD Radeon RX 7900 XTX"), "AMD");
+  Check(!IsNvidiaBlackwell(0x8086, 0x2c05, "RTX 5090 lookalike"), "vendor first");
+}
 } // namespace
 int main(int argc, char **argv) {
   if (argc > 1 && std::string_view(argv[1]) == "--fatal-shutdown") {
@@ -231,6 +244,7 @@ int main(int argc, char **argv) {
   ConcurrentSnapshot();
   PublicationStress();
   ConcurrentPackets();
+  AutoDetection();
   HangWatchdog::NoteFatal("first mock fatal", "source/renderer.cpp", 53);
   HangWatchdog::NoteFatal("later cleanup failure", "source/cleanup.cpp", 99);
   const auto fatal = HangWatchdog::SnapshotForTest();

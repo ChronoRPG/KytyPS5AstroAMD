@@ -11,8 +11,10 @@ This release builds on the U59 renderer and the Demon's Souls changes of the pre
   - The logs of RTX 50 PCs that freeze at the title screen -> galaxy map step all end in this readback path:
     the game's render threads re-read small flags a shader writes every frame. If your RTX 40/50 PC freezes
     there, try this release with its bundled preset.
-- The hang watchdog is disabled in the release preset (`KYTY_HANG_WATCHDOG=0`). Test kits can enable it with
-  `KYTY_HANG_WATCHDOG=1`; see `docs/HANG-WATCHDOG.md`. Disabled hot paths skip diagnostic record updates.
+- The hang watchdog is on only for NVIDIA RTX 50 GPUs (`KYTY_HANG_WATCHDOG=auto` in the preset; `=1` turns it on for any
+  GPU, `=0` off). When the picture stops for 5 seconds it writes `_HangTrace\watchdog-*\watchdog.txt` beside the
+  emulator: what every thread is doing and waiting for. If your RTX 50 PC still freezes, please send that file.
+  On other GPUs its hot paths stay off; see `docs/HANG-WATCHDOG.md`.
 - Measured on one PC (RTX 3090, Ryzen 9 7950X3D): no fps or VRAM change against int5. With the fix switched off
   and on in the same process: Sky Garden -0.14% +/- 0.50%, Creamy Canyon -0.13% +/- 0.66%, identical VRAM.
 

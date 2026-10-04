@@ -16,6 +16,12 @@ extern std::atomic<bool>  g_enabled;
 	return g_enabled.load(std::memory_order_relaxed);
 }
 void     Initialize(std::string_view trace_directory = {});
+// KYTY_HANG_WATCHDOG=auto (the release preset): the watchdog stays off at Initialize and turns on
+// here, once the GPU is selected, only for NVIDIA RTX 50 (Blackwell) GPUs, where the emulator froze
+// at the title screen -> galaxy map step. The caller logs the result.
+enum class AutoResult { NotAuto, On, Off };
+[[nodiscard]] bool       IsNvidiaBlackwell(uint32_t vendor_id, uint32_t device_id, std::string_view name);
+[[nodiscard]] AutoResult ResolveAutoForDevice(uint32_t vendor_id, uint32_t device_id, std::string_view name);
 void     Shutdown();
 void     SetThreadName(std::string_view name);
 void     SetGuestThread(uint64_t guest_thread, std::string_view name);

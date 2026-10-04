@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -1387,6 +1388,17 @@ void WindowContext::CreateVulkan() {
 	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();
 
 	LOGF("Select device: %s\n", device_properties.deviceName.data());
+	switch (HangWatchdog::ResolveAutoForDevice(device_properties.vendorID, device_properties.deviceID,
+	                                           device_properties.deviceName.data())) {
+		case HangWatchdog::AutoResult::On:
+			LOGF("Kyty hang watchdog: on for this RTX 50 GPU (KYTY_HANG_WATCHDOG=auto); if the picture stops "
+			     "for 5 s it writes _HangTrace\\watchdog-*\\watchdog.txt\n");
+			break;
+		case HangWatchdog::AutoResult::Off:
+			LOGF("Kyty hang watchdog: off, not an RTX 50 GPU (KYTY_HANG_WATCHDOG=auto)\n");
+			break;
+		case HangWatchdog::AutoResult::NotAuto: break;
+	}
 
 	const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info {
 	    .format = vk::Format::eBc1RgbaUnormBlock,
