@@ -39,6 +39,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -5001,23 +5002,39 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
 	auto [mapped, offset] =
 	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	// Map refuses a reservation larger than the download buffer instead of waiting for space, so
+	// a whole-image readback can exceed it. Such a readback is staged in a private buffer of
+	// exactly the needed size instead of exiting; the deferred write-back retires it once the copy
+	// has been read, as the shared-buffer path releases its reservation.
+	std::unique_ptr<Buffer> oversized;
 	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("TextureCache: image readback of %" PRIu64
+			     " bytes exceeds the download buffer; staging it in a private buffer\n",
+			     range.size);
+		}
+		oversized = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                     AllFlags, range.size);
+		mapped    = oversized->Mapped().data();
+		offset    = 0;
+	} else {
+		download.Commit();
 	}
-	download.Commit();
+	auto& destination = oversized != nullptr ? *oversized : static_cast<Buffer&>(download);
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
-	download.Flush(offset, range.size);
+	destination.Flush(offset, range.size);
 
-	DownloadImage(image, download, offset, range.size, std::move(transfer));
+	DownloadImage(image, destination, offset, range.size, std::move(transfer));
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer              = download.Handle();
+	barrier.buffer              = destination.Handle();
 	barrier.offset              = offset;
 	barrier.size                = range.size;
 	m_scheduler.EndRendering();
@@ -5026,6 +5043,16 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	                                               1, &barrier, 0, nullptr);
 	const auto publication = m_buffer_cache.BeginBackingPublication(
 	    std::span<const GuestRange>(&range, 1), m_scheduler.CurrentTick());
+	if (oversized != nullptr) {
+		m_scheduler.DeferPriorityOperation(
+		    [this, owner = std::move(oversized), range, mapped, publication]() mutable {
+			    owner->Invalidate(0, range.size);
+			    LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+			    m_buffer_cache.EndBackingPublication(publication);
+			    owner.reset();
+		    });
+		return true;
+	}
 	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, publication] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
