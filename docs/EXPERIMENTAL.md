@@ -178,7 +178,7 @@ Release with Ninja in an x64 Visual Studio developer shell, as in `.github/workf
 - Configure from `C:\kyty-src`, a directory junction to the checkout (`mklink /J C:\kyty-src <checkout>`, then
   `cmake -S C:\kyty-src -B <new build directory>`). clang-cl names functions in anonymous namespaces after a hash
   of the source path, so a build from any other path loses their part of the profile.
-- Add `-DKYTY_EMULATOR_IPO=ON` and `-DKYTY_PGO_USE=C:/kyty-src/tools/pgo/u59-int6-sg-1.profdata`. Without
+- Add `-DKYTY_EMULATOR_IPO=ON` and `-DKYTY_PGO_USE=C:/kyty-src/tools/pgo/u59-int7-sg-1.profdata`. Without
   `KYTY_PGO_USE` the build works, but without the profile's speedup.
 - Build `launcher` and `kyty_emulator`, install to `_Build/windows/install`, and copy `tools/u59-preset.json` beside
   `launcher.exe`.
