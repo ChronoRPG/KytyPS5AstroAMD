@@ -652,6 +652,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	LOGF("Vulkan shader object support: %s (renderer uses pipelines)\n",
 	     supported_shader_object.shaderObject ? "true" : "false");
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	if (!graphics.mesh_shader_enabled) {
+		// Not a reason to reject the device: games without mesh (NGG) shaders still run.
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "WARNING: the GPU \"{}\" has no mesh shaders ({}). Games that draw with mesh (NGG) "
+		    "shaders stop at their first such draw; other games are not affected.\n",
+		    graphics.GetPhysicalDeviceProperties().deviceName.data(),
+		    mesh_extension ? "VK_EXT_mesh_shader without the meshShader feature"
+		                   : "no VK_EXT_mesh_shader"));
+	}
 	// Optional: native indirect draws fall back to CPU-read arguments without these.
 	graphics.draw_indirect_first_instance_enabled =
 	    supported_features2.features.drawIndirectFirstInstance == VK_TRUE;

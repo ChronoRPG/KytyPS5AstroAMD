@@ -407,6 +407,9 @@ using GraphicsPipelineCreateHook =
 [[nodiscard]] bool PipelineDynamicRasterStateEnabled();
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
+// Stops the emulator at a mesh (NGG) draw on a device without mesh shaders, naming the missing
+// extension and the device: such draws have no fallback.
+[[noreturn]] void ExitWithoutMeshShaders(const GraphicContext& graphics);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
                             const PipelineVertexInputState&        vertex_input,
