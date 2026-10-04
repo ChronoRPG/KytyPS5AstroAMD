@@ -160,6 +160,19 @@ public:
 	// host dependencies are not ready is waited for here, once the records before it
 	// were submitted.
 	void DrainPendingLocked();
+	// The same, but only until `progress` has dispatched `tick`; later records stay queued for the
+	// worker. For an operation on another queue that waits for that tick.
+	void DrainThroughLocked(const SubmissionProgress* progress, uint64_t tick);
+	// Without queue_mutex: waits for the host dependencies of the records pending now (or of those
+	// up to `progress`'s record of `tick`), so a drain under queue_mutex that follows rarely waits
+	// while holding it.
+	void WaitPendingDependencies(const SubmissionProgress* progress = nullptr, uint64_t tick = 0);
+	// The caller MUST own queue_mutex. For presentation: submits the pending records that can be
+	// submitted now, in order, and never waits. A record whose host dependencies are not ready stays
+	// queued with every later record of its scheduler; other schedulers' records (the presenter's
+	// blit, which reads only a completed frame) go ahead of it. So the present waits for nothing
+	// that has not been submitted, and the game's texture copies never delay it.
+	void DrainReadyForPresentLocked();
 	// Called by the window owner after both schedulers stop, before device destruction. Joins
 	// without holding queue_mutex and submits all accepted records before returning.
 	void Shutdown();

@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -250,6 +251,119 @@ void QueueSubmissionBroker::DrainPendingLocked() {
 		SubmitInOrder(records.data(), count);
 		remaining -= count;
 	}
+}
+
+void QueueSubmissionBroker::DrainThroughLocked(const SubmissionProgress* progress, uint64_t tick) {
+	if (!m_enabled || progress == nullptr) {
+		return;
+	}
+	while (progress->dispatched_tick.load(std::memory_order_acquire) < tick) {
+		std::array<QueuedSubmission, MaxBatch> records;
+		size_t                                 count = 0;
+		{
+			std::lock_guard lock(m_mutex);
+			bool            last = false;
+			while (!last && count < MaxBatch && !m_pending.empty()) {
+				auto& next = m_pending.front();
+				last       = next.progress.get() == progress && next.tick >= tick;
+				records[count++] = std::move(next);
+				m_pending.pop_front();
+			}
+			if (Profiler::DetailedEnabled() && tracy::ProfilerAvailable()) {
+				TracyPlot("SubmissionQueue.Pending", static_cast<double>(m_pending.size()));
+			}
+		}
+		if (count == 0) {
+			return; // not pending: the caller made sure the tick reached the broker
+		}
+		m_space_available.notify_all();
+		SubmitInOrder(records.data(), count);
+	}
+}
+
+void QueueSubmissionBroker::DrainReadyForPresentLocked() {
+	if (!m_enabled) {
+		return;
+	}
+	std::vector<QueuedSubmission> ready;
+	{
+		std::lock_guard lock(m_mutex);
+		// Schedulers with a held record; their later records stay behind it, in order.
+		std::array<const SubmissionProgress*, 4> held {};
+		size_t                                   held_count = 0;
+		bool                                     hold_all   = false;
+		std::deque<QueuedSubmission>             kept;
+		ready.reserve(m_pending.size());
+		for (auto& record: m_pending) {
+			const auto* progress = record.progress.get();
+			bool        hold     = hold_all || std::find(held.begin(), held.begin() + held_count,
+			                                             progress) != held.begin() + held_count;
+			if (!hold && !record.submit.HostDependenciesReady()) {
+				hold = true;
+				if (held_count < held.size()) {
+					held[held_count++] = progress;
+				} else {
+					hold_all = true;
+				}
+			}
+			if (hold) {
+				kept.push_back(std::move(record));
+			} else {
+				ready.push_back(std::move(record));
+			}
+		}
+		m_pending = std::move(kept);
+		if (Profiler::DetailedEnabled() && tracy::ProfilerAvailable()) {
+			TracyPlot("SubmissionQueue.Pending", static_cast<double>(m_pending.size()));
+		}
+	}
+	if (ready.empty()) {
+		return;
+	}
+	m_space_available.notify_all();
+	for (size_t first = 0; first < ready.size(); first += MaxBatch) {
+		SubmitBatch(ready.data() + first, std::min(MaxBatch, ready.size() - first));
+	}
+}
+
+void QueueSubmissionBroker::WaitPendingDependencies(const SubmissionProgress* progress,
+                                                    uint64_t                  tick) {
+	if (!m_enabled) {
+		return;
+	}
+	// Per dependency, the newest value a pending record names: values only grow along the queue.
+	SubmitInfo needs;
+	bool       found = progress == nullptr;
+	{
+		std::lock_guard lock(m_mutex);
+		for (const auto& record: m_pending) {
+			const auto& submit = record.submit;
+			for (uint32_t i = 0; i < submit.num_host_dependencies; ++i) {
+				auto* const dependency = submit.host_dependencies[i];
+				const auto  value      = submit.host_dependency_values[i];
+				uint32_t    slot       = 0;
+				while (slot < needs.num_host_dependencies &&
+				       needs.host_dependencies[slot] != dependency) {
+					++slot;
+				}
+				if (slot < needs.num_host_dependencies) {
+					needs.host_dependency_values[slot] =
+					    std::max(needs.host_dependency_values[slot], value);
+				} else if (slot < SubmitInfo::MaxHostDependencies) {
+					needs.AddHostDependency(dependency, value);
+				}
+			}
+			if (progress != nullptr && record.progress.get() == progress && record.tick >= tick) {
+				found = record.tick == tick;
+				break;
+			}
+		}
+	}
+	if (!found) {
+		return; // the worker has taken that tick meanwhile
+	}
+	// The dependencies outlive the records (SubmitInfo), which the worker may submit meanwhile.
+	needs.WaitHostDependencies();
 }
 
 void QueueSubmissionBroker::SubmitInOrder(const QueuedSubmission* records, size_t count) {

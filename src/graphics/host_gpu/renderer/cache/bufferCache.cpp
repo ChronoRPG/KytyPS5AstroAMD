@@ -1818,12 +1818,14 @@ BufferCache::SideIssueResult BufferCache::TryIssueSideReadback(
 	if (side_queue) {
 		// Every tick older than the current recording was handed to queue 0 or to the submission
 		// broker. Drain the broker only if the producer has not reached the driver yet, so this
-		// wait is never submitted ahead of its signal.
+		// wait is never submitted ahead of its signal; only up to the producer, after waiting
+		// without queue_mutex for the work its batches read (SubmitDependency).
 		const auto& progress = m_scheduler.GetMasterSemaphore().GetSubmissionProgress();
 		if (progress != nullptr &&
 		    progress->dispatched_tick.load(std::memory_order_acquire) < producer) {
+			m_graphics.submission_queue.WaitPendingDependencies(progress.get(), producer);
 			Common::LockGuard lock(m_graphics.queue_mutex);
-			m_graphics.submission_queue.DrainPendingLocked();
+			m_graphics.submission_queue.DrainThroughLocked(progress.get(), producer);
 		}
 		Common::LockGuard lock(m_graphics.side_queue_mutex);
 		HangWatchdog::Scope native(

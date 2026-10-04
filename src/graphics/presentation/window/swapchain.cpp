@@ -1154,8 +1154,10 @@ Swapchain::Status Swapchain::Present() {
 
 	vk::Result result;
 	{
+		// The blit this present waits for goes ahead of game batches still waiting for their
+		// texture copies: the present never waits for them, nor for a signal not yet submitted.
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
-		m_window.graphic_ctx.submission_queue.DrainPendingLocked();
+		m_window.graphic_ctx.submission_queue.DrainReadyForPresentLocked();
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
 	switch (result) {
