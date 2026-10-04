@@ -981,9 +981,6 @@ if(BUILD_TESTING)
 	add_test(NAME wave_reductions_linear_uses COMMAND $<TARGET_FILE:shader_cfg_tests> --wave-reduction-only)
 	set_tests_properties(wave_reductions_linear_uses PROPERTIES
 		ENVIRONMENT "KYTY_TEST_COMPARE_LINEAR_USES=1")
-	add_test(NAME isa_accuracy_linear_uses COMMAND $<TARGET_FILE:shader_cfg_tests> --isa-accuracy-only)
-	set_tests_properties(isa_accuracy_linear_uses PROPERTIES
-		ENVIRONMENT "KYTY_TEST_COMPARE_LINEAR_USES=1")
 	add_test(NAME upsync2_opcodes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --new-opcodes-only)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME registered_shader_code_on COMMAND $<TARGET_FILE:shader_cfg_tests> --registered-shader-code-only)

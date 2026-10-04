@@ -172,6 +172,17 @@ TestCompileResult RecompileForTest(
                  static_cast<unsigned long long>(compared),
                  static_cast<unsigned long long>(options.shader_hash), quadratic.spirv.size(),
                  linear.spirv.size());
+    // KYTY_TEST_COMPARE_LINEAR_USES_DUMP=<prefix>: both modules as <prefix><n>-off.spv / -on.spv.
+    if (const char *prefix = std::getenv("KYTY_TEST_COMPARE_LINEAR_USES_DUMP"); prefix != nullptr) {
+      for (const auto &[suffix, words] : {std::pair{"-off.spv", &quadratic.spirv},
+                                          std::pair{"-on.spv", &linear.spirv}}) {
+        const auto path = std::string(prefix) + std::to_string(compared) + suffix;
+        if (auto *file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+          std::fwrite(words->data(), sizeof(uint32_t), words->size(), file);
+          std::fclose(file);
+        }
+      }
+    }
   }
   Check(quadratic.spirv == linear.spirv, "KYTY_IR_LINEAR_USES changed a program's SPIR-V");
   if ((compared & 63u) == 0) {
