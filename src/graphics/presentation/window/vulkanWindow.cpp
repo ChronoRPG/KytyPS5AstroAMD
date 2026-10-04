@@ -710,7 +710,37 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// Optional: IMAGE_SAMPLE*_CL clamps become the MinLod image operand.
 	const bool shader_resource_min_lod =
 	    supported_features2.features.shaderResourceMinLod == VK_TRUE;
-	ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = shader_resource_min_lod});
+	// Derivatives in compute shaders (IMAGE_GET_LOD): VK_KHR_compute_shader_derivatives, else the NV
+	// extension (one feature structure for both); the emitter declares the matching SPIR-V extension.
+	// Without either, such a shader keeps the KHR declaration and is named when it is compiled.
+	vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR compute_derivatives {};
+	const bool derivatives_khr =
+	    HasExtension(device_extensions, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+	const bool derivatives_nv =
+	    HasExtension(device_extensions, VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+	if (derivatives_khr || derivatives_nv) {
+		vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR supported_derivatives {};
+		vk::PhysicalDeviceFeatures2                           derivatives_query {};
+		derivatives_query.pNext = &supported_derivatives;
+		physical_device.getFeatures2(&derivatives_query);
+		compute_derivatives.computeDerivativeGroupQuads =
+		    supported_derivatives.computeDerivativeGroupQuads;
+	}
+	{
+		namespace Spirv = ShaderRecompiler::Spirv;
+		const auto derivatives = compute_derivatives.computeDerivativeGroupQuads != VK_TRUE
+		                             ? Spirv::HostComputeDerivatives::None
+		                         : derivatives_khr ? Spirv::HostComputeDerivatives::Khr
+		                                           : Spirv::HostComputeDerivatives::Nv;
+		Spirv::SetHostImageFeatures(
+		    {.min_lod = shader_resource_min_lod, .compute_derivatives = derivatives});
+		LOGF("Vulkan compute shader derivatives (IMAGE_GET_LOD): %s\n",
+		     derivatives == Spirv::HostComputeDerivatives::Khr
+		         ? VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
+		     : derivatives == Spirv::HostComputeDerivatives::Nv
+		         ? VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME
+		         : "unavailable (compute shaders that need them are named when compiled)");
+	}
 	LOGF("Vulkan shaderResourceMinLod (IMAGE_SAMPLE*_CL): %s\n",
 	     shader_resource_min_lod ? "true" : "false");
 	// S_MEMREALTIME (KYTY_REALTIME_CLOCK): the device clock, else the subgroup clock, else the
@@ -990,6 +1020,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (shader_clock.shaderDeviceClock == VK_TRUE || shader_clock.shaderSubgroupClock == VK_TRUE) {
 		shader_clock.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext  = &shader_clock;
+	}
+	if (compute_derivatives.computeDerivativeGroupQuads == VK_TRUE) {
+		compute_derivatives.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext         = &compute_derivatives;
 	}
 	if (graphics.shader_image_int64_atomics_enabled) {
 		image_atomic_int64.pNext = const_cast<void*>(create_info.pNext);
@@ -1488,6 +1522,13 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		// Derivatives in compute shaders (IMAGE_GET_LOD); the NV extension has the same feature.
+		if (HasExtension(available_extensions, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+		} else if (HasExtension(available_extensions,
+		                        VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
 		}
 		// Native 8-bit index buffers for indirect draws; the KHR and EXT features are identical.
 		if (HasExtension(available_extensions, VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME)) {

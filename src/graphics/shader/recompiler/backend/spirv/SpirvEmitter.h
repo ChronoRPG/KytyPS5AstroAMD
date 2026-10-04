@@ -32,10 +32,18 @@ struct HostBufferRobustness {
 void                 SetHostBufferRobustness(const HostBufferRobustness& robustness);
 HostBufferRobustness GetHostBufferRobustness();
 
+// Derivatives in compute shaders (IMAGE_GET_LOD: OpImageQueryLod under DerivativeGroupQuads). The
+// device layer enables VK_KHR_compute_shader_derivatives, else VK_NV_compute_shader_derivatives
+// (the same capability and execution mode, declared with the NV SPIR-V extension). None: the device
+// has neither; such a shader still declares the KHR extension, which the driver may reject, and the
+// emitter names it once.
+enum class HostComputeDerivatives : uint8_t { Khr, Nv, None };
+
 // Optional image features of the device (set once by the device layer).
 struct HostImageFeatures {
 	// shaderResourceMinLod: the MinLod image operand, used for IMAGE_SAMPLE*_CL.
-	bool min_lod = false;
+	bool                   min_lod             = false;
+	HostComputeDerivatives compute_derivatives = HostComputeDerivatives::Khr;
 };
 
 void              SetHostImageFeatures(const HostImageFeatures& features);

@@ -5104,6 +5104,61 @@ void TestNewShaderRecompilerImageQueryTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// The compute-derivatives declaration follows the device (SetHostImageFeatures): the KHR SPIR-V
+// extension by default and with VK_KHR_compute_shader_derivatives, the NV one with only
+// VK_NV_compute_shader_derivatives (the same capability and execution mode), and still KHR on a
+// device with neither (the emitter names the shader instead).
+void TestComputeDerivativesHostExtension() {
+  namespace Spirv = ShaderRecompiler::Spirv;
+  // The LOD goes to LDS so that the query stays live; an 8x8 group has the even X and Y sizes
+  // DerivativeGroupQuads needs.
+  const uint32_t shader[] = {
+      EncodeMimg0(0x60, 0x3),
+      EncodeMimg1(6, 0, 0, 1), // image_get_lod v[6:7], v[1:2]
+      EncodeDs0(0x0d),
+      EncodeDs1(0, 6, 0), // ds_write_b32 v0, v6
+      0xbf810000u,
+  };
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 8;
+  compute.threads_num[1] = 8;
+  compute.threads_num[2] = 1;
+  compute.thread_ids_num = 2;
+  compute.lds_size_dwords = 256;
+  compute.wave_size = 64;
+  compute.host_subgroup_size = 64;
+  const auto contains_text = [](const std::vector<uint32_t> &binary, const char *text) {
+    const std::string bytes(reinterpret_cast<const char *>(binary.data()),
+                            binary.size() * sizeof(uint32_t));
+    return bytes.find(text) != std::string::npos;
+  };
+  const auto saved = Spirv::GetHostImageFeatures();
+  for (const auto mode : {Spirv::HostComputeDerivatives::Khr, Spirv::HostComputeDerivatives::Nv,
+                          Spirv::HostComputeDerivatives::None}) {
+    auto features = saved;
+    features.compute_derivatives = mode;
+    Spirv::SetHostImageFeatures(features);
+    auto user_data = ImageTestUserData();
+    // Clear the fixture T#'s reserved bits: otherwise it is not a descriptor and binds a null image.
+    user_data[2] = 0x003f003fu;
+    user_data[6] = 0u;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.input_info.compute = &compute;
+    options.wave_size = 64;
+    options.user_data = user_data;
+    const auto result = RecompileForTest(shader, options);
+    const bool nv = mode == Spirv::HostComputeDerivatives::Nv;
+    Check(contains_text(result.spirv, "SPV_NV_compute_shader_derivatives") == nv &&
+              contains_text(result.spirv, "SPV_KHR_compute_shader_derivatives") == !nv,
+          "compute derivatives declare the wrong SPIR-V extension for the host device");
+    Check(std::find(result.spirv.begin(), result.spirv.end(), 5288u) != result.spirv.end() &&
+              std::find(result.spirv.begin(), result.spirv.end(), 5289u) != result.spirv.end(),
+          "compute derivatives lost the derivative group capability or execution mode");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+  Spirv::SetHostImageFeatures(saved);
+}
+
 void TestNewShaderRecompilerCubeSampleCoordinates() {
   constexpr uint32_t MimgDimCube = 3;
   const uint32_t shader[] = {
@@ -14582,6 +14637,11 @@ int main(int argc, char **argv) {
     std::printf("shader_cfg --wave-reduction-only: ok\n");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--compute-derivatives-only") == 0) {
+    TestComputeDerivativesHostExtension();
+    std::printf("shader_cfg --compute-derivatives-only: ok\n");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--fold-lane-masks-only") == 0) {
     TestWaveRowReduction(false);
     TestWaveRowReduction(true);
@@ -14625,6 +14685,7 @@ int main(int argc, char **argv) {
   TestImageAtomicWidthDecoder();
   TestNewShaderDecoderArchitecture();
   TestImageAddressOperands();
+  TestComputeDerivativesHostExtension();
   TestSopkCompareImmediateExtension();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();
