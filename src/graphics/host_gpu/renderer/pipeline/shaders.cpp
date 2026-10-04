@@ -401,9 +401,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	// MoltenVK lacks VK_EXT_depth_clip_enable; omit the depth-clip struct on macOS and accept
 	// Vulkan's default depth clipping (enabled) instead of the PS5's clamp behavior.
 #if !defined(__APPLE__)
-	// The DB clamps depth to the viewport range after polygon offset is applied.
-	rasterizer.depthClampEnable = VK_TRUE;
-	rasterizer.pNext = &clip_ext;
+	// The DB clamps depth to the viewport range after polygon offset is applied; without
+	// VK_EXT_depth_clip_enable the clamp also turns clipping off (DeviceCompat::DepthClampEnable).
+	rasterizer.depthClampEnable = DeviceCompat::DepthClampEnable(graphics.depth_clip_enable_enabled,
+	                                                             static_params.depth_clip_enable)
+	                                  ? VK_TRUE
+	                                  : VK_FALSE;
+	if (graphics.depth_clip_enable_enabled) {
+		rasterizer.pNext = &clip_ext;
+	}
 #endif
 	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex {};
 	EXIT_NOT_IMPLEMENTED(static_params.provoking_vtx_last &&
@@ -460,11 +466,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	color_write.pColorWriteEnables = color_write_enable;
 
 	vk::PipelineColorBlendStateCreateInfo color_blending {};
-	// MoltenVK lacks VK_EXT_color_write_enable; drop the dynamic color-write struct on macOS
-	// and rely on each attachment's static colorWriteMask (all channels enabled by default).
-#if !defined(__APPLE__)
-	color_blending.pNext = &color_write;
-#endif
+	// Without VK_EXT_color_write_enable (MoltenVK, older drivers) drop the dynamic color-write
+	// struct and rely on each attachment's static colorWriteMask (all channels enabled by default).
+	if (graphics.color_write_enable_enabled) {
+		color_blending.pNext = &color_write;
+	}
 	color_blending.logicOp         = vk::LogicOp::eCopy;
 	color_blending.attachmentCount = rendering.color_count;
 	color_blending.pAttachments    = color_blend_attachment;
@@ -515,11 +521,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    vk::DynamicState::eStencilWriteMask,
 	    vk::DynamicState::eBlendConstants,
 	};
-#if !defined(__APPLE__)
-	if (rendering.color_count != 0) {
+	if (graphics.color_write_enable_enabled && rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
-#endif
 	if (PipelineDynamicRasterStateEnabled()) {
 		// Core Vulkan 1.3 (no feature bit). The key holds zeroes for these fields; the draw records
 		// the values from the same registers (SetGraphicsDynamicParams).

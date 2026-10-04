@@ -65,6 +65,13 @@ struct GraphicContext {
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	// VK_EXT_color_write_enable: draws turn attachments without an image off through dynamic
+	// colour-write enables. Without it (older drivers, MoltenVK) pipelines keep their static write
+	// masks; an attachment without an image view discards its writes anyway.
+	bool                               color_write_enable_enabled            = false;
+	// VK_EXT_depth_clip_enable: depth clipping set apart from the always-on depth clamp (the DB's
+	// behaviour). Without it, pipelines clamp only where the guest turns Z clipping off.
+	bool                               depth_clip_enable_enabled             = false;
 	bool                               supports_block_texel_view              = false;
 	// shaderStorageImageReadWithoutFormat (TileManager::TileFromImage).
 	bool                               storage_image_read_without_format_enabled = false;

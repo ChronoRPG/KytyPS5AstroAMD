@@ -43,6 +43,15 @@ struct SubgroupSizeControl {
 	return size;
 }
 
+// The rasterizer's depthClampEnable. The DB always clamps depth to the viewport range; with
+// VK_EXT_depth_clip_enable Z clipping is set apart, so the clamp is always on. Without it the clamp
+// also turns clipping off, so it is on only where the guest turns Z clipping off, and a draw that
+// keeps clipping clips without the clamp.
+[[nodiscard]] constexpr bool DepthClampEnable(bool depth_clip_enable_extension,
+                                              bool guest_z_clip) noexcept {
+	return depth_clip_enable_extension || !guest_z_clip;
+}
+
 [[nodiscard]] constexpr bool IsBlockCompressedFormat(VkFormat format) noexcept {
 	return format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && format <= VK_FORMAT_BC7_SRGB_BLOCK;
 }

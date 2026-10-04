@@ -143,11 +143,21 @@ void TestImageCreateFallbacks() {
 	       "block-compressed formats are BC1 to BC7");
 }
 
+void TestDepthClamp() {
+	// With VK_EXT_depth_clip_enable (NVIDIA, as before): always clamped, clipping set apart.
+	Expect(DepthClampEnable(true, true) && DepthClampEnable(true, false),
+	       "depth clip extension: the clamp is always on");
+	// Without it: the clamp only where the guest turns Z clipping off (the clamp disables clipping).
+	Expect(!DepthClampEnable(false, true), "no extension, Z clipping on: clip without the clamp");
+	Expect(DepthClampEnable(false, false), "no extension, Z clipping off: clamp");
+}
+
 } // namespace
 
 int main() {
 	TestComputeSubgroupSize();
 	TestImageCreateFallbacks();
+	TestDepthClamp();
 	if (g_failures != 0) {
 		std::printf("DeviceCompatTests: failed: %d check(s)\n", g_failures);
 		return 1;
