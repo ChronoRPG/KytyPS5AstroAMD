@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,8 +20,10 @@
 #include <functional>
 #include <mutex>
 #include <numeric>
+#include <set>
 #include <string>
 #include <unordered_set>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -94,6 +97,12 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	    format > Prospero::BufferFormat::kBc7Srgb) {
 		return false;
 	}
+	// The range above leaves the encoding's gaps open, and a value such as 139, which lies between
+	// 136 and 156 and names nothing, used to pass here and abort the emulator further down instead
+	// of being treated as what it is: eight dwords that are not a descriptor.
+	if (!Prospero::IsDefinedBufferFormat(format)) {
+		return false;
+	}
 	if (r128 && type != Prospero::ImageType::kColor1D && type != Prospero::ImageType::kColor2D &&
 	    type != Prospero::ImageType::kColor2DMsaa) {
 		return false;
@@ -114,6 +123,26 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 		       (r128 || max_mip == fragments);
 	}
 	return true;
+}
+
+// A null image keeps the draw alive, but the walk read something that is not a descriptor (all-zero
+// dwords are an unbound slot, not reported), so say so once per shader and slot instead of hiding it.
+void ReportInvalidImageDescriptor(uint64_t shader_hash, uint32_t slot,
+                                  const DescriptorValue& descriptor) {
+	static std::mutex                                   mutex;
+	static std::set<std::pair<uint64_t, uint32_t>>    reported;
+	{
+		const std::lock_guard lock(mutex);
+		if (reported.size() >= 64 || !reported.emplace(shader_hash, slot).second) {
+			return;
+		}
+	}
+	const auto& words = descriptor.dwords;
+	std::fprintf(stderr,
+	             "image descriptor %u of shader 0x%016" PRIx64
+	             " is not a descriptor, binding null: %08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+	             slot, shader_hash, words[0], words[1], words[2], words[3], words[4], words[5],
+	             words[6], words[7]);
 }
 
 uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
@@ -1264,6 +1293,9 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 					return false;
 				}
 				if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
+					if (!NullImageDescriptor(snapshot.images[i])) {
+						ReportInvalidImageDescriptor(program.shader_hash, i, snapshot.images[i]);
+					}
 					snapshot.images[i].dwords.fill(0);
 				}
 			}
