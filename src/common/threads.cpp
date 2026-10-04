@@ -45,8 +45,18 @@ bool ShortSleepsBlock() {
 #ifdef KYTY_WIN_CS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
-constexpr DWORD    KYTY_CS_SPIN_COUNT          = 4000;
 constexpr uint64_t KYTY_SLEEP_SPIN_LIMIT_100NS = 500; // 50 us
+
+// Spins of a contested Common::Mutex before it blocks (KYTY_CS_SPIN_COUNT, default 4000; 0 blocks
+// at once and leaves the core to other threads). Read once, at the first mutex.
+static DWORD CsSpinCount() {
+	static const DWORD count = [] {
+		const char* value = std::getenv("KYTY_CS_SPIN_COUNT");
+		return value != nullptr && value[0] != '\0' ? static_cast<DWORD>(std::strtoul(value, nullptr, 10))
+		                                            : DWORD {4000};
+	}();
+	return count;
+}
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -191,7 +201,7 @@ using thread_id_t = std::thread::id;
 
 struct MutexPrivate {
 #ifdef KYTY_WIN_CS
-	MutexPrivate() { InitializeCriticalSectionAndSpinCount(&m_cs, KYTY_CS_SPIN_COUNT); }
+	MutexPrivate() { InitializeCriticalSectionAndSpinCount(&m_cs, CsSpinCount()); }
 	~MutexPrivate() { DeleteCriticalSection(&m_cs); }
 	KYTY_CLASS_NO_COPY(MutexPrivate);
 	CRITICAL_SECTION m_cs {};
