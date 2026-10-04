@@ -25006,9 +25006,7 @@ public:
     vertex.buffers[0].attr_indices[1] = 1;
     vertex.buffers[0].attr_offsets[1] = 2 * sizeof(float);
     for (uint32_t i = 0; i < 2; i++) {
-      const auto format = i == 0 ? Prospero::BufferFormat::k32_32Float
-                          : packed_vertex_color ? Prospero::BufferFormat::k11_11_10Float
-                                                : Prospero::BufferFormat::k32_32_32_32Float;
+      const auto format = i == 0 ? Prospero::BufferFormat::k32_32Float : color_format;
       vertex.resources[i].fields[3] = DstSel(4, 5, 6, 7) |
                                       (static_cast<uint32_t>(format) << 12u);
       vertex.resources_dst[i].registers_num =
@@ -25041,9 +25039,8 @@ public:
     std::vector<u32> vertex_words(vertices.size());
     std::memcpy(vertex_words.data(), vertices.data(), sizeof(vertices));
     if (packed_vertex_color) {
-      // R11/G11/B10 unsigned floats: 0.5, 1.0, 2.0; Vulkan supplies the missing alpha as 1.
       for (uint32_t i = 0; i < 3; i++) {
-        vertex_words[i * 6 + 2] = 0x801e0380u;
+        vertex_words[i * 6 + 2] = packed_color;
       }
     }
     auto buffer = CreateHostBuffer(name, sizeof(vertices), vk::BufferUsageFlagBits::eVertexBuffer,
@@ -25153,12 +25150,11 @@ public:
     draw(filled);
     const auto solid_pixels = read_color();
     if (packed_vertex_color) {
-      const std::array<float, 4> expected{0.5f, 1.0f, 2.0f, 1.0f};
       const auto center = 4 * ((extent / 2) * extent + extent / 2);
-      for (uint32_t component = 0; component < expected.size(); component++) {
+      for (uint32_t component = 0; component < packed_expected.size(); component++) {
         Require(name, "packed vertex fetch and coverage",
                 std::abs(std::bit_cast<float>(solid_pixels[center + component]) -
-                         expected[component]) < 0.0001f && solid_pixels[component] == 0,
+                         packed_expected[component]) < 0.0001f && solid_pixels[component] == 0,
                 "packed vertex color changed channels, clamped HDR, or filled outside the triangle");
       }
     } else if (depth_feedback) {
@@ -50986,7 +50982,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRasterization(false);
-    vulkan.CheckRasterization(false, true);
+    vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
+    vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
