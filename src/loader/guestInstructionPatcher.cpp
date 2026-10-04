@@ -159,6 +159,8 @@ InstructionPatchCounts& ReplacementCounts(GuestInstructionPatchResult& result,
 	}
 }
 
+using RejectionMap = std::map<uintptr_t, PatchRejection>;
+
 bool UsesInstructionTrap(InstructionReplacement replacement, bool trap_replacements) {
 	return replacement != InstructionReplacement::None &&
 	       (trap_replacements || replacement == InstructionReplacement::InsertQ ||
@@ -369,7 +371,28 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 	}
 	const ZydisRegister table_reg = add->second.operands[1].reg.value;
 
-	const auto load = previous_contiguous(add);
+	// Compilers sometimes schedule unrelated instructions between the table load and the add.
+	const auto is_table_load = [&](const DecodedCodeInstruction& decoded) {
+		return decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOVSXD &&
+		       decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		       IsSameRegister(decoded.operands[0].reg.value, target_reg) &&
+		       decoded.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+		       IsSameRegister(decoded.operands[1].mem.base, table_reg);
+	};
+	auto load = previous_contiguous(add);
+	for (size_t gap = 0; gap < MaxInterveningInstructions && load != function.instructions.end() &&
+	                     !is_table_load(load->second);
+	     ++gap) {
+		const auto& between = load->second;
+		if (WritesRegister(between, target_reg) || WritesRegister(between, table_reg) ||
+		    IsControlFlowTerminator(between.instruction) ||
+		    between.instruction.meta.category == ZYDIS_CATEGORY_CALL ||
+		    between.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
+			load = function.instructions.end();
+			break;
+		}
+		load = previous_contiguous(load);
+	}
 	if (load == function.instructions.end() ||
 	    load->second.instruction.mnemonic != ZYDIS_MNEMONIC_MOVSXD ||
 	    load->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
@@ -380,7 +403,7 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 	    load->second.operands[1].mem.scale != sizeof(s32)) {
 		return std::nullopt;
 	}
-	const ZydisRegister index_reg = load->second.operands[1].mem.index;
+	ZydisRegister index_reg = load->second.operands[1].mem.index;
 
 	constexpr size_t         MaxPatternInstructions = 64;
 	std::optional<size_t>    table_size;
@@ -418,6 +441,21 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 			break;
 		}
 		if (WritesRegister(decoded, index_reg)) {
+			// Follow a register copy (including the 32-bit self-copy that zero-extends the index)
+			// back to the register the bounds check tested.
+			const auto is_wide_gpr = [](const ZydisDecodedOperand& operand) {
+				return operand.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+				       (operand.size == 32 || operand.size == 64) &&
+				       (ZydisRegisterGetClass(operand.reg.value) == ZYDIS_REGCLASS_GPR32 ||
+				        ZydisRegisterGetClass(operand.reg.value) == ZYDIS_REGCLASS_GPR64);
+			};
+			if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
+			    decoded.instruction.operand_count_visible == 2 && is_wide_gpr(decoded.operands[0]) &&
+			    is_wide_gpr(decoded.operands[1]) &&
+			    IsSameRegister(decoded.operands[0].reg.value, index_reg)) {
+				index_reg = decoded.operands[1].reg.value;
+				continue;
+			}
 			return std::nullopt;
 		}
 	}
@@ -512,6 +550,51 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 	return resolved_targets;
 }
 
+// An unresolved indirect jump that leaves the function (a tail call), so it cannot land inside
+// the function and relocating its instructions stays safe. Two forms qualify:
+// - JMP [mem] without an index register loads one code pointer (vtable slot, import stub); an
+//   indexed form could be a jump table.
+// - JMP reg right after the frame is popped (POP RBP or LEAVE with no branch target between that
+//   and the jump): a jump back into the function would run with a dead frame.
+bool IsTailCallIndirectJump(const DecodedFunction& function, uintptr_t branch_address) {
+	const auto branch = function.instructions.find(branch_address);
+	if (branch == function.instructions.end() ||
+	    branch->second.instruction.mnemonic != ZYDIS_MNEMONIC_JMP) {
+		return false;
+	}
+	const auto& target = branch->second.operands[0];
+	if (target.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+		return target.mem.index == ZYDIS_REGISTER_NONE;
+	}
+	if (target.type != ZYDIS_OPERAND_TYPE_REGISTER) {
+		return false;
+	}
+
+	constexpr size_t MaxEpilogueInstructions = 12;
+	auto             cursor                  = branch;
+	for (size_t count = 0; count < MaxEpilogueInstructions; ++count) {
+		const auto& decoded = cursor->second;
+		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEAVE ||
+		    (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_POP &&
+		     decoded.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		     decoded.operands[0].reg.value == ZYDIS_REGISTER_RBP)) {
+			return true;
+		}
+		if (function.branch_targets.contains(cursor->first) ||
+		    cursor == function.instructions.begin()) {
+			return false;
+		}
+		const auto previous = std::prev(cursor);
+		if (previous->first + previous->second.instruction.length != cursor->first ||
+		    IsControlFlowTerminator(previous->second.instruction) ||
+		    previous->second.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
+			return false;
+		}
+		cursor = previous;
+	}
+	return false;
+}
+
 DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
                                uintptr_t segment_start, uintptr_t segment_end) {
 	DecodedFunction               function;
@@ -586,7 +669,12 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 			break;
 		}
 	}
-	function.has_indirect_branch = indirect_branches.size() != resolved_indirect_branches.size();
+	for (const uintptr_t branch: indirect_branches) {
+		if (!resolved_indirect_branches.contains(branch) &&
+		    !IsTailCallIndirectJump(function, branch)) {
+			function.has_indirect_branch = true;
+		}
+	}
 	return function;
 }
 
@@ -989,7 +1077,12 @@ bool NeedsTrapRedZoneProtection(const DecodedCodeInstruction& decoded) {
 
 void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunction& function,
                                  const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                                 const RejectionMap&                            rejections,
                                  GuestInstructionPatchResult&                   result) {
+	const auto reason_of = [&rejections](uintptr_t address) {
+		const auto found = rejections.find(address);
+		return found != rejections.end() ? found->second : PatchRejection::NoRelaySlot;
+	};
 	for (const auto& [address, rewrite]: rewrite_sites) {
 		if (rewrite.replacement == InstructionReplacement::None ||
 		    module.patched.contains(reinterpret_cast<u8*>(address))) {
@@ -1004,17 +1097,24 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
 				     ZydisMnemonicGetString(decoded.instruction.mnemonic),
 				     reinterpret_cast<void*>(address));
 			}
+			// Left unpatched (counted as skipped), not trapped.
+			++ReplacementCounts(result, rewrite.replacement)
+			      .rejected[static_cast<size_t>(reason_of(address))];
 			continue;
 		}
 		MarkInstructionTrap(reinterpret_cast<u8*>(address), decoded.instruction,
 		                    rewrite.replacement);
-		++ReplacementCounts(result, rewrite.replacement).trapped;
+		auto& counts = ReplacementCounts(result, rewrite.replacement);
+		++counts.trapped;
+		++counts.rejected[static_cast<size_t>(reason_of(address))];
 	}
 }
 
 void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& function,
                                const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
-                               GuestInstructionPatchResult&                   result) {
+                               RejectionMap& rejections, GuestInstructionPatchResult& result) {
+	// Why the most recent emit_span attempt failed.
+	PatchRejection emit_failure {PatchRejection::EncodeFailed};
 	struct RelocationSpan {
 		std::vector<const DecodedCodeInstruction*> instructions;
 		uintptr_t                                  patch_start {};
@@ -1026,6 +1126,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 	const auto emit_span = [&](RelocationSpan& span) -> std::optional<size_t> {
 		auto&        generator         = module->trampoline_gen;
 		const size_t trampoline_offset = generator.getSize();
+		emit_failure                   = PatchRejection::EncodeFailed;
 		const bool   has_replacements =
 		    std::ranges::any_of(span.instructions, [&](const auto* decoded) {
 			    const auto rewrite = rewrite_sites.find(decoded->address);
@@ -1086,6 +1187,8 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 				}
 			}
 			const int error = Xbyak::GetError();
+			emit_failure    = error == Xbyak::ERR_CODE_IS_TOO_BIG ? PatchRejection::TrampolineExhausted
+			                                                      : PatchRejection::EncodeFailed;
 			// Roll back before retrying this uncommitted span with smaller trap replacements.
 			generator.reset();
 			generator.setSize(trampoline_offset);
@@ -1114,6 +1217,13 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 				auto& counts = ReplacementCounts(result, rewrite->second.replacement);
 				if (UsesInstructionTrap(rewrite->second.replacement, span.trap_replacements)) {
 					++counts.trapped;
+					// INSERTQ and RDPID trap by design; the others trap here only because
+					// trampoline space ran out.
+					if (span.trap_replacements &&
+					    rewrite->second.replacement != InstructionReplacement::InsertQ &&
+					    rewrite->second.replacement != InstructionReplacement::ReadProcessorId) {
+						++counts.rejected[static_cast<size_t>(PatchRejection::TrampolineExhausted)];
+					}
 				} else {
 					++counts.native;
 				}
@@ -1132,13 +1242,18 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 			continue;
 		}
 
-		const auto collect_forward_span = [&]() -> std::optional<RelocationSpan> {
+		PatchRejection span_failure {PatchRejection::SpanUndecoded};
+		const auto     collect_forward_span = [&]() -> std::optional<RelocationSpan> {
 			RelocationSpan span {.patch_start = site, .continuation = site};
 			while (span.patch_size < NearJumpSize) {
 				const auto decoded_it = function.instructions.find(span.continuation);
-				if (decoded_it == function.instructions.end() ||
-				    (span.continuation != site &&
-				     function.branch_targets.contains(span.continuation))) {
+				if (decoded_it == function.instructions.end()) {
+					span_failure = PatchRejection::SpanUndecoded;
+					return std::nullopt;
+				}
+				if (span.continuation != site &&
+				    function.branch_targets.contains(span.continuation)) {
+					span_failure = PatchRejection::SpanBranchTarget;
 					return std::nullopt;
 				}
 
@@ -1148,6 +1263,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 				span.continuation += decoded.instruction.length;
 				if (span.patch_size < NearJumpSize &&
 				    IsControlFlowTerminator(decoded.instruction)) {
+					span_failure = PatchRejection::SpanTerminator;
 					return std::nullopt;
 				}
 			}
@@ -1166,16 +1282,24 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 
 			while (span.patch_size < NearJumpSize) {
 				const auto previous_end = function.instructions.lower_bound(span.patch_start);
-				if (previous_end == function.instructions.begin() ||
-				    function.branch_targets.contains(span.patch_start)) {
+				if (previous_end == function.instructions.begin()) {
+					span_failure = PatchRejection::SpanUndecoded;
+					return std::nullopt;
+				}
+				if (function.branch_targets.contains(span.patch_start)) {
+					span_failure = PatchRejection::SpanBranchTarget;
 					return std::nullopt;
 				}
 
 				const auto  previous = std::prev(previous_end);
 				const auto& decoded  = previous->second;
 				if (previous->first + decoded.instruction.length != span.patch_start ||
-				    previous->first < covered_until ||
-				    IsControlFlowTerminator(decoded.instruction)) {
+				    previous->first < covered_until) {
+					span_failure = PatchRejection::SpanUndecoded;
+					return std::nullopt;
+				}
+				if (IsControlFlowTerminator(decoded.instruction)) {
+					span_failure = PatchRejection::SpanTerminator;
 					return std::nullopt;
 				}
 
@@ -1196,6 +1320,8 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 				trampoline_offset = emit_span(*forward_span);
 				if (trampoline_offset) {
 					selected_span = std::move(forward_span);
+				} else {
+					span_failure = emit_failure;
 				}
 			}
 		}
@@ -1204,10 +1330,16 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 				trampoline_offset = emit_span(*backward_span);
 				if (trampoline_offset) {
 					selected_span = std::move(backward_span);
+				} else {
+					span_failure = emit_failure;
 				}
 			}
 		}
 		if (!selected_span) {
+			const bool blocked_by_indirect_branch =
+			    !can_relocate_neighbors && site_instruction.instruction.length < NearJumpSize;
+			rejections[site] =
+			    blocked_by_indirect_branch ? PatchRejection::IndirectBranchFunction : span_failure;
 			unresolved_sites.push_back(site);
 			continue;
 		}
@@ -1255,6 +1387,9 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 		ASSERT(site_instruction != function.instructions.end());
 		if (function.has_indirect_branch ||
 		    site_instruction->second.instruction.length < ShortJumpSize) {
+			if (function.has_indirect_branch) {
+				rejections[site] = PatchRejection::IndirectBranchFunction;
+			}
 			record_unsupported(site);
 			continue;
 		}
@@ -1268,6 +1403,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 		const size_t trampoline_start       = module->trampoline_gen.getSize();
 		const auto   site_trampoline_offset = emit_span(site_span);
 		if (!site_trampoline_offset) {
+			rejections[site] = emit_failure;
 			record_unsupported(site);
 			continue;
 		}
@@ -1414,6 +1550,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 
 		if (!host_span && !final_relay_slot) {
 			module->trampoline_gen.setSize(trampoline_start);
+			rejections[site] = PatchRejection::NoRelaySlot;
 			record_unsupported(site);
 			continue;
 		}
@@ -1540,7 +1677,10 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		}
 
 		++result.function_count;
-		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
+		// Jump tables usually sit in a read-only data segment, not in the code segment.
+		auto function = DecodeFunction(function_start, function_end,
+		                               reinterpret_cast<uintptr_t>(module->start),
+		                               reinterpret_cast<uintptr_t>(module->end));
 		if (analyze_red_zone) {
 			AnalyzeRedZoneLiveness(function);
 		}
@@ -1559,8 +1699,9 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 			CollectAmdInstructions(function, rewrite_sites, result, host_features);
 		}
 		if (!rewrite_sites.empty()) {
-			RelocateGuestInstructions(module, function, rewrite_sites, result);
-			TrapUnrelocatedInstructions(*module, function, rewrite_sites, result);
+			RejectionMap rejections;
+			RelocateGuestInstructions(module, function, rewrite_sites, rejections, result);
+			TrapUnrelocatedInstructions(*module, function, rewrite_sites, rejections, result);
 		}
 	}
 	const auto trampoline_addr =

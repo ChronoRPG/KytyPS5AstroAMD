@@ -3468,6 +3468,9 @@ void TestPackedReciprocalSquareRoot() {
 				      "exhausted reciprocal-root generation lost fallback coverage");
 				Check(test, Xbyak::GetError() == 0,
 				      "failed trampoline generation leaked Xbyak's thread-local error");
+				Check(test, exhausted.reciprocal_sqrt.rejected[static_cast<size_t>(
+				                Loader::PatchRejection::TrampolineExhausted)] == instruction_count,
+				      "exhausted reciprocal-root generation did not report trampoline exhaustion");
 				if (expected_traps == 0) {
 					Check(test, std::equal(original.begin(), original.end(), code.getCode()),
 					      "unsafe fallback modified a live guest red zone site");
@@ -3602,6 +3605,9 @@ void TestPackedReciprocalSquareRoot() {
 	                std::equal(expected_fallback.begin(), expected_fallback.end(),
 	                           unsupported_code.getCode()),
 	      "unsafe native relocation did not select the in-place trap fallback");
+	Check(test, unsupported.reciprocal_sqrt.rejected[static_cast<size_t>(
+	                Loader::PatchRejection::IndirectBranchFunction)] == 1,
+	      "indirect jump fixture did not report its rejection reason");
 	const auto traps_before = g_instruction_traps;
 	function(input.data(), output.data());
 	Check(test, g_instruction_traps == traps_before + 1 && output[0] == 0x3f800000 &&
@@ -4017,6 +4023,242 @@ void TestPackedBitField(bool insert) {
 	std::printf("[host]    %-48s ok (all 4096 length/index pairs)\n", test);
 }
 
+// VRSQRTPS in functions with indirect jumps: tail calls and resolvable jump tables keep the site
+// native; an indirect jump that may land inside the function still forces the in-place trap.
+void TestPackedReciprocalSquareRootIndirectBranches() {
+	const char*        test            = "PackedReciprocalSquareRootIndirectBranches";
+	constexpr uint64_t code_size       = 0x4000;
+	constexpr uint64_t allocation_size = code_size * 2;
+	constexpr uint32_t second_function = 0x400;
+	constexpr uint32_t table_offset    = 0x1000;
+	const auto         mapping         = Libs::LibKernel::Memory::AllocateProgramMemory(
+        0x908000000, allocation_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
+        "rsqrt_indirect_test");
+	Check(test, mapping != 0, "failed to allocate instruction test code");
+	InstructionTestScope restore {mapping, allocation_size};
+	restore.InstallHandler(test);
+	using GuestFunction = void(KYTY_SYSV_ABI*)(const uint32_t*, uint32_t*, uint64_t);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+
+	using Loader::PatchRejection;
+	struct Expectation {
+		bool           native;
+		PatchRejection reason; // Only meaningful when !native.
+	};
+	// Patches the generated code and runs it for each (index, marker): VRSQRTPS must produce
+	// 1/sqrt(4) with zeroed upper lanes, and a non-zero marker must appear in output[16].
+	const auto run_case = [&](const char* name, Xbyak::CodeGenerator& code, uint32_t segment_size,
+	                          Expectation                                expect,
+	                          std::vector<std::pair<uint32_t, uint32_t>> index_markers) {
+		const std::vector<uintptr_t> starts {mapping, mapping + second_function};
+		if (Xbyak::GetError() != 0) {
+			std::printf("[host]    rsqrt indirect %s: %s\n", name,
+			            Xbyak::ConvertErrorToString(Xbyak::GetError()));
+		}
+		Check(test, Xbyak::GetError() == 0, "failed to generate indirect-branch fixture");
+		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
+		      "failed to flush generated instruction test code");
+		Loader::RegisterGuestInstructionPatchModule(
+		    reinterpret_cast<void*>(mapping), code_size,
+		    reinterpret_cast<void*>(mapping + code_size), code_size);
+		const auto  patched = Loader::PatchGuestInstructions(mapping, segment_size, starts, false, true);
+		const auto& counts  = patched.reciprocal_sqrt;
+		uint64_t    rejected_total = 0;
+		for (const auto reason_count: counts.rejected) {
+			rejected_total += reason_count;
+		}
+		std::printf("[host]    rsqrt indirect %-26s native=%" PRIu64 " trapped=%" PRIu64 "\n", name,
+		            counts.native, counts.trapped);
+		Check(test, counts.found == 1 && counts.Skipped() == 0 &&
+		                counts.native == (expect.native ? 1u : 0u) &&
+		                counts.trapped == (expect.native ? 0u : 1u),
+		      "indirect-branch fixture has the wrong native/trapped counts");
+		Check(test, rejected_total == (expect.native ? 0u : 1u) &&
+		                (expect.native ||
+		                 counts.rejected[static_cast<size_t>(expect.reason)] == 1),
+		      "indirect-branch fixture has the wrong rejection reason");
+		std::array<uint32_t, 16> input {};
+		std::array<uint32_t, 32> output {};
+		input.fill(0x3f800000);
+		input[0]                = 0x40800000; // 1/sqrt(4) = 0.5 exactly
+		const auto traps_before = g_instruction_traps;
+		for (const auto& [index, marker]: index_markers) {
+			output.fill(0xdeadbeef);
+			function(input.data(), output.data(), index);
+			Check(test, output[0] == 0x3f000000 && output[1] == 0x3f800000 &&
+			                output[2] == 0x3f800000 && output[3] == 0x3f800000,
+			      "indirect-branch fixture computed the wrong reciprocal root");
+			Check(test, output[4] == 0 && output[5] == 0 && output[6] == 0 && output[7] == 0,
+			      "indirect-branch fixture kept upper YMM lanes");
+			if (marker != 0) {
+				Check(test, output[16] == marker, "jump table selected the wrong path");
+			}
+		}
+		Check(test, static_cast<uint64_t>(g_instruction_traps - traps_before) ==
+		                (expect.native ? 0u : index_markers.size()),
+		      "indirect-branch fixture trapped (or failed to trap) unexpectedly");
+	};
+	const auto start_fresh = [&] {
+		std::memset(reinterpret_cast<void*>(mapping), 0xcc, allocation_size);
+	};
+	const auto pad_to = [](Xbyak::CodeGenerator& code, uint32_t offset) {
+		while (code.getSize() < offset) {
+			code.db(0xcc);
+		}
+	};
+	// The tail-call target is a separate function: store YMM1 and return to the caller.
+	const auto emit_second_function = [&](Xbyak::CodeGenerator& code, Xbyak::Label* label) {
+		pad_to(code, second_function);
+		if (label != nullptr) {
+			code.L(*label);
+		}
+		code.vmovups(code.ptr[code.rsi], Xbyak::Ymm(1));
+		code.vzeroupper();
+		code.ret();
+	};
+	const auto entry = [](uint32_t target) {
+		return static_cast<uint32_t>(static_cast<int32_t>(target) -
+		                             static_cast<int32_t>(table_offset));
+	};
+
+	{ // JMP [rip+cell]: loads one code pointer, no index register.
+		start_fresh();
+		Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+		Xbyak::Label         cell;
+		code.vmovups(Xbyak::Ymm(1), code.ptr[code.rdi]);
+		code.vrsqrtps(Xbyak::Xmm(1), Xbyak::Xmm(1));
+		code.jmp(code.ptr[code.rip + cell]);
+		emit_second_function(code, nullptr);
+		pad_to(code, 0x800);
+		code.L(cell);
+		code.dq(mapping + second_function);
+		run_case("tail jmp [rip+cell]", code, 0x800, {true, {}}, {{0, 0}});
+	}
+	{ // JMP [rax+8]: a vtable tail call.
+		start_fresh();
+		Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+		Xbyak::Label         cell;
+		code.vmovups(Xbyak::Ymm(1), code.ptr[code.rdi]);
+		code.vrsqrtps(Xbyak::Xmm(1), Xbyak::Xmm(1));
+		code.lea(code.rax, code.ptr[code.rip + cell]);
+		code.jmp(code.ptr[code.rax + 8]);
+		emit_second_function(code, nullptr);
+		pad_to(code, 0x800);
+		code.L(cell);
+		code.dq(0);
+		code.dq(mapping + second_function);
+		run_case("tail jmp [rax+8]", code, 0x800, {true, {}}, {{0, 0}});
+	}
+	{ // JMP reg after POP RBP: the frame is gone, so the target is another function.
+		start_fresh();
+		Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+		Xbyak::Label         target;
+		code.push(code.rbp);
+		code.mov(code.rbp, code.rsp);
+		code.vmovups(Xbyak::Ymm(1), code.ptr[code.rdi]);
+		code.vrsqrtps(Xbyak::Xmm(1), Xbyak::Xmm(1));
+		code.lea(code.rax, code.ptr[code.rip + target]);
+		code.pop(code.rbp);
+		code.jmp(code.rax);
+		emit_second_function(code, &target);
+		run_case("tail pop rbp; jmp rax", code, 0x800, {true, {}}, {{0, 0}});
+	}
+	{ // A branch into the jump after POP RBP: not provably a tail call.
+		start_fresh();
+		Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+		Xbyak::Label         target;
+		Xbyak::Label         join;
+		code.push(code.rbp);
+		code.mov(code.rbp, code.rsp);
+		code.vmovups(Xbyak::Ymm(1), code.ptr[code.rdi]);
+		code.vrsqrtps(Xbyak::Xmm(1), Xbyak::Xmm(1));
+		code.lea(code.rax, code.ptr[code.rip + target]);
+		code.test(code.edx, code.edx);
+		code.jnz(join);
+		code.pop(code.rbp);
+		code.L(join);
+		code.jmp(code.rax);
+		emit_second_function(code, &target);
+		run_case("jmp rax, branch target", code, 0x800,
+		         {false, PatchRejection::IndirectBranchFunction}, {{0, 0}});
+	}
+	{ // Indexed JMP [rcx+rdx*8]: an absolute jump table can land inside the function.
+		start_fresh();
+		Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+		Xbyak::Label         table;
+		code.vmovups(Xbyak::Ymm(1), code.ptr[code.rdi]);
+		code.vrsqrtps(Xbyak::Xmm(1), Xbyak::Xmm(1));
+		code.lea(code.rcx, code.ptr[code.rip + table]);
+		code.jmp(code.ptr[code.rcx + code.rdx * 8]);
+		const uint32_t path = code.getSize();
+		code.mov(code.dword[code.rsi + 64], 11);
+		code.vmovups(code.ptr[code.rsi], Xbyak::Ymm(1));
+		code.vzeroupper();
+		code.ret();
+		emit_second_function(code, nullptr);
+		pad_to(code, 0x800);
+		code.L(table);
+		code.dq(mapping + path);
+		run_case("indexed jmp [rcx+rdx*8]", code, 0x800,
+		         {false, PatchRejection::IndirectBranchFunction}, {{0, 11}});
+	}
+
+	// Bounded relative jump tables (movsxd/add/jmp) sit in read-only data after the code, outside
+	// the executable segment but inside the module.
+	enum class TableForm { IndexCopy, SelfCopyWithGap, ForeignTarget };
+	const auto jump_table_case = [&](const char* name, TableForm form) {
+		start_fresh();
+		Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+		Xbyak::Label         table;
+		Xbyak::Label         fallback;
+		Xbyak::Label         done;
+		code.vmovups(Xbyak::Ymm(1), code.ptr[code.rdi]);
+		code.vrsqrtps(Xbyak::Xmm(1), Xbyak::Xmm(1));
+		code.cmp(code.edx, 1);
+		code.ja(fallback);
+		if (form == TableForm::SelfCopyWithGap) {
+			code.mov(code.edx, code.edx); // Zero-extends the tested index.
+			code.lea(code.rcx, code.ptr[code.rip + table]);
+			code.movsxd(code.rax, code.dword[code.rcx + code.rdx * 4]);
+			code.mov(code.r8d, 7); // Unrelated work scheduled between the load and the add.
+		} else {
+			code.mov(code.eax, code.edx); // The load indexes a copy of the tested register.
+			code.lea(code.rcx, code.ptr[code.rip + table]);
+			code.movsxd(code.rax, code.dword[code.rcx + code.rax * 4]);
+		}
+		code.add(code.rax, code.rcx);
+		code.jmp(code.rax);
+		const uint32_t path0 = code.getSize();
+		code.mov(code.dword[code.rsi + 64], 11);
+		code.jmp(done);
+		const uint32_t path1 = code.getSize();
+		code.mov(code.dword[code.rsi + 64], 22);
+		code.jmp(done);
+		code.L(fallback);
+		code.mov(code.dword[code.rsi + 64], 99);
+		code.L(done);
+		code.vmovups(code.ptr[code.rsi], Xbyak::Ymm(1));
+		code.vzeroupper();
+		code.ret();
+		emit_second_function(code, nullptr);
+		pad_to(code, table_offset);
+		code.L(table);
+		code.dd(entry(path0));
+		code.dd(entry(form == TableForm::ForeignTarget ? second_function : path1));
+		if (form == TableForm::ForeignTarget) {
+			// The second entry leaves the function, so the table is not trusted.
+			run_case(name, code, second_function, {false, PatchRejection::IndirectBranchFunction},
+			         {{0, 11}});
+		} else {
+			run_case(name, code, second_function, {true, {}}, {{0, 11}, {1, 22}, {5, 99}});
+		}
+	};
+	jump_table_case("jump table, index copy", TableForm::IndexCopy);
+	jump_table_case("jump table, self copy+gap", TableForm::SelfCopyWithGap);
+	jump_table_case("jump table, foreign target", TableForm::ForeignTarget);
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestPackedBitFieldExtract() {
 	TestPackedBitField(false);
 }
@@ -4371,6 +4613,7 @@ int main(int argc, char** argv) {
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
 		RunTest(TestPackedReciprocalSquareRoot);
+		RunTest(TestPackedReciprocalSquareRootIndirectBranches);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
@@ -4394,6 +4637,7 @@ int main(int argc, char** argv) {
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPackedReciprocalSquareRoot);
+	RunTest(TestPackedReciprocalSquareRootIndirectBranches);
 	RunTest(TestPackedBitFieldExtract);
 	RunTest(TestCpuExtensionContexts);
 	RunTest(TestPackedBitFieldInsert);

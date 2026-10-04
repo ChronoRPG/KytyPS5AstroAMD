@@ -2135,6 +2135,19 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				if (!details.empty()) details += "; ";
 				details += fmt::format("{}: native={}, trapped={}, skipped={}", name, counts.native,
 				                       counts.trapped, counts.Skipped());
+				// Why sites have no native trampoline (the reasons add up to trapped + skipped, less
+				// INSERTQ/RDPID, which trap by design).
+				std::string reasons;
+				for (size_t i = 0; i < PatchRejectionCount; ++i) {
+					if (counts.rejected[i] != 0) {
+						reasons += fmt::format("{}{}={}", reasons.empty() ? "" : ", ",
+						                       PatchRejectionName(static_cast<PatchRejection>(i)),
+						                       counts.rejected[i]);
+					}
+				}
+				if (!reasons.empty()) {
+					details += fmt::format(" [no native: {}]", reasons);
+				}
 			}
 			const auto  found   = combined.found;
 			const auto  skipped = combined.Skipped();

@@ -19,10 +19,36 @@ struct GuestInstructionHostFeatures {
 
 GuestInstructionHostFeatures GetGuestInstructionHostFeatures();
 
+// Why a found instruction has no native trampoline (it traps, or is left unpatched).
+enum class PatchRejection : uint8_t {
+	SpanBranchTarget,       // a neighbour needed for the 5-byte jump is a branch target
+	SpanTerminator,         // a jump, ret or similar ends the span before 5 bytes
+	SpanUndecoded,          // a neighbour is outside the decoded function (padding, data)
+	IndirectBranchFunction, // unresolved indirect jump: neighbours cannot be relocated safely
+	EncodeFailed,           // a relocated neighbour could not be re-encoded
+	TrampolineExhausted,    // trampoline space ran out; the site traps inside its trampoline
+	NoRelaySlot,            // short-jump relay: no host or relay slot within 127 bytes
+	Count
+};
+constexpr size_t PatchRejectionCount = static_cast<size_t>(PatchRejection::Count);
+inline const char* PatchRejectionName(PatchRejection reason) {
+	switch (reason) {
+		case PatchRejection::SpanBranchTarget: return "branch-target";
+		case PatchRejection::SpanTerminator: return "terminator";
+		case PatchRejection::SpanUndecoded: return "undecoded";
+		case PatchRejection::IndirectBranchFunction: return "indirect-branch";
+		case PatchRejection::EncodeFailed: return "encode-failed";
+		case PatchRejection::TrampolineExhausted: return "trampoline-full";
+		case PatchRejection::NoRelaySlot: return "no-relay";
+		default: return "?";
+	}
+}
+
 struct InstructionPatchCounts {
 	uint64_t found   = 0;
 	uint64_t native  = 0;
 	uint64_t trapped = 0;
+	uint64_t rejected[PatchRejectionCount] {};
 
 	uint64_t Skipped() const { return found - native - trapped; }
 
@@ -30,6 +56,9 @@ struct InstructionPatchCounts {
 		found += other.found;
 		native += other.native;
 		trapped += other.trapped;
+		for (size_t i = 0; i < PatchRejectionCount; ++i) {
+			rejected[i] += other.rejected[i];
+		}
 		return *this;
 	}
 };
