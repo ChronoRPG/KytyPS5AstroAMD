@@ -872,6 +872,11 @@ add_executable(ampr_counter_bank_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(ampr_counter_bank_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+add_executable(occlusion_reset_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/OcclusionResetTests.cpp")
+target_include_directories(occlusion_reset_tests PRIVATE ${inc_headers})
+target_link_libraries(occlusion_reset_tests common)
+add_test(NAME occlusion_reset COMMAND $<TARGET_FILE:occlusion_reset_tests>)
+
 # Pure helpers of the texture/descriptor binding path; no Vulkan device is created.
 add_executable(binding_path_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BindingPathTests.cpp"

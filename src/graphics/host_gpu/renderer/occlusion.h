@@ -2,6 +2,7 @@
 #define KYTY_RENDERER_OCCLUSION_H_
 
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/occlusionReset.h"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -126,6 +127,7 @@ private:
 	std::unique_ptr<Buffer> m_result;
 	std::unique_ptr<Buffer> m_publish;
 	uint32_t m_slot_count = DefaultPublishSlots;
+	OcclusionResetWindow m_reset_window;
 	std::vector<uint64_t> m_slot_ticks;
 	// KYTY_OCCLUSION_BATCH: the batch reduction pipeline, the per-slot prefix table and the dumps
 	// recorded since the last batch (consecutive slots from m_batch_first_slot).

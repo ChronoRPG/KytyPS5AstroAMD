@@ -2,6 +2,7 @@
 #include "common/hangTrace.h"
 #include "common/alignment.h"
 #include "common/profiler.h"
+#include "common/liveSwitch.h"
 #include "gpu_dcc_shaders/gpu_dcc_occlusion_batch_spv.h"
 #include "gpu_dcc_shaders/gpu_dcc_occlusion_spv.h"
 #include "graphics/host_gpu/coherenceLog.h"
@@ -17,6 +18,11 @@
 #include <cstring>
 
 namespace Libs::Graphics {
+namespace {
+// Reset a bounded unused query prefix at once. Each query still begins and ends at exactly the
+// old points, and every copy/reduction/publication is unchanged. Safe to switch per preparation.
+Live::Switch g_reset_batch("KYTY_OCCLUSION_RESET_BATCH", Live::ParseDefaultOff);
+}
 bool OcclusionCounter::Enabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_GPU_OCCLUSION");
@@ -305,6 +311,7 @@ void OcclusionCounter::FlushBatch() {
 	                     1, &barrier, 0, nullptr, 0, nullptr);
 	EXIT_IF(scheduler.CurrentTick() != tick);
 	m_pending     = 0;
+	m_reset_window.Reduced();
 	m_verified    = 0;
 	m_batch_count = 0;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionReductions);
@@ -378,7 +385,10 @@ void OcclusionCounter::Prepare(uint32_t control) {
 		return;
 	}
 	Initialize();
-	m_context.GetCommandScheduler().Current().Sink().resetQueryPool(m_pool, m_pending, 1);
+	const auto reset = m_reset_window.Prepare(m_pending, QueryCapacity, g_reset_batch.On() ? 64u : 1u);
+	if (reset.count != 0) {
+		m_context.GetCommandScheduler().Current().Sink().resetQueryPool(m_pool, reset.first, reset.count);
+	}
 	m_prepared = true;
 }
 
@@ -419,6 +429,7 @@ void OcclusionCounter::FlushPending() {
 	                            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
 	Dispatch(0, m_counter->Handle(), 0, m_counter->Size());
 	m_pending = 0;
+	m_reset_window.Reduced();
 	Profiler::CountFrameEvent(Profiler::FrameEvent::NativeOcclusionReductions);
 }
 
