@@ -4,7 +4,15 @@ This release builds on the U59 renderer and the Demon's Souls changes of the pre
 
 ## New in this update
 
-This update is about compatibility: the freeze on RTX 50 PCs, AMD and Intel GPUs and CPUs, and older drivers.
+- Adaptive triggers: the game now sees the state of the trigger effects it sets (`scePadGetTriggerEffectState`
+  always answered 0 before). Astro Bot levels in which L2/R2 actions, such as punches, did nothing now work. The
+  state follows from the game's effect and how far the trigger is pressed, so it also works with other pads and the
+  keyboard (a keyboard L2/R2 counts as fully pressed). Everything else is unchanged from int9; program caches built
+  by int9 stay valid.
+- Confirmed by players: int9 fixed the freeze on an RTX 5090 PC (Sky Garden at 38 fps).
+
+From int9 (`u59-windows-20261004-int9`), about compatibility: the freeze on RTX 50 PCs, AMD and Intel GPUs and
+CPUs, and older drivers.
 
 - A fix for the freeze on NVIDIA RTX 50 PCs. A hang watchdog report from an RTX 5070 Ti showed the cause: the GPU
   waited for a texture copy that a CPU thread was about to finish, and that thread's copy-done signal and the frame
