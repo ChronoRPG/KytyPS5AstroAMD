@@ -1,7 +1,13 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_DEVICECOMPAT_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_DEVICECOMPAT_H_
 
+#include <array>
 #include <cstdint>
+
+#ifndef VK_NO_PROTOTYPES
+#define VK_NO_PROTOTYPES // as in vulkanCommon.h
+#endif
+#include <vulkan/vulkan_core.h>
 
 // Choices that let the emulator run on devices without every optional Vulkan feature it uses (AMD,
 // Intel, older NVIDIA): pure functions of what the device reports, tested without a device
@@ -35,6 +41,76 @@ struct SubgroupSizeControl {
 		return 0u;
 	}
 	return size;
+}
+
+[[nodiscard]] constexpr bool IsBlockCompressedFormat(VkFormat format) noexcept {
+	return format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && format <= VK_FORMAT_BC7_SRGB_BLOCK;
+}
+
+// Whether the format itself (optimal tiling) supports every usage in `usage`. Usages without a
+// matching format feature (e.g. the attachment feedback loop) count as unsupported.
+[[nodiscard]] constexpr bool FormatSupportsUsage(VkFormatFeatureFlags features,
+                                                 VkImageUsageFlags    usage) noexcept {
+	constexpr std::array<std::array<uint32_t, 2>, 6> pairs {{
+	    {VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_FORMAT_FEATURE_TRANSFER_SRC_BIT},
+	    {VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_FORMAT_FEATURE_TRANSFER_DST_BIT},
+	    {VK_IMAGE_USAGE_SAMPLED_BIT, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT},
+	    {VK_IMAGE_USAGE_STORAGE_BIT, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT},
+	    {VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT},
+	    {VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+	     VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT},
+	}};
+	VkImageUsageFlags                                supported = 0;
+	for (const auto& [usage_bit, feature_bit]: pairs) {
+		if ((features & feature_bit) != 0) {
+			supported |= usage_bit;
+		}
+	}
+	return (usage & ~supported) == 0;
+}
+
+struct ImageCreateCandidate {
+	VkImageUsageFlags  usage = 0;
+	VkImageCreateFlags flags = 0;
+};
+
+struct ImageCreateCandidates {
+	std::array<ImageCreateCandidate, 4> list {};
+	uint32_t                            count = 0;
+};
+
+// For an image the device refuses: the image's usage and flags (the first candidate), then the
+// same without what no role of the image needs on this device, dropped in turn (each candidate
+// keeps the previous drops), until the device accepts one:
+//  1. storage, when the format itself has no storage support: the usage only serves storage views
+//     of another format (through EXTENDED_USAGE). The emulator's own storage writers (direct tiler
+//     uploads, DCC clears, blits) check the image's usage first; a guest storage binding of such an
+//     image stops with a message (Image::FindView);
+//  2. BLOCK_TEXEL_VIEW_COMPATIBLE, once there is no storage usage: uncompressed views of a
+//     block-compressed image serve its storage uploads; a guest binding of one stops likewise;
+//  3. EXTENDED_USAGE, once the format itself supports every remaining usage (the flag only allows
+//     usages it does not).
+// Every usage a binding needs, and MUTABLE_FORMAT (views in other formats), stay.
+[[nodiscard]] constexpr ImageCreateCandidates
+OptionalImageCreateFallbacks(VkImageUsageFlags usage, VkImageCreateFlags flags,
+                             VkFormatFeatureFlags features) noexcept {
+	ImageCreateCandidates result;
+	result.list[result.count++] = {usage, flags};
+	if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0 &&
+	    (features & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) == 0) {
+		usage &= ~static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_STORAGE_BIT);
+		result.list[result.count++] = {usage, flags};
+	}
+	if ((flags & VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT) != 0 &&
+	    (usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0) {
+		flags &= ~static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT);
+		result.list[result.count++] = {usage, flags};
+	}
+	if ((flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) != 0 && FormatSupportsUsage(features, usage)) {
+		flags &= ~static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
+		result.list[result.count++] = {usage, flags};
+	}
+	return result;
 }
 
 } // namespace Libs::Graphics::DeviceCompat
