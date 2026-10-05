@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCompileQueue.h"
 #include "graphics/host_gpu/renderer/pipeline/programDiskCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 #include "graphics/host_gpu/renderer/pipeline/stagePrepWorker.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderCodeSnapshot.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -264,6 +265,8 @@ struct CompileTotals {
 	std::atomic<uint64_t> disk_load_ns {0};
 	std::atomic<uint64_t> disk_verify_checks {0};
 	std::atomic<uint64_t> disk_verify_mismatches {0};
+	// Permutations published by the shader precompile replay (KYTY_SHADER_PRECOMPILE).
+	std::atomic<uint64_t> replayed {0};
 };
 CompileTotals g_compile_totals;
 
@@ -1321,6 +1324,8 @@ struct PipelineCache::ProgramCache {
 		ProgramKey           second_key;
 		std::vector<uint8_t> validation;
 		std::array<LookupMemo, LookupMemoStages> memos;
+		// CompileAndPublish sets it when it published a new permutation (the caller clears it).
+		bool                 published_new = false;
 	};
 
 	static bool LookupMemoEnabled() {
@@ -2257,17 +2262,21 @@ struct PipelineCache::ProgramCache {
 	                                     ShaderRecompiler::IR::EvaluationScratch& evaluation,
 	                                     ProgramScratch& scratch, StagePrep& prep,
 	                                     ShaderReadAttempt& read_attempt, bool prep_materialized,
-	                                     bool speculative = false) {
+	                                     bool speculative = false, bool replay = false) {
 		// Cache hits returned before this. This covers translation through native shader-module
 		// creation; readiness failures can retry, so count successful creations separately.
-		Profiler::ScopedFrameWait shader_miss(Profiler::FrameWait::ShaderProgramMiss);
+		// A precompile replay (ReplayEntry) runs on a background thread with `prep` already
+		// holding the permutation's stored specialization: nothing is read from guest memory, no
+		// draw waits for it, and the journal already has it.
+		std::optional<Profiler::ScopedFrameWait> shader_miss;
+		if (!replay) shader_miss.emplace(Profiler::FrameWait::ShaderProgramMiss);
 		// Everything from here on, lock and in-flight waits included, is compile time of the
 		// waiting draw.
 		struct StallScope {
 			uint64_t begin = CompileClockNs();
 			bool account;
 			~StallScope() { if (account) AddCompileStall(CompileClockNs() - begin); }
-		} stall {.account = !speculative};
+		} stall {.account = !speculative && !replay};
 		std::vector<uint32_t> owned_code;
 		auto translation_code = params.code;
 		if (speculative) {
@@ -2284,7 +2293,9 @@ struct PipelineCache::ProgramCache {
 			translation_code = owned_code;
 		}
 		const auto publish_index = [&](const SourceEntry& source, const Permutation& permutation) {
-			if (ResourceReuseEnabled()) source.reuse.current.permutation_index = permutation.index;
+			if (ResourceReuseEnabled() && !replay) {
+				source.reuse.current.permutation_index = permutation.index;
+			}
 			return &permutation;
 		};
 		// Declared before `lock`, so destroyed after it is released on every return.
@@ -2504,7 +2515,7 @@ struct PipelineCache::ProgramCache {
 				dropped.clear();
 				g_compile_totals.disk_source_hits.fetch_add(1, std::memory_order_relaxed);
 				const bool materialized =
-				    Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
+				    replay || Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
 				lock.lock();
 				if (!materialized) {
 					FinishInFlight(record);
@@ -2549,7 +2560,7 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 			const bool materialized =
-			    Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
+			    replay || Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
 			lock.lock();
 			if (!materialized) {
 				FinishInFlight(record);
@@ -2688,8 +2699,9 @@ struct PipelineCache::ProgramCache {
 			Profiler::CountFrameEvent(Profiler::FrameEvent::TranslationReuses);
 		}
 		times.from_disk   = from_disk;
-		const auto detail = fmt::format("{}{}{}{}", reason, times.reused ? "+reused" : "",
-		                                from_disk ? "+disk" : "", speculative ? "+prefetch" : "");
+		const auto detail = fmt::format("{}{}{}{}{}", reason, times.reused ? "+reused" : "",
+		                                from_disk ? "+disk" : "", speculative ? "+prefetch" : "",
+		                                replay ? "+replay" : "");
 		if (speculative) speculative_programs.fetch_add(1, std::memory_order_relaxed);
 		RecordProgramCompile(ProgramStageName(stage), params.hash, permutation.handle.id, times,
 		                     CompileClockNs() - stall.begin, detail);
@@ -2724,6 +2736,7 @@ struct PipelineCache::ProgramCache {
 			check.stored_spirv_plain = reloaded->spirv_plain;
 			SubmitBackgroundCheck(std::move(check));
 		}
+		scratch.published_new = true;
 		if (store) {
 			// The published permutation is immutable; its metadata is encoded from it.
 			std::vector<uint8_t> info;
@@ -2731,7 +2744,149 @@ struct PipelineCache::ProgramCache {
 			disk->AddPermutation(disk_key.digest, push_data_cursor, specialization_bytes, info,
 			                     words.spirv, words.spirv_plain);
 		}
+		if (journal != nullptr && !replay) {
+			JournalPermutation(params, translation_code, key, options, input_info,
+			                   push_data_cursor, permutation.specialization, specialization_bytes,
+			                   code_words);
+		}
 		return publish_index(*source, permutation);
+	}
+
+	// Shader precompile (shaderPrecompile.h; KYTY_SHADER_PRECOMPILE): null when off.
+	ShaderJournal* journal = nullptr;
+
+	template <typename InputInfo>
+	static constexpr ShaderJournal::Kind JournalKind() {
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			return ShaderJournal::Kind::Vertex;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			return ShaderJournal::Kind::Pixel;
+		} else {
+			return ShaderJournal::Kind::Compute;
+		}
+	}
+
+	// Journals a published permutation's inputs. Only programs whose guest hash is the content
+	// hash of their code are journaled (every headerless shader: Astro Bot's all), so that a
+	// replayed source can only stand for the code it names; merged-stage back halves are not.
+	// `specialization_bytes` and `code_words` are filled when the persistent program cache already
+	// encoded and copied them. Cost: once per new permutation, on its compile.
+	template <typename InputInfo>
+	void JournalPermutation(const ShaderParams& params, std::span<const uint32_t> code,
+	                        const ProgramKey& key, const ShaderRecompiler::CompileOptions& options,
+	                        const InputInfo& input_info, uint32_t push_data_cursor,
+	                        const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                        std::vector<uint8_t>& specialization_bytes,
+	                        const std::vector<uint32_t>& code_words) {
+		static_assert(std::is_trivially_copyable_v<InputInfo>);
+		if (!params.back_code.empty() || code.empty() || key.code_size != code.size()) return;
+		ShaderJournal::Source source;
+		source.stage                   = static_cast<uint32_t>(key.stage);
+		source.kind                    = JournalKind<InputInfo>();
+		source.hash                    = key.hash;
+		source.user_data_count         = key.user_data_count;
+		source.code_size               = key.code_size;
+		source.wave_size               = options.wave_size;
+		source.user_data_base          = options.user_data_base;
+		source.plain_mip_stats_variant = options.plain_mip_stats_variant;
+		source.static_state            = key.static_state;
+		if (!journal->HasSource(source)) {
+			if (!code_words.empty()) {
+				source.code = code_words;
+			} else {
+				source.code.resize(code.size());
+				if (!LibKernel::Memory::TryReadGpuCleanBacking(reinterpret_cast<uint64_t>(code.data()),
+				                                               source.code.data(), code.size_bytes())) {
+					std::memcpy(source.code.data(), code.data(), code.size_bytes());
+				}
+			}
+			if (XXH3_64bits(source.code.data(), source.code.size() * sizeof(uint32_t)) != key.hash) {
+				return;
+			}
+			InputInfo copy = input_info;
+			copy.stage     = {};
+			source.input_info.assign(reinterpret_cast<const uint8_t*>(&copy),
+			                         reinterpret_cast<const uint8_t*>(&copy) + sizeof(copy));
+		}
+		if (specialization_bytes.empty()) {
+			ShaderRecompiler::IR::EncodeSpecialization(specialization, specialization_bytes);
+		}
+		journal->Record(std::move(source), push_data_cursor, specialization_bytes);
+	}
+
+	template <typename InputInfo>
+	ShaderPrecompiler::Outcome ReplayWith(InputInfo& input_info, ShaderParams& params,
+	                                      const ShaderJournal::Source& source,
+	                                      const ShaderJournal::Entry& entry,
+	                                      ShaderRecompiler::IR::ResourceSpecialization specialization) {
+		using Outcome = ShaderPrecompiler::Outcome;
+		if (source.input_info.size() != sizeof(InputInfo)) return Outcome::Skipped;
+		std::memcpy(static_cast<void*>(&input_info), source.input_info.data(), sizeof(InputInfo));
+		input_info.stage = {};
+		auto& scratch = ThreadScratch();
+		ProgramKey key;
+		BuildKey(params, input_info, key);
+		// The journal's key must be what this build derives from the stored input info.
+		if (key.stage != static_cast<ShaderType>(source.stage) || key.static_state != source.static_state ||
+		    key.code_size != source.code_size) {
+			return Outcome::Skipped;
+		}
+		if (const auto* existing = FindSource(key)) {
+			if (existing->skip_dispatch.load(std::memory_order_relaxed)) return Outcome::Skipped;
+			if (FindPermutation(*existing, specialization, entry.push_data_cursor)) {
+				return Outcome::Present;
+			}
+		}
+		StagePrep prep;
+		prep.specialization = std::move(specialization);
+		const ShaderRecompiler::IR::SrtRuntime runtime {
+		    .user_data   = std::span(params.user_data).first(params.user_data_count),
+		    .shader_base = params.Base(),
+		};
+		ShaderReadAttempt attempt;
+		scratch.published_new = false;
+		CompileAndPublish(params, input_info, entry.push_data_cursor, key, runtime,
+		                  ShaderRecompiler::IR::ThreadEvaluationScratch(), scratch, prep, attempt, true,
+		                  false, true);
+		if (!scratch.published_new) return Outcome::Skipped;
+		g_compile_totals.replayed.fetch_add(1, std::memory_order_relaxed);
+		return Outcome::Compiled;
+	}
+
+	// One journal entry compiled and published as the draw that first needed it would have: the
+	// same CompileAndPublish (disk cache, translation reuse, in-flight sharing with the command
+	// processor's own compiles), from the stored specialization instead of guest memory.
+	ShaderPrecompiler::Outcome ReplayEntry(const ShaderJournal::Source& source,
+	                                       const ShaderJournal::Entry&  entry) {
+		using Outcome = ShaderPrecompiler::Outcome;
+		ShaderParams params;
+		if (source.code.empty() || source.code.size() != source.code_size ||
+		    source.user_data_count > params.user_data.size() ||
+		    XXH3_64bits(source.code.data(), source.code.size() * sizeof(uint32_t)) != source.hash) {
+			return Outcome::Skipped;
+		}
+		params.code            = source.code;
+		params.user_data_count = source.user_data_count;
+		params.hash            = source.hash;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		if (!ShaderRecompiler::IR::DecodeSpecialization(entry.specialization, specialization)) {
+			return Outcome::Skipped;
+		}
+		switch (source.kind) {
+			case ShaderJournal::Kind::Vertex: {
+				auto info = std::make_unique<ShaderVertexInputInfo>();
+				return ReplayWith(*info, params, source, entry, std::move(specialization));
+			}
+			case ShaderJournal::Kind::Pixel: {
+				auto info = std::make_unique<ShaderPixelInputInfo>();
+				return ReplayWith(*info, params, source, entry, std::move(specialization));
+			}
+			case ShaderJournal::Kind::Compute: {
+				auto info = std::make_unique<ShaderComputeInputInfo>();
+				return ReplayWith(*info, params, source, entry, std::move(specialization));
+			}
+		}
+		return Outcome::Skipped;
 	}
 
 	// Per-stage totals of compiled permutations (equal to the sum of every source's
@@ -3410,6 +3565,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		m_saver = std::make_unique<DriverCacheSaver>(*this);
 	}
 	InitializeProgramDiskCache();
+	InitializeShaderPrecompile();
 	if (GraphicsPipelineLibrary::Enabled(m_graphics)) {
 		m_library = std::make_unique<LibraryState>(*this);
 		PipelineCacheLog("Graphics pipeline libraries: enabled (fast link, {})",
@@ -3431,6 +3587,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 }
 
 PipelineCache::~PipelineCache() {
+	StopShaderPrecompile();
 	m_program_cache->StopBackgroundChecks();
 	if (m_prefetch != nullptr) m_prefetch->Stop();
 	LogCompileTotals();
@@ -3774,6 +3931,7 @@ uint64_t PipelineCache::WriteDriverCache(bool periodic) {
 }
 
 void PipelineCache::Save() {
+	StopShaderPrecompile();
 	if (m_prefetch != nullptr) m_prefetch->Stop();
 	if (m_program_disk != nullptr) {
 		// Pending background checks are dropped; a check never outlives the disk cache.
@@ -3806,6 +3964,89 @@ void PipelineCache::WaitProgramChecks() {
 	m_program_cache->WaitBackgroundChecks();
 }
 
+void PipelineCache::WaitShaderPrecompile() {
+	if (m_shader_precompiler != nullptr) m_shader_precompiler->Wait();
+	if (m_shader_journal != nullptr) m_shader_journal->Flush();
+}
+
+// KYTY_SHADER_PRECOMPILE=1 (default off): journals the inputs of every program permutation this
+// run compiles (shaderPrecompile.h) and replays the ones an earlier run journaled on background
+// threads from start-up, so the game finds them published. KYTY_SHADER_PRECOMPILE_PATH names
+// another journal file (tests; the default is _PipelineCache/<title>.shaders.journal),
+// KYTY_SHADER_PRECOMPILE_REPLAY=0 only records, KYTY_SHADER_PRECOMPILE_THREADS (default 2, 1..8)
+// sets the replay threads, KYTY_SHADER_PRECOMPILE_MAX (default 30000, 0 = all) the entries
+// replayed, KYTY_SHADER_PRECOMPILE_WAIT=1 makes start-up wait for the replay to finish. KYTY_RESOURCE_REUSE=1 keeps it off (that mode serializes preparation on a mutex the
+// replay does not take).
+void PipelineCache::InitializeShaderPrecompile() {
+	if (EnvU64("KYTY_SHADER_PRECOMPILE", 0) == 0) {
+		return;
+	}
+	if (ResourceReuseEnabled()) {
+		PipelineCacheLog("Shader precompile: off (KYTY_RESOURCE_REUSE=1)");
+		return;
+	}
+	std::filesystem::path path;
+	if (const auto* custom = std::getenv("KYTY_SHADER_PRECOMPILE_PATH");
+	    custom != nullptr && *custom != '\0') {
+		path = std::filesystem::path(custom);
+	} else {
+		const auto title_id = PipelineCacheTitleId();
+		if (title_id.empty()) {
+			return;
+		}
+		path = std::filesystem::path("_PipelineCache") / (title_id + ".shaders.journal");
+	}
+	// The identity holds what the stored inputs depend on besides the game: the device (subgroup
+	// and mesh limits are part of the stage input infos) and the sizes of the input structs. The
+	// translator is not part of it: the journal holds inputs, not outputs.
+	const auto& properties = m_graphics.GetPhysicalDeviceProperties();
+	const auto  identity   = fmt::format(
+        "kyty shader journal; device {:08x}:{:08x}; input infos {} {} {}", properties.vendorID,
+        properties.deviceID, sizeof(ShaderVertexInputInfo), sizeof(ShaderPixelInputInfo),
+        sizeof(ShaderComputeInputInfo));
+	ShaderJournal::Settings settings;
+	settings.path     = path;
+	settings.identity = std::vector<uint8_t>(identity.begin(), identity.end());
+	settings.log      = [](const std::string& message) { PipelineCacheLog("{}", message); };
+	m_shader_journal  = std::make_unique<ShaderJournal>(std::move(settings));
+	m_program_cache->journal = m_shader_journal.get();
+	const auto stats = m_shader_journal->GetStats();
+	PipelineCacheLog("Shader precompile: journal {}: {} sources, {} permutations loaded ({:.0f} ms{}{})",
+	                 Common::PathToString(path), m_shader_journal->Sources().size(),
+	                 m_shader_journal->Entries().size(), static_cast<double>(stats.load_ns) / 1.0e6,
+	                 stats.damaged_bytes != 0 ? "; damaged tail ignored" : "",
+	                 stats.header_rejected ? "; another device or format, replaced" : "");
+	if (EnvU64("KYTY_SHADER_PRECOMPILE_REPLAY", 1) == 0 || m_shader_journal->Entries().empty()) {
+		return;
+	}
+	ShaderPrecompiler::Settings replay;
+	replay.threads     = static_cast<uint32_t>(std::clamp<uint64_t>(EnvU64("KYTY_SHADER_PRECOMPILE_THREADS", 2), 1, 8));
+	replay.max_entries = EnvU64("KYTY_SHADER_PRECOMPILE_MAX", 30000);
+	replay.thread_init = [](uint32_t) { Profiler::SetThreadName("ShaderPrecompile"); };
+	replay.log         = [](const std::string& message) { PipelineCacheLog("{}", message); };
+	replay.on_finished = [this] { m_shader_journal->ReleaseLoaded(); };
+	m_shader_precompiler = std::make_unique<ShaderPrecompiler>(
+	    *m_shader_journal, std::move(replay),
+	    [this](const ShaderJournal::Source& source, const ShaderJournal::Entry& entry) {
+		    return m_program_cache->ReplayEntry(source, entry);
+	    });
+	if (EnvU64("KYTY_SHADER_PRECOMPILE_WAIT", 0) != 0) {
+		// Start-up waits for the replay (the best case of precompiling: tests, measurements).
+		m_shader_precompiler->Wait();
+	}
+}
+
+// Stops the replay (entries in progress finish) and drops the loaded journal content; the journal
+// keeps recording until the cache goes.
+void PipelineCache::StopShaderPrecompile() {
+	if (m_shader_precompiler != nullptr) {
+		m_shader_precompiler->Stop();
+		m_shader_precompiler.reset(); // joins the workers
+		if (m_shader_journal != nullptr) m_shader_journal->ReleaseLoaded();
+	}
+	if (m_shader_journal != nullptr) m_shader_journal->Flush();
+}
+
 PipelineCache::ProgramTotals PipelineCache::Totals() {
 	const auto& t = g_compile_totals;
 	return {.programs          = t.programs.load(std::memory_order_relaxed),
@@ -3813,7 +4054,8 @@ PipelineCache::ProgramTotals PipelineCache::Totals() {
 	        .source_hits       = t.disk_source_hits.load(std::memory_order_relaxed),
 	        .permutation_hits  = t.disk_permutation_hits.load(std::memory_order_relaxed),
 	        .verify_checks     = t.disk_verify_checks.load(std::memory_order_relaxed),
-	        .verify_mismatches = t.disk_verify_mismatches.load(std::memory_order_relaxed)};
+	        .verify_mismatches = t.disk_verify_mismatches.load(std::memory_order_relaxed),
+	        .replayed          = t.replayed.load(std::memory_order_relaxed)};
 }
 
 bool PipelineDynamicRasterStateEnabled() {
