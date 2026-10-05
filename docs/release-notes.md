@@ -5,6 +5,16 @@
 
 ## What's new
 
+- **Astro Bot without the "non RT patch" (int15 RT candidate):** the game's own tiled lighting, GI probes and ray
+  traced shadows now run, so the patch is no longer needed. Without it the title screen robots used to be black and
+  the lighting was missing, because the lighting shaders contain ray-tracing instructions and were skipped. Those
+  instructions now run in software on any GPU. To play without the patch, remove or disable both mods of
+  `_Patches\PPSA21567.json` (or `PPSA21564.json`). On the test PC (RTX 3090, Ryzen 9 7950X3D) the unpatched game ran
+  about 3-4% slower than the patched one in Sky Garden and at the Creamy Canyon (snow) start. The first launch after
+  an update builds the large lighting shaders, which can freeze the picture for up to about 20 seconds once.
+  Switches: `KYTY_RT_SOFTWARE=0 KYTY_RT_STUB=1` keeps the lighting but lets every ray miss (no ray-traced shadows);
+  `KYTY_RT_SOFTWARE=0` alone skips those shaders again (only useful with the patch on). The bundled preset's
+  `KYTY_SRT_VARIANT_READS=1` is required; without it the lighting shaders are skipped.
 - **Shader precompile:** the emulator remembers every shader it has built and rebuilds them in the background at the
   next launch, before the game needs them. Places you have already visited stutter much less on later visits: in
   Astro Bot's Sky Garden, 437 shaders were built during play on the first run and 8 on the second. The first launch
