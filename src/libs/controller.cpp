@@ -364,7 +364,7 @@ constexpr int TRIGGER_PRESSED_MIN = 8;
 
 int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int value) {
 	const int pos = std::clamp(value, 0, 255) * 10 / 256;
-	// A feedback trigger pushes against the finger only while it is pressed: an effect from
+	// A feedback trigger pushes, and a vibration trigger fires, only while it is pressed: an effect from
 	// position 0 on an untouched trigger is "no force" (Astro's Playroom waits for the change).
 	const bool pressed = value >= TRIGGER_PRESSED_MIN;
 	switch (command.mode) {
@@ -378,7 +378,7 @@ int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int value) {
 			return pos >= command.data[0] ? TRIGGER_STATE_WEAPON_ALMOST_PRESSED
 			                              : TRIGGER_STATE_WEAPON_NOT_PRESSED;
 		case 3: // vibration from position data[0], amplitude data[1], frequency data[2]
-			return command.data[1] != 0 && command.data[2] != 0 && pos >= command.data[0]
+			return pressed && command.data[1] != 0 && command.data[2] != 0 && pos >= command.data[0]
 			           ? TRIGGER_STATE_VIBRATION_IS_FIRING
 			           : TRIGGER_STATE_VIBRATION_NOT_FIRING;
 		case 4: // multiple-position feedback: strength per position
@@ -388,7 +388,7 @@ int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int value) {
 			return pressed && pos >= command.data[0] ? TRIGGER_STATE_FEEDBACK_IS_PUSHING
 			                              : TRIGGER_STATE_FEEDBACK_NO_FORCE;
 		case 6: // multiple-position vibration: frequency data[0], amplitude per position
-			return command.data[0] != 0 && command.data[1 + pos] != 0
+			return pressed && command.data[0] != 0 && command.data[1 + pos] != 0
 			           ? TRIGGER_STATE_VIBRATION_IS_FIRING
 			           : TRIGGER_STATE_VIBRATION_NOT_FIRING;
 		default: return 0;
