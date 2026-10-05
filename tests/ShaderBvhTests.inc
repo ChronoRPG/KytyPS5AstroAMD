@@ -1181,11 +1181,58 @@ void RunNodeBudget(VulkanHarness *vulkan) {
   }
 }
 
+// ----------------------------------------------------------------------------------------------
+// The traversal-loop shape (see TestTraversalLoopBreakRegion in shader_cfg_tests) runs correctly:
+// the outer loop counts s0 to 4 and then leaves through the break region, whose loop counts s1
+// to 3. Every lane stores s0 and s1.
+TestCase TraversalLoopBreakRegion(u32 wave_size) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave_size == 64u ? "TraversalLoopBreakRegionWave64" : "TraversalLoopBreakRegionWave32";
+  test.code = {
+      EncodeSMovB32(0, InlineU32(0)),           // s_mov_b32 s0, 0
+      EncodeSopc(0x0a, 0, InlineU32(4)),        // outer: s_cmp_lt_u32 s0, 4
+      EncodeSopp(0x05, 5),                      // s_cbranch_scc1 body
+      EncodeSMovB32(1, InlineU32(0)),           // s_mov_b32 s1, 0
+      EncodeSop2(0x00, 1, 1, InlineU32(1)),     // inner: s_add_u32 s1, s1, 1
+      EncodeSopc(0x0a, 1, InlineU32(3)),        // s_cmp_lt_u32 s1, 3
+      EncodeSopp(0x05, 0xfffdu),                // s_cbranch_scc1 inner
+      EncodeSopp(0x02, 4),                      // s_branch done
+      EncodeSop2(0x00, 0, 0, InlineU32(1)),     // body: s_add_u32 s0, s0, 1
+      EncodeSopc(0x06, 0, InlineU32(50)),       // s_cmp_eq_u32 s0, 50
+      EncodeSopp(0x05, 1),                      // s_cbranch_scc1 done
+      EncodeSopp(0x02, 0xfff5u),                // s_branch outer
+      EncodeVop1(0x01, 1, 0),                   // done: v_mov_b32 v1, s0
+      EncodeVop1(0x01, 2, 1),                   // v_mov_b32 v2, s1
+  };
+  AppendStoreVgprAtLaneDwordOffset(&test.code, 1, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&test.code, 2, 0, wave_size);
+  AppendEnd(&test.code);
+  test.initial.assign(2u * wave_size, 0u);
+  test.expected.assign(2u * wave_size, 0u);
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    test.expected[lane] = 4u;
+    test.expected[wave_size + lane] = 3u;
+  }
+  test.opcodes = {O::S_MOV_B32, O::S_CMP_LT_U32, O::S_CBRANCH_SCC1, O::S_ADD_U32,
+                  O::S_BRANCH,  O::S_CMP_EQ_U32, O::V_MOV_B32,      O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 void RunAll(VulkanHarness *vulkan) {
   CheckReferenceDirected();
   RunStub(vulkan);
   RunSoftware(vulkan, 64);
   RunNodeBudget(vulkan);
+  for (const u32 wave_size : {32u, 64u}) {
+    RunCase(vulkan, TraversalLoopBreakRegion(wave_size));
+  }
 }
 
 // ----------------------------------------------------------------------------------------------

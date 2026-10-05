@@ -227,6 +227,64 @@ void TestRayTracingStub() {
   Check(!ordinary.program.info.uses_bvh, "program without BVH was marked as using BVH");
 }
 
+// The traversal-loop shape of Astro Bot's BVH shaders (380bb9d636390bae and 26 more failed spirv-val
+// with "Selection must be structured"): the loop body's first conditional either stays in the
+// loop or enters a region with its own loop that leaves through the loop's merge, and the body
+// has another exit. The conditional must get a selection merge (a synthetic block on the region's
+// exit edge), not be treated as loop control.
+//   s0 = 0
+//   outer: if (s0 < 4) goto body
+//          s1 = 0; inner: s1 += 1; if (s1 < 3) goto inner; goto done   <- the break region
+//   body:  s0 += 1; if (s0 == 50) goto done; goto outer                <- the other exit
+//   done:  ...
+std::vector<uint32_t> TraversalLoopBreakRegionCode() {
+  return {
+      EncodeSMovB32(0, 128),            // 0: s_mov_b32 s0, 0
+      EncodeSopc(0x0a, 0, 132),         // 1: outer: s_cmp_lt_u32 s0, 4
+      EncodeSopp(0x05, 5),              // 2: s_cbranch_scc1 body
+      EncodeSMovB32(1, 128),            // 3: s_mov_b32 s1, 0
+      EncodeSop2(0x00, 1, 1, 129),      // 4: inner: s_add_u32 s1, s1, 1
+      EncodeSopc(0x0a, 1, 131),         // 5: s_cmp_lt_u32 s1, 3
+      EncodeSopp(0x05, 0xfffdu),        // 6: s_cbranch_scc1 inner
+      EncodeSopp(0x02, 4),              // 7: s_branch done
+      EncodeSop2(0x00, 0, 0, 129),      // 8: body: s_add_u32 s0, s0, 1
+      EncodeSopc(0x06, 0, 178),         // 9: s_cmp_eq_u32 s0, 50
+      EncodeSopp(0x05, 1),              // 10: s_cbranch_scc1 done
+      EncodeSopp(0x02, 0xfff5u),        // 11: s_branch outer
+      EncodeSopp(0x01),                 // 12: done: s_endpgm
+  };
+}
+
+void TestTraversalLoopBreakRegion() {
+  namespace D = ShaderRecompiler::Decoder;
+  namespace CFG = ShaderRecompiler::CFG;
+  const auto code = TraversalLoopBreakRegionCode();
+  D::Program decoded;
+  D::DecodeProgram(code, decoded);
+  auto graph = CFG::BuildGraph(decoded);
+  Check(!graph.unsupported && !graph.irreducible && CFG::Structurize(graph),
+        "traversal-loop break region did not structurize");
+  // The conditional at pc 4 (the loop's first body block) has a merge: a synthetic block that
+  // breaks to the loop merge.
+  const auto conditional = std::ranges::find_if(graph.blocks, [](const CFG::BasicBlock &block) {
+    return block.start_pc == 4u && block.inst_begin != block.inst_end &&
+           block.terminator.kind == CFG::TerminatorKind::ConditionalBranch;
+  });
+  Check(conditional != graph.blocks.end(), "traversal-loop conditional not found");
+  const auto *merge = graph.FindBlock(conditional->terminator.merge_block);
+  Check(merge != nullptr && merge->inst_begin == merge->inst_end &&
+            merge->terminator.kind == CFG::TerminatorKind::Branch &&
+            graph.FindBlock(merge->terminator.true_block) != nullptr &&
+            graph.FindBlock(merge->terminator.true_block)->start_pc == 48u,
+        "traversal-loop conditional lacks its synthetic merge before the loop exit");
+  for (const auto stage : {ShaderType::Compute, ShaderType::Pixel}) {
+    const auto compiled = RecompileForTest(code, MakeCompileOptions(stage));
+    Check(!compiled.program.dispatcher_fallback,
+          "traversal-loop shader fell back to the dispatcher");
+    CheckSpirvBinaryValidates(compiled.spirv);
+  }
+}
+
 // Development check on real guest code (not part of the default run): each file is a raw
 // shader binary (code first; data after its end is ignored). Decodes it with the BVH decoder,
 // then translates it as a wave32 compute shader (Astro Bot's RT kernels set CS_W32_EN) with
@@ -291,5 +349,212 @@ int TranslateBvhShaderFiles(int argc, char **argv) {
                 ok[0] ? "yes" : "NO", ok[1] ? "yes" : "NO");
     failures += ok[0] && ok[1] ? 0 : 1;
   }
+  return failures;
+}
+
+// Development check (not part of the default run): shader_cfg_tests --bvh-validate <file|@list>...
+// compiles each raw guest compute shader (code first; data after its end is ignored) the way the
+// emulator does -- TranslateProgram, ExtractResourcePlan, MaterializeResources, CompileProgram --
+// and validates the SPIR-V as pipelineCache.cpp does (spirv-val, Vulkan 1.3). A failure prints
+// the validator's messages with the disassembly around the failing instruction and writes the
+// module next to the input (<file>.w<wave>.<mode>.spv).
+// - The codegen switches come from the environment, as in the game (KYTY_SRT_VARIANT_READS,
+//   KYTY_BDA_WRITES, KYTY_RT_STUB, KYTY_RT_SOFTWARE, ...). KYTY_HARNESS_RT_MODES=stub,software
+//   (any of stub, software, env) runs each file once per BVH mode; the default is env.
+// - KYTY_HARNESS_WAVE=32|64|32,64 (default 32,64) with a host subgroup of 32 (the RTX 3090).
+// - Resources materialize against synthetic memory in which every read succeeds with plausible
+//   pointers (RT-TILED's --srt-plan-files memory); the float controls are the 3090's.
+// - @list reads one path per line (UTF-8, with or without a BOM).
+namespace BvhValidate {
+
+bool ReadSynthetic(void *, uint64_t address, std::span<uint32_t> values) {
+  for (size_t i = 0; i < values.size(); i++) {
+    const uint64_t word_address = address + i * 4u;
+    values[i] = (word_address & 4u) != 0
+                    ? 0x1u
+                    : (0x00100000u | static_cast<uint32_t>(word_address & 0xff0u));
+  }
+  return true;
+}
+
+std::vector<std::string> SplitList(const char *text) {
+  std::vector<std::string> items;
+  std::string item;
+  for (const char *c = text; ; ++c) {
+    if (*c == ',' || *c == '\0') {
+      if (!item.empty()) items.push_back(item);
+      item.clear();
+      if (*c == '\0') break;
+    } else if (*c != ' ') {
+      item += *c;
+    }
+  }
+  return items;
+}
+
+std::vector<std::string> ExpandFiles(int argc, char **argv) {
+  std::vector<std::string> files;
+  for (int arg = 2; arg < argc; ++arg) {
+    if (argv[arg][0] != '@') {
+      files.emplace_back(argv[arg]);
+      continue;
+    }
+    std::FILE *list = std::fopen(argv[arg] + 1, "rb");
+    if (list == nullptr) {
+      std::fprintf(stderr, "%s: cannot open\n", argv[arg] + 1);
+      continue;
+    }
+    std::string text;
+    char buffer[4096];
+    size_t read = 0;
+    while ((read = std::fread(buffer, 1, sizeof(buffer), list)) != 0) text.append(buffer, read);
+    std::fclose(list);
+    if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xefu &&
+        static_cast<unsigned char>(text[1]) == 0xbbu && static_cast<unsigned char>(text[2]) == 0xbfu) {
+      text.erase(0, 3);
+    }
+    std::string line;
+    for (const char c : text) {
+      if (c == '\n' || c == '\r') {
+        if (!line.empty()) files.push_back(line);
+        line.clear();
+      } else {
+        line += c;
+      }
+    }
+    if (!line.empty()) files.push_back(line);
+  }
+  return files;
+}
+
+// The disassembly lines around instruction `index` (the validator's instruction position).
+std::string Context(const std::vector<uint32_t> &spirv, size_t index) {
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+  std::string text;
+  tools.Disassemble(spirv, &text,
+                    static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_NO_HEADER) |
+                        static_cast<uint32_t>(SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES));
+  std::vector<std::string> lines;
+  std::string line;
+  for (const char c : text) {
+    if (c == '\n') {
+      lines.push_back(line);
+      line.clear();
+    } else {
+      line += c;
+    }
+  }
+  std::string out;
+  const size_t first = index > 12u ? index - 12u : 0u;
+  for (size_t i = first; i < lines.size() && i <= index + 6u; ++i) {
+    out += (i == index ? ">> " : "   ") + lines[i] + "\n";
+  }
+  return out;
+}
+
+} // namespace BvhValidate
+
+int ValidateBvhShaderFiles(int argc, char **argv) {
+  namespace IRN = ShaderRecompiler::IR;
+  const auto *wave_text = std::getenv("KYTY_HARNESS_WAVE");
+  const auto *mode_text = std::getenv("KYTY_HARNESS_RT_MODES");
+  const auto waves = BvhValidate::SplitList(wave_text != nullptr ? wave_text : "32,64");
+  const auto modes = BvhValidate::SplitList(mode_text != nullptr ? mode_text : "env");
+  const auto saved_controls = ShaderRecompiler::Spirv::GetHostFloatControls();
+  ShaderRecompiler::Spirv::SetHostFloatControls(
+      {.denorm_flush_f32 = false, .denorm_preserve_f16 = true, .denorm_preserve_f64 = false});
+  std::array<uint32_t, 64> user_data{};
+  for (uint32_t i = 0; i < user_data.size(); i++) {
+    user_data[i] = (i & 1u) != 0 ? 0x1u : (0x00200000u + i * 0x100u);
+  }
+  int failures = 0;
+  for (const auto &path : BvhValidate::ExpandFiles(argc, argv)) {
+    std::FILE *file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+      std::printf("%s: cannot open\n", path.c_str());
+      failures++;
+      continue;
+    }
+    std::vector<uint32_t> code;
+    uint32_t word = 0;
+    while (std::fread(&word, sizeof(word), 1, file) == 1) code.push_back(word);
+    std::fclose(file);
+    for (const auto &wave_name : waves) {
+      const auto wave = static_cast<uint32_t>(std::strtoul(wave_name.c_str(), nullptr, 10));
+      for (const auto &mode : modes) {
+        auto codegen = ShaderRecompiler::GetCodegenOptions();
+        if (mode == "stub" || mode == "software") {
+          codegen.rt_stub = mode == "stub";
+          codegen.rt_software = mode == "software";
+        }
+        const auto saved_codegen = ShaderRecompiler::GetCodegenOptions();
+        ShaderRecompiler::SetCodegenOptions(codegen);
+        ShaderComputeInputInfo info{};
+        info.wave_size = wave;
+        info.host_subgroup_size = 32;
+        info.threads_num[0] = 64;
+        info.threads_num[1] = 1;
+        info.threads_num[2] = 1;
+        info.thread_ids_num = 3;
+        info.group_id[0] = info.group_id[1] = info.group_id[2] = true;
+        info.workgroup_register = 16;
+        auto options = MakeCompileOptions(ShaderType::Compute);
+        options.input_info.compute = &info;
+        options.wave_size = wave;
+        options.user_data = user_data;
+        const auto label = path + " w" + wave_name + " " + mode;
+        std::fprintf(stderr, "%s: compiling\n", label.c_str());
+        std::fflush(stderr);
+        auto translated = ShaderRecompiler::TranslateProgram(code, options);
+        std::string result;
+        if (translated.skip_dispatch || translated.program.blocks.empty()) {
+          result = "skipped";
+        } else {
+          const auto plan = IRN::ExtractResourcePlan(translated.program);
+          IRN::SrtRuntime runtime{};
+          runtime.user_data = user_data;
+          runtime.read_memory = BvhValidate::ReadSynthetic;
+          runtime.read_specialization_memory = BvhValidate::ReadSynthetic;
+          IRN::ResourceSnapshot snapshot;
+          IRN::ResourceSpecialization specialization;
+          if (!IRN::MaterializeResources(plan, runtime, snapshot, specialization)) {
+            result = "not materialized";
+          } else {
+            const auto compiled =
+                ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+            spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+            std::string messages;
+            size_t first_index = SIZE_MAX;
+            tools.SetMessageConsumer([&](spv_message_level_t, const char *,
+                                         const spv_position_t &position, const char *message) {
+              messages += "  spirv-val: " + std::string(message) + "\n";
+              first_index = std::min<size_t>(first_index, position.index);
+            });
+            if (tools.Validate(compiled.spirv)) {
+              result = "valid (" + std::to_string(compiled.spirv.size()) + " words)";
+            } else {
+              result = "INVALID";
+              failures++;
+              std::printf("%s: INVALID\n%s", label.c_str(), messages.c_str());
+              if (first_index != SIZE_MAX) {
+                std::printf("%s", BvhValidate::Context(compiled.spirv, first_index).c_str());
+              }
+              const auto out_path = path + ".w" + wave_name + "." + mode + ".spv";
+              if (std::FILE *out = std::fopen(out_path.c_str(), "wb"); out != nullptr) {
+                std::fwrite(compiled.spirv.data(), sizeof(uint32_t), compiled.spirv.size(), out);
+                std::fclose(out);
+              }
+            }
+          }
+        }
+        ShaderRecompiler::SetCodegenOptions(saved_codegen);
+        if (result != "INVALID") {
+          std::printf("%s: %s\n", label.c_str(), result.c_str());
+        }
+        std::fflush(stdout);
+      }
+    }
+  }
+  ShaderRecompiler::Spirv::SetHostFloatControls(saved_controls);
   return failures;
 }
