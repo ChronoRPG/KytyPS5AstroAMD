@@ -1374,16 +1374,17 @@ bool SrtWalker::ResolveRecipeReadAddress(const ResourcePlan::EvaluationRecipe& r
 }
 
 bool SrtWalker::ReadRawWord(uint64_t address, uint64_t& result, bool allow_probe) {
-	// A null guest pointer (an unset table, because this path is not taken) is a null descriptor:
-	// read it as zero. Only the first page is unmapped.
-	if (address < 0x1000u) {
-		result = 0;
-		return true;
-	}
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
 			ObserveSrtRead(m_runtime, address, {&word, 1}, false);
+			// A null guest pointer (an unset table, because this path is not taken) is a null
+			// descriptor: read it as zero. Only the first page is unmapped. Checked after the
+			// read, so a reader that does back low addresses still returns its data.
+			if (address < 0x1000u) {
+				result = 0;
+				return true;
+			}
 			return false;
 		}
 	} else {
