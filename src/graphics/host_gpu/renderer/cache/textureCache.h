@@ -432,8 +432,12 @@ private:
 	void CommitGpuWrite(Image& image);
 	void CommitGpuWrite(Image& image, const WriteClaim& claim);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
-	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
-	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
+	// Returns false, after reporting once per signature, when `id` cannot take the clear (a depth
+	// image for a colour range, a stencil plane record, a level or layer range beyond the image):
+	// nothing was changed, so the caller must not consume the guest's clear key or fill.
+	[[nodiscard]] bool ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
+	                              const vk::ImageSubresourceRange& range,
+	                              const vk::ClearValue& clear, const char* site);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
