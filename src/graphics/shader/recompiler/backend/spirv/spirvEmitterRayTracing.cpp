@@ -503,25 +503,70 @@ uint32_t BvhLowering::Triangle(uint32_t address) {
 		b[axis] = pick(1u, 3u, 3u, 4u);
 		c[axis] = pick(2u, 2u, 4u, 0u);
 	}
-	const auto e1    = Sub3(b, a);
-	const auto e2    = Sub3(c, a);
-	const auto e3    = Sub3(origin, a);
-	const auto s1    = Cross(direction, e2);
-	const auto s2    = Cross(e3, e1);
-	const auto t_num = Dot(e2, s2);
-	const auto t_den = Dot(s1, e1);
-	const auto i_num = Dot(e3, s1);
-	const auto j_num = Dot(direction, s2);
-	const auto t     = ExactDiv(t_num, t_den);
-	const auto u     = ExactDiv(i_num, t_den);
-	const auto v     = ExactDiv(j_num, t_den);
-	const auto zero  = Cf(ZeroBits);
-	const auto one   = Cf(OneBits);
-	const auto miss  = Or(
-	    Or(Or(Op(spv::OpFOrdLessThan, Bool(), u, zero), Op(spv::OpFOrdGreaterThan, Bool(), u, one)),
-	       Or(Op(spv::OpFOrdLessThan, Bool(), v, zero),
-	          Op(spv::OpFOrdGreaterThan, Bool(), FAdd(u, v), one))),
-	    Op(spv::OpFOrdLessThan, Bool(), t, zero));
+	const auto e1      = Sub3(b, a);
+	const auto e2      = Sub3(c, a);
+	const auto e3      = Sub3(origin, a);
+	const auto s1      = Cross(direction, e2);
+	const auto s2      = Cross(e3, e1);
+	const auto t_num   = Dot(e2, s2);
+	const auto t_den   = Dot(s1, e1);
+	const auto i_num   = Dot(e3, s1);
+	const auto j_num   = Dot(direction, s2);
+	const auto zero    = Cf(ZeroBits);
+	const auto one     = Cf(OneBits);
+	const auto miss_of = [&](uint32_t t, uint32_t u, uint32_t v, uint32_t u_plus_v) {
+		return Or(Or(Or(Op(spv::OpFOrdLessThan, Bool(), u, zero),
+		                Op(spv::OpFOrdGreaterThan, Bool(), u, one)),
+		             Or(Op(spv::OpFOrdLessThan, Bool(), v, zero),
+		                Op(spv::OpFOrdGreaterThan, Bool(), u_plus_v, one))),
+		          Op(spv::OpFOrdLessThan, Bool(), t, zero));
+	};
+	// The miss decision needs only the signs of t, u and v and where u and u + v lie against 1. Far
+	// from those thresholds, quotients through the host's reciprocal decide exactly as the
+	// correctly rounded ones (RT-HW's PsrTriangleMiss): Vulkan bounds OpFDiv by 2.5 ulp for a
+	// divisor in [2^-126, 2^126], so num * (1 / t_den) is within about 3.5 ulp of the correctly
+	// rounded quotient, 2^-21.2 relative. The decision is taken from them when:
+	// - |t_den| is a normal in [2^-126, 2^126] and every approximation is finite;
+	// - |t|, |u|, |v| > 2^-100, so none of the correctly rounded quotients is a zero;
+	// - |u - 1| > 2^-18 and |u + v - 1| > 2^-18 (1 + |u| + |v|).
+	// Otherwise the exact integer divisions decide; near the thresholds that is rare.
+	const auto abs_bits = [&](uint32_t value) {
+		return Op(spv::OpBitwiseAnd, U32(), ToU32(value), Cu(0x7fffffffu));
+	};
+	const auto finite = [&](uint32_t value) {
+		return Op(spv::OpULessThan, Bool(), abs_bits(value), Cu(PlusInfBits));
+	};
+	const auto away_from_zero = [&](uint32_t value) {
+		return Op(spv::OpUGreaterThan, Bool(), abs_bits(value), Cu(0x0d800000u)); // 2^-100
+	};
+	const auto fabs = [&](uint32_t value) {
+		return EmitGlsl<GLSLstd450FAbs, IR::Type::F32>(s, value);
+	};
+	const auto margin     = Cf(0x36800000u); // 2^-18
+	const auto den_bits   = abs_bits(t_den);
+	const auto den_ok     = And(Op(spv::OpUGreaterThanEqual, Bool(), den_bits, Cu(0x00800000u)),
+	                            Op(spv::OpULessThanEqual, Bool(), den_bits, Cu(0x7e800000u)));
+	const auto reciprocal = Op(spv::OpFDiv, F32(), one, t_den);
+	const auto t_approx   = FMul(t_num, reciprocal);
+	const auto u_approx   = FMul(i_num, reciprocal);
+	const auto v_approx   = FMul(j_num, reciprocal);
+	const auto sum_approx = FAdd(u_approx, v_approx);
+	const auto u_clear    = Op(spv::OpFOrdGreaterThan, Bool(), fabs(FSub(u_approx, one)), margin);
+	const auto sum_clear  = Op(spv::OpFOrdGreaterThan, Bool(), fabs(FSub(sum_approx, one)),
+	                           FMul(margin, FAdd(FAdd(one, fabs(u_approx)), fabs(v_approx))));
+	const auto certain    = And(
+	    And(And(den_ok, And(And(finite(t_approx), finite(u_approx)),
+	                        And(finite(v_approx), finite(sum_approx)))),
+	        And(And(away_from_zero(t_approx), away_from_zero(u_approx)), away_from_zero(v_approx))),
+	    And(u_clear, sum_clear));
+	const auto miss = IfElse(
+	    certain, Bool(), [&]() { return miss_of(t_approx, u_approx, v_approx, sum_approx); },
+	    [&]() {
+		    const auto t = ExactDiv(t_num, t_den);
+		    const auto u = ExactDiv(i_num, t_den);
+		    const auto v = ExactDiv(j_num, t_den);
+		    return miss_of(t, u, v, FAdd(u, v));
+	    });
 	const auto                    result_t   = Sel(F32(), miss, Cf(PlusInfBits), t_num);
 	const auto                    result_den = Sel(F32(), miss, one, t_den);
 	const std::array<uint32_t, 3> barycentric {FSub(FSub(result_den, i_num), j_num), i_num, j_num};

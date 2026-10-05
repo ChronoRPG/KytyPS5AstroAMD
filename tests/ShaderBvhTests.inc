@@ -675,11 +675,24 @@ Scenario FuzzScenario(u32 seed, bool a16) {
       const u32 type = rng.Below(4);
       constexpr std::array<std::array<u32, 3>, 4> Fan{
           {{0u, 1u, 2u}, {1u, 3u, 2u}, {2u, 3u, 4u}, {2u, 4u, 0u}}};
-      // A random point in the triangle (barycentric), or near its edges.
+      // A random point in the triangle (barycentric). Often it is instead within 2^-26..2^-12 of an
+      // edge (u = 0, v = 0 or u + v = 1) or of u = 1, on either side, where the miss decision
+      // leaves the reciprocal fast path for the exact divisions.
       float wa = rng.Uniform(0, 1), wb = rng.Uniform(0, 1);
       if (wa + wb > 1) {
         wa = 1 - wa;
         wb = 1 - wb;
+      }
+      if (rng.Chance(40)) {
+        // ("near" is a Windows macro.)
+        const float step = std::ldexp(rng.Chance(50) ? 1.0f : -1.0f,
+                                      -12 - static_cast<int>(rng.Below(15)));
+        switch (rng.Below(4)) {
+        case 0: wa = step; break;
+        case 1: wb = step; break;
+        case 2: wb = 1 - wa + step; break;
+        default: wa = 1 + step; wb = rng.Uniform(-0.001f, 0.001f); break;
+        }
       }
       for (u32 axis = 0; axis < 3u; ++axis) {
         point[axis] = vertices[Fan[type][0]][axis] * (1 - wa - wb) +
