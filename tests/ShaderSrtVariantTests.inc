@@ -274,6 +274,130 @@ void CallIsSkipped() {
   std::printf("[compute] CallIsSkipped                     ok\n");
 }
 
+// Flat SRT reads through a pointer that is null, or points nowhere, when the plan is evaluated
+// before the dispatch: Astro Bot's tiled lighting (78af8e26) loads a TLAS pointer from its SRT and
+// header fields through it (s_load_dwordx2 s[10:11], s[8:9], 0x30), on a path only lanes that
+// trace a shadow ray take, and the pointer is null while no TLAS exists. The in-place reader (no
+// read_memory, as in game) must not touch such an address: it reads 0 and the plan materializes.
+// Without the check the second read dereferences 0x30 and the process dies. A mapped pointer
+// still reads its data, and is_guest_mapped extends the check to every address outside the guest
+// mappings (the game passes it with KYTY_SRT_VARIANT_READS).
+namespace NullBasedReads {
+
+constexpr uint64_t Unmapped = 0x0000010000000000ull; // 1 TiB: outside every test mapping
+uint32_t refused = 0;
+
+bool GuestMapped(uint64_t address, uint64_t size) {
+  if (address + size > Unmapped && address < Unmapped + 0x1000u) {
+    refused++;
+    return false;
+  }
+  return true;
+}
+
+// The game's clean-backing probe shape: fails (touching nothing) where no backing exists.
+bool HostProbe(void *, uint64_t address, std::span<uint32_t> values) {
+  const auto size = values.size_bytes();
+  if (ShaderRecompiler::IR::NeverMappedAddress(address, size) ||
+      (address + size > Unmapped && address < Unmapped + 0x1000u)) {
+    return false;
+  }
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address), size);
+  return true;
+}
+
+} // namespace NullBasedReads
+
+void NullBasedFlatReadReadsZero() {
+  constexpr const char *name = "NullBasedFlatReadReadsZero";
+  namespace IRN = ShaderRecompiler::IR;
+  std::vector<u32> code;
+  code.push_back(EncodeSmem0(0x01, 8, 0)); // s_load_dwordx2 s[8:9], s[0:1], 0
+  code.push_back(EncodeSmem1(0, 125));
+  code.push_back(EncodeSopp(0x0c, 0xc07f)); // s_waitcnt lgkmcnt(0)
+  const u32 header_pc = static_cast<u32>(code.size() * sizeof(u32));
+  code.push_back(EncodeSmem0(0x01, 10, 4)); // s_load_dwordx2 s[10:11], s[8:9], 0x30
+  code.push_back(EncodeSmem1(0x30, 125));
+  code.push_back(EncodeSopp(0x0c, 0xc07f));
+  AppendStoreSgpr(&code, 10, 0);
+  AppendStoreSgpr(&code, 11, 1);
+  AppendEnd(&code);
+
+  static std::array<uint64_t, 16> table{};  // table[0]: the pointer the shader follows
+  static std::array<u32, 32> header{};       // a mapped target: dwords 12-13 at +0x30
+  header[12] = 0x1234u;
+  header[13] = 0x5678u;
+  // Materializes the plan with the pointer set to `pointer` and returns the two values the
+  // second load's flat slots hold.
+  const auto run = [&](uint64_t pointer, IRN::SrtMappedRange mapped, IRN::SrtMemoryReader probe,
+                       const char *stage) {
+    table[0] = pointer;
+    auto user_data = MakeNativeUserData(nullptr);
+    const auto table_address = reinterpret_cast<uint64_t>(table.data());
+    user_data[0] = static_cast<u32>(table_address);
+    user_data[1] = static_cast<u32>(table_address >> 32u);
+    ShaderComputeInputInfo compute_info{};
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Compute;
+    options.input_info.compute = &compute_info;
+    options.user_data = user_data;
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    Require(name, stage, !translated.skip_dispatch && !translated.program.blocks.empty(),
+            "the pointer-chasing program did not translate");
+    const auto plan = IRN::ExtractResourcePlan(translated.program);
+    IRN::ResourceSnapshot resources;
+    IRN::ResourceSpecialization specialization;
+    const IRN::SrtRuntime runtime{
+        .user_data = user_data,
+        .shader_base = reinterpret_cast<uint64_t>(code.data()),
+        .try_read_clean_backing = probe,
+        .is_guest_mapped = mapped,
+    };
+    Require(name, stage, IRN::MaterializeResources(plan, runtime, resources, specialization),
+            "the plan did not materialize");
+    std::vector<u32> values;
+    for (const auto &read : plan.srt_reads) {
+      const auto *inst = read.value.Resolve().TryInstruction();
+      if (inst != nullptr && inst->Flags<IRN::MemoryFlags>().pc == header_pc &&
+          read.flat_offset < resources.flattened_srt.size()) {
+        values.push_back(resources.flattened_srt[read.flat_offset]);
+      }
+    }
+    std::ranges::sort(values);
+    Require(name, stage, values.size() == 2u,
+            "the header load did not become two flat slots (" +
+                std::to_string(values.size()) + ")");
+    return std::pair{values[0], values[1]};
+  };
+  // Without and with the clean-backing probe (KYTY_SRT_READ_RUNS: the flat-run path of R2's crash).
+  for (const auto probe : {IRN::SrtMemoryReader{}, IRN::SrtMemoryReader{NullBasedReads::HostProbe}})
+  for (const bool variant_reads : {true, false}) {
+    auto codegen = GetCodegenOptions();
+    codegen.srt_variant_reads = variant_reads;
+    ScopedCodegenOptions scope(codegen);
+    const auto null_read = run(0, nullptr, probe, "null pointer");
+    Require(name, "null pointer", null_read.first == 0u && null_read.second == 0u,
+            "a read of null + 0x30 did not read 0: " + Hex(null_read.first) + " " +
+                Hex(null_read.second));
+    const auto header_address = reinterpret_cast<uint64_t>(header.data());
+    const auto mapped_read = run(header_address, nullptr, probe, "mapped pointer");
+    const auto checked_read = run(header_address, NullBasedReads::GuestMapped, probe,
+                                  "mapped pointer, checked");
+    Require(name, "mapped pointer",
+            mapped_read == std::pair{0x1234u, 0x5678u} && checked_read == mapped_read,
+            "a mapped header read " + Hex(mapped_read.first) + " " + Hex(checked_read.first));
+    NullBasedReads::refused = 0;
+    const auto unmapped_read =
+        run(NullBasedReads::Unmapped, NullBasedReads::GuestMapped, probe, "unmapped pointer");
+    Require(name, "unmapped pointer",
+            unmapped_read.first == 0u && unmapped_read.second == 0u &&
+                NullBasedReads::refused >= 2u,
+            "a read outside the guest mappings was not refused and read as 0 (refused " +
+                std::to_string(NullBasedReads::refused) + ")");
+  }
+  std::printf("[compute] %-32s ok\n", name);
+}
+
 void RunAll(VulkanHarness *vulkan) {
   auto options = GetCodegenOptions();
   options.srt_variant_reads = true;
@@ -282,6 +406,7 @@ void RunAll(VulkanHarness *vulkan) {
   RunCase(vulkan, ScalarLoadsThroughLoopCarriedRecords());
   RunCase(vulkan, RawLoadsThroughGpuSelectedDescriptors());
   CallIsSkipped();
+  NullBasedFlatReadReadsZero();
 }
 
 } // namespace SrtVariantTests

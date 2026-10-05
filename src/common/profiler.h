@@ -131,6 +131,9 @@ enum class FrameEvent : uint32_t {
 	SrtProbeMisses,
 	SrtProbeBytes,
 	SrtProbeBatchHits,
+	// Flat SRT reads of an address no guest page backs, read as 0 instead of faulting
+	// (SrtWalker::InPlaceReadable).
+	SrtUnmappedReads,
 	ResourceReuseHits,
 	ResourceReuseMisses,
 	ResourceReuseValidationBytes,

@@ -32,6 +32,7 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/ProgramCodec.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -442,9 +443,36 @@ bool NativeDccEnabled() {
 	return enabled;
 }
 
+// A strict SRT read that failed because no guest page can back the address: never-mapped
+// addresses, and with KYTY_SRT_VARIANT_READS any address outside the GPU-mapped guest ranges. No
+// synchronization could make such a read succeed, so the materialization would stop the emulator;
+// it reads 0 instead, as the GPU reads an unmapped page (SrtWalker::InPlaceReadable does the same
+// for the in-place reads).
+bool ReadsUnmappedGuestMemory(uint64_t address, std::span<uint32_t> values) {
+	const auto size = values.size_bytes();
+	if (!ShaderRecompiler::IR::NeverMappedAddress(address, size) &&
+	    (!ShaderRecompiler::GetCodegenOptions().srt_variant_reads ||
+	     LibKernel::Memory::IsGpuMapped(address, size))) {
+		return false;
+	}
+	std::fill(values.begin(), values.end(), 0u);
+	Profiler::CountFrameEvent(Profiler::FrameEvent::SrtUnmappedReads);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "SRT: a resource read of unmapped address 0x{:x} (0x{:x} bytes) before a dispatch or "
+		    "draw returns 0, as the GPU reads an unmapped page.\n",
+		    address, size));
+	}
+	return true;
+}
+
 bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	const bool read = !values.empty() &&
 	    LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+	if (!read && !values.empty() && ReadsUnmappedGuestMemory(address, values)) {
+		return true;
+	}
 	if (!read && userdata != nullptr) {
 		static_cast<ShaderReadAttempt*>(userdata)->Missing(address, values.size_bytes());
 	}
@@ -1579,6 +1607,12 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .try_read_clean_backing = SrtReadRunsEnabled() ? TryReadShaderCleanBacking : nullptr,
 		    .share_clean_values = SharedResourceEvaluationEnabled(),
+		    // KYTY_SRT_VARIANT_READS: an in-place flat read outside the GPU-mapped guest ranges
+		    // reads 0 (a garbage or null pointer the shader only follows on some paths). Without
+		    // the switch only never-mapped addresses do (SrtWalker::InPlaceReadable).
+		    .is_guest_mapped = ShaderRecompiler::GetCodegenOptions().srt_variant_reads
+		                           ? LibKernel::Memory::IsGpuMapped
+		                           : nullptr,
 		};
 	}
 

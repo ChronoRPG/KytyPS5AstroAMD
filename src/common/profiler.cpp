@@ -69,6 +69,7 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.SrtProbeMisses.Cumulative",
     "FrameEvent.SrtProbeBytes.Cumulative",
     "FrameEvent.SrtProbeBatchHits.Cumulative",
+    "FrameEvent.SrtUnmappedReads.Cumulative",
     "FrameEvent.ResourceReuseHits.Cumulative",
     "FrameEvent.ResourceReuseMisses.Cumulative",
     "FrameEvent.ResourceReuseValidationBytes.Cumulative",

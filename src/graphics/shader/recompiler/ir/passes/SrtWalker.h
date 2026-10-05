@@ -12,6 +12,7 @@ class Value;
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
 using SrtReadObserver = void (*)(void* userdata, uint64_t address,
                                 std::span<const uint32_t> values, bool success);
+using SrtMappedRange  = bool (*)(uint64_t address, uint64_t size);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -32,7 +33,20 @@ struct SrtRuntime {
 	// Share successful strict evaluations with an ordinary evaluator in this same
 	// materialization only. Never import ordinary results into a strict evaluator.
 	bool share_clean_values = false;
+	// Optional: whether [address, address + size) is guest memory the GPU can read. The in-place
+	// read (read_memory null, no successful probe) reads 0 outside it instead of touching the
+	// address. Without it, only addresses that are never mapped read 0 (the first 64 KiB and
+	// non-canonical addresses), where the in-place read would fault with nothing to resolve it.
+	SrtMappedRange is_guest_mapped = nullptr;
 };
+
+// Addresses no guest or host mapping can contain: the first 64 KiB (never mapped on Windows, Linux
+// or the PS5) and non-canonical ones. A read of one faults with nothing to resolve it.
+constexpr bool NeverMappedAddress(uint64_t address, uint64_t size) {
+	constexpr uint64_t NullRegionEnd  = 0x10000;
+	constexpr uint64_t CanonicalLimit = uint64_t {1} << 47u;
+	return address < NullRegionEnd || size > CanonicalLimit || address > CanonicalLimit - size;
+}
 
 inline void ObserveSrtRead(const SrtRuntime& runtime, uint64_t address,
                            std::span<const uint32_t> values, bool success) {
@@ -105,6 +119,8 @@ private:
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool ResolveRawReadAddress(const Inst& inst, uint64_t& address, uint64_t& available);
 	bool ReadRawWord(uint64_t address, uint64_t& result, bool allow_probe = true);
+	[[nodiscard]] bool InPlaceReadable(uint64_t address);
+	void NoteUnmappedRead(uint64_t address) const;
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
 	bool EvaluateFlatRun(uint32_t first, uint32_t end, std::vector<uint32_t>& flat,
 	                     uint32_t& consumed);
@@ -120,6 +136,9 @@ private:
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
+	// The last 4 KiB page is_guest_mapped confirmed: mappings do not change during one walk
+	// (unmaps run on the GPU thread, which is walking), and flat reads cluster in a few tables.
+	uint64_t                        m_mapped_page = UINT64_MAX;
 	bool                            m_count_recipes = false;
 	uint64_t                        m_compiled_nodes = 0;
 	uint64_t                        m_fallback_nodes = 0;
