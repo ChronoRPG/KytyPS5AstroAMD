@@ -176,18 +176,23 @@ struct CodegenOptions {
 	// (0xffffffff); a triangle node returns t_num=+inf, t_denom=1.0 and zero in dwords 2-3 (a
 	// cleared hit_status in triangle return mode 0). Diagnostic only: it never reports a hit.
 	bool rt_stub = false;
-	// KYTY_RT_SOFTWARE=1: translate the BVH instructions exactly in software (IR BvhIntersectRay,
-	// lowered in the SPIR-V backend; spec: Profiling/analysis/RT-SOFTWARE-DESIGN.md). Takes
-	// precedence over KYTY_RT_STUB.
-	bool rt_software = false;
+	// KYTY_RT_SOFTWARE (default 1): translate the BVH instructions exactly in software (IR
+	// BvhIntersectRay, lowered in the SPIR-V backend; spec: RT-SOFTWARE-DESIGN.md). Takes precedence
+	// over KYTY_RT_STUB. Astro Bot's own tiled deferred lighting and its GI probe tracing contain
+	// these instructions; without a BVH mode their whole dispatches are skipped, which leaves the
+	// scene unlit (black robots on the title screen). KYTY_RT_SOFTWARE=0 with KYTY_RT_STUB=1 keeps
+	// the passes but lets every ray miss (no ray-traced shadows); KYTY_RT_SOFTWARE=0 alone restores
+	// the old skip.
+	bool rt_software = true;
 	// KYTY_RT_TYPE6=0 (with KYTY_RT_SOFTWARE): node type 6 misses (four invalid children) like
 	// RDNA2's user node, instead of being decoded as the PS5 shared-exponent box.
 	bool rt_type6 = true;
 	// KYTY_BDA_WRITES=1 (or =verify): raw stores and atomics through a V# the shader computes
 	// (Psr's BVH builders) write guest memory through BDA instead of failing resource tracking. The
 	// renderer settles each such dispatch synchronously: it waits for it and marks the pages it wrote
-	// GPU-owned before the CP continues (Profiling/analysis/BDA-WRITES-DESIGN.md).
-	bool bda_writes = false;
+	// GPU-owned before the CP continues (BDA-WRITES-DESIGN.md). Default 1: Astro Bot's BVH builders
+	// need it once its game patches are off; KYTY_BDA_WRITES=0 restores the old refusal.
+	bool bda_writes = true;
 	// KYTY_RT_NODE_BUDGET=<n> (with KYTY_RT_SOFTWARE; 0 = no limit): the most BVH node tests one
 	// guest lane runs. A garbage or cyclic BVH can keep the guest's traversal looping forever and
 	// lose the device. Past the budget every node test misses without reading memory, the

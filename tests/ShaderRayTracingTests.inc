@@ -1,5 +1,17 @@
 void TestRayTracingDispatchDetection() {
   namespace D = ShaderRecompiler::Decoder;
+  // The skip behaviour without a BVH mode (KYTY_RT_SOFTWARE=0, KYTY_RT_STUB=0); the software path is
+  // the default.
+  struct NoBvhMode {
+    ShaderRecompiler::CodegenOptions saved = ShaderRecompiler::GetCodegenOptions();
+    NoBvhMode() {
+      auto options = saved;
+      options.rt_stub = false;
+      options.rt_software = false;
+      ShaderRecompiler::SetCodegenOptions(options);
+    }
+    ~NoBvhMode() { ShaderRecompiler::SetCodegenOptions(saved); }
+  } no_bvh_mode;
   const auto check_decoded = [](std::span<const uint32_t> code, bool expected,
                                 const char *message) {
     D::Program decoded;

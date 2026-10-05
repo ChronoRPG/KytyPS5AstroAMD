@@ -4343,7 +4343,11 @@ enum class BdaWritesMode { Off, On, Verify };
 BdaWritesMode GetBdaWritesMode() {
 	static const BdaWritesMode mode = [] {
 		const auto* value = std::getenv("KYTY_BDA_WRITES");
-		if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+		// On by default, like CodegenOptions::bda_writes (KYTY_BDA_WRITES=0 turns both off).
+		if (value == nullptr || value[0] == '\0') {
+			return BdaWritesMode::On;
+		}
+		if (std::strcmp(value, "0") == 0) {
 			return BdaWritesMode::Off;
 		}
 		return std::strcmp(value, "verify") == 0 ? BdaWritesMode::Verify : BdaWritesMode::On;
