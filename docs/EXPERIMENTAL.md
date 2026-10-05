@@ -1,11 +1,13 @@
 # U59 integration release (Windows x64)
 
-This release builds on the U59 renderer and the Demon's Souls changes of the previous U59 release.
+This release builds on the U59 renderer of the previous U59 releases.
 
 ## New in this update
 
-Pre-release: int11 plus the changes below. If something works worse than in int11, please report it and use int11.
+Pre-release: int13 plus the changes below. If something works worse than in int13, please report it and use int13.
 
+- Adaptive triggers (also in int13): a vibration trigger reports "firing" only while it is pressed; in Astro's
+  Playroom the gun fired by itself.
 - The launcher's "AMD CPU patch" (`--amd-cpu`) now runs 11,026 of the game's 11,069 `VRSQRTPS` instructions as
   native code (43 still trap, 1,088 before): Sky Garden 34.5 fps with the option on (31.6 in int9 and int10, about
   the same as without the option now). The improved code analysis also applies to the red-zone protection.
