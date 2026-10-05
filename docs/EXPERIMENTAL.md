@@ -4,6 +4,22 @@ This release builds on the U59 renderer and the Demon's Souls changes of the pre
 
 ## New in this update
 
+Pre-release: int11 plus the changes below. If something works worse than in int11, please report it and use int11.
+
+- The launcher's "AMD CPU patch" (`--amd-cpu`) now runs 11,026 of the game's 11,069 `VRSQRTPS` instructions as
+  native code (43 still trap, 1,088 before): Sky Garden 34.5 fps with the option on (31.6 in int9 and int10, about
+  the same as without the option now). The improved code analysis also applies to the red-zone protection.
+- Game file reads into memory the emulator protects (Windows errors 998 and 1784) are retried through a temporary
+  buffer instead of looking like an empty file to the game.
+- When VRAM runs out while a texture is converted, idle scratch buffers are freed and the allocation retried, instead
+  of stopping.
+- A compute shader whose texture-LOD query result is unused no longer stops the shader translator (any GPU).
+- Intel GPUs: mesh and pixel shaders require the subgroup width the guest wave needs (NVIDIA and AMD unchanged).
+- Checked on one PC (RTX 3090, Ryzen 9 7950X3D): all 342 tests pass; Sky Garden 33-35 fps and Creamy Canyon 21.8 fps,
+  as int11. Program caches stay valid.
+
+From int11 (`u59-windows-20261005-int11`):
+
 - More adaptive trigger fixes, tested in Astro's Playroom: the gacha capsules break on R2 again. A feedback trigger
   now reports "pushing" only while it is pressed (it did so untouched before, so the game never saw the press); the
   state follows every effect the game sets; and an L2/R2 that arrives as a button only (input remapping, some pads
