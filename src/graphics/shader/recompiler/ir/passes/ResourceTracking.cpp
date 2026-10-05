@@ -1223,12 +1223,15 @@ private:
 		if (buffer != BufferAccess::None) {
 			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle,
 			               source)) {
-				// An S_BUFFER_LOAD through a V# the shader computed (KYTY_SRT_VARIANT_READS, e.g.
-				// a BVH instance's record) reads through BDA like the vector raw loads below.
-				const bool indirect_scalar = m_indirect_scalar_buffers &&
-				                             memory.kind == ResourceKind::ScalarBuffer &&
-				                             memory.SupportsIndirectBufferLoad(op);
-				if (!indirect_scalar &&
+				// KYTY_SRT_VARIANT_READS: an S_BUFFER_LOAD through a V# the shader computed (e.g. a
+				// BVH instance's record) or any raw vector load through one reads through BDA like
+				// the raw DWORD x2-x4 loads below.
+				const bool indirect_variant =
+				    m_indirect_scalar_buffers &&
+				    ((memory.kind == ResourceKind::ScalarBuffer &&
+				      memory.SupportsIndirectBufferLoad(op)) ||
+				     (memory.kind == ResourceKind::Buffer && memory.SupportsIndirectRawLoad(op)));
+				if (!indirect_variant &&
 				    (memory.kind != ResourceKind::Buffer || !memory.SupportsIndirectBufferLoad(op))) {
 					if (m_indirect_scalar_buffers) {
 						MarkUnresolved(flags.pc);
@@ -1238,8 +1241,13 @@ private:
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
 					     "requires a raw DWORD x2/x3/x4 load");
 				}
-				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
-				m_info.uses_dma                         = true;
+				auto& indirect = m_program.memory_info[flags.index];
+				indirect.kind  = ResourceKind::IndirectBuffer;
+				if (m_indirect_scalar_buffers) {
+					// No bound buffer: resource-control-flow planning skips it (it has no source).
+					indirect.resource = NoIndirectBufferResource;
+				}
+				m_info.uses_dma = true;
 				return;
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);

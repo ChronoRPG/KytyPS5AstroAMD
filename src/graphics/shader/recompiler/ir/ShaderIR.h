@@ -43,6 +43,10 @@ enum class ResourceKind {
 	       kind == ResourceKind::Global || kind == ResourceKind::Scratch;
 }
 
+// MemoryInfo::resource of an IndirectBuffer access that KYTY_SRT_VARIANT_READS created: it has no
+// bound buffer and no descriptor source.
+inline constexpr uint32_t NoIndirectBufferResource = UINT32_MAX;
+
 struct MemoryInfo {
 	ResourceKind            kind                     = ResourceKind::None;
 	uint32_t                resource                 = 0;
@@ -75,6 +79,22 @@ struct MemoryInfo {
 		return !formatted && !typed && data_bits == 32u &&
 		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
 		        opcode == ValueOpcode::LoadBufferU32x4 || opcode == ValueOpcode::ReadConstBuffer);
+	}
+	// KYTY_SRT_VARIANT_READS: every raw (unformatted) vector load can read through a V# the shader
+	// computes, BUFFER_LOAD_UBYTE/USHORT/DWORD included, not only DWORDX2-X4.
+	[[nodiscard]] bool SupportsIndirectRawLoad(ValueOpcode opcode) const {
+		if (formatted || typed) {
+			return false;
+		}
+		switch (opcode) {
+			case ValueOpcode::LoadBufferU8: return data_bits == 8u;
+			case ValueOpcode::LoadBufferU16: return data_bits == 16u;
+			case ValueOpcode::LoadBufferU32:
+			case ValueOpcode::LoadBufferU32x2:
+			case ValueOpcode::LoadBufferU32x3:
+			case ValueOpcode::LoadBufferU32x4: return data_bits == 32u;
+			default: return false;
+		}
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;

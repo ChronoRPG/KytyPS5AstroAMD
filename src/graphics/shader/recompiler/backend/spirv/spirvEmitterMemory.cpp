@@ -831,6 +831,72 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 	return ConstructU32Composite(state, components, values);
 }
 
+// One raw BUFFER_LOAD_DWORD/UBYTE/USHORT through a V# the shader computed (KYTY_SRT_VARIANT_READS,
+// ResourceKind::IndirectBuffer), read through BDA. Addressing and the OOB_SELECT range checks are
+// LoadIndirectBuffer's for one DWORD, with the element's own size (RDNA2 ISA 8.1.5, "Range
+// Checking": OOB_SELECT 3 checks offset + payload); an out-of-range element reads 0.
+uint32_t LoadIndirectBufferElement(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t bits) {
+	auto&       state   = ctx.state;
+	const auto& handle  = *inst.Arg(0).ResolveInstruction();
+	const auto  word1   = ctx.Arg(handle, 1);
+	const auto  records = ctx.Arg(handle, 2);
+	const auto  word3   = ctx.Arg(handle, 3);
+	const auto  field   = [&](uint32_t word, uint32_t first, uint32_t count) {
+		return EmitBitFieldUExtract(state, word, ConstantU32(state, first),
+		                            ConstantU32(state, count));
+	};
+	const auto nonzero = [&](uint32_t value) {
+		return Binary(state, spv::OpINotEqual, TypeBool(state), value, ConstantU32(state, 0));
+	};
+	const auto bytes    = ConstantU32(state, bits / 8u);
+	const auto has_data = [&](uint32_t offset, uint32_t size) {
+		return AndCondition(
+		    state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), size, bytes),
+		    Binary(state, spv::OpULessThanEqual, TypeBool(state), offset,
+		           Binary(state, spv::OpISub, TypeU32(state), size, bytes)));
+	};
+	const auto stride       = field(word1, 16, 14);
+	const auto swizzle      = AndCondition(state, nonzero(stride), nonzero(field(word1, 31, 1)));
+	const auto index_stride = field(word3, 21, 2);
+	const auto add_tid      = nonzero(field(word3, 23, 1));
+	const auto index =
+	    Binary(state, spv::OpIAdd, TypeU32(state), ctx.Arg(inst, 1),
+	           Select(state, TypeU32(state), add_tid, BufferLane(state), ConstantU32(state, 0)));
+	const auto soffset         = ctx.Arg(inst, 3);
+	const auto base            = DeviceAddressFromWords(state, ctx.Arg(handle, 0), field(word1, 0, 16));
+	const auto valid_format    = nonzero(field(word3, 12, 7));
+	const auto mode            = field(word3, 28, 2);
+	const auto index_in_bounds = Binary(state, spv::OpULessThan, TypeBool(state), index, records);
+	const auto scalar_in_bounds =
+	    Binary(state, spv::OpULessThanEqual, TypeBool(state), soffset, records);
+	const auto raw_records = Binary(state, spv::OpISub, TypeU32(state), records, soffset);
+	const auto raw_index_in_bounds =
+	    Binary(state, spv::OpULessThan, TypeBool(state), index, raw_records);
+	const auto address = CalculateBufferAddress(state, index, ctx.Arg(inst, 2), soffset,
+	                                            ctx.Memory(inst).offset, stride, swizzle,
+	                                            index_stride);
+	const auto structured_bounds =
+	    AndCondition(state, index_in_bounds,
+	                 Binary(state, spv::OpULessThan, TypeBool(state), address.offset, stride));
+	const auto raw_bounds = AndCondition(
+	    state, scalar_in_bounds,
+	    Select(state, TypeBool(state), swizzle,
+	           AndCondition(state, raw_index_in_bounds, has_data(address.offset, stride)),
+	           has_data(address.offset, raw_records)));
+	auto in_bounds = Select(state, TypeBool(state),
+	                        Binary(state, spv::OpIEqual, TypeBool(state), mode, ConstantU32(state, 0)),
+	                        structured_bounds, index_in_bounds);
+	in_bounds = Select(
+	    state, TypeBool(state),
+	    Binary(state, spv::OpULessThan, TypeBool(state), mode, ConstantU32(state, 2)), in_bounds,
+	    Select(state, TypeBool(state),
+	           Binary(state, spv::OpIEqual, TypeBool(state), mode, ConstantU32(state, 2)),
+	           nonzero(records), raw_bounds));
+	const auto guest = Binary(state, spv::OpIAdd, TypeScalarU64(state), base,
+	                          Unary(state, spv::OpUConvert, TypeScalarU64(state), address.byte));
+	return LoadBda(ctx, guest, AndCondition(state, valid_format, in_bounds), bits);
+}
+
 uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	return EmitValueOrDefaultIfCondition(
@@ -1314,6 +1380,13 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	uint32_t   value;
 	if (buffer_components > 1u)
 		value = LoadWideBuffer(ctx, inst, buffer_components);
+	else if (buffer_components == 1u && mem.kind == IR::ResourceKind::IndirectBuffer)
+		value = EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+			return LoadIndirectBufferElement(ctx, inst,
+			                                 inst.GetType() == IR::Type::U8    ? 8u
+			                                 : inst.GetType() == IR::Type::U16 ? 16u
+			                                                                   : 32u);
+		});
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);
 	else if (mem.kind == IR::ResourceKind::ScalarAddress)

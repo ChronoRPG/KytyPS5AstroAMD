@@ -30,6 +30,7 @@
 #include <map>
 #include <mutex>
 #include <span>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 
@@ -546,10 +547,11 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 
 } // namespace
 
-// KYTY_SRT_VARIANT_READS: logs each program dropped because a descriptor it computes at runtime
-// has no BDA path (see TrackResources). Without the switch its flat SRT slots fail to evaluate and
-// its dispatches or draws are dropped just the same.
-static void NoteUnresolvedDescriptor(const CompileOptions& options, uint32_t pc) {
+// KYTY_SRT_VARIANT_READS: logs each program the switch skips instead of exiting, once per shader:
+// a descriptor it computes at runtime that has no BDA path (see TrackResources; without the switch
+// its flat SRT slots fail to evaluate and its dispatches or draws are dropped just the same), or an
+// S_SWAPPC_B64 call (without the switch, the CFG build exits).
+static void NoteSkippedProgram(const CompileOptions& options, uint32_t pc, std::string_view reason) {
 	static std::mutex                   mutex;
 	static std::unordered_set<uint64_t> logged;
 	{
@@ -559,9 +561,16 @@ static void NoteUnresolvedDescriptor(const CompileOptions& options, uint32_t pc)
 		}
 	}
 	Log::WriteToConsoleAndLog(fmt::format(
-	    "KYTY_SRT_VARIANT_READS: {} shader 0x{:016x} computes a descriptor at runtime (pc=0x{:08x}) "
-	    "that has no BDA path; its dispatches and draws are skipped.\n",
-	    StageName(options.stage), options.shader_hash, pc));
+	    "KYTY_SRT_VARIANT_READS: {} shader 0x{:016x} {} (pc=0x{:08x}); its dispatches and draws are "
+	    "skipped.\n",
+	    StageName(options.stage), options.shader_hash, reason, pc));
+}
+
+// S_SWAPPC_B64 with a destination: a call through a function pointer (the NULL-destination jump
+// decodes as S_SETPC_B64). Psr's shader-mesh BVH builders fetch vertices through such callbacks.
+static bool IsUnsupportedCall(const Decoder::Instruction& inst) {
+	return inst.opcode == Decoder::Opcode::UNSUPPORTED && inst.family == Decoder::Family::SOP1 &&
+	       inst.opcode_id == 0x21u;
 }
 
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
@@ -634,6 +643,19 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		decoded_dump = Decoder::ProgramToString(decoded);
 		if (options.early_dump) {
 			LOGF("%s decoded RDNA2 (early):\n%s", GetDumpLabel(options), decoded_dump.c_str());
+		}
+	}
+	// KYTY_SRT_VARIANT_READS: a program that calls a function through S_SWAPPC_B64 is skipped with
+	// one log line instead of exiting when the CFG is built.
+	if (GetCodegenOptions().srt_variant_reads) {
+		const auto call = std::ranges::find_if(decoded.instructions, IsUnsupportedCall);
+		if (call != decoded.instructions.end()) {
+			NoteSkippedProgram(options, call->pc,
+			                   "calls a function through S_SWAPPC_B64, which is not supported");
+			TranslateResult skipped;
+			skipped.skip_dispatch = true;
+			skipped.decoded_dump  = std::move(decoded_dump);
+			return skipped;
 		}
 	}
 
@@ -726,7 +748,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	IR::EliminateDeadCode(ir.blocks);
 	if (const auto unresolved_pc = IR::TrackResources(ir, variant_reads);
 	    unresolved_pc != UINT32_MAX) {
-		NoteUnresolvedDescriptor(options, unresolved_pc);
+		NoteSkippedProgram(options, unresolved_pc,
+		                   "computes a descriptor at runtime that has no BDA path");
 		TranslateResult skipped;
 		skipped.skip_dispatch = true;
 		return skipped;

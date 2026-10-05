@@ -156,12 +156,132 @@ TestCase ScalarLoadsThroughLoopCarriedRecords() {
   return test;
 }
 
+// BUFFER_LOAD_DWORD/UBYTE/SBYTE/USHORT/SSHORT through V#s the shader selects at runtime (the
+// BDA path, KYTY_SRT_VARIANT_READS). RDNA2 ISA 8.1.5 range checks by OOB_SELECT (V# dword3
+// bits 29:28): 0 structured (index >= num_records or offset >= stride), 1 index only, 2 only
+// num_records == 0, 3 raw (offset + payload > num_records - SOFFSET); an invalid FORMAT reads 0.
+TestCase RawLoadsThroughGpuSelectedDescriptors() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000128000000ull;
+  enum Load : u32 { Ubyte = 0x08, Sbyte = 0x09, Ushort = 0x0a, Sshort = 0x0b, Dword = 0x0c };
+  struct LoadCase {
+    u32 op, mode, stride, records, index, voffset, soffset, inst_offset;
+    bool idxen, invalid_format = false;
+  };
+  const LoadCase cases[] = {
+      {Dword, 3, 0, 16, 0, 8, 0, 0, false},   // 8 + 4 <= 16: in
+      {Dword, 3, 0, 16, 0, 14, 0, 0, false},  // 14 + 4 > 16: 0
+      {Ubyte, 3, 0, 13, 0, 12, 0, 0, false},  // 12 + 1 <= 13: in
+      {Ubyte, 3, 0, 12, 0, 12, 0, 0, false},  // 12 + 1 > 12: 0
+      {Ushort, 3, 0, 14, 0, 12, 0, 0, false}, // 12 + 2 <= 14: in
+      {Ushort, 3, 0, 13, 0, 12, 0, 0, false}, // 12 + 2 > 13: 0
+      {Sbyte, 3, 0, 32, 0, 5, 0, 0, false},   // sign-extended byte
+      {Sshort, 3, 0, 32, 0, 6, 0, 0, false},  // sign-extended short
+      {Dword, 3, 0, 16, 0, 4, 4, 4, false},   // SOFFSET 4 + offset 8: 8 + 4 <= 16 - 4: in
+      {Dword, 3, 0, 16, 0, 8, 4, 0, false},   // 8 + 4 > 16 - 4: 0
+      {Dword, 0, 8, 3, 2, 4, 0, 0, true},     // structured: index 2 < 3, offset 4 < 8: in
+      {Dword, 0, 8, 3, 3, 0, 0, 0, true},     // index 3 >= 3: 0
+      {Dword, 0, 8, 3, 1, 8, 0, 0, true},     // offset 8 >= stride 8: 0
+      {Dword, 1, 8, 3, 1, 12, 0, 0, true},    // index only: offset 12 past the stride still reads
+      {Dword, 1, 4, 2, 2, 0, 0, 0, true},     // index 2 >= 2: 0
+      {Dword, 2, 0, 1, 0, 20, 0, 0, false},   // num_records != 0: no bounds
+      {Dword, 2, 0, 0, 0, 0, 0, 0, false},    // num_records == 0: 0
+      {Dword, 3, 0, 32, 0, 0, 0, 0, false, true}, // invalid format: 0
+  };
+  constexpr u32 Count = static_cast<u32>(std::size(cases));
+  const auto byte_at = [](u32 i, u32 b) { return static_cast<uint8_t>(0x80u + i * 16u + b * 5u); };
+  TestCase test;
+  test.name = "RawLoadsThroughGpuSelectedDescriptors";
+  test.initial.resize(4096);
+  for (u32 i = 0; i < Count; ++i) {
+    const u32 data_offset = 8192 + i * 128;
+    const uint64_t base = GuestBase + data_offset;
+    const u32 format = cases[i].invalid_format ? 0u : 0x16u;
+    const std::array<u32, 4> descriptor{
+        static_cast<u32>(base), (cases[i].stride << 16u) | static_cast<u32>(base >> 32u),
+        cases[i].records, (cases[i].mode << 28u) | (format << 12u) | 0xfacu};
+    std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130 + i * 30);
+    for (u32 b = 0; b < 128; ++b) {
+      auto &word = test.initial[(data_offset + b) / 4];
+      word |= static_cast<u32>(byte_at(i, b)) << ((b % 4u) * 8u);
+    }
+  }
+  for (u32 i = 0; i < Count; ++i) {
+    const u32 selected = Count - 1 - i;
+    const auto &input = cases[selected];
+    test.initial[64 + i] = selected;
+    AppendVMovU32(&test.code, 30, (64 + i) * 4);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0))); // v_readfirstlane_b32 s20, v0
+    test.code.push_back(EncodeSop2(0x26, 20, 20, 255)); // s_mul_i32 s20, s20, 120
+    test.code.push_back(120);
+    test.code.push_back(EncodeSmem0(0x0a, 8, 0)); // s_buffer_load_dwordx4 s[8:11], s[0:3]
+    test.code.push_back(EncodeSmem1(520, 20));
+    AppendSMovLiteral(&test.code, 22, input.soffset);
+    AppendVMovU32(&test.code, 2, input.idxen ? input.index : input.voffset);
+    AppendVMovU32(&test.code, 3, input.voffset);
+    test.code.push_back(EncodeMubuf0(input.op, input.inst_offset, input.idxen, true));
+    test.code.push_back(EncodeMubuf1(1, 2, 2, 22)); // v1, s[8:11], v[2:3] or v2, s22
+    AppendStoreVgpr(&test.code, 1, i);
+    // Reference: RDNA2 8.1.5 linear addressing and range checks.
+    const u32 bytes = input.op == Dword ? 4u : (input.op == Ushort || input.op == Sshort) ? 2u : 1u;
+    const u32 offset = input.voffset + input.inst_offset;
+    const u32 record = input.idxen ? input.index * input.stride : 0u;
+    bool in = !input.invalid_format;
+    switch (input.mode) {
+      case 0: in = in && input.index < input.records && offset < input.stride; break;
+      case 1: in = in && input.index < input.records; break;
+      case 2: in = in && input.records != 0; break;
+      default:
+        in = in && input.soffset <= input.records && offset + bytes <= input.records - input.soffset;
+        break;
+    }
+    const u32 first = input.soffset + record + offset;
+    u32 value = 0;
+    if (in) {
+      for (u32 b = 0; b < bytes; ++b) {
+        value |= static_cast<u32>(byte_at(selected, first + b)) << (b * 8u);
+      }
+      if (input.op == Sbyte) value = static_cast<u32>(static_cast<int32_t>(static_cast<int8_t>(value)));
+      if (input.op == Sshort) value = static_cast<u32>(static_cast<int32_t>(static_cast<int16_t>(value)));
+    }
+    test.expected.push_back(value);
+  }
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_LOAD_UBYTE,
+                  O::BUFFER_LOAD_SBYTE, O::BUFFER_LOAD_USHORT, O::BUFFER_LOAD_SSHORT,
+                  O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  return test;
+}
+
+// S_SWAPPC_B64 (a call through a function pointer) is skipped, not a CFG-build exit.
+void CallIsSkipped() {
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 4, 0x1000u);
+  AppendSMovLiteral(&code, 5, 0);
+  code.push_back(0xbe8e2104u); // s_swappc_b64 s[14:15], s[4:5]
+  AppendEnd(&code);
+  ShaderComputeInputInfo compute_info{};
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  const auto result = ShaderRecompiler::TranslateProgram(code, options);
+  Require("CallIsSkipped", "translate", result.skip_dispatch,
+          "S_SWAPPC_B64 program was not skipped under KYTY_SRT_VARIANT_READS");
+  std::printf("[compute] CallIsSkipped                     ok\n");
+}
+
 void RunAll(VulkanHarness *vulkan) {
   auto options = GetCodegenOptions();
   options.srt_variant_reads = true;
   ScopedCodegenOptions scope(options);
   RunCase(vulkan, ScalarBufferLoadsGpuSelectedDescriptors());
   RunCase(vulkan, ScalarLoadsThroughLoopCarriedRecords());
+  RunCase(vulkan, RawLoadsThroughGpuSelectedDescriptors());
+  CallIsSkipped();
 }
 
 } // namespace SrtVariantTests
