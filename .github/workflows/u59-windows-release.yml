@@ -154,7 +154,7 @@ jobs:
         shell: pwsh
         run: |
           $runtime = Join-Path $env:GITHUB_WORKSPACE '_Build/windows/install'
-          $release = Join-Path $env:RUNNER_TEMP 'KytyPS5-U59-Demons-Windows-x64'
+          $release = Join-Path $env:RUNNER_TEMP 'KytyPS5-U59-Windows-x64'
           New-Item -ItemType Directory -Path $release | Out-Null
           Copy-Item -Path (Join-Path $runtime '*') -Destination $release -Recurse
           Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination $release
@@ -170,7 +170,7 @@ jobs:
           Copy-Item -Path '3rdparty/tracy/profiler/src/font/Roboto-*.ttf' -Destination $fonts
           if (@(Get-ChildItem -LiteralPath $fonts -Filter 'Roboto-*.ttf').Count -ne 4) { throw 'Expected four Roboto fonts.' }
           Copy-Item -LiteralPath '3rdparty/SPIRV-Tools/LICENSE' -Destination (Join-Path $fonts 'LICENSE-Apache-2.0.txt')
-          $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-U59-Demons-Windows-x64.zip'
+          $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-U59-Windows-x64.zip'
           Compress-Archive -Path (Join-Path $release '*') -DestinationPath $archive
           "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
@@ -179,7 +179,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create $env:GITHUB_REF_NAME 'KytyPS5-U59-Demons-Windows-x64.zip' `
+          # docs/release-notes.md: the first line is the title ("# ..."), the rest the notes. A tag ending in -pre
+          # becomes a GitHub pre-release.
+          $lines = Get-Content -LiteralPath 'docs/release-notes.md'
+          $title = ($lines[0] -replace '^#\s*', '').Trim()
+          $lines | Select-Object -Skip 1 | Set-Content -LiteralPath 'release-notes-body.md' -Encoding utf8
+          $flags = @()
+          if ($env:GITHUB_REF_NAME -like '*-pre') { $flags += '--prerelease' }
+          gh release create $env:GITHUB_REF_NAME 'KytyPS5-U59-Windows-x64.zip' @flags `
             --repo $env:GITHUB_REPOSITORY `
-            --title "U59 integration: adaptive trigger fix for Astro's Playroom gun (Windows x64, $env:GITHUB_REF_NAME)" `
-            --notes "New since u59-windows-20261005-int11: a vibration trigger now reports firing only while it is pressed; in Astro's Playroom the gun fired by itself with the trigger untouched. Nothing else changed since int11; program caches stay valid. From int11 (new since int10): more adaptive trigger fixes, tested in Astro's Playroom, where the gacha capsules break on R2 again. A feedback trigger now reports pushing only while it is pressed (it did so untouched before, so the game never saw the press); the trigger state follows every effect the game sets; an L2/R2 that arrives as a button only (input remapping, some pads and tools) counts as a full press. Nothing else changed since int10; program caches stay valid. From int10 (new since int9): adaptive triggers. The game now sees the state of the trigger effects it sets (scePadGetTriggerEffectState always answered 0 before), so Astro Bot levels in which L2/R2 actions such as punches did nothing now work. The state follows from the game's effect and how far the trigger is pressed, so it also works with other pads and the keyboard. Nothing else changed; int9's program caches stay valid. Also: players confirmed that int9 fixed the freeze on an RTX 5090 PC. From int9 (new since int7), about compatibility. RTX 50 freeze fix: a hang watchdog report from an RTX 5070 Ti showed the cause. The GPU waited for a texture copy that a CPU thread was about to finish, and that thread's copy-done signal and the frame presentation then blocked each other inside Windows (hardware-accelerated GPU scheduling). The emulator now waits for such copies on the CPU before it hands the GPU work that reads them to the driver, so the GPU never waits for a signal that only the CPU can give later; the upload DMA transfers follow the same rule. Not yet confirmed on an RTX 50 PC: RTX 50 players, please report whether the freeze is gone with the default Mailbox present mode, and if it still freezes send _HangTrace\watchdog-*\watchdog.txt from beside the emulator. AMD, Intel and older GPUs: places where the emulator stopped because a GPU or driver lacked an optional feature now continue. VK_EXT_color_write_enable and VK_EXT_depth_clip_enable are optional; images the driver refuses are created without the optional usages and flags they can do without; compute shaders that compute a texture LOD enable VK_KHR_compute_shader_derivatives (or the NV extension); Intel compute shaders require 32-wide subgroups; AMD pixel and mesh shaders require the guest's wave size; block-compressed volume textures, depth feedback loops without the host extension, image descriptors with undefined formats, oversized image readbacks and low GPU memory reports no longer stop the emulator; GPUs without mesh shaders get a clear message at startup and at the first mesh draw. On NVIDIA RTX cards these paths are unchanged; they were not tested on AMD or Intel hardware for this release. CPUs, from upstream KytyPS5: the launcher's AMD CPU patch option (--amd-cpu) now runs the game's VRSQRTPS instructions as native code at most sites (Sky Garden 31.6 instead of 18.9 fps with the option on); CPUs without SSE4a (Intel) run EXTRQ through native code, and INSERTQ, RDPID and CLWB are emulated where the CPU lacks them. Windows: emulator functions the game calls realign the stack (a crash fix). Also from upstream (third sync, through db1758527): rendering fixes, DualSense vibration and volume settings in the launcher, the cursor hidden over the game window, kernel timers and batched AIO. The shader translation changed, so the first launch of each game rebuilds its program cache: slow first loads and stutter until it fills. Measured on one PC (RTX 3090, Ryzen 9 7950X3D, 120 Hz vblank, warm cache): Sky Garden 35.2 fps (int7: 33-35), Creamy Canyon 21.3 fps (int7: 21.7-22.2); Demon's Souls boots to its menu. kyty_emulator is built with a new PGO profile recorded in Astro Bot. Microsoft Defender flagged int7's launcher.exe as Trojan:Win32/Bearfoos.A!ml (a machine-learning verdict); the launcher is built by this repository's release workflow from src/launcher. Open launcher.exe directly; the existing shared Kyty.ini supplies game paths and display settings. See U59-README.md. From int7: shader pipelines prepared ahead (less stutter on first runs), a small upload ring (about 0.4-0.5 GB less RAM), batched occlusion query resets and the shader storage-write retick fix."
+            --title $title `
+            --notes-file 'release-notes-body.md'

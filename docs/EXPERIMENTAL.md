@@ -1,6 +1,6 @@
 # U59 integration release (Windows x64)
 
-This release builds on the U59 renderer and the Demon's Souls changes of the previous U59 release.
+This release builds on the U59 renderer of the previous U59 releases.
 
 ## New in this update
 
