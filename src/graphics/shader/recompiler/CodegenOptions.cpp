@@ -79,6 +79,7 @@ CodegenOptions FromEnvironment() {
 	options.rt_stub      = EnvFlag("KYTY_RT_STUB", options.rt_stub);
 	options.rt_software  = EnvFlag("KYTY_RT_SOFTWARE", options.rt_software);
 	options.rt_type6     = EnvFlag("KYTY_RT_TYPE6", options.rt_type6);
+	options.bda_writes        = EnvFlag("KYTY_BDA_WRITES", options.bda_writes);
 	if (const auto* mode = std::getenv("KYTY_MAD_MODE"); mode != nullptr) {
 		if (std::strcmp(mode, "exact") == 0) {
 			options.mad_mode = MadMode::Exact;

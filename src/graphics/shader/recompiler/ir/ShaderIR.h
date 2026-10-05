@@ -80,6 +80,48 @@ struct MemoryInfo {
 		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
 		        opcode == ValueOpcode::LoadBufferU32x4 || opcode == ValueOpcode::ReadConstBuffer);
 	}
+	// KYTY_BDA_WRITES: raw (unformatted) stores and every buffer atomic can write through a V# the
+	// shader computes.
+	[[nodiscard]] bool SupportsIndirectRawWrite(ValueOpcode opcode) const {
+		if (formatted || typed) {
+			return false;
+		}
+		switch (opcode) {
+			case ValueOpcode::StoreBufferU8: return data_bits == 8u;
+			case ValueOpcode::StoreBufferU16: return data_bits == 16u;
+			case ValueOpcode::StoreBufferU32:
+			case ValueOpcode::StoreBufferU32x2:
+			case ValueOpcode::StoreBufferU32x3:
+			case ValueOpcode::StoreBufferU32x4: return data_bits == 32u;
+			case ValueOpcode::BufferAtomicSwap32:
+			case ValueOpcode::BufferAtomicCmpSwap32:
+			case ValueOpcode::BufferAtomicIAdd32:
+			case ValueOpcode::BufferAtomicISub32:
+			case ValueOpcode::BufferAtomicSMin32:
+			case ValueOpcode::BufferAtomicUMin32:
+			case ValueOpcode::BufferAtomicSMax32:
+			case ValueOpcode::BufferAtomicUMax32:
+			case ValueOpcode::BufferAtomicAnd32:
+			case ValueOpcode::BufferAtomicOr32:
+			case ValueOpcode::BufferAtomicXor32:
+			case ValueOpcode::BufferAtomicInc32:
+			case ValueOpcode::BufferAtomicDec32:
+			case ValueOpcode::BufferAtomicFMin32:
+			case ValueOpcode::BufferAtomicFMax32:
+			case ValueOpcode::BufferAtomicSwap64:
+			case ValueOpcode::BufferAtomicCmpSwap64:
+			case ValueOpcode::BufferAtomicIAdd64:
+			case ValueOpcode::BufferAtomicISub64:
+			case ValueOpcode::BufferAtomicSMin64:
+			case ValueOpcode::BufferAtomicUMin64:
+			case ValueOpcode::BufferAtomicSMax64:
+			case ValueOpcode::BufferAtomicUMax64:
+			case ValueOpcode::BufferAtomicAnd64:
+			case ValueOpcode::BufferAtomicOr64:
+			case ValueOpcode::BufferAtomicXor64: return true;
+			default: return false;
+		}
+	}
 	// KYTY_SRT_VARIANT_READS: every raw (unformatted) vector load can read through a V# the shader
 	// computes, BUFFER_LOAD_UBYTE/USHORT/DWORD included, not only DWORDX2-X4.
 	[[nodiscard]] bool SupportsIndirectRawLoad(ValueOpcode opcode) const {
@@ -516,6 +558,10 @@ struct ShaderInfo {
 	bool                             uses_dma           = false;
 	// IMAGE_BVH*_INTERSECT_RAY translated (KYTY_RT_STUB); counts the program's draws/dispatches.
 	bool                             uses_bvh           = false;
+	// KYTY_BDA_WRITES: the program stores or does atomics through a V# it computes (IndirectBuffer
+	// writes through BDA). Implies uses_dma and has_address_writes; the renderer settles each of
+	// its dispatches synchronously.
+	bool                             bda_writes         = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

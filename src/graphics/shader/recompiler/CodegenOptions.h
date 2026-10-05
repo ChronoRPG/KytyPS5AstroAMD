@@ -183,6 +183,11 @@ struct CodegenOptions {
 	// KYTY_RT_TYPE6=0 (with KYTY_RT_SOFTWARE): node type 6 misses (four invalid children) like
 	// RDNA2's user node, instead of being decoded as the PS5 shared-exponent box.
 	bool rt_type6 = true;
+	// KYTY_BDA_WRITES=1 (or =verify): raw stores and atomics through a V# the shader computes
+	// (Psr's BVH builders) write guest memory through BDA instead of failing resource tracking. The
+	// renderer settles each such dispatch synchronously: it waits for it and marks the pages it wrote
+	// GPU-owned before the CP continues (Profiling/analysis/BDA-WRITES-DESIGN.md).
+	bool bda_writes = false;
 };
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.

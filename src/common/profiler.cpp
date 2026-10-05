@@ -698,6 +698,11 @@ constexpr std::array<const char*, kFrameEventCount> kFrameEventNames {
     "FrameEvent.CpCommitDccGuestRejects.Cumulative",
     "FrameEvent.CpCommitTexDccRecords.Cumulative",
     "FrameEvent.CpCommitTexDccRejects.Cumulative",
+    "FrameEvent.BdaSettles.Cumulative",
+    "FrameEvent.BdaSettlePages.Cumulative",
+    "FrameEvent.BdaDroppedWrites.Cumulative",
+    "FrameEvent.BdaAliasHits.Cumulative",
+    "FrameEvent.BdaAliasedImages.Cumulative",
 };
 static_assert(kFrameEventNames.back() != nullptr, "FrameEvent names must match the enum");
 
@@ -773,6 +778,7 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitCallNames {
     "FrameWait.DrawPrepCommitWaitStart.Calls.Cumulative",
     "FrameWait.CpSeqPrefetch.Calls.Cumulative",
     "FrameWait.SubmitDependencyWait.Calls.Cumulative",
+    "FrameWait.BdaSettle.Calls.Cumulative",
 };
 static_assert(kFrameWaitCallNames.back() != nullptr, "FrameWait names must match the enum");
 constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
@@ -841,6 +847,7 @@ constexpr std::array<const char*, kFrameWaitCount> kFrameWaitTimeNames {
     "FrameWait.DrawPrepCommitWaitStart.Nanoseconds.Cumulative",
     "FrameWait.CpSeqPrefetch.Nanoseconds.Cumulative",
     "FrameWait.SubmitDependencyWait.Nanoseconds.Cumulative",
+    "FrameWait.BdaSettle.Nanoseconds.Cumulative",
 };
 static_assert(kFrameWaitTimeNames.back() != nullptr, "FrameWait names must match the enum");
 

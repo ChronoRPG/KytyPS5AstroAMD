@@ -34,8 +34,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <unordered_set>
+#include <mutex>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -4330,6 +4333,186 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSy
 			}
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false, stats);
 		}
+	}
+}
+
+namespace {
+
+enum class BdaWritesMode { Off, On, Verify };
+
+BdaWritesMode GetBdaWritesMode() {
+	static const BdaWritesMode mode = [] {
+		const auto* value = std::getenv("KYTY_BDA_WRITES");
+		if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+			return BdaWritesMode::Off;
+		}
+		return std::strcmp(value, "verify") == 0 ? BdaWritesMode::Verify : BdaWritesMode::On;
+	}();
+	return mode;
+}
+
+// One console line per shader for each kind of BDA-write anomaly.
+bool FirstBdaWriteNote(uint64_t shader_hash, uint32_t kind) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> noted;
+	std::scoped_lock                    lock(mutex);
+	return noted.insert(shader_hash ^ (static_cast<uint64_t>(kind) << 62u)).second;
+}
+
+} // namespace
+
+bool BdaWritesEnabled() {
+	return GetBdaWritesMode() != BdaWritesMode::Off;
+}
+
+bool BdaWritesVerify() {
+	return GetBdaWritesMode() == BdaWritesMode::Verify;
+}
+
+void BufferCache::PrepareBdaWrites() {
+	EXIT_IF(!BdaWritesEnabled());
+	m_fault_manager.PrepareBdaWrites();
+	// The dispatch may overwrite any known fill.
+	ForgetKnownFills(0, uint64_t {1} << 40u);
+	// A GPU-modified image over a cache buffer holds bytes its buffer lacks. A BDA write into that
+	// buffer and the settle's image invalidation would drop them: move them into the buffer first
+	// when image writebacks are on, exactly as a writable binding over the range does (only pages
+	// with a cache buffer can receive a BDA write).
+	std::vector<std::pair<BufferId, GuestRange>> overlaps;
+	{
+		std::scoped_lock lock {m_texture_cache.m_lock};
+		m_texture_cache.m_slot_images.ForEach([&](ImageId, const Image& image) {
+			if (!image.IsGpuModified()) {
+				return;
+			}
+			const auto begin = image.info.data.address;
+			const auto end   = image.info.data.End();
+			auto       it    = m_buffers.upper_bound(begin);
+			if (it != m_buffers.begin()) {
+				--it;
+			}
+			for (; it != m_buffers.end() && it->first < end; ++it) {
+				const auto& buffer = m_slot_buffers[it->second];
+				const auto  start  = std::max(buffer.CpuAddress(), begin);
+				const auto  finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+				if (start < finish) {
+					overlaps.push_back({it->second, GuestRange {start, finish - start}});
+				}
+			}
+		});
+	}
+	if (overlaps.empty()) {
+		return;
+	}
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaAliasedImages, overlaps.size());
+	if (!ImageWritebackOnGpuWriteEnabled()) {
+		// As for a writable binding with writebacks off: the image contents are not moved.
+		return;
+	}
+	for (const auto& [id, range]: overlaps) {
+		if (!IsBufferInvalid(id) && m_slot_buffers[id].IsInBounds(range.address, range.size)) {
+			PreserveImagesForGpuWrite(id, range.address, range.size);
+		}
+	}
+}
+
+void BufferCache::SettleBdaWrites(uint64_t shader_hash) {
+	EXIT_IF(!BdaWritesEnabled());
+	Profiler::ScopedFrameWait wait(Profiler::FrameWait::BdaSettle);
+	// Records the compaction after the dispatch, submits and waits: the pages it wrote.
+	const auto writes = m_fault_manager.CollectBdaWrites();
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettles);
+	if (writes.dropped != 0) {
+		Profiler::CountFrameEvent(Profiler::FrameEvent::BdaDroppedWrites, writes.dropped);
+		if (FirstBdaWriteNote(shader_hash, 0)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "KYTY_BDA_WRITES: CS shader 0x{:016x} dropped {} write(s) to pages without a cache "
+			    "buffer (their faults create one for later dispatches).\n",
+			    shader_hash, writes.dropped));
+		}
+		if (BdaWritesVerify()) {
+			EXIT("KYTY_BDA_WRITES=verify: shader 0x%016" PRIx64 " dropped %u BDA write(s)\n",
+			     shader_hash, writes.dropped);
+		}
+	}
+	RangeSet written;
+	if (writes.overflow) {
+		// More pages than the list holds (the rest of the bits are gone): every page that could
+		// have received a write, i.e. every cache buffer.
+		for (const auto& [vaddr, id]: m_buffers) {
+			written.Add(vaddr, m_slot_buffers[id].Size());
+		}
+		if (FirstBdaWriteNote(shader_hash, 1)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "KYTY_BDA_WRITES: CS shader 0x{:016x} wrote more pages than one settle lists; every "
+			    "cache buffer is taken into GPU ownership.\n",
+			    shader_hash));
+		}
+	} else {
+		for (const auto page: writes.pages) {
+			written.Add(page, CACHING_PAGESIZE);
+		}
+	}
+	uint64_t settled_pages = 0;
+	written.ForEach([&](uint64_t start, uint64_t end) {
+		SettleBdaWrittenRange(start, end - start, shader_hash, settled_pages);
+	});
+	Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettlePages, settled_pages);
+}
+
+void BufferCache::SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t shader_hash,
+                                        uint64_t& settled_pages) {
+	// Collect first: settling a part may create or merge buffers (not here, but keep the loop
+	// independent of the map).
+	std::vector<std::pair<BufferId, GuestRange>> parts;
+	const auto                                   end = vaddr + size;
+	auto                                         it  = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		const auto  start  = std::max(buffer.CpuAddress(), vaddr);
+		const auto  finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+		if (start < finish) {
+			parts.push_back({it->second, GuestRange {start, finish - start}});
+		}
+	}
+	for (const auto& [id, range]: parts) {
+		const auto start = range.address;
+		const auto bytes = range.size;
+		settled_pages += (bytes + CACHING_PAGESIZE - 1) / CACHING_PAGESIZE;
+		// An image that owned bytes here missed their move into the buffer before the write
+		// (writebacks off, or a GPU-modified image this dispatch made): its bytes are lost now.
+		if (m_texture_cache.IsRegionGpuModified(start, bytes)) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::BdaAliasHits);
+			if (FirstBdaWriteNote(shader_hash, 2)) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "KYTY_BDA_WRITES: CS shader 0x{:016x} wrote 0x{:x}+0x{:x}, under a GPU-modified "
+				    "image.\n",
+				    shader_hash, start, bytes));
+			}
+			if (BdaWritesVerify()) {
+				EXIT("KYTY_BDA_WRITES=verify: shader 0x%016" PRIx64 " wrote 0x%016" PRIx64
+				     "+0x%" PRIx64 " under a GPU-modified image\n",
+				     shader_hash, start, bytes);
+			}
+		}
+		// What a writable binding over the range records (ObtainBuffer), after the fact: the
+		// dispatch has completed, so the pages become GPU-owned before anything else is recorded
+		// or read.
+		auto& buffer = m_slot_buffers[id];
+		(void)SynchronizeBuffer(buffer, start, bytes, true, false, nullptr, "bda-write");
+		buffer.MarkContentWritten();
+		if (!m_gpu_modified_ranges.Contains(start, bytes)) {
+			CleanVerdict::Invalidate(start, bytes, Coherence::Source::BufferDirtyAdd);
+		}
+		m_gpu_modified_ranges.Add(start, bytes);
+		NoteBufferContentWrite(start, bytes);
+		ForgetKnownFills(start, bytes);
+		HangTrace::NoteGpuWrite(start, bytes);
+		// Overlapping images are rebuilt from the buffer (the Water agent's rule for BDA writes).
+		m_texture_cache.InvalidateMemoryFromGPU(start, bytes);
 	}
 }
 
