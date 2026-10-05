@@ -4,6 +4,11 @@ This release builds on the U59 renderer and the Demon's Souls changes of the pre
 
 ## New in this update
 
+- Adaptive triggers: a vibration trigger now reports "firing" only while it is pressed. In Astro's Playroom the gun
+  fired by itself with the trigger untouched. Nothing else changed since int11; program caches stay valid.
+
+From int11 (`u59-windows-20261005-int11`):
+
 - More adaptive trigger fixes, tested in Astro's Playroom: the gacha capsules break on R2 again. A feedback trigger
   now reports "pushing" only while it is pressed (it did so untouched before, so the game never saw the press); the
   state follows every effect the game sets; and an L2/R2 that arrives as a button only (input remapping, some pads
