@@ -83,6 +83,15 @@ jobs:
             avplayer_file_tests device_compat_tests shader_cfg_tests kernel_file_system_tests
 
       - name: Test
-        shell: cmd
+        shell: pwsh
         run: |
-          ctest --test-dir _Build/tests --output-on-failure -R "^(page_manager|memory_tracker|audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|virtual_memory_allocation.*|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|device_compat|shader_cfg|kernel_file_system)$"
+          ctest --test-dir _Build/tests --output-on-failure -R "^(page_manager|memory_tracker|audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|virtual_memory_allocation.*|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|device_compat|shader_cfg|kernel_file_system)$" 2>&1 | Tee-Object -FilePath ctest.log
+          $code = $LASTEXITCODE
+          # Job logs need a GitHub sign-in to read; annotations do not. Name each failed test and its error lines.
+          foreach ($line in (Get-Content ctest.log | Select-String -Pattern '\((Failed|Timeout|Exception|SEGFAULT|Not Run)\)|\*\*\*(Failed|Exception)')) {
+            Write-Host ('::error::' + "$($line.Line.Trim())".Replace('%', '%25'))
+          }
+          foreach ($line in (Get-Content ctest.log | Select-String -Pattern 'Fatal|Error:|FAILED|abort' | Select-Object -First 10)) {
+            Write-Host ('::warning::' + "$($line.Line.Trim())".Replace('%', '%25'))
+          }
+          exit $code
