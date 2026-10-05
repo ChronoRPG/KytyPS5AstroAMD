@@ -4498,6 +4498,33 @@ void BufferCache::SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t 
 				     shader_hash, start, bytes);
 			}
 		}
+		// PrepareBda uploaded every CPU-dirty page before the dispatch, and CommitBindings then
+		// returned every hot page (CPU-dirty by construction) to clean tracking, or to CPU-dirty
+		// when its shadow no longer matched (has_address_writes: InvalidateContentRevisions). A
+		// written page that is CPU-dirty now was written by the guest while the dispatch was being
+		// recorded or ran: the upload below then puts the guest's page over the dispatch's bytes
+		// (hardware would keep both writers' bytes).
+		if (m_memory_tracker.IsRegionCpuModified(start, bytes)) {
+			uint64_t dirty_pages = 0;
+			for (uint64_t page = Common::AlignDown(start, CACHING_PAGESIZE); page < start + bytes;
+			     page += CACHING_PAGESIZE) {
+				const auto first = std::max(page, start);
+				const auto last  = std::min(page + CACHING_PAGESIZE, start + bytes);
+				dirty_pages += m_memory_tracker.IsRegionCpuModified(first, last - first) ? 1u : 0u;
+			}
+			Profiler::CountFrameEvent(Profiler::FrameEvent::BdaSettleCpuDirtyPages, dirty_pages);
+			if (FirstBdaWriteNote(shader_hash, 3)) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "KYTY_BDA_WRITES: CS shader 0x{:016x} wrote 0x{:x}+0x{:x}, which the guest also "
+				    "wrote during the dispatch ({} page(s)).\n",
+				    shader_hash, start, bytes, dirty_pages));
+			}
+			if (BdaWritesVerify()) {
+				EXIT("KYTY_BDA_WRITES=verify: shader 0x%016" PRIx64 " wrote 0x%016" PRIx64
+				     "+0x%" PRIx64 ", which the guest wrote during the dispatch\n",
+				     shader_hash, start, bytes);
+			}
+		}
 		// What a writable binding over the range records (ObtainBuffer), after the fact: the
 		// dispatch has completed, so the pages become GPU-owned before anything else is recorded
 		// or read.

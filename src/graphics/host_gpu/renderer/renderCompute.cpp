@@ -386,7 +386,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		Profiler::CountFrameEvent(Profiler::FrameEvent::RtStubDispatches);
 	}
 	if (program.info.bda_writes) {
-		// KYTY_BDA_WRITES: settled synchronously right after the dispatch below.
+		// KYTY_BDA_WRITES: settled synchronously right after the dispatch below. The settle relies
+		// on PrepareBda's pass above having uploaded every CPU-dirty page first.
+		EXIT_IF(!program.info.uses_dma);
 		m_context.GetBufferCache().PrepareBdaWrites();
 	}
 	RebindImages(bindings);
@@ -517,7 +519,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		Profiler::CountFrameEvent(Profiler::FrameEvent::RtStubDispatches);
 	}
 	if (program.info.bda_writes) {
-		// KYTY_BDA_WRITES: settled synchronously right after the dispatch below.
+		// KYTY_BDA_WRITES: settled synchronously right after the dispatch below. The settle relies
+		// on PrepareBda's pass above having uploaded every CPU-dirty page first.
+		EXIT_IF(!program.info.uses_dma);
 		m_context.GetBufferCache().PrepareBdaWrites();
 	}
 	RebindImages(bindings);

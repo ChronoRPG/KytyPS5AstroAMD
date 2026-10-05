@@ -194,8 +194,10 @@ FaultManager::BdaWrites FaultManager::CollectBdaWrites() {
 		                                          AllFlags, BdaDownloadSize);
 	}
 	auto* mapped = m_bda_download->Mapped().data();
-	std::memset(mapped, 0, BdaDownloadSize);
-	m_bda_download->Flush(0, BdaDownloadSize);
+	// Only the count (entry 0) is read before entries are: the shader writes entries 1..count and
+	// the copy below overwrites the counter slot.
+	std::memset(mapped, 0, sizeof(uint64_t));
+	m_bda_download->Flush(0, sizeof(uint64_t));
 
 	constexpr auto bitmap_offset  = BufferCache::BDA_WRITE_BITMAP_WORD * sizeof(uint32_t);
 	constexpr auto bitmap_size    = BufferCache::FAULT_BITMAP_WORDS * sizeof(uint32_t);
@@ -273,12 +275,17 @@ FaultManager::BdaWrites FaultManager::CollectBdaWrites() {
 	command.pipelineBarrier2(dependency);
 
 	m_scheduler.Wait(m_scheduler.CurrentTick());
-	m_bda_download->Invalidate(0, BdaDownloadSize);
+	// Read back only what was written: the count, then its entries and the counter copy.
+	m_bda_download->Invalidate(0, sizeof(uint64_t));
 	BdaWrites result;
 	uint32_t  count = 0;
 	std::memcpy(&count, mapped, sizeof(count));
 	result.overflow   = count > MaxBdaWritePages - 1;
 	const auto stored = std::min<size_t>(count, MaxBdaWritePages - 1);
+	if (stored != 0) {
+		m_bda_download->Invalidate(sizeof(uint64_t), stored * sizeof(uint64_t));
+	}
+	m_bda_download->Invalidate(BdaPagesAreaSize, sizeof(uint32_t));
 	result.pages.resize(stored);
 	std::memcpy(result.pages.data(), mapped + sizeof(uint64_t), stored * sizeof(uint64_t));
 	std::memcpy(&result.dropped, mapped + BdaPagesAreaSize, sizeof(uint32_t));

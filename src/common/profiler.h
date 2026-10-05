@@ -1227,6 +1227,8 @@ enum class FrameEvent : uint32_t {
 	BdaDroppedWrites,
 	BdaAliasHits,
 	BdaAliasedImages,
+	// Written pages the guest also wrote during the dispatch (CPU-dirty at the settle).
+	BdaSettleCpuDirtyPages,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip
