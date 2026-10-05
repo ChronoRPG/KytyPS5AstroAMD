@@ -48,10 +48,6 @@ bool                       IsFmaskTextureFormat(BufferFormat format);
 /// and 156 for instance, so a value well inside the enum's range can still be no format, and that
 /// is what separates a descriptor from eight dwords that merely sit where one was expected.
 bool                       IsDefinedBufferFormat(BufferFormat format);
-/// Whether the value names a format at all. The encoding leaves wide gaps, everything between 136
-/// and 156 for instance, so a value well inside the enum's range can still be no format, and that
-/// is what separates a descriptor from eight dwords that merely sit where one was expected.
-bool                       IsDefinedBufferFormat(BufferFormat format);
 TextureNumericClass        SampledTextureNumericClass(BufferFormat format);
 BufferFormat               RemapTextureFormat(BufferFormat format);
 
