@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineFastFirst.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
@@ -232,6 +233,8 @@ public:
 		uint64_t programs = 0;
 	};
 	[[nodiscard]] PrefetchTotals GetPrefetchTotals() const;
+	// KYTY_PIPELINE_FAST_FIRST counters (all zero when it is off); tests and diagnostics.
+	[[nodiscard]] FastFirstSnapshot GetFastFirstTotals() const;
 	void NoteProgramPrefetchWait(uint64_t ns);
 	void PrefetchGraphicsPipeline(const PipelineTargets& targets, const HW::Context& ctx,
 	    const HW::UserConfig& user_config, const ShaderVertexInputInfo& vertex_info,

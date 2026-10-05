@@ -28,6 +28,9 @@ namespace Libs::Graphics {
 // plus running optimized compiles (beyond it a new pipeline is built optimized, synchronously, as
 // without the switch); KYTY_PIPELINE_FAST_FIRST_RETIRE_S (default 60, 0 = until exit) how long a
 // replaced pipeline handle stays alive for command buffers that may still use it;
+// KYTY_PIPELINE_FAST_FIRST_PROBE (default 1; 0 skips the driver-cache probe, so every eligible new
+// pipeline is built fast and optimized later; the driver's own on-disk cache can otherwise answer
+// the probe for pipelines this process never compiled);
 // KYTY_PIPELINE_FAST_FIRST_DRAIN_S (default 5) how long exit waits for queued optimized compiles
 // so the saved driver cache holds them.
 
@@ -65,13 +68,15 @@ struct FastFirstCounters {
 	std::atomic<uint64_t> saved_ns {0};        // sum of (optimized compile - fast build) per swap
 	std::atomic<uint64_t> handles_destroyed {0};
 	std::atomic<uint64_t> max_pending {0};
+	std::atomic<uint64_t> seen {0};            // every new pipeline that reached the fast-first path
+	std::atomic<uint64_t> probe_ns {0};        // time spent in driver-cache probes
 };
 
 struct FastFirstSnapshot {
 	uint64_t graphics_fast = 0, compute_fast = 0, fast_ns = 0, cache_hits = 0, ineligible = 0;
 	uint64_t cap_fallbacks = 0, fast_failed = 0, swaps = 0, swaps_dropped = 0, optimize_failed = 0;
 	uint64_t optimize_skipped = 0, optimize_ns = 0, saved_ns = 0, handles_destroyed = 0;
-	uint64_t pending = 0, max_pending = 0;
+	uint64_t pending = 0, max_pending = 0, seen = 0, probe_ns = 0;
 };
 
 [[nodiscard]] inline FastFirstSnapshot SnapshotFastFirst(const FastFirstCounters& c, uint64_t pending) {
@@ -80,15 +85,16 @@ struct FastFirstSnapshot {
 	        get(c.ineligible), get(c.cap_fallbacks), get(c.fast_failed), get(c.swaps),
 	        get(c.swaps_dropped), get(c.optimize_failed), get(c.optimize_skipped),
 	        get(c.optimize_ns), get(c.saved_ns), get(c.handles_destroyed), pending,
-	        get(c.max_pending)};
+	        get(c.max_pending), get(c.seen), get(c.probe_ns)};
 }
 
 [[nodiscard]] inline std::string FormatFastFirst(const FastFirstSnapshot& s) {
-	char text[512];
+	char text[640];
 	std::snprintf(text, sizeof(text),
 	              "Pipeline fast-first: %llu fast builds (%llu graphics, %llu compute; draws waited "
 	              "%.1f ms), %llu optimized swaps (worker %.1f ms, estimated stall saved %.1f ms), "
-	              "%llu pending (peak %llu); built optimized as usual: %llu driver-cache hits, "
+	              "%llu pending (peak %llu); %llu new pipelines seen; built optimized as usual: "
+	              "%llu driver-cache hits (probe %.1f ms), "
 	              "%llu ineligible, %llu queue full, %llu fast build failed; %llu optimized compiles "
 	              "failed, %llu dropped, %llu replaced handles destroyed",
 	              static_cast<unsigned long long>(s.graphics_fast + s.compute_fast),
@@ -97,7 +103,8 @@ struct FastFirstSnapshot {
 	              static_cast<unsigned long long>(s.swaps), static_cast<double>(s.optimize_ns) / 1e6,
 	              static_cast<double>(s.saved_ns) / 1e6, static_cast<unsigned long long>(s.pending),
 	              static_cast<unsigned long long>(s.max_pending),
-	              static_cast<unsigned long long>(s.cache_hits),
+	              static_cast<unsigned long long>(s.seen),
+	              static_cast<unsigned long long>(s.cache_hits), static_cast<double>(s.probe_ns) / 1e6,
 	              static_cast<unsigned long long>(s.ineligible),
 	              static_cast<unsigned long long>(s.cap_fallbacks),
 	              static_cast<unsigned long long>(s.fast_failed),

@@ -3339,23 +3339,37 @@ struct PipelineCache::FastFirstState {
 	                    FastFirstEnvU64("KYTY_PIPELINE_FAST_FIRST_MAX_PENDING", 1024), 1, 1u << 20))),
 	      retire_age_ns(FastFirstEnvU64("KYTY_PIPELINE_FAST_FIRST_RETIRE_S", 60) * 1'000'000'000ull),
 	      drain_ms(FastFirstEnvU64("KYTY_PIPELINE_FAST_FIRST_DRAIN_S", 5) * 1000ull),
-	      log_gate(FastFirstNowNs()),
-	      probe(owner.m_graphics.pipeline_creation_cache_control_enabled) {}
+	      probe(owner.m_graphics.pipeline_creation_cache_control_enabled &&
+	            FastFirstEnvU64("KYTY_PIPELINE_FAST_FIRST_PROBE", 1) != 0),
+	      reporter([this](std::stop_token stop) { Report(stop); }) {}
 	FastFirstState(const FastFirstState&)            = delete;
 	FastFirstState& operator=(const FastFirstState&) = delete;
 
-	void MaybeLog() {
-		if (log_gate.TryClaim(FastFirstNowNs())) {
-			PipelineCacheLog("{}", FormatFastFirst(SnapshotFastFirst(counters, scheduler.Pending())));
+	void Log(const char* when) {
+		PipelineCacheLog("{} ({})", FormatFastFirst(SnapshotFastFirst(counters, scheduler.Pending())),
+		                 when);
+	}
+	// Every 60 s, active or not, so a killed process still leaves its counts in the log.
+	void Report(const std::stop_token& stop) {
+		std::unique_lock lock(report_mutex);
+		while (!report_cv.wait_for(lock, stop, std::chrono::seconds(60), [] { return false; }) &&
+		       !stop.stop_requested()) {
+			Log("60 s report");
 		}
+	}
+	// One early line after the first 100 new pipelines.
+	void NoteSeen() {
+		if (counters.seen.fetch_add(1, std::memory_order_relaxed) + 1 == 100) Log("first 100 pipelines");
 	}
 
 	// Exit: queued optimized compiles run until the drain budget is spent (the driver cache saved
 	// after this holds them), the rest is dropped and their fast pipelines stay.
 	void Stop() {
 		if (scheduler.Stopped()) return;
+		reporter.request_stop();
+		if (reporter.joinable()) reporter.join();
 		scheduler.Stop(drain_ms);
-		PipelineCacheLog("{}", FormatFastFirst(SnapshotFastFirst(counters, scheduler.Pending())));
+		Log("exit");
 	}
 
 	vk::Result CreateGraphics(const vk::GraphicsPipelineCreateInfo& info, vk::Pipeline* pipeline,
@@ -3364,6 +3378,7 @@ struct PipelineCache::FastFirstState {
 		const auto plain  = [&] {
             return device.createGraphicsPipelines(cache.m_driver_cache, 1, &info, nullptr, pipeline);
 		};
+		NoteSeen();
 		auto snapshot = GraphicsPipelineSnapshot::Capture(info);
 		if (snapshot == nullptr) {
 			counters.ineligible.fetch_add(1, std::memory_order_relaxed);
@@ -3372,9 +3387,11 @@ struct PipelineCache::FastFirstState {
 		if (probe) {
 			auto probe_info  = info;
 			probe_info.flags = vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
-			vk::Pipeline cached = nullptr;
+			vk::Pipeline cached      = nullptr;
+			const auto   probe_begin = CompileClockNs();
 			const auto   probed =
 			    device.createGraphicsPipelines(cache.m_driver_cache, 1, &probe_info, nullptr, &cached);
+			counters.probe_ns.fetch_add(CompileClockNs() - probe_begin, std::memory_order_relaxed);
 			if (probed == vk::Result::eSuccess && cached != nullptr) {
 				counters.cache_hits.fetch_add(1, std::memory_order_relaxed);
 				*pipeline = cached;
@@ -3412,6 +3429,7 @@ struct PipelineCache::FastFirstState {
 		const auto plain  = [&] {
             return device.createComputePipelines(cache.m_driver_cache, 1, &info, nullptr, pipeline);
 		};
+		NoteSeen();
 		auto snapshot = ComputeSnapshot::Capture(info);
 		if (snapshot == nullptr) {
 			counters.ineligible.fetch_add(1, std::memory_order_relaxed);
@@ -3420,9 +3438,11 @@ struct PipelineCache::FastFirstState {
 		if (probe) {
 			auto probe_info  = info;
 			probe_info.flags = vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
-			vk::Pipeline cached = nullptr;
+			vk::Pipeline cached      = nullptr;
+			const auto   probe_begin = CompileClockNs();
 			const auto   probed =
 			    device.createComputePipelines(cache.m_driver_cache, 1, &probe_info, nullptr, &cached);
+			counters.probe_ns.fetch_add(CompileClockNs() - probe_begin, std::memory_order_relaxed);
 			if (probed == vk::Result::eSuccess && cached != nullptr) {
 				counters.cache_hits.fetch_add(1, std::memory_order_relaxed);
 				*pipeline = cached;
@@ -3461,7 +3481,6 @@ struct PipelineCache::FastFirstState {
 			    OptimizeGraphics(key, fast, fast_ns, *snapshot);
 		    },
 		    [this] { counters.optimize_skipped.fetch_add(1, std::memory_order_relaxed); });
-		MaybeLog();
 	}
 	void EnqueueCompute(uint64_t id, vk::Pipeline fast, ComputeFast& in) {
 		const auto fast_ns = in.fast_ns;
@@ -3470,7 +3489,6 @@ struct PipelineCache::FastFirstState {
 			    OptimizeCompute(id, fast, fast_ns, *snapshot);
 		    },
 		    [this] { counters.optimize_skipped.fetch_add(1, std::memory_order_relaxed); });
-		MaybeLog();
 	}
 
 	static void NameThread() {
@@ -3522,7 +3540,6 @@ struct PipelineCache::FastFirstState {
 		// The driver cache just received the optimized pipeline: schedule the periodic save.
 		cache.NotePipelineCreated(ns);
 		replace(ns);
-		MaybeLog();
 	}
 
 	PipelineCache&     cache;
@@ -3530,8 +3547,10 @@ struct PipelineCache::FastFirstState {
 	FastFirstScheduler scheduler;
 	const uint64_t     retire_age_ns;
 	const uint64_t     drain_ms;
-	FastFirstLogGate   log_gate;
 	const bool         probe;
+	std::mutex                  report_mutex;
+	std::condition_variable_any report_cv;
+	std::jthread               reporter;
 	// Guarded by PipelineCache::m_mutex. Objects stay allocated until the cache goes (other
 	// threads may hold a reference to one; it is a few words); only the Vulkan handle of a
 	// replaced pipeline is destroyed, after retire_age_ns, because recorded command buffers may
@@ -4886,6 +4905,11 @@ PipelineCache::PrefetchTotals PipelineCache::GetPrefetchTotals() const {
 	return {m_prefetch->submitted.load(), m_prefetch->used.load(), m_prefetch->compile_ns.load(),
 	        m_prefetch->wait_ns.load(), m_prefetch->max_wait_ns.load(),
 	        m_program_cache->speculative_programs.load()};
+}
+
+FastFirstSnapshot PipelineCache::GetFastFirstTotals() const {
+	if (m_fast_first == nullptr) return {};
+	return SnapshotFastFirst(m_fast_first->counters, m_fast_first->scheduler.Pending());
 }
 
 bool PipelineCache::PipelinePrefetchEnabled() const noexcept {

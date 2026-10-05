@@ -16831,6 +16831,29 @@ public:
                 "program prefetch enabled but no program was compiled from a clean snapshot");
       }
     }
+    if (const auto* fast = std::getenv("KYTY_PIPELINE_FAST_FIRST"); fast != nullptr && std::strcmp(fast, "0") != 0) {
+      // The real draw path must take the unoptimized first build and later swap the optimized
+      // pipeline in (the test sets KYTY_PIPELINE_FAST_FIRST_PROBE=0 so a driver-side cache cannot
+      // answer the probe).
+      const auto begin = std::chrono::steady_clock::now();
+      auto totals = context.GetPipelineCache().GetFastFirstTotals();
+      while (totals.swaps == 0 && std::chrono::steady_clock::now() - begin < std::chrono::seconds(30)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        totals = context.GetPipelineCache().GetFastFirstTotals();
+      }
+      std::printf("[gpu]     %-32s fast-first: %llu seen, %llu graphics + %llu compute fast builds, %llu swaps, %llu hits, %llu ineligible\n",
+                  name, static_cast<unsigned long long>(totals.seen),
+                  static_cast<unsigned long long>(totals.graphics_fast),
+                  static_cast<unsigned long long>(totals.compute_fast),
+                  static_cast<unsigned long long>(totals.swaps),
+                  static_cast<unsigned long long>(totals.cache_hits),
+                  static_cast<unsigned long long>(totals.ineligible));
+      Require(name, "fast-first built pipelines unoptimized first",
+              totals.graphics_fast + totals.compute_fast > 0,
+              "KYTY_PIPELINE_FAST_FIRST is on but no pipeline took the fast build");
+      Require(name, "optimized pipelines swapped in", totals.swaps > 0,
+              "no optimized pipeline replaced a fast one within 30 s");
+    }
     LibKernel::Memory::InstallGpuResources(nullptr);
     context.ShutdownGpu();
     if (DrawPrep::BindingParts() != 0) {

@@ -1055,7 +1055,7 @@ if(BUILD_TESTING)
 	set_tests_properties(pipeline_fast_first PROPERTIES TIMEOUT 60)
 	add_test(NAME pipeline_fast_first_rendering COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(pipeline_fast_first_rendering PROPERTIES
-		ENVIRONMENT "KYTY_PIPELINE_FAST_FIRST=1;KYTY_PIPELINE_FAST_FIRST_RETIRE_S=1;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=130"
+		ENVIRONMENT "KYTY_PIPELINE_FAST_FIRST=1;KYTY_PIPELINE_FAST_FIRST_PROBE=0;KYTY_PIPELINE_FAST_FIRST_RETIRE_S=1;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=130"
 		TIMEOUT 180)
 	add_test(NAME pipeline_fast_first_draw_run COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-run-only)
 	set_tests_properties(pipeline_fast_first_draw_run PROPERTIES
