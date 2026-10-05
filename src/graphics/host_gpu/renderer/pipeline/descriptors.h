@@ -123,6 +123,12 @@ template <typename T>
 
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor,
                                                    bool r128 = false);
+[[nodiscard]] bool IsSupportedSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
+                                                   const ShaderTextureResource& descriptor,
+                                                   vk::Format image_format, vk::Format view_format);
+[[nodiscard]] uint64_t SampledDepthBindingSignature(const ShaderRecompiler::IR::ImageResource& resource,
+                                                    const ShaderTextureResource& descriptor,
+                                                    vk::Format image_format, vk::Format view_format);
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size);
 

@@ -46018,6 +46018,86 @@ void CheckDepthTextureEncoding() {
   std::printf("[host]    %-32s ok\n", "DepthTextureEncoding");
 }
 
+// Astro Bot (PPSA21567) 1.018, 3328x1872 dynamic-resolution tier: a shader samples memory the cache
+// holds as a D32 depth image through an R16G16_SFLOAT render-target T# with DCC metadata. The host
+// cannot view a depth image that way, so the cache gives the colour interpretation its own alias
+// (NeedsColorAliasForSampledDepth) and a binding that still reaches the depth validation is never
+// fatal (SampledDepthBindingSignature keys the once-per-descriptor report).
+void CheckSampledDepthReinterpretedAsColor() {
+  const ShaderTextureResource descriptor{{
+      0x0543de00u,
+      0xc1d00000u,
+      0x01d3c33fu,
+      0x91b0022cu,
+      0x00000000u,
+      0x00000000u,
+      0xe07b0000u,
+      0x0005714eu,
+  }};
+  Require("SampledDepthAsColor", "descriptor decode",
+          descriptor.Format() == Prospero::BufferFormat::k16_16Float &&
+              descriptor.Type() == Prospero::ImageType::kColor2D &&
+              descriptor.TileMode() == Prospero::TileMode::kRenderTarget &&
+              descriptor.Width5() + 1u == 3328u &&
+              descriptor.Height5() + 1u == 1872u &&
+              descriptor.DstSelXYZW() == 0x22cu &&
+              descriptor.WriteCompress() && descriptor.MetaCompress() &&
+              descriptor.DccAlphaPos() &&
+              (descriptor.fields[6] & 0x00ffffffu) == 0x007b0000u,
+          "captured T# did not decode as a DCC R16G16_FLOAT render-target texture");
+
+  ShaderRecompiler::IR::ImageResource resource{};
+  resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+  resource.numeric_class = Prospero::TextureNumericClass::Float;
+  resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+  resource.read = true;
+  const auto depth_format = vk::Format::eD32Sfloat;
+  const auto view_format = vk::Format::eR16G16Sfloat;
+  Require("SampledDepthAsColor", "depth path rejects it",
+          !IsSupportedDepthTextureEncoding(descriptor) &&
+              !IsSupportedSampledDepthView(depth_format, view_format,
+                                           descriptor.DstSelXYZW()) &&
+              !IsSupportedSampledDepthBinding(resource, descriptor, depth_format,
+                                              view_format),
+          "a DCC colour T# over a depth image was accepted as a depth binding");
+
+  Require("SampledDepthAsColor", "colour alias is wanted",
+          NeedsColorAliasForSampledDepth(depth_format, 4, view_format, 4) &&
+              NeedsColorAliasForSampledDepth(depth_format, 4,
+                                             vk::Format::eR8G8B8A8Unorm, 4) &&
+              IsSupportedSampledColorView(view_format, view_format,
+                                          descriptor.DstSelXYZW()),
+          "R16G16_SFLOAT sampling of a D32 image did not select a colour alias");
+
+  Require("SampledDepthAsColor", "depth-compatible views keep the depth image",
+          !NeedsColorAliasForSampledDepth(depth_format, 4, vk::Format::eR32Sfloat, 4) &&
+              !NeedsColorAliasForSampledDepth(depth_format, 4, vk::Format::eR32Uint, 4) &&
+              !NeedsColorAliasForSampledDepth(depth_format, 4, vk::Format::eD32Sfloat, 4) &&
+              !NeedsColorAliasForSampledDepth(vk::Format::eD16Unorm, 2,
+                                              vk::Format::eR16Sfloat, 2) &&
+              !NeedsColorAliasForSampledDepth(vk::Format::eD32SfloatS8Uint, 4, view_format,
+                                              4) &&
+              !NeedsColorAliasForSampledDepth(depth_format, 4,
+                                              vk::Format::eR16G16B16A16Sfloat, 8) &&
+              !NeedsColorAliasForSampledDepth(vk::Format::eR16G16Sfloat, 4, view_format, 4),
+          "a depth-compatible or size-mismatched view requested a colour alias");
+
+  auto other = descriptor;
+  other.fields[6] ^= 0x100000u;
+  Require("SampledDepthAsColor", "once-per-descriptor signature",
+          SampledDepthBindingSignature(resource, descriptor, depth_format, view_format) ==
+                  SampledDepthBindingSignature(resource, descriptor, depth_format,
+                                               view_format) &&
+              SampledDepthBindingSignature(resource, descriptor, depth_format, view_format) !=
+                  SampledDepthBindingSignature(resource, other, depth_format, view_format) &&
+              SampledDepthBindingSignature(resource, descriptor, depth_format, view_format) !=
+                  SampledDepthBindingSignature(resource, descriptor, depth_format,
+                                               vk::Format::eR32Sfloat),
+          "descriptor signatures do not distinguish the reported bindings");
+
+  std::printf("[host]    %-32s ok\n", "SampledDepthAsColor");
+}
+
 ShaderRecompiler::IR::ImageResource BasicStorageTextureResource() {
   ShaderRecompiler::IR::ImageResource resource{};
   resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
@@ -50748,6 +50828,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
     CheckDepthTextureEncoding();
+    CheckSampledDepthReinterpretedAsColor();
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckRasterization(true);
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
@@ -50874,6 +50955,7 @@ int main(int argc, char **argv) {
   CheckImageTransitionState(vulkan.RuntimeRenderer());
   CheckSampledDepthResource();
   CheckDepthTextureEncoding();
+  CheckSampledDepthReinterpretedAsColor();
   vulkan.CheckSamplerBorderColors();
   vulkan.CheckComparisonDepthTexture();
   vulkan.CheckRasterization(true);
