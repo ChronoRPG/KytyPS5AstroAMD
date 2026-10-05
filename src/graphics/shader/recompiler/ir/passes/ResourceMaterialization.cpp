@@ -99,6 +99,12 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 		return false;
 	}
 	// The range above leaves the encoding's gaps open, and a value such as 139, which lies between
+	// 136 and 156 and names nothing, used to pass here and abort the emulator further down instead of
+	// being treated as what it is: eight dwords that are not a descriptor.
+	if (!Prospero::IsDefinedBufferFormat(format)) {
+		return false;
+	}
+	// The range above leaves the encoding's gaps open, and a value such as 139, which lies between
 	// 136 and 156 and names nothing, used to pass here and abort the emulator further down instead
 	// of being treated as what it is: eight dwords that are not a descriptor.
 	if (!Prospero::IsDefinedBufferFormat(format)) {
@@ -160,7 +166,8 @@ enum class SamplerClass : uint8_t { Float, Integer, PointInteger };
 template <typename Image>
 SamplerClass ClassifySampler(const Image& image) {
 	if (image.numeric_class == Prospero::TextureNumericClass::Sint ||
-	    image.conversion_format != Prospero::BufferFormat::kInvalid) {
+	    (image.numeric_class == Prospero::TextureNumericClass::Uint &&
+	     image.conversion_format != Prospero::BufferFormat::kInvalid)) {
 		return SamplerClass::PointInteger;
 	}
 	return image.numeric_class == Prospero::TextureNumericClass::Uint ? SamplerClass::Integer

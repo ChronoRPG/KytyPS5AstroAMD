@@ -89,7 +89,8 @@ private:
 	void          BUFFER_LOAD(const Decoder::Instruction& inst);
 	void          BUFFER_STORE(const Decoder::Instruction& inst);
 	void          BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
-	void          IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
+	void          IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode32,
+	                           IR::ValueOpcode opcode64 = IR::ValueOpcode::Count);
 	void DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool returns_value);
 	void FLAT_LOAD(const Decoder::Instruction& inst);
 	void FLAT_STORE(const Decoder::Instruction& inst);
@@ -109,11 +110,10 @@ private:
 	void DS_READ2(const Decoder::Instruction& inst);
 	void DS_WRITE(const Decoder::Instruction& inst);
 	void DS_WRITE2(const Decoder::Instruction& inst);
-	void DS_MINMAX_F32(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void DS_APPEND_CONSUME(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void DS_ADDTID(const Decoder::Instruction& inst, bool write);
 	void DS_SWIZZLE_B32(const Decoder::Instruction& inst);
-	void DS_BPERMUTE_B32(const Decoder::Instruction& inst);
+	void DS_PERMUTE(const Decoder::Instruction& inst, bool backward);
 
 	IR::F32 SelectF32(IR::U1 condition, IR::F32 true_value, IR::F32 false_value);
 	IR::U32 ConvertF32ToU32Saturated(IR::F32 value, float upper_bound, float safe_upper,
@@ -212,8 +212,7 @@ private:
 	void    V_BFI_B32(const Decoder::Instruction& inst);
 	void    S_BITCMP_B32(const Decoder::Instruction& inst, bool expected);
 	void    S_BITCMP_B64(const Decoder::Instruction& inst, bool expected);
-	void    V_ALIGNBIT_B32(const Decoder::Instruction& inst);
-	void    V_ALIGNBYTE_B32(const Decoder::Instruction& inst);
+	void    V_ALIGN_B32(const Decoder::Instruction& inst, bool byte_offset);
 	void    V_LSHL_ADD_U32(const Decoder::Instruction& inst);
 	void    V_ADD_LSHL_U32(const Decoder::Instruction& inst);
 	void    V_XAD_U32(const Decoder::Instruction& inst);
