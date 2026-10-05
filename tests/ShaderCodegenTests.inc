@@ -937,6 +937,65 @@ void CheckLodStatsGate() {
               gated_spirv.size());
 }
 
+#include "ShaderIndirectImageCode.inc"
+
+// A bindless sample (the guest picks one of several images from a descriptor table by a key
+// found with a waterfall loop) of a GET_LOD_STATS-instrumented pixel shader: the recompiler
+// emits one sample per candidate image under an OpSwitch and merges the results with an OpPhi.
+// Each sample's instrumentation adds branches, so the block that ends a case is not the block it
+// started in, and the phi must name that last block. Demon's Souls pixel shader
+// 0xc509ed46b415549b (character creation): the phi named the case's first block and NVIDIA's
+// shader compiler crashed on the invalid module. Compile-only, needs no GPU
+// (--lod-stats-codegen-only).
+void CheckIndirectImageLodStats() {
+  constexpr const char *name = "CodegenIndirectImageLodStats";
+  constexpr u32 srt = 0x1000u;      // user data 0..1: the root table
+  constexpr u32 table = 0x2000u;    // root table dwords 0..1: the image table pointer
+  constexpr u32 images = table + 0x158u; // the shader reads image `key` at images + key * 32
+  constexpr u32 first_pointer = 0x6000u; // root table dwords 2..: pointers to constant data
+  GraphicsCase test;
+  test.name = name;
+  test.fragment_code.assign(std::begin(kBindlessWaterfallPixelShader),
+                            std::end(kBindlessWaterfallPixelShader));
+  test.pixel_interpolator_settings = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+  test.memory.assign(0x4000u, 0u);
+  test.user_data[0] = srt;
+  test.has_user_data = true;
+  test.memory[srt / 4u] = table;
+  for (u32 i = 0; i < 2u; i++) {
+    test.memory[srt / 4u + 2u + i * 2u] = first_pointer + i * 0x1000u;
+  }
+  // Eight distinct 2D array images (the shader samples 2d_array) in the table.
+  for (u32 key = 0; key < 8u; key++) {
+    const u32 word = (images + key * 32u) / 4u;
+    test.memory[word] = 0x100u + key;
+    test.memory[word + 1u] =
+        static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    test.memory[word + 2u] = 63u | (63u << 14u);
+    test.memory[word + 3u] = DstSel(4, 5, 6, 7) |
+                             (static_cast<u32>(Prospero::ImageType::kColor2DArray) << 28u);
+  }
+  std::vector<u32> spirv[2];
+  for (u32 mode = 0; mode < 2u; mode++) {
+    CodegenOptions options = GetCodegenOptions();
+    options.lod_stats_gate = mode == 0u;
+    ScopedCodegenOptions scope(options);
+    // CompileFragmentCase validates the module (spirv-val), the instrumented one and the plain one.
+    spirv[mode] = CompileFragmentCase(test, true).spirv;
+  }
+  for (const auto &module : spirv) {
+    Require(name, "bindless switch",
+            CountSpirv(module, "OpSwitch") >= 1u && CountSpirv(module, "OpPhi") >= 1u &&
+                CountSpirv(module, "OpImageQueryLod") >= 2u,
+            "the shader did not take the indirect image switch with LOD instrumentation (OpSwitch " +
+                std::to_string(CountSpirv(module, "OpSwitch")) + ", OpPhi " +
+                std::to_string(CountSpirv(module, "OpPhi")) + ", OpImageQueryLod " +
+                std::to_string(CountSpirv(module, "OpImageQueryLod")) + ")");
+  }
+  std::printf("[codegen] %-32s ok (SPIR-V %zu / %zu words)\n", name, spirv[0].size(),
+              spirv[1].size());
+}
+
 // KYTY_LOD_STATS_PLAIN_VARIANT: the plain variant of an instrumented pixel shader keeps the
 // mip_stats binding and every guest instruction but has no GET_LOD_STATS feedback: no LOD query,
 // subgroup reduction or atomic, so no memory side effect that would force late depth tests.
@@ -2046,6 +2105,7 @@ void RunAll(VulkanHarness *vulkan) {
   CheckMadModes(vulkan);
   CheckLodStatsGate();
   CheckLodStatsPlainVariant();
+  CheckIndirectImageLodStats();
   CheckMoveRelValueSet(vulkan);
   CheckMoveRelKnownZeros(vulkan);
   CheckUniformLaneReads(vulkan);

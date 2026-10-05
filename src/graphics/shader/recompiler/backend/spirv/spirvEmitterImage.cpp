@@ -1374,14 +1374,16 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                          spv::SelectionControlMaskNone);
 		state.builder.AddFunction(switch_words);
 		std::vector<uint32_t> phi_words {spv::OpPhi, result_type, state.builder.AllocateId()};
+		// A sample can end in a block other than the one the case started in (the GET_LOD_STATS
+		// record branches), so the phi names the block that actually branches to the merge.
 		EmitLabel(state, default_label);
 		phi_words.push_back(EmitSample(image.indirect_resources[0]));
-		phi_words.push_back(default_label);
+		phi_words.push_back(state.current_label);
 		state.builder.AddFunction(spv::OpBranch, merge_label);
 		for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); candidate++) {
 			EmitLabel(state, labels[candidate - 1u]);
 			phi_words.push_back(EmitSample(image.indirect_resources[candidate]));
-			phi_words.push_back(labels[candidate - 1u]);
+			phi_words.push_back(state.current_label);
 			state.builder.AddFunction(spv::OpBranch, merge_label);
 		}
 		EmitLabel(state, merge_label);

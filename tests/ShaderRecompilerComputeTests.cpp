@@ -1856,6 +1856,9 @@ struct GraphicsCase {
   bool pixel_depth_export = false;
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
+  // Guest memory the shader's scalar loads read through (byte address = index * 4); empty:
+  // none, only the user data is known.
+  std::vector<u32> memory;
 };
 
 struct CompiledShader {
@@ -2654,10 +2657,15 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test, bool plain_variant 
   ProgramCacheRoundTrip cache_check(test.name, test.fragment_code, options, resource_plan);
   ShaderRecompiler::IR::ResourceSnapshot resources;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
-  const ShaderRecompiler::IR::SrtRuntime runtime{
+  ShaderRecompiler::IR::SrtRuntime runtime{
       .user_data = options.user_data,
       .shader_base = reinterpret_cast<uint64_t>(test.fragment_code.data()),
   };
+  if (!test.memory.empty()) {
+    runtime.read_memory = ReadTestMemory;
+    runtime.userdata = const_cast<std::vector<u32> *>(&test.memory);
+    runtime.read_specialization_memory = ReadTestMemory;
+  }
   Require(test.name, "resource materialization",
           ShaderRecompiler::IR::MaterializeResources(
               resource_plan, runtime, resources, specialization),
@@ -50758,6 +50766,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--lod-stats-codegen-only") == 0) {
     CodegenTests::CheckLodStatsGate();
     CodegenTests::CheckLodStatsPlainVariant();
+    CodegenTests::CheckIndirectImageLodStats();
     return 0;
   }
   // Only the recompiler semantic cases (compute and graphics), without the host/runtime
