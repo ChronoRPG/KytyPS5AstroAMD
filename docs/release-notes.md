@@ -16,7 +16,7 @@
   the emulator (for example at Demon's Souls' character creation).
 - **Automatic GPU choice:** with the launcher's GPU setting on auto, the emulator could pick the wrong device on PCs
   with more than one, and the game then crashed in levels. It now prefers the dedicated graphics card with the most
-  video memory, and the log names the chosen GPU. If a game crashes for you on auto, select your graphics card in
+  video memory, and the console shows the chosen GPU ("Kyty GPU: ..."). If a game crashes for you on auto, select your graphics card in
   the launcher.
 - **Vulkan validation no longer stops the game:** with the launcher's Vulkan validation option on, Astro Bot stopped
   at boot. Validation messages now go to `_kyty_vulkan_validation.log`. Leave the option off for playing; it makes

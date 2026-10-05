@@ -418,7 +418,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	}
 
 	if (best_device != nullptr) {
-		LOGF("Vulkan device selected: %s\n", best_name.c_str());
+		std::printf("Kyty GPU: %s (%s)\n", best_name.c_str(),
+		            Config::GetGpuIndex() >= 0 ? "selected in the launcher" : "automatic choice");
 	}
 	out_device       = best_device;
 	out_queue_family = best_queue_family;
