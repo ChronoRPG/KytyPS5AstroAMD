@@ -13458,6 +13458,15 @@ bool ReadSrtCountOnly(void* userdata, uint64_t, std::span<uint32_t>) {
   return false;
 }
 
+// A reader that backs every address, the low ones included (the compute tests' SRT reader maps
+// offsets from 0): its data wins over the null-pointer rule.
+bool ReadSrtLowBacked(void*, uint64_t address, std::span<uint32_t> words) {
+  for (size_t i = 0; i < words.size(); i++) {
+    words[i] = 0x5a5a0000u + static_cast<uint32_t>(address / 4u + i);
+  }
+  return true;
+}
+
 void TestSrtWalkerNullPointerReadsZero() {
   const uint32_t shader[] = {
       EncodeSMovB32(124, 130),
@@ -13475,9 +13484,17 @@ void TestSrtWalkerNullPointerReadsZero() {
   std::vector<uint32_t> flat;
   Check(ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat),
         "null SRT pointer did not read as zero");
-  Check(reads == 0 && flat.size() == 4 &&
+  // The rule applies once the read fails: a reader that backs nothing returns zeros.
+  Check(reads > 0 && flat.size() == 4 &&
             std::all_of(flat.begin(), flat.end(), [](uint32_t word) { return word == 0; }),
-        "null SRT pointer touched memory or returned a non-zero descriptor");
+        "null SRT pointer returned a non-zero descriptor");
+  const ShaderRecompiler::IR::SrtRuntime backed{user_data, 0, ReadSrtLowBacked, nullptr};
+  std::vector<uint32_t> backed_flat;
+  Check(ShaderRecompiler::IR::SrtWalker(ir, backed).RefreshFlatBuffer(backed_flat) &&
+            backed_flat.size() == 4 &&
+            std::none_of(backed_flat.begin(), backed_flat.end(),
+                         [](uint32_t word) { return word == 0; }),
+        "a reader that backs low addresses was overridden by the null-pointer rule");
 
   user_data[8] = 0x2000u;
   reads = 0;
@@ -14852,7 +14869,21 @@ int main(int argc, char **argv) {
     std::printf("shader_cfg --fold-lane-masks-only: ok\n");
     return 0;
   }
+  if (argc >= 3 && std::strcmp(argv[1], "--bvh-validate") == 0) {
+    return ValidateBvhShaderFiles(argc, argv) == 0 ? 0 : 1;
+  }
+  if (argc >= 3 && std::strcmp(argv[1], "--bvh-files") == 0) {
+    return TranslateBvhShaderFiles(argc, argv) == 0 ? 0 : 1;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ray-tracing-only") == 0) {
+    TestRayTracingDispatchDetection();
+    TestRayTracingStub();
+    TestTraversalLoopBreakRegion();
+    return 0;
+  }
   TestRayTracingDispatchDetection();
+  TestRayTracingStub();
+  TestTraversalLoopBreakRegion();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

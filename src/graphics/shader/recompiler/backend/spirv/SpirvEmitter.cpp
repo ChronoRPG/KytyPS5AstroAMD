@@ -89,7 +89,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 			uses_gds |= kind == IR::ResourceKind::Gds;
 		}
 	}
-	if (uses_gds || LoopGuardApplies(program.shader_hash)) {
+	if (uses_gds || LoopGuardApplies(program.shader_hash) || IR::UsesBvhNodeCount(program)) {
 		Expect(Kind::Gds);
 	}
 	if (program.info.uses_dma) {
@@ -158,7 +158,10 @@ void ValidateNativeProgram(const IR::Program& program) {
 	const auto indirect_buffer_handle = [&](const IR::Inst& handle) {
 		return program.info.uses_dma && handle.NumArgs() == 4u && !handle.Uses().empty() &&
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
-			       if (IR::BufferAccessOf(use.user->GetOpcode()) != IR::BufferAccess::Read) {
+			       const auto access = IR::BufferAccessOf(use.user->GetOpcode());
+			       // KYTY_BDA_WRITES: stores and atomics through the V# as well.
+			       if (access != IR::BufferAccess::Read &&
+			           !(program.info.bda_writes && access != IR::BufferAccess::None)) {
 				       return false;
 			       }
 			       const auto index = use.user->Flags<IR::MemoryFlags>().index;

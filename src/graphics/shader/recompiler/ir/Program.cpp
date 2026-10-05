@@ -477,7 +477,10 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				if (memory.kind == ResourceKind::IndirectBuffer &&
-				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
+				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode()) &&
+				    !memory.SupportsIndirectRawLoad(inst.GetOpcode()) &&
+				    !(program.info.bda_writes &&
+				      memory.SupportsIndirectRawWrite(inst.GetOpcode()))) {
 					return Fail("indirect buffer requires a raw DWORD x2/x3/x4 load");
 				}
 				if (buffer_components > 1u &&

@@ -853,6 +853,38 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// The faulting host call chain, unwound from the fault context (symbolize the addresses
+		// with llvm-symbolizer --obj=kyty_emulator.exe). A frame without unwind data (guest code)
+		// continues from the return address at RSP while that is readable.
+		if (info->native_context != nullptr) {
+			CONTEXT context = *static_cast<const CONTEXT*>(info->native_context);
+			std::printf("host call chain:");
+			for (int frame = 0; frame < 32 && context.Rip != 0; frame++) {
+				std::printf("%s 0x%016" PRIx64, (frame % 4 == 0) ? "\n " : "",
+				            static_cast<uint64_t>(context.Rip));
+				DWORD64     image_base = 0;
+				auto*       function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+				if (function == nullptr) {
+					if (!IsReadableRange(context.Rsp, sizeof(uint64_t))) {
+						break;
+					}
+					context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+					context.Rsp += sizeof(uint64_t);
+					continue;
+				}
+				// The unwind reads saved registers and the return address from this frame.
+				if (!IsReadableRange(context.Rsp, 512)) {
+					break;
+				}
+				void*   handler_data = nullptr;
+				DWORD64 establisher  = 0;
+				RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
+				                 &handler_data, &establisher, nullptr);
+			}
+			std::printf("\n");
+		}
+#endif
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
