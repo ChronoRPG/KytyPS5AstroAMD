@@ -694,6 +694,14 @@ target_include_directories(spirv_cache_salt_tests PRIVATE ${inc_headers})
 add_executable(pipeline_compile_queue_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineCompileQueueTests.cpp")
 target_include_directories(pipeline_compile_queue_tests PRIVATE ${inc_headers})
 
+# Shader precompile (KYTY_SHADER_PRECOMPILE): the journal file and the replay driver.
+add_executable(shader_precompile_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderPrecompileTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/shaderPrecompile.cpp"
+)
+target_link_libraries(shader_precompile_tests xxhash)
+target_include_directories(shader_precompile_tests PRIVATE ${inc_headers})
+
 add_executable(shader_code_snapshot_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ShaderCodeSnapshotTests.cpp")
 target_link_libraries(shader_code_snapshot_tests xxhash)
 target_include_directories(shader_code_snapshot_tests PRIVATE ${inc_headers})
@@ -1046,6 +1054,8 @@ if(BUILD_TESTING)
 	add_test(NAME spirv_cache_salt COMMAND $<TARGET_FILE:spirv_cache_salt_tests>)
 	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
 	add_test(NAME shader_code_snapshot COMMAND $<TARGET_FILE:shader_code_snapshot_tests>)
+	add_test(NAME shader_precompile COMMAND $<TARGET_FILE:shader_precompile_tests>)
+	set_tests_properties(shader_precompile PROPERTIES TIMEOUT 60)
 	set_tests_properties(pipeline_compile_queue PROPERTIES TIMEOUT 30)
 	add_test(NAME pipeline_prefetch_rendering COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(pipeline_prefetch_rendering PROPERTIES
@@ -2024,6 +2034,7 @@ if(BUILD_TESTING)
 		spirv_local_arrays_tests
 		vram_budget_tests
 		device_compat_tests
+		shader_precompile_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests

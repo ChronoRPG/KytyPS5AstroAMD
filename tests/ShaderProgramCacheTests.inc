@@ -811,8 +811,64 @@ void CheckReloadedPrograms(VulkanHarness &harness) {
               background ? ", checked in the background" : verify ? ", verified" : "");
 }
 
+// KYTY_SHADER_PRECOMPILE (pipeline/shaderPrecompile.h): a run journals the inputs of its
+// permutations; the next run (start-up waits for the replay, KYTY_SHADER_PRECOMPILE_WAIT=1)
+// finds every program published before its first dispatch or draw, without the persistent program
+// cache (every program is translated and emitted by the replay), and renders the same.
+void CheckShaderPrecompileReplay(VulkanHarness &harness) {
+  constexpr const char *name = "ShaderPrecompileReplay";
+  const auto path = std::filesystem::current_path() / "shader-precompile-gpu-test.bin";
+  RemoveTestFile(path);
+  const auto path_text = path.string();
+  ScopedEnv enable("KYTY_SHADER_PRECOMPILE", "1");
+  ScopedEnv file("KYTY_SHADER_PRECOMPILE_PATH", path_text.c_str());
+  ScopedEnv wait("KYTY_SHADER_PRECOMPILE_WAIT", "1");
+  ScopedEnv no_disk("KYTY_PROGRAM_CACHE", "0");
+  const std::vector<std::vector<u32>> shaders{DispatchShader(4), DispatchShader(5),
+                                              DispatchShader(6)};
+
+  // Cold: compiled by the dispatches and journaled; nothing to replay.
+  const auto before = PipelineCache::Totals();
+  const auto cold = RunDispatches(harness, name, shaders);
+  const auto after_cold = PipelineCache::Totals();
+  Require(name, "cold run",
+          after_cold.programs - before.programs == shaders.size() &&
+              after_cold.replayed == before.replayed && std::filesystem::exists(path),
+          "the cold run replayed programs or wrote no journal");
+
+  // Warm: the new context replays the journal at start-up; the dispatches compile nothing.
+  const auto warm = RunDispatches(harness, name, shaders);
+  const auto after_warm = PipelineCache::Totals();
+  Require(name, "warm run",
+          after_warm.replayed - after_cold.replayed == shaders.size() &&
+              after_warm.programs - after_cold.programs == shaders.size() &&
+              after_warm.translations - after_cold.translations == shaders.size(),
+          "the replay did not publish exactly the journaled programs before the dispatches");
+  Require(name, "replayed output", warm == cold,
+          "a replayed program wrote other values than the one the dispatch compiled");
+
+  // Graphics: guest vertex and pixel programs (the stage input infos and render-target export
+  // mapping are part of their keys), replayed in a new context.
+  RemoveTestFile(path);
+  const auto before_draw = PipelineCache::Totals();
+  harness.CheckRasterization(false);
+  const auto after_draw_cold = PipelineCache::Totals();
+  harness.CheckRasterization(false);
+  const auto after_draw_warm = PipelineCache::Totals();
+  const auto cold_programs = after_draw_cold.programs - before_draw.programs;
+  Require(name, "replayed draws",
+          cold_programs != 0 &&
+              after_draw_warm.replayed - after_draw_cold.replayed == cold_programs &&
+              after_draw_warm.programs - after_draw_cold.programs == cold_programs,
+          "the second rasterization check did not find every graphics program replayed");
+  RemoveTestFile(path);
+  std::printf("[gpu]     %-32s ok (%zu dispatch and %" PRIu64 " graphics programs replayed)\n", name,
+              shaders.size(), cold_programs);
+}
+
 void RunGpu(VulkanHarness &harness) {
   CheckReloadedPrograms(harness);
+  CheckShaderPrecompileReplay(harness);
 }
 
 // --program-cache-tamper-only, with KYTY_PROGRAM_CACHE_VERIFY=1 or background: a stored

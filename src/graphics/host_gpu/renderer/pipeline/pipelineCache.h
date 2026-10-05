@@ -25,6 +25,8 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 class ProgramDiskCache;
+class ShaderJournal;
+class ShaderPrecompiler;
 struct RenderColorInfo;
 struct RenderDepthInfo;
 class CommandBuffer;
@@ -277,12 +279,17 @@ public:
 		uint64_t permutation_hits  = 0;
 		uint64_t verify_checks     = 0;
 		uint64_t verify_mismatches = 0;
+		// Permutations published by the shader precompile replay (KYTY_SHADER_PRECOMPILE).
+		uint64_t replayed          = 0;
 	};
 	[[nodiscard]] static ProgramTotals Totals();
 	// The persistent program cache; null when KYTY_PROGRAM_CACHE is off.
 	[[nodiscard]] ProgramDiskCache* GetProgramDiskCache() const { return m_program_disk.get(); }
 	// Returns once the checks KYTY_PROGRAM_CACHE_VERIFY=background has queued are done (tests).
 	void WaitProgramChecks();
+	// Returns once the shader precompile replay (KYTY_SHADER_PRECOMPILE, shaderPrecompile.h) has
+	// replayed every journal entry (tests); at once when it is off. The journal is also written.
+	void WaitShaderPrecompile();
 	// Diagnostic only; skips busy cache locks instead of waiting for compiles/preparation.
 	void ReportRamStats();
 
@@ -368,6 +375,10 @@ private:
 	std::unique_ptr<LibraryState> m_library;
 	struct PrefetchState;
 	std::unique_ptr<PrefetchState> m_prefetch;
+	// Shader precompile (KYTY_SHADER_PRECOMPILE=1, shaderPrecompile.h): the journal of compiled
+	// permutations' inputs and the background replay of the entries an earlier run left in it.
+	std::unique_ptr<ShaderJournal>     m_shader_journal;
+	std::unique_ptr<ShaderPrecompiler> m_shader_precompiler;
 	// Bumped whenever a cached pipeline object is replaced (a linked pipeline by its optimized
 	// build), so that per-thread lookup memos do not keep returning the replaced object. Starts in
 	// a range of its own per cache instance, so memos never match another instance.
@@ -385,6 +396,8 @@ private:
 
 	void InitializeDriverCache();
 	void InitializeProgramDiskCache();
+	void InitializeShaderPrecompile();
+	void StopShaderPrecompile();
 	// Serializes m_driver_cache and atomically replaces the cache file. Returns the payload size
 	// written, 0 on failure, or UINT64_MAX for a periodic save skipped over the size cap.
 	uint64_t WriteDriverCache(bool periodic);
