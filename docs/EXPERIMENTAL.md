@@ -4,7 +4,30 @@ This release builds on the U59 renderer of the previous U59 releases.
 
 ## New in this update
 
-Pre-release: int13 plus the changes below. If something works worse than in int13, please report it and use int13.
+Pre-release: the int13 pre-release plus the changes below. If something works worse than in int13, please report it
+and use int13.
+
+- Shader precompile (`KYTY_SHADER_PRECOMPILE=1` in the preset): every shader variant the emulator translates is
+  recorded in `_PipelineCache\<title>.shaders.journal`, and the next launch translates the recorded ones again on two
+  low-priority background threads before the game asks for them. Sky Garden on a cold program cache: 437 shaders
+  (12.3 s of translation) were built during play on the first run and 8 (0.3 s) on the second, after 433 were
+  rebuilt in 6.4 s at startup. The first launch gains nothing; places never visited still compile on first use. The
+  journal is tied to the GPU model; delete it after a driver update if in doubt. `KYTY_SHADER_PRECOMPILE=0` turns it
+  off.
+- Fast first pipelines (`KYTY_PIPELINE_FAST_FIRST=1` in the preset): a new pipeline is first built without driver
+  optimization, so the draw does not wait for a full compile, and the optimized pipeline is built on two background
+  threads and swapped in. Sky Garden on an empty pipeline cache: draws waited 0.31 s for pipelines instead of 1.38 s.
+  `KYTY_PIPELINE_FAST_FIRST=0` turns it off; `KYTY_PIPELINE_FAST_FIRST_PROBE=1` asks the driver cache first (on NVIDIA
+  the driver's own disk cache answers it, so pipelines are then built optimized as before).
+- A pixel shader that samples one of several textures chosen at run time, with texture-LOD feedback, produced invalid
+  SPIR-V (an `OpPhi` naming the wrong block); Demon's Souls stopped at character creation.
+- With the launcher's Vulkan validation option on, validation errors are written to `_kyty_vulkan_validation.log`
+  and no longer stop the game (Astro Bot stopped at boot on a known vertex/pixel interface message).
+  `KYTY_VULKAN_VALIDATION_MODE=exit` restores stopping at the first error. Validation makes games much slower.
+- Checked on one PC (RTX 3090, Ryzen 9 7950X3D): Sky Garden 33.0 fps with both new switches on against 33.4 fps for
+  int13 built the same way (two alternating runs each; the difference is within run-to-run noise).
+
+From the int13 pre-release (`u59-windows-20261005-int13-pre`):
 
 - Adaptive triggers (also in int13): a vibration trigger reports "firing" only while it is pressed; in Astro's
   Playroom the gun fired by itself.

@@ -1163,14 +1163,15 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
 	}
 }
 
-// KYTY_VULKAN_VALIDATION_MODE=log: diagnostic runs record validation errors and warnings in a
-// file (KYTY_VULKAN_VALIDATION_LOG, default _kyty_vulkan_validation.log) and keep running,
-// instead of exiting on the first error. Each message id is written in full for its first five
-// occurrences, then as a count at every power of two.
+// Validation errors and warnings are recorded in a file (KYTY_VULKAN_VALIDATION_LOG, default
+// _kyty_vulkan_validation.log) and the game keeps running: users turn the launcher's validation
+// option on while troubleshooting, and a known message would otherwise stop every game at boot.
+// KYTY_VULKAN_VALIDATION_MODE=exit restores exiting on the first validation error. Each message
+// id is written in full for its first five occurrences, then as a count at every power of two.
 static bool VulkanValidationLogOnly() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_VULKAN_VALIDATION_MODE");
-		return value != nullptr && std::strcmp(value, "log") == 0;
+		return value == nullptr || std::strcmp(value, "exit") != 0;
 	}();
 	return enabled;
 }
@@ -1237,6 +1238,12 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	if (VulkanValidationLogOnly() &&
 	    (message_severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eError ||
 	     message_severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning)) {
+		static std::once_flag announce;
+		std::call_once(announce, [] {
+			LOGF("Vulkan validation: errors and warnings are written to the validation log file and "
+			     "do not stop the game (KYTY_VULKAN_VALIDATION_MODE=exit stops at the first error); "
+			     "validation makes the game much slower\n");
+		});
 		RecordVulkanValidationMessage(
 		    message_severity == vk::DebugUtilsMessageSeverityFlagBitsEXT::eError ? "E" : "W",
 		    callback_data);
