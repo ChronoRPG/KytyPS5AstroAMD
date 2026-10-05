@@ -229,6 +229,11 @@ bool IsDefinedBufferFormat(BufferFormat format) {
 	       (format >= BufferFormat::kFmask8_S2_F1 && format <= BufferFormat::kBc7Srgb);
 }
 
+/// True when the format table has an entry for the value, false for the gaps in the encoding.
+bool IsDefinedBufferFormat(BufferFormat format) {
+	return FindFormatInfo(format) != nullptr;
+}
+
 TextureNumericClass SampledTextureNumericClass(BufferFormat format) {
 	const auto* info = FindFormatInfo(format);
 	if (info == nullptr || !info->sampled_texture) {

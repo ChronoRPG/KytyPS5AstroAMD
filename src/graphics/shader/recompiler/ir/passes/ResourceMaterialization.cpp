@@ -99,6 +99,12 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 		return false;
 	}
 	// The range above leaves the encoding's gaps open, and a value such as 139, which lies between
+	// 136 and 156 and names nothing, used to pass here and abort the emulator further down instead of
+	// being treated as what it is: eight dwords that are not a descriptor.
+	if (!Prospero::IsDefinedBufferFormat(format)) {
+		return false;
+	}
+	// The range above leaves the encoding's gaps open, and a value such as 139, which lies between
 	// 136 and 156 and names nothing, used to pass here and abort the emulator further down instead
 	// of being treated as what it is: eight dwords that are not a descriptor.
 	if (!Prospero::IsDefinedBufferFormat(format)) {
