@@ -180,6 +180,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	vk::PhysicalDevice  best_device       = nullptr;
 	uint32_t            best_queue_family = static_cast<uint32_t>(-1);
 	SurfaceCapabilities best_capabilities;
+	std::tuple<int, int, uint64_t> best_rank {};
+	std::string                    best_name;
 
 	for (const auto& device: devices) {
 		bool skip_device = false;
@@ -382,14 +384,42 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			continue;
 		}
 
-		if (best_device == nullptr ||
-		    device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+		// Automatic choice: a discrete GPU over an integrated one (a Ryzen iGPU next to an RTX card),
+		// a native driver over a layered one (Microsoft's D3D12-based "Dozen" driver can list the same
+		// card again as a discrete GPU), then the most device-local memory; the first wins a tie.
+		vk::PhysicalDeviceDriverProperties driver_properties {};
+		vk::PhysicalDeviceProperties2      properties2 {};
+		properties2.pNext = &driver_properties;
+		device.getProperties2(&properties2);
+		const auto memory_properties = device.getMemoryProperties();
+		uint64_t   local_bytes       = 0;
+		for (uint32_t i = 0; i < memory_properties.memoryHeapCount; i++) {
+			if (memory_properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+				local_bytes = std::max<uint64_t>(local_bytes, memory_properties.memoryHeaps[i].size);
+			}
+		}
+		const bool layered = driver_properties.driverID == vk::DriverId::eMesaDozen;
+		const int  type_rank =
+		    device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu     ? 3
+		    : device_properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu ? 2
+		    : device_properties.deviceType == vk::PhysicalDeviceType::eVirtualGpu    ? 1
+		                                                                             : 0;
+		const auto rank = std::make_tuple(layered ? 0 : 1, type_rank, local_bytes);
+		LOGF("Vulkan device candidate: %s (type %d, driver %d, %.1f GiB device-local)\n",
+		     device_properties.deviceName.data(), type_rank, static_cast<int>(driver_properties.driverID),
+		     static_cast<double>(local_bytes) / (1024.0 * 1024.0 * 1024.0));
+		if (best_device == nullptr || rank > best_rank) {
 			best_device       = device;
 			best_queue_family = queue_family;
 			best_capabilities = std::move(candidate_capabilities);
+			best_rank         = rank;
+			best_name         = device_properties.deviceName.data();
 		}
 	}
 
+	if (best_device != nullptr) {
+		LOGF("Vulkan device selected: %s\n", best_name.c_str());
+	}
 	out_device       = best_device;
 	out_queue_family = best_queue_family;
 	if (best_device != nullptr) {
