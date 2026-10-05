@@ -772,9 +772,29 @@ void BufferCache::Unregister(BufferId id) {
 	ChangeRegister<false>(id);
 }
 
+void BufferCache::EnsureBdaPageTableInitialized() {
+	if (m_bda_pagetable_initialized) {
+		return;
+	}
+	// A sparse table reads as zero wherever nothing is bound (KYTY_BDA_PAGETABLE_SPARSE).
+	if (m_bda_pagetable_buffer.IsSparse()) {
+		m_bda_pagetable_initialized = true;
+		return;
+	}
+	// Recorded before the first table write or read, and ordered by Fill barriers.
+	m_bda_pagetable_buffer.Fill(0, m_bda_pagetable_buffer.Size(), 0);
+	m_bda_pagetable_initialized = true;
+}
+
+Buffer* BufferCache::GetBdaPageTableBuffer() {
+	EnsureBdaPageTableInitialized();
+	return &m_bda_pagetable_buffer;
+}
+
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	InvalidateBdaSynchronization();
+	EnsureBdaPageTableInitialized();
 	auto& buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));

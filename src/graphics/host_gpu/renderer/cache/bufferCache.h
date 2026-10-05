@@ -128,7 +128,8 @@ public:
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+	// Both the first registration and the first consumer clear the table, so unowned entries read as zero.
+	[[nodiscard]] Buffer* GetBdaPageTableBuffer();
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
@@ -212,6 +213,9 @@ public:
 private:
 	friend struct BufferCacheTestAccess;
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainImageStagingBuffer(uint64_t size);
+
+	// Device memory is not zero-initialized, and a zero entry is what shaders read as unmapped.
+	void EnsureBdaPageTableInitialized();
 
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);
@@ -581,6 +585,7 @@ private:
 	void EnsureBdaTableResident(uint64_t first_page, uint64_t page_count);
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
+	bool                                              m_bda_pagetable_initialized = false;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
