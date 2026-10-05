@@ -355,7 +355,11 @@ struct TextureCacheTestAccess {
                          const vk::ImageSubresourceRange &range,
                          const vk::ClearValue &clear) {
     auto lock = Lock(cache);
-    cache.ClearImage(command, id, cache.GetImage(id).backing.format, range, clear);
+    if (!cache.ClearImage(command, id, cache.GetImage(id).backing.format, range, clear,
+                          "test")) {
+      std::fprintf(stderr, "TextureCacheTestAccess::ClearImage was rejected\n");
+      std::abort();
+    }
   }
 
   static void ConfigureGarbageCollection(TextureCache &cache,

@@ -893,6 +893,9 @@ add_executable(image_cache_gc_policy_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(image_cache_gc_policy_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+add_executable(image_clear_range_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ImageClearRangeTests.cpp")
+target_include_directories(image_clear_range_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(host_input_pulse_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/HostInputPulseTests.cpp")
 target_include_directories(host_input_pulse_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
@@ -1029,6 +1032,7 @@ if(BUILD_TESTING)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME image_cache_gc_policy COMMAND $<TARGET_FILE:image_cache_gc_policy_tests>)
+	add_test(NAME image_clear_range COMMAND $<TARGET_FILE:image_clear_range_tests>)
 	add_test(NAME ampr_counter_bank COMMAND $<TARGET_FILE:ampr_counter_bank_tests>)
 	add_test(NAME draw_prep COMMAND $<TARGET_FILE:draw_prep_tests>)
 	add_test(NAME eop_timestamp COMMAND $<TARGET_FILE:eop_timestamp_tests>)
@@ -2059,6 +2063,7 @@ if(BUILD_TESTING)
 		shader_cfg_tests
 		scalar_provenance_tests
 		image_page_table_tests
+		image_clear_range_tests
 		memory_tracker_tests
 		page_manager_tests
 		archive_file_tests

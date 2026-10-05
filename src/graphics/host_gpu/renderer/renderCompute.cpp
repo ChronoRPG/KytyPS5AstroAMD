@@ -175,8 +175,9 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		                                       1, view.base_layer, view.layer_count};
 		vk::ClearValue clear {};
 		clear.depthStencil = vk::ClearDepthStencilValue {0.0f, fill.value};
-		cache.ClearImage(command, binding.image_id, image.backing.format, range, clear);
-		return true;
+		// A rejected clear (reported) leaves the guest shader to run.
+		return cache.ClearImage(command, binding.image_id, image.backing.format, range, clear,
+		                        "compute-stencil-fill");
 	}
 	ShaderBufferResource descriptor;
 	uint32_t             packed_clear = 0;

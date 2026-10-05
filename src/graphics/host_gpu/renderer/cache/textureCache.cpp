@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpCommit.h"
 #include "graphics/host_gpu/renderer/image/dccClear.h"
+#include "graphics/host_gpu/renderer/image/imageClearRange.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/stagingCopier.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -304,6 +305,27 @@ void TraceDccDiagnostic(const char* format, Args... args) {
 		tiles.back().surface_z = layer;
 	}
 	return tiles;
+}
+
+
+// DCC/CMASK describe colour surfaces. A lookup of such a description can resolve to an image that
+// holds depth (same memory reused as depth and colour, e.g. Astro Bot's D32S8 targets reused as RG16F
+// DCC targets) or to a stencil plane record. Neither can take a colour clear and the description's
+// metadata is not theirs, so the materialisation does nothing for them (reported a few times).
+bool ColourMetadataTargetsDepth(const char* site, ImageId id, const Image& image) {
+	if (!image.info.IsDepth() && !image.depth_id) {
+		return false;
+	}
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+		std::printf("TextureCache: %s metadata skipped for a depth image: image=%u:%u host_format=%s "
+		            "depth_id=%u stencil=%u address=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		            site, id.index, id.generation, vk::to_string(image.info.pixel_format).c_str(),
+		            image.depth_id ? 1u : 0u, image.info.HasStencil() ? 1u : 0u,
+		            image.info.data.address, image.info.data.size);
+		std::fflush(stdout);
+	}
+	return true;
 }
 
 } // namespace
@@ -2965,6 +2987,9 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	{
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
+		if (ColourMetadataTargetsDepth("DCC", id, image)) {
+			return; // not provable: every lookup decides again
+		}
 		image.info.metadata = desc.info.metadata;
 		// A native DCC allocation must not retain a reused HTile/CMask/FMask interpretation.
 		EraseSurfaceMeta(range.address);
@@ -3034,11 +3059,18 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			const auto slice_size = range.size / layers;
 			for (uint32_t slice = 0; slice < count; slice++) {
 				++m_dcc_decision_effects;
+				bool cleared = false;
 				{
 					std::scoped_lock lock {m_lock};
-					ClearImage(m_scheduler.Current(), id, view.format,
-					           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
-					            image_first + slice, 1}, clear);
+					cleared = ClearImage(m_scheduler.Current(), id, view.format,
+					                     {vk::ImageAspectFlagBits::eColor, view.base_level,
+					                      view.level_count, image_first + slice, 1},
+					                     clear, "dcc-known-fill");
+				}
+				if (!cleared) {
+					// Rejected (reported): leave the metadata as the guest wrote it.
+					m_dcc_noop_refusal = Profiler::FrameEvent::TargetRecordDccClear;
+					return;
 				}
 				if (desc.type != BindingType::VideoOut) {
 					m_buffer_cache.FillBuffer(range.address + slice_size * (first + slice),
@@ -3231,13 +3263,19 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 			}
 			continue;
 		}
+		bool cleared = false;
 		{
 			KYTY_PROFILER_DETAIL_BLOCK("DCC::ClearImage");
 			++m_dcc_decision_effects;
 			std::scoped_lock lock {m_lock};
-			ClearImage(m_scheduler.Current(), id, view.format,
-			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
-			            image_first + slice, 1}, clear);
+			cleared = ClearImage(m_scheduler.Current(), id, view.format,
+			                     {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
+			                      image_first + slice, 1},
+			                     clear, "dcc-cpu-fallback");
+		}
+		if (!cleared) {
+			// Rejected (reported): the guest's clear key stays; nothing is published as cleared.
+			continue;
 		}
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
@@ -3285,6 +3323,12 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 		return;
 	}
 	KYTY_PROFILER_DETAIL_FUNCTION();
+	{
+		std::scoped_lock lock {m_lock};
+		if (ColourMetadataTargetsDepth("CMASK", id, m_slot_images[id])) {
+			return;
+		}
+	}
 	const auto  range  = desc.cmask.range;
 	const auto& view   = desc.view_info;
 	const auto  layers = desc.info.TransferLayers();
@@ -3368,12 +3412,16 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 			continue;
 		}
 		provable = false;
+		bool cleared = false;
 		{
 			std::scoped_lock lock {m_lock};
-			ClearImage(m_scheduler.Current(), id, view.format,
-			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
-			            view.base_layer + slice, 1},
-			           clear);
+			cleared = ClearImage(m_scheduler.Current(), id, view.format,
+			                     {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
+			                      view.base_layer + slice, 1},
+			                     clear, "cmask-fast-clear");
+		}
+		if (!cleared) {
+			continue; // rejected (reported): the CMASK bytes stay as the guest wrote them
 		}
 		// After the eliminate every tile is expanded; this also keeps a later binding from
 		// clearing again what the draws wrote meanwhile. FillBuffer can fault: no texture lock.
@@ -3443,12 +3491,16 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 			                              : Event::CmaskFastClearUnproven);
 			continue;
 		}
+		bool applied = false;
 		{
 			std::scoped_lock lock {m_lock};
-			ClearImage(m_scheduler.Current(), id, view.format,
-			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
-			            view.base_layer + slice, 1},
-			           clear);
+			applied = ClearImage(m_scheduler.Current(), id, view.format,
+			                     {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
+			                      view.base_layer + slice, 1},
+			                     clear, "cmask-readback");
+		}
+		if (!applied) {
+			continue; // rejected (reported): the CMASK bytes stay as the guest wrote them
 		}
 		m_buffer_cache.FillBuffer(metadata.address, metadata.size, UINT32_MAX, false);
 		Profiler::CountFrameEvent(Event::CmaskFastClears);
@@ -4267,28 +4319,115 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		}
 		clear.depthStencil.stencil = stencil_clear;
 	}
-	ClearImage(command, selected, image.backing.format,
-	           {aspect, 0, image.info.resources.levels, 0, image.info.TransferLayers()}, clear);
-	return true;
+	// A rejected clear (reported) returns false: the guest's own fill shader then runs.
+	return ClearImage(command, selected, image.backing.format,
+	                  {aspect, 0, image.info.resources.levels, 0, image.info.TransferLayers()}, clear,
+	                  "clear-from-buffer");
 }
 
-void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
-                              const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
+namespace {
+
+// A clear the target cannot take is reported once per distinct signature (printf: reaches the
+// console users send; LOGF does not) and then skipped by the caller of ClearImage.
+void ReportRejectedClear(const char* site, ImageId id, const Image& image, ClearRangeFault fault,
+                         const ClearTarget& target, const ClearRange& range) {
+	const auto& info = image.info;
+	uint64_t    hash = 0xcbf29ce484222325ull;
+	const auto  mix  = [&hash](uint64_t value) {
+		hash = (hash ^ value) * 0x100000001b3ull;
+	};
+	for (const char* c = site != nullptr ? site : ""; *c != 0; ++c) {
+		mix(static_cast<uint8_t>(*c));
+	}
+	mix(static_cast<uint64_t>(fault));
+	mix(static_cast<uint64_t>(info.guest_format));
+	mix(static_cast<uint64_t>(info.pixel_format));
+	mix(static_cast<uint64_t>(image.backing.format));
+	mix(target.aspects | (target.stencil_companion ? 0x100u : 0u) | (info.IsVolume() ? 0x200u : 0u));
+	mix(target.levels);
+	mix(target.layers);
+	mix((static_cast<uint64_t>(info.extent.width) << 32) | info.extent.height);
+	mix(range.aspect_mask);
+	mix((static_cast<uint64_t>(range.base_level) << 32) | range.level_count);
+	mix((static_cast<uint64_t>(range.base_layer) << 32) | range.layer_count);
+	static std::mutex              mutex;
+	static std::array<uint64_t, 128> seen {};
+	static size_t                  seen_count = 0;
+	{
+		std::scoped_lock lock {mutex};
+		if (std::find(seen.begin(), seen.begin() + seen_count, hash) != seen.begin() + seen_count) {
+			return;
+		}
+		if (seen_count < seen.size()) {
+			seen[seen_count++] = hash;
+		}
+	}
+	std::printf(
+	    "TextureCache: ClearImage skipped (%s): site=%s image=%u:%u guest_format=%u host_format=%s "
+	    "backing_format=%s depth=%u stencil=%u volume=%u depth_id=%u stencil_companion=%u "
+	    "levels=%u layers=%u backing_layers=%u target_layers=%u extent=%ux%ux%u "
+	    "address=0x%016" PRIx64 " size=0x%016" PRIx64
+	    " range={aspect=0x%x level=%u+%u layer=%u+%u} target_aspects=0x%x\n",
+	    ClearRangeFaultName(fault), site != nullptr ? site : "?", id.index, id.generation,
+	    static_cast<uint32_t>(info.guest_format), vk::to_string(info.pixel_format).c_str(),
+	    vk::to_string(image.backing.format).c_str(), info.IsDepth() ? 1u : 0u,
+	    info.HasStencil() ? 1u : 0u, info.IsVolume() ? 1u : 0u, image.depth_id.index,
+	    image.depth_id ? 1u : 0u, info.resources.levels, info.resources.layers,
+	    image.backing.layers, target.layers, info.extent.width, info.extent.height,
+	    info.extent.depth, info.data.address, info.data.size, range.aspect_mask, range.base_level,
+	    range.level_count, range.base_layer, range.layer_count, target.aspects);
+	std::fflush(stdout);
+}
+
+} // namespace
+
+// Returns false (and changes nothing) when the target image cannot take the clear. The guest
+// sources of a skipped clear stay as they are: the image keeps its previous contents and ownership
+// (nothing is committed as GPU-written), so stale pixels are never published as the cleared result,
+// and callers must not consume the guest's clear key (metadata) or fill.
+bool TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
+                              const vk::ImageSubresourceRange& range, const vk::ClearValue& clear,
+                              const char* site) {
 	KYTY_GPU_OP_SITE("texcache.clear");
+	if (command.IsInvalid()) {
+		EXIT("TextureCache: invalid command buffer for an image clear (%s)\n",
+		     site != nullptr ? site : "?");
+	}
+	{
+		// Validated before any state changes (residency, tracking) so a rejection is a pure no-op.
+		auto&      target_image = m_slot_images[id];
+		const auto aspects      = target_image.info.IsDepth()
+		                              ? ImageViewOps::DepthAspectMask(target_image.backing.format)
+		                              : vk::ImageAspectFlagBits::eColor;
+		const ClearTarget target {
+		    .levels = target_image.info.resources.levels,
+		    .layers = ClearTargetLayers(target_image.info.IsVolume(),
+		                                target_image.info.extent.depth, range.baseMipLevel,
+		                                target_image.backing.layers),
+		    .aspects = static_cast<uint32_t>(VkImageAspectFlags(aspects)),
+		    .stencil_companion = static_cast<bool>(target_image.depth_id),
+		    .format_aliased    = format != target_image.backing.format,
+		    .volume            = target_image.info.IsVolume()};
+		const ClearRange request {
+		    .aspect_mask = static_cast<uint32_t>(VkImageAspectFlags(range.aspectMask)),
+		    .base_level  = range.baseMipLevel,
+		    .level_count = range.levelCount,
+		    .base_layer  = range.baseArrayLayer,
+		    .layer_count = range.layerCount};
+		const auto fault = CheckClearRange(target, request);
+		if (fault != ClearRangeFault::None) {
+			ReportRejectedClear(site, id, target_image, fault, target, request);
+			return false;
+		}
+	}
 	// Levels outside the cleared range must hold guest data, and the result is GPU-owned.
 	RequireFullResidency(id);
 	auto& image = m_slot_images[id];
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
-	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
 	const auto layers = image.info.IsVolume()
 	                        ? std::max(image.info.extent.depth >> range.baseMipLevel, 1u)
 	                        : image.backing.layers;
-	EXIT_IF(command.IsInvalid() || image.depth_id || !range.aspectMask || range.levelCount == 0 ||
-	        range.levelCount > image.info.resources.levels - range.baseMipLevel ||
-	        range.layerCount == 0 || range.baseArrayLayer >= layers ||
-	        range.layerCount > layers - range.baseArrayLayer ||
-	        (range.aspectMask & aspects) != range.aspectMask);
 	const bool full_subresources = range.baseMipLevel == 0 &&
 	                               range.levelCount == image.info.resources.levels &&
 	                               range.baseArrayLayer == 0 && range.layerCount == layers;
@@ -4312,8 +4451,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	command.EndRendering();
 	// Transfer clears use the backing format; aliased clears must encode through their view.
 	if (format != image.backing.format || (image.info.IsVolume() && !full_image)) {
-		EXIT_NOT_IMPLEMENTED(range.aspectMask != vk::ImageAspectFlagBits::eColor ||
-		                     range.levelCount != 1);
+		// Shape validated up front (ClearRangeFault::ViewClearShape).
 		ImageViewInfo view {};
 		view.format = format;
 		view.type   = range.layerCount == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
@@ -4340,7 +4478,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		command.Handle().endRendering();
 		image.NoteContentWrite();
 		CommitGpuWrite(image);
-		return;
+		return true;
 	}
 	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
 	              command.Handle());
@@ -4359,6 +4497,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	}
 	image.NoteContentWrite();
 	CommitGpuWrite(image);
+	return true;
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
