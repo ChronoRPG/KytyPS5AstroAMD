@@ -946,11 +946,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		}
 	}
 	// Native FP64 arithmetic (upstream 16b83a034) declares SignedZeroInfNanPreserve for 64-bit
-	// floats and RTE rounding for 32-bit ones.
+	// floats; 32-bit rounding stays native, like ordinary FP32 arithmetic (upstream 7992aecb7).
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&
-	    properties12.shaderSignedZeroInfNanPreserveFloat64 &&
-	    properties12.shaderRoundingModeRTEFloat32;
+	    properties12.shaderSignedZeroInfNanPreserveFloat64;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 #if defined(__APPLE__)

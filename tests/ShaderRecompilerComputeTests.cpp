@@ -35432,8 +35432,7 @@ TestCase VectorF64CapturedScreenSpaceShadows() {
                          "OpTypeFloat 64",
                          "OpFDiv",
                          "Fma",
-                         "SignedZeroInfNanPreserve 64",
-                         "RoundingModeRTE 32"};
+                         "SignedZeroInfNanPreserve 64"};
   test.ir_counts = {{"ConvertF64S32", 9},
                     {"FPRecip64", 3},
                     {"FPMul64", 3},
