@@ -20,6 +20,12 @@ struct MimgGatherInfo {
 	uint32_t flags    = 0;
 };
 
+struct MimgAtomicInfo {
+	uint32_t encoding    = 0;
+	Opcode   decoded     = Opcode::UNSUPPORTED;
+	bool     supports_64 = false;
+};
+
 constexpr ImageDimension DecodeImageDimension(uint32_t dim) {
 	switch (dim) {
 		case 0u: return ImageDimension::Dim1D;
@@ -194,18 +200,18 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
     {0x61u, Opcode::IMAGE_GATHER4H, ImageSampleFlagGatherHorizontal},
 };
 
-constexpr Detail::OpcodeMap MIMG_ATOMIC_OPCODE_LIST[] = {
-    {0x0fu, Opcode::IMAGE_ATOMIC_SWAP},
+constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
+    {0x0fu, Opcode::IMAGE_ATOMIC_SWAP, true},
     {0x10u, Opcode::IMAGE_ATOMIC_CMPSWAP},
-    {0x11u, Opcode::IMAGE_ATOMIC_ADD},
+    {0x11u, Opcode::IMAGE_ATOMIC_ADD, true},
     {0x12u, Opcode::IMAGE_ATOMIC_SUB},
     {0x14u, Opcode::IMAGE_ATOMIC_SMIN},
-    {0x15u, Opcode::IMAGE_ATOMIC_UMIN},
+    {0x15u, Opcode::IMAGE_ATOMIC_UMIN, true},
     {0x16u, Opcode::IMAGE_ATOMIC_SMAX},
-    {0x17u, Opcode::IMAGE_ATOMIC_UMAX},
-    {0x18u, Opcode::IMAGE_ATOMIC_AND},
-    {0x19u, Opcode::IMAGE_ATOMIC_OR},
-    {0x1au, Opcode::IMAGE_ATOMIC_XOR},
+    {0x17u, Opcode::IMAGE_ATOMIC_UMAX, true},
+    {0x18u, Opcode::IMAGE_ATOMIC_AND, true},
+    {0x19u, Opcode::IMAGE_ATOMIC_OR, true},
+    {0x1au, Opcode::IMAGE_ATOMIC_XOR, true},
     {0x1bu, Opcode::IMAGE_ATOMIC_INC},
     {0x1cu, Opcode::IMAGE_ATOMIC_DEC},
     {0x1eu, Opcode::IMAGE_ATOMIC_FMIN},
@@ -217,7 +223,7 @@ constexpr auto MIMG_GATHER_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_GATHER_OPCO
 constexpr auto MIMG_ATOMIC_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_ATOMIC_OPCODE_LIST);
 
 Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                        const Detail::OpcodeMap* atomic) {
+                        const MimgAtomicInfo* atomic) {
 	if (sample != nullptr) {
 		return Opcode::IMAGE_SAMPLE;
 	}
@@ -251,7 +257,7 @@ uint32_t DecodeMimgSampleFlags(const MimgSampleInfo* sample, const MimgGatherInf
 
 uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
                                      const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                                     const Detail::OpcodeMap* atomic) {
+                                     const MimgAtomicInfo* atomic) {
 	if (sample != nullptr) {
 		return ImageSampleAddressComponents(sample->flags, dimension);
 	}
@@ -375,7 +381,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 			SetUnsupported(inst, Family::MIMG, opcode, "MIMG image atomic has invalid DMASK");
 		} else if (inst.dmask == mask64) {
 			inst.data_bits = 64u;
-			if (inst.opcode != Opcode::IMAGE_ATOMIC_UMAX) {
+			if (!atomic->supports_64) {
 				SetUnsupported(inst, Family::MIMG, opcode,
 				               "MIMG 64-bit image atomic opcode is not implemented");
 			}

@@ -241,19 +241,25 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 		case ValueOpcode::ImageWrite:
 			return {ImageAccess::Write, ImageResourceClass::Storage, false};
 		case ValueOpcode::ImageAtomicSwap32:
+		case ValueOpcode::ImageAtomicSwap64:
 		case ValueOpcode::ImageAtomicIAdd32:
+		case ValueOpcode::ImageAtomicIAdd64:
 		case ValueOpcode::ImageAtomicSMin32:
 		case ValueOpcode::ImageAtomicUMin32:
+		case ValueOpcode::ImageAtomicUMin64:
 		case ValueOpcode::ImageAtomicSMax32:
 		case ValueOpcode::ImageAtomicUMax32:
 		case ValueOpcode::ImageAtomicUMax64:
 		case ValueOpcode::ImageAtomicAnd32:
+		case ValueOpcode::ImageAtomicAnd64:
 		case ValueOpcode::ImageAtomicOr32:
+		case ValueOpcode::ImageAtomicOr64:
 		case ValueOpcode::ImageAtomicXor32:
 		case ValueOpcode::ImageAtomicCmpSwap32:
 		case ValueOpcode::ImageAtomicISub32:
 		case ValueOpcode::ImageAtomicInc32:
 		case ValueOpcode::ImageAtomicDec32:
+		case ValueOpcode::ImageAtomicXor64:
 		case ValueOpcode::ImageAtomicFMin32:
 		case ValueOpcode::ImageAtomicFMax32:
 			return {ImageAccess::Atomic, ImageResourceClass::Storage, false};

@@ -814,16 +814,22 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 
 spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
-		case IR::ValueOpcode::ImageAtomicSwap32: return spv::OpAtomicExchange;
-		case IR::ValueOpcode::ImageAtomicIAdd32: return spv::OpAtomicIAdd;
+		case IR::ValueOpcode::ImageAtomicSwap32:
+		case IR::ValueOpcode::ImageAtomicSwap64: return spv::OpAtomicExchange;
+		case IR::ValueOpcode::ImageAtomicIAdd32:
+		case IR::ValueOpcode::ImageAtomicIAdd64: return spv::OpAtomicIAdd;
 		case IR::ValueOpcode::ImageAtomicSMin32: return spv::OpAtomicSMin;
-		case IR::ValueOpcode::ImageAtomicUMin32: return spv::OpAtomicUMin;
+		case IR::ValueOpcode::ImageAtomicUMin32:
+		case IR::ValueOpcode::ImageAtomicUMin64: return spv::OpAtomicUMin;
 		case IR::ValueOpcode::ImageAtomicSMax32: return spv::OpAtomicSMax;
 		case IR::ValueOpcode::ImageAtomicUMax32:
 		case IR::ValueOpcode::ImageAtomicUMax64: return spv::OpAtomicUMax;
-		case IR::ValueOpcode::ImageAtomicAnd32: return spv::OpAtomicAnd;
-		case IR::ValueOpcode::ImageAtomicOr32: return spv::OpAtomicOr;
-		case IR::ValueOpcode::ImageAtomicXor32: return spv::OpAtomicXor;
+		case IR::ValueOpcode::ImageAtomicAnd32:
+		case IR::ValueOpcode::ImageAtomicAnd64: return spv::OpAtomicAnd;
+		case IR::ValueOpcode::ImageAtomicOr32:
+		case IR::ValueOpcode::ImageAtomicOr64: return spv::OpAtomicOr;
+		case IR::ValueOpcode::ImageAtomicXor32:
+		case IR::ValueOpcode::ImageAtomicXor64: return spv::OpAtomicXor;
 		case IR::ValueOpcode::ImageAtomicISub32: return spv::OpAtomicISub;
 		// R32ui texel pointers: SMin/SMax interpret the unsigned bits as signed.
 		// Compare-exchange and wrapping inc/dec are expanded by EmitImage.
