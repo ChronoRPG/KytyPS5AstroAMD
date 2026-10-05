@@ -1,3 +1,5 @@
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterRayTracing.h"
+
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
@@ -30,11 +32,13 @@ using Vec3 = std::array<uint32_t, 3>;
 
 class BvhLowering {
 public:
-	BvhLowering(ValueEmitContext& ctx_, const IR::Inst& inst_)
-	    : ctx(ctx_), s(ctx_.state), inst(inst_),
-	      flush_f32(GetHostFloatControls().denorm_flush_f32) {}
+	BvhLowering(ValueEmitContext& ctx_, const BvhOperands& operands)
+	    : ctx(ctx_), s(ctx_.state), flush_f32(GetHostFloatControls().denorm_flush_f32),
+	      tsharp(operands.tsharp), node_lo(operands.node_lo), node_hi(operands.node_hi),
+	      extent(operands.extent), origin(operands.origin), direction(operands.direction),
+	      inverse(operands.inverse) {}
 
-	uint32_t Emit();
+	uint32_t NodeTest();
 
 private:
 	uint32_t F32() { return TypeF32(s); }
@@ -74,7 +78,10 @@ private:
 	uint32_t FSub(uint32_t a, uint32_t b) { return FArith(spv::OpFSub, a, b); }
 	uint32_t FMul(uint32_t a, uint32_t b) { return FArith(spv::OpFMul, a, b); }
 	uint32_t IsNan(uint32_t a) { return Op1(spv::OpIsNan, Bool(), a); }
-	// IEEE maxNum/minNum: a NaN operand is ignored; a tie returns the second operand.
+	// IEEE maxNum/minNum: a NaN operand is ignored; a tie returns the second operand. Explicit
+	// compares and selects rather than GLSL NMax/NMin: those were no faster here, and under a
+	// flushing float mode the driver may treat a denormal against a zero differently from the
+	// compares around it (see EmitFastMinMaxF32).
 	uint32_t MaxNum(uint32_t a, uint32_t b) {
 		const auto take_a = Or(IsNan(b), Op(spv::OpFOrdGreaterThan, Bool(), a, b));
 		return Sel(F32(), IsNan(a), b, Sel(F32(), take_a, a, b));
@@ -145,9 +152,10 @@ private:
 
 	ValueEmitContext&       ctx;
 	EmitterState&           s;
-	const IR::Inst&         inst;
 	const bool              flush_f32;
 	std::array<uint32_t, 4> tsharp {};
+	uint32_t                node_lo   = 0;
+	uint32_t                node_hi   = 0;
 	uint32_t                node_type = 0;
 	uint32_t                extent    = 0;
 	Vec3                    origin {};
@@ -422,13 +430,11 @@ uint32_t BvhLowering::SharedExpBound(uint32_t field, uint32_t exponent, bool is_
 	    Op(spv::OpBitwiseAnd, U32(),
 	       Op(spv::OpBitwiseOr, U32(), Op(spv::OpShiftLeftLogical, U32(), magnitude, shift), fill),
 	       Cu(0x7fffffu));
-	// Zero magnitude.
-	const auto zero   = Op(spv::OpIEqual, Bool(), magnitude, Cu(0u));
-	const auto mant_z = Sel(U32(), away, Cu(0x7fffffu), Cu(0u));
-	const auto exp_z  = Sel(U32(), And(away, Op(spv::OpUGreaterThan, Bool(), exponent, Cu(17u))),
-	                        Op(spv::OpISub, U32(), exponent, Cu(17u)), Cu(0u));
-	const auto mant   = Sel(U32(), zero, mant_z, mant_n);
-	const auto exp    = Sel(U32(), zero, exp_z, exp_n);
+	// Zero magnitude (FindUMsb gives -1, so down = min(17, exponent)): rounding away yields
+	// mantissa 0x7fffff at exponent max(exponent - 17, 0), which is exp_n; otherwise a signed zero.
+	const auto zero = Op(spv::OpIEqual, Bool(), magnitude, Cu(0u));
+	const auto mant = Sel(U32(), And(zero, away), Cu(0x7fffffu), mant_n);
+	const auto exp  = Sel(U32(), And(zero, Not(away)), Cu(0u), exp_n);
 	return ToF32(Op(spv::OpBitwiseOr, U32(),
 	                Op(spv::OpBitwiseOr, U32(), Op(spv::OpShiftLeftLogical, U32(), sign, Cu(31u)),
 	                   Op(spv::OpShiftLeftLogical, U32(), exp, Cu(23u))),
@@ -542,77 +548,83 @@ uint32_t BvhLowering::Triangle(uint32_t address) {
 	return result;
 }
 
-uint32_t BvhLowering::Emit() {
-	// Every operand is read before the first branch.
-	const auto descriptor = ctx.Arg(inst, 1);
-	for (uint32_t index = 0; index < 4u; index++) {
-		tsharp[index] = Extract(U32(), descriptor, index);
-	}
-	const auto node_lo = ctx.Arg(inst, 2);
-	const auto node_hi = ctx.Arg(inst, 3);
-	extent             = ToF32(ctx.Arg(inst, 4));
-	for (uint32_t axis = 0; axis < 3u; axis++) {
-		origin[axis]    = ToF32(ctx.Arg(inst, 5u + axis));
-		direction[axis] = ToF32(ctx.Arg(inst, 8u + axis));
-		inverse[axis]   = ToF32(ctx.Arg(inst, 11u + axis));
-	}
-	const auto active = ctx.Arg(inst, 14);
-
-	return EmitValueOrDefaultIfCondition(s, active, U32x4(), ConstantU32CompositeZero(s, 4), [&]() {
-		node_type       = Op(spv::OpBitwiseAnd, U32(), node_lo, Cu(7u));
-		const auto node = U64Of(node_lo, node_hi);
-		// Node address = T# base (bits 39:0 = address bits 47:8) + (pointer & ~7) << 3.
-		const auto base =
-		    Op(spv::OpBitwiseOr, U64(),
-		       Op(spv::OpShiftLeftLogical, U64(), Op1(spv::OpUConvert, U64(), tsharp[0]), Cu64(8)),
-		       Op(spv::OpShiftLeftLogical, U64(),
-		          Op1(spv::OpUConvert, U64(), Op(spv::OpBitwiseAnd, U32(), tsharp[1], Cu(0xffu))),
-		          Cu64(40)));
-		const auto address =
-		    Op(spv::OpIAdd, U64(), base,
-		       Op(spv::OpShiftLeftLogical, U64(),
-		          Op(spv::OpBitwiseAnd, U64(), node, Cu64(~uint64_t {7})), Cu64(3)));
-		// Bounds check against the T# size (number of 64-byte nodes minus 1).
-		const auto index    = Op(spv::OpShiftRightLogical, U64(), node, Cu64(3));
-		const auto size     = U64Of(tsharp[2], Op(spv::OpBitwiseAnd, U32(), tsharp[3], Cu(0x3ffu)));
-		const auto in_range = Op(spv::OpULessThanEqual, Bool(), index, size);
-		const auto triangle = Op(spv::OpULessThan, Bool(), node_type, Cu(4u));
-		const auto box16    = Op(spv::OpIEqual, Bool(), node_type, Cu(4u));
-		const auto box32    = Op(spv::OpIEqual, Bool(), node_type, Cu(5u));
-		// Type 6 is the PS5's shared-exponent box; KYTY_RT_TYPE6=0 misses it like RDNA2 (GPURT).
-		const auto box_ps5 = GetCodegenOptions().rt_type6
-		                         ? Op(spv::OpIEqual, Bool(), node_type, Cu(6u))
-		                         : ConstantBool(s, false);
-		const auto miss    = [&]() {
-			const auto t      = Sel(U32(), triangle, Cu(PlusInfBits), Cu(InvalidNode));
-			const auto den    = Sel(U32(), triangle, Cu(OneBits), Cu(InvalidNode));
-			const auto rest   = Sel(U32(), triangle, Cu(0u), Cu(InvalidNode));
-			const auto result = s.builder.AllocateId();
-			s.builder.AddFunction(spv::OpCompositeConstruct, U32x4(), result, t, den, rest, rest);
-			return result;
-		};
-		return IfElse(
-		    And(in_range, triangle), U32x4(), [&]() { return Triangle(address); },
-		    [&]() {
-			    return IfElse(
-			        And(in_range, box16), U32x4(), [&]() { return Box16(address); },
-			        [&]() {
-				        return IfElse(
-				            And(in_range, box32), U32x4(), [&]() { return Box32(address); },
-				            [&]() {
-					            return IfElse(
-					                And(in_range, box_ps5), U32x4(),
-					                [&]() { return BoxPs5(address); }, miss);
-				            });
-			        });
-		    });
-	});
+uint32_t BvhLowering::NodeTest() {
+	node_type       = Op(spv::OpBitwiseAnd, U32(), node_lo, Cu(7u));
+	const auto node = U64Of(node_lo, node_hi);
+	// Node address = T# base (bits 39:0 = address bits 47:8) + (pointer & ~7) << 3.
+	const auto base =
+	    Op(spv::OpBitwiseOr, U64(),
+	       Op(spv::OpShiftLeftLogical, U64(), Op1(spv::OpUConvert, U64(), tsharp[0]), Cu64(8)),
+	       Op(spv::OpShiftLeftLogical, U64(),
+	          Op1(spv::OpUConvert, U64(), Op(spv::OpBitwiseAnd, U32(), tsharp[1], Cu(0xffu))),
+	          Cu64(40)));
+	const auto address = Op(spv::OpIAdd, U64(), base,
+	                        Op(spv::OpShiftLeftLogical, U64(),
+	                           Op(spv::OpBitwiseAnd, U64(), node, Cu64(~uint64_t {7})), Cu64(3)));
+	// Bounds check against the T# size (number of 64-byte nodes minus 1).
+	const auto index    = Op(spv::OpShiftRightLogical, U64(), node, Cu64(3));
+	const auto size     = U64Of(tsharp[2], Op(spv::OpBitwiseAnd, U32(), tsharp[3], Cu(0x3ffu)));
+	const auto in_range = Op(spv::OpULessThanEqual, Bool(), index, size);
+	const auto triangle = Op(spv::OpULessThan, Bool(), node_type, Cu(4u));
+	const auto box16    = Op(spv::OpIEqual, Bool(), node_type, Cu(4u));
+	const auto box32    = Op(spv::OpIEqual, Bool(), node_type, Cu(5u));
+	// Type 6 is the PS5's shared-exponent box; KYTY_RT_TYPE6=0 misses it like RDNA2 (GPURT).
+	const auto box_ps5 = GetCodegenOptions().rt_type6 ? Op(spv::OpIEqual, Bool(), node_type, Cu(6u))
+	                                                  : ConstantBool(s, false);
+	const auto miss    = [&]() {
+		const auto t      = Sel(U32(), triangle, Cu(PlusInfBits), Cu(InvalidNode));
+		const auto den    = Sel(U32(), triangle, Cu(OneBits), Cu(InvalidNode));
+		const auto rest   = Sel(U32(), triangle, Cu(0u), Cu(InvalidNode));
+		const auto result = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpCompositeConstruct, U32x4(), result, t, den, rest, rest);
+		return result;
+	};
+	return IfElse(
+	    And(in_range, triangle), U32x4(), [&]() { return Triangle(address); },
+	    [&]() {
+		    return IfElse(
+		        And(in_range, box16), U32x4(), [&]() { return Box16(address); },
+		        [&]() {
+			        return IfElse(
+			            And(in_range, box32), U32x4(), [&]() { return Box32(address); },
+			            [&]() {
+				            return IfElse(
+				                And(in_range, box_ps5), U32x4(), [&]() { return BoxPs5(address); },
+				                miss);
+			            });
+		        });
+	    });
 }
 
 } // namespace
 
+uint32_t EmitBvhNodeTest(ValueEmitContext& ctx, const BvhOperands& operands) {
+	return BvhLowering(ctx, operands).NodeTest();
+}
+
 uint32_t EmitBvhIntersectRay(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return BvhLowering(ctx, inst).Emit();
+	auto& s = ctx.state;
+	// Every operand is read before the first branch.
+	BvhOperands operands;
+	const auto  descriptor = ctx.Arg(inst, 1);
+	for (uint32_t index = 0; index < 4u; index++) {
+		operands.tsharp[index] = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpCompositeExtract, TypeU32(s), operands.tsharp[index],
+		                      descriptor, index);
+	}
+	const auto to_f32 = [&](uint32_t bits) { return Unary(s, spv::OpBitcast, TypeF32(s), bits); };
+	operands.node_lo  = ctx.Arg(inst, 2);
+	operands.node_hi  = ctx.Arg(inst, 3);
+	operands.extent   = to_f32(ctx.Arg(inst, 4));
+	for (uint32_t axis = 0; axis < 3u; axis++) {
+		operands.origin[axis]    = to_f32(ctx.Arg(inst, 5u + axis));
+		operands.direction[axis] = to_f32(ctx.Arg(inst, 8u + axis));
+		operands.inverse[axis]   = to_f32(ctx.Arg(inst, 11u + axis));
+	}
+	const auto active = ctx.Arg(inst, 14);
+	return EmitValueOrDefaultIfCondition(s, active, TypeU32Vector(s, 4),
+	                                     ConstantU32CompositeZero(s, 4),
+	                                     [&]() { return EmitBvhNodeTest(ctx, operands); });
 }
 
 // KYTY_RT_STUB: a triangle node (type 0-3) misses with t_num = +inf, t_denom = 1.0 and zero
