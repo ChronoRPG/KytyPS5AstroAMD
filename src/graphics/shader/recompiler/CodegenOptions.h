@@ -176,6 +176,13 @@ struct CodegenOptions {
 	// (0xffffffff); a triangle node returns t_num=+inf, t_denom=1.0 and zero in dwords 2-3 (a
 	// cleared hit_status in triangle return mode 0). Diagnostic only: it never reports a hit.
 	bool rt_stub = false;
+	// KYTY_RT_SOFTWARE=1: translate the BVH instructions exactly in software (IR BvhIntersectRay,
+	// lowered in the SPIR-V backend; spec: Profiling/analysis/RT-SOFTWARE-DESIGN.md). Takes
+	// precedence over KYTY_RT_STUB.
+	bool rt_software = false;
+	// KYTY_RT_TYPE6=0 (with KYTY_RT_SOFTWARE): node type 6 misses (four invalid children) like
+	// RDNA2's user node, instead of being decoded as the PS5 shared-exponent box.
+	bool rt_type6 = true;
 };
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.

@@ -56,6 +56,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/CodegenFingerprint.h"
+#include "graphics/shader/recompiler/BvhReference.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
@@ -102,6 +103,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -109,6 +111,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <semaphore>
 #include <set>
 #include <span>
@@ -2870,6 +2873,25 @@ public:
     GraphicContext &m_graphics;
     u32 m_saved;
   };
+  // The float controls the emulator declares on this device (vulkanWindow.cpp,
+  // ConfigureShaderFloatControls): f32 denormals are flushed only where the device supports it.
+  [[nodiscard]] ShaderRecompiler::Spirv::HostFloatControls DeviceFloatControls() const {
+    vk::PhysicalDeviceVulkan12Properties v12{};
+    vk::PhysicalDeviceProperties2 properties{};
+    properties.pNext = &v12;
+    m_physical_device.getProperties2(&properties);
+    ShaderRecompiler::Spirv::HostFloatControls controls{};
+    const auto independence = v12.denormBehaviorIndependence;
+    if (independence != vk::ShaderFloatControlsIndependence::eNone) {
+      controls.denorm_flush_f32 = v12.shaderDenormFlushToZeroFloat32 == VK_TRUE;
+      const bool preserve16 = v12.shaderDenormPreserveFloat16 == VK_TRUE;
+      const bool preserve64 = v12.shaderDenormPreserveFloat64 == VK_TRUE;
+      const bool all = independence == vk::ShaderFloatControlsIndependence::eAll;
+      controls.denorm_preserve_f16 = all ? preserve16 : preserve16 && preserve64;
+      controls.denorm_preserve_f64 = all ? preserve64 : preserve16 && preserve64;
+    }
+    return controls;
+  }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
     return m_runtime_context;
@@ -50789,6 +50811,18 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bvh-only") == 0) {
     VulkanHarness vulkan;
     BvhTests::RunAll(&vulkan);
+    return 0;
+  }
+  // --bvh-fuzz <iterations> [first iteration]
+  if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--bvh-fuzz") == 0) {
+    VulkanHarness vulkan;
+    BvhTests::RunSoftware(&vulkan, static_cast<u32>(std::strtoul(argv[2], nullptr, 10)),
+                          argc == 4 ? static_cast<u32>(std::strtoul(argv[3], nullptr, 10)) : 0u);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-bench") == 0) {
+    VulkanHarness vulkan;
+    BvhTests::RunBenchmark(&vulkan);
     return 0;
   }
   // CPU only: compiles and validates the GET_LOD_STATS instrumentation.

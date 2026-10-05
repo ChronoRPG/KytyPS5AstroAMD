@@ -543,6 +543,12 @@ void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
 
+// 64-bit (OpTypeInt 64) guest/device address constant.
+uint32_t EmitDeviceAddressConstant(EmitterState& state, uint64_t value);
+// Guest address (64-bit int) -> device address of the same byte through the BDA page table, or 0
+// (and a recorded fault) when the page is not mapped. Requires program.info.uses_dma.
+uint32_t EmitBdaDeviceAddress(ValueEmitContext& ctx, uint32_t guest_address);
+
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
 auto EmitImageMipSwitch(EmitterState& state, uint32_t mip_lod, uint32_t mip_count,

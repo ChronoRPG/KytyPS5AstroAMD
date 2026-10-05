@@ -498,8 +498,9 @@ void NoteBvhInstructions(const CompileOptions& options, Decoder::Program& decode
 		count++;
 		first_pc = std::min(first_pc, inst.pc);
 		if (!decode_bvh && inst.opcode != Decoder::Opcode::UNSUPPORTED) {
-			Decoder::SetUnsupported(inst, Decoder::Family::MIMG, inst.opcode_id,
-			                        "BVH ray intersection is disabled (KYTY_RT_STUB=1 enables it)");
+			Decoder::SetUnsupported(
+			    inst, Decoder::Family::MIMG, inst.opcode_id,
+			    "BVH ray intersection is disabled (KYTY_RT_SOFTWARE=1 or KYTY_RT_STUB=1 enables it)");
 		}
 	}
 	if (count == 0 || !decode_bvh) {
@@ -513,10 +514,11 @@ void NoteBvhInstructions(const CompileOptions& options, Decoder::Program& decode
 			return;
 		}
 	}
+	const bool software = GetCodegenOptions().rt_software;
 	Log::WriteToConsoleAndLog(fmt::format(
-	    "KYTY_RT_STUB: {} shader 0x{:016x} has {} BVH intersection instruction(s), first at "
-	    "pc=0x{:08x}; every ray misses.\n",
-	    StageName(options.stage), options.shader_hash, count, first_pc));
+	    "{}: {} shader 0x{:016x} has {} BVH intersection instruction(s), first at pc=0x{:08x}{}.\n",
+	    software ? "KYTY_RT_SOFTWARE" : "KYTY_RT_STUB", StageName(options.stage),
+	    options.shader_hash, count, first_pc, software ? "" : "; every ray misses"));
 }
 
 Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<const uint32_t> back,
@@ -596,8 +598,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(code.size()));
 
-	// IMAGE_BVH*_INTERSECT_RAY is translated only when a BVH mode is on (KYTY_RT_STUB).
-	const bool decode_bvh = GetCodegenOptions().rt_stub;
+	// IMAGE_BVH*_INTERSECT_RAY is translated only when a BVH mode is on (KYTY_RT_SOFTWARE or
+	// KYTY_RT_STUB).
+	const bool decode_bvh = GetCodegenOptions().rt_software || GetCodegenOptions().rt_stub;
 	Decoder::Program decoded;
 	std::vector<uint32_t> joined_code;
 	if (!options.back_code.empty()) {

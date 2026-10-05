@@ -88,10 +88,11 @@ void TestRayTracingDispatchDetection() {
 
 class ScopedRtStub {
 public:
-  explicit ScopedRtStub(bool enabled)
+  explicit ScopedRtStub(bool enabled, bool software = false)
       : m_saved(ShaderRecompiler::GetCodegenOptions()) {
     auto options = m_saved;
     options.rt_stub = enabled;
+    options.rt_software = software;
     ShaderRecompiler::SetCodegenOptions(options);
   }
   ~ScopedRtStub() { ShaderRecompiler::SetCodegenOptions(m_saved); }
@@ -189,6 +190,28 @@ void TestRayTracingStub() {
               .skip_dispatch,
           "BVH compute shader was not skipped without KYTY_RT_STUB");
   }
+  // KYTY_RT_SOFTWARE: BVH shaders compile to valid SPIR-V. A pixel shader that exports the
+  // result keeps the node test alive (an unused result is dead code), so spirv-val checks the whole
+  // lowering, BDA node fetch included.
+  {
+    const ScopedRtStub software(false, true);
+    const auto compute = RecompileForTest(compute_code, MakeCompileOptions(ShaderType::Compute));
+    Check(!compute.spirv.empty() && compute.program.info.uses_bvh,
+          "KYTY_RT_SOFTWARE compute program did not compile or lost its BVH flag");
+    CheckSpirvBinaryValidates(compute.spirv);
+    for (const bool type6 : {true, false}) {
+      auto options = ShaderRecompiler::GetCodegenOptions();
+      options.rt_type6 = type6;
+      ShaderRecompiler::SetCodegenOptions(options);
+      const std::array pixel_code{0xf1989f01u, 0x00081014u,
+                                  EncodeExp0(0x00, 0xf, true, false, true),
+                                  EncodeExp1(16, 17, 18, 19), EncodeSopp(0x01)};
+      const auto pixel = RecompileForTest(pixel_code, MakeCompileOptions(ShaderType::Pixel));
+      Check(!pixel.spirv.empty() && pixel.program.info.uses_bvh && pixel.program.info.uses_dma,
+            "KYTY_RT_SOFTWARE pixel program did not compile or lost its BVH or BDA flag");
+      CheckSpirvBinaryValidates(pixel.spirv);
+    }
+  }
   const ScopedRtStub stub(true);
   for (const auto stage : {ShaderType::Compute, ShaderType::Pixel}) {
     const auto options = MakeCompileOptions(stage);
@@ -206,10 +229,18 @@ void TestRayTracingStub() {
 
 // Development check on real guest code (not part of the default run): each file is a raw
 // shader binary (code first; data after its end is ignored). Decodes it with the BVH decoder,
-// then translates it as a compute shader with KYTY_RT_STUB. Returns the number of failures.
+// then translates it as a wave32 compute shader (Astro Bot's RT kernels set CS_W32_EN) with
+// KYTY_RT_STUB and with KYTY_RT_SOFTWARE. Returns the number of failures.
 int TranslateBvhShaderFiles(int argc, char **argv) {
   namespace D = ShaderRecompiler::Decoder;
-  const ScopedRtStub stub(true);
+  static const ShaderComputeInputInfo wave32 = [] {
+    ShaderComputeInputInfo info{};
+    info.wave_size = 32;
+    info.host_subgroup_size = 32;
+    return info;
+  }();
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &wave32;
   int failures = 0;
   for (int arg = 2; arg < argc; ++arg) {
     std::FILE *file = std::fopen(argv[arg], "rb");
@@ -237,14 +268,27 @@ int TranslateBvhShaderFiles(int argc, char **argv) {
         std::fprintf(stderr, "%s: %s\n", argv[arg], D::InstructionToString(inst).c_str());
       }
     }
-    const auto translated = ShaderRecompiler::TranslateProgram(
-        code, MakeCompileOptions(ShaderType::Compute));
-    const bool ok = unsupported == 0 && !translated.skip_dispatch &&
-                    !translated.program.blocks.empty();
-    std::printf("%s: instructions=%zu bvh=%u bvh64=%u unsupported=%u translated=%s\n",
+    bool ok[2] = {};
+    for (const bool software : {false, true}) {
+      const ScopedRtStub mode(!software, software);
+      const auto translated = ShaderRecompiler::TranslateProgram(code, options);
+      uint32_t ops = 0;
+      for (const auto *block : translated.program.blocks) {
+        for (const auto &inst : *block) {
+          const auto op = inst.GetOpcode();
+          ops += op == ShaderRecompiler::IR::ValueOpcode::BvhIntersectRay ||
+                         op == ShaderRecompiler::IR::ValueOpcode::BvhIntersectRayStub
+                     ? 1u
+                     : 0u;
+        }
+      }
+      ok[software ? 1 : 0] = unsupported == 0 && !translated.skip_dispatch &&
+                             !translated.program.blocks.empty() && ops == bvh + bvh64;
+    }
+    std::printf("%s: instructions=%zu bvh=%u bvh64=%u unsupported=%u stub=%s software=%s\n",
                 argv[arg], program.instructions.size(), bvh, bvh64, unsupported,
-                ok ? "yes" : "NO");
-    failures += ok ? 0 : 1;
+                ok[0] ? "yes" : "NO", ok[1] ? "yes" : "NO");
+    failures += ok[0] && ok[1] ? 0 : 1;
   }
   return failures;
 }
