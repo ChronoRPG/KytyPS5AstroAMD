@@ -1758,6 +1758,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		case BindingType::Texture:
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
 			recreate |= raw_d16_texture;
+			// Astro Bot (PPSA21567) samples the D32 memory of its 3328x1872 depth target as
+			// R16G16_SFLOAT: a colour alias is filled from the depth image.
+			recreate |= !requested.HasStencil() && !cached.info.HasStencil() &&
+			            NeedsColorAliasForSampledDepth(cached.info.pixel_format,
+			                                           cached.info.bytes_per_block,
+			                                           requested.pixel_format,
+			                                           requested.bytes_per_block);
 			break;
 		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
 		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
