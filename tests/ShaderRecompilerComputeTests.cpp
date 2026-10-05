@@ -17675,6 +17675,142 @@ public:
                 deferred ? ", deferred labels" : "");
   }
 
+  // KYTY_SRT_VARIANT_READS skips a program that calls a function through S_SWAPPC_B64, through
+  // the real pipeline cache. With the shader dump on, it also saves the callee next to the
+  // program's dump: the callee address comes from the dispatch's user data (s[4:5], copied into
+  // the link pair s[14:15] as Psr's shader-mesh builders do), and the file holds the callee's
+  // guest code from its first instruction up to and including its return (s_setpc_b64 s[14:15]),
+  // not the words after it. The dispatch itself does not run. A callee address outside the guest
+  // mappings, or null, is not read: the program is skipped just the same, and nothing is dumped.
+  void CheckCallTargetDump() {
+    constexpr const char *name = "CallTargetDump";
+    constexpr uintptr_t base = 0x0000000207c00000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t callee = base + 0x1000;
+    EnsureRuntimeContext();
+
+    static std::vector<u32> code;
+    code.clear();
+    code.push_back(EncodeSMovB32(14, 4)); // s_mov_b32 s14, s4
+    code.push_back(EncodeSMovB32(15, 5)); // s_mov_b32 s15, s5
+    code.push_back(0xbe8e210eu);          // s_swappc_b64 s[14:15], s[14:15]
+    AppendEnd(&code);
+    // The same program with one and two leading s_nop: distinct programs for the other callees.
+    static std::vector<u32> unmapped_code;
+    static std::vector<u32> null_code;
+    unmapped_code = code;
+    unmapped_code.insert(unmapped_code.begin(), EncodeSopp(0x00));
+    null_code = unmapped_code;
+    null_code.insert(null_code.begin(), EncodeSopp(0x00));
+    for (const auto *program : {&code, &unmapped_code, &null_code}) {
+      ShaderMapUserData(reinterpret_cast<uint64_t>(program->data()),
+                        {.type = Prospero::ShaderBinaryType::kCs,
+                         .code_size_bytes = static_cast<uint32_t>(program->size() * sizeof(u32))});
+    }
+    constexpr uint64_t unmapped_callee = base + allocation_size + 0x100000;
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "callee direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "callee direct mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    // The callee: s_mov_b32 s20, literal; v_mov_b32 v1, s20; s_setpc_b64 s[14:15]; then words that
+    // are not part of it.
+    const std::array<u32, 6> callee_words{EncodeSMovB32(20, 255), 0x12345678u,
+                                          EncodeVop1(0x01, 1, 20), 0xbe80200eu,
+                                          0xdeadbeefu, 0xbf810000u};
+    std::memcpy(reinterpret_cast<void *>(callee), callee_words.data(), sizeof(callee_words));
+
+    const auto folder = std::filesystem::temp_directory_path() /
+                        fmt::format("kyty_callee_dump_{}",
+                                    std::chrono::steady_clock::now().time_since_epoch().count());
+    Config::ConfigOptions options;
+    options.printf_direction = Config::LogDirection::Silent;
+    options.graphics_debug_dump_enabled = true;
+    options.shader_log_folder = folder;
+    Config::Load(options);
+    {
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.GetGpu().SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        scheduler.Begin(registers, user_config, shaders);
+        context.MapMemory(base, allocation_size);
+        const auto dispatch = [&](const std::vector<u32> &program, uint64_t target) {
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(program.data()),
+                               .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = 64, .user_sgpr = 6, .tgid_x_en = true});
+          for (uint32_t i = 0; i < 4; i++) {
+            shaders.SetCsUserSgpr(i, 0, HW::UserSgprType::Unknown);
+          }
+          shaders.SetCsUserSgpr(4, static_cast<u32>(target), HW::UserSgprType::Unknown);
+          shaders.SetCsUserSgpr(5, static_cast<u32>(target >> 32u), HW::UserSgprType::Unknown);
+          context.GetRenderExecutor().DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41u);
+        };
+        dispatch(code, callee);
+        dispatch(unmapped_code, unmapped_callee);
+        dispatch(null_code, 0);
+        RenderExecutorTestAccess::ResetBindings(context.GetRenderExecutor());
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+      });
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      context.ShutdownGpu();
+    }
+    options.graphics_debug_dump_enabled = false;
+    options.shader_log_folder = "_Shaders";
+    Config::Load(options);
+
+    std::vector<std::filesystem::path> dumps;
+    uint32_t callee_files = 0;
+    std::error_code error;
+    const auto suffix = fmt::format("_{:012x}.bin", callee);
+    for (const auto &entry : std::filesystem::directory_iterator(folder / "original", error)) {
+      const auto file_name = entry.path().filename().string();
+      callee_files += file_name.starts_with("callee_") ? 1u : 0u;
+      if (file_name.starts_with("callee_cs_") && file_name.ends_with(suffix)) {
+        dumps.push_back(entry.path());
+      }
+    }
+    Require(name, "callee dumped", dumps.size() == 1u && callee_files == 1u,
+            "expected exactly one callee dump in " + folder.string() + ", found " +
+                std::to_string(dumps.size()) + " of " + std::to_string(callee_files));
+    std::vector<u32> dumped(std::filesystem::file_size(dumps[0]) / sizeof(u32));
+    if (std::FILE *file = std::fopen(dumps[0].string().c_str(), "rb"); file != nullptr) {
+      dumped.resize(std::fread(dumped.data(), sizeof(u32), dumped.size(), file));
+      std::fclose(file);
+    }
+    Require(name, "callee code",
+            dumped == std::vector<u32>(callee_words.begin(), callee_words.begin() + 4),
+            "the dump does not hold the callee up to its return (" +
+                std::to_string(dumped.size()) + " words)");
+    std::filesystem::remove_all(folder, error);
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "callee mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "callee allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // KYTY_CMASK_FAST_CLEAR: a colour target with CB_COLOR0_INFO.FAST_CLEAR whose CMASK the game's
   // metadata fill set to 0 (every tile fast-cleared) is cleared to CLEAR_WORD0/1 when it is
   // bound, and its CMASK is left expanded (0xFF), as after the eliminate. Rebinding afterwards,

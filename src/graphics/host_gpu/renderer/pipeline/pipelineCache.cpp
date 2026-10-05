@@ -740,6 +740,78 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 	}
 }
 
+// The code of each function a skipped S_SWAPPC_B64 program calls (ShaderRecompiler CallTarget), next
+// to the program's own dump: original/callee_<stage>_<program hash>_<callee address>.bin. It holds
+// the callee from its first instruction up to and including the first S_SETPC_B64 (or null-
+// destination S_SWAPPC_B64) through the return pair, at most 4 KiB; a literal equal to that
+// encoding would end it early. Only guest memory the GPU can read is copied: through the clean
+// backing, else in place inside the GPU-mapped ranges; an unreadable callee logs a line instead.
+void DumpCallTargets(const char* stage_name, uint64_t shader_hash,
+                     std::span<const ShaderRecompiler::CallTarget> targets) {
+	if (!Config::GraphicsDebugDumpEnabled() || targets.empty()) {
+		return;
+	}
+	constexpr size_t MaxWords   = 1024; // 4 KiB
+	constexpr size_t ChunkWords = 64;
+	for (const auto& target: targets) {
+		std::vector<uint32_t> words(MaxWords);
+		size_t                read = 0;
+		if ((target.address & 3u) == 0u) {
+			while (read < MaxWords) {
+				const auto chunk   = std::span(words).subspan(read, std::min(ChunkWords, MaxWords - read));
+				const auto address = target.address + read * sizeof(uint32_t);
+				if (!LibKernel::Memory::TryReadGpuCleanBacking(address, chunk.data(),
+				                                              chunk.size_bytes())) {
+					if (ShaderRecompiler::IR::NeverMappedAddress(address, chunk.size_bytes()) ||
+					    !LibKernel::Memory::IsGpuMapped(address, chunk.size_bytes())) {
+						break;
+					}
+					std::memcpy(chunk.data(), reinterpret_cast<const void*>(address),
+					            chunk.size_bytes());
+				}
+				read += chunk.size();
+			}
+		}
+		size_t end      = read;
+		bool   returned = false;
+		for (size_t i = 0; i < read; i++) {
+			const auto word = words[i];
+			const bool sop1 = (word >> 23u) == 0x17du;
+			const auto op   = (word >> 8u) & 0xffu;
+			const auto sdst = (word >> 16u) & 0x7fu;
+			if (sop1 && (word & 0xffu) == target.return_sgpr &&
+			    (op == 0x20u || (op == 0x21u && sdst == 125u))) {
+				end      = i + 1;
+				returned = true;
+				break;
+			}
+		}
+		if (end == 0) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "KYTY_SRT_VARIANT_READS: callee 0x{:x} of {} shader 0x{:016x} is not readable "
+			    "guest memory; not dumped.\n",
+			    target.address, stage_name, shader_hash));
+			continue;
+		}
+		const auto path = Config::GetShaderLogFolder() / "original" /
+		                  fmt::format("callee_{}_{:016x}_{:012x}.bin", stage_name, shader_hash,
+		                              target.address);
+		Common::File::CreateDirectories(path.parent_path());
+		Common::File file(path);
+		if (file.IsInvalid()) {
+			const auto path_text = Common::PathToString(path);
+			LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", path_text.c_str());
+			continue;
+		}
+		file.Write(words.data(), end * sizeof(uint32_t));
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "KYTY_SRT_VARIANT_READS: dumped callee 0x{:x} (s[{}:{}]) of {} shader 0x{:016x}: {} "
+		    "bytes, {}.\n",
+		    target.address, target.user_sgpr, target.user_sgpr + 1u, stage_name, shader_hash,
+		    end * sizeof(uint32_t), returned ? "up to its return" : "no return within the dump"));
+	}
+}
+
 void DumpMatchedShaderInputs(const ShaderParams& params,
                              const ShaderRecompiler::CompileOptions& options,
                              const char* stage_name, std::span<const uint32_t> static_state,
@@ -2570,6 +2642,8 @@ struct PipelineCache::ProgramCache {
 				// Skipped ray-tracing shaders are never compiled; dump their guest code here.
 				DumpShaderOriginal(ProgramStageName(options.stage), options.shader_hash,
 				                   params.code, translated.decoded_dump);
+				DumpCallTargets(ProgramStageName(options.stage), options.shader_hash,
+				                translated.call_targets);
 				if (disk_on) {
 					disk->AddSource(disk_key, true, {});
 				}

@@ -398,6 +398,86 @@ void NullBasedFlatReadReadsZero() {
   std::printf("[compute] %-32s ok\n", name);
 }
 
+// The callees a skipped S_SWAPPC_B64 program jumps to, from the dispatch's user data: Psr's
+// shader-mesh builders copy a callback record from user SGPRs into s[14:17] before each
+// s_swappc_b64 s[14:15], s[14:15] (the swappc writes the return address into its destination pair,
+// which does not make a target unknown). A call directly through user SGPRs names them. A target
+// the program computes some other way is only counted as unresolved in the log line.
+void CallTargetsFromUserData() {
+  constexpr const char *name = "CallTargetsFromUserData";
+  std::vector<u32> code;
+  for (u32 i = 0; i < 4; ++i) {
+    code.push_back(EncodeSMovB32(14 + i, 4 + i)); // s_mov_b32 s[14 + i], s[4 + i]
+  }
+  code.push_back(0xbe8e210eu); // s_swappc_b64 s[14:15], s[14:15]
+  code.push_back(EncodeSMovB32(14, 8));
+  code.push_back(EncodeSMovB32(15, 9));
+  code.push_back(0xbe8e210eu); // s_swappc_b64 s[14:15], s[14:15]
+  code.push_back(0xbe94210au); // s_swappc_b64 s[20:21], s[10:11]
+  AppendEnd(&code);
+  std::array<u32, 16> user_data{};
+  user_data[4] = 0x00001000u;
+  user_data[5] = 0x00000002u;
+  user_data[8] = 0x00003000u;
+  user_data[9] = 0x00000004u;
+  user_data[10] = 0x00005000u;
+  user_data[11] = 0x00010006u; // bits above 48 are not part of the address
+  ShaderComputeInputInfo compute_info{};
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  const auto result = ShaderRecompiler::TranslateProgram(code, options);
+  Require(name, "skipped", result.skip_dispatch, "the calling program was not skipped");
+  const auto &targets = result.call_targets;
+  const auto has = [&](uint64_t address, u32 user_sgpr, u32 return_sgpr) {
+    return std::ranges::any_of(targets, [&](const ShaderRecompiler::CallTarget &target) {
+      return target.address == address && target.user_sgpr == user_sgpr &&
+             target.return_sgpr == return_sgpr;
+    });
+  };
+  Require(name, "targets",
+          targets.size() == 3u && has(0x0000000200001000ull, 4, 14) &&
+              has(0x0000000400003000ull, 8, 14) && has(0x0000000600005000ull, 10, 20),
+          "the callees were not read from user data (" + std::to_string(targets.size()) +
+              " found)");
+
+  // A target the program computes from a user-data copy has no known callee.
+  std::vector<u32> computed;
+  computed.push_back(EncodeSMovB32(14, 4));
+  computed.push_back(EncodeSMovB32(15, 5));
+  computed.push_back(EncodeSop2(0x00, 14, 14, InlineU32(4))); // s_add_u32 s14, s14, 4
+  computed.push_back(0xbe8e210eu);
+  AppendEnd(&computed);
+  const auto partial = ShaderRecompiler::TranslateProgram(computed, options);
+  Require(name, "computed target", partial.skip_dispatch && partial.call_targets.empty(),
+          "a computed target was reported as a user-data callee");
+
+  // Across control flow: a copy in the entry block reaches a call behind a branch target; a copy
+  // on one path only does not.
+  std::vector<u32> branchy;
+  branchy.push_back(EncodeSMovB32(14, 4));
+  branchy.push_back(EncodeSMovB32(15, 5));
+  branchy.push_back(EncodeSopp(0x04, 1)); // s_cbranch_scc0 over the next instruction
+  branchy.push_back(EncodeSMovB32(20, 6));
+  branchy.push_back(0xbe8e210eu); // s_swappc_b64 s[14:15], s[14:15] (a branch target)
+  AppendEnd(&branchy);
+  const auto dominated = ShaderRecompiler::TranslateProgram(branchy, options);
+  Require(name, "entry copy", dominated.skip_dispatch && dominated.call_targets.size() == 1u &&
+                                  dominated.call_targets[0].address == 0x0000000200001000ull,
+          "an entry-block copy did not reach a call behind a branch target");
+  std::vector<u32> one_path;
+  one_path.push_back(EncodeSopp(0x04, 2)); // s_cbranch_scc0 over the two copies
+  one_path.push_back(EncodeSMovB32(14, 4));
+  one_path.push_back(EncodeSMovB32(15, 5));
+  one_path.push_back(0xbe8e210eu);
+  AppendEnd(&one_path);
+  const auto conditional = ShaderRecompiler::TranslateProgram(one_path, options);
+  Require(name, "one-path copy", conditional.skip_dispatch && conditional.call_targets.empty(),
+          "a copy on one path only was reported as the callee");
+  std::printf("[compute] %-32s ok\n", name);
+}
+
 void RunAll(VulkanHarness *vulkan) {
   auto options = GetCodegenOptions();
   options.srt_variant_reads = true;
@@ -406,6 +486,8 @@ void RunAll(VulkanHarness *vulkan) {
   RunCase(vulkan, ScalarLoadsThroughLoopCarriedRecords());
   RunCase(vulkan, RawLoadsThroughGpuSelectedDescriptors());
   CallIsSkipped();
+  CallTargetsFromUserData();
+  vulkan->CheckCallTargetDump();
   NullBasedFlatReadReadsZero();
 }
 
