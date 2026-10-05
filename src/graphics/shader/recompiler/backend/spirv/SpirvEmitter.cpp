@@ -89,7 +89,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 			uses_gds |= kind == IR::ResourceKind::Gds;
 		}
 	}
-	if (uses_gds || LoopGuardApplies(program.shader_hash)) {
+	if (uses_gds || LoopGuardApplies(program.shader_hash) || IR::UsesBvhNodeCount(program)) {
 		Expect(Kind::Gds);
 	}
 	if (program.info.uses_dma) {

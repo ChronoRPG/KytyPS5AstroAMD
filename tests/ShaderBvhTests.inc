@@ -833,6 +833,12 @@ void RunStub(VulkanHarness *vulkan) {
   }
 }
 
+namespace Recompiler = ::Libs::Graphics::ShaderRecompiler;
+
+// GDS size of the node-count tests: room for the budget word and the whole histogram.
+constexpr u32 GdsDwords = 32;
+static_assert(GdsDwords >= Recompiler::RtNodeStatsGdsFromEnd + Recompiler::RtNodeStatsBins);
+
 // Runs a MakeCase test and reports mismatching lanes with their inputs.
 void RunChecked(VulkanHarness *vulkan, const TestCase &test, const Scenario &scenario, u32 wave_size,
                 bool bvh64, bool a16) {
@@ -850,9 +856,21 @@ void RunChecked(VulkanHarness *vulkan, const TestCase &test, const Scenario &sce
   const bool bda =
       ShaderRecompiler::IR::FindBinding(compiled.program.bindings, Kind::BdaPagetable) != nullptr;
   auto buffer = vulkan->CreateStorageBuffer(test.name, test.initial, test.initial.size(), bda);
-  vulkan->Dispatch(test, compiled, buffer);
+  // The BVH node count (KYTY_RT_NODE_BUDGET, on by default) reports through GDS.
+  const bool gds =
+      ShaderRecompiler::IR::FindBinding(compiled.program.bindings, Kind::Gds) != nullptr;
+  auto gds_buffer = vulkan->CreateStorageBuffer(test.name, std::vector<u32>(GdsDwords, 0u),
+                                                GdsDwords);
+  vulkan->Dispatch(test, compiled, buffer, gds ? &gds_buffer : nullptr);
   const auto actual = vulkan->ReadBuffer(test.name, buffer, test.expected.size());
+  const auto gds_words = vulkan->ReadBuffer(test.name, gds_buffer, GdsDwords);
+  vulkan->DestroyBuffer(&gds_buffer);
   vulkan->DestroyBuffer(&buffer);
+  // (EXEC = 0 folds the instruction away, and with it the count.)
+  Require(test.name, "node budget", gds == ShaderRecompiler::IR::UsesBvhNodeCount(compiled.program),
+          "the BVH node count's GDS binding does not follow KYTY_RT_NODE_BUDGET");
+  Require(test.name, "node budget", gds_words[GdsDwords - Recompiler::RtNodeBudgetGdsFromEnd] == 0u,
+          "an ordinary node test exhausted the default BVH node budget");
   // Float results match any NaN with any NaN: the encoding of a NaN made by an invalid operation
   // is the host's (x86 0xffc00000, NVIDIA 0x7fffffff), as in every other translated float op.
   const auto is_nan = [](u32 bits) { return (bits & 0x7fffffffu) > PlusInf; };
@@ -986,10 +1004,175 @@ void RunSoftware(VulkanHarness *vulkan, u32 fuzz_iterations, u32 first_iteration
   }
 }
 
+// ----------------------------------------------------------------------------------------------
+// KYTY_RT_NODE_BUDGET / KYTY_RT_NODE_STATS
+
+// The scenario must outlive the case (its name). A traversal that follows child 0 until a node
+// test returns no hit child, counting its node tests in s2; then a scalar loop counts s3 up to 0x10000 (the loop an exhausted invocation must
+// leave at once). Stores s2, s3 and the last result's dword 0 at [lane], [wave + lane] and
+// [2 * wave + lane].
+TestCase MakeWalkCase(const Scenario &scenario, u32 wave_size, u32 expected_tests,
+                      u32 expected_s3) {
+  using O = ShaderOpcode;
+  auto test = MakeCase(scenario, wave_size, false, false, false, true);
+  std::vector<u32> code;
+  AppendRecordAddress(&code);
+  const u32 dwords = BvhAddressDwords(false, false);
+  for (u32 k = 0; k < dwords; ++k) {
+    code.push_back(EncodeMubuf0(0x0cu, (k == 0u ? 0u : k + 1u) * 4u));
+    code.push_back(EncodeMubuf1(40u + k, 0, 1));
+  }
+  for (u32 i = 0; i < 4u; ++i) AppendSMovLiteral(&code, 32u + i, scenario.tsharp[i]);
+  code.push_back(EncodeSMovB32(2, InlineU32(0)));
+  const auto walk = static_cast<u32>(code.size());
+  AppendBvh(&code, false, false, 16, 40, 32);
+  code.push_back(EncodeSop2(0x00, 2, 2, InlineU32(1)));   // s_add_u32 s2, s2, 1
+  code.push_back(EncodeVopc(0xc2, 193u, 16));             // v_cmp_eq_u32 vcc, -1, v16
+  code.push_back(EncodeSopp(0x07, 2));                    // s_cbranch_vccnz done
+  code.push_back(EncodeVop1(0x01, 40, Vgpr(16)));         // v_mov_b32 v40, v16
+  const auto back = static_cast<int32_t>(code.size());
+  code.push_back(EncodeSopp(0x02, static_cast<u32>(static_cast<int32_t>(walk) - (back + 1)) &
+                                      0xffffu));        // s_branch walk
+  code.push_back(EncodeSMovB32(3, InlineU32(0)));
+  const auto count = static_cast<u32>(code.size());
+  code.push_back(EncodeSop2(0x00, 3, 3, InlineU32(1)));   // s_add_u32 s3, s3, 1
+  code.push_back(EncodeSopc(0x0a, 3, 255u));              // s_cmp_lt_u32 s3, 0x10000
+  code.push_back(0x10000u);
+  const auto again = static_cast<int32_t>(code.size());
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(static_cast<int32_t>(count) - (again + 1)) &
+                                      0xffffu));        // s_cbranch_scc1 count
+  code.push_back(EncodeVop1(0x01, 20, 2));                // v_mov_b32 v20, s2
+  code.push_back(EncodeVop1(0x01, 21, 3));                // v_mov_b32 v21, s3
+  AppendStoreVgprAtLaneDwordOffset(&code, 20, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 21, 0, wave_size);
+  AppendStoreVgprAtLaneDwordOffset(&code, 16, 0, 2u * wave_size);
+  AppendEnd(&code);
+  test.code = std::move(code);
+  test.expected.assign(3u * wave_size, 0u);
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    test.expected[lane] = expected_tests;
+    test.expected[wave_size + lane] = expected_s3;
+    test.expected[2u * wave_size + lane] = InvalidNode;
+  }
+  test.opcodes = {O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD, O::S_MOV_B32,
+                  O::IMAGE_BVH_INTERSECT_RAY, O::S_ADD_U32, O::V_CMP_EQ_U32,
+                  O::S_CBRANCH_VCCNZ, O::V_MOV_B32, O::S_BRANCH, O::S_CMP_LT_U32,
+                  O::S_CBRANCH_SCC1, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+// `links` box32 nodes, 128 bytes apart, each with child 0 = the next node and no other child; the
+// last one points back to the first when `cycle`, else it has no child. One ray through them.
+Scenario WalkScenario(u32 links, bool cycle, const char *name) {
+  Scenario scenario;
+  scenario.name = name;
+  scenario.tsharp = Tsharp();
+  constexpr std::array<float, 6> Everywhere{-1000, -1000, -1000, 1000, 1000, 1000};
+  for (u32 link = 0; link < links; ++link) {
+    const bool last = link + 1u == links;
+    const u32 next = last ? (cycle ? static_cast<u32>(Pointer(0, 5)) : InvalidNode)
+                          : static_cast<u32>(Pointer((link + 1u) * 128u, 5));
+    scenario.image.Box32(link * 128u, {next, InvalidNode, InvalidNode, InvalidNode},
+                         {Everywhere, Everywhere, Everywhere, Everywhere});
+  }
+  scenario.lanes.push_back(MakeLane(Pointer(0, 5), Inf, {0, 0, 0}, {1, 0, 0}, {1, Inf, Inf}));
+  return scenario;
+}
+
+std::vector<u32> RunWalk(VulkanHarness *vulkan, const TestCase &test) {
+  const auto compiled = CompileCase(test, vulkan->SubgroupSize());
+  Require(test.name, "GDS", ShaderRecompiler::IR::FindBinding(
+                                compiled.program.bindings,
+                                ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr,
+          "a counted BVH program does not bind GDS");
+  auto buffer = vulkan->CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+  auto gds = vulkan->CreateStorageBuffer(test.name, std::vector<u32>(GdsDwords, 0u), GdsDwords);
+  vulkan->Dispatch(test, compiled, buffer, &gds);
+  const auto actual = vulkan->ReadBuffer(test.name, buffer, test.expected.size());
+  auto gds_words = vulkan->ReadBuffer(test.name, gds, GdsDwords);
+  vulkan->DestroyBuffer(&gds);
+  vulkan->DestroyBuffer(&buffer);
+  Require(test.name, "result", actual == test.expected,
+          "walk results differ (lane 0: tests " + std::to_string(actual[0]) + ", second loop " +
+              std::to_string(actual[test.expected.size() / 3u]) + ")");
+  return gds_words;
+}
+
+// CPU only: the count and its GDS binding exist exactly when the budget or the statistics are on.
+void CheckNodeCountCodegen() {
+  constexpr const char *name = "BvhNodeCountCodegen";
+  const auto scenario = WalkScenario(1, false, name);
+  const auto test = MakeCase(scenario, 32, false, false, false, true);
+  for (const u32 mode : {0u, 1u, 2u}) {
+    auto options = GetCodegenOptions();
+    options.rt_software = true;
+    options.rt_node_budget = mode == 1u ? 64u : 0u;
+    options.rt_node_stats = mode == 2u;
+    const ScopedCodegenOptions scoped(options);
+    const auto compiled = CompileCase(test, 32u);
+    const auto names = CodegenTests::CountSpirv(compiled.spirv, "OpName %bvh_node_count");
+    const bool gds = ShaderRecompiler::IR::FindBinding(
+                         compiled.program.bindings,
+                         ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr;
+    Require(name, "SPIR-V", (names == 1u) == (mode != 0u) && gds == (mode != 0u),
+            "the BVH node count or its GDS binding does not follow the switches");
+  }
+  std::printf("[bvh]     %-32s ok\n", name);
+}
+
+// GPU: a cyclic BVH ends at the budget, the invocation leaves its next loop at once, and each
+// invocation reports once; with the statistics, a 5-node walk lands in bin [4, 8).
+void RunNodeBudget(VulkanHarness *vulkan) {
+  CheckNodeCountCodegen();
+  const auto controls = vulkan->DeviceFloatControls();
+  const ScopedFloatControls float_controls(controls);
+  for (const u32 wave_size : {32u, 64u}) {
+    const u32 lanes = wave_size == 64u && vulkan->SubgroupSize() == 32u ? 2u : 1u;
+    const u32 invocations = wave_size / lanes;
+    {
+      auto options = GetCodegenOptions();
+      options.rt_software = true;
+      options.rt_node_budget = 100;
+      options.rt_node_stats = false;
+      const ScopedCodegenOptions scoped(options);
+      // The 101st node test misses; the walk stops there and the counting loop is left at once.
+      const auto scenario = WalkScenario(1, true, "BvhBudgetCycle");
+      const auto test = MakeWalkCase(scenario, wave_size, 101, 1);
+      const auto gds = RunWalk(vulkan, test);
+      for (u32 word = 0; word < GdsDwords; ++word) {
+        const u32 want = word == GdsDwords - Recompiler::RtNodeBudgetGdsFromEnd ? invocations : 0u;
+        Require(test.name, "report", gds[word] == want,
+                "GDS dword " + std::to_string(word) + " is " + std::to_string(gds[word]) +
+                    ", expected " + std::to_string(want));
+      }
+      std::printf("[bvh]     %-24s wave%-2u ok (%u reports)\n", test.name, wave_size,
+                  gds[GdsDwords - Recompiler::RtNodeBudgetGdsFromEnd]);
+    }
+    {
+      auto options = GetCodegenOptions();
+      options.rt_software = true;
+      options.rt_node_budget = 0;
+      options.rt_node_stats = true;
+      const ScopedCodegenOptions scoped(options);
+      const auto scenario = WalkScenario(5, false, "BvhNodeStats");
+      const auto test = MakeWalkCase(scenario, wave_size, 5, 0x10000);
+      const auto gds = RunWalk(vulkan, test);
+      for (u32 word = 0; word < GdsDwords; ++word) {
+        const u32 want = word == GdsDwords - Recompiler::RtNodeStatsGdsFromEnd - 2u ? invocations : 0u;
+        Require(test.name, "histogram", gds[word] == want,
+                "GDS dword " + std::to_string(word) + " is " + std::to_string(gds[word]) +
+                    ", expected " + std::to_string(want));
+      }
+      std::printf("[bvh]     %-24s wave%-2u ok\n", test.name, wave_size);
+    }
+  }
+}
+
 void RunAll(VulkanHarness *vulkan) {
   CheckReferenceDirected();
   RunStub(vulkan);
   RunSoftware(vulkan, 64);
+  RunNodeBudget(vulkan);
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -1100,13 +1283,18 @@ double TimeCase(VulkanHarness *vulkan, const TestCase &test, u32 repeats, u32 sa
   const bool bda =
       ShaderRecompiler::IR::FindBinding(compiled.program.bindings, Kind::BdaPagetable) != nullptr;
   auto buffer = vulkan->CreateStorageBuffer(test.name, test.initial, test.initial.size(), bda);
+  const bool gds =
+      ShaderRecompiler::IR::FindBinding(compiled.program.bindings, Kind::Gds) != nullptr;
+  auto gds_buffer = vulkan->CreateStorageBuffer(test.name, std::vector<u32>(GdsDwords, 0u),
+                                                GdsDwords);
   std::vector<double> times;
   for (u32 sample = 0; sample < samples; ++sample) {
     double elapsed_us = 0;
-    vulkan->Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, nullptr, repeats,
-                     &elapsed_us);
+    vulkan->Dispatch(test, compiled, buffer, gds ? &gds_buffer : nullptr, nullptr, nullptr,
+                     nullptr, nullptr, repeats, &elapsed_us);
     times.push_back(elapsed_us * 1000.0);
   }
+  vulkan->DestroyBuffer(&gds_buffer);
   vulkan->DestroyBuffer(&buffer);
   std::sort(times.begin(), times.end());
   return times[times.size() / 2u];

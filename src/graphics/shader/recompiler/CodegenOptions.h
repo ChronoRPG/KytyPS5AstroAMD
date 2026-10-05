@@ -188,7 +188,27 @@ struct CodegenOptions {
 	// renderer settles each such dispatch synchronously: it waits for it and marks the pages it wrote
 	// GPU-owned before the CP continues (Profiling/analysis/BDA-WRITES-DESIGN.md).
 	bool bda_writes = false;
+	// KYTY_RT_NODE_BUDGET=<n> (with KYTY_RT_SOFTWARE; 0 = no limit): the most BVH node tests one
+	// guest lane runs. A garbage or cyclic BVH can keep the guest's traversal looping forever and
+	// lose the device. Past the budget every node test misses without reading memory, the
+	// invocation takes each loop's exit edge (as KYTY_LOOP_GUARD does), and at return it adds one to
+	// GDS dword end - RtNodeBudgetGdsFromEnd, which the command processor reports at flips ("RT
+	// node budget"). Every invocation of a wave executes the instruction for each node the wave's
+	// packet traversal visits, so the count is the wave's traversal length. The default is a safety
+	// net far above expected traversals (KYTY_RT_NODE_STATS measures them).
+	uint32_t rt_node_budget = 8192;
+	// KYTY_RT_NODE_STATS=1 (with KYTY_RT_SOFTWARE): at return, each invocation that ran node tests
+	// adds one to the GDS dword of its per-lane count's power of two (bin k holds counts in
+	// [2^k, 2^(k+1)), at end - RtNodeStatsGdsFromEnd - k), reported at flips. A diagnostic for the
+	// budget.
+	bool rt_node_stats = false;
 };
+
+// GDS dwords, counted from the end of GDS, that KYTY_RT_NODE_BUDGET and KYTY_RT_NODE_STATS report
+// through (the last one is KYTY_LOOP_GUARD's).
+inline constexpr uint32_t RtNodeBudgetGdsFromEnd = 2;
+inline constexpr uint32_t RtNodeStatsGdsFromEnd  = 3;
+inline constexpr uint32_t RtNodeStatsBins        = 24;
 
 // True when KYTY_LOOP_GUARD applies to the guest shader with this hash.
 [[nodiscard]] bool LoopGuardApplies(uint64_t shader_hash);

@@ -80,6 +80,11 @@ CodegenOptions FromEnvironment() {
 	options.rt_software  = EnvFlag("KYTY_RT_SOFTWARE", options.rt_software);
 	options.rt_type6     = EnvFlag("KYTY_RT_TYPE6", options.rt_type6);
 	options.bda_writes        = EnvFlag("KYTY_BDA_WRITES", options.bda_writes);
+	if (const auto* budget = std::getenv("KYTY_RT_NODE_BUDGET");
+	    budget != nullptr && budget[0] != '\0') {
+		options.rt_node_budget = static_cast<uint32_t>(std::strtoul(budget, nullptr, 0));
+	}
+	options.rt_node_stats = EnvFlag("KYTY_RT_NODE_STATS", options.rt_node_stats);
 	if (const auto* mode = std::getenv("KYTY_MAD_MODE"); mode != nullptr) {
 		if (std::strcmp(mode, "exact") == 0) {
 			options.mad_mode = MadMode::Exact;

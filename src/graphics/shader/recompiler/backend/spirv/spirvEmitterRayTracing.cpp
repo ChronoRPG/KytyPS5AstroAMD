@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include <algorithm>
 #include <array>
 
 // Software IMAGE_BVH_INTERSECT_RAY / IMAGE_BVH64_INTERSECT_RAY (IR BvhIntersectRay, built by
@@ -622,9 +623,36 @@ uint32_t EmitBvhIntersectRay(ValueEmitContext& ctx, const IR::Inst& inst) {
 		operands.inverse[axis]   = to_f32(ctx.Arg(inst, 11u + axis));
 	}
 	const auto active = ctx.Arg(inst, 14);
-	return EmitValueOrDefaultIfCondition(s, active, TypeU32Vector(s, 4),
-	                                     ConstantU32CompositeZero(s, 4),
-	                                     [&]() { return EmitBvhNodeTest(ctx, operands); });
+	if (s.bvh_node_count_variable == 0) {
+		return EmitValueOrDefaultIfCondition(s, active, TypeU32Vector(s, 4),
+		                                     ConstantU32CompositeZero(s, 4),
+		                                     [&]() { return EmitBvhNodeTest(ctx, operands); });
+	}
+	// KYTY_RT_NODE_BUDGET / KYTY_RT_NODE_STATS: every invocation counts every execution, whatever
+	// EXEC holds (the wave's traversal length; a two-lane invocation counts once per half).
+	const auto count = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpLoad, TypeU32(s), count, s.bvh_node_count_variable);
+	const auto saturated = Binary(s, spv::OpIEqual, TypeBool(s), count, ConstantU32(s, UINT32_MAX));
+	s.builder.AddFunction(spv::OpStore, s.bvh_node_count_variable,
+	                      Select(s, TypeU32(s), saturated, count,
+	                             Binary(s, spv::OpIAdd, TypeU32(s), count, ConstantU32(s, 1u))));
+	const uint64_t budget = GetCodegenOptions().rt_node_budget;
+	if (budget == 0) {
+		return EmitValueOrDefaultIfCondition(s, active, TypeU32Vector(s, 4),
+		                                     ConstantU32CompositeZero(s, 4),
+		                                     [&]() { return EmitBvhNodeTest(ctx, operands); });
+	}
+	// Past the budget a node test misses without reading memory: a box has no hit children and a
+	// triangle is not hit, so the guest's traversal stack only drains.
+	const auto limit =
+	    static_cast<uint32_t>(std::min<uint64_t>(budget * s.lane_count, UINT32_MAX - 1u));
+	const auto allowed = Binary(s, spv::OpULessThan, TypeBool(s), count, ConstantU32(s, limit));
+	return EmitValueOrDefaultIfCondition(
+	    s, active, TypeU32Vector(s, 4), ConstantU32CompositeZero(s, 4), [&]() {
+		    return EmitValueOrDefaultIfCondition(s, allowed, TypeU32Vector(s, 4),
+		                                         EmitBvhIntersectRayStub(s, operands.node_lo),
+		                                         [&]() { return EmitBvhNodeTest(ctx, operands); });
+	    });
 }
 
 // KYTY_RT_STUB: a triangle node (type 0-3) misses with t_num = +inf, t_denom = 1.0 and zero

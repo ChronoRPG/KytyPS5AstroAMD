@@ -241,6 +241,7 @@ int TranslateBvhShaderFiles(int argc, char **argv) {
   }();
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.input_info.compute = &wave32;
+  options.wave_size = 32;
   int failures = 0;
   for (int arg = 2; arg < argc; ++arg) {
     std::FILE *file = std::fopen(argv[arg], "rb");
