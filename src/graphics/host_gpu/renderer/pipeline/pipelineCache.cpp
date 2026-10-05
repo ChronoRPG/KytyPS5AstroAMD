@@ -1370,8 +1370,9 @@ struct PipelineCache::ProgramCache {
 		std::vector<uint32_t>              user_dependencies;
 		bool                               projected_key = false;
 		PermutationList                    permutations;
-		// Set under the exclusive programs lock; may be set on an already published entry.
-		std::atomic<bool>                  skip_dispatch {false};
+		// Set under the exclusive programs lock; may be set on an already published entry. Also
+		// set without it by Materialize for a plan that can never materialize (SkipVariantPlan).
+		mutable std::atomic<bool>          skip_dispatch {false};
 		// Mutated in place by reuse-mode refreshes; only touched under m_reuse_mutex.
 		mutable ReuseState                 reuse;
 		// The source's unmodified translation for further permutations (KYTY_TRANSLATION_CACHE),
@@ -1773,6 +1774,43 @@ struct PipelineCache::ProgramCache {
 		return false;
 	}
 
+	// A plan that failed to materialize with no guest range left to synchronize. When one of its
+	// flat SRT reads has a loop-carried address (a BVH traversal's instance record) and
+	// KYTY_SRT_VARIANT_READS is off, no evaluation before the dispatch can ever produce it: skip
+	// the source's dispatches and draws with one console line per shader instead of stopping the
+	// emulator. Every other such failure still exits. A concurrent Get of the same source may
+	// still materialize once more; it fails the same way.
+	static bool SkipVariantPlan(const SourceEntry& source) {
+		const auto& plan = source.resource_plan;
+		uint32_t    pc   = 0;
+		if (ShaderRecompiler::GetCodegenOptions().srt_variant_reads ||
+		    !ShaderRecompiler::IR::FindVariantFlatRead(plan, pc)) {
+			return false;
+		}
+		if (source.skip_dispatch.exchange(true, std::memory_order_relaxed)) {
+			return true;
+		}
+		Profiler::CountFrameEvent(Profiler::FrameEvent::VariantPlanSkips);
+		static std::mutex                   mutex;
+		static std::unordered_set<uint64_t> logged;
+		{
+			std::scoped_lock lock(mutex);
+			if (!logged.insert(plan.shader_hash ^ static_cast<uint64_t>(plan.stage)).second) {
+				return true;
+			}
+		}
+		std::string stage = ProgramStageName(plan.stage);
+		std::ranges::transform(stage, stage.begin(), [](unsigned char c) {
+			return static_cast<char>(std::toupper(c));
+		});
+		PipelineCacheLog("{} shader 0x{:016x} reads SRT data through a loop-carried address "
+		                 "(pc=0x{:08x}), which no evaluation before the dispatch can produce; its "
+		                 "dispatches and draws are skipped (KYTY_SRT_VARIANT_READS=1 compiles such "
+		                 "reads).",
+		                 stage, plan.shader_hash, pc);
+		return true;
+	}
+
 	// Materializes one stage and records a readiness failure for the retry loop.
 	bool Materialize(const SourceEntry& source, const ShaderRecompiler::IR::SrtRuntime& runtime,
 	                 ShaderRecompiler::IR::EvaluationScratch& evaluation, ProgramScratch& scratch,
@@ -1789,6 +1827,9 @@ struct PipelineCache::ProgramCache {
 		if (clean_compiles && DrawPrep::Speculative()) return false;
 		// An unsuccessful optional uniform-fill/active-source probe is harmless if the
 		// complete refresh succeeded. Only a failed refresh requests a retry.
+		if (read_attempt.count == 0 && SkipVariantPlan(source)) {
+			return false; // not a readiness failure: the caller skips the dispatch or draw
+		}
 		if (!NativeDccEnabled() || read_attempt.count == 0) {
 			// A failure no read can fix (an unsupported descriptor format, a specialization the
 			// recompiler rejects): the stage gets no program and its draws/dispatches are dropped

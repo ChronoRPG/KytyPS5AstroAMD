@@ -3,9 +3,10 @@
 //
 // Astro Bot's tiled deferred-lighting kernels walk a BVH: they load an instance record through a
 // loop-carried pointer (S_LOAD) and read the record's V# with S_BUFFER_LOAD. Without the switch
-// such a record read is a flat SRT slot that cannot be evaluated before the dispatch (the dispatch
-// is dropped), and an S_BUFFER_LOAD through a runtime V# fails resource tracking. With it, both
-// are read in the shader through BDA, with the RDNA2 bounds of a bound scalar buffer.
+// such a record read is a flat SRT slot that cannot be evaluated before the dispatch (the pipeline
+// cache skips the program's dispatches with one log line), and an S_BUFFER_LOAD through a runtime
+// V# fails resource tracking. With it, both are read in the shader through BDA, with the RDNA2
+// bounds of a bound scalar buffer.
 
 namespace SrtVariantTests {
 
@@ -257,6 +258,82 @@ TestCase RawLoadsThroughGpuSelectedDescriptors() {
   return test;
 }
 
+// Without KYTY_SRT_VARIANT_READS the loop-carried record reads above stay flat SRT slots, and no
+// evaluation before the dispatch can produce their addresses. FindVariantFlatRead names one of
+// them, which is how the pipeline cache tells such a plan (skipped with one log line) from any
+// other that fails to materialize (still an exit). A pointer loaded once and followed is not
+// loop-carried.
+void VariantPlanIsFound() {
+  constexpr const char *name = "VariantPlanIsFound";
+  auto codegen = GetCodegenOptions();
+  codegen.srt_variant_reads = false;
+  ScopedCodegenOptions scope(codegen);
+  ShaderComputeInputInfo compute_info{};
+  const auto translate = [&](const TestCase &test, std::array<u32, 64> &user_data) {
+    user_data = MakeNativeUserData(nullptr);
+    user_data[2] = static_cast<u32>(test.initial.size() * sizeof(u32));
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Compute;
+    options.input_info.compute = &compute_info;
+    options.user_data = user_data;
+    auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
+    Require(name, "translate", !translated.skip_dispatch && !translated.program.blocks.empty(),
+            std::string(test.name) + " did not translate");
+    return ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  };
+
+  const auto records = ScalarLoadsThroughLoopCarriedRecords();
+  std::array<u32, 64> user_data{};
+  const auto plan = translate(records, user_data);
+  std::vector<uint32_t> loop_reads;
+  {
+    ShaderRecompiler::Decoder::Program decoded;
+    ShaderRecompiler::Decoder::DecodeProgram(records.code, decoded);
+    for (const auto &inst : decoded.instructions) {
+      if (inst.opcode == ShaderOpcode::S_LOAD_DWORDX2 ||
+          inst.opcode == ShaderOpcode::S_LOAD_DWORDX4 ||
+          inst.opcode == ShaderOpcode::S_BUFFER_LOAD_DWORDX4) {
+        loop_reads.push_back(inst.pc);
+      }
+    }
+  }
+  uint32_t pc = UINT32_MAX;
+  Require(name, "loop-carried read",
+          ShaderRecompiler::IR::FindVariantFlatRead(plan, pc) &&
+              std::ranges::find(loop_reads, pc) != loop_reads.end(),
+          "no flat read through the loop-carried pointer was found (pc " + Hex(pc) + ")");
+  ShaderRecompiler::IR::ResourceSnapshot resources;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = user_data,
+      .shader_base = reinterpret_cast<uint64_t>(records.code.data()),
+      .read_memory = ReadTestMemory,
+      .userdata = const_cast<std::vector<u32> *>(&records.initial),
+  };
+  Require(name, "no materialization",
+          !ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization),
+          "a plan with a loop-carried flat read materialized");
+
+  // A pointer the shader loads once and follows (no loop) is evaluated before the dispatch as
+  // usual: not reported.
+  TestCase chase;
+  chase.name = "PointerChase";
+  chase.initial.resize(64);
+  chase.code.push_back(EncodeSmem0(0x01, 8, 0)); // s_load_dwordx2 s[8:9], s[0:1], 0
+  chase.code.push_back(EncodeSmem1(0, 125));
+  chase.code.push_back(EncodeSopp(0x0c, 0xc07f)); // s_waitcnt lgkmcnt(0)
+  chase.code.push_back(EncodeSmem0(0x01, 10, 4)); // s_load_dwordx2 s[10:11], s[8:9], 0x30
+  chase.code.push_back(EncodeSmem1(0x30, 125));
+  chase.code.push_back(EncodeSopp(0x0c, 0xc07f));
+  AppendStoreSgpr(&chase.code, 10, 0);
+  AppendEnd(&chase.code);
+  std::array<u32, 64> chase_user_data{};
+  const auto chase_plan = translate(chase, chase_user_data);
+  Require(name, "pointer chase", !ShaderRecompiler::IR::FindVariantFlatRead(chase_plan, pc),
+          "a pointer loaded outside any loop was reported as loop-carried");
+  std::printf("[compute] %-32s ok\n", name);
+}
+
 // S_SWAPPC_B64 (a call through a function pointer) is skipped, not a CFG-build exit.
 void CallIsSkipped() {
   std::vector<u32> code;
@@ -489,6 +566,8 @@ void RunAll(VulkanHarness *vulkan) {
   CallTargetsFromUserData();
   vulkan->CheckCallTargetDump();
   NullBasedFlatReadReadsZero();
+  VariantPlanIsFound();
+  vulkan->CheckVariantPlanSkipped();
 }
 
 } // namespace SrtVariantTests

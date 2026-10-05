@@ -76,6 +76,11 @@ void SealEvaluationIndices(ResourcePlan& program);
 EvaluationScratch& ThreadEvaluationScratch();
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
+// Whether a flat SRT read's address depends on a phi ResolveInvariantPhi cannot reduce (a
+// loop-carried pointer such as a BVH traversal's instance record): no evaluation before the
+// dispatch can produce it, so the plan never materializes. `pc` receives the first such read's
+// guest pc. Walks the plan's IR; meant for a failed materialization, not for every one.
+bool FindVariantFlatRead(const ResourcePlan& program, uint32_t& pc);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 

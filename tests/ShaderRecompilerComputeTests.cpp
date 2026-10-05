@@ -17811,6 +17811,133 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // The BVH traversal shape through the real pipeline cache: a loop follows `next` pointers
+  // through records and stores each record's value. Without KYTY_SRT_VARIANT_READS the record
+  // reads are flat SRT slots whose loop-carried addresses no evaluation before the dispatch can
+  // produce: the dispatch is skipped (one log line, FrameEvent VariantPlanSkips) instead of
+  // stopping the emulator, and so is the next dispatch of the same program. With the switch, a
+  // fresh context runs the same dispatch through BDA and stores both values.
+  void CheckVariantPlanSkipped() {
+    constexpr const char *name = "VariantPlanSkipped";
+    constexpr uintptr_t base = 0x0000000207800000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t output = base;              // bound through the user-data V#
+    constexpr uint64_t records = base + 0x40000;   // two 64-byte records: next, value
+    EnsureRuntimeContext();
+
+    static std::vector<u32> code;
+    code.clear();
+    AppendSMovLiteral(&code, 20, static_cast<u32>(records));
+    AppendSMovLiteral(&code, 21, static_cast<u32>(records >> 32u));
+    AppendSMovLiteral(&code, 30, 0);                         // output byte offset
+    const auto loop = code.size();
+    code.push_back(EncodeSopc(0x13, 20, InlineU32(0)));      // s_cmp_lg_u64 s[20:21], 0
+    const auto exit_branch = code.size();
+    code.push_back(EncodeSopp(0x04, 0));                     // s_cbranch_scc0 done
+    code.push_back(EncodeSmem0(0x00, 24, 10));               // s_load_dword s24, s[20:21], 8
+    code.push_back(EncodeSmem1(8, 125));
+    code.push_back(EncodeSmem0(0x01, 22, 10));               // s_load_dwordx2 s[22:23], s[20:21], 0
+    code.push_back(EncodeSmem1(0, 125));
+    code.push_back(EncodeSopp(0x0c, 0xc07f));                // s_waitcnt lgkmcnt(0)
+    code.push_back(EncodeVop1(0x01, 1, 24));                 // v_mov_b32 v1, s24
+    code.push_back(EncodeVop1(0x01, 2, 30));                 // v_mov_b32 v2, s30
+    code.push_back(EncodeMubuf0(0x1c));                      // buffer_store_dword v1, v2, s[0:3] offen
+    code.push_back(EncodeMubuf1(1, 0, 2));
+    code.push_back(EncodeSop2(0x00, 30, 30, InlineU32(4)));  // s_add_u32 s30, s30, 4
+    code.push_back(EncodeSop1(0x04, 20, 22));                // s_mov_b64 s[20:21], s[22:23]
+    const auto back_branch = code.size();
+    code.push_back(EncodeSopp(0x02, static_cast<u32>(static_cast<int32_t>(loop) -
+                                                     static_cast<int32_t>(back_branch + 1)) &
+                                        0xffffu));           // s_branch loop
+    code[exit_branch] = EncodeSopp(0x04, static_cast<u32>(code.size() - (exit_branch + 1)));
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "variant-plan direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "variant-plan direct mapping failed");
+
+    const auto saved_options = ShaderRecompiler::GetCodegenOptions();
+    const auto run = [&](bool variant_reads, uint32_t dispatches) {
+      std::memset(mapped, 0, allocation_size);
+      auto *record_words = reinterpret_cast<u32 *>(records);
+      record_words[0] = static_cast<u32>(records + 64); // record 0: next = record 1
+      record_words[1] = static_cast<u32>((records + 64) >> 32u);
+      record_words[2] = 11;
+      record_words[16 + 2] = 22;                        // record 1: next = null
+      auto options = saved_options;
+      options.srt_variant_reads = variant_reads;
+      ShaderRecompiler::SetCodegenOptions(options);
+      const auto context_owner = MakeRenderContext();
+      auto &context = *context_owner;
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.GetGpu().SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        scheduler.Begin(registers, user_config, shaders);
+        context.MapMemory(base, allocation_size);
+        // Backed pages: the BDA reads of the switch-on run find them in the page table.
+        (void)context.GetBufferCache().FindBuffer(records, BufferCache::CACHING_PAGESIZE);
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                             .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
+        const std::array<u32, 4> output_vsharp{static_cast<u32>(output),
+                                               static_cast<u32>(output >> 32u), 64u,
+                                               (3u << 28u) | (0x16u << 12u) | 0xfacu};
+        for (uint32_t i = 0; i < output_vsharp.size(); i++) {
+          shaders.SetCsUserSgpr(i, output_vsharp[i], HW::UserSgprType::Unknown);
+        }
+        for (uint32_t dispatch = 0; dispatch < dispatches; dispatch++) {
+          context.GetRenderExecutor().DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41u);
+        }
+      });
+      const auto first = *reinterpret_cast<volatile u32 *>(output);
+      const auto second = *reinterpret_cast<volatile u32 *>(output + 4);
+      context.GetGpu().SendCommandSync([&] {
+        auto &scheduler = context.GetCommandScheduler();
+        RenderExecutorTestAccess::ResetBindings(context.GetRenderExecutor());
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+      });
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      context.ShutdownGpu();
+      ShaderRecompiler::SetCodegenOptions(saved_options);
+      return std::pair{first, second};
+    };
+    const auto [skipped_first, skipped_second] = run(false, 2);
+    Require(name, "skipped without KYTY_SRT_VARIANT_READS",
+            skipped_first == 0u && skipped_second == 0u,
+            "a dispatch whose plan cannot materialize stored " + Hex(skipped_first) + " " +
+                Hex(skipped_second));
+    const auto [first, second] = run(true, 1);
+    Require(name, "runs with KYTY_SRT_VARIANT_READS", first == 11u && second == 22u,
+            "the record walk stored " + Hex(first) + " " + Hex(second) + ", expected 11 22");
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "variant-plan mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "variant-plan allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // KYTY_CMASK_FAST_CLEAR: a colour target with CB_COLOR0_INFO.FAST_CLEAR whose CMASK the game's
   // metadata fill set to 0 (every tile fast-cleared) is cleared to CLEAR_WORD0/1 when it is
   // bound, and its CMASK is left expanded (0xFF), as after the eliminate. Rebinding afterwards,

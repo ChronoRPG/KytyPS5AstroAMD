@@ -2019,6 +2019,43 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 	return RuntimeValidator(program, type).Run(value);
 }
 
+bool FindVariantFlatRead(const ResourcePlan& program, uint32_t& pc) {
+	std::unordered_set<const Inst*> visited;
+	std::vector<Value>              pending;
+	for (const auto& read: program.srt_reads) {
+		const auto* read_inst = read.value.Resolve().TryInstruction();
+		if (read_inst == nullptr) {
+			continue;
+		}
+		// The read's address operands; the value it reads does not matter.
+		pending.clear();
+		for (size_t index = 0; index < read_inst->NumArgs(); index++) {
+			pending.push_back(read_inst->Arg(index));
+		}
+		while (!pending.empty()) {
+			const auto value = pending.back().Resolve();
+			pending.pop_back();
+			const auto* inst = value.IsImmediate() ? nullptr : value.TryInstruction();
+			if (inst == nullptr || !visited.insert(inst).second) {
+				continue;
+			}
+			if (inst->GetOpcode() == ValueOpcode::Phi) {
+				const auto invariant = ResolveInvariantPhi(program, value);
+				if (invariant.IsEmpty()) {
+					pc = read_inst->Flags<MemoryFlags>().pc;
+					return true;
+				}
+				pending.push_back(invariant);
+				continue;
+			}
+			for (size_t index = 0; index < inst->NumArgs(); index++) {
+				pending.push_back(inst->Arg(index));
+			}
+		}
+	}
+	return false;
+}
+
 void BuildSrtPlan(Program& program, bool variant_reads) {
 	if (program.resource_tracking_complete) {
 		EXIT("shader SRT planning failed: cannot rebuild SRT after resource tracking");
