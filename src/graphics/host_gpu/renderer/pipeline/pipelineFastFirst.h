@@ -28,9 +28,10 @@ namespace Libs::Graphics {
 // plus running optimized compiles (beyond it a new pipeline is built optimized, synchronously, as
 // without the switch); KYTY_PIPELINE_FAST_FIRST_RETIRE_S (default 60, 0 = until exit) how long a
 // replaced pipeline handle stays alive for command buffers that may still use it;
-// KYTY_PIPELINE_FAST_FIRST_PROBE (default 1; 0 skips the driver-cache probe, so every eligible new
-// pipeline is built fast and optimized later; the driver's own on-disk cache can otherwise answer
-// the probe for pipelines this process never compiled);
+// KYTY_PIPELINE_FAST_FIRST_PROBE (default 0: every eligible new pipeline is built fast and
+// optimized later; 1 first probes the driver cache, which NVIDIA's own on-disk cache can answer for
+// pipelines this process never compiled, and a cold Sky Garden run then waited 1.38 s on pipeline
+// creation instead of 0.31 s);
 // KYTY_PIPELINE_FAST_FIRST_DRAIN_S (default 5) how long exit waits for queued optimized compiles
 // so the saved driver cache holds them.
 

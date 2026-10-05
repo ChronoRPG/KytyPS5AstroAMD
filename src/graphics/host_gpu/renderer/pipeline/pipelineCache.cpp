@@ -3495,7 +3495,7 @@ struct PipelineCache::FastFirstState {
 	      retire_age_ns(FastFirstEnvU64("KYTY_PIPELINE_FAST_FIRST_RETIRE_S", 60) * 1'000'000'000ull),
 	      drain_ms(FastFirstEnvU64("KYTY_PIPELINE_FAST_FIRST_DRAIN_S", 5) * 1000ull),
 	      probe(owner.m_graphics.pipeline_creation_cache_control_enabled &&
-	            FastFirstEnvU64("KYTY_PIPELINE_FAST_FIRST_PROBE", 1) != 0),
+	            FastFirstEnvU64("KYTY_PIPELINE_FAST_FIRST_PROBE", 0) != 0),
 	      reporter([this](std::stop_token stop) { Report(stop); }) {}
 	FastFirstState(const FastFirstState&)            = delete;
 	FastFirstState& operator=(const FastFirstState&) = delete;
