@@ -203,3 +203,48 @@ void TestRayTracingStub() {
                                          MakeCompileOptions(ShaderType::Compute));
   Check(!ordinary.program.info.uses_bvh, "program without BVH was marked as using BVH");
 }
+
+// Development check on real guest code (not part of the default run): each file is a raw
+// shader binary (code first; data after its end is ignored). Decodes it with the BVH decoder,
+// then translates it as a compute shader with KYTY_RT_STUB. Returns the number of failures.
+int TranslateBvhShaderFiles(int argc, char **argv) {
+  namespace D = ShaderRecompiler::Decoder;
+  const ScopedRtStub stub(true);
+  int failures = 0;
+  for (int arg = 2; arg < argc; ++arg) {
+    std::FILE *file = std::fopen(argv[arg], "rb");
+    if (file == nullptr) {
+      std::fprintf(stderr, "%s: cannot open\n", argv[arg]);
+      failures++;
+      continue;
+    }
+    std::vector<uint32_t> code;
+    uint32_t word = 0;
+    while (std::fread(&word, sizeof(word), 1, file) == 1) {
+      code.push_back(word);
+    }
+    std::fclose(file);
+    D::Program program;
+    D::DecodeProgram(code, program, true);
+    uint32_t bvh = 0;
+    uint32_t bvh64 = 0;
+    uint32_t unsupported = 0;
+    for (const auto &inst : program.instructions) {
+      bvh += inst.opcode == D::Opcode::IMAGE_BVH_INTERSECT_RAY ? 1u : 0u;
+      bvh64 += inst.opcode == D::Opcode::IMAGE_BVH64_INTERSECT_RAY ? 1u : 0u;
+      if (inst.opcode == D::Opcode::UNSUPPORTED) {
+        unsupported++;
+        std::fprintf(stderr, "%s: %s\n", argv[arg], D::InstructionToString(inst).c_str());
+      }
+    }
+    const auto translated = ShaderRecompiler::TranslateProgram(
+        code, MakeCompileOptions(ShaderType::Compute));
+    const bool ok = unsupported == 0 && !translated.skip_dispatch &&
+                    !translated.program.blocks.empty();
+    std::printf("%s: instructions=%zu bvh=%u bvh64=%u unsupported=%u translated=%s\n",
+                argv[arg], program.instructions.size(), bvh, bvh64, unsupported,
+                ok ? "yes" : "NO");
+    failures += ok ? 0 : 1;
+  }
+  return failures;
+}
