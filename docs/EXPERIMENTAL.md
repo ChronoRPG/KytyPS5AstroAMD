@@ -4,8 +4,28 @@ This release builds on the U59 renderer of the previous U59 releases.
 
 ## New in this update
 
-Pre-release: the int13 pre-release plus the changes below. If something works worse than in int13, please report it
-and use int13.
+int15 (main release): int14 plus the changes below.
+
+- Images read as colour over memory the texture cache holds as a plain D32 depth image (Astro Bot reuses depth memory
+  as an RG16F DCC target at its 3328x1872 and 3840x2160 dynamic-resolution tiers) get a colour alias instead of
+  stopping with "unsupported sampled depth image"; anything still unsupported binds a null texture and is reported
+  once.
+- `TextureCache::ClearImage` validates its range before any state change and skips a rejected clear with one
+  `TextureCache: ClearImage skipped (<fault>): site=...` line per signature instead of exiting (leaving an extra
+  level in Sky Garden stopped the emulator). DCC and CMASK fast-clear metadata is no longer applied to depth images
+  (`TextureCache: DCC|CMASK metadata skipped for a depth image`).
+- Upstream KytyPS5 (through 72e4989b1, reviewed and partly hand-ported): shader opcode and precision fixes (DS float
+  min/max, DS_PERMUTE, DS masked OR, FP64 min/max/rounding, 64-bit image atomics, SDWA, V_CMPX_NE_U16, FLAT D16
+  loads, ALIGNBYTE), no RTE rounding mode for FP64 shaders (an NVIDIA pipeline compile hang), image formats that name
+  nothing bound empty (#1019), null SRT pointers read as zero (#987), guest thread priorities (#1050), the BDA page
+  table cleared before first use (#1065), polygon draws as triangle fans, partially resident depth flags, libFont
+  kerning and metrics, trophy notifications. Not taken: the FP32 MAD rounding change (it conflicts with our
+  position-invariant MAD mode) and the readback-window removal.
+- Release notes correction for int14: the shader precompile mainly helps after an emulator update, when the program
+  cache is rebuilt; with an unchanged emulator the program cache already covers revisits.
+- Checked on one PC (RTX 3090, Ryzen 9 7950X3D): Sky Garden 34.8 fps (int14 34.1), snow level 21.2 fps (int14 21.7).
+
+From the int14 pre-release (`u59-windows-20261005-int14-pre`):
 
 - Shader precompile (`KYTY_SHADER_PRECOMPILE=1` in the preset): every shader variant the emulator translates is
   recorded in `_PipelineCache\<title>.shaders.journal`, and the next launch translates the recorded ones again on two

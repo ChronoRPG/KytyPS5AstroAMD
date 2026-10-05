@@ -1,40 +1,35 @@
-# KytyPS5 U59 int14 pre-release — Less shader stutter, loading and shader crash fixes
+# KytyPS5 U59 int15 — Crash fixes, upstream shader fixes and less shader stutter
 
-> **Pre-release.** This is the int13 pre-release plus the changes below. If anything works worse than in int13, please
-> report it (with your GPU and CPU model) and use the int13 release instead.
+This is the new main release. It includes everything from the int13 and int14 pre-releases. Keep using the Astro Bot
+"non RT patch" game patches with this build; the pre-release int16 runs the game's full graphics without them.
 
-## What's new
+## What's new since int14
 
-- **Shader precompile:** the emulator remembers every shader it has built and rebuilds them in the background at the
-  next launch, before the game needs them. Places you have already visited stutter much less on later visits: in
-  Astro Bot's Sky Garden, 437 shaders were built during play on the first run and 8 on the second. The first launch
-  works as before.
-- **Faster first pipelines:** when the game needs a new pipeline, a quick version is built first and the fully
-  optimized one replaces it in the background. In Sky Garden with an empty cache, the game waited 0.3 s in total for
-  pipelines instead of 1.4 s.
-- **Shader fix:** a kind of pixel shader that picks its texture at run time was translated incorrectly and stopped
-  the emulator (for example at Demon's Souls' character creation).
-- **Automatic GPU choice:** with the launcher's GPU setting on auto, the emulator could pick the wrong device on PCs
-  with more than one, and the game then crashed in levels. It now prefers the dedicated graphics card with the most
-  video memory, and the console shows the chosen GPU ("Kyty GPU: ..."). If a game crashes for you on auto, select your graphics card in
-  the launcher.
-- **Vulkan validation no longer stops the game:** with the launcher's Vulkan validation option on, Astro Bot stopped
-  at boot. Validation messages now go to `_kyty_vulkan_validation.log`. Leave the option off for playing; it makes
-  games much slower.
+- **Fewer crashes on fast GPUs:** on fast graphics cards Astro Bot raises its resolution, reuses memory between
+  images, and the emulator stopped with "unsupported sampled depth image". These images are now read correctly.
+- **No crash when leaving extra levels:** leaving an extra level in Sky Garden could stop the emulator on an image
+  clear it rejected. Such a clear is now skipped, and the console prints one `TextureCache: ClearImage skipped ...`
+  line with the details. Please send that line if you see it.
+- **Upstream fixes:** about 20 shader translation fixes, a fix for Demon's Souls stopping on an unknown image format,
+  thread priorities that keep busy game threads from starving the graphics thread, and trophy notifications.
 
-## Also in the int13 pre-release
+## From int14
 
-- **Fewer crashes when loading:** game file reads into memory the emulator protects no longer look like empty files
-  to the game. If int13 crashes for you while a level loads, try this build.
-- **Faster AMD CPU patch (`--amd-cpu`):** in Sky Garden it is now as fast as without the option.
-- **Low-VRAM cards, Intel GPUs and one compute shader:** fixes for cases that stopped the emulator.
-- **Adaptive triggers** (also in int13): Astro Bot's L2/R2 actions, Astro's Playroom capsules and the gun work.
+- **Shader precompile:** the emulator records the shaders it has built, and after an emulator update it rebuilds the
+  ones you have already seen in the background, so areas you have visited do not stutter again. The first time you
+  play an area works as before.
+- **Faster first pipelines:** a quick version of each new pipeline is used until the optimized one is ready. In Sky
+  Garden with an empty cache, the game waited 0.3 s in total for pipelines instead of 1.4 s.
+- **Automatic GPU choice:** on auto, the emulator now prefers your dedicated graphics card, and the console shows the
+  chosen GPU ("Kyty GPU: ..."). If a game crashes for you on auto, select your graphics card in the launcher.
+- **Fewer loading crashes, Vulkan validation no longer stops the game, Demon's Souls character creation works, and
+  the adaptive trigger fixes.**
 
 ## Checked
 
 - All automated tests pass.
-- Astro Bot Sky Garden runs as fast as int13 on the test PC (RTX 3090, Ryzen 9 7950X3D): 33.0 fps against 33.4 fps,
-  within run-to-run noise.
+- Astro Bot on the test PC (RTX 3090, Ryzen 9 7950X3D): Sky Garden 34.8 fps (int14: 34.1) and the snow level
+  21.2 fps (int14: 21.7), within run-to-run noise.
 
 ## Installing
 
@@ -42,12 +37,12 @@
 2. Open `launcher.exe`. Your existing game list and settings are picked up automatically.
 3. Game patches go in a `_Patches` folder next to the launcher; saves are kept per folder in `_SaveData`.
 
-Both new features are switched on in `u59-preset.json` next to the launcher. If something looks wrong, set
-`KYTY_SHADER_PRECOMPILE` or `KYTY_PIPELINE_FAST_FIRST` to `"0"` there and tell us which one it was.
+If a game crashes, please send the console text with your GPU and CPU model.
 
 ## Known issues
 
 - Microsoft Defender may flag `launcher.exe` (`Trojan:Win32/Bearfoos.A!ml`, a machine-learning verdict on the
   unsigned launcher). It is built from this repository's source by the GitHub workflow.
+- A game patch made for another game version can crash the game. Use patch files that match your version exactly.
 
 See `U59-README.md` in the download for the full list of changes and switches.
