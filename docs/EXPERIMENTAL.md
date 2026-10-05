@@ -4,8 +4,48 @@ This release builds on the U59 renderer of the previous U59 releases.
 
 ## New in this update
 
-Pre-release: the int13 pre-release plus the changes below. If something works worse than in int13, please report it
-and use int13.
+Pre-release int16: the int15 release plus Astro Bot's own lighting without the "non RT patch". If something works
+worse than in int15, please report it and use int15, or turn the two patch mods back on.
+
+- Compute shaders that contain IMAGE_BVH_INTERSECT_RAY run instead of being skipped: the instruction is emulated in
+  software (`KYTY_RT_SOFTWARE`, default 1), with a per-ray node budget against runaway traversals
+  (`KYTY_RT_NODE_BUDGET`, default 8192; `KYTY_RT_NODE_STATS` reports traversal statistics). Astro Bot's tiled
+  lighting kernel 0x78af8e269b528b5c (and 11 related kernels) contain the instruction, so without the patch the whole
+  lighting pass was dropped (black robots, unlit title). `KYTY_RT_SOFTWARE=0 KYTY_RT_STUB=1` lets every ray miss;
+  `KYTY_RT_SOFTWARE=0` restores the skip.
+- Stores and atomics through V#s computed at run time write through BDA (`KYTY_BDA_WRITES`, default 1).
+- SRT walks: a flat read of an unmapped address reads 0; a null SRT pointer reads as a zero descriptor once the read
+  fails; a program whose SRT reads follow a loop-carried pointer is skipped instead of exiting; the CFG structuriser
+  gives a loop's break-region conditional a selection merge.
+- The program disk cache keeps the new "uses BVH" and "writes through BDA" flags, and the codegen fingerprint covers the
+  RT and BDA-write options.
+- Crash reports print the faulting host call chain.
+- Checked on one PC (RTX 3090, Ryzen 9 7950X3D, Astro Bot 1.018, PGO build): Sky Garden 32.0 and 35.3 fps without the
+  patches against 34.8 with them; snow level 21.1 against 21.2. The first launch after an update builds the 13 RT
+  kernels' pipelines (1-2.9 s each) on the command-processor thread.
+
+int15 (main release, `u59-windows-20261005-int15`):
+
+- Images read as colour over memory the texture cache holds as a plain D32 depth image (Astro Bot reuses depth memory
+  as an RG16F DCC target at its 3328x1872 and 3840x2160 dynamic-resolution tiers) get a colour alias instead of
+  stopping with "unsupported sampled depth image"; anything still unsupported binds a null texture and is reported
+  once.
+- `TextureCache::ClearImage` validates its range before any state change and skips a rejected clear with one
+  `TextureCache: ClearImage skipped (<fault>): site=...` line per signature instead of exiting (leaving an extra
+  level in Sky Garden stopped the emulator). DCC and CMASK fast-clear metadata is no longer applied to depth images
+  (`TextureCache: DCC|CMASK metadata skipped for a depth image`).
+- Upstream KytyPS5 (through 72e4989b1, reviewed and partly hand-ported): shader opcode and precision fixes (DS float
+  min/max, DS_PERMUTE, DS masked OR, FP64 min/max/rounding, 64-bit image atomics, SDWA, V_CMPX_NE_U16, FLAT D16
+  loads, ALIGNBYTE), no RTE rounding mode for FP64 shaders (an NVIDIA pipeline compile hang), image formats that name
+  nothing bound empty (#1019), null SRT pointers read as zero (#987), guest thread priorities (#1050), the BDA page
+  table cleared before first use (#1065), polygon draws as triangle fans, partially resident depth flags, libFont
+  kerning and metrics, trophy notifications. Not taken: the FP32 MAD rounding change (it conflicts with our
+  position-invariant MAD mode) and the readback-window removal.
+- Release notes correction for int14: the shader precompile mainly helps after an emulator update, when the program
+  cache is rebuilt; with an unchanged emulator the program cache already covers revisits.
+- Checked on one PC (RTX 3090, Ryzen 9 7950X3D): Sky Garden 34.8 fps (int14 34.1), snow level 21.2 fps (int14 21.7).
+
+From the int14 pre-release (`u59-windows-20261005-int14-pre`):
 
 - Shader precompile (`KYTY_SHADER_PRECOMPILE=1` in the preset): every shader variant the emulator translates is
   recorded in `_PipelineCache\<title>.shaders.journal`, and the next launch translates the recorded ones again on two
