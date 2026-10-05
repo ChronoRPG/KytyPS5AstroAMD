@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineFastFirst.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -659,9 +660,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	graphics.pipeline_library_enabled = library_fast_linking &&
 	    HasExtension(device_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
-	// Only used by the library path's driver-cache probe; the default device stays unchanged.
+	// Only used by the driver-cache probes of the library path and KYTY_PIPELINE_FAST_FIRST; the
+	// default device stays unchanged.
 	graphics.pipeline_creation_cache_control_enabled =
-	    graphics.pipeline_library_enabled &&
+	    (graphics.pipeline_library_enabled || Libs::Graphics::PipelineFastFirstRequested()) &&
 	    supported_features13.pipelineCreationCacheControl == VK_TRUE;
 	LOGF("Vulkan pipeline support: GPL extension=%s, feature=%s, fast linking=%s, cache control=%s\n",
 	     pipeline_library_extension ? "true" : "false",

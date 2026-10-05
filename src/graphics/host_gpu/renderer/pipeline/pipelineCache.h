@@ -291,6 +291,7 @@ private:
 	struct PipelineDiagnostics;
 	struct DriverCacheSaver;
 	struct LibraryState;
+	struct FastFirstState;
 
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;
@@ -366,6 +367,9 @@ private:
 	// Graphics pipeline libraries and the background compiles that replace linked pipelines
 	// (KYTY_PIPELINE_LIBRARY, pipelineLibrary.h); null when off or unsupported.
 	std::unique_ptr<LibraryState> m_library;
+	// Unoptimized-first pipeline creation and the background optimized compiles
+	// (KYTY_PIPELINE_FAST_FIRST, pipelineFastFirst.h); null when off.
+	std::unique_ptr<FastFirstState> m_fast_first;
 	struct PrefetchState;
 	std::unique_ptr<PrefetchState> m_prefetch;
 	// Bumped whenever a cached pipeline object is replaced (a linked pipeline by its optimized
@@ -392,6 +396,11 @@ private:
 	// Background compile finished: swaps `optimized` in for the linked pipeline cached under `key`.
 	void ReplaceLinkedPipeline(const GraphicsPipelineKey* key, vk::Pipeline linked,
 	                           vk::Pipeline optimized);
+	// Fast-first: swaps the optimized pipeline in for the unoptimized one cached under the key (a
+	// new object; the old one is retired), and destroys retired handles that are old enough.
+	void ReplaceFastPipeline(const GraphicsPipelineKey* graphics_key, uint64_t compute_id,
+	                         vk::Pipeline fast, vk::Pipeline optimized, uint64_t fast_ns,
+	                         uint64_t optimize_ns);
 };
 
 // Creates a graphics pipeline from a complete monolithic create info instead of
@@ -419,9 +428,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const PipelineStaticParameters&        static_params,
                             vk::PipelineCache                      driver_cache,
                             const GraphicsPipelineCreateHook*      create_hook = nullptr);
+// Creates a compute pipeline from the complete create info instead of vkCreateComputePipelines
+// (KYTY_PIPELINE_FAST_FIRST). The create info and its chained structures live only for the call.
+using ComputePipelineCreateHook =
+    std::function<vk::Result(const vk::ComputePipelineCreateInfo& info, vk::Pipeline* pipeline)>;
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
+                            const ComputePipelineCreateHook* create_hook = nullptr);
 
 } // namespace Libs::Graphics
 

@@ -694,6 +694,10 @@ target_include_directories(spirv_cache_salt_tests PRIVATE ${inc_headers})
 add_executable(pipeline_compile_queue_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineCompileQueueTests.cpp")
 target_include_directories(pipeline_compile_queue_tests PRIVATE ${inc_headers})
 
+# KYTY_PIPELINE_FAST_FIRST: scheduling, retirement and accounting (pipeline/pipelineFastFirst.h).
+add_executable(pipeline_fast_first_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineFastFirstTests.cpp")
+target_include_directories(pipeline_fast_first_tests PRIVATE ${inc_headers})
+
 add_executable(shader_code_snapshot_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ShaderCodeSnapshotTests.cpp")
 target_link_libraries(shader_code_snapshot_tests xxhash)
 target_include_directories(shader_code_snapshot_tests PRIVATE ${inc_headers})
@@ -1047,6 +1051,16 @@ if(BUILD_TESTING)
 	add_test(NAME pipeline_compile_queue COMMAND $<TARGET_FILE:pipeline_compile_queue_tests>)
 	add_test(NAME shader_code_snapshot COMMAND $<TARGET_FILE:shader_code_snapshot_tests>)
 	set_tests_properties(pipeline_compile_queue PROPERTIES TIMEOUT 30)
+	add_test(NAME pipeline_fast_first COMMAND $<TARGET_FILE:pipeline_fast_first_tests>)
+	set_tests_properties(pipeline_fast_first PROPERTIES TIMEOUT 60)
+	add_test(NAME pipeline_fast_first_rendering COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
+	set_tests_properties(pipeline_fast_first_rendering PROPERTIES
+		ENVIRONMENT "KYTY_PIPELINE_FAST_FIRST=1;KYTY_PIPELINE_FAST_FIRST_RETIRE_S=1;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=130"
+		TIMEOUT 180)
+	add_test(NAME pipeline_fast_first_draw_run COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-run-only)
+	set_tests_properties(pipeline_fast_first_draw_run PROPERTIES
+		ENVIRONMENT "KYTY_PIPELINE_FAST_FIRST=1;KYTY_DRAW_RUN=exit;KYTY_PIPELINE_COLD_SALT=131"
+		TIMEOUT 180)
 	add_test(NAME pipeline_prefetch_rendering COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-prep-engine-only)
 	set_tests_properties(pipeline_prefetch_rendering PROPERTIES
 		ENVIRONMENT "KYTY_PIPELINE_PREFETCH=1;KYTY_PIPELINE_PREFETCH_THREADS=2;KYTY_DRAW_PREP_BINDINGS=1;KYTY_DRAW_PREP_VERIFY=exit;KYTY_PIPELINE_COLD_SALT=127"
@@ -2022,6 +2036,7 @@ if(BUILD_TESTING)
 		game_patch_filter_tests
 		lru_cache_tests
 		spirv_local_arrays_tests
+		pipeline_fast_first_tests
 		vram_budget_tests
 		device_compat_tests
 		shader_vertex_metadata_tests
