@@ -4,8 +4,18 @@ This release builds on the U59 renderer of the previous U59 releases.
 
 ## New in this update
 
-Pre-release int16: the int15 release plus Astro Bot's own lighting without the "non RT patch". If something works
-worse than in int15, please report it and use int15, or turn the two patch mods back on.
+Pre-release int16.1: int16 plus one fix.
+
+- Reverted the upstream libFont commits "font: fix glyph metrics and raster sizes" (32e9fa30) and "font: add scaled
+  kerning" (f860c9c5), which broke Astro Bot's level title text (wrong glyph sizes and spacing). The libFont code is
+  back to its int14 state; the fix was checked on screen. The same reverts are in int15.1.
+- Known issues: on RTX 50 GPUs the first launch can crash once while the RT kernels' pipelines are built; a second
+  start works. On AMD GPUs with the two patch mods off, the GPU can be lost (VK_ERROR_DEVICE_LOST) and Go-Go
+  Archipelago's water can spike frame times; AMD players should keep the patch mods on or use int15.1.
+
+Pre-release int16 (`u59-windows-20261005-int16-pre`): the int15 release plus Astro Bot's own lighting without the
+"non RT patch". If something works worse than in int15, please report it and use int15, or turn the two patch mods
+back on.
 
 - Compute shaders that contain IMAGE_BVH_INTERSECT_RAY run instead of being skipped: the instruction is emulated in
   software (`KYTY_RT_SOFTWARE`, default 1), with a per-ray node budget against runaway traversals
@@ -39,8 +49,8 @@ int15 (main release, `u59-windows-20261005-int15`):
   loads, ALIGNBYTE), no RTE rounding mode for FP64 shaders (an NVIDIA pipeline compile hang), image formats that name
   nothing bound empty (#1019), null SRT pointers read as zero (#987), guest thread priorities (#1050), the BDA page
   table cleared before first use (#1065), polygon draws as triangle fans, partially resident depth flags, libFont
-  kerning and metrics, trophy notifications. Not taken: the FP32 MAD rounding change (it conflicts with our
-  position-invariant MAD mode) and the readback-window removal.
+  kerning and metrics (reverted in int15.1 and int16.1), trophy notifications. Not taken: the FP32 MAD rounding
+  change (it conflicts with our position-invariant MAD mode) and the readback-window removal.
 - Release notes correction for int14: the shader precompile mainly helps after an emulator update, when the program
   cache is rebuilt; with an unchanged emulator the program cache already covers revisits.
 - Checked on one PC (RTX 3090, Ryzen 9 7950X3D): Sky Garden 34.8 fps (int14 34.1), snow level 21.2 fps (int14 21.7).
