@@ -1396,7 +1396,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		translator.AddBranchCondition(cfg_block, result.block_info[typed_index]);
 		lds_write_pending = translator.LdsWritePending();
 	}
-	IR::ValidateProgram(result, false);
+	if (IR::ValidationEnabled()) {
+		IR::ValidateProgram(result, false);
+	}
 	return result;
 }
 
