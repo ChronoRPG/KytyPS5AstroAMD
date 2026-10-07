@@ -95,6 +95,8 @@ and the test tool `KYTY_VRAM_LIMIT_MB=<MiB>` (imitates a smaller GPU).
 
 ## Known issues
 
+- **Grass flicker:** small grass/moss clumps on sand (e.g. the crash-site hub) can flicker between two looks from
+  frame to frame. Also in earlier builds; being looked at.
 - **RTX 50 series:** the first launch after installing or updating could crash once while the ray tracing shaders
   were being built. The hang watchdog fix should cure the crash we know of; if it still happens, start the game again
   and please send the console text.
