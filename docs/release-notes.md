@@ -1,13 +1,55 @@
-# KytyPS5 U59 int16.1 pre-release — Astro Bot with full lighting, GI and ray tracing, no patches needed
+# KytyPS5 U59 int16.1 — Astro Bot with full lighting, GI and ray tracing, performance-mode occlusion
 
-> **Pre-release.** This is the int15.1 release plus Astro Bot's full graphics. If anything works worse than in
-> int15.1, please report it (with your GPU and CPU model) and use int15.1, or turn the patches back on (see below).
+> int16.1 is int16 plus low-risk fixes and a much faster default for heavy levels. If anything works worse than in
+> int16 or int15.1, please report it (with your GPU and CPU model).
 
 ## What's new in int16.1
 
-- **Level title text fixed:** in int16 (and int15) the level name shown when Astro Bot enters a level was drawn wrong
-  (broken letter sizes and spacing). Two font changes taken from upstream caused this and have been undone, so the
-  titles look as they did in int14. The same fix is in the int15.1 main release.
+- **Performance mode by default: occlusion queries off.** The game asks the GPU, thousands of times per frame,
+  whether objects are hidden behind others. Answering those queries accurately costs about half the frame rate in
+  the heaviest levels. int16.1 now answers "visible" to all of them by default (`KYTY_GPU_OCCLUSION=0`, as other
+  Kyty forks do), which roughly doubles the frame rate in the snow level, the clock tower and Ape Escape.
+  On the test PC (RTX 3090, Ryzen 9 7950X3D; a test build without the release build's profile optimization, which
+  adds about 15%): snow 41 fps, clock tower 31, Ape Escape 31, Sky Garden 30, volcano 59 (accurate mode: snow 20).
+  Possible side effects: the game may draw objects or effects that it would normally hide behind walls (rarely
+  visible, and it can cost GPU time where a lot is hidden).
+- **Accurate occlusion toggle:** Global settings > Graphics & display > "Accurate occlusion queries (slower; fixes
+  rare visibility issues)" turns the accurate mode back on (it passes `--gpu-occlusion on`, which overrides the
+  preset). Use it if you see objects through walls or other visibility problems, and please report where. The
+  accurate mode includes the volcano lava fix below.
+- **Volcano lava fixed (accurate occlusion mode):** with the camera tilted down in the volcano level, the lava lake
+  disappeared (flat orange fog). The emulator paired the game's occlusion queries by a wrong address rule; it now
+  pairs them by address, which also keeps the occlusion gate on in Sky Garden.
+- **Hang watchdog no longer kills the game:** on RTX 50 cards (where the watchdog is on by default) a 5 s stall could
+  end the emulator with "Unhandled host exception ... RtlVirtualUnwind". The watchdog's stack dump is now guarded.
+- **Out of video memory no longer ends the emulator:** an image that does not fit goes to system memory (slower; the
+  console prints "Vulkan: video memory full ..."), and a buffer that does not fit is retried.
+- **File id fix:** Astro Bot file ids are assigned one per file; six pairs of game files shared an id and one of each
+  pair could be read in place of the other (one of them a galaxy-map icon).
+- **Audio:** sounds the game sends to the DualSense speaker now play at 30% on the PC speakers (they were up to 19 dB
+  louder than music and effects). Four new volume sliders (master, game sound, music, controller speaker on PC) are in
+  the launcher's global Audio settings. The console also prints audio port diagnostics (`AudioDiag` lines).
+- **"AMD CPU patch" renamed** to "Intel CPU compatibility (AMD instruction patch)" in the launcher's Compatibility
+  settings. It is the same setting (saved configurations and `--amd-cpu` keep working): on Intel CPUs it emulates the
+  PS5's AMD-only instructions (EXTRQ/INSERTQ) and AMD's `VRSQRTPS` results. It is not needed on AMD CPUs.
+- **Smaller fixes** ported from chenxiao07's fork: a clean process exit after a fatal error (no more unkillable
+  emulator processes), a faster guest memory search while streaming, and faster release shader translation.
+- **Level title text fixed** (from the int16.1 pre-release): the level name is drawn as in int14 again.
+
+### New defaults and how to turn each off
+
+| Switch | Default | Off / old behaviour | What it does |
+| --- | --- | --- | --- |
+| `KYTY_GPU_OCCLUSION` (preset) | `0` (performance mode) | `1`, or the launcher's "Accurate occlusion queries" (`--gpu-occlusion on`) | Occlusion queries answered "visible" instead of counted on the GPU |
+| `KYTY_IMAGE_SYSMEM_FALLBACK` | on | `0` | Images that do not fit in video memory go to system memory |
+| `KYTY_APR_HASHED_IDS` | off | `1` restores the old hashed ids | One file id per file path |
+| `KYTY_FATAL_EXIT_PROCESS` | off | `1` restores the old exit path | Fatal errors end the process with TerminateProcess |
+| `KYTY_IR_VALIDATE` | off in release | `1` runs it | Shader IR validation |
+| `KYTY_AUDIO_DIAG` | on | `0` | Audio port open/close lines in the console (256 lines max) |
+| Audio volumes | master/main/music 100%, pad speaker on PC 30% | launcher sliders, or `KYTY_AUDIO_MASTER_VOLUME`, `KYTY_AUDIO_MAIN_VOLUME`, `KYTY_AUDIO_MUSIC_VOLUME`, `KYTY_AUDIO_PAD_SPEAKER_ON_MAIN_VOLUME` (percent, 0-200) | |
+
+Optional (off by default): `KYTY_WIDE_FILL_CLEAR=1`, `KYTY_GUEST_STORAGE_REPEAT=1`, `KYTY_READBACK_MERGE_GAP_KB=64`,
+and the test tool `KYTY_VRAM_LIMIT_MB=<MiB>` (imitates a smaller GPU).
 
 ## From int16
 
@@ -32,10 +74,11 @@
 
 ## Checked
 
-- All automated tests pass (int16.1 as well).
-- int16.1: Astro Bot level titles checked on screen.
-- Astro Bot 1.018 on one PC (RTX 3090, Ryzen 9 7950X3D): Sky Garden and the snow level with and without the
-  patches, with no errors. Not tested by us on AMD or Intel GPUs or on version 1.007; player reports from RTX 50
+- All automated tests pass.
+- Astro Bot 1.018 on one PC (RTX 3090, Ryzen 9 7950X3D), patches off: Sky Garden, snow, clock tower, Ape Escape and
+  the volcano with the default (performance) occlusion mode, and snow plus the volcano lava with the camera tilted
+  down in accurate mode, with no console errors.
+- Not tested by us on AMD or Intel GPUs or on version 1.007; player reports from RTX 50
   and AMD cards are listed under known issues.
 
 ## Installing
@@ -46,16 +89,30 @@
 
 ## Known issues
 
-- **RTX 50 series:** the first launch after installing or updating can crash once while the ray tracing shaders are
-  being built. Start the game again; it works from then on.
+- **RTX 50 series:** the first launch after installing or updating could crash once while the ray tracing shaders
+  were being built. The hang watchdog fix should cure the crash we know of; if it still happens, start the game again
+  and please send the console text.
 - **AMD graphics cards:** with the two patches turned off, the GPU can stop responding ("device lost"), and the water
   in Go-Go Archipelago can make the frame rate drop sharply. On AMD, keep the patches on, or use int15.1.
+- **Galaxy map:** red trails, pillars and blocky red areas can appear on the galaxy map around the volcano (the
+  hidden world), and a red band at the bottom of the screen. Known, being investigated; it does not affect levels.
+- **Second (red) galaxy:** one player (RTX 5080, Intel CPU) crashed while arriving at Go-Go Archipelago for the first
+  time (the loader read through a bad pointer). We could not reproduce it on our PC. A save from just before the red
+  galaxy would help.
 - One crash during startup was seen once in testing and could not be reproduced. If the console shows a crash, please
   send it; it now names the code path.
 - The software ray tracing changes behaviour for other games too (for example Demon's Souls); please report any new
   problem there.
 - Microsoft Defender may flag `launcher.exe` (`Trojan:Win32/Bearfoos.A!ml`, a machine-learning verdict on the
   unsigned launcher). It is built from this repository's source by the GitHub workflow.
+
+## Testers wanted
+
+Please report (GPU, CPU, driver, what you did, the console text) especially from:
+- **RTX 50 series** cards (first launch after the update, ray tracing shaders, hang watchdog);
+- **AMD Radeon** cards (device lost with the patches off, water in Go-Go Archipelago);
+- **Intel CPUs** (with "Intel CPU compatibility" on and off; the red galaxy's first arrival);
+- **8-12 GB graphics cards** (video memory full messages, stutter, frame rate with the defaults).
 
 Switches for testing: `KYTY_RT_SOFTWARE=0 KYTY_RT_STUB=1` keeps the lighting but lets every ray miss (no ray-traced
 shadows); `KYTY_RT_SOFTWARE=0` alone skips those shaders again (only with the patches on). The bundled preset's
