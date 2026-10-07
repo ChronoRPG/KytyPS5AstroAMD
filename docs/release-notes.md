@@ -1,7 +1,7 @@
 # KytyPS5 U59 int16.1 — Astro Bot with full lighting, GI and ray tracing, performance-mode occlusion
 
-> int16.1 is int16 plus low-risk fixes and a much faster default for heavy levels. If anything works worse than in
-> int16 or int15.1, please report it (with your GPU and CPU model).
+> int16.1 is the int16 pre-release plus low-risk fixes and a much faster default for heavy levels. If anything works
+> worse than in the int16 pre-release or int15, please report it (with your GPU and CPU model).
 
 ## What's new in int16.1
 
@@ -40,7 +40,7 @@
   PS5's AMD-only instructions (EXTRQ/INSERTQ) and AMD's `VRSQRTPS` results. It is not needed on AMD CPUs.
 - **Smaller fixes** ported from chenxiao07's fork: a clean process exit after a fatal error (no more unkillable
   emulator processes), a faster guest memory search while streaming, and faster release shader translation.
-- **Level title text fixed** (from the int16.1 pre-release): the level name is drawn as in int14 again.
+- **Level title text fixed** (fixed after the int16 pre-release): the level name is drawn as in int14 again.
 
 ### New defaults and how to turn each off
 
@@ -71,7 +71,7 @@ and the test tool `KYTY_VRAM_LIMIT_MB=<MiB>` (imitates a smaller GPU).
 - **First launch:** the first start after an update builds the large lighting shaders, which can freeze the picture
   for up to about 20 seconds once.
 
-## Also in int15 and int15.1
+## Also in int15
 
 - No more "unsupported sampled depth image" stops on fast GPUs, no crash when leaving extra levels in Sky Garden,
   about 20 upstream shader fixes, a Demon's Souls fix for an unknown image format, and thread priority changes.
@@ -101,7 +101,7 @@ and the test tool `KYTY_VRAM_LIMIT_MB=<MiB>` (imitates a smaller GPU).
   were being built. The hang watchdog fix should cure the crash we know of; if it still happens, start the game again
   and please send the console text.
 - **AMD graphics cards:** with the two patches turned off, the GPU can stop responding ("device lost"), and the water
-  in Go-Go Archipelago can make the frame rate drop sharply. On AMD, keep the patches on, or use int15.1.
+  in Go-Go Archipelago can make the frame rate drop sharply. On AMD, keep the patches on, or use int15.
 - **Second (red) galaxy:** one player (RTX 5080, Intel CPU) crashed while arriving at Go-Go Archipelago for the first
   time (the loader read through a bad pointer). We could not reproduce it on our PC. A save from just before the red
   galaxy would help.
