@@ -1,4 +1,4 @@
-name: Jetsku AMD - Registro continuo
+name: Jetsku AMD - Finalizacion de envios
 
 on:
   workflow_dispatch:
@@ -66,7 +66,6 @@ jobs:
                       return nullptr;
                   }
 
-                  // Write records without a stdio output buffer.
                   std::setvbuf(g_amd_live_file, nullptr, _IONBF, 0);
                   const auto run = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::system_clock::now().time_since_epoch()).count();
@@ -178,7 +177,91 @@ jobs:
               new = '\t\tcase vk::Result::eErrorDeviceLost:\n\t\t\tDumpDeviceLossDiagnostics(m_window.graphic_ctx);\n\t\t\tEXIT("'+api+' failed: %s\\n", vk::to_string(result).c_str());\n\t\t\tbreak;\n'+old
               replace('src/graphics/presentation/window/swapchain.cpp', old, new)
 
-          print('AMD live diagnostic installed')
+          replace(root+'queueSubmission.cpp',
+                  'bool HasOnlyMasterSignal(const QueuedSubmission& record) {',
+                  r'''std::atomic<bool> g_amd_wait_disabled {false};
+
+          bool AmdSubmitWaitEnabled() {
+              static const bool requested = [] {
+                  const auto* value = std::getenv("KYTY_AMD_SUBMIT_WAIT");
+                  const bool on = value != nullptr && std::strcmp(value, "1") == 0;
+                  if (on) {
+                      std::printf("AMD submit wait: main-queue diagnostic ON; timeout 2 seconds\n");
+                      std::fflush(stdout);
+                  }
+                  return on;
+              }();
+              return requested && DeviceFaultDiagnosticsEnabled() &&
+                     !g_amd_wait_disabled.load(std::memory_order_relaxed);
+          }
+
+          bool HasOnlyMasterSignal(const QueuedSubmission& record) {''')
+
+          replace(root+'queueSubmission.cpp',
+                  'void QueueSubmissionBroker::SubmitInOrder(const QueuedSubmission* records, size_t count) {',
+                  '''void QueueSubmissionBroker::SubmitInOrder(const QueuedSubmission* records, size_t count) {
+              if (AmdSubmitWaitEnabled() && count > 1) {
+                  for (size_t i = 0; i < count; ++i) SubmitInOrder(records + i, 1);
+                  return;
+              }''')
+
+          replace(root+'queueSubmission.cpp',
+                  '\t\tresult = m_graphics->queue.submit(static_cast<uint32_t>(native_count), submits.data(), nullptr);',
+                  '''        for (size_t i = 0; i < count; ++i)
+                      RecordAmdTrace(6, records[i].tick, records[i].debug_op,
+                                     records[i].debug_submit, count);
+          \t\tresult = m_graphics->queue.submit(static_cast<uint32_t>(native_count), submits.data(), nullptr);
+                  for (size_t i = 0; i < count; ++i)
+                      RecordAmdTrace(7, records[i].tick,
+                                     static_cast<uint64_t>(static_cast<int64_t>(result)), 0, 0);''')
+
+          replace(root+'queueSubmission.cpp',
+                  '\t\trecord.progress->dispatched_tick.notify_all();\n\t}\n}',
+                  r'''        record.progress->dispatched_tick.notify_all();
+              }
+              if (AmdSubmitWaitEnabled() && count == 1) {
+                  const auto& record = records[0];
+                  bool has_signal = false;
+                  for (uint32_t i = 0; i < record.submit.num_signal_semaphores; ++i)
+                      has_signal |= record.master_semaphore != nullptr &&
+                                    record.submit.signal_semaphores[i] == record.master_semaphore &&
+                                    record.submit.signal_ticks[i] == record.tick;
+
+                  if (has_signal) {
+                      const vk::Semaphore semaphore = record.master_semaphore;
+                      const uint64_t value = record.tick;
+                      vk::SemaphoreWaitInfo wait_info {};
+                      wait_info.semaphoreCount = 1;
+                      wait_info.pSemaphores = &semaphore;
+                      wait_info.pValues = &value;
+
+                      RecordAmdTrace(9, value, 2000000000ull, 0, 0);
+                      // Preserve submission order while waiting.
+                      // Timeout is not proof of a GPU fault.
+                      const auto completed =
+                          m_graphics->device.waitSemaphores(&wait_info, 2000000000ull);
+                      RecordAmdTrace(8, value,
+                                     static_cast<uint64_t>(static_cast<int64_t>(completed)), 0, 0);
+
+                      if (completed == vk::Result::eTimeout) {
+                          g_amd_wait_disabled.store(true, std::memory_order_relaxed);
+                          std::printf("AMD submit wait: timeout at tick=%llu; completion NOT confirmed; further diagnostic waits disabled\n",
+                                      static_cast<unsigned long long>(value));
+                          std::fflush(stdout);
+                      } else if (completed != vk::Result::eSuccess) {
+                          if (completed == vk::Result::eErrorDeviceLost)
+                              DumpDeviceLossDiagnostics(*m_graphics, value, true);
+                          EXIT("AMD submit wait failed at tick=%llu: %s\n",
+                               static_cast<unsigned long long>(value),
+                               vk::to_string(completed).c_str());
+                      }
+                  } else {
+                      RecordAmdTrace(10, record.tick, 0, 0, 0);
+                  }
+              }
+          }''')
+
+          print('AMD live trace and bounded completion diagnostic installed')
           '@ | python -
           if ($LASTEXITCODE -ne 0) { throw "AMD diagnostic adaptation failed" }
           git diff --check
@@ -263,7 +346,7 @@ jobs:
             -DKYTY_PGO_USE=%PGO_PROFILE% ^
             -DKYTY_BUILD_ORIGIN=Fork ^
             -DKYTY_BUILD_REPOSITORY=%GITHUB_REPOSITORY% ^
-            -DKYTY_RELEASE_TAG=AMD-live-trace ^
+            -DKYTY_RELEASE_TAG=AMD-submit-wait ^
             -DCMAKE_C_COMPILER=%LLVM%/clang-cl.exe ^
             -DCMAKE_CXX_COMPILER=%LLVM%/clang-cl.exe ^
             -DCMAKE_LINKER=%LLVM%/lld-link.exe ^
@@ -314,7 +397,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $runtime = Join-Path $env:GITHUB_WORKSPACE '_Build/windows/install'
-          $release = Join-Path $env:RUNNER_TEMP 'KytyPS5-AMD-Live'
+          $release = Join-Path $env:RUNNER_TEMP 'KytyPS5-AMD-SubmitWait'
           New-Item -ItemType Directory -Path $release | Out-Null
           Copy-Item -Path (Join-Path $runtime '*') -Destination $release -Recurse
           Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination $release
@@ -328,6 +411,7 @@ jobs:
             KYTY_BDA_INCREMENTAL_SYNC = '0'
             KYTY_CP_RECORDER = '0'
             KYTY_HANG_TRACE = '0'
+            KYTY_AMD_SUBMIT_WAIT = '1'
           }
           foreach ($key in $flags.Keys) {
             $preset | Add-Member -NotePropertyName $key -NotePropertyValue $flags[$key] -Force
@@ -342,7 +426,7 @@ jobs:
           @echo off
           cd /d "%~dp0"
           if exist "_amd_gpu_live.txt" move /y "_amd_gpu_live.txt" "_amd_gpu_live-anterior-%RANDOM%.txt" >nul
-          echo Inicia Astro Bot. Cuando se cierre, busca _amd_gpu_live.txt.
+          echo Inicia Astro Bot y conserva la consola despues del cierre.
           "%~dp0launcher.exe" %*
           pause
           '@ | Set-Content -LiteralPath (Join-Path $release 'Diagnostico-AMD.cmd') -Encoding ascii
@@ -367,14 +451,14 @@ jobs:
             }
           }
 
-          $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-AMD-Live.zip'
+          $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-AMD-SubmitWait.zip'
           Compress-Archive -Path (Join-Path $release '*') -DestinationPath $archive
 
       - name: Upload diagnostic build
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-AMD-Live
-          path: KytyPS5-AMD-Live.zip
+          name: KytyPS5-AMD-SubmitWait
+          path: KytyPS5-AMD-SubmitWait.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -382,7 +466,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: AMD-Live-build-log
+          name: AMD-SubmitWait-build-log
           path: pgo-build.log
           if-no-files-found: ignore
           retention-days: 7
