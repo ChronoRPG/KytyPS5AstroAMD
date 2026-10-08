@@ -1,4 +1,4 @@
-name: Jetsku AMD - Traza de buffers y shaders
+name: Jetsku AMD - Registro continuo
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install AMD diagnostic trace
+      - name: Install AMD live diagnostic
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -39,8 +39,94 @@ jobs:
 
           root = 'src/graphics/host_gpu/'
 
-          replace(root+'graphicContext.h', '[[nodiscard]] bool DeviceFaultDiagnosticsEnabled();', '''[[nodiscard]] bool DeviceFaultDiagnosticsEnabled();
+          replace(root+'graphicContext.h',
+                  '[[nodiscard]] bool DeviceFaultDiagnosticsEnabled();',
+                  '''[[nodiscard]] bool DeviceFaultDiagnosticsEnabled();
           void RecordAmdTrace(uint32_t kind, uint64_t a, uint64_t b, uint64_t c, uint64_t d);''')
+
+          replace(root+'diagnosticCheckpoints.cpp',
+                  '#include <cinttypes>',
+                  '#include <cinttypes>\n#include <chrono>')
+
+          replace(root+'diagnosticCheckpoints.cpp',
+                  'std::atomic_flag g_dumping = ATOMIC_FLAG_INIT;',
+                  r'''std::atomic_flag g_dumping = ATOMIC_FLAG_INIT;
+          std::mutex g_amd_live_mutex;
+          std::FILE* g_amd_live_file = nullptr;
+          bool g_amd_live_attempted = false;
+          uint64_t g_amd_live_sequence = 0;
+
+          std::FILE* AmdLiveFileLocked() {
+              if (!g_amd_live_attempted) {
+                  g_amd_live_attempted = true;
+                  g_amd_live_file = std::fopen("_amd_gpu_live.txt", "wb");
+                  if (g_amd_live_file == nullptr) {
+                      std::printf("AMD live trace: could not create _amd_gpu_live.txt\n");
+                      std::fflush(stdout);
+                      return nullptr;
+                  }
+
+                  // Write records without a stdio output buffer.
+                  std::setvbuf(g_amd_live_file, nullptr, _IONBF, 0);
+                  const auto run = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::system_clock::now().time_since_epoch()).count();
+
+                  std::fprintf(g_amd_live_file,
+                      "AMD live trace run=%lld; CPU records, NOT GPU completion\n",
+                      static_cast<long long>(run));
+                  std::fprintf(g_amd_live_file,
+                      "event kinds: 0=create 1=destroy (a=VkBuffer b=BDA c=guest d=size); 2=shader (a=tick b=stage c=hash d=submit); 3=BDA-map (a=guest b=BDA c=size d=tick); 5=device-loss (a=tick)\n");
+                  std::printf("AMD live trace: writing _amd_gpu_live.txt run=%lld\n",
+                              static_cast<long long>(run));
+                  std::fflush(stdout);
+              }
+              return g_amd_live_file;
+          }
+
+          void WriteAmdLiveCommand(const DiagnosticCheckpoint& c) {
+              if (!DeviceFaultDiagnosticsEnabled()) return;
+              const std::lock_guard lock(g_amd_live_mutex);
+              if (auto* f = AmdLiveFileLocked(); f != nullptr) {
+                  std::fprintf(f,
+                      "row=%llu command=%llu tick=%llu op=%u submit=%llu args=%u,%u,%u,%u,0x%016llx VS=0x%016llx PS=0x%016llx CS=0x%016llx\n",
+                      static_cast<unsigned long long>(++g_amd_live_sequence),
+                      static_cast<unsigned long long>(c.sequence),
+                      static_cast<unsigned long long>(c.tick), c.op,
+                      static_cast<unsigned long long>(c.submit_id),
+                      c.arg0, c.arg1, c.arg2, c.arg3,
+                      static_cast<unsigned long long>(c.arg4),
+                      static_cast<unsigned long long>(c.vs),
+                      static_cast<unsigned long long>(c.ps),
+                      static_cast<unsigned long long>(c.cs));
+              }
+          }''')
+
+          replace(root+'diagnosticCheckpoints.cpp',
+                  '\tslot.sequence = sequence;',
+                  '\tslot.sequence = sequence;\n\tWriteAmdLiveCommand(slot);')
+
+          replace(root+'diagnosticCheckpoints.cpp',
+                  'static void DumpDeviceFault(GraphicContext& graphics) {',
+                  r'''void RecordAmdTrace(uint32_t kind, uint64_t a, uint64_t b,
+                              uint64_t c, uint64_t d) {
+              if (!DeviceFaultDiagnosticsEnabled()) return;
+              const std::lock_guard lock(g_amd_live_mutex);
+              if (auto* f = AmdLiveFileLocked(); f != nullptr) {
+                  std::fprintf(f,
+                      "row=%llu event kind=%u a=0x%016llx b=0x%016llx c=0x%016llx d=0x%016llx\n",
+                      static_cast<unsigned long long>(++g_amd_live_sequence), kind,
+                      static_cast<unsigned long long>(a),
+                      static_cast<unsigned long long>(b),
+                      static_cast<unsigned long long>(c),
+                      static_cast<unsigned long long>(d));
+              }
+          }
+
+          static void DumpDeviceFault(GraphicContext& graphics) {''')
+
+          replace(root+'diagnosticCheckpoints.cpp',
+                  '\tif (g_dumping.test_and_set(std::memory_order_acquire)) return;',
+                  '\tRecordAmdTrace(5, tick, 0, 0, 0);\n\tif (g_dumping.test_and_set(std::memory_order_acquire)) return;')
 
           replace(root+'renderer/context.cpp',
                   'if (m_graphics.diagnostic_checkpoints_enabled && m_buffer) {',
@@ -49,111 +135,6 @@ jobs:
           replace(root+'renderer/context.cpp',
                   'if (marker != nullptr) {\n\t\t\tHandle().setCheckpointNV(marker);',
                   'if (marker != nullptr && m_graphics.diagnostic_checkpoints_enabled) {\n\t\t\tHandle().setCheckpointNV(marker);')
-
-          replace(root+'diagnosticCheckpoints.cpp',
-                  'static void DumpDeviceFault(GraphicContext& graphics) {',
-                  r'''namespace {
-          struct AmdTraceRow {
-              uint64_t seq = 0;
-              uint32_t kind = 0;
-              uint64_t a = 0, b = 0, c = 0, d = 0;
-          };
-
-          constexpr size_t AMD_TRACE_CAPACITY = 4096;
-          std::array<AmdTraceRow, AMD_TRACE_CAPACITY> g_amd_trace {};
-          uint64_t g_amd_sequence = 0;
-          std::mutex g_amd_mutex;
-
-          void DumpAmdTrace() {
-              // CPU records only; these do not prove GPU completion.
-              std::array<AmdTraceRow, AMD_TRACE_CAPACITY> rows {};
-              uint64_t end = 0;
-              {
-                  const std::lock_guard lock(g_amd_mutex);
-                  rows = g_amd_trace;
-                  end = g_amd_sequence;
-              }
-
-              std::array<DiagnosticCheckpoint, 512> commands {};
-              uint64_t command_end = 0;
-              {
-                  const std::lock_guard lock(g_checkpoint_mutex);
-                  command_end = g_checkpoint_sequence;
-                  const auto first = command_end > commands.size()
-                      ? command_end - commands.size() : 0;
-                  for (uint64_t n = first + 1; n <= command_end; ++n)
-                      commands[(n - 1) % commands.size()] =
-                          g_checkpoints[n % CHECKPOINT_RING_SIZE];
-              }
-
-              auto* file = std::fopen("_amd_gpu_trace.txt", "wb");
-              if (file == nullptr) {
-                  std::printf("AMD trace: could not write _amd_gpu_trace.txt\n");
-                  return;
-              }
-
-              std::fprintf(file, "CPU history; NOT proof of GPU completion.\n");
-              std::fprintf(file, "Events retained=%llu total=%llu\n",
-                           static_cast<unsigned long long>(
-                               std::min<uint64_t>(end, rows.size())),
-                           static_cast<unsigned long long>(end));
-              std::fprintf(file,
-                  "kind 0=buffer-create 1=buffer-destroy: a=VkBuffer b=BDA c=guest d=size\n");
-              std::fprintf(file,
-                  "kind 2=shader-selected: a=tick b=stage(0-2 vertex,3 pixel,4 compute) c=hash d=submit\n");
-              std::fprintf(file,
-                  "kind 3=BDA-map: a=guest b=BDA c=size d=tick\n");
-
-              const auto first = end > rows.size() ? end - rows.size() : 0;
-              for (uint64_t n = first + 1; n <= end; ++n) {
-                  const auto& row = rows[n % rows.size()];
-                  std::fprintf(file,
-                      "event=%llu kind=%u a=0x%016llx b=0x%016llx c=0x%016llx d=0x%016llx\n",
-                      static_cast<unsigned long long>(row.seq), row.kind,
-                      static_cast<unsigned long long>(row.a),
-                      static_cast<unsigned long long>(row.b),
-                      static_cast<unsigned long long>(row.c),
-                      static_cast<unsigned long long>(row.d));
-              }
-
-              std::fprintf(file,
-                  "Commands: VS/PS/CS are guest code addresses, NOT shader hashes.\n");
-              const auto first_command = command_end > commands.size()
-                  ? command_end - commands.size() : 0;
-              for (uint64_t n = first_command + 1; n <= command_end; ++n) {
-                  const auto& c = commands[(n - 1) % commands.size()];
-                  std::fprintf(file,
-                      "command=%llu tick=%llu op=%s submit=%llu args=%u,%u,%u,%u,0x%016llx VS=0x%016llx PS=0x%016llx CS=0x%016llx\n",
-                      static_cast<unsigned long long>(c.sequence),
-                      static_cast<unsigned long long>(c.tick),
-                      OpName(c.op),
-                      static_cast<unsigned long long>(c.submit_id),
-                      c.arg0, c.arg1, c.arg2, c.arg3,
-                      static_cast<unsigned long long>(c.arg4),
-                      static_cast<unsigned long long>(c.vs),
-                      static_cast<unsigned long long>(c.ps),
-                      static_cast<unsigned long long>(c.cs));
-              }
-
-              std::fclose(file);
-              std::printf("AMD trace: wrote _amd_gpu_trace.txt (CPU history)\n");
-              std::fflush(stdout);
-          }
-          } // namespace
-
-          void RecordAmdTrace(uint32_t kind, uint64_t a, uint64_t b,
-                              uint64_t c, uint64_t d) {
-              if (!DeviceFaultDiagnosticsEnabled()) return;
-              const std::lock_guard lock(g_amd_mutex);
-              const auto seq = ++g_amd_sequence;
-              g_amd_trace[seq % AMD_TRACE_CAPACITY] = {seq, kind, a, b, c, d};
-          }
-
-          static void DumpDeviceFault(GraphicContext& graphics) {''')
-
-          replace(root+'diagnosticCheckpoints.cpp',
-                  '\tDumpDeviceFault(graphics);',
-                  '\tDumpAmdTrace();\n\tDumpDeviceFault(graphics);')
 
           replace(root+'renderer/cache/streamBuffer.cpp',
                   '\tVkMemoryPropertyFlags properties = 0;',
@@ -174,15 +155,9 @@ jobs:
                                  m_scheduler.CurrentTick());
           \t\tEnsureBdaTableResident(pages.first, size_pages);''')
 
-          replace(root+'renderer/renderCompute.cpp',
-                  '\tconst auto& program   = *input_info.stage.program;',
-                  '''\tconst auto& program   = *input_info.stage.program;
-              RecordAmdTrace(2, m_context.GetCommandScheduler().CurrentTick(), 4,
-                             program.shader_hash, submit_id);''')
-
-          replace(root+'renderer/renderCompute.cpp',
-                  '\tconst auto& program = *input_info.stage.program;',
-                  '''\tconst auto& program = *input_info.stage.program;
+          for old in ['\tconst auto& program   = *input_info.stage.program;',
+                      '\tconst auto& program = *input_info.stage.program;']:
+              replace(root+'renderer/renderCompute.cpp', old, old+'''
               RecordAmdTrace(2, m_context.GetCommandScheduler().CurrentTick(), 4,
                              program.shader_hash, submit_id);''')
 
@@ -203,7 +178,7 @@ jobs:
               new = '\t\tcase vk::Result::eErrorDeviceLost:\n\t\t\tDumpDeviceLossDiagnostics(m_window.graphic_ctx);\n\t\t\tEXIT("'+api+' failed: %s\\n", vk::to_string(result).c_str());\n\t\t\tbreak;\n'+old
               replace('src/graphics/presentation/window/swapchain.cpp', old, new)
 
-          print('AMD CPU history and buffer trace installed')
+          print('AMD live diagnostic installed')
           '@ | python -
           if ($LASTEXITCODE -ne 0) { throw "AMD diagnostic adaptation failed" }
           git diff --check
@@ -288,7 +263,7 @@ jobs:
             -DKYTY_PGO_USE=%PGO_PROFILE% ^
             -DKYTY_BUILD_ORIGIN=Fork ^
             -DKYTY_BUILD_REPOSITORY=%GITHUB_REPOSITORY% ^
-            -DKYTY_RELEASE_TAG=AMD-address-trace ^
+            -DKYTY_RELEASE_TAG=AMD-live-trace ^
             -DCMAKE_C_COMPILER=%LLVM%/clang-cl.exe ^
             -DCMAKE_CXX_COMPILER=%LLVM%/clang-cl.exe ^
             -DCMAKE_LINKER=%LLVM%/lld-link.exe ^
@@ -339,7 +314,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $runtime = Join-Path $env:GITHUB_WORKSPACE '_Build/windows/install'
-          $release = Join-Path $env:RUNNER_TEMP 'KytyPS5-AMD-Trace'
+          $release = Join-Path $env:RUNNER_TEMP 'KytyPS5-AMD-Live'
           New-Item -ItemType Directory -Path $release | Out-Null
           Copy-Item -Path (Join-Path $runtime '*') -Destination $release -Recurse
           Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination $release
@@ -366,7 +341,8 @@ jobs:
           @'
           @echo off
           cd /d "%~dp0"
-          echo Inicia Astro Bot. Cuando se cierre, busca _amd_gpu_trace.txt.
+          if exist "_amd_gpu_live.txt" move /y "_amd_gpu_live.txt" "_amd_gpu_live-anterior-%RANDOM%.txt" >nul
+          echo Inicia Astro Bot. Cuando se cierre, busca _amd_gpu_live.txt.
           "%~dp0launcher.exe" %*
           pause
           '@ | Set-Content -LiteralPath (Join-Path $release 'Diagnostico-AMD.cmd') -Encoding ascii
@@ -374,7 +350,6 @@ jobs:
           if (Test-Path -LiteralPath (Join-Path $release 'Kyty.ini')) {
             throw 'Unexpected local Kyty.ini in the package.'
           }
-
           Copy-Item -LiteralPath 'docs/EXPERIMENTAL.md' -Destination (Join-Path $release 'U59-README.md')
           Copy-Item -LiteralPath 'LICENSE' -Destination $release
 
@@ -392,14 +367,14 @@ jobs:
             }
           }
 
-          $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-AMD-Trace.zip'
+          $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-AMD-Live.zip'
           Compress-Archive -Path (Join-Path $release '*') -DestinationPath $archive
 
       - name: Upload diagnostic build
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-AMD-Trace
-          path: KytyPS5-AMD-Trace.zip
+          name: KytyPS5-AMD-Live
+          path: KytyPS5-AMD-Live.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -407,7 +382,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: AMD-Trace-build-log
+          name: AMD-Live-build-log
           path: pgo-build.log
           if-no-files-found: ignore
           retention-days: 7
