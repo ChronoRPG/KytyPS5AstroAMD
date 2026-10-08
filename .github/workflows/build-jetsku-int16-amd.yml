@@ -1,4 +1,4 @@
-name: Jetsku AMD - Finalizacion de envios
+name: Jetsku AMD - Copias directas
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install AMD live diagnostic
+      - name: Install AMD diagnostic
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -55,15 +55,16 @@ jobs:
                       std::fflush(stdout);
                       return nullptr;
                   }
-                  // No stdio output buffer: records survive a later abrupt process exit.
                   std::setvbuf(g_amd_live_file, nullptr, _IONBF, 0);
                   const auto run = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::system_clock::now().time_since_epoch()).count();
                   std::fprintf(g_amd_live_file, "AMD live trace run=%lld; CPU records, NOT GPU completion\n",
                                static_cast<long long>(run));
                   std::fprintf(g_amd_live_file, "event kinds: 0=create 1=destroy (a=VkBuffer b=BDA c=guest d=size); 2=shader (a=tick b=stage c=hash d=submit); 3=BDA-map (a=guest b=BDA c=size d=tick); 5=device-loss (a=tick)\n");
+                  std::fprintf(g_amd_live_file, "readback events: 20=submit-start (a=value b=producer c=current d=separate-queue); 21=submit-result (a=value b=result c=producer d=current); 22=source-buffer (a=handle b=BDA c=guest d=size); 23=destination-buffer (a=handle b=BDA c=staging-offset d=size); 24=copy-region (a=src-offset b=dst-offset c=size d=current); 25=counter-query (a=target b=result c=counter d=semaphore); 26=wait-start; 27=wait-result\n");
                   std::printf("AMD live trace: writing _amd_gpu_live.txt run=%lld\n",
                               static_cast<long long>(run));
+                  std::printf("AMD readback trace: direct copy observation ON\n");
                   std::fflush(stdout);
               }
               return g_amd_live_file;
@@ -128,7 +129,7 @@ jobs:
               old = '\t\tdefault: EXIT("'+api+' failed: %s\\n", vk::to_string(result).c_str());'
               new = '\t\tcase vk::Result::eErrorDeviceLost:\n\t\t\tDumpDeviceLossDiagnostics(m_window.graphic_ctx);\n\t\t\tEXIT("'+api+' failed: %s\\n", vk::to_string(result).c_str());\n\t\t\tbreak;\n'+old
               replace('src/graphics/presentation/window/swapchain.cpp', old, new)
-          print('AMD live diagnostic installed')
+
           replace(root+'queueSubmission.cpp', 'bool HasOnlyMasterSignal(const QueuedSubmission& record) {', r'''std::atomic<bool> g_amd_wait_disabled {false};
 
           bool AmdSubmitWaitEnabled() {
@@ -147,7 +148,6 @@ jobs:
 
           bool HasOnlyMasterSignal(const QueuedSubmission& record) {''')
           replace(root+'queueSubmission.cpp', '\tEXIT_IF(count == 0 || count > MaxBatch);', """\tEXIT_IF(count == 0 || count > MaxBatch);
-              // Central entry used by the worker and all broker drain paths.
               if (AmdSubmitWaitEnabled() && count > 1) {
                   for (size_t i = 0; i < count; ++i) SubmitBatch(records + i, 1);
                   return;
@@ -176,9 +176,8 @@ jobs:
                       wait_info.pSemaphores = &semaphore;
                       wait_info.pValues = &value;
                       RecordAmdTrace(9, value, 2000000000ull, 0, 0);
-                      // Retain the caller's queue mutex to preserve submission order.
-                      // A dependency needing that mutex can cause a timeout: this is not
-                      // evidence of a GPU fault, and disables further diagnostic waits.
+                      // Keep the queue mutex to preserve submission order.
+                      // Timeout can be a dependency issue, not a GPU fault.
                       const auto completed = m_graphics->device.waitSemaphores(&wait_info, 2000000000ull);
                       RecordAmdTrace(8, value,
                                      static_cast<uint64_t>(static_cast<int64_t>(completed)), 0, 0);
@@ -198,7 +197,27 @@ jobs:
                   }
               }
           }''')
-          print('Bounded main-queue completion diagnostic installed')
+
+          replace(root+'renderer/cache/bufferCache.cpp', '\tcommand.copyBuffer(buffer.Handle(), side.staging->Handle(), static_cast<uint32_t>(regions.size()),', r'''    RecordAmdTrace(22, reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer.Handle())),
+                             buffer.BufferDeviceAddress(), buffer.CpuAddress(), buffer.Size());
+              RecordAmdTrace(23, reinterpret_cast<uint64_t>(static_cast<VkBuffer>(side.staging->Handle())),
+                             side.staging->BufferDeviceAddress(), staging_base, side.staging->Size());
+              for (const auto& region : regions)
+                  RecordAmdTrace(24, region.srcOffset, region.dstOffset, region.size, current);
+              command.copyBuffer(buffer.Handle(), side.staging->Handle(), static_cast<uint32_t>(regions.size()),''')
+          for queue, code in [('m_graphics.side_queue', 1), ('m_graphics.queue', 0)]:
+              old = '\t\tsubmit_result = '+queue+'.submit(1, &submit, nullptr);'
+              new = '\t\tRecordAmdTrace(20, value, producer, current, '+str(code)+');\n'+old+'\n\t\tRecordAmdTrace(21, value, static_cast<uint64_t>(static_cast<int64_t>(submit_result)), producer, current);'
+              replace(root+'renderer/cache/bufferCache.cpp', old, new)
+          replace(root+'renderer/cache/bufferCache.cpp', '\t\tRequireVulkanSuccess(graphics.device.getSemaphoreCounterValue(semaphore, &current),\n\t\t                     "query side-readback semaphore");', r'''        const auto queried = graphics.device.getSemaphoreCounterValue(semaphore, &current);
+                  RecordAmdTrace(25, target, static_cast<uint64_t>(static_cast<int64_t>(queried)), current,
+                                 reinterpret_cast<uint64_t>(static_cast<VkSemaphore>(semaphore)));
+                  RequireVulkanSuccess(queried, "query side-readback semaphore");''')
+          replace(root+'renderer/cache/bufferCache.cpp', '\t\tRequireVulkanSuccess(graphics.device.waitSemaphores(&wait_info, UINT64_MAX),\n\t\t                     "wait for side readback");', r'''        RecordAmdTrace(26, target, 0, 0, 0);
+                  const auto waited = graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+                  RecordAmdTrace(27, target, static_cast<uint64_t>(static_cast<int64_t>(waited)), 0, 0);
+                  RequireVulkanSuccess(waited, "wait for side readback");''')
+          print('Direct readback submission and completion observation installed')
           '@ | python -
           if ($LASTEXITCODE -ne 0) { throw "AMD diagnostic adaptation failed" }
           git diff --check
@@ -277,7 +296,7 @@ jobs:
             -DKYTY_PGO_USE=%PGO_PROFILE% ^
             -DKYTY_BUILD_ORIGIN=Fork ^
             -DKYTY_BUILD_REPOSITORY=%GITHUB_REPOSITORY% ^
-            -DKYTY_RELEASE_TAG=AMD-submit-wait ^
+            -DKYTY_RELEASE_TAG=AMD-readback-trace ^
             -DCMAKE_C_COMPILER=%LLVM%/clang-cl.exe ^
             -DCMAKE_CXX_COMPILER=%LLVM%/clang-cl.exe ^
             -DCMAKE_LINKER=%LLVM%/lld-link.exe ^
@@ -289,9 +308,9 @@ jobs:
         run: |
           $ninja = Get-Content -LiteralPath '_Build/windows/build.ninja' -Raw
           if (-not $ninja.Contains('C$:\kyty-src\src\emulator.cpp')) {
-            throw 'build.ninja does not compile C:\kyty-src\src\emulator.cpp: the PGO profile would only partly apply.'
+            throw 'The PGO source path does not match C:\kyty-src.'
           }
-          Write-Host "MSVC tools $env:VCToolsVersion (the profile's standard-library code: 14.51.36231)"
+          Write-Host "MSVC tools $env:VCToolsVersion"
 
       - name: Build and install
         shell: cmd
@@ -321,14 +340,14 @@ jobs:
           $sum = { param($pattern) ($log | Select-String -Pattern $pattern | ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Measure-Object -Sum).Sum }
           $mismatched = & $sum 'profile data may be out of date: of \d+ functions?, (\d+)'
           $missing = & $sum 'profile data may be incomplete: of \d+ functions?, (\d+)'
-          Write-Host "PGO: $([int]$mismatched) functions with mismatched profile data, $([int]$missing) without profile data"
-          if ($mismatched -gt 0) { Write-Host "::warning::PGO: $mismatched functions have mismatched profile data" }
+          Write-Host "PGO: $([int]$mismatched) mismatched functions, $([int]$missing) without profile data"
 
-      - name: Package portable experimental runtime
+      - name: Package portable diagnostic
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $runtime = Join-Path $env:GITHUB_WORKSPACE '_Build/windows/install'
-          $release = Join-Path $env:RUNNER_TEMP 'KytyPS5-AMD-SubmitWait'
+          $release = Join-Path $env:RUNNER_TEMP 'KytyPS5-AMD-Readback'
           New-Item -ItemType Directory -Path $release | Out-Null
           Copy-Item -Path (Join-Path $runtime '*') -Destination $release -Recurse
           Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination $release
@@ -342,6 +361,8 @@ jobs:
             KYTY_CP_RECORDER = '0'
             KYTY_HANG_TRACE = '0'
             KYTY_AMD_SUBMIT_WAIT = '1'
+            KYTY_UPLOAD_DMA = '0'
+            KYTY_SIDE_QUEUE = '0'
           }
           foreach ($key in $flags.Keys) {
             $preset | Add-Member -NotePropertyName $key -NotePropertyValue $flags[$key] -Force
@@ -351,12 +372,13 @@ jobs:
           @echo off
           cd /d "%~dp0"
           if exist "_amd_gpu_live.txt" move /y "_amd_gpu_live.txt" "_amd_gpu_live-anterior-%RANDOM%.txt" >nul
-          echo Inicia Astro Bot. Cuando se cierre, busca _amd_gpu_live.txt.
+          echo Inicia Astro Bot con el interprete de ESTA carpeta.
+          echo Cuando se cierre, envia la consola y _amd_gpu_live.txt.
           "%~dp0launcher.exe" %*
           pause
           '@ | Set-Content -LiteralPath (Join-Path $release 'Diagnostico-AMD.cmd') -Encoding ascii
           if (Test-Path -LiteralPath (Join-Path $release 'Kyty.ini')) {
-            throw 'The release must use the shared Kyty settings location; remove the local Kyty.ini.'
+            throw 'Unexpected local Kyty.ini in the package.'
           }
           Copy-Item -LiteralPath 'docs/EXPERIMENTAL.md' -Destination (Join-Path $release 'U59-README.md')
           Copy-Item -LiteralPath 'LICENSE' -Destination $release
@@ -365,15 +387,19 @@ jobs:
           Copy-Item -Path '3rdparty/tracy/profiler/src/font/Roboto-*.ttf' -Destination $fonts
           if (@(Get-ChildItem -LiteralPath $fonts -Filter 'Roboto-*.ttf').Count -ne 4) { throw 'Expected four Roboto fonts.' }
           Copy-Item -LiteralPath '3rdparty/SPIRV-Tools/LICENSE' -Destination (Join-Path $fonts 'LICENSE-Apache-2.0.txt')
-          $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-AMD-SubmitWait.zip'
+          foreach ($exe in 'launcher.exe', 'kyty_emulator.exe') {
+            if (-not (Test-Path -LiteralPath (Join-Path $release $exe))) {
+              throw "Missing executable: $exe"
+            }
+          }
+          $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-AMD-Readback.zip'
           Compress-Archive -Path (Join-Path $release '*') -DestinationPath $archive
-          "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Upload diagnostic build
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-AMD-SubmitWait
-          path: KytyPS5-AMD-SubmitWait.zip
+          name: KytyPS5-AMD-Readback
+          path: KytyPS5-AMD-Readback.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -381,7 +407,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: AMD-SubmitWait-build-log
+          name: AMD-Readback-build-log
           path: pgo-build.log
           if-no-files-found: ignore
           retention-days: 7
