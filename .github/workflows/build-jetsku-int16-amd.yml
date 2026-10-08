@@ -1,4 +1,4 @@
-name: Jetsku AMD - Diagnostico de fallo GPU
+name: Jetsku AMD - Traza de buffers y shaders
 
 on:
   workflow_dispatch:
@@ -9,14 +9,10 @@ permissions:
 jobs:
   windows:
     runs-on: windows-2022
-    timeout-minutes: 360
-
-    defaults:
-      run:
-        shell: pwsh
+    timeout-minutes: 90
 
     steps:
-      - name: Checkout exact Jetsku source
+      - name: Checkout exact Jetsku base
         uses: actions/checkout@v4
         with:
           ref: f9e19582f0deac0d1226a7ce3faae30a9ab408ab
@@ -27,81 +23,222 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Add device-loss report to presentation errors
+      - name: Install AMD diagnostic trace
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           @'
           from pathlib import Path
 
-          path = Path("src/graphics/presentation/window/swapchain.cpp")
-          source = path.read_text(encoding="utf-8")
+          def replace(path, old, new, count=1):
+              p = Path(path)
+              s = p.read_text(encoding='utf-8')
+              if s.count(old) != count:
+                  raise RuntimeError(f'{path}: expected {count} boundaries, found {s.count(old)}')
+              p.write_text(s.replace(old, new), encoding='utf-8', newline='\n')
 
-          for call in ("vkAcquireNextImageKHR", "vkQueuePresentKHR"):
-              old = (
-                  '\t\tdefault: EXIT("' + call +
-                  ' failed: %s\\n", vk::to_string(result).c_str());'
-              )
-              if source.count(old) != 1:
-                  raise RuntimeError("Unexpected error boundary: " + call)
+          root = 'src/graphics/host_gpu/'
 
-              new = (
-                  "\t\tcase vk::Result::eErrorDeviceLost:\n"
-                  "\t\t\tDumpDeviceLossDiagnostics(m_window.graphic_ctx);\n"
-                  '\t\t\tEXIT("' + call +
-                  ' failed: %s\\n", vk::to_string(result).c_str());\n'
-                  "\t\t\tbreak;\n" + old
-              )
-              source = source.replace(old, new)
+          replace(root+'graphicContext.h', '[[nodiscard]] bool DeviceFaultDiagnosticsEnabled();', '''[[nodiscard]] bool DeviceFaultDiagnosticsEnabled();
+          void RecordAmdTrace(uint32_t kind, uint64_t a, uint64_t b, uint64_t c, uint64_t d);''')
 
-          path.write_text(source, encoding="utf-8", newline="\n")
-          print("Device-loss reporting installed at acquire and present.")
+          replace(root+'renderer/context.cpp',
+                  'if (m_graphics.diagnostic_checkpoints_enabled && m_buffer) {',
+                  'if (DeviceFaultDiagnosticsEnabled() && m_buffer) {')
+
+          replace(root+'renderer/context.cpp',
+                  'if (marker != nullptr) {\n\t\t\tHandle().setCheckpointNV(marker);',
+                  'if (marker != nullptr && m_graphics.diagnostic_checkpoints_enabled) {\n\t\t\tHandle().setCheckpointNV(marker);')
+
+          replace(root+'diagnosticCheckpoints.cpp',
+                  'static void DumpDeviceFault(GraphicContext& graphics) {',
+                  r'''namespace {
+          struct AmdTraceRow {
+              uint64_t seq = 0;
+              uint32_t kind = 0;
+              uint64_t a = 0, b = 0, c = 0, d = 0;
+          };
+
+          constexpr size_t AMD_TRACE_CAPACITY = 4096;
+          std::array<AmdTraceRow, AMD_TRACE_CAPACITY> g_amd_trace {};
+          uint64_t g_amd_sequence = 0;
+          std::mutex g_amd_mutex;
+
+          void DumpAmdTrace() {
+              // CPU records only; these do not prove GPU completion.
+              std::array<AmdTraceRow, AMD_TRACE_CAPACITY> rows {};
+              uint64_t end = 0;
+              {
+                  const std::lock_guard lock(g_amd_mutex);
+                  rows = g_amd_trace;
+                  end = g_amd_sequence;
+              }
+
+              std::array<DiagnosticCheckpoint, 512> commands {};
+              uint64_t command_end = 0;
+              {
+                  const std::lock_guard lock(g_checkpoint_mutex);
+                  command_end = g_checkpoint_sequence;
+                  const auto first = command_end > commands.size()
+                      ? command_end - commands.size() : 0;
+                  for (uint64_t n = first + 1; n <= command_end; ++n)
+                      commands[(n - 1) % commands.size()] =
+                          g_checkpoints[n % CHECKPOINT_RING_SIZE];
+              }
+
+              auto* file = std::fopen("_amd_gpu_trace.txt", "wb");
+              if (file == nullptr) {
+                  std::printf("AMD trace: could not write _amd_gpu_trace.txt\n");
+                  return;
+              }
+
+              std::fprintf(file, "CPU history; NOT proof of GPU completion.\n");
+              std::fprintf(file, "Events retained=%llu total=%llu\n",
+                           static_cast<unsigned long long>(
+                               std::min<uint64_t>(end, rows.size())),
+                           static_cast<unsigned long long>(end));
+              std::fprintf(file,
+                  "kind 0=buffer-create 1=buffer-destroy: a=VkBuffer b=BDA c=guest d=size\n");
+              std::fprintf(file,
+                  "kind 2=shader-selected: a=tick b=stage(0-2 vertex,3 pixel,4 compute) c=hash d=submit\n");
+              std::fprintf(file,
+                  "kind 3=BDA-map: a=guest b=BDA c=size d=tick\n");
+
+              const auto first = end > rows.size() ? end - rows.size() : 0;
+              for (uint64_t n = first + 1; n <= end; ++n) {
+                  const auto& row = rows[n % rows.size()];
+                  std::fprintf(file,
+                      "event=%llu kind=%u a=0x%016llx b=0x%016llx c=0x%016llx d=0x%016llx\n",
+                      static_cast<unsigned long long>(row.seq), row.kind,
+                      static_cast<unsigned long long>(row.a),
+                      static_cast<unsigned long long>(row.b),
+                      static_cast<unsigned long long>(row.c),
+                      static_cast<unsigned long long>(row.d));
+              }
+
+              std::fprintf(file,
+                  "Commands: VS/PS/CS are guest code addresses, NOT shader hashes.\n");
+              const auto first_command = command_end > commands.size()
+                  ? command_end - commands.size() : 0;
+              for (uint64_t n = first_command + 1; n <= command_end; ++n) {
+                  const auto& c = commands[(n - 1) % commands.size()];
+                  std::fprintf(file,
+                      "command=%llu tick=%llu op=%s submit=%llu args=%u,%u,%u,%u,0x%016llx VS=0x%016llx PS=0x%016llx CS=0x%016llx\n",
+                      static_cast<unsigned long long>(c.sequence),
+                      static_cast<unsigned long long>(c.tick),
+                      OpName(c.op),
+                      static_cast<unsigned long long>(c.submit_id),
+                      c.arg0, c.arg1, c.arg2, c.arg3,
+                      static_cast<unsigned long long>(c.arg4),
+                      static_cast<unsigned long long>(c.vs),
+                      static_cast<unsigned long long>(c.ps),
+                      static_cast<unsigned long long>(c.cs));
+              }
+
+              std::fclose(file);
+              std::printf("AMD trace: wrote _amd_gpu_trace.txt (CPU history)\n");
+              std::fflush(stdout);
+          }
+          } // namespace
+
+          void RecordAmdTrace(uint32_t kind, uint64_t a, uint64_t b,
+                              uint64_t c, uint64_t d) {
+              if (!DeviceFaultDiagnosticsEnabled()) return;
+              const std::lock_guard lock(g_amd_mutex);
+              const auto seq = ++g_amd_sequence;
+              g_amd_trace[seq % AMD_TRACE_CAPACITY] = {seq, kind, a, b, c, d};
+          }
+
+          static void DumpDeviceFault(GraphicContext& graphics) {''')
+
+          replace(root+'diagnosticCheckpoints.cpp',
+                  '\tDumpDeviceFault(graphics);',
+                  '\tDumpAmdTrace();\n\tDumpDeviceFault(graphics);')
+
+          replace(root+'renderer/cache/streamBuffer.cpp',
+                  '\tVkMemoryPropertyFlags properties = 0;',
+                  '''\tRecordAmdTrace(0, reinterpret_cast<uint64_t>(static_cast<VkBuffer>(m_buffer)),
+                             m_device_address, m_cpu_address, m_size);
+          \tVkMemoryPropertyFlags properties = 0;''')
+
+          replace(root+'renderer/cache/streamBuffer.cpp',
+                  'Buffer::~Buffer() {',
+                  '''Buffer::~Buffer() {
+              if (m_buffer != nullptr && !m_sparse)
+                  RecordAmdTrace(1, reinterpret_cast<uint64_t>(static_cast<VkBuffer>(m_buffer)),
+                                 m_device_address, m_cpu_address, m_size);''')
+
+          replace(root+'renderer/cache/bufferCache.cpp',
+                  '\t\tEnsureBdaTableResident(pages.first, size_pages);',
+                  '''\t\tRecordAmdTrace(3, buffer.CpuAddress(), buffer.BufferDeviceAddress(), buffer.Size(),
+                                 m_scheduler.CurrentTick());
+          \t\tEnsureBdaTableResident(pages.first, size_pages);''')
+
+          replace(root+'renderer/renderCompute.cpp',
+                  '\tconst auto& program   = *input_info.stage.program;',
+                  '''\tconst auto& program   = *input_info.stage.program;
+              RecordAmdTrace(2, m_context.GetCommandScheduler().CurrentTick(), 4,
+                             program.shader_hash, submit_id);''')
+
+          replace(root+'renderer/renderCompute.cpp',
+                  '\tconst auto& program = *input_info.stage.program;',
+                  '''\tconst auto& program = *input_info.stage.program;
+              RecordAmdTrace(2, m_context.GetCommandScheduler().CurrentTick(), 4,
+                             program.shader_hash, submit_id);''')
+
+          replace(root+'renderer/renderDraw.cpp',
+                  '\tconst auto& pipeline = *pipeline_object;',
+                  '''\tconst auto& pipeline = *pipeline_object;
+              for (uint32_t stage = 0; stage < vertex_stages.size(); ++stage) {
+                  if (vertex_stages[stage].stage.program != nullptr)
+                      RecordAmdTrace(2, m_context.GetCommandScheduler().CurrentTick(), stage,
+                                     vertex_stages[stage].stage.program->shader_hash, submit_id);
+              }
+              if (state.ps_active && state.ps_input_info.stage.program != nullptr)
+                  RecordAmdTrace(2, m_context.GetCommandScheduler().CurrentTick(), 3,
+                                 state.ps_input_info.stage.program->shader_hash, submit_id);''')
+
+          for api in ['vkAcquireNextImageKHR', 'vkQueuePresentKHR']:
+              old = '\t\tdefault: EXIT("'+api+' failed: %s\\n", vk::to_string(result).c_str());'
+              new = '\t\tcase vk::Result::eErrorDeviceLost:\n\t\t\tDumpDeviceLossDiagnostics(m_window.graphic_ctx);\n\t\t\tEXIT("'+api+' failed: %s\\n", vk::to_string(result).c_str());\n\t\t\tbreak;\n'+old
+              replace('src/graphics/presentation/window/swapchain.cpp', old, new)
+
+          print('AMD CPU history and buffer trace installed')
           '@ | python -
-
-          if ($LASTEXITCODE -ne 0) {
-              throw "Diagnostic adaptation failed"
-          }
-
+          if ($LASTEXITCODE -ne 0) { throw "AMD diagnostic adaptation failed" }
           git diff --check
-          if ($LASTEXITCODE -ne 0) {
-              throw "Invalid diagnostic diff"
-          }
+          if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
 
-      - name: Setup Visual Studio
+      - name: Set up Visual Studio
         uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Setup Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v5
 
       - name: Locate vcpkg
         id: vcpkg
+        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $root = Split-Path (Get-Command vcpkg).Source
-          $hash = (Get-FileHash "$root\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash
-          "root=$root" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "hash=$hash" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
+          $portHash = (Get-FileHash "$vcpkgRoot\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash
+          "root=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "port_hash=$($portHash.ToLowerInvariant())" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Cache glslang
         id: glslang_cache
         uses: actions/cache@v4
         with:
           path: ${{ steps.vcpkg.outputs.root }}\installed\x64-windows
-          key: glslang-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.hash }}-tools-opt
+          key: glslang-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
 
       - name: Install glslang
+        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $root = "${{ steps.vcpkg.outputs.root }}"
-
+          $vcpkgRoot = "${{ steps.vcpkg.outputs.root }}"
           if ("${{ steps.glslang_cache.outputs.cache-hit }}" -ne "true") {
-              vcpkg install glslang[tools,opt]:x64-windows
-              if ($LASTEXITCODE -ne 0) {
-                  throw "glslang installation failed"
-              }
+            vcpkg install glslang[tools,opt]:x64-windows
+            if ($LASTEXITCODE -ne 0) { throw "glslang installation failed" }
           }
-
-          "$root\installed\x64-windows\tools\glslang" |
-              Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+          "$vcpkgRoot\installed\x64-windows\tools\glslang" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
@@ -113,69 +250,59 @@ jobs:
           cache: true
 
       - name: Install LLVM 22.1.3
+        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $installer = Join-Path $env:RUNNER_TEMP "LLVM-22.1.3-win64.exe"
-
-          Invoke-WebRequest `
-              -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.3/LLVM-22.1.3-win64.exe" `
-              -OutFile $installer
-
-          $process = Start-Process `
-              -FilePath $installer `
-              -ArgumentList '/S', '/D=C:\LLVM-22.1.3' `
-              -Wait `
-              -PassThru
-
+          $installer = Join-Path $env:RUNNER_TEMP 'LLVM-22.1.3-win64.exe'
+          Invoke-WebRequest -Uri 'https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.3/LLVM-22.1.3-win64.exe' `
+            -OutFile $installer
+          $process = Start-Process -FilePath $installer -ArgumentList '/S', '/D=C:\LLVM-22.1.3' -Wait -PassThru
           if ($process.ExitCode -ne 0) {
-              throw "LLVM installation failed"
+            throw "LLVM installer exited with $($process.ExitCode)"
           }
-
-          $version = & "C:\LLVM-22.1.3\bin\clang-cl.exe" --version |
-              Select-Object -First 1
-
+          $version = & 'C:\LLVM-22.1.3\bin\clang-cl.exe' --version | Select-Object -First 1
+          Write-Host $version
           if ($version -notmatch 'clang version 22\.1\.3\b') {
-              throw "Unexpected LLVM version: $version"
+            throw "Unexpected clang-cl: $version"
+          }
+          foreach ($tool in 'lld-link.exe', 'llvm-lib.exe') {
+            if (-not (Test-Path -LiteralPath "C:\LLVM-22.1.3\bin\$tool")) {
+              throw "$tool missing"
+            }
           }
 
-      - name: Map source to PGO path
+      - name: Map the source to the PGO path
         shell: cmd
         run: |
           mklink /J C:\kyty-src "%GITHUB_WORKSPACE%"
-          if errorlevel 1 exit /b %ERRORLEVEL%
           git config --global --add safe.directory C:/kyty-src
 
-      - name: Configure IPO and PGO
+      - name: Configure Release
         shell: cmd
         run: |
           set LLVM=C:/LLVM-22.1.3/bin
+          set PGO_PROFILE=C:/kyty-src/tools/pgo/u59-int9-sg-1.profdata
           cmake -S C:\kyty-src -B _Build/windows ^
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DKYTY_EMULATOR_IPO=ON ^
-            -DKYTY_PGO_USE=C:/kyty-src/tools/pgo/u59-int9-sg-1.profdata ^
+            -DKYTY_PGO_USE=%PGO_PROFILE% ^
             -DKYTY_BUILD_ORIGIN=Fork ^
             -DKYTY_BUILD_REPOSITORY=%GITHUB_REPOSITORY% ^
-            -DKYTY_RELEASE_TAG=AMD-device-loss-diagnostic ^
+            -DKYTY_RELEASE_TAG=AMD-address-trace ^
             -DCMAKE_C_COMPILER=%LLVM%/clang-cl.exe ^
             -DCMAKE_CXX_COMPILER=%LLVM%/clang-cl.exe ^
             -DCMAKE_LINKER=%LLVM%/lld-link.exe ^
             -DCMAKE_AR=%LLVM%/llvm-lib.exe ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
 
-      - name: Verify PGO path
+      - name: Check the PGO source path
+        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $ninja = Get-Content "_Build/windows/build.ninja" -Raw
-
+          $ninja = Get-Content -LiteralPath '_Build/windows/build.ninja' -Raw
           if (-not $ninja.Contains('C$:\kyty-src\src\emulator.cpp')) {
-              throw "Unexpected PGO source path"
+            throw 'Unexpected compilation path for the PGO profile.'
           }
-
-          if (-not $ninja.Contains("-fprofile-instr-use=") -or
-              -not $ninja.Contains("-flto")) {
-              throw "IPO or PGO flags missing"
-          }
+          Write-Host "MSVC tools $env:VCToolsVersion"
 
       - name: Build and install
         shell: cmd
@@ -186,92 +313,101 @@ jobs:
           set CL=
           type pgo-build.log
           if %BUILD_EXIT% neq 0 exit /b %BUILD_EXIT%
-
           cmake --install _Build/windows --prefix _Build/windows/install
-          if errorlevel 1 exit /b %ERRORLEVEL%
 
-      - name: Package diagnostic runtime
+      - name: Show build errors
+        if: failure()
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath 'pgo-build.log') {
+            $lines = @(Get-Content -LiteralPath 'pgo-build.log' |
+              Select-String -Pattern 'error|FAILED|fatal' |
+              Select-Object -First 8)
+            if (-not $lines) {
+              $lines = @(Get-Content -LiteralPath 'pgo-build.log' |
+                Select-Object -Last 8)
+            }
+            foreach ($line in $lines) {
+              Write-Host ('::error::' + "$line".Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A'))
+            }
+          } else {
+            Write-Host '::error::pgo-build.log was not written'
+          }
+
+      - name: Package portable runtime
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $runtime = Join-Path $env:GITHUB_WORKSPACE "_Build/windows/install"
+          $runtime = Join-Path $env:GITHUB_WORKSPACE '_Build/windows/install'
+          $release = Join-Path $env:RUNNER_TEMP 'KytyPS5-AMD-Trace'
+          New-Item -ItemType Directory -Path $release | Out-Null
+          Copy-Item -Path (Join-Path $runtime '*') -Destination $release -Recurse
+          Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination $release
 
-          foreach ($exe in @("launcher.exe", "kyty_emulator.exe")) {
-              if (-not (Test-Path (Join-Path $runtime $exe))) {
-                  throw "Missing executable: $exe"
-              }
+          $presetPath = Join-Path $release 'u59-preset.json'
+          $preset = Get-Content -LiteralPath $presetPath -Raw | ConvertFrom-Json
+          $flags = @{
+            KYTY_DEVICE_FAULT_DIAGNOSTICS = '1'
+            KYTY_FUNCTION_ARRAY_SHRINK = '0'
+            KYTY_PIPELINE_FAST_FIRST = '0'
+            KYTY_BDA_INCREMENTAL_SYNC = '0'
+            KYTY_CP_RECORDER = '0'
+            KYTY_HANG_TRACE = '0'
           }
-
-          Copy-Item "tools/u59-preset.json" -Destination $runtime
-
-          $env:KYTY_PACKAGE_RUNTIME = $runtime
-          @'
-          import json
-          import os
-          from pathlib import Path
-
-          runtime = Path(os.environ["KYTY_PACKAGE_RUNTIME"])
-          path = runtime / "u59-preset.json"
-          preset = json.loads(path.read_text(encoding="utf-8-sig"))
-          preset["KYTY_DEVICE_FAULT_DIAGNOSTICS"] = "1"
-          preset["KYTY_FUNCTION_ARRAY_SHRINK"] = "0"
-          path.write_text(
-              json.dumps(preset, indent=2) + "\n",
-              encoding="utf-8"
+          foreach ($key in $flags.Keys) {
+            $preset | Add-Member -NotePropertyName $key -NotePropertyValue $flags[$key] -Force
+          }
+          [IO.File]::WriteAllText(
+            $presetPath,
+            (ConvertTo-Json -InputObject $preset -Depth 8),
+            [Text.UTF8Encoding]::new($false)
           )
-          '@ | python -
-
-          if ($LASTEXITCODE -ne 0) {
-              throw "Diagnostic preset generation failed"
-          }
-
-          Copy-Item "docs/EXPERIMENTAL.md" -Destination (Join-Path $runtime "U59-README.md")
-          Copy-Item "LICENSE" -Destination $runtime
-
-          $fonts = Join-Path $runtime "3rdparty/tracy/profiler/src/font"
-          New-Item -ItemType Directory -Path $fonts -Force | Out-Null
-          Copy-Item "3rdparty/tracy/profiler/src/font/Roboto-*.ttf" -Destination $fonts
-
-          Copy-Item "3rdparty/SPIRV-Tools/LICENSE" `
-              -Destination (Join-Path $fonts "LICENSE-Apache-2.0.txt")
 
           @'
           @echo off
           cd /d "%~dp0"
+          echo Inicia Astro Bot. Cuando se cierre, busca _amd_gpu_trace.txt.
           "%~dp0launcher.exe" %*
-          '@ | Set-Content (Join-Path $runtime "Diagnostico-Jetsku-AMD.cmd") -Encoding ascii
+          pause
+          '@ | Set-Content -LiteralPath (Join-Path $release 'Diagnostico-AMD.cmd') -Encoding ascii
 
-          @(
-              "Device-loss diagnostic build; not a crash fix.",
-              "Original Jetsku base with IPO and imported PGO.",
-              "Device-fault diagnostics ON; function-array shrink OFF.",
-              "Copy _Patches and select THIS interpreter.",
-              "Keep AMD CPU patch OFF, shader validation OFF, red-zone ON.",
-              "Send the full console after the crash."
-          ) | Set-Content (Join-Path $runtime "DIAGNOSTICO-AMD.txt") -Encoding ascii
-
-          Compress-Archive `
-              -Path (Join-Path $runtime "*") `
-              -DestinationPath "KytyPS5-Jetsku-AMD-Diagnostico.zip" `
-              -Force
-
-          if (-not (Test-Path "KytyPS5-Jetsku-AMD-Diagnostico.zip") -or
-              (Get-Item "KytyPS5-Jetsku-AMD-Diagnostico.zip").Length -eq 0) {
-              throw "Packaging failed"
+          if (Test-Path -LiteralPath (Join-Path $release 'Kyty.ini')) {
+            throw 'Unexpected local Kyty.ini in the package.'
           }
+
+          Copy-Item -LiteralPath 'docs/EXPERIMENTAL.md' -Destination (Join-Path $release 'U59-README.md')
+          Copy-Item -LiteralPath 'LICENSE' -Destination $release
+
+          $fonts = Join-Path $release '3rdparty/tracy/profiler/src/font'
+          New-Item -ItemType Directory -Path $fonts | Out-Null
+          Copy-Item -Path '3rdparty/tracy/profiler/src/font/Roboto-*.ttf' -Destination $fonts
+          if (@(Get-ChildItem -LiteralPath $fonts -Filter 'Roboto-*.ttf').Count -ne 4) {
+            throw 'Expected four Roboto fonts.'
+          }
+          Copy-Item -LiteralPath '3rdparty/SPIRV-Tools/LICENSE' -Destination (Join-Path $fonts 'LICENSE-Apache-2.0.txt')
+
+          foreach ($exe in 'launcher.exe', 'kyty_emulator.exe') {
+            if (-not (Test-Path -LiteralPath (Join-Path $release $exe))) {
+              throw "Missing executable: $exe"
+            }
+          }
+
+          $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-AMD-Trace.zip'
+          Compress-Archive -Path (Join-Path $release '*') -DestinationPath $archive
 
       - name: Upload diagnostic build
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Jetsku-AMD-Diagnostico
-          path: KytyPS5-Jetsku-AMD-Diagnostico.zip
+          name: KytyPS5-AMD-Trace
+          path: KytyPS5-AMD-Trace.zip
           if-no-files-found: error
           retention-days: 7
 
-      - name: Upload compiler log
+      - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Jetsku-AMD-Diagnostic-Compiler-log
+          name: AMD-Trace-build-log
           path: pgo-build.log
           if-no-files-found: ignore
           retention-days: 7
