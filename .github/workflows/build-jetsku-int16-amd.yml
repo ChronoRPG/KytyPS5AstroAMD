@@ -358,7 +358,7 @@ jobs:
           if (Test-Path -LiteralPath (Join-Path $release 'Kyty.ini')) {
             throw 'The release must use the shared Kyty settings location; remove the local Kyty.ini.'
           }
-          Copy-Item -LiteralPath 'docs/EXPERIMENTAL.md' -Destination (Join-Path $release 'U59-README.md'))
+          Copy-Item -LiteralPath 'docs/EXPERIMENTAL.md' -Destination (Join-Path $release 'U59-README.md')
           Copy-Item -LiteralPath 'LICENSE' -Destination $release
           $fonts = Join-Path $release '3rdparty/tracy/profiler/src/font'
           New-Item -ItemType Directory -Path $fonts | Out-Null
